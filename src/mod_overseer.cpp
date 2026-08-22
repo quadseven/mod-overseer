@@ -43,7 +43,6 @@
 
 #include "Chat.h"
 #include "Log.h"
-#include "Channel.h"
 #include "DatabaseEnv.h"
 #include "Group.h"
 #include "Guild.h"
@@ -131,7 +130,6 @@ uint32 KindFromName(std::string const& name)
     if (name == "raid")    return KIND_RAID;
     if (name == "guild")   return KIND_GUILD;
     if (name == "officer") return KIND_OFFICER;
-    if (name == "channel") return KIND_CHANNEL;
     return KIND_NONE;
 }
 
@@ -333,7 +331,6 @@ public:
         PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT,
         PLAYERHOOK_CAN_PLAYER_USE_GROUP_CHAT,
         PLAYERHOOK_CAN_PLAYER_USE_GUILD_CHAT,
-        PLAYERHOOK_CAN_PLAYER_USE_CHANNEL_CHAT,
     }) {}
 
     // say / yell / emote - audibility is distance on the same map.
@@ -415,22 +412,16 @@ public:
         return true;
     }
 
-    // public channels - off by default; the one source that would drown the
-    // relay on a 500-bot world.
-    bool OnPlayerCanUseChat(Player* player, uint32 /*type*/, uint32 /*lang*/, std::string& msg,
-                            Channel* channel) override
-    {
-        if (!channel || !Interested(KIND_CHANNEL))
-            return true;
-
-        ForEachWatcher(KIND_CHANNEL, [&](Player* watcher)
-        {
-            if (channel->IsOn(watcher->GetGUID()))
-                RecordHeard(player, watcher->GetName(), KIND_CHANNEL, msg, channel->GetName());
-        });
-        return true;
-    }
-
+    // Public channels (Trade, General) are NOT captured, and the reason is
+    // worth stating: Channel::IsOn is PRIVATE, and the core exposes no public
+    // way to ask whether a player is in a given channel (Player::m_channels is
+    // private too, with no getter). Recording without that test would relay
+    // lines the watcher is not actually in - which is precisely the "wiretap
+    // rather than chat log" failure the rest of this file works to avoid.
+    //
+    // So the capability is absent rather than approximate. KindFromName
+    // refuses "channel" for the same reason, so a watch row asking for it
+    // fails loudly at parse time instead of silently doing nothing.
 };
 
 class OverseerWorldScript : public WorldScript

@@ -37,9 +37,12 @@ CREATE TABLE IF NOT EXISTS `overseer_chat` (
 
 CREATE TABLE IF NOT EXISTS `overseer_chat_watch` (
   `name` VARCHAR(12) NOT NULL,
-  -- Comma-separated channel kinds. `channel` (Trade, General, LookingForGroup)
-  -- is deliberately absent from the default: on a 500-bot world it is the one
-  -- source that would drown the relay.
+  -- Comma-separated channel kinds. Public channels (Trade, General,
+  -- LookingForGroup) are NOT supported at all - not merely off by default.
+  -- Channel::IsOn is private in the core and there is no public way to ask
+  -- whether a player is in a given channel, so membership cannot be tested;
+  -- recording without it would relay lines the watcher is not in. Asking for
+  -- `channel` here is rejected rather than silently ignored.
   `channels` VARCHAR(255) NOT NULL
     DEFAULT 'say,yell,emote,whisper,party,raid,guild,officer',
   `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
