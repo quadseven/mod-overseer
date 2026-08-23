@@ -1,0 +1,51 @@
+-- Let the roster learn what a character of its level would know (infra#2757).
+--
+-- WHY THE FAMILY NEEDED THIS. mod-playerbots already does the whole job on
+-- levelup - AutoMaintenanceOnLevelupAction picks talents and learns every spell
+-- a trainer would teach - and every line of it is behind the same guard:
+--
+--     if (!sPlayerbotAIConfig.autoPickTalents || !sRandomPlayerbotMgr.IsRandomBot(bot))
+--         return;
+--     if (sPlayerbotAIConfig.autoLearnTrainerSpells && sRandomPlayerbotMgr.IsRandomBot(bot))
+--         LearnTrainerSpells(out);
+--
+-- IsRandomBot() needs BOTH IsInRandomAccountList(accountId) - the "<prefix>0..N"
+-- list our named accounts can never enter - AND membership of currentBots, the
+-- random-bot pool these characters are deliberately kept out of so they are not
+-- re-rolled. It also returns false outright for a selfbot, and SelfBotLevel is
+-- 3 here. Three separate reasons, any one of them enough.
+--
+-- So AutoLearnTrainerSpells = 1 and AutoPickTalents = 1 were both set, both
+-- read, and neither could ever reach this family. Measured live: a level 11
+-- warrior with 13 spells and 1 talent, and a level 9 paladin with ZERO spells -
+-- no seal, no judgement, nothing but auto-attack. That is what "grug is a
+-- dumbass he just charged 3 mobs and died" actually looked like from inside.
+--
+-- WHY A COLUMN AND NOT A REDERIVATION. Training is idempotent but not free: it
+-- walks the whole talent DBC and every trainer list for the class. Recording
+-- the level it was last done at turns a per-tick sweep into one pass per level
+-- gained, which is exactly how often a real character visits a trainer.
+ALTER TABLE `overseer_roster`
+    -- Which talent tree to spend points in, as a DBC tabpage: 0, 1 or 2 in the
+    -- in-game left-to-right order (warrior 0=arms 1=fury 2=protection).
+    -- Anything outside that range leaves talents alone entirely, which is the
+    -- safe default for a character added to the roster without somebody
+    -- deciding its role.
+    --
+    -- WHY NOT THE PREMADE SPEC NAMES. AiPlayerbot.PremadeSpecLink.<cls>.<spec>
+    -- is only configured at levels 60 and 80, and InitTalentsByTemplate walks
+    -- DOWN from the character's level looking for one, so below 60 it finds
+    -- nothing and spends no points at all. The tabpage is the level-independent
+    -- half of the same fact.
+    --
+    -- UNSIGNED WITH A SENTINEL, not a signed -1. The module reads this with
+    -- Field::Get<uint8>, which mod-playerbots uses in 34 places; Get<int8> it
+    -- never uses once. A column shape whose reader has no precedent in the
+    -- codebase that has to compile against it is a compile risk for nothing,
+    -- and 255 is as unambiguous as -1 when the valid range is 0-2.
+    ADD COLUMN `spec_tab` TINYINT UNSIGNED NOT NULL DEFAULT 255
+        COMMENT 'Talent tree to spend points in (DBC tabpage 0-2); 255 leaves talents alone',
+    -- 0 means never trained, and level 1 is a real level, so this cannot be
+    -- NULL-as-never without every read having to say so.
+    ADD COLUMN `trained_level` TINYINT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT 'Character level at which training was last applied';

@@ -51,13 +51,18 @@
 #include "GuildMgr.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "DBCStores.h"
+#include "DBCStructure.h"
+#include "PlayerbotFactory.h"
 #include "Playerbots.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "World.h"
 #include "WorldSession.h"
 
+#include <algorithm>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -83,6 +88,18 @@ constexpr uint32 ROSTER_LOGINS_PER_POLL = 3;
 // How often to check the roster is still one party. Cheap - a pointer compare
 // per member until something is actually wrong.
 constexpr uint32 PARTY_POLL_MS = 30000;
+
+// How often the roster is checked for training it has not had yet. Slower than
+// the other sweeps on purpose: the check is one indexed SELECT, but the work it
+// guards walks the talent DBC and every trainer list for the class, and nothing
+// is lost by a character carrying a new level for a minute before it knows what
+// that level taught it.
+constexpr uint32 TRAIN_POLL_MS = 60000;
+
+// The highest DBC talent tabpage. spec_tab holds a tabpage, and anything above
+// this means no tree was chosen - which is a decision the module must not make
+// on a named character's behalf.
+constexpr uint8 MAX_TALENT_TAB = 2;
 // Fast enough that a relayed conversation still feels live.
 constexpr uint32 CHAT_FLUSH_MS = 1000;
 // One world tick must never stall on a burst of queued commands.
@@ -453,6 +470,7 @@ public:
         _chatFlushTimer += diff;
         _rosterTimer += diff;
         _partyTimer += diff;
+        _trainTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
@@ -484,6 +502,11 @@ public:
         {
             _partyTimer = 0;
             KeepRosterGrouped();
+        }
+        if (_trainTimer >= TRAIN_POLL_MS)
+        {
+            _trainTimer = 0;
+            TrainRoster();
         }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
@@ -657,6 +680,150 @@ private:
         }
 
         group->BroadcastGroupUpdate();
+    }
+
+    // Teach the roster what a character of its level would already know.
+    //
+    // WHY THIS EXISTS AT ALL. mod-playerbots does this job properly on levelup -
+    // AutoMaintenanceOnLevelupAction picks talents, learns every trainer spell,
+    // and re-runs the skill init - and every branch of it is behind
+    // IsRandomBot(bot). That needs the account to be in the "<prefix>0..N"
+    // random-bot list AND the character to be in the currentBots pool AND the
+    // bot not to be a selfbot. This family fails all three, permanently and by
+    // design: named accounts cannot enter the list, they are kept out of the
+    // pool so RandomPlayerbotMgr never re-rolls them, and SelfBotLevel is 3.
+    //
+    // The result was invisible because the config said otherwise.
+    // AutoLearnTrainerSpells and AutoPickTalents were both 1, both parsed, and
+    // both dead on arrival for these five. What it looked like from the outside
+    // was a family that fought badly: a level 11 warrior with 13 spells and one
+    // talent, and a level 9 paladin with no spells whatsoever - no seal, no
+    // judgement, auto-attack and nothing else.
+    //
+    // WHY THE FACTORY AND NOT A SPELL LIST. PlayerbotFactory::InitAvailableSpells
+    // walks the real trainer tables, so a character learns exactly what a trainer
+    // in the world would teach it and nothing more. Writing our own list would be
+    // a second, worse copy of data the server already has, and would drift the
+    // first time a class changed.
+    //
+    // WHAT IS DELIBERATELY NOT CALLED. AutoTeleportForLevel, which yanks a bot to
+    // a level-appropriate zone: the family is questing somewhere on purpose and
+    // being teleported out of it mid-quest is not training, it is abduction.
+    // Randomize() and ClearEverything() likewise - they re-roll gear and level,
+    // which is the exact fate the roster exists to protect these characters from.
+    void TrainRoster()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, spec_tab, trained_level FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            uint8 const specTab = fields[1].Get<uint8>();
+            uint8 const trainedLevel = fields[2].Get<uint8>();
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot)
+                continue;
+
+            uint8 const level = bot->GetLevel();
+
+            // Two reasons to do the work, and the talent one has to be gated on
+            // specTab as well: with no tree chosen the points are never spent,
+            // so "has free points" would be true forever and this would re-run
+            // the whole trainer walk every single poll.
+            bool const hasTree = specTab <= MAX_TALENT_TAB;
+            bool const wantsTalents = hasTree && bot->GetFreeTalentPoints() > 0;
+            if (level == trainedLevel && !wantsTalents)
+                continue;
+
+            LOG_INFO("module.overseer", "overseer: training '{}' at level {} (spec_tab {})",
+                     name, static_cast<uint32>(level), static_cast<uint32>(specTab));
+
+            PlayerbotFactory factory(bot, level);
+            factory.InitSkills();
+            factory.InitClassSpells();
+            factory.InitAvailableSpells();
+
+            if (hasTree)
+                SpendTalents(bot, static_cast<uint32>(specTab));
+
+            bot->SendTalentsInfoData(false);
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_roster SET trained_level = {} WHERE name = '{}'",
+                static_cast<uint32>(level), Esc(name));
+        } while (result->NextRow());
+    }
+
+    // Spend every free talent point in one tree, lowest row first.
+    //
+    // WHY NOT PlayerbotFactory::InitTalentsTree. It picks the tree at random
+    // from AiPlayerbot.RandomClassSpecProb, which is right for a bot nobody
+    // knows and wrong for a named character whose role is a decision - Grug
+    // tanks because he is the father who goes first, not because a die landed
+    // on protection. It then applies the premade spec link, which is configured
+    // only at levels 60 and 80: InitTalentsByTemplate walks DOWN from the
+    // character's level looking for one, finds nothing below 60, and spends no
+    // points at all. Every talent the family could have had before level 60 was
+    // being left on the table by a path that reported success.
+    //
+    // WHY ROW ORDER MATTERS. A talent tier only unlocks once enough points sit
+    // in the tiers above it, so an out-of-order walk silently learns nothing
+    // past the first locked row. std::map iterates ascending, which is the
+    // order the tree itself requires.
+    //
+    // WHY FIVE POINTS PER ROW. That is the tier requirement, so it is also the
+    // least that opens the next row. Without the cap a five-rank talent on row
+    // 0 can eat every point a low-level character has and the tree never opens.
+    void SpendTalents(Player* bot, uint32 tabpage)
+    {
+        uint32 const classMask = bot->getClassMask();
+
+        std::map<uint32, std::vector<TalentEntry const*>> rows;
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* talent = sTalentStore.LookupEntry(i);
+            if (!talent)
+                continue;
+
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(talent->TalentTab);
+            if (!tab || tab->tabpage != tabpage)
+                continue;
+
+            if ((classMask & tab->ClassMask) == 0)
+                continue;
+
+            rows[talent->Row].push_back(talent);
+        }
+
+        for (auto const& row : rows)
+        {
+            uint32 const before = bot->GetFreeTalentPoints();
+            for (TalentEntry const* talent : row.second)
+            {
+                uint32 const free = bot->GetFreeTalentPoints();
+                if (!free || before - free >= 5)
+                    break;
+
+                uint32 maxRank = 0;
+                for (uint32 rank = 0; rank < std::min<uint32>(MAX_TALENT_RANK, free); ++rank)
+                    if (talent->RankID[rank])
+                        maxRank = rank;
+
+                // A talent behind a prerequisite is unlearnable until the
+                // prerequisite is held, and LearnTalent refuses silently rather
+                // than complaining, so the dependency is satisfied first.
+                if (talent->DependsOn)
+                    bot->LearnTalent(talent->DependsOn,
+                                     std::min<uint32>(talent->DependsOnRank, free - 1));
+
+                bot->LearnTalent(talent->TalentID, maxRank);
+            }
+        }
     }
 
     // Rebuilt wholesale rather than diffed: the list is a handful of rows and
@@ -1028,6 +1195,7 @@ private:
     // first ticks, and a login queued into that is a login that quietly fails.
     uint32 _rosterTimer = 0;
     uint32 _partyTimer = 0;
+    uint32 _trainTimer = 0;
     bool _watchLoaded = false;
 };
 
