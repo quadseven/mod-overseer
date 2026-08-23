@@ -46,6 +46,7 @@
 #include "Log.h"
 #include "DatabaseEnv.h"
 #include "Group.h"
+#include "GroupMgr.h"
 #include "Guild.h"
 #include "GuildMgr.h"
 #include "ObjectAccessor.h"
@@ -78,6 +79,10 @@ constexpr uint32 ROSTER_POLL_MS = 30000;
 // Bots logged in per pass. A cap because the first pass after a restart would
 // otherwise queue every roster login into one world tick.
 constexpr uint32 ROSTER_LOGINS_PER_POLL = 3;
+
+// How often to check the roster is still one party. Cheap - a pointer compare
+// per member until something is actually wrong.
+constexpr uint32 PARTY_POLL_MS = 30000;
 // Fast enough that a relayed conversation still feels live.
 constexpr uint32 CHAT_FLUSH_MS = 1000;
 // One world tick must never stall on a burst of queued commands.
@@ -447,6 +452,7 @@ public:
         _sweepTimer += diff;
         _chatFlushTimer += diff;
         _rosterTimer += diff;
+        _partyTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
@@ -473,6 +479,11 @@ public:
         {
             _rosterTimer = 0;
             KeepRosterOnline();
+        }
+        if (_partyTimer >= PARTY_POLL_MS)
+        {
+            _partyTimer = 0;
+            KeepRosterGrouped();
         }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
@@ -538,6 +549,83 @@ private:
             sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
             ++started;
         } while (result->NextRow());
+    }
+
+    // Keep the roster in one party, so they can actually talk to each other.
+    //
+    // WHY. /say carries about 25 yards. The family grinds in different zones,
+    // so a conversation held in /say is five characters talking to themselves
+    // in empty air - which is exactly what happened: every captured line came
+    // back with heard_by equal to sender_name, and Discord showed a coherent
+    // conversation that never occurred. Party chat has no range limit.
+    //
+    // WHY NOT THE PLAYERBOT INVITE ACTION. InviteToGroupAction::Execute reads
+    // `Player* master = event.getOwner(); return Invite(bot, master);` - it
+    // invites the WHISPERER and ignores any name given. This module runs
+    // commands through the character's own session, so that is Invite(x, x),
+    // which the action refuses. There is no owner to hand it, so the group has
+    // to be formed here.
+    //
+    // WHY NOT `.group join`. It requires the first argument to already be in a
+    // group, so it can add to a party but cannot create one.
+    void KeepRosterGrouped()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1 ORDER BY name");
+        if (!result)
+            return;
+
+        std::vector<Player*> present;
+        do
+        {
+            if (Player* p = ObjectAccessor::FindPlayerByName(result->Fetch()[0].Get<std::string>()))
+                present.push_back(p);
+        } while (result->NextRow());
+
+        if (present.size() < 2)
+            return;
+
+        // Prefer a group the roster is already in over making a new one, so a
+        // party someone formed by hand is joined rather than competed with.
+        Group* group = nullptr;
+        for (Player* p : present)
+        {
+            if (Group* existing = p->GetGroup())
+            {
+                group = existing;
+                break;
+            }
+        }
+
+        if (!group)
+        {
+            Player* leader = present.front();
+            group = new Group();
+            if (!group->Create(leader))
+            {
+                delete group;
+                LOG_WARN("module.overseer", "overseer: could not form the roster party");
+                return;
+            }
+            sGroupMgr->AddGroup(group);
+            LOG_INFO("module.overseer", "overseer: formed the roster party under '{}'",
+                     leader->GetName());
+        }
+
+        for (Player* p : present)
+        {
+            if (p->GetGroup())
+                continue;   // already with us, or in a party of their own
+            if (group->IsFull())
+            {
+                LOG_WARN("module.overseer", "overseer: party full, '{}' left out",
+                         p->GetName());
+                break;
+            }
+            if (group->AddMember(p))
+                LOG_INFO("module.overseer", "overseer: '{}' joined the party", p->GetName());
+        }
+        group->BroadcastGroupUpdate();
     }
 
     // Rebuilt wholesale rather than diffed: the list is a handful of rows and
@@ -908,6 +996,7 @@ private:
     // immediately: the character cache and the world are still settling in the
     // first ticks, and a login queued into that is a login that quietly fails.
     uint32 _rosterTimer = 0;
+    uint32 _partyTimer = 0;
     bool _watchLoaded = false;
 };
 
