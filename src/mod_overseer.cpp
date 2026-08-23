@@ -573,8 +573,13 @@ private:
         // Designated leader first, so a freshly formed party starts in the
         // right hands rather than being corrected afterwards.
         QueryResult result = CharacterDatabase.Query(
-            "SELECT name, lead FROM overseer_roster WHERE enabled = 1 "
-            "ORDER BY lead DESC, name");
+            // `lead` is BACKTICKED because it is a reserved word in MySQL 8 -
+            // the LEAD() window function. Unquoted it is a syntax error, the
+            // core treats a malformed query as unrecoverable, and the
+            // worldserver aborts on the first roster poll. It shipped that way
+            // and took the server down in a crash loop.
+            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
+            "ORDER BY `lead` DESC, name");
         if (!result)
             return;
 
