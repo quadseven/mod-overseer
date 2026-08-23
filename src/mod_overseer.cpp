@@ -570,15 +570,23 @@ private:
     // group, so it can add to a party but cannot create one.
     void KeepRosterGrouped()
     {
+        // Designated leader first, so a freshly formed party starts in the
+        // right hands rather than being corrected afterwards.
         QueryResult result = CharacterDatabase.Query(
-            "SELECT name FROM overseer_roster WHERE enabled = 1 ORDER BY name");
+            "SELECT name, lead FROM overseer_roster WHERE enabled = 1 "
+            "ORDER BY lead DESC, name");
         if (!result)
             return;
 
+        std::string wantsToLead;
         std::vector<Player*> present;
         do
         {
-            if (Player* p = ObjectAccessor::FindPlayerByName(result->Fetch()[0].Get<std::string>()))
+            Field* row = result->Fetch();
+            std::string const name = row[0].Get<std::string>();
+            if (row[1].Get<uint8>() && wantsToLead.empty())
+                wantsToLead = name;
+            if (Player* p = ObjectAccessor::FindPlayerByName(name))
                 present.push_back(p);
         } while (result->NextRow());
 
@@ -625,6 +633,24 @@ private:
             if (group->AddMember(p))
                 LOG_INFO("module.overseer", "overseer: '{}' joined the party", p->GetName());
         }
+        // Leadership drifts on its own: when the leader logs out the server
+        // promotes whoever is left, so a character taken over at the keyboard
+        // and handed back comes home a member. Corrected here rather than with
+        // `.group leader`, which needs GM security a bot session does not have.
+        if (!wantsToLead.empty())
+        {
+            if (Player* head = ObjectAccessor::FindPlayerByName(wantsToLead))
+            {
+                if (head->GetGroup() == group && group->GetLeaderGUID() != head->GetGUID())
+                {
+                    group->ChangeLeader(head->GetGUID());
+                    group->SendUpdate();
+                    LOG_INFO("module.overseer", "overseer: '{}' now leads the party",
+                             wantsToLead);
+                }
+            }
+        }
+
         group->BroadcastGroupUpdate();
     }
 
