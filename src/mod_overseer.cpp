@@ -41,6 +41,7 @@
  * common "nobody is listening to this kind" case costs one atomic load.
  */
 
+#include "CharacterCache.h"
 #include "Chat.h"
 #include "Log.h"
 #include "DatabaseEnv.h"
@@ -68,6 +69,15 @@ constexpr uint32 COMMAND_POLL_MS = 2000;
 constexpr uint32 SNAPSHOT_MS = 5000;
 constexpr uint32 WATCH_RELOAD_MS = 30000;
 constexpr uint32 CHAT_SWEEP_MS = 300000;
+
+// How often to check that the roster is still logged in. A login is a query
+// holder plus a world-thread callback, so this is not free; 30s is far below
+// any interval a viewer would notice and far above the cost.
+constexpr uint32 ROSTER_POLL_MS = 30000;
+
+// Bots logged in per pass. A cap because the first pass after a restart would
+// otherwise queue every roster login into one world tick.
+constexpr uint32 ROSTER_LOGINS_PER_POLL = 3;
 // Fast enough that a relayed conversation still feels live.
 constexpr uint32 CHAT_FLUSH_MS = 1000;
 // One world tick must never stall on a burst of queued commands.
@@ -436,6 +446,7 @@ public:
         _watchTimer += diff;
         _sweepTimer += diff;
         _chatFlushTimer += diff;
+        _rosterTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
@@ -458,6 +469,11 @@ public:
             _watchTimer = 0;
             ReloadWatchList();
         }
+        if (_rosterTimer >= ROSTER_POLL_MS)
+        {
+            _rosterTimer = 0;
+            KeepRosterOnline();
+        }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
             _chatFlushTimer = 0;
@@ -473,6 +489,57 @@ public:
     }
 
 private:
+    // Log in the characters that are supposed to be playing (infra#2656).
+    //
+    // AddPlayerBot with a master account of 0 is the whole trick. The
+    // permission gate in PlayerbotHolder::AddPlayerBot reads
+    //
+    //     bool isRndbot = !masterAccountId;
+    //     if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount)
+    //
+    // so passing 0 skips it, and the login callback then takes the branch that
+    // needs no master session. That is what makes this unattended: no client,
+    // nobody logged in, no `.bot add` typed by a human.
+    //
+    // These bots are deliberately NOT enrolled in RandomPlayerbotMgr's pool.
+    // Its bots come from `add` rows in playerbots_random_bots, which these
+    // characters do not have, so the periodic Randomize() that would re-roll a
+    // level 1 character's level and gear never reaches them.
+    void KeepRosterOnline()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        uint32 started = 0;
+        do
+        {
+            if (started >= ROSTER_LOGINS_PER_POLL)
+                break;
+
+            std::string const name = result->Fetch()[0].Get<std::string>();
+
+            // Already playing. Checked by name rather than by tracking what we
+            // launched, so a character that logs out for any reason - a crash,
+            // a real player taking it over and leaving - comes back on the next
+            // pass without the module needing to have noticed why it went.
+            if (ObjectAccessor::FindPlayerByName(name))
+                continue;
+
+            ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(name);
+            if (!guid)
+            {
+                LOG_WARN("module.overseer", "overseer: roster character '{}' does not exist", name);
+                continue;
+            }
+
+            LOG_INFO("module.overseer", "overseer: logging in roster character '{}'", name);
+            sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+            ++started;
+        } while (result->NextRow());
+    }
+
     // Rebuilt wholesale rather than diffed: the list is a handful of rows and
     // a torn update would silently stop capturing a character's chat.
     void ReloadWatchList()
@@ -837,6 +904,10 @@ private:
     uint32 _watchTimer = 0;
     uint32 _sweepTimer = 0;
     uint32 _chatFlushTimer = 0;
+    // Seeded so the first roster check runs one poll after startup rather than
+    // immediately: the character cache and the world are still settling in the
+    // first ticks, and a login queued into that is a login that quietly fails.
+    uint32 _rosterTimer = 0;
     bool _watchLoaded = false;
 };
 
