@@ -1373,7 +1373,12 @@ private:
             // already recorded themselves in lowPriorityQuest - so the only
             // question left is whether the character is going anywhere.
             time_t const nowSec = std::time(nullptr);
-            RepickMemory& repick = state.repick;
+            // `auto&`, not `RepickMemory&`: the type is nested inside AimState,
+            // so the unqualified name is not in scope here and naming it
+            // outright BROKE THE BUILD ON MAIN (infra#2801). `auto&` binds the
+            // same reference, needs no qualification, and cannot drift if the
+            // struct is ever moved or renamed.
+            auto& repick = state.repick;
             uint32 justFailed = 0;
             if (repick.lastPicked)
             {
