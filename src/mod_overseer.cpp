@@ -48,9 +48,12 @@
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Guild.h"
+#include "Item.h"
+#include "ItemTemplate.h"
 #include "GuildMgr.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "Bag.h"
 #include "DBCStores.h"
 #include "DBCStructure.h"
 #include "PlayerbotFactory.h"
@@ -231,6 +234,45 @@ std::string Esc(std::string s)
     TruncateUtf8(s, MAX_CHAT_BYTES);
     CharacterDatabase.EscapeString(s);
     return s;
+}
+
+// A probe result is JSON and can run to a few KB - a spell list alone passes
+// MAX_CHAT_BYTES by level 11 - so it needs an escape that does not truncate to
+// chat length. The cap is still finite: `result` is MEDIUMTEXT, and a runaway
+// probe should be cut off rather than handed to MySQL as a 16MB row.
+constexpr size_t MAX_PROBE_BYTES = 262144;
+
+std::string EscLong(std::string s)
+{
+    TruncateUtf8(s, MAX_PROBE_BYTES);
+    CharacterDatabase.EscapeString(s);
+    return s;
+}
+
+// Minimal JSON string escaping. Item and character names come from the world,
+// not from the probe, so they can carry anything the client allows.
+std::string J(std::string const& s)
+{
+    std::ostringstream out;
+    out << '"';
+    for (char const c : s)
+    {
+        switch (c)
+        {
+            case '"':  out << "\\\""; break;
+            case '\\': out << "\\\\"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20)
+                    out << ' ';
+                else
+                    out << c;
+        }
+    }
+    out << '"';
+    return out.str();
 }
 
 struct PendingLine
@@ -996,6 +1038,11 @@ private:
             // Names are server-enforced to letters only, so they are safe to
             // embed; `detail` is one of the literals below; `command` is never
             // echoed back into SQL.
+            // Cleared per row: a probe that fails must not inherit the answer
+            // the previous row produced, which would be a wrong reading served
+            // with every appearance of a fresh one.
+            std::string probeResult;
+
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
             if (!player)
                 detail = "target not online";
@@ -1003,6 +1050,8 @@ private:
                 detail = DoChat(player, channel, command, targetArg, status);
             else if (kind == "gm")
                 detail = DoGmCommand(player, command, status);
+            else if (kind == "probe")
+                detail = DoProbe(player, command, status, probeResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 botAI->HandleCommand(CHAT_MSG_WHISPER, command, player);
@@ -1015,10 +1064,19 @@ private:
             // waiting and already ended this row, writing over it would
             // resurrect a command the sender has been told nothing came of,
             // and the two sides would disagree about what happened.
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}' "
-                "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
-                status, detail, id, g_runToken);
+            // `result` is written as its own statement shape rather than always
+            // being included, so a non-probe row does not have NULL written over
+            // whatever a reader might already have taken from it.
+            if (probeResult.empty())
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = '{}', detail = '{}' "
+                    "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
+                    status, detail, id, g_runToken);
+            else
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
+                    status, detail, EscLong(probeResult), id, g_runToken);
         } while (result->NextRow());
     }
 
@@ -1099,6 +1157,244 @@ private:
         }
         else
             return "unknown chat channel";
+
+        status = "delivered";
+        return "";
+    }
+
+    // Ask a LIVING character what it is doing, and answer from memory.
+    //
+    // WHY THIS EXISTS. Every check on this family used to go through
+    // acore_characters, which is up to fifteen minutes stale - PlayerSaveInterval
+    // is 900000 and each player's save timer is staggered from its own login.
+    // After the training pass in #2756 the database reported a paladin with zero
+    // spells for a quarter of an hour after he had been taught them. Worse in the
+    // other direction: a command reports `delivered` the moment it is handed
+    // over, so `talents spec prot pve` reported success and did nothing at all.
+    //
+    // Nothing here mutates. A probe cannot be the reason an experiment appeared
+    // to work, which is the whole point of separating it from kind='bot'.
+    static std::string ProbeState(Player* bot)
+    {
+        std::ostringstream o;
+        Unit* target = bot->GetSelectedUnit();
+        Unit* victim = bot->GetVictim();
+        Group* group = bot->GetGroup();
+
+        o << "{";
+        o << "\"name\":" << J(bot->GetName());
+        o << ",\"level\":" << uint32(bot->GetLevel());
+        o << ",\"class\":" << uint32(bot->getClass());
+        o << ",\"alive\":" << (bot->IsAlive() ? "true" : "false");
+        o << ",\"health\":" << bot->GetHealth() << ",\"max_health\":" << bot->GetMaxHealth();
+        o << ",\"power\":" << bot->GetPower(bot->getPowerType());
+        o << ",\"max_power\":" << bot->GetMaxPower(bot->getPowerType());
+        o << ",\"in_combat\":" << (bot->IsInCombat() ? "true" : "false");
+        o << ",\"mounted\":" << (bot->IsMounted() ? "true" : "false");
+        // Stance matters for a warrior tank: Defensive Stance is the difference
+        // between holding a mob and merely standing near it.
+        o << ",\"shapeshift\":" << uint32(bot->GetShapeshiftForm());
+        o << ",\"money\":" << bot->GetMoney();
+        o << ",\"zone\":" << bot->GetZoneId() << ",\"area\":" << bot->GetAreaId();
+        o << ",\"map\":" << bot->GetMapId();
+        o << ",\"x\":" << bot->GetPositionX() << ",\"y\":" << bot->GetPositionY()
+          << ",\"z\":" << bot->GetPositionZ();
+        o << ",\"target\":" << (target ? J(target->GetName()) : "null");
+        o << ",\"victim\":" << (victim ? J(victim->GetName()) : "null");
+        o << ",\"free_talent_points\":" << bot->GetFreeTalentPoints();
+        o << ",\"in_group\":" << (group ? "true" : "false");
+        if (group)
+        {
+            Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
+            o << ",\"group_leader\":" << (leader ? J(leader->GetName()) : "null");
+            o << ",\"group_size\":" << uint32(group->GetMembersCount());
+        }
+        o << ",\"has_bot_ai\":" << (GET_PLAYERBOT_AI(bot) ? "true" : "false");
+        o << "}";
+        return o.str();
+    }
+
+    static std::string ProbeSpells(Player* bot)
+    {
+        std::ostringstream o;
+        uint32 count = 0;
+        o << "{\"spells\":[";
+        for (auto const& entry : bot->GetSpellMap())
+        {
+            // Disabled entries are spells the character has lost or superseded;
+            // counting them would inflate the number the probe exists to check.
+            if (entry.second->State == PLAYERSPELL_REMOVED || entry.second->disabled)
+                continue;
+            if (count++)
+                o << ",";
+            o << entry.first;
+        }
+        o << "],\"count\":" << count << "}";
+        return o.str();
+    }
+
+    static std::string ProbeTalents(Player* bot)
+    {
+        std::ostringstream o;
+        // Points per tree, counted the way AiFactory::GetPlayerSpecTab counts
+        // them, because that is what decides which strategies the bot runs.
+        uint32 perTab[3] = {0, 0, 0};
+        for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
+        {
+            TalentEntry const* talent = sTalentStore.LookupEntry(i);
+            if (!talent)
+                continue;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(talent->TalentTab);
+            if (!tab || tab->tabpage > 2)
+                continue;
+            if ((bot->getClassMask() & tab->ClassMask) == 0)
+                continue;
+            for (uint32 rank = 0; rank < MAX_TALENT_RANK; ++rank)
+                if (talent->RankID[rank] && bot->HasSpell(talent->RankID[rank]))
+                    perTab[tab->tabpage] += rank + 1;
+        }
+        uint32 best = 0;
+        for (uint32 t = 1; t < 3; ++t)
+            if (perTab[t] > perTab[best])
+                best = t;
+
+        o << "{\"per_tab\":[" << perTab[0] << "," << perTab[1] << "," << perTab[2] << "]";
+        o << ",\"spec_tab\":" << best;
+        o << ",\"free_points\":" << bot->GetFreeTalentPoints() << "}";
+        return o.str();
+    }
+
+    // The LIVE strategy lists, off the engines themselves. Not the persisted
+    // copy in playerbots_db_store, which is written on change and can lag or
+    // disagree with what the bot is running this second.
+    static std::string ProbeStrategies(Player* bot)
+    {
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI)
+            return "{\"error\":\"no bot ai\"}";
+
+        std::ostringstream o;
+        o << "{";
+        bool firstState = true;
+        for (auto const& pair : {std::make_pair("combat", BOT_STATE_COMBAT),
+                                 std::make_pair("non_combat", BOT_STATE_NON_COMBAT),
+                                 std::make_pair("dead", BOT_STATE_DEAD)})
+        {
+            if (!firstState)
+                o << ",";
+            firstState = false;
+            o << J(pair.first) << ":[";
+            bool first = true;
+            for (std::string const& name : botAI->GetStrategies(pair.second))
+            {
+                if (!first)
+                    o << ",";
+                first = false;
+                o << J(name);
+            }
+            o << "]";
+        }
+        o << "}";
+        return o.str();
+    }
+
+    // Equipped items and how broken they are. "Should this character go and
+    // repair" is otherwise a guess, and it has already been guessed wrong.
+    static std::string ProbeGear(Player* bot)
+    {
+        std::ostringstream o;
+        o << "{\"equipped\":[";
+        bool first = true;
+        uint32 broken = 0;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!item)
+                continue;
+            ItemTemplate const* proto = item->GetTemplate();
+            uint32 const cur = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
+            uint32 const max = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
+            if (max && cur == 0)
+                ++broken;
+            if (!first)
+                o << ",";
+            first = false;
+            o << "{\"slot\":" << uint32(slot);
+            o << ",\"entry\":" << item->GetEntry();
+            o << ",\"name\":" << J(proto ? proto->Name1 : "");
+            o << ",\"quality\":" << (proto ? proto->Quality : 0);
+            o << ",\"durability\":" << cur << ",\"max_durability\":" << max << "}";
+        }
+        o << "],\"broken\":" << broken << "}";
+        return o.str();
+    }
+
+    // Free space, and what is worth selling. Grey items are the junk a
+    // character is supposed to take to a vendor.
+    static std::string ProbeBags(Player* bot)
+    {
+        uint32 slots = 0;
+        uint32 used = 0;
+        uint32 junk = 0;
+        uint32 junkValue = 0;
+
+        auto visit = [&](Item* item)
+        {
+            if (!item)
+                return;
+            ++used;
+            ItemTemplate const* proto = item->GetTemplate();
+            if (proto && proto->Quality == ITEM_QUALITY_POOR)
+            {
+                ++junk;
+                junkValue += proto->SellPrice * item->GetCount();
+            }
+        };
+
+        // The backpack.
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+            ++slots;
+            visit(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        }
+        // Then each equipped bag, which is where the space actually comes from -
+        // a character with no bags has 16 slots and fills them in an hour.
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = bot->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+            {
+                ++slots;
+                visit(bag->GetItemByPos(i));
+            }
+        }
+
+        std::ostringstream o;
+        o << "{\"slots\":" << slots << ",\"used\":" << used
+          << ",\"free\":" << (slots - used)
+          << ",\"junk\":" << junk << ",\"junk_copper\":" << junkValue << "}";
+        return o.str();
+    }
+
+    static char const* DoProbe(Player* bot, std::string const& what, char const*& status,
+                               std::string& out)
+    {
+        if (what == "state")
+            out = ProbeState(bot);
+        else if (what == "spells")
+            out = ProbeSpells(bot);
+        else if (what == "talents")
+            out = ProbeTalents(bot);
+        else if (what == "strategies")
+            out = ProbeStrategies(bot);
+        else if (what == "gear")
+            out = ProbeGear(bot);
+        else if (what == "bags")
+            out = ProbeBags(bot);
+        else
+            return "unknown probe (state|spells|talents|strategies|gear|bags)";
 
         status = "delivered";
         return "";

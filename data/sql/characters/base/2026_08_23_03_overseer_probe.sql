@@ -1,0 +1,31 @@
+-- Ask a living character what it is actually doing (infra#2759).
+--
+-- WHY. Every check on this family so far has gone through acore_characters,
+-- and that table is up to fifteen minutes stale: PlayerSaveInterval is 900000
+-- and each player's save timer is staggered from its own login. After shipping
+-- the training pass in #2756 the database said a level 9 paladin still had zero
+-- spells for a quarter of an hour AFTER he had been taught them. The change had
+-- worked and every available instrument said it had not.
+--
+-- The reverse is worse and has already happened repeatedly: a command reports
+-- `delivered` because the row was handed over, while the thing it asked for
+-- never occurred. `talents spec prot pve` returned delivered and changed
+-- nothing. There was no way to ask the character itself.
+--
+-- WHY NOT kind='gm'. `.pinfo`, `.gps` and friends would answer some of this,
+-- but that path runs through the character's own session and a playerbot
+-- session carries no GM security - with account 318 at gmlevel 3 both are
+-- refused. It only works while a real client holds the character, which is
+-- exactly when it is least needed.
+--
+-- WHY READ-ONLY. A probe answers from the live Player* and mutates nothing, so
+-- it cannot be the reason an experiment succeeded. Anything that changes the
+-- world still goes through kind='bot' or kind='chat', where it is visible as a
+-- command rather than hidden inside an inspection.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe') NOT NULL DEFAULT 'bot',
+    -- MEDIUMTEXT because `detail` is VARCHAR(255) and a spell list alone
+    -- exceeds that at level 11. detail keeps its job - short status and error
+    -- strings - and this carries the payload, so nothing that reads detail
+    -- today has to learn about probes.
+    ADD COLUMN `result` MEDIUMTEXT NULL DEFAULT NULL AFTER `detail`;
