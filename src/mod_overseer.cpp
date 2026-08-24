@@ -107,6 +107,7 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <variant>
 #include <vector>
 
 namespace
@@ -141,6 +142,15 @@ constexpr uint32 TRAIN_POLL_MS = 60000;
 // finishes an objective should pick up the next one while the party is still
 // standing there rather than a minute later.
 constexpr uint32 QUEST_POLL_MS = 20000;
+
+// How long a chosen quest is allowed to sit unfulfilled before the aim is given
+// up on. The PRIMARY release is the aimed quest being handed in; this is only
+// the backstop for an aim that can never land - a quest sharing never delivered,
+// a beneficiary who abandoned it, a council decision nothing can satisfy. It is
+// deliberately longer than mod-playerbots' own statusDoQuestDuration of 30
+// minutes (NewRpgAction.h:68), so an aim is never released merely because the
+// RPG lease lapsed: that is what re-assertion is for.
+constexpr time_t DRIVE_AIM_BACKSTOP_SECONDS = 60 * 60;
 
 // The highest DBC talent tabpage. spec_tab holds a tabpage, and anything above
 // this means no tree was chosen - which is a decision the module must not make
@@ -1150,16 +1160,37 @@ private:
     // objective individually would scatter the family across the zone, which is
     // the failure the follow work fixed. They travel by following whoever is
     // travelling.
+    // WHERE THE CHOSEN QUEST COMES FROM. The council decides, the supervisor
+    // persists the decision, and the bridge writes the quest id onto the
+    // traveller's roster row (bridge._aim_traveller, renewed by
+    // goals._reconcile_quest; migration
+    // 2026_08_24_00_overseer_roster_drive_quest.sql). Until this change nothing
+    // read that column: the family agreed in party chat to get Ugga her last
+    // Large Candle and then stood still, 0.0 yards in 45 seconds, eleven yards
+    // from the kobolds that drop it. The decision was made, persisted, and
+    // dropped on the floor one step short of the ground.
+    //
+    // `drive_quest` = 0 means "no opinion", and that is the case that still
+    // picks the first eligible quest out of the leader's own log. A stale or
+    // unreachable aim degrades to that same behaviour rather than to standing
+    // still - which is the whole reason the fallback is kept.
+    //
+    // The column and this reader ship in the same image: mod-overseer applies
+    // its own SQL at worldserver startup, so the two cannot disagree. The
+    // bridge is a separate deployment and guards its write on 1054 instead.
     void DriveQuests()
     {
         QueryResult result = CharacterDatabase.Query(
-            "SELECT name FROM overseer_roster WHERE enabled = 1 AND `lead` = 1");
+            "SELECT name, drive_quest FROM overseer_roster WHERE enabled = 1 AND `lead` = 1");
         if (!result)
             return;
 
         do
         {
-            std::string const name = result->Fetch()[0].Get<std::string>();
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            uint32 const aim = fields[1].Get<uint32>();
+
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot)
                 continue;
@@ -1168,15 +1199,119 @@ private:
             if (!botAI)
                 continue;
 
+            // What it is working on RIGHT NOW, which is a different question
+            // from whether it is questing at all. RPG_DO_QUEST self-expires
+            // after statusDoQuestDuration = 30 minutes (NewRpgAction.h:68,
+            // checked at NewRpgAction.cpp:288) and the bot then re-rolls its
+            // own status - including a RANDOM quest out of its log. So an aim
+            // is a LEASE, not a one-shot, and knowing which quest the lease
+            // currently names is what lets it be re-asserted without
+            // restarting the travel every twenty seconds.
+            //
+            // rpgInfo is a public member of PlayerbotAI (PlayerbotAI.h:603),
+            // rpgInfo.data is a public std::variant (NewRpgInfo.h:97), and
+            // DoQuest::questId is a public field on it (NewRpgInfo.h:47-54);
+            // upstream reads the same variant the same way for TravelFlight
+            // (NewRpgAction.cpp:297).
+            bool const onQuest = botAI->rpgInfo.GetStatus() == RPG_DO_QUEST;  // NewRpgInfo.h:99
+            uint32 working = 0;
+            if (onQuest)
+            {
+                if (NewRpgInfo::DoQuest const* doQuest =
+                        std::get_if<NewRpgInfo::DoQuest>(&botAI->rpgInfo.data))
+                    working = doQuest->questId;
+            }
+
+            // The aim as this loop last saw it, so a standing complaint is made
+            // once rather than three times a minute forever. Nothing here is
+            // read as a decision: the roster row remains the only real state.
+            AimState& state = _lastAim[name];
+            uint32 const previous = state.questId;
+            bool const aimChanged = aim != previous;
+            if (aimChanged)
+            {
+                state.questId = aim;
+                state.since = std::time(nullptr);
+            }
+
+            // THE OPPORTUNISTIC TURN-IN, WHICH IS THE FAILURE THIS EXISTS TO
+            // MAKE VISIBLE. Measured in the dev world: a bot given `new rpg`
+            // and left alone walked 79 yards, handed in the ONE parked quest
+            // whose giver it happened to path past, re-rolled to something
+            // else and never came back for the other two - stalled at 79 yards,
+            // out of combat, for eight minutes. "A quest got turned in while an
+            // aim was set" is therefore NOT evidence the aim did anything, and
+            // a reader has to be able to tell the two apart at a glance.
+            bool const aimed = aim != 0;
+            if (aimed && state.lastWorking && state.lastWorking != aim &&
+                bot->GetQuestRewardStatus(state.lastWorking))  // Player.h:1491
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' turned in quest {} while aimed at quest {} - "
+                         "that is an opportunistic turn-in, not the errand it was sent "
+                         "on", name, state.lastWorking, aim);
+            }
+            state.lastWorking = working;
+
+            bool stillAimed = aimed;
+            if (aimed)
+            {
+                // PRIMARY RELEASE: the AIMED quest, specifically, was handed
+                // in. Not any quest completing - see the turn-in line above -
+                // and not a timer. This is what makes a backlog clearable one
+                // errand at a time instead of one errand per lucky encounter.
+                // GetQuestRewardStatus is the rewarded set, so it stays true
+                // after the quest leaves the log (Player.h:1491).
+                if (bot->GetQuestRewardStatus(aim))  // Player.h:1491
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' handed in chosen quest {} - releasing the "
+                             "aim, the errand is done", name, aim);
+                    ClearAim(name);
+                    state = AimState();
+                    stillAimed = false;
+                }
+                // BACKSTOP: an aim that can never land - never shared, since
+                // abandoned, or simply impossible - must not pin the traveller
+                // to it forever. Releasing hands it back to its own log, which
+                // is playing badly rather than not playing at all.
+                else if (state.since &&
+                         std::time(nullptr) - state.since > DRIVE_AIM_BACKSTOP_SECONDS)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' was aimed at quest {} for over {} minutes "
+                             "without handing it in - releasing the aim as unreachable",
+                             name, aim,
+                             static_cast<uint32>(DRIVE_AIM_BACKSTOP_SECONDS / 60));
+                    ClearAim(name);
+                    state = AimState();
+                    stillAimed = false;
+                }
+            }
+
+            if (stillAimed)
+            {
+                if (DriveChosenQuest(name, bot, botAI, aim, working, aimChanged))
+                    continue;
+                // Fell through on purpose: the aim could not land, and a
+                // traveller doing something is better than one standing still.
+            }
+            else if (!aim && aimChanged)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' quest aim cleared (was quest {}) - back to "
+                         "picking from its own log", name, previous);
+            }
+
             // Already on one. Re-issuing would restart the travel from here
             // every poll, which is a character that walks toward an objective
             // forever and never arrives.
-            if (botAI->rpgInfo.GetStatus() == RPG_DO_QUEST)
+            if (onQuest)
                 continue;
 
             for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
             {
-                uint32 const questId = bot->GetQuestSlotQuestId(slot);
+                uint32 const questId = bot->GetQuestSlotQuestId(slot);  // Player.h:1510
                 if (!questId)
                     continue;
 
@@ -1184,7 +1319,7 @@ private:
                 // deliberately included: the objective is met and the walk back
                 // to the giver is the rest of the quest, and a family that
                 // never turns anything in is not playing either.
-                QuestStatus const status = bot->GetQuestStatus(questId);
+                QuestStatus const status = bot->GetQuestStatus(questId);  // Player.h:1492
                 if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
                     continue;
 
@@ -1192,12 +1327,93 @@ private:
                 if (!quest)
                     continue;
 
-                LOG_INFO("module.overseer", "overseer: '{}' now working quest {} ({})",
-                         name, questId, quest->GetTitle());
-                botAI->rpgInfo.ChangeToDoQuest(questId, quest);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' now working quest {} ({}) - picked from its own "
+                         "log, nothing chosen", name, questId, quest->GetTitle());
+                botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
                 break;
             }
         } while (result->NextRow());
+    }
+
+    // Give the aim back. The bridge owns this column and will aim again the
+    // moment the council decides again; what a supervisor polling on its own
+    // cadence cannot do is notice a turn-in the instant it happens, and an aim
+    // left standing on a finished quest is an aim that can never land - the
+    // traveller would be re-aimed at it every twenty seconds forever while
+    // DriveChosenQuest refused it every time.
+    //
+    // Esc() rather than a bare interpolation because every other write in this
+    // file does, not because a character name can carry a quote.
+    void ClearAim(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET drive_quest = 0 WHERE name = '{}'", Esc(name));
+    }
+
+    // Put the council's chosen quest in front of the traveller, or say why it
+    // could not be. Returns true when the aim is in force - just applied, or
+    // already running - and false when the caller should fall back to the
+    // leader's own log.
+    //
+    // EVERY PATH LOGS. This epic's defining bug is an action that reports
+    // success while doing nothing, and an aim that silently fails to land is
+    // that same bug wearing a new hat. The one deliberately silent path is
+    // "the lease already names this quest", because that is the steady state
+    // and it is reached three times a minute.
+    bool DriveChosenQuest(std::string const& name, Player* bot, PlayerbotAI* botAI,
+                          uint32 questId, uint32 working, bool aimChanged)
+    {
+        // THE BOT MUST HOLD THE QUEST. NewRpgDoQuestAction dispatches only on
+        // QUEST_STATUS_INCOMPLETE and QUEST_STATUS_COMPLETE and otherwise calls
+        // info.ChangeToIdle(), so aiming at a quest the character does not
+        // carry is a silent no-op that idles it on the very next tick. Getting
+        // the quest into its log is quest sharing's job (kind='share'); until
+        // that has happened this says so and gets out of the way.
+        QuestStatus const status = bot->GetQuestStatus(questId);  // Player.h:1492
+        if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
+        {
+            if (aimChanged)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is aimed at quest {} but does not hold it "
+                         "(quest status {}) - aiming would idle it on the next tick, so "
+                         "it keeps picking from its own log until the quest is shared",
+                         name, questId, static_cast<uint32>(status));
+            return false;
+        }
+
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+        {
+            if (aimChanged)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is aimed at quest {}, which this world has no "
+                         "template for - falling back to its own log", name, questId);
+            return false;
+        }
+
+        // The lease already names this quest. Re-issuing ChangeToDoQuest here
+        // would reset objectiveIdx, pos and lastReachPOI (NewRpgInfo.h:47-54)
+        // every twenty seconds, which is a character that walks toward an
+        // objective forever and never arrives.
+        if (working == questId)
+            return true;
+
+        if (working)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' had drifted onto quest {} - re-asserting chosen "
+                     "quest {} ({})", name, working, questId, quest->GetTitle());
+        else if (aimChanged)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' now working quest {} ({}) - chosen by the council",
+                     name, questId, quest->GetTitle());
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' re-asserting chosen quest {} ({}) - the 30-minute "
+                     "RPG_DO_QUEST lease had lapsed", name, questId, quest->GetTitle());
+
+        botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
+        return true;
     }
 
     // Teach the roster what a character of its level would already know.
@@ -2634,6 +2850,20 @@ private:
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
+    // What DriveQuests knew about each traveller's aim last time round, so a
+    // standing complaint is logged once instead of three times a minute, an
+    // aim that never lands can be given up on, and a turn-in of the WRONG
+    // quest is distinguishable from a turn-in of the right one. The roster row
+    // remains the decision; none of this is read as one. World thread only -
+    // DriveQuests runs from OnUpdate - so unguarded. Lost on restart, which
+    // only restarts the backstop clock.
+    struct AimState
+    {
+        uint32 questId{0};      // the aim as this loop last saw it
+        time_t since{0};        // when that aim was first seen
+        uint32 lastWorking{0};  // the quest RPG_DO_QUEST last named
+    };
+    std::map<std::string, AimState> _lastAim;
     uint32 _eventTimer = 0;
     bool _watchLoaded = false;
 };
