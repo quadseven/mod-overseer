@@ -52,6 +52,8 @@
 #include "ItemTemplate.h"
 #include "GuildMgr.h"
 #include "ObjectAccessor.h"
+#include "ObjectMgr.h"
+#include "QuestDef.h"
 #include "Player.h"
 #include "Bag.h"
 #include "DBCStores.h"
@@ -98,6 +100,12 @@ constexpr uint32 PARTY_POLL_MS = 30000;
 // is lost by a character carrying a new level for a minute before it knows what
 // that level taught it.
 constexpr uint32 TRAIN_POLL_MS = 60000;
+
+// How often the traveller is pointed at a quest. Faster than training because
+// it is one indexed SELECT and a quest-log walk, and because a character that
+// finishes an objective should pick up the next one while the party is still
+// standing there rather than a minute later.
+constexpr uint32 QUEST_POLL_MS = 20000;
 
 // The highest DBC talent tabpage. spec_tab holds a tabpage, and anything above
 // this means no tree was chosen - which is a decision the module must not make
@@ -513,6 +521,7 @@ public:
         _rosterTimer += diff;
         _partyTimer += diff;
         _trainTimer += diff;
+        _questTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
@@ -549,6 +558,11 @@ public:
         {
             _trainTimer = 0;
             TrainRoster();
+        }
+        if (_questTimer >= QUEST_POLL_MS)
+        {
+            _questTimer = 0;
+            DriveQuests();
         }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
@@ -722,6 +736,87 @@ private:
         }
 
         group->BroadcastGroupUpdate();
+    }
+
+    // Point the roster at the quests they keep talking about.
+    //
+    // WHAT WAS WRONG. The council reaches a decision - "Grug need 2 Bundle of
+    // Wood for A Bundle of Trouble" - and it goes nowhere, because nothing
+    // turns a decision into behaviour. Minutes later the goal supervisor
+    // re-asserts `grind`, which means "kill what is in front of you", and that
+    // is exactly what they do. They were never being stupid; they were doing
+    // the last thing anybody actually told them.
+    //
+    // mod-playerbots already has the mechanism. RPG_DO_QUEST reads the quest
+    // log, resolves the objective's POI and walks the bot to it. Its chat
+    // command cannot reach this family:
+    //
+    //     bool isMaster = master && master->GetGUID() == owner->GetGUID();
+    //     bool isGM = owner->GetSession() && owner->GetSession()->GetSecurity() >= SEC_GAMEMASTER;
+    //     if (!isMaster && !isGM) ... "Only your master or a GM can change my rpg status."
+    //
+    // These bots are masterless by design and their sessions carry no GM
+    // security, so both halves are false forever. Third mechanism in this epic
+    // behind that same wall, after talent picking and trainer spells.
+    //
+    // rpgInfo is public and NewRpgInfo is a struct, so the module sets the
+    // state directly - which is the same permission the chat command would have
+    // granted, arrived at without pretending to be a master.
+    //
+    // ONLY THE TRAVELLER. Followers run `nc -new rpg` and `nc +follow` on
+    // purpose: `new rpg` acts at relevance 3.0 to 11.0 against follow's 1.0, so
+    // a follower given both wanders off every tick. Sending them to a quest
+    // objective individually would scatter the family across the zone, which is
+    // the failure the follow work fixed. They travel by following whoever is
+    // travelling.
+    void DriveQuests()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1 AND `lead` = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot)
+                continue;
+
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            if (!botAI)
+                continue;
+
+            // Already on one. Re-issuing would restart the travel from here
+            // every poll, which is a character that walks toward an objective
+            // forever and never arrives.
+            if (botAI->rpgInfo.GetStatus() == RPG_DO_QUEST)
+                continue;
+
+            for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            {
+                uint32 const questId = bot->GetQuestSlotQuestId(slot);
+                if (!questId)
+                    continue;
+
+                // INCOMPLETE means there is work left to do. COMPLETE is
+                // deliberately included: the objective is met and the walk back
+                // to the giver is the rest of the quest, and a family that
+                // never turns anything in is not playing either.
+                QuestStatus const status = bot->GetQuestStatus(questId);
+                if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
+                    continue;
+
+                Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+                if (!quest)
+                    continue;
+
+                LOG_INFO("module.overseer", "overseer: '{}' now working quest {} ({})",
+                         name, questId, quest->GetTitle());
+                botAI->rpgInfo.ChangeToDoQuest(questId, quest);
+                break;
+            }
+        } while (result->NextRow());
     }
 
     // Teach the roster what a character of its level would already know.
@@ -1492,6 +1587,7 @@ private:
     uint32 _rosterTimer = 0;
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
+    uint32 _questTimer = 0;
     bool _watchLoaded = false;
 };
 
