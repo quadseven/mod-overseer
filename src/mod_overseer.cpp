@@ -143,6 +143,42 @@ constexpr uint32 TRAIN_POLL_MS = 60000;
 // standing there rather than a minute later.
 constexpr uint32 QUEST_POLL_MS = 20000;
 
+// HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
+// IT (infra#2801). Measured on the live realm: the leader was handed quest 109
+// thirty-eight times in twelve minutes and travelled 0.0 yards, because its
+// turn-in is in Westfall and he is in Elwynn. Three is a compromise - one
+// idle-out is ordinary (combat, death, the quest leaving the log), and waiting
+// longer than a minute to notice a wedge is a minute of a character doing
+// nothing.
+constexpr uint8 QUEST_REPICK_STRIKES = 3;
+
+// How long a given-up quest stays given up. A quest unreachable from Elwynn is
+// reachable from Goldshire: the bot moves, the world moves, and a refusal that
+// outlives its reason is its own bug. Fifteen minutes is long enough that a
+// wedge does not churn and short enough that a walk to the next zone gets a
+// fresh chance.
+constexpr time_t QUEST_GIVE_UP_COOLDOWN_SECONDS = 900;
+
+// How far the traveller must have got from where it stood when a quest was
+// chosen for the attempt to count as "tried" rather than "wedged".
+//
+// THIS NUMBER IS GENEROUS ON PURPOSE, and a small one would have quietly
+// disabled the whole feature. The failure path MOVES THE BOT: when MoveFarTo
+// cannot resolve a route, upstream nudges with MoveRandomNear(10.0f)
+// (NewRpgAction.cpp:342, :357, :513, :607) so the next tick starts somewhere
+// else. The AI ticks many times inside one twenty-second poll, so a bot going
+// nowhere still random-walks a respectable distance. A threshold near the
+// ten-yard nudge radius therefore resets the strike count on exactly the bot
+// it exists to catch, and the result is a silent no-op that looks like the
+// feature working.
+//
+// Being generous costs almost nothing, because `!onQuest` already does most
+// of the discriminating: a bot on a long slow route stays IN RPG_DO_QUEST and
+// never reaches this code at all. This check only has to avoid striking a bot
+// that is demonstrably going somewhere, and directional travel clears forty
+// yards easily while a bounded random walk does not.
+constexpr float QUEST_PROGRESS_YARDS = 45.0f;
+
 // How long a chosen quest is allowed to sit unfulfilled before the aim is given
 // up on. The PRIMARY release is the aimed quest being handed in; this is only
 // the backstop for an aim that can never land - a quest sharing never delivered,
@@ -1268,7 +1304,17 @@ private:
                              "overseer: '{}' handed in chosen quest {} - releasing the "
                              "aim, the errand is done", name, aim);
                     ClearAim(name);
-                    state = AimState();
+                    // Clear the AIM, not the whole state: `givenUp`,
+                    // `lastPicked` and `strikes` are what this traveller has
+                    // learned about quests it cannot reach, and a wholesale
+                    // `state = AimState()` threw that away. The backstop
+                    // release below fires precisely for an unreachable aim,
+                    // and the fallback walk runs in the SAME iteration - so
+                    // wiping the memory here handed the quest straight back
+                    // (infra#2801 review).
+                    state.questId = 0;
+                    state.since = 0;
+                    state.lastWorking = 0;
                     stillAimed = false;
                 }
                 // BACKSTOP: an aim that can never land - never shared, since
@@ -1284,7 +1330,17 @@ private:
                              name, aim,
                              static_cast<uint32>(DRIVE_AIM_BACKSTOP_SECONDS / 60));
                     ClearAim(name);
-                    state = AimState();
+                    // Clear the AIM, not the whole state: `givenUp`,
+                    // `lastPicked` and `strikes` are what this traveller has
+                    // learned about quests it cannot reach, and a wholesale
+                    // `state = AimState()` threw that away. The backstop
+                    // release below fires precisely for an unreachable aim,
+                    // and the fallback walk runs in the SAME iteration - so
+                    // wiping the memory here handed the quest straight back
+                    // (infra#2801 review).
+                    state.questId = 0;
+                    state.since = 0;
+                    state.lastWorking = 0;
                     stillAimed = false;
                 }
             }
@@ -1309,11 +1365,123 @@ private:
             if (onQuest)
                 continue;
 
+            // REACHING HERE MEANS THE BOT IS NOT ON A QUEST. If this loop chose
+            // one for it on an earlier poll, that choice has since been
+            // abandoned by upstream without the quest being finished. Every
+            // idle site that can get us here is a trouble signal - :483 and
+            // :580 are both "can't find a poi pos", and :547 and :622 have
+            // already recorded themselves in lowPriorityQuest - so the only
+            // question left is whether the character is going anywhere.
+            time_t const nowSec = std::time(nullptr);
+            RepickMemory& repick = state.repick;
+            uint32 justFailed = 0;
+            if (repick.lastPicked)
+            {
+                // A quest that has left the log is not a wedge and must not be
+                // logged as one. The slot walk below would never offer it
+                // again, but the strike above is assessed before the walk.
+                QuestStatus const heldStatus =
+                    bot->GetQuestStatus(repick.lastPicked);  // Player.h:1492
+                bool const stillActionable = heldStatus == QUEST_STATUS_INCOMPLETE ||
+                                             heldStatus == QUEST_STATUS_COMPLETE;
+
+                float const dx = bot->GetPositionX() - repick.fromX;
+                float const dy = bot->GetPositionY() - repick.fromY;
+                bool const moved =
+                    (dx * dx + dy * dy) > (QUEST_PROGRESS_YARDS * QUEST_PROGRESS_YARDS);
+
+                if (!stillActionable)
+                {
+                    // Handed in, abandoned, or otherwise gone. Forget it
+                    // silently: nothing here is evidence about reachability.
+                    repick.strikes = 0;
+                    repick.lastPicked = 0;
+                }
+                else if (moved)
+                {
+                    // Going somewhere. Restart the count and the origin so the
+                    // next streak is measured from where it actually is.
+                    repick.strikes = 0;
+                    repick.fromX = bot->GetPositionX();
+                    repick.fromY = bot->GetPositionY();
+                }
+                else if (++repick.strikes >= QUEST_REPICK_STRIKES)
+                {
+                    repick.givenUp[repick.lastPicked] = nowSec;
+                    // Every argument is an integer or a string, and the uint8
+                    // is cast, exactly as the training log above does: fmt
+                    // renders an unsigned char as a character in some
+                    // configurations, and this file cannot be compiled on a PR
+                    // to find that out.
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' gave up on quest {} - chosen {} times and "
+                             "abandoned without getting more than {} yards from ({}, {}); "
+                             "its turn-in is likely somewhere it cannot route to. Leaving "
+                             "it alone for {} minutes",
+                             name, repick.lastPicked, static_cast<uint32>(repick.strikes),
+                             static_cast<uint32>(QUEST_PROGRESS_YARDS),
+                             static_cast<int32>(repick.fromX),
+                             static_cast<int32>(repick.fromY),
+                             static_cast<uint32>(QUEST_GIVE_UP_COOLDOWN_SECONDS / 60));
+                    repick.strikes = 0;
+                    repick.lastPicked = 0;
+                }
+                else
+                {
+                    // Struck but not yet given up on. THE STRIKE COUNT DECIDES
+                    // WHEN TO STOP TRYING; IT MUST NOT DECIDE WHETHER TO TRY
+                    // SOMETHING ELSE NOW. Acceptance criterion 2 is that a
+                    // quest which has just failed is not re-picked in
+                    // preference to an untried one, so it is deferred for this
+                    // poll and used only if nothing else is eligible.
+                    justFailed = repick.lastPicked;
+                }
+            }
+
+            // A refusal that outlives its reason is its own bug.
+            for (auto it = repick.givenUp.begin(); it != repick.givenUp.end();)
+            {
+                if (nowSec - it->second >= QUEST_GIVE_UP_COOLDOWN_SECONDS)
+                    it = repick.givenUp.erase(it);
+                else
+                    ++it;
+            }
+
+            bool picked = false;
+            bool skipped = false;
+            uint32 deferred = 0;
             for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
             {
                 uint32 const questId = bot->GetQuestSlotQuestId(slot);  // Player.h:1510
                 if (!questId)
                     continue;
+
+                // UPSTREAM'S OWN GIVE-UP SET, which its picker already honours
+                // at NewRpgBaseAction.cpp:1149 and :1241. Without this we hand
+                // back the very quest mod-playerbots just rejected, which is
+                // the general case of the same defect.
+                if (botAI->lowPriorityQuest.find(questId) !=  // PlayerbotAI.h:605
+                    botAI->lowPriorityQuest.end())
+                {
+                    skipped = true;
+                    continue;
+                }
+
+                // Ours, for the failure upstream never records.
+                if (repick.givenUp.count(questId))
+                {
+                    skipped = true;
+                    continue;
+                }
+
+                // Deferred, not refused: the quest that just failed goes to
+                // the back of this poll rather than being handed straight
+                // back ahead of one that has not been tried.
+                if (questId == justFailed)
+                {
+                    deferred = questId;
+                    continue;
+                }
 
                 // INCOMPLETE means there is work left to do. COMPLETE is
                 // deliberately included: the objective is met and the walk back
@@ -1331,7 +1499,80 @@ private:
                          "overseer: '{}' now working quest {} ({}) - picked from its own "
                          "log, nothing chosen", name, questId, quest->GetTitle());
                 botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
+
+                // Strikes count consecutive failures of the SAME quest, so
+                // moving to a different one starts the count again. The
+                // position is the baseline the next poll measures against.
+                // The origin is set only when the chosen quest CHANGES, so
+                // the distance above is measured across the whole strike
+                // streak. Rewriting it every poll would shrink the window to
+                // twenty seconds, and a random walk wins over twenty seconds.
+                if (questId != repick.lastPicked)
+                {
+                    repick.strikes = 0;
+                    repick.fromX = bot->GetPositionX();
+                    repick.fromY = bot->GetPositionY();
+                }
+                repick.lastPicked = questId;
+                repick.stuckLogged = false;
+                picked = true;
                 break;
+            }
+
+            // NOTHING UNTRIED WAS ELIGIBLE, so the quest that just failed is
+            // better than standing still - it has been struck but not given up
+            // on, and a leader carrying only one quest would otherwise stop
+            // questing altogether. It keeps its strike count, so if it goes
+            // nowhere again it still reaches the give-up.
+            if (!picked && deferred)
+            {
+                // Re-check the status here too. The deferral `continue`d past
+                // the walk's own check, so without this the quest reaches
+                // ChangeToDoQuest validated only for template existence - and
+                // NewRpgDoQuestAction::Execute would hit its `default:` and
+                // ChangeToIdle immediately (NewRpgAction.cpp:444), burning a
+                // poll and taking a strike for the wrong reason.
+                QuestStatus const deferredStatus =
+                    bot->GetQuestStatus(deferred);  // Player.h:1492
+                Quest const* quest = (deferredStatus == QUEST_STATUS_INCOMPLETE ||
+                                      deferredStatus == QUEST_STATUS_COMPLETE)
+                                         ? sObjectMgr->GetQuestTemplate(deferred)
+                                         : nullptr;
+                if (quest)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has nothing untried, so it is retrying "
+                             "quest {} ({}) - strike {} against it",
+                             name, deferred, quest->GetTitle(),
+                             static_cast<uint32>(repick.strikes));
+                    botAI->rpgInfo.ChangeToDoQuest(deferred, quest);  // NewRpgInfo.h:106
+                    repick.lastPicked = deferred;
+                    repick.stuckLogged = false;
+                    picked = true;
+                }
+            }
+
+            // EVERY ELIGIBLE QUEST HAS BEEN GIVEN UP ON. This is the leader's
+            // real state, not a hypothetical: all three of his completed
+            // quests turn in outside his zone. Saying so once is the difference
+            // between a diagnosable stall and the silent one that hid this bug
+            // for a day - and falling through to `grind` is playing badly,
+            // which beats not playing at all.
+            if (!picked && skipped && !repick.stuckLogged)
+            {
+                std::ostringstream ids;
+                for (auto const& [questId, when] : repick.givenUp)
+                {
+                    if (ids.tellp())
+                        ids << ", ";
+                    ids << questId;
+                }
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has given up on every quest it can act on "
+                         "(ours: {}), so it has nothing to work and will fall back to "
+                         "whatever else its strategies choose",
+                         name, ids.str().empty() ? std::string("none") : ids.str());
+                repick.stuckLogged = true;
             }
         } while (result->NextRow());
     }
@@ -2890,6 +3131,28 @@ private:
         uint32 questId{0};      // the aim as this loop last saw it
         time_t since{0};        // when that aim was first seen
         uint32 lastWorking{0};  // the quest RPG_DO_QUEST last named
+        // THE RE-PICK MEMORY (infra#2801). One concept, kept together and
+        // NOT reset when the aim is: releasing an aim says nothing about
+        // which quests are reachable, and an earlier revision cleared this
+        // wholesale with `state = AimState()`, which handed a just-abandoned
+        // quest straight back on the next poll.
+        //
+        // Upstream keeps its own give-up set in `lowPriorityQuest` and the
+        // walk below honours it, but upstream only writes there after
+        // reaching the reward POI and sitting for five minutes
+        // (NewRpgAction.cpp:622). A leader who cannot reach the POI at all
+        // never starts that clock, so for HIS failure upstream's memory stays
+        // empty forever and this is the only record there is.
+        struct RepickMemory
+        {
+            uint32 lastPicked{0};  // the quest this loop chose last
+            uint8 strikes{0};      // consecutive chooses of it that went nowhere
+            float fromX{0.f};      // where it stood when the STREAK began, so
+            float fromY{0.f};      // "went nowhere" is measured over the streak
+            bool stuckLogged{false};           // whole-log complaint made once
+            std::map<uint32, time_t> givenUp;  // quest -> when we gave up
+        };
+        RepickMemory repick;
     };
     std::map<std::string, AimState> _lastAim;
     uint32 _eventTimer = 0;
