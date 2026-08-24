@@ -70,6 +70,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1069,6 +1070,55 @@ private:
         CharacterDatabase.Execute(ss.str().c_str());
     }
 
+    // ONE COMMAND PER VERB PER CHARACTER PER POLL.
+    //
+    // WHAT WAS WRONG. The goal supervisor hands the party leader three orders
+    // in one batch, and they are all inserted in the same second:
+    //
+    //     03:02:00  Grug  nc +new rpg   overseer:life  delivered
+    //     03:02:00  Grug  nc +grind     overseer:life  delivered
+    //     03:02:00  Grug  co +flee      overseer:life  delivered
+    //
+    // At 03:07 a live read of Grug's non-combat engine had `grind` and no
+    // `new rpg`, with no `-new rpg` ever sent to him. `new rpg` is the only
+    // strategy that makes a character travel and work quests, so the family
+    // stood still: all five moved 0.0 yards in 45 seconds, 11 yards from the
+    // kobolds they had just agreed in party chat to go kill.
+    //
+    // WHY. A whispered command does not act when it is delivered. It lands in
+    // PlayerbotAI::chatCommands (PlayerbotAI.cpp:1107) and is drained on the
+    // bot's next AI tick by HandleCommands (PlayerbotAI.cpp:553-588), which
+    // empties the WHOLE queue in one pass and, for each entry, calls
+    // ChatCommandTrigger::ExternalEvent. That trigger keeps ONE param:
+    //
+    //     void ChatCommandTrigger::ExternalEvent(std::string const paramName, Player* eventPlayer)
+    //     { param = paramName; owner = eventPlayer; triggered = true; }
+    //                          -- ChatCommandTrigger.cpp:15-20
+    //
+    // and there is one trigger instance per verb, cached for the life of the
+    // bot by NamedObjectContextList::GetContextObject (NamedObjectContext.h:203).
+    // So both `nc` commands write the same slot before the engine ever reads
+    // it, and Check() (ChatCommandTrigger.cpp:22-28) returns only the last one
+    // written. `+grind` overwrote `+new rpg`, which was never applied at all -
+    // this was never an eviction, it was a command that never arrived.
+    // `co +flee` survived because `co` is a different trigger.
+    //
+    // The three deliveries all reported `delivered` truthfully: HandleCommand
+    // did accept every one of them. The loss happens a tick later, inside
+    // mod-playerbots, where nothing reports anything.
+    //
+    // THE FIX. Hand a character at most one command per verb per poll and
+    // leave the rest pending. They go out on the next poll 2s later
+    // (COMMAND_POLL_MS), after the bot's AI has ticked and consumed the first,
+    // so each one gets the trigger slot to itself. Keying on the verb rather
+    // than on the character alone is what keeps `co +flee` in the same batch:
+    // it cannot collide with `nc` and has no reason to wait.
+    //
+    // Deliberately NOT done by folding them into one `nc +new rpg,+grind`
+    // command in the supervisor. That would fix this batch and nothing else -
+    // the goal loop and the roster loop insert independently, so any two `nc`
+    // rows that happen to be pending together collide the same way. The queue
+    // is where the constraint actually lives.
     void DeliverPendingCommands()
     {
         QueryResult result = CharacterDatabase.Query(
@@ -1077,6 +1127,11 @@ private:
             COMMANDS_PER_POLL);
         if (!result)
             return;
+
+        // "<character>\n<verb>" already handed to a bot in THIS poll. Local to
+        // the poll on purpose: the trigger slot is only contended between
+        // deliveries that share one drain of the queue.
+        std::set<std::string> spoken;
 
         do
         {
@@ -1090,6 +1145,28 @@ private:
 
             char const* status = "error";
             char const* detail = "";
+
+            // Bot orders only. 'chat', 'gm' and 'probe' do not go through
+            // PlayerbotAI::HandleCommand and share no trigger, so nothing they
+            // do can be overwritten by the row after them.
+            if (kind != "chat" && kind != "gm" && kind != "probe")
+            {
+                // The verb is the first word - `nc`, `co`, `d`. What the rest
+                // of the line says does not matter here; two commands with the
+                // same verb reach the same ChatCommandTrigger whatever their
+                // arguments are.
+                std::string const verb = command.substr(0, command.find(' '));
+                if (!spoken.insert(targetName + "\n" + verb).second)
+                {
+                    // Left PENDING, not claimed and not failed. The sender is
+                    // still waiting and will get its answer 2s from now.
+                    LOG_DEBUG("module.overseer",
+                              "overseer: holding command {} ('{}' for '{}') until next poll; "
+                              "'{}' already sent this poll and they share a trigger",
+                              id, command, targetName, verb);
+                    continue;
+                }
+            }
 
             // CLAIM BEFORE RUNNING, synchronously.
             //
