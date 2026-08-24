@@ -1316,9 +1316,12 @@ private:
         o << "{\"spells\":[";
         for (auto const& entry : bot->GetSpellMap())
         {
-            // Disabled entries are spells the character has lost or superseded;
-            // counting them would inflate the number the probe exists to check.
-            if (entry.second->State == PLAYERSPELL_REMOVED || entry.second->disabled)
+            // Removed and inactive entries are spells the character has lost or
+            // superseded; counting them would inflate the number the probe
+            // exists to check. This is upstream's own filter verbatim
+            // (ListSpellsAction) - PlayerSpell has `Active`, and the `disabled`
+            // this once read does not exist on it, which failed the build.
+            if (entry.second->State == PLAYERSPELL_REMOVED || !entry.second->Active)
                 continue;
             if (count++)
                 o << ",";
