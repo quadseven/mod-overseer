@@ -1,0 +1,49 @@
+-- Hand an item from one living character to another (infra#2597).
+--
+-- WHY. A party rolls on everything, so loot lands on whoever won the roll and
+-- not on whoever can use it. The priest is carrying a two-handed axe she can
+-- never equip while the warrior wants it. This is the normal state of a party,
+-- not an accident, and fixing it by hand means a person dragging items into a
+-- trade window - which is exactly the thing this whole epic exists to avoid.
+--
+-- WHY NOT kind='bot'. mod-playerbots' only item-transfer chat command is
+-- `t <Hitem:id:>` and its target is hardcoded to the bot's master
+-- (TradeAction.cpp:26-38). Worse, it CANNOT COMPLETE between two bots:
+-- TradeStatusAction::CheckTrade (TradeStatusAction.cpp:165-200) takes a
+-- bot<->bot branch whenever the master is not a real player - and a selfbot is
+-- not a real player, because PlayerbotAI::IsRealPlayer (PlayerbotAI.cpp:
+-- 4389-4395) is `player && !GET_PLAYERBOT_AI(player)`. That branch refuses to
+-- accept unless the TRADER's own side already holds an item, so a one-way gift
+-- leaves the window open forever. Meanwhile TradeAction::Execute has already
+-- returned true (TradeAction.cpp:77) and the command row reads `delivered`.
+-- That is the `sell junk` shape: reports success, does nothing.
+--
+-- WHY A NEW KIND AND NOT A RESERVED VERB. Two reasons, both structural:
+--
+--   1. kind='bot' rows are routed into PlayerbotAI::HandleCommand and are
+--      subject to the per-verb trigger-slot hold added in #2768. A reserved
+--      verb would have to be special-cased ahead of that dedupe, so it would
+--      be a new kind in everything but name.
+--   2. `give` is already a real mod-playerbots chat token (`give leader`).
+--      Reserving it inside kind='bot' would silently shadow a command that
+--      works today - the failure mode would be a leadership handoff that
+--      quietly became an item handoff.
+--
+-- The queue already has one kind per delivery MECHANISM - 'chat' speaks, 'gm'
+-- parses a dot-command, 'probe' reads live state - and each carries its own
+-- result contract. An inventory move is a fourth mechanism.
+--
+-- ENUM values cannot be added by re-running the CREATE TABLE: the base file is
+-- `CREATE TABLE IF NOT EXISTS`, which is a no-op against an existing table, so
+-- the column keeps whatever value set it already has. It takes an explicit
+-- ALTER. (Same trap already documented for overseer_goal.kind.)
+--
+-- Column re-use, no new columns:
+--   target_name  the GIVER   (the character the item leaves)
+--   target_arg   the RECEIVER (already VARCHAR(12), already used this way by
+--                kind='chat' channel='whisper')
+--   command      which item: `guid:<item_instance.guid>` or `entry:<id>`
+--   detail       short refusal reason, or empty on success
+--   result       JSON: what actually moved, or why nothing did
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give') NOT NULL DEFAULT 'bot';

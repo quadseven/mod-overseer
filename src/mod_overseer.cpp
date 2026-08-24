@@ -15,6 +15,12 @@
  *                     with that account's own security level. No escalation:
  *                     a non-GM account gets the same refusal it would get by
  *                     typing the command itself.
+ *       kind='probe' - read-only. Answers from the live Player*, never from
+ *                     the up-to-fifteen-minutes-stale characters table.
+ *       kind='give' - move one item from target_name's bags into target_arg's,
+ *                     inside a CharacterDatabase transaction. There is no chat
+ *                     command that can do this between two bots; see the
+ *                     migration 2026_08_24_00_overseer_give.sql for why.
  *
  *  2. Presence snapshots. Every few seconds the positions and vitals of every
  *     online character are written to acore_characters.overseer_snapshot,
@@ -67,6 +73,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <random>
@@ -1146,10 +1153,10 @@ private:
             char const* status = "error";
             char const* detail = "";
 
-            // Bot orders only. 'chat', 'gm' and 'probe' do not go through
-            // PlayerbotAI::HandleCommand and share no trigger, so nothing they
-            // do can be overwritten by the row after them.
-            if (kind != "chat" && kind != "gm" && kind != "probe")
+            // Bot orders only. 'chat', 'gm', 'probe' and 'give' do not go
+            // through PlayerbotAI::HandleCommand and share no trigger, so
+            // nothing they do can be overwritten by the row after them.
+            if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -1212,8 +1219,9 @@ private:
             // echoed back into SQL.
             // Cleared per row: a probe that fails must not inherit the answer
             // the previous row produced, which would be a wrong reading served
-            // with every appearance of a fresh one.
-            std::string probeResult;
+            // with every appearance of a fresh one. kind='give' fills the same
+            // column, for the same reason: the row must carry ITS OWN outcome.
+            std::string rowResult;
 
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
             if (!player)
@@ -1223,7 +1231,9 @@ private:
             else if (kind == "gm")
                 detail = DoGmCommand(player, command, status);
             else if (kind == "probe")
-                detail = DoProbe(player, command, status, probeResult);
+                detail = DoProbe(player, command, status, rowResult);
+            else if (kind == "give")
+                detail = DoGive(player, targetArg, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 botAI->HandleCommand(CHAT_MSG_WHISPER, command, player);
@@ -1237,9 +1247,10 @@ private:
             // resurrect a command the sender has been told nothing came of,
             // and the two sides would disagree about what happened.
             // `result` is written as its own statement shape rather than always
-            // being included, so a non-probe row does not have NULL written over
-            // whatever a reader might already have taken from it.
-            if (probeResult.empty())
+            // being included, so a row that produces no payload does not have
+            // NULL written over whatever a reader might already have taken
+            // from it.
+            if (rowResult.empty())
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = '{}', detail = '{}' "
                     "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
@@ -1248,7 +1259,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
-                    status, detail, EscLong(probeResult), id, g_runToken);
+                    status, detail, EscLong(rowResult), id, g_runToken);
         } while (result->NextRow());
     }
 
@@ -1601,6 +1612,283 @@ private:
         if (handler.HasSentErrorMessage())
             return "command failed or was refused (detail went to the game chat log)";
 
+        status = "delivered";
+        return "";
+    }
+
+    // ---------------------------------------------------------------- give --
+    //
+    // Move ONE item from one living character's bags into another's.
+    //
+    // WHY THIS IS A MODULE JOB. A party rolls on everything, so loot lands on
+    // whoever won the roll rather than on whoever can use it - the priest ends
+    // up carrying a two-handed axe she can never equip while the warrior wants
+    // it. That is the normal state of a party, not an accident.
+    //
+    // mod-playerbots cannot do it. Its only item-transfer chat command is
+    // `t <Hitem:id:>` and its target is hardcoded to the bot's master
+    // (TradeAction.cpp:26-38). Even pointed at the right master it cannot
+    // COMPLETE: TradeStatusAction::CheckTrade (TradeStatusAction.cpp:165-200)
+    // takes a bot<->bot branch whenever the master is not a real player, and
+    // PlayerbotAI::IsRealPlayer (PlayerbotAI.cpp:4389-4395) is
+    // `player && !GET_PLAYERBOT_AI(player)` - so a SELFBOT is not a real
+    // player. That branch refuses to accept unless the trader's own side
+    // already holds an item, so a one-way gift leaves the trade window open
+    // forever, while TradeAction::Execute has already returned true
+    // (TradeAction.cpp:77) and the queue row reads `delivered`. Reports
+    // success, does nothing - the recurring bug this module exists to stop.
+    //
+    // WHY THE TRANSACTION. The move is three writes that must all land or none
+    // of them: the giver's character_inventory row goes away, item_instance
+    // changes owner, and the receiver gets a character_inventory row. Half of
+    // that applied is a duplicated or a vanished item. SendMailAction.cpp:
+    // 166-175 is the shape being copied (BeginTransaction, then
+    // DeleteFromInventoryDB + SaveToDB, then CommitTransaction);
+    // GiveItemAction.cpp:79-96 does the same move with NO transaction at all,
+    // which is why it is not the model.
+    //
+    // ORDERING, and why it is not arbitrary:
+    //   Player::RemoveItem is explicit that it "does not actually change the
+    //   item" (PlayerStorage.cpp:3006-3007), so after MoveItemFromInventory
+    //   the item is still ITEM_UNCHANGED and Item::SaveToDB would hit its
+    //   `case ITEM_UNCHANGED: break` and write NOTHING (Item.cpp:409-410).
+    //   Hence the explicit SetState(ITEM_CHANGED) before the save.
+    //   SaveToDB then ends with SetState(ITEM_UNCHANGED) (Item.cpp:413), which
+    //   is why it must run BEFORE the store rather than after:
+    //   MoveItemToInventory is what puts the item into the RECEIVER's update
+    //   queue, and clearing that afterwards would leave an item owned by the
+    //   receiver that is in nobody's bags.
+    //
+    // The receiver's character_inventory row is written here, in the same
+    // transaction, instead of being left to the receiver's next periodic save.
+    // PlayerSaveInterval is 900000 - fifteen minutes in which a worldserver
+    // crash would leave the item owned by the receiver and in no container at
+    // all, which is the losing half of exactly the corruption the transaction
+    // is for.
+
+    struct GiveSpec
+    {
+        bool valid = false;
+        bool byGuid = false;
+        uint32 key = 0;
+    };
+
+    // `guid:494263` or `entry:4562`.
+    //
+    // GUID IS THE PREFERRED FORM and the one to use for a specific item. An
+    // entry names an item TYPE: a character holding two of them, or a stack,
+    // or one worn and one spare, gives entry two right answers and the command
+    // would have to pick. item_instance.guid names exactly one row and is what
+    // an operator already reads out of the database when deciding what to
+    // move. `entry` is kept for the convenient case of "the only one they
+    // have", and the result JSON always reports the guid that actually moved,
+    // so an entry-addressed move is still auditable after the fact.
+    static GiveSpec ParseGiveSpec(std::string const& command)
+    {
+        GiveSpec spec;
+        std::string::size_type const colon = command.find(':');
+        if (colon == std::string::npos)
+            return spec;
+
+        std::string const what = command.substr(0, colon);
+        std::string const value = command.substr(colon + 1);
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+            return spec;
+
+        if (what == "guid")
+            spec.byGuid = true;
+        else if (what != "entry")
+            return spec;
+
+        spec.key = static_cast<uint32>(std::strtoul(value.c_str(), nullptr, 10));
+        spec.valid = (spec.key != 0);
+        return spec;
+    }
+
+    // Worn gear, the backpack and equipped bags - the places a character can
+    // actually hand something out of. Deliberately NOT the bank, which
+    // Player::GetItemByGuid does search (PlayerStorage.cpp:423-440): a
+    // character standing in a field cannot reach their bank, and moving an
+    // item out of it from here would be a state change no player could make.
+    static Item* FindCarriedItem(Player* who, bool byGuid, uint32 key)
+    {
+        auto matches = [&](Item* item)
+        {
+            return byGuid ? (item->GetGUID().GetCounter() == key) : (item->GetEntry() == key);
+        };
+
+        // 0..38: equipment, the four bag slots, then the backpack.
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (matches(item))
+                    return item;
+
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (matches(item))
+                        return item;
+        }
+        return nullptr;
+    }
+
+    // EVERY exit from here writes `out`, including every refusal. A row that
+    // ends 'error' with an empty result is a row nobody can diagnose from
+    // outside the worldserver, and this queue has already shipped one action
+    // that reported success while doing nothing.
+    static char const* DoGive(Player* giver, std::string const& receiverName,
+                              std::string const& command, char const*& status,
+                              std::string& out)
+    {
+        auto refuse = [&](char const* reason, char const* detail) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(reason)
+              << ",\"from\":" << J(giver->GetName())
+              << ",\"to\":" << J(receiverName)
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+            return detail;
+        };
+
+        GiveSpec const spec = ParseGiveSpec(command);
+        if (!spec.valid)
+            return refuse("malformed item spec",
+                          "malformed give: want guid:<item_instance.guid> or entry:<id>");
+
+        if (receiverName.empty())
+            return refuse("no receiver", "no receiver (put the receiving character in target_arg)");
+
+        Player* receiver = ObjectAccessor::FindPlayerByName(receiverName);
+        if (!receiver)
+            return refuse("receiver offline", "receiver not online");
+
+        // Not merely pointless: MoveItemFromInventory followed by a store back
+        // onto the same character is a real chance to lose the item for no
+        // gain at all.
+        if (receiver == giver)
+            return refuse("same character", "giver and receiver are the same character");
+
+        Item* item = FindCarriedItem(giver, spec.byGuid, spec.key);
+        if (!item)
+            return refuse("item not found",
+                          spec.byGuid ? "no carried item with that guid on the giver"
+                                      : "no carried item with that entry on the giver");
+
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return refuse("no item template", "item has no template");
+
+        // Captured BEFORE anything moves. Player::RemoveItem calls
+        // SetSlot(NULL_SLOT) (PlayerStorage.cpp:3072), so the source position
+        // is unreadable afterwards, and the Item* itself is not guaranteed to
+        // survive a store that merges into an existing stack.
+        ObjectGuid const itemGuid = item->GetGUID();
+        uint32 const itemEntry = item->GetEntry();
+        uint32 const itemCount = item->GetCount();
+        uint8 const srcBag = item->GetBagSlot();
+        uint8 const srcSlot = item->GetSlot();
+        std::string const itemName = proto->Name1;
+
+        auto describe = [&](char const* outcome, char const* reason, int32 storeResult,
+                            int32 destSlot)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"from\":" << J(giver->GetName())
+              << ",\"to\":" << J(receiver->GetName())
+              << ",\"item_guid\":" << itemGuid.GetCounter()
+              << ",\"entry\":" << itemEntry
+              << ",\"name\":" << J(itemName)
+              << ",\"count\":" << itemCount
+              << ",\"src_bag\":" << uint32(srcBag)
+              << ",\"src_slot\":" << uint32(srcSlot)
+              << ",\"dest_slot\":" << destSlot
+              << ",\"store_result\":" << storeResult << "}";
+            out = o.str();
+        };
+
+        // Soulbound is checked separately from CanBeTraded purely so the
+        // refusal can NAME it: it is the one refusal that is permanent, and
+        // telling an operator "cannot be handed over" when the real answer is
+        // "and never will be" invites them to retry forever.
+        if (item->IsSoulBound())
+        {
+            describe("refused", "item is soulbound to the giver", EQUIP_ERR_OK, -1);
+            return "item is soulbound and can never be handed over";
+        }
+        // Everything else Item::CanBeTraded (Item.cpp:795-820) knows about: a
+        // non-empty bag, a bag that is itself equipped, an item currently
+        // being looted, a temporary or bind-on-enchant.
+        if (!item->CanBeTraded())
+        {
+            describe("refused", "item cannot be traded (non-empty bag, worn bag, being looted, "
+                                "or bound by enchant)", EQUIP_ERR_OK, -1);
+            return "item cannot be handed over";
+        }
+
+        // Asked BEFORE anything is removed from the giver, so a receiver with
+        // no room costs nothing: the giver still has the item and the row says
+        // why.
+        ItemPosCountVec dest;
+        InventoryResult const msg = receiver->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+        if (msg != EQUIP_ERR_OK)
+        {
+            describe("refused", "receiver cannot store the item", int32(msg), -1);
+            // No apostrophe, and that is not a style choice: `detail` is
+            // embedded straight into the UPDATE below, so every literal on
+            // this path must be free of quote characters.
+            return msg == EQUIP_ERR_INVENTORY_FULL ? "receiver bags are full"
+                                                   : "receiver cannot store the item";
+        }
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+        // 1. Off the giver, in memory and in character_inventory.
+        giver->MoveItemFromInventory(srcBag, srcSlot, true);
+        item->DeleteFromInventoryDB(trans);
+
+        // 2. Re-owned in item_instance. SetState is required because
+        //    RemoveItem left the item ITEM_UNCHANGED and SaveToDB ignores
+        //    that state; the default nullptr `forplayer` means no update
+        //    queue is touched by it.
+        item->SetOwnerGUID(receiver->GetGUID());
+        item->SetState(ITEM_CHANGED);
+        item->SaveToDB(trans);
+
+        // 3. Into the receiver's bags. in_characterInventoryDB = true because
+        //    the character_inventory row is written just below rather than
+        //    being deferred to the receiver's next save.
+        receiver->MoveItemToInventory(dest, item, true, true);
+
+        // 4. The placement, durably. Re-found by guid rather than reusing
+        //    `item`: a store that merges into an existing stack consumes the
+        //    source item (PlayerStorage.cpp:2786-2800), and in that case there
+        //    is no new row to write - the surviving stack already has one.
+        int32 destSlot = -1;
+        if (Item* stored = receiver->GetItemByGuid(itemGuid))
+        {
+            destSlot = int32(stored->GetSlot());
+            Bag* container = stored->GetContainer();
+            trans->Append(
+                "REPLACE INTO character_inventory (guid, bag, slot, item) VALUES ({}, {}, {}, {})",
+                receiver->GetGUID().GetRawValue(),
+                container ? container->GetGUID().GetCounter() : 0,
+                uint32(destSlot),
+                itemGuid.GetCounter());
+        }
+
+        CharacterDatabase.CommitTransaction(trans);
+
+        LOG_INFO("module.overseer", "overseer: gave item {} (entry {}) from '{}' to '{}'",
+                 itemGuid.GetCounter(), itemEntry, giver->GetName(), receiver->GetName());
+
+        describe("moved", "", EQUIP_ERR_OK, destSlot);
         status = "delivered";
         return "";
     }
