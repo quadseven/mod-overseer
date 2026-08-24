@@ -1392,12 +1392,40 @@ private:
             return false;
         }
 
-        // The lease already names this quest. Re-issuing ChangeToDoQuest here
-        // would reset objectiveIdx, pos and lastReachPOI (NewRpgInfo.h:47-54)
-        // every twenty seconds, which is a character that walks toward an
-        // objective forever and never arrives.
-        if (working == questId)
+        // The lease already names this quest, and the aim has not moved since
+        // we last looked - leave it alone. Re-issuing ChangeToDoQuest on every
+        // poll would reset objectiveIdx, pos and lastReachPOI
+        // (NewRpgInfo.h:47-54) every twenty seconds, which is a character that
+        // walks toward an objective forever and never arrives.
+        //
+        // BUT NOT WHEN THE AIM HAS JUST CHANGED, and that distinction is the
+        // whole errand. Measured in dev on 2026-08-24: Ymrossi drifted onto
+        // quest 233 by itself, was re-asserted onto the council's 3109, handed
+        // 3109 in, and its rpg then re-rolled back onto 233. Aiming it at 233
+        // for its SECOND errand hit this guard - `working == questId` was true,
+        // so this returned silently and nothing happened. The bot sat holding a
+        // DoQuest state for 233 whose objective pointer belonged to its own
+        // earlier pursuit, and 233 was already COMPLETE, so there was no
+        // objective left to walk to and it never advanced to the hand-in.
+        //
+        // The first errand only worked BECAUSE ChangeToDoQuest was called
+        // fresh and reset that pointer. A new errand needs the same reset even
+        // when the id happens to match, because the state behind it belongs to
+        // a different, self-chosen pursuit. Re-issue once on the change, then
+        // go quiet again - which keeps the walks-forever loop this guard was
+        // written to prevent.
+        if (working == questId && !aimChanged)
             return true;
+
+        if (working == questId)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' was already on quest {} ({}) by its own choice - "
+                     "re-issuing for the new errand so the objective pointer resets",
+                     name, questId, quest->GetTitle());
+            botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
+            return true;
+        }
 
         if (working)
             LOG_INFO("module.overseer",
