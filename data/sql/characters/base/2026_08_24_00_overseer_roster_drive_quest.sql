@@ -1,0 +1,42 @@
+-- Which quest the overseer wants the party leader working (infra#2597).
+--
+-- WHAT THIS FIXES. The family's council already decides to do quests. Watched
+-- live in party chat: Ugga said she needed one more Large Candle for Kobold
+-- Candles, Bork, Grog and Grug all said they would help, Ugga said "then it is
+-- settled" - and then all five stood still. Measured: 0.0 yards in 45 seconds,
+-- none of them in combat, 11 yards from the kobolds that drop the item. The
+-- agreement never became movement, because nothing carried the decision to the
+-- one place that can act on it.
+--
+-- WHY THE PARTY LEADER AND NOBODY ELSE. The family has exactly ONE traveller,
+-- deliberately. `new rpg` is the strategy that walks a character to a quest
+-- objective and its actions run at relevance 3.0-11.0 against `follow`'s 1.0,
+-- so a follower holding both wanders off every single tick. Measured live: the
+-- family spread over 937 yards with `new rpg` on everyone, and closed to within
+-- 3 yards once it was taken off the followers. The cost of getting that wrong
+-- is the healer 600 yards away while the tank dies. So a quest decision changes
+-- WHERE the traveller goes; it never changes who travels. Equal progress comes
+-- from the family HOLDING the same quests, not from everyone wandering off
+-- independently.
+--
+-- WHY A COLUMN AND NOT AN overseer_command ROW. Command rows are at-most-once
+-- and consumed on read, and this has to be a standing intent. mod-playerbots'
+-- RPG_DO_QUEST status self-expires after statusDoQuestDuration = 30 minutes,
+-- and once the status goes IDLE the bot re-rolls its own - including picking a
+-- RANDOM quest out of its log. An aim is therefore a LEASE that must be
+-- re-asserted, and it must also survive the leader relogging. `lead` and
+-- `spec_tab` on this same table set the precedent for standing intent.
+--
+-- WHY 0 AND NOT NULL for "no opinion". Every other column on this table uses a
+-- sentinel rather than NULL for the same reason: the module reads these with
+-- Field::Get<uint32>, and a nullable column would put a NULL check in front of
+-- every read for no gain. Quest ids start at 1, so 0 is unambiguous.
+--
+-- THE READER IS NOT WRITTEN YET, and that is on purpose - see the PR. The
+-- bridge writes this column (bridge._aim_traveller, renewed by
+-- goals._reconcile_quest); teaching DriveQuests() to prefer it over the first
+-- eligible quest in the leader's own log is a separate, C++-only change.
+-- Until then the column is written and unread, which is a no-op on the game.
+ALTER TABLE `overseer_roster`
+    ADD COLUMN `drive_quest` INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT 'Quest id the overseer wants this character working; 0 = pick for itself';
