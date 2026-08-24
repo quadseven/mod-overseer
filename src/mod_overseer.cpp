@@ -1217,7 +1217,15 @@ private:
     void DriveQuests()
     {
         QueryResult result = CharacterDatabase.Query(
-            "SELECT name, drive_quest FROM overseer_roster WHERE enabled = 1 AND `lead` = 1");
+            // EVERY enabled member, not only the leader (infra#2801, "quest
+            // together"). Handing a quest in is reachable only through the rpg
+            // strategy, so a follower that cannot be aimed cannot ever turn
+            // anything in - which is why the four hoarded completed quests
+            // while the leader handed his own in. `lead` still comes back
+            // because the FALLBACK below stays leader-only: an unaimed
+            // follower carrying `new rpg` is the 937-yard scatter, and the aim
+            // is the only thing holding the party to one destination.
+            "SELECT name, drive_quest, `lead` FROM overseer_roster WHERE enabled = 1");
         if (!result)
             return;
 
@@ -1226,6 +1234,7 @@ private:
             Field* fields = result->Fetch();
             std::string const name = fields[0].Get<std::string>();
             uint32 const aim = fields[1].Get<uint32>();
+            bool const isLead = fields[2].Get<uint8>() != 0;
 
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot)
@@ -1363,6 +1372,16 @@ private:
             // every poll, which is a character that walks toward an objective
             // forever and never arrives.
             if (onQuest)
+                continue;
+
+            // AN UNAIMED FOLLOWER STAYS PUT. Everything below picks a quest out
+            // of the character's OWN log, which is per-character and therefore
+            // divergent - five bots free-roaming their own logs is precisely
+            // the 937-yard spread that taking `new rpg` off them was meant to
+            // cure. A follower questing with the family does so because it was
+            // aimed at the SAME quest as everyone else; with no aim there is no
+            // shared destination, and standing still beats scattering.
+            if (!isLead)
                 continue;
 
             // REACHING HERE MEANS THE BOT IS NOT ON A QUEST. If this loop chose
