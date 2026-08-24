@@ -1,7 +1,7 @@
 /*
  * mod-overseer: the bridge between the outside world and the simulation.
  *
- * Four jobs, all running inside the worldserver:
+ * Five jobs, all running inside the worldserver:
  *
  *  1. Command delivery. Rows inserted into acore_characters.overseer_command
  *     (by the Discord bridge) are carried out. Three kinds share one queue:
@@ -33,8 +33,16 @@
  *     log rather than a firehose: audibility is evaluated against the same
  *     rules the client uses, so a watcher sees what it would really see.
  *
- *  4. Retention. Chat is swept on a timer. A 500-bot world talks constantly
- *     and nothing here is worth keeping for long.
+ *  4. Event record. Discrete things that HAPPEN to a roster character - a
+ *     level gained, a quest taken or finished or handed in, an item equipped,
+ *     a death - are written to acore_characters.overseer_event as they occur.
+ *     This exists because every diagnosis in this epic so far has ended at a
+ *     screenshot: the server knew the fact and kept no record of it. Scoped to
+ *     overseer_roster and de-duplicated per hour; the migration
+ *     2026_08_24_02_overseer_event.sql carries the reasoning in full.
+ *
+ *  5. Retention. Chat and events are swept on a timer. A 500-bot world talks
+ *     constantly and nothing here is worth keeping for long.
  *
  * The database is the whole interface on purpose: no listening socket, no new
  * network surface on the worldserver. Anything that can reach MySQL (which is
@@ -45,6 +53,15 @@
  * map-update thread. The watch list is therefore guarded by a mutex, with an
  * atomic union of watched channel kinds as a lock-free early-out so the
  * common "nobody is listening to this kind" case costs one atomic load.
+ *
+ * The event hooks are on the same footing and follow the same discipline: a
+ * bot levels up and dies inside Player::Update, so those hooks land on a map
+ * thread too. They do NO database work. They take a lock, touch memory, and
+ * leave; the world thread does the INSERT. This is not fastidiousness - the
+ * worldserver was measured at 285% CPU with the map pool doing the work, and
+ * DatabaseWorkerPool::EscapeString borrows the shared synchronous connection
+ * with no lock of its own, so a query from a map thread is both a stall and a
+ * race.
  */
 
 #include "CharacterCache.h"
@@ -73,13 +90,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <mutex>
 #include <random>
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -131,6 +151,29 @@ constexpr size_t MAX_CHAT_BYTES = 255;
 // Relayed lines are the bridge's problem once sent; unrelayed ones are kept
 // a little longer so a bridge outage does not lose the conversation.
 constexpr uint32 CHAT_RETENTION_MINUTES = 180;
+
+// How often queued events are written. Slower than the chat flush on purpose:
+// chat is a live conversation somebody is reading in Discord, events are a
+// record somebody queries after the fact. A longer window is also a bigger
+// one to coalesce repeats in, so the slower timer costs fewer rows, not more.
+constexpr uint32 EVENT_FLUSH_MS = 5000;
+
+// A fortnight. Long enough that "when did this start" has an answer for
+// anything anyone is still arguing about, short enough that a bug firing every
+// ten seconds cannot grow the table without bound.
+constexpr uint32 EVENT_RETENTION_DAYS = 14;
+
+// The hour an event fell in, as the grouping half of the unique key. See
+// 2026_08_24_02_overseer_event.sql for why the timeline is coarsened to an
+// hour rather than collapsed entirely or kept per-occurrence.
+constexpr uint32 EVENT_BUCKET_SECONDS = 3600;
+
+// DISTINCT keys held between two flushes, not occurrences - a repeat costs
+// nothing, because it increments a counter on a key that is already there.
+// Five characters producing 500 genuinely different events in five seconds is
+// not a busy world, it is a bug, and the bound is what stops that bug becoming
+// an out-of-memory instead of a log line.
+constexpr size_t MAX_EVENT_KEYS = 500;
 
 enum ChatKindMask : uint32
 {
@@ -393,6 +436,143 @@ void CaptureBypassed(Player* sender, uint32 kind, std::string const& text, Pred&
             RecordHeard(sender, watcher->GetName(), kind, text, "");
     });
 }
+
+/*
+ * ---------------------------------------------------------------------------
+ * The event record (infra#2597).
+ * ---------------------------------------------------------------------------
+ *
+ * THE ROSTER GATE IS THE FIRST AND LARGEST VOLUME CONTROL. The player hooks
+ * below fire for every one of the 500 random bots as well as for the family of
+ * five, so the very first thing every hook does is ask whether this character
+ * is one of ours. Everything else - resolving a quest title, taking the queue
+ * lock, formatting a string - happens only after that question is answered
+ * yes, roughly a hundred times less often than it is asked.
+ *
+ * The roster is cached rather than queried, because the alternative is a
+ * SELECT per player event on a 500-bot world, which is exactly the synchronous
+ * per-event query the world loop cannot afford. It is refreshed from
+ * overseer_roster on the poll that already reads that table, so this adds no
+ * query of its own.
+ *
+ * NAMES ARE COMPARED CASE-INSENSITIVELY. overseer_roster is written by the
+ * bridge and Player::GetName returns the canonical capitalisation the world
+ * uses; if those two ever disagreed by a letter's case the hooks would record
+ * nothing at all, forever, with nothing in the logs to say so. That is the
+ * precise failure this whole change exists to abolish, so it is not left to
+ * chance for the sake of a strcmp.
+ */
+
+std::string LowerName(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+std::mutex g_rosterMutex;
+std::set<std::string> g_rosterLower;
+// Lock-free early-out, same trick as g_watchUnion: before the roster has ever
+// been read there is nobody to record, and a stale read costs one needless
+// locked lookup rather than a wrong answer.
+std::atomic<bool> g_rosterKnown{false};
+
+void SetRosterNames(std::vector<std::string> const& names)
+{
+    std::lock_guard<std::mutex> guard(g_rosterMutex);
+    g_rosterLower.clear();
+    for (std::string const& name : names)
+        g_rosterLower.insert(LowerName(name));
+    g_rosterKnown.store(!g_rosterLower.empty(), std::memory_order_relaxed);
+}
+
+bool OnRoster(std::string const& name)
+{
+    if (!g_rosterKnown.load(std::memory_order_relaxed))
+        return false;
+    std::lock_guard<std::mutex> guard(g_rosterMutex);
+    return g_rosterLower.find(LowerName(name)) != g_rosterLower.end();
+}
+
+// Exactly the unique key of overseer_event. Keeping the two identical is what
+// makes the in-memory coalescing and the ON DUPLICATE KEY UPDATE agree: a
+// repeat that collapses in RAM is the same repeat that would collapse in the
+// database, so a flush boundary never changes what the table ends up holding.
+struct EventKey
+{
+    std::string characterName;
+    std::string kind;
+    uint32 subjectId = 0;
+    uint32 bucket = 0;
+
+    bool operator<(EventKey const& other) const
+    {
+        return std::tie(characterName, kind, subjectId, bucket) <
+               std::tie(other.characterName, other.kind, other.subjectId, other.bucket);
+    }
+};
+
+struct PendingEvent
+{
+    std::string subjectName;
+    std::string detail;
+    uint32 characterGuid = 0;
+    uint32 zoneId = 0;
+    uint32 occurrences = 0;
+    uint16 mapId = 0;
+    uint8 level = 0;
+};
+
+// A MAP, not a vector, and that is the whole de-duplication design. The chat
+// queue is a vector because every line is different and losing one loses
+// speech. Events repeat: the axe error fired every ten seconds forever, and a
+// vector would have grown a copy of the same sentence six times a minute until
+// the cap dropped it. Keyed, the hundredth occurrence is an increment.
+std::mutex g_eventMutex;
+std::map<EventKey, PendingEvent> g_eventQueue;
+uint64 g_droppedEvents = 0;
+
+// The one place an event is captured. Runs on whatever thread the event
+// happened on - for bots, a map-update thread - so it does NO database work
+// and does not resolve anything it was not handed.
+void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
+                 std::string const& subjectName, std::string const& detail)
+{
+    if (!actor || !kind)
+        return;
+    if (!OnRoster(actor->GetName()))
+        return;
+
+    EventKey key;
+    key.characterName = actor->GetName();
+    key.kind = kind;
+    key.subjectId = subjectId;
+    key.bucket = static_cast<uint32>(std::time(nullptr) / EVENT_BUCKET_SECONDS);
+
+    std::lock_guard<std::mutex> guard(g_eventMutex);
+    auto it = g_eventQueue.find(key);
+    if (it == g_eventQueue.end())
+    {
+        if (g_eventQueue.size() >= MAX_EVENT_KEYS)
+        {
+            ++g_droppedEvents;
+            return;
+        }
+        it = g_eventQueue.emplace(key, PendingEvent()).first;
+    }
+
+    // The LAST occurrence in a bucket wins for everything outside the key.
+    // Where a character was and what level it had when a thing last happened
+    // is the useful answer; where it was the first of forty times is not.
+    PendingEvent& pending = it->second;
+    pending.subjectName = subjectName;
+    pending.detail = detail;
+    pending.characterGuid = actor->GetGUID().GetCounter();
+    pending.zoneId = actor->GetZoneId();
+    pending.mapId = static_cast<uint16>(actor->GetMapId());
+    pending.level = actor->GetLevel();
+    ++pending.occurrences;
+}
 }  // namespace
 
 /*
@@ -514,6 +694,156 @@ public:
     // fails loudly at parse time instead of silently doing nothing.
 };
 
+/*
+ * The event record's observation points.
+ *
+ * EVERY HOOK HERE WAS VERIFIED AGAINST THE PINNED CORE, declaration and call
+ * site both, because the C++ in this repository only compiles on a push to
+ * main - a member that does not exist is not a failed check on a pull request,
+ * it is a broken main branch. Core efe123fab543c5faf3c477674ec17a18fd59f09f:
+ *
+ *   OnPlayerLevelChanged          PlayerScript.h:267   Player.cpp:2583
+ *   OnPlayerQuestAccept           PlayerScript.h:752   PlayerQuest.cpp:426
+ *   OnPlayerBeforeQuestComplete   PlayerScript.h:457   PlayerQuest.cpp:618
+ *   OnPlayerCompleteQuest         PlayerScript.h:249   PlayerQuest.cpp:903
+ *   OnPlayerEquip                 PlayerScript.h:418   PlayerStorage.cpp:2928,
+ *                                                      2936, 2960
+ *   OnPlayerJustDied              PlayerScript.h:234   Player.cpp:4651
+ *
+ * TWO OF THOSE NAMES LIE, AND BOTH LIES MATTER.
+ *
+ * OnPlayerCompleteQuest is NOT "the quest's objectives are done". Its call
+ * site is the last line of Player::RewardQuest (PlayerQuest.cpp:675-904), so
+ * it fires when a quest is HANDED IN and paid out. It is recorded here as
+ * 'quest_reward' for that reason; calling it quest_complete would have put a
+ * turn-in under a name that means something else, and a report built on that
+ * column would have been quietly wrong about when the family finished things.
+ *
+ * OnPlayerBeforeQuestComplete IS the objectives-satisfied moment - it is the
+ * first thing Player::CompleteQuest does (PlayerQuest.cpp:611-621) - but it is
+ * a GATE hook returning bool, not an observer. It is used the same way this
+ * module already uses OnPlayerCanUseChat: as the only available vantage point,
+ * returning true unconditionally so it can never veto anything. If it ever
+ * returned false the family would stop being able to complete quests at all,
+ * so the return is a bare `return true` on its own line and should stay that
+ * way.
+ *
+ * SPELL CAST FAILURES ARE ABSENT, AND THAT IS THE POINT OF THIS COMMENT.
+ * They are the reason this table was asked for: "Must have a Axe equipped"
+ * repeated every ten seconds for hours and had to be read off a screenshot,
+ * because the server computed the refusal and wrote it down nowhere. There is
+ * no hook at the pinned SHA that can see it. AllSpellScript::OnSpellCheckCast
+ * (AllSpellScript.h:57) is the ONLY hook in the entire core taking a
+ * SpellCastResult - verified by grepping ScriptMgr.h, which declares exactly
+ * one (ScriptMgr.h:650) - and Spell::CheckCast calls it at the very top with
+ * `res` initialised to SPELL_CAST_OK immediately beforehand
+ * (Spell.cpp:5673-5678). It is an input: a chance for a script to REFUSE a
+ * cast. The real reason is computed in the six hundred lines after it and goes
+ * straight to Spell::SendCastResult (Spell.cpp:3546 from prepare, 3854 from
+ * cast) with no script call in between. AllSpellScript::CanPrepare is no help
+ * either - Spell.cpp:3465, sixty-five lines BEFORE the CheckCast whose result
+ * it would need. Nor does the module side hold it: mod-playerbots at
+ * 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312 keeps no last-cast-result anywhere
+ * in PlayerbotAI.h.
+ *
+ * Recording it therefore needs a core patch adding a hook at SendCastResult -
+ * which production/docker/azerothcore-playerbots/patches/ now makes possible,
+ * and which is deliberately NOT bundled here. A patch that touches ScriptMgr,
+ * AllSpellScript and Spell.cpp is exactly the kind of change that discovers it
+ * was wrong ninety minutes into a compile on main. The kind string 'cast_fail'
+ * is reserved in the migration so the reporting layer can be built against it
+ * now and the column meanings cannot drift when it lands.
+ */
+class OverseerEventScript : public PlayerScript
+{
+public:
+    // Only the six hooks this script implements. An empty list would enable
+    // ALL player hooks, which on a 500-bot world puts this script in the
+    // dispatch loop for every player event the core has.
+    OverseerEventScript() : PlayerScript("OverseerEventScript", {
+        PLAYERHOOK_ON_LEVEL_CHANGED,
+        PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
+        PLAYERHOOK_ON_BEFORE_QUEST_COMPLETE,
+        PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
+        PLAYERHOOK_ON_EQUIP,
+        PLAYERHOOK_ON_PLAYER_JUST_DIED,
+    }) {}
+
+    // Fires on the way DOWN as well - the hook is named for a change, not a
+    // gain - so the level reached is the subject and the level left is the
+    // detail. That way a row can never be ambiguous about which way it went.
+    void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
+    {
+        if (!player)
+            return;
+        RecordEvent(player, "level_up", player->GetLevel(), "",
+                    "from " + std::to_string(static_cast<uint32>(oldLevel)));
+    }
+
+    void OnPlayerQuestAccept(Player* player, Quest const* quest) override
+    {
+        if (!player || !quest)
+            return;
+        RecordEvent(player, "quest_accept", quest->GetQuestId(), quest->GetTitle(), "");
+    }
+
+    // Objectives satisfied. A gate hook used as an observer - see above.
+    bool OnPlayerBeforeQuestComplete(Player* player, uint32 questId) override
+    {
+        if (player)
+        {
+            // GetQuestTemplate rather than carrying a title from elsewhere:
+            // this hook is handed an id and nothing else, and the same lookup
+            // is already how DriveQuests names a quest.
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            RecordEvent(player, "quest_complete", questId,
+                        quest ? quest->GetTitle() : "", "");
+        }
+        return true;
+    }
+
+    // Handed in and paid out.
+    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
+    {
+        if (!player || !quest)
+            return;
+        RecordEvent(player, "quest_reward", quest->GetQuestId(), quest->GetTitle(), "");
+    }
+
+    void OnPlayerEquip(Player* player, Item* item, uint8 /*bag*/, uint8 slot,
+                       bool /*update*/) override
+    {
+        if (!player || !item)
+            return;
+
+        // A LOGIN IS NOT AN EQUIP. Player::_LoadInventory puts every worn item
+        // back on through QuickEquipItem (PlayerStorage.cpp:6000), which calls
+        // this hook with update=true unconditionally (PlayerStorage.cpp:2960)
+        // - so the `update` argument cannot be used to tell the two apart, and
+        // without this test every restart would file seventeen item_equip rows
+        // per character for gear nobody touched. PlayerLoading is the core's
+        // own test for the same situation; Spell::SendCastResult uses it to
+        // decide not to report cast failures during a load (Spell.cpp:4691).
+        if (player->GetSession() && player->GetSession()->PlayerLoading())
+            return;
+
+        ItemTemplate const* proto = item->GetTemplate();
+        RecordEvent(player, "item_equip", item->GetEntry(), proto ? proto->Name1 : "",
+                    "slot " + std::to_string(static_cast<uint32>(slot)));
+    }
+
+    // Deaths carry no subject, so every death in an hour lands on one row with
+    // a count. That is deliberate: "Grug died nine times between 02:00 and
+    // 03:00" is the observation worth having, and nine rows saying "died" with
+    // nothing to tell them apart is not nine times more information.
+    void OnPlayerJustDied(Player* player) override
+    {
+        if (!player)
+            return;
+        RecordEvent(player, "death", 0, "", "");
+    }
+};
+
 class OverseerWorldScript : public WorldScript
 {
 public:
@@ -530,12 +860,19 @@ public:
         _partyTimer += diff;
         _trainTimer += diff;
         _questTimer += diff;
+        _eventTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
         {
             _watchLoaded = true;
             ReloadWatchList();
+            // And the roster, for the same reason and a sharper one: the event
+            // hooks record NOTHING until they know who is on it, so leaving
+            // this to the 30-second roster poll would mean a blind window
+            // after every restart - which is precisely when a character is
+            // most likely to do something worth having a record of.
+            ReloadRosterNames();
         }
         if (_commandTimer >= COMMAND_POLL_MS)
         {
@@ -577,12 +914,24 @@ public:
             _chatFlushTimer = 0;
             FlushChat();
         }
+        if (_eventTimer >= EVENT_FLUSH_MS)
+        {
+            _eventTimer = 0;
+            FlushEvents();
+        }
         if (_sweepTimer >= CHAT_SWEEP_MS)
         {
             _sweepTimer = 0;
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_chat WHERE created_at < NOW() - INTERVAL {} MINUTE",
                 CHAT_RETENTION_MINUTES);
+            // Swept on last_seen, not first_seen: a row that is still being
+            // incremented is a problem that is still happening, and deleting
+            // it because it started three weeks ago would restart its history
+            // and lose the one fact that made it interesting.
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_event WHERE last_seen < NOW() - INTERVAL {} DAY",
+                EVENT_RETENTION_DAYS);
         }
     }
 
@@ -603,20 +952,37 @@ private:
     // Its bots come from `add` rows in playerbots_random_bots, which these
     // characters do not have, so the periodic Randomize() that would re-roll a
     // level 1 character's level and gear never reaches them.
+    // Read the roster and publish it to the event hooks. Split out of
+    // KeepRosterOnline so startup can prime the hooks without also queueing
+    // logins into the first ticks, which the roster timer's seeding
+    // deliberately avoids.
+    std::vector<std::string> ReloadRosterNames()
+    {
+        std::vector<std::string> names;
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT name FROM overseer_roster WHERE enabled = 1"))
+        {
+            do
+            {
+                names.push_back(result->Fetch()[0].Get<std::string>());
+            } while (result->NextRow());
+        }
+        SetRosterNames(names);
+        return names;
+    }
+
     void KeepRosterOnline()
     {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT name FROM overseer_roster WHERE enabled = 1");
-        if (!result)
-            return;
+        // The whole list is read before any login is attempted, because the
+        // login loop stops after ROSTER_LOGINS_PER_POLL and the event hooks
+        // need the names of everybody on the roster, not of the first three.
+        std::vector<std::string> const names = ReloadRosterNames();
 
         uint32 started = 0;
-        do
+        for (std::string const& name : names)
         {
             if (started >= ROSTER_LOGINS_PER_POLL)
                 break;
-
-            std::string const name = result->Fetch()[0].Get<std::string>();
 
             // Already playing. Checked by name rather than by tracking what we
             // launched, so a character that logs out for any reason - a crash,
@@ -635,7 +1001,7 @@ private:
             LOG_INFO("module.overseer", "overseer: logging in roster character '{}'", name);
             sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
             ++started;
-        } while (result->NextRow());
+        }
     }
 
     // Keep the roster in one party, so they can actually talk to each other.
@@ -1074,6 +1440,83 @@ private:
                << "','" << Esc(line.text)
                << "')";
         }
+        CharacterDatabase.Execute(ss.str().c_str());
+    }
+
+    // Write the queued events. Same shape as FlushChat and for the same two
+    // reasons - EscapeString borrows the shared synchronous connection, and one
+    // multi-row statement per tick beats one statement per event - with one
+    // addition: the batch is already coalesced by key, so the row count here is
+    // the number of DISTINCT things that happened, never the number of times
+    // they happened.
+    void FlushEvents()
+    {
+        std::map<EventKey, PendingEvent> batch;
+        uint64 dropped = 0;
+        {
+            std::lock_guard<std::mutex> guard(g_eventMutex);
+            if (g_eventQueue.empty() && !g_droppedEvents)
+                return;
+            batch.swap(g_eventQueue);
+            dropped = g_droppedEvents;
+            g_droppedEvents = 0;
+        }
+
+        // Overflow is OURS to bound, so it is counted and said out loud - the
+        // same bargain FlushChat strikes with g_droppedLines. Now that
+        // module.overseer has an appender of its own, this line will actually
+        // be somewhere a person can read it.
+        if (dropped)
+            LOG_WARN("module.overseer", "overseer: dropped {} events (queue full)", dropped);
+
+        if (batch.empty())
+            return;
+
+        std::ostringstream ss;
+        ss << "INSERT INTO overseer_event (character_name, character_guid, kind, subject_id, "
+              "subject_name, detail, level, map, zone, bucket, occurrences) VALUES ";
+        bool first = true;
+        for (std::pair<EventKey const, PendingEvent> const& entry : batch)
+        {
+            EventKey const& key = entry.first;
+            PendingEvent const& ev = entry.second;
+            if (!first)
+                ss << ',';
+            first = false;
+            ss << "('" << Esc(key.characterName)
+               << "'," << ev.characterGuid
+               << ",'" << Esc(key.kind)
+               << "'," << key.subjectId
+               << ",'" << Esc(ev.subjectName)
+               << "','" << Esc(ev.detail)
+               << "'," << static_cast<uint32>(ev.level)
+               << ',' << static_cast<uint32>(ev.mapId)
+               << ',' << ev.zoneId
+               << ',' << key.bucket
+               << ',' << ev.occurrences
+               << ')';
+        }
+
+        // The de-duplication contract. `occurrences` on the right of the `=` is
+        // the value already in the table and VALUES(occurrences) is the count
+        // this batch carries, so a row's total survives a flush boundary: sixty
+        // failures split as 40 + 20 across two ticks still reads 60.
+        //
+        // VALUES() in an ON DUPLICATE clause is deprecated as of MySQL 8.0.20 in
+        // favour of a row alias. It is used anyway and on purpose: the alias
+        // form is a syntax ERROR before 8.0.19, and a statement built into a
+        // C++ string is not something anybody will notice has stopped working
+        // until the table stops filling. A deprecation notice is a cheaper
+        // failure than that.
+        ss << " ON DUPLICATE KEY UPDATE "
+              "occurrences = occurrences + VALUES(occurrences), "
+              "last_seen = CURRENT_TIMESTAMP, "
+              "character_guid = VALUES(character_guid), "
+              "subject_name = VALUES(subject_name), "
+              "detail = VALUES(detail), "
+              "level = VALUES(level), "
+              "map = VALUES(map), "
+              "zone = VALUES(zone)";
         CharacterDatabase.Execute(ss.str().c_str());
     }
 
@@ -1956,6 +2399,7 @@ private:
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
+    uint32 _eventTimer = 0;
     bool _watchLoaded = false;
 };
 
@@ -1963,4 +2407,5 @@ void Addmod_overseerScripts()
 {
     new OverseerWorldScript();
     new OverseerChatScript();
+    new OverseerEventScript();
 }
