@@ -21,6 +21,13 @@
  *                     inside a CharacterDatabase transaction. There is no chat
  *                     command that can do this between two bots; see the
  *                     migration 2026_08_24_00_overseer_give.sql for why.
+ *       kind='share' - put a quest target_name is carrying into target_arg's
+ *                     quest log, behind the core's own eligibility checks.
+ *                     mod-playerbots' two sharing paths both need a master and
+ *                     these bots have none, and the packet path would make an
+ *                     unconditional null-master dereference reachable
+ *                     (AcceptQuestAction.cpp:139). Neither divider nor packet
+ *                     is touched here; see 2026_08_24_03_overseer_share.sql.
  *
  *  2. Presence snapshots. Every few seconds the positions and vitals of every
  *     online character are written to acore_characters.overseer_snapshot,
@@ -1596,10 +1603,11 @@ private:
             char const* status = "error";
             char const* detail = "";
 
-            // Bot orders only. 'chat', 'gm', 'probe' and 'give' do not go
-            // through PlayerbotAI::HandleCommand and share no trigger, so
-            // nothing they do can be overwritten by the row after them.
-            if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give")
+            // Bot orders only. 'chat', 'gm', 'probe', 'give' and 'share' do
+            // not go through PlayerbotAI::HandleCommand and share no trigger,
+            // so nothing they do can be overwritten by the row after them.
+            if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
+                && kind != "share")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -1662,8 +1670,9 @@ private:
             // echoed back into SQL.
             // Cleared per row: a probe that fails must not inherit the answer
             // the previous row produced, which would be a wrong reading served
-            // with every appearance of a fresh one. kind='give' fills the same
-            // column, for the same reason: the row must carry ITS OWN outcome.
+            // with every appearance of a fresh one. kind='give' and
+            // kind='share' fill the same column, for the same reason: the row
+            // must carry ITS OWN outcome.
             std::string rowResult;
 
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
@@ -1677,6 +1686,8 @@ private:
                 detail = DoProbe(player, command, status, rowResult);
             else if (kind == "give")
                 detail = DoGive(player, targetArg, command, status, rowResult);
+            else if (kind == "share")
+                detail = DoShare(player, targetArg, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 botAI->HandleCommand(CHAT_MSG_WHISPER, command, player);
@@ -2332,6 +2343,230 @@ private:
                  itemGuid.GetCounter(), itemEntry, giver->GetName(), receiver->GetName());
 
         describe("moved", "", EQUIP_ERR_OK, destSlot);
+        status = "delivered";
+        return "";
+    }
+
+    // --------------------------------------------------------------- share --
+    //
+    // Put a quest one family member is carrying into another member's log.
+    //
+    // WHY THIS IS A MODULE JOB. Five characters quest together holding five
+    // different quest logs, so the same fight pays two of them nothing - Og
+    // 17 turn-ins against Grog and Ugga on 3, standing three yards apart
+    // killing the same mobs. The only way five people get paid for one kill
+    // is for all five to hold the quest.
+    //
+    // mod-playerbots cannot do it for these bots. Both of its paths need a
+    // master, and these are masterless by design:
+    //   * `share quest <link>` returns false at ShareQuestAction.cpp:16 -
+    //     `if (!GetMaster()) return false;`
+    //   * `auto share quest` is only wired into the `maintenance` strategy,
+    //     which AiFactory never adds (commented out at AiFactory.cpp:628 and
+    //     657), and even when forced on it does nothing: in an ALL-BOT party
+    //     `partyNeedsQuest` is never set (ShareQuestAction.cpp:60-97 only sets
+    //     it for a member with no PlayerbotAI), so HandlePushQuestToParty is
+    //     never called and no divider is ever written.
+    //
+    // WHY NO DIVIDER AND NO PACKET, WHICH IS THE LOAD-BEARING PART.
+    // AcceptQuestShareAction::Execute takes `master = GetMaster()`
+    // (AcceptQuestAction.cpp:104) and dereferences it unconditionally at
+    // AcceptQuestAction.cpp:139:
+    //
+    //     if (!bot->GetDivider().IsEmpty())
+    //         master->SendPushToPartyResponse(bot, QUEST_PARTY_MSG_ACCEPT_QUEST);
+    //
+    // That is a worldserver segfault for a masterless bot. It is unreachable
+    // today only because nothing ever sets a roster bot's divider AND feeds it
+    // the packet. Any implementation calling HandlePushQuestToParty and then
+    // HandleMasterIncomingPacket creates exactly that pair. So this calls the
+    // core API directly - Player::AddQuestAndCheckCompletion - and never
+    // touches SetDivider or CMSG_PUSHQUESTTOPARTY at all. The crash stays
+    // unreachable, and the outcome is synchronous and can be reported.
+    //
+    // AddQuestAndCheckCompletion rather than AddQuest: it fires
+    // OnPlayerQuestAccept and auto-completes an instantly-satisfiable quest,
+    // and it is explicitly null-questGiver-safe (core PlayerQuest.cpp:568-569,
+    // `if (!questGiver) return;`), so passing the holder is safe.
+    //
+    // THE ELIGIBILITY CHECKS ARE NOT POLITENESS. They are the same set the
+    // core applies in WorldSession::HandlePushQuestToParty (core
+    // QuestHandler.cpp:529-603), minus the ones that exist only to send a chat
+    // response. Skipping them is how a level 10 priest ends up holding a level
+    // 20 quest she can never finish, which is worse than the lopsidedness this
+    // is fixing. Every one of them is verified present in the pinned core:
+    //
+    //   Player::CanShareQuest              Player.h:1561
+    //   Player::SatisfyQuestStatus         Player.h:1477
+    //   Player::SatisfyQuestLog            Player.h:1472
+    //   Player::CanTakeQuest               Player.h:1456
+    //   Player::CanAddQuest                Player.h:1457
+    //   Player::AddQuestAndCheckCompletion Player.h:1462
+    //   Player::GetQuestStatus             Player.h:1492
+    //   Player::GetQuestRewardStatus       Player.h:1491
+    //   Player::GetGroup                   Player.h:2520
+    //   WorldObject::IsInMap               Object.h:542
+    //   Group::IsMember                    Group.h:238
+    //
+    // EVERY EXIT WRITES `out`, refusals included, and `status` becomes
+    // 'delivered' ONLY after the quest has been read back out of the taker's
+    // log. This queue has already shipped an action that reported success
+    // while doing nothing; a share that reported 'delivered' because the call
+    // returned would be the same bug wearing a different hat.
+
+    // `quest:1234`. Deliberately the same shape as the give spec so an
+    // operator reading the queue does not have to learn two grammars.
+    static uint32 ParseShareSpec(std::string const& command)
+    {
+        std::string::size_type const colon = command.find(':');
+        if (colon == std::string::npos)
+            return 0;
+        if (command.substr(0, colon) != "quest")
+            return 0;
+        std::string const value = command.substr(colon + 1);
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+            return 0;
+        return static_cast<uint32>(std::strtoul(value.c_str(), nullptr, 10));
+    }
+
+    static char const* DoShare(Player* holder, std::string const& takerName,
+                               std::string const& command, char const*& status,
+                               std::string& out)
+    {
+        uint32 const questId = ParseShareSpec(command);
+
+        // Filled by every path, so no row ever ends without saying what it
+        // decided. `reason` is the machine-readable half - the bridge counts
+        // these - and the returned `detail` is the human half.
+        auto describe = [&](char const* outcome, char const* reason, int32 takerStatus)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"from\":" << J(holder->GetName())
+              << ",\"to\":" << J(takerName)
+              << ",\"quest_id\":" << questId
+              << ",\"taker_status\":" << takerStatus
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        if (!questId)
+        {
+            describe("refused", "malformed request", -1);
+            return "malformed share: want quest:<id>";
+        }
+        if (takerName.empty())
+        {
+            describe("refused", "no taker", -1);
+            return "no taker (put the receiving character in target_arg)";
+        }
+
+        Player* taker = ObjectAccessor::FindPlayerByName(takerName);
+        if (!taker)
+        {
+            describe("refused", "taker offline", -1);
+            return "taker not online";
+        }
+        if (taker == holder)
+        {
+            describe("refused", "same character", -1);
+            return "holder and taker are the same character";
+        }
+
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+        {
+            describe("refused", "no such quest", -1);
+            return "no quest template with that id";
+        }
+
+        // CanShareQuest is BOTH halves of "may this move": the quest must
+        // carry QUEST_FLAGS_SHARABLE, and the holder must actually have it in
+        // m_QuestStatus (core PlayerQuest.cpp:1517-1536). A row naming a
+        // holder who turned the quest in last week fails here rather than
+        // silently sharing something nobody is carrying.
+        if (!holder->CanShareQuest(questId))
+        {
+            describe("refused", "holder cannot share it (not held, or not flagged sharable)",
+                     int32(taker->GetQuestStatus(questId)));
+            return "holder is not carrying that quest or it is not sharable";
+        }
+
+        // Same party and same map, which is what the core itself requires
+        // (`!player->IsInMap(_player)` skips a member outright). Not a
+        // politeness check: sharing into a character on another continent is
+        // how a quest log fills with work nobody can reach, which is exactly
+        // Bork's Coldridge Valley problem in reverse.
+        Group* group = holder->GetGroup();
+        if (!group || !group->IsMember(taker->GetGUID()))
+        {
+            describe("refused", "not in the same party", int32(taker->GetQuestStatus(questId)));
+            return "holder and taker are not in the same party";
+        }
+        if (!taker->IsInMap(holder))
+        {
+            describe("refused", "not on the same map", int32(taker->GetQuestStatus(questId)));
+            return "holder and taker are not on the same map";
+        }
+
+        // Already-rewarded is checked before already-held so the two never
+        // report as one another: "she finished this last week" and "it is in
+        // her log right now" call for opposite next moves.
+        if (taker->GetQuestRewardStatus(questId))
+        {
+            describe("refused", "taker already turned it in", int32(QUEST_STATUS_REWARDED));
+            return "taker has already been rewarded for that quest";
+        }
+        QuestStatus const before = taker->GetQuestStatus(questId);
+        if (before != QUEST_STATUS_NONE)
+        {
+            describe("refused", "taker already holds it", int32(before));
+            return "taker already has that quest";
+        }
+        if (!taker->SatisfyQuestStatus(quest, false))
+        {
+            describe("refused", "taker cannot take it in its current state", int32(before));
+            return "taker cannot take that quest in its current state";
+        }
+        if (!taker->SatisfyQuestLog(false))
+        {
+            describe("refused", "taker quest log is full", int32(before));
+            return "taker quest log is full";
+        }
+        // Level, race, class, prerequisite chain and exclusive group all live
+        // behind this one call, which is why the decision layer mirrors those
+        // rules rather than the module re-deriving them.
+        if (!taker->CanTakeQuest(quest, false))
+        {
+            describe("refused", "taker is not eligible (level, race, class, prerequisite "
+                                "or exclusive group)", int32(before));
+            return "taker is not eligible for that quest";
+        }
+        if (!taker->CanAddQuest(quest, false))
+        {
+            describe("refused", "no bag space for the quest starting item", int32(before));
+            return "taker has no bag space for the quest starting item";
+        }
+
+        taker->AddQuestAndCheckCompletion(quest, holder);
+
+        // READ IT BACK. The whole reason this is a module job rather than a
+        // chat command is that a chat command reports what it SENT. This
+        // reports what the taker's quest log actually says afterwards, and
+        // anything other than a real status is an error however cleanly the
+        // call returned.
+        QuestStatus const after = taker->GetQuestStatus(questId);
+        if (after == QUEST_STATUS_NONE)
+        {
+            describe("error", "the quest did not land in the taker log", int32(after));
+            return "the quest did not land in the taker log";
+        }
+
+        LOG_INFO("module.overseer", "overseer: shared quest {} ({}) from '{}' to '{}'",
+                 questId, quest->GetTitle(), holder->GetName(), taker->GetName());
+
+        describe("shared", "", int32(after));
         status = "delivered";
         return "";
     }

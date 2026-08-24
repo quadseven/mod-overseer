@@ -1,0 +1,90 @@
+-- Put a quest one family member is carrying into another's log (infra#2778,
+-- part of infra#2597).
+--
+-- WHY. Five characters quest together and hold five DIFFERENT quest logs, so
+-- the same fight pays two of them nothing. Read live:
+--
+--     name   level  quests_done
+--     Og       10       17
+--     Grug     14       13
+--     Bork     11       13
+--     Ugga     11        3
+--     Grog     10        3
+--
+-- Grog and Ugga have three turn-ins between them. They stand within three
+-- yards of the others and kill the same mobs; they simply do not hold the
+-- quests those kills count towards. The only way five people get paid for one
+-- kill is for all five to be carrying the quest.
+--
+-- It is also the precondition for aiming the traveller: NewRpgDoQuestAction
+-- reads bot->GetQuestStatus(questId) and dispatches only on INCOMPLETE or
+-- COMPLETE, so pointing the party leader at a laggard's quest does nothing
+-- unless the leader HOLDS it.
+--
+-- WHY NOT kind='bot'. mod-playerbots ships two sharing paths and both need a
+-- master, which these bots do not have:
+--
+--   * `share quest <link>` returns false immediately -
+--     `if (!GetMaster()) return false;` (ShareQuestAction.cpp:16).
+--   * `auto share quest` is only wired into the `maintenance` strategy, and
+--     every line that would add that strategy in AiFactory is commented out
+--     (AiFactory.cpp:628, 657). Forced on by command it still does nothing:
+--     in an ALL-BOT party `partyNeedsQuest` is never set (ShareQuestAction
+--     .cpp:60-97 sets it only for a member with no PlayerbotAI), so
+--     HandlePushQuestToParty is never called and no divider is ever written,
+--     so every recipient's AcceptQuestShareAction refuses at its
+--     `!bot->GetDivider()` guard (AcceptQuestAction.cpp:113).
+--
+-- WHY NOT THE PACKET PATH, AT ALL. AcceptQuestShareAction::Execute takes
+-- `master = GetMaster()` (AcceptQuestAction.cpp:104) and dereferences it
+-- unconditionally at AcceptQuestAction.cpp:139:
+--
+--     if (!bot->GetDivider().IsEmpty())
+--         master->SendPushToPartyResponse(bot, QUEST_PARTY_MSG_ACCEPT_QUEST);
+--
+-- Reaching that line with a null master is a worldserver segfault. It is
+-- unreachable today ONLY because nothing both sets a roster bot's divider and
+-- feeds it the packet. Any implementation calling HandlePushQuestToParty and
+-- then HandleMasterIncomingPacket creates exactly that pair and crashes the
+-- world. kind='share' calls Player::AddQuestAndCheckCompletion directly and
+-- never touches SetDivider or CMSG_PUSHQUESTTOPARTY, so the crash stays
+-- unreachable and the outcome is synchronous and reportable.
+--
+-- WHY A NEW KIND AND NOT A RESERVED VERB, the same two structural reasons
+-- that made `give` a kind: kind='bot' rows are routed into
+-- PlayerbotAI::HandleCommand and subject to the per-verb trigger-slot hold
+-- (#2768), so a reserved verb would have to be special-cased ahead of that
+-- dedupe and would be a new kind in everything but name; and `share` is
+-- already a real mod-playerbots chat token, so reserving it inside kind='bot'
+-- would silently shadow a command that exists.
+--
+-- WHY A COMMAND ROW AND NOT A ROSTER COLUMN. `lead`, `spec_tab` and
+-- `drive_quest` are STANDING intents - they have to survive a relog and a
+-- 30-minute RPG_DO_QUEST expiry, so they are re-asserted from a column.
+-- Sharing a quest is a discrete ACT that happens once and is then true
+-- forever, exactly like handing over an item. At-most-once is the right
+-- delivery for it, and the per-row `result` is where the outcome of THAT
+-- share is recorded.
+--
+-- ENUM values cannot be added by re-running the CREATE TABLE: the base file is
+-- `CREATE TABLE IF NOT EXISTS`, a no-op against an existing table, so the
+-- column keeps whatever value set it already has. It takes an explicit ALTER.
+-- (Same trap already documented for overseer_command.kind='give' and for
+-- overseer_goal.kind; it has bitten this codebase twice.)
+--
+-- Column re-use, no new columns:
+--   target_name  the HOLDER (the character already carrying the quest)
+--   target_arg   the TAKER  (already VARCHAR(12), already used this way by
+--                kind='give' and by kind='chat' channel='whisper')
+--   command      which quest: `quest:<quest_template.ID>`
+--   detail       short refusal reason, or empty on success
+--   result       JSON: outcome, reason, from, to, quest_id, taker_status
+--
+-- EVERY refusal path writes `result` and is distinguishable from every other:
+-- not sharable, not held by the holder, not in the party, not on the map,
+-- already rewarded, already held, log full, not eligible, no bag space, and
+-- "the call returned and the quest is still not in the log". `status` becomes
+-- 'delivered' ONLY after the quest is read back out of the taker's log.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share')
+        NOT NULL DEFAULT 'bot';
