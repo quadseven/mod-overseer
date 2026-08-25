@@ -1,0 +1,59 @@
+-- Where the overseer wants this character to WALK TO (infra#2783).
+--
+-- WHAT THIS UNBLOCKS. Before this column the family could walk to a quest
+-- objective and nowhere else. Not a trainer, not a vendor, not a repair NPC,
+-- not a bank, not the guild-charter petitioner, not the tabard designer. Every
+-- one of those was already an allowed RPG target in mod-playerbots - the
+-- allowed-flag list at PossibleRpgTargetsValue.cpp:23-46 is a single
+-- unconditional block containing TRAINER (:43), VENDOR (:44), REPAIR (:45),
+-- BANKER (:29), GUILD_BANKER (:30), TRAINER_PROFESSION (:32), PETITIONER (:39)
+-- and TABARDDESIGNER (:40). The gap was never the targets. It was that the one
+-- public way into that state took no argument:
+--
+--     void ChangeToDoQuest(uint32 questId, const Quest* quest);  -- aimable
+--     void ChangeToWanderNpc();                                  -- takes nothing
+--
+-- (NewRpgInfo.h:104-106 at the pinned module SHA.) So the bot always chose its
+-- own NPC, and one missing argument blocked #2757 (professions), #2829/#2830
+-- (crafting and the materials to craft with), #2831 (the guild and its tabard)
+-- and the `town run` / `train` modes of #2834 simultaneously.
+--
+-- WHY A ROLE AND NOT A CREATURE ID. "Go to a profession trainer" is a decision
+-- the council can make out of what it already knows. "Go to creature 5511"
+-- needs to know which trainer is nearest to wherever the character is standing
+-- at the moment of the decision - a fact only the worldserver holds, and one
+-- that changes as he walks. So the normal value here is a role keyword and
+-- mod-overseer resolves the nearest matching spawn ON THE CHARACTER'S OWN MAP
+-- when it aims him. The keywords are listed in production/scripts/wow-overseer/
+-- travel.py and duplicated in mod_overseer.cpp; tests/test_travel_npc.py
+-- compares the two tables in both directions, because a keyword one side
+-- accepts and the other does not is exactly the written-and-unread failure of
+-- #2776. A bare decimal creature entry is also accepted, for the case where
+-- the target really is one specific NPC.
+--
+-- WHY A COLUMN AND NOT AN overseer_command ROW, same argument as drive_quest:
+-- command rows are at-most-once and consumed on read, and this is a standing
+-- intent. RPG_WANDER_NPC self-expires after statusWanderNpcDuration - FIVE
+-- minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278), six times
+-- shorter than the thirty-minute quest lease - and the bot then re-rolls its
+-- own status. An aim here is therefore a LEASE that must be re-asserted, and it
+-- must survive the character relogging.
+--
+-- WHY VARCHAR AND NOT AN ENUM. The value is either a keyword or a number, and
+-- the set of keywords grows as the epic reaches more NPC kinds. An ENUM would
+-- need an ALTER for each, and adding a value by editing a CREATE TABLE does
+-- nothing at all to a table that already exists - a trap this repo has already
+-- been caught by once (see 2026_08_24_00_overseer_give.sql).
+--
+-- WHY '' AND NOT NULL for "no opinion". Every other column on this table uses a
+-- sentinel for the same reason: mod-overseer reads these with Field::Get, and a
+-- nullable column would put a NULL check in front of every read for no gain.
+--
+-- WHAT AN AIM DOES NOT DO. It delivers TRAVEL, not TRANSACTION. A character
+-- aimed at a trainer walks to the trainer and stands in front of it. It does
+-- not train, buy, repair or sign anything - the only interaction upstream
+-- performs on arrival is its existing quest-giver branch. Every one of those
+-- verbs is its own issue, and every one of them was blocked on this.
+ALTER TABLE `overseer_roster`
+    ADD COLUMN `travel_npc` VARCHAR(32) NOT NULL DEFAULT ''
+        COMMENT 'Role keyword or creature entry this character should walk to; empty = stay with the family';

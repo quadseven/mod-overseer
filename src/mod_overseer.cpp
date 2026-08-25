@@ -152,6 +152,40 @@ constexpr uint32 TRAIN_POLL_MS = 60000;
 // standing there rather than a minute later.
 constexpr uint32 QUEST_POLL_MS = 20000;
 
+// How often a character sent to an NPC is pointed at it again (infra#2783).
+// RPG_WANDER_NPC self-expires to IDLE after statusWanderNpcDuration, which is
+// FIVE minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278) - six times
+// shorter than the thirty-minute quest lease. A walk across two zones takes
+// longer than the lease it is walking under, so the aim is not a one-shot: it
+// is renewed here, and a poll slower than the lease would mean the traveller
+// spent part of every five minutes wandering off on its own.
+constexpr uint32 TRAVEL_POLL_MS = 15000;
+
+// How close counts as arrived. INTERACTION_DISTANCE is 5.0 yards and is what
+// the game uses to decide whether a player may talk to an NPC at all; this is
+// deliberately looser, because arrival is measured against the SPAWN POINT out
+// of the creature table while the creature itself patrols away from it. Too
+// tight and the errand never reads as finished; too loose and it reads as
+// finished from across the room.
+constexpr float TRAVEL_ARRIVED_YARDS = 12.0f;
+
+// How long a character may be sent somewhere before the errand is given up on.
+// The primary release is ARRIVING; this is the backstop for a target that
+// cannot be reached at all - the far side of an ocean, inside an instance, a
+// spawn that no longer exists. Longer than two RPG leases so an aim is never
+// released merely because the lease lapsed, which is what renewal is for.
+constexpr time_t TRAVEL_BACKSTOP_SECONDS = 20 * 60;
+
+// How long travel keeps the wheel after an errand ends (PR #2840 review).
+// OnUpdate runs DriveQuests BEFORE DriveTravel, so without a grace the poll
+// that releases an arrived errand can be followed immediately by a
+// ChangeToDoQuest that wipes the WanderNpc state the bot is still standing in -
+// and upstream wants npcStayTime = 8 seconds at the NPC (NewRpgAction.h:99)
+// before it counts as having been there. Longer than one QUEST_POLL_MS plus
+// that dwell, so the last poll of the errand and the first poll of the quest
+// drive can never be the same poll. See TravelHoldsTheWheel.
+constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
+
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
 // thirty-eight times in twelve minutes and travelled 0.0 yards, because its
@@ -929,6 +963,7 @@ public:
         _partyTimer += diff;
         _trainTimer += diff;
         _questTimer += diff;
+        _travelTimer += diff;
         _eventTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
@@ -982,6 +1017,11 @@ public:
         {
             _questTimer = 0;
             DriveQuests();
+        }
+        if (_travelTimer >= TRAVEL_POLL_MS)
+        {
+            _travelTimer = 0;
+            DriveTravel();
         }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
@@ -1449,7 +1489,12 @@ private:
             // because the FALLBACK below stays leader-only: an unaimed
             // follower carrying `new rpg` is the 937-yard scatter, and the aim
             // is the only thing holding the party to one destination.
-            "SELECT name, drive_quest, `lead` FROM overseer_roster WHERE enabled = 1");
+            // `travel_npc` comes back for ONE reason: to decide whether this
+            // drive should be steering this character at all. It is never
+            // written here and never acted on beyond that decision - see the
+            // arbitration below.
+            "SELECT name, drive_quest, `lead`, travel_npc FROM overseer_roster "
+            "WHERE enabled = 1");
         if (!result)
             return;
 
@@ -1459,6 +1504,7 @@ private:
             std::string const name = fields[0].Get<std::string>();
             uint32 const aim = fields[1].Get<uint32>();
             bool const isLead = fields[2].Get<uint8>() != 0;
+            std::string const travelTarget = fields[3].Get<std::string>();
 
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot)
@@ -1467,6 +1513,76 @@ private:
             PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
             if (!botAI)
                 continue;
+
+            // The aim as this loop last saw it, so a standing complaint is made
+            // once rather than three times a minute forever. Nothing here is
+            // read as a decision: the roster row remains the only real state.
+            AimState& state = _lastAim[name];
+
+            // ---------------------------------------------- arbitration --
+            //
+            // WHO STEERS THIS CHARACTER (PR #2840 review). This drive and
+            // DriveTravel both write botAI->rpgInfo, one every twenty seconds
+            // and the other every fifteen, and left alone they take turns: a
+            // travel aim makes the status something other than RPG_DO_QUEST,
+            // so this drive re-issues ChangeToDoQuest; that makes it something
+            // other than RPG_WANDER_NPC, so DriveTravel re-issues
+            // ChangeToWanderNpc; each write resets the other errand's movement
+            // state and the character goes nowhere while looking busy. The dev
+            // roster carries a drive_quest on the leader, so this is the
+            // ordinary case and not a corner.
+            //
+            // TRAVEL WINS WHILE AN ERRAND IS OUTSTANDING - and NOT because a
+            // travel errand is "more explicit". `drive_quest` is exactly as
+            // explicit: the same council decides it and the same bridge writes
+            // it. The asymmetry that decides this is that travel is BOUNDED and
+            // this drive is not. An errand ends on arrival, and at the latest
+            // after TRAVEL_BACKSTOP_SECONDS; a quest aim is renewed by the
+            // bridge for as long as the council keeps deciding, and when no aim
+            // is set at all this drive still picks from the character's own log
+            // forever. So "quest wins" starves travel with no bound - and then
+            // the errand's own backstop releases it as "sent over twenty
+            // minutes ago and never arrived" when it was never tried, which is
+            // this epic's one unforgivable bug: a mechanism reporting something
+            // it did not observe. "Travel wins" costs the quest aim a bounded
+            // pause and makes no false statement.
+            //
+            // ONE DECISION IN ONE PLACE. TravelHoldsTheWheel is the whole of
+            // the arbitration and it is asked here and nowhere else. DriveTravel
+            // does not know this drive exists and must not learn: two functions
+            // each deferring to the other is how the next oscillation gets
+            // built.
+            if (TravelHoldsTheWheel(name, travelTarget, botAI))
+            {
+                if (!state.travelHeld)
+                {
+                    state.travelHeld = std::time(nullptr);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is on a travel errand ({}) - the quest "
+                             "drive stands down until it lands", name,
+                             travelTarget.empty() ? std::string("just released")
+                                                  : travelTarget);
+                }
+                continue;
+            }
+
+            if (state.travelHeld)
+            {
+                // THE HAND-BACK. Time spent stood down is not time the aim
+                // spent failing, so the backstop clock is carried forward over
+                // the errand instead of running through it. Without this the
+                // arbitration would rebuild the very bug this PR fixes on the
+                // travel side: a quest aim held across a long errand released
+                // as unreachable on the first poll after the hand-back, having
+                // been given no chance to land.
+                time_t const handedBack = std::time(nullptr);
+                if (state.since)
+                    state.since += handedBack - state.travelHeld;
+                state.travelHeld = 0;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is off its travel errand - the quest drive "
+                         "picks up again", name);
+            }
 
             // What it is working on RIGHT NOW, which is a different question
             // from whether it is questing at all. RPG_DO_QUEST self-expires
@@ -1491,10 +1607,6 @@ private:
                     working = doQuest->questId;
             }
 
-            // The aim as this loop last saw it, so a standing complaint is made
-            // once rather than three times a minute forever. Nothing here is
-            // read as a decision: the roster row remains the only real state.
-            AimState& state = _lastAim[name];
             uint32 const previous = state.questId;
             bool const aimChanged = aim != previous;
             if (aimChanged)
@@ -1931,6 +2043,470 @@ private:
 
         botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
         return true;
+    }
+
+
+    // ---------------------------------------------------------------- travel --
+    //
+    // THE ONE VERB THE WHOLE EPIC WAS WAITING ON (infra#2783). Before this the
+    // family could walk to a quest objective and nowhere else: no trainer, no
+    // vendor, no repair, no bank, no guild-charter petitioner, no tabard
+    // designer. Not because those NPCs were disallowed - mod-playerbots'
+    // allowed-target list at PossibleRpgTargetsValue.cpp:23-46 is one
+    // unconditional block and contains all of them - but because the only way
+    // into RPG_WANDER_NPC took no argument (NewRpgInfo.h:104), so the bot always
+    // chose its own NPC. One missing parameter blocked #2757, #2829, #2830,
+    // #2831 and the `town run` and `train` modes of #2834 at once.
+    //
+    // WHAT IS DELIBERATELY NOT HERE: the transaction. Arriving is all this does.
+    // Upstream's only interaction on arrival is its existing quest-giver branch
+    // (NewRpgAction.cpp:398-399), so a character aimed at a trainer walks there
+    // and stands in front of it, and learns nothing. Training, buying, repairing
+    // and signing a charter are each their own issue - and each of them was
+    // blocked on being unable to get there at all.
+
+    // The keywords the roster may name, and the NPC flag each one matches.
+    // DUPLICATED, ON PURPOSE AND UNAVOIDABLY, in
+    // production/scripts/wow-overseer/travel.py: a compiled module and a Python
+    // process share no schema. tests/test_travel_npc.py compares the two tables
+    // in BOTH directions, because a keyword one side accepts and the other
+    // silently ignores is the written-and-unread failure of #2776 wearing a new
+    // hat.
+    struct TravelRole
+    {
+        char const* keyword;
+        uint32 npcFlag;
+    };
+    static std::vector<TravelRole> const& TravelRoles()
+    {
+        static std::vector<TravelRole> const roles = {
+            {"trainer",            UNIT_NPC_FLAG_TRAINER},
+            {"class trainer",      UNIT_NPC_FLAG_TRAINER_CLASS},
+            {"profession trainer", UNIT_NPC_FLAG_TRAINER_PROFESSION},
+            {"vendor",             UNIT_NPC_FLAG_VENDOR},
+            {"repair",             UNIT_NPC_FLAG_REPAIR},
+            {"banker",             UNIT_NPC_FLAG_BANKER},
+            {"guild banker",       UNIT_NPC_FLAG_GUILD_BANKER},
+            {"auctioneer",         UNIT_NPC_FLAG_AUCTIONEER},
+            {"petitioner",         UNIT_NPC_FLAG_PETITIONER},
+            {"tabard designer",    UNIT_NPC_FLAG_TABARDDESIGNER},
+            {"innkeeper",          UNIT_NPC_FLAG_INNKEEPER},
+            {"flight master",      UNIT_NPC_FLAG_FLIGHTMASTER},
+            {"stable master",      UNIT_NPC_FLAG_STABLEMASTER},
+        };
+        return roles;
+    }
+
+    // Every flag any keyword can ask for, so the index can drop the ~99% of
+    // spawns that are nothing anybody can be sent to.
+    static uint32 TravelAnyFlag()
+    {
+        uint32 mask = 0;
+        for (TravelRole const& role : TravelRoles())
+            mask |= role.npcFlag;
+        return mask;
+    }
+
+    // WHY AN INDEX AND NOT A QUERY, and why it is built here rather than in
+    // Python. Three reasons, in order of how much they matter:
+    //
+    //   1. NEAREST DEPENDS ON WHERE THE CHARACTER IS STANDING, which changes as
+    //      he walks and is known only inside the worldserver. A target chosen
+    //      out of band is a target chosen for where he was, not where he is.
+    //   2. NO SCHEMA GUESS. sObjectMgr already holds every creature spawn, and
+    //      this reads it through exactly the members mod-playerbots itself
+    //      reads at the pinned SHA - creatureData.id, .mapid, .posX/.posY/.posZ
+    //      (TravelMgr.cpp:4648-4661) - so nothing here depends on a column name
+    //      in acore_world.creature being what we remember it being. The C++
+    //      only compiles on a push to main; a guessed member name costs the
+    //      whole team forty-five minutes to find out about.
+    //   3. IT IS A LOOP OVER A QUARTER OF A MILLION SPAWNS. Doing that per
+    //      character per poll, on the world thread, to answer a question whose
+    //      answer never changes, would be a real cost for no gain. Built once,
+    //      lazily, on the first errand rather than at startup - a world where
+    //      nobody is ever sent anywhere pays nothing.
+    void BuildTravelIndex()
+    {
+        if (_travelIndexBuilt)
+            return;
+        _travelIndexBuilt = true;
+
+        uint32 const wanted = TravelAnyFlag();
+        for (auto const& itr : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureData const& data = itr.second;
+            CreatureTemplate const* creatureTemplate = sObjectMgr->GetCreatureTemplate(data.id);
+            if (!creatureTemplate)
+                continue;
+
+            // THE SPAWN'S OWN FLAGS WIN WHERE IT HAS THEM. `creature.npcflag`
+            // is a per-spawn override and 0 means "use the template", which is
+            // the overwhelmingly common case (CreatureData.h:383 and :200). A
+            // guard that read only the template would index a spawn that is
+            // deliberately NOT a vendor as one, and send somebody to it.
+            uint32 const npcFlags = data.npcflag ? data.npcflag : creatureTemplate->npcflag;
+            if (!(npcFlags & wanted))
+                continue;
+
+            TravelSpawn spawn;
+            spawn.entry = data.id;
+            spawn.mapId = data.mapid;
+            spawn.x = data.posX;
+            spawn.y = data.posY;
+            spawn.z = data.posZ;
+            spawn.npcFlags = npcFlags;
+            _travelSpawns.push_back(spawn);
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: travel index built - {} spawns the family can be sent to",
+                 static_cast<uint32>(_travelSpawns.size()));
+    }
+
+    // Turn a roster value into a specific spawn near this character.
+    //
+    // SAME MAP ONLY, and that is a refusal rather than a limitation to fix
+    // later. MoveFarTo paths through PathGenerator, and there is no navmesh
+    // across an ocean or into an instance - the same reason patch 0003 keeps
+    // upstream's MapId check while removing its zone check. A cross-continent
+    // errand needs a boat, and a character that accepted one would fail far
+    // more confusingly than one that refuses.
+    bool ResolveTravelTarget(Player* bot, std::string const& target,
+                             uint32& outEntry, WorldPosition& outPos)
+    {
+        BuildTravelIndex();
+
+        uint32 wantedEntry = 0;
+        uint32 wantedFlag = 0;
+        bool const numeric = !target.empty() &&
+                             target.find_first_not_of("0123456789") == std::string::npos;
+        if (numeric)
+        {
+            wantedEntry = static_cast<uint32>(std::strtoul(target.c_str(), nullptr, 10));
+            if (!wantedEntry)
+                return false;
+        }
+        else
+        {
+            for (TravelRole const& role : TravelRoles())
+            {
+                if (target == role.keyword)
+                {
+                    wantedFlag = role.npcFlag;
+                    break;
+                }
+            }
+            if (!wantedFlag)
+                return false;
+        }
+
+        uint32 const mapId = bot->GetMapId();
+        float bestDist = 0.f;
+        bool found = false;
+        for (TravelSpawn const& spawn : _travelSpawns)
+        {
+            if (spawn.mapId != mapId)
+                continue;
+            if (wantedEntry ? spawn.entry != wantedEntry : !(spawn.npcFlags & wantedFlag))
+                continue;
+
+            float const dist = bot->GetDistance2d(spawn.x, spawn.y);
+            if (!found || dist < bestDist)
+            {
+                found = true;
+                bestDist = dist;
+                outEntry = spawn.entry;
+                outPos = WorldPosition(spawn.mapId, spawn.x, spawn.y, spawn.z);
+            }
+        }
+        return found;
+    }
+
+    // Only `new rpg` walks a character to an NPC: it owns the `wander npc
+    // status` trigger (NewRpgStrategy.cpp), and NewRpgWanderNpcAction is
+    // reachable through nothing else. The family carry it on the LEADER alone,
+    // because five characters each free-roaming is the 937-yard scatter that
+    // taking it off the followers cured - so a follower cannot be sent
+    // anywhere, and travels by following. HasStrategy is PlayerbotAI.h:416.
+    //
+    // Named once because two callers need the same answer: DriveTravel, which
+    // refuses such an errand out loud, and the arbitration below, which must
+    // NOT stand the quest drive down for an errand that will never move anyone.
+    bool CanBeSentToNpc(PlayerbotAI* botAI)
+    {
+        return botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+    }
+
+    // THE ARBITRATION between this drive and DriveQuests, in full. DriveQuests
+    // is the only caller and carries the argument for the direction; what is
+    // here is the two ways travel holds the wheel.
+    bool TravelHoldsTheWheel(std::string const& name, std::string const& travelTarget,
+                             PlayerbotAI* botAI)
+    {
+        // 1. AN ERRAND IS OUTSTANDING. Not merely "the column is set": an aim
+        //    on a character that cannot act on it moves nobody, and standing
+        //    the quest drive down for one would quietly take an unaimable
+        //    follower out of the family's questing until somebody noticed the
+        //    column. DriveTravel leaves such a row set on purpose and says so.
+        if (!travelTarget.empty() && CanBeSentToNpc(botAI))
+            return true;
+
+        // 2. THE ERRAND HAS JUST ENDED, and the hand-back must not land on the
+        //    tick that ended it. DriveQuests runs BEFORE DriveTravel inside one
+        //    OnUpdate, so without this the poll that releases an arrived errand
+        //    is followed by a ChangeToDoQuest that wipes the WanderNpc state the
+        //    character is still standing in - before upstream has finished the
+        //    eight seconds at the NPC that count as having got there
+        //    (npcStayTime, NewRpgAction.h:99). That is the oscillation above in
+        //    miniature: it happens once and then stops, which makes it harder
+        //    to see rather than less real.
+        //
+        //    A grace keyed by name and swept when it lapses is the shape the
+        //    repick memory's give-up set already uses (infra#2801): a refusal
+        //    that outlives its reason is its own bug.
+        auto const it = _travelHandback.find(name);
+        if (it == _travelHandback.end())
+            return false;
+        if (std::time(nullptr) - it->second < TRAVEL_HANDBACK_SECONDS)
+            return true;
+        _travelHandback.erase(it);
+        return false;
+    }
+
+    // Give the errand back. THE ONE TERMINAL PATH - every release in DriveTravel
+    // goes through here, which is why it does three things and not one.
+    //
+    // Esc() rather than a bare interpolation for the same reason every other
+    // write in this file uses it: the name came out of a table a person edits.
+    void ClearTravelAim(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
+        // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
+        // twenty-minute backstop, and a state entry outliving its errand is
+        // inherited by the NEXT errand at the same target - which is then
+        // released as unreachable on its first poll, having walked nowhere.
+        _travelState.erase(name);
+        // And the quest drive keeps its hands off for a moment: see
+        // TravelHoldsTheWheel, case 2.
+        _travelHandback[name] = std::time(nullptr);
+    }
+
+    // An errand can also end without this loop touching it: the bridge owns the
+    // column and clears it when it re-aims the family. Such a row simply stops
+    // coming back from the query, so nothing INSIDE the loop can see it go, and
+    // its state entry would sit there with a running clock waiting to poison the
+    // next errand. Comparing the map against the rows that did come back is the
+    // only place that absence is visible.
+    void PruneTravelState(std::set<std::string> const& stillAimed)
+    {
+        for (auto it = _travelState.begin(); it != _travelState.end();)
+        {
+            if (stillAimed.count(it->first))
+            {
+                ++it;
+                continue;
+            }
+            // The character may be mid-walk under an aim nobody is renewing any
+            // more, so this is a release like any other and takes the same grace.
+            _travelHandback[it->first] = std::time(nullptr);
+            it = _travelState.erase(it);
+        }
+    }
+
+    void DriveTravel()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, travel_npc FROM overseer_roster "
+            "WHERE enabled = 1 AND travel_npc <> ''");
+        if (!result)
+        {
+            // No errands anywhere, so nothing this loop remembers is still true.
+            PruneTravelState(std::set<std::string>());
+            return;
+        }
+
+        std::set<std::string> stillAimed;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            std::string const target = fields[1].Get<std::string>();
+            // Recorded before any refusal below, because the ROW still exists:
+            // the prune is about rows that vanished, not about characters this
+            // loop declined to move.
+            stillAimed.insert(name);
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot)
+                continue;
+
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            if (!botAI)
+                continue;
+
+            TravelState& state = _travelState[name];
+            if (state.target != target)
+            {
+                state.target = target;
+                state.since = std::time(nullptr);
+                state.entry = 0;
+                state.pinned = false;
+                state.arrived = false;
+            }
+
+            // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
+            // this is the one failure that would look exactly like success from
+            // the outside: the column is set, the module read it, and nothing
+            // moves. Only `new rpg` runs NewRpgWanderNpcAction - it is the
+            // strategy that owns the `wander npc status` trigger
+            // (NewRpgStrategy.cpp) - and the family deliberately carry it on the
+            // LEADER ALONE, because five characters each free-roaming is the
+            // 937-yard scatter that taking it off the followers cured. So a
+            // follower cannot be sent anywhere; it arrives by following. Say so
+            // once per errand rather than renewing an aim nothing will read.
+            // CanBeSentToNpc is the shared predicate the arbitration also
+            // asks, so this refusal and that decision can never disagree.
+            if (!CanBeSentToNpc(botAI))
+            {
+                if (!state.arrived)
+                {
+                    state.arrived = true;  // "said already", not "got there"
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' was sent to '{}' but does not carry `new rpg` - "
+                             "nothing walks it anywhere. Followers travel by following the "
+                             "leader; aim the leader instead", name, target);
+                }
+                continue;
+            }
+
+            // THE RESOLVED SPAWN IS PINNED FOR THE LIFE OF THE ERRAND (PR
+            // #2840 review). ResolveTravelTarget picks the nearest spawn of the
+            // role FROM WHERE THE CHARACTER NOW STANDS, so walking toward one
+            // trainer can bring a different one nearer and hand back a new entry
+            // mid-walk - which re-issues the aim, resets `lastReach` and
+            // `startT`, and prints "sent to" a second time. An errand means one
+            // NPC, so it is chosen once. A map change drops the pin, because a
+            // spawn on a map the character has left is not reachable from here
+            // and ResolveTravelTarget would refuse it anyway.
+            uint32 entry = 0;
+            WorldPosition pos;
+            if (state.pinned && state.mapId == bot->GetMapId())
+            {
+                entry = state.entry;
+                pos = WorldPosition(state.mapId, state.x, state.y, state.z);
+            }
+            else if (!ResolveTravelTarget(bot, target, entry, pos))
+            {
+                // Said unconditionally: the errand is released on this line and
+                // its state erased with it, so there is no second poll of this
+                // errand to repeat it.
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was sent to '{}' and there is no such spawn on "
+                         "map {} - releasing the errand", name, target,
+                         static_cast<uint32>(bot->GetMapId()));
+                ClearTravelAim(name);
+                continue;
+            }
+
+            // ARRIVAL IS THE PRIMARY RELEASE, measured against the spawn point
+            // rather than read out of the bot's own state. Upstream clears
+            // `npcOrGo` eight seconds after reaching an NPC (npcStayTime,
+            // NewRpgAction.h:99), so the bot's state stops naming the target
+            // almost immediately and cannot be asked "did you get there".
+            // Distance can be, and it is the thing the errand actually means.
+            if (bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()) <= TRAVEL_ARRIVED_YARDS)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' reached '{}' (creature {}) - errand done, releasing",
+                         name, target, entry);
+                ClearTravelAim(name);
+                continue;
+            }
+
+            // BACKSTOP. An errand that can never land must not pin a character
+            // to it forever - that is a character standing still, which is the
+            // state this whole epic exists to stop mistaking for a working one.
+            if (state.since && std::time(nullptr) - state.since > TRAVEL_BACKSTOP_SECONDS)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was sent to '{}' over {} minutes ago and never "
+                         "arrived - releasing the errand as unreachable", name, target,
+                         static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
+                ClearTravelAim(name);
+                continue;
+            }
+
+            // THE RE-ISSUE GUARD, and the #2799 lesson in the shape this status
+            // needs it. Three cases have to come apart, and only one of them
+            // wants a write:
+            //
+            //   1. ALREADY WALKING TO THIS NPC -> do nothing. The common case,
+            //      and the one that breaks loudly if it is got wrong:
+            //      ChangeToWanderNpc rebuilds the variant, which resets
+            //      `lastReach` (so a character standing at the trainer never
+            //      finishes the eight seconds that count as having arrived) and
+            //      resets `startT` (so the five-minute lease never expires and
+            //      the errand loses its only bound). Restarting the walk on
+            //      every poll is also precisely what MoveFarTo's own comment
+            //      warns about - a bot that oscillates instead of arriving.
+            //   2. A DIFFERENT NPC -> re-issue. `npcEntry` names the target, so
+            //      a changed aim is simply a changed entry.
+            //   3. THE AIM WAS DROPPED and the errand is still outstanding ->
+            //      re-issue the same target deliberately. Upstream drops it by
+            //      letting the five-minute lease lapse to IDLE, at which point
+            //      the status is no longer RPG_WANDER_NPC and the test below
+            //      falls through to the write.
+            //
+            // WHAT MAKES CASE 3 TELLABLE AT ALL. For the quest aim, "the target
+            // is empty" meant both "never aimed" and "arrived, and it cleared".
+            // Here it cannot: the eight-second consume in
+            // NewRpgWanderNpcAction clears `npcOrGo` and NEVER `npcEntry`, and
+            // patch 0005 re-resolves `npcEntry` on the next tick. Two
+            // alternatives were rejected. Reading `lastReach` cannot answer it,
+            // because `lastReach` is reset by the very re-issue being decided
+            // about. Keeping the answer in module-side state cannot either,
+            // because a worldserver restart or a relog loses it and an errand
+            // has to survive both. A separate, never-consumed field makes the
+            // state SAY which case it is instead of leaving it to be inferred.
+            if (botAI->rpgInfo.GetStatus() == RPG_WANDER_NPC)  // NewRpgInfo.h:99
+            {
+                if (NewRpgInfo::WanderNpc const* wander =
+                        std::get_if<NewRpgInfo::WanderNpc>(&botAI->rpgInfo.data))
+                {
+                    if (wander->npcEntry == entry)
+                        continue;
+                }
+            }
+
+            // patches/mod-playerbots/0005-wander-npc-can-be-aimed.patch adds this
+            // overload. The no-argument ChangeToWanderNpc() upstream ships takes
+            // no target, which is the entire reason this feature did not exist.
+            botAI->rpgInfo.ChangeToWanderNpc(entry, pos);
+
+            // Pinned to what it was actually SENT to, not to what was
+            // resolved: a resolve that never reached ChangeToWanderNpc is not
+            // this errand's target. The same test gates the log, so "sent to" is
+            // printed once per errand rather than once per poll.
+            if (!state.pinned || state.entry != entry)
+            {
+                state.pinned = true;
+                state.entry = entry;
+                // The spawn is on the character's own map by construction:
+                // ResolveTravelTarget refuses every other one.
+                state.mapId = bot->GetMapId();
+                state.x = pos.GetPositionX();
+                state.y = pos.GetPositionY();
+                state.z = pos.GetPositionZ();
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' sent to '{}' - creature {} at {:.0f} yards",
+                         name, target, entry,
+                         bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
+            }
+        } while (result->NextRow());
+
+        PruneTravelState(stillAimed);
     }
 
     // Teach the roster what a character of its level would already know.
@@ -3677,6 +4253,49 @@ private:
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
+    uint32 _travelTimer = 0;
+
+    // ---------------------------------------------------------------- travel --
+    //
+    // One spawn point of one NPC the family can be sent to. Built once, from
+    // sObjectMgr, and then only read - see BuildTravelIndex for why it is a
+    // cache and not a query.
+    struct TravelSpawn
+    {
+        uint32 entry{0};
+        uint32 mapId{0};
+        float x{0.f};
+        float y{0.f};
+        float z{0.f};
+        uint32 npcFlags{0};
+    };
+    std::vector<TravelSpawn> _travelSpawns;
+    bool _travelIndexBuilt = false;
+
+    // What DriveTravel knew about each errand last time round, so an aim that
+    // can never land is given up on rather than renewed forever, and so
+    // "arrived" is announced once instead of every poll. World thread only -
+    // DriveTravel runs from OnUpdate - so unguarded, like _lastAim. Lost on
+    // restart, which only restarts the backstop clock.
+    struct TravelState
+    {
+        std::string target;   // the column value as this loop last saw it
+        time_t since{0};      // when that target was first seen
+        uint32 entry{0};      // the spawn it resolved to
+        bool pinned{false};   // ...and which it is NOT resolved away from again
+        uint32 mapId{0};      // where that spawn is, so a map change drops the pin
+        float x{0.f};
+        float y{0.f};
+        float z{0.f};
+        bool arrived{false};  // announced already
+    };
+    std::map<std::string, TravelState> _travelState;
+    // When travel last let go of a character, so the quest drive does not pick
+    // it up on the same tick the errand ended. Written by ClearTravelAim and by
+    // PruneTravelState - every way an errand can end - and read only by
+    // TravelHoldsTheWheel, which sweeps an entry once it lapses. World thread
+    // only, like everything else on this loop.
+    std::map<std::string, time_t> _travelHandback;
     // What DriveQuests knew about each traveller's aim last time round, so a
     // standing complaint is logged once instead of three times a minute, an
     // aim that never lands can be given up on, and a turn-in of the WRONG
@@ -3689,6 +4308,10 @@ private:
         uint32 questId{0};      // the aim as this loop last saw it
         time_t since{0};        // when that aim was first seen
         uint32 lastWorking{0};  // the quest RPG_DO_QUEST last named
+        // When the travel drive took the wheel, or 0 while this drive has it.
+        // Both a "said it once" flag for the stand-down line and the amount the
+        // backstop clock is carried forward on the hand-back.
+        time_t travelHeld{0};
         // THE RE-PICK MEMORY (infra#2801). One concept, kept together and
         // NOT reset when the aim is: releasing an aim says nothing about
         // which quests are reachable, and an earlier revision cleared this
