@@ -1184,6 +1184,209 @@ private:
         }
 
         group->BroadcastGroupUpdate();
+
+        // Runs LAST on purpose: it hands out the leader that the block above
+        // has just finished correcting.
+        KeepRosterFollowing(group, present);
+    }
+
+    // Give the followers somebody to follow (infra#2818).
+    //
+    // WHY `follow` HAS NEVER MOVED ANYBODY. It is on all five and it is not
+    // broken. It resolves through a formation, and every formation resolves
+    // through the MASTER. FormationValue's default is ChaosFormation
+    // (Formations.cpp:506-507); ChaosFormation is a MoveAheadFormation and does
+    // not override GetTargetName, so it inherits the base's `return ""`
+    // (Formations.h:23), which sends FollowAction::Execute down the location
+    // branch (FollowActions.cpp:218) rather than the named-target one. That
+    // branch calls GetLocation(), which opens
+    //
+    //     Player* master = GetMaster();
+    //     if (!ValidateTargetContext(master, bot))
+    //         return Formation::NullLocation;
+    //
+    // (Formations.cpp:50-54, and again inside ChaosFormation::
+    // GetLocationInternal at Formations.cpp:140-143). No master is a null
+    // location, and Execute returns false (FollowActions.cpp:219-220). Nobody
+    // has ever followed anybody. What looked like cohesion was the whole party
+    // standing still: measured live, max pairwise spread 935 yards and rising,
+    // with no restoring force of any kind.
+    //
+    // WHY THE FAMILY CANNOT ACQUIRE ONE BY ITSELF. UpdateAIGroupMaster() runs
+    // unconditionally from UpdateAI every tick (PlayerbotAI.cpp:397) and
+    // rechecks at PlayerbotAI.cpp:437 - but it only ever assigns what
+    // FindNewMaster() hands back, and FindNewMaster returns the group leader
+    // only when the leader is NOT a bot or IS a selfbot
+    // (PlayerbotAI.cpp:4420), a member on the same test
+    // (PlayerbotAI.cpp:4431), and otherwise nullptr (PlayerbotAI.cpp:4450).
+    // Five bots, none of them a selfbot while nobody is logged in, so it
+    // returns nullptr and the `if (newMaster)` guard at PlayerbotAI.cpp:440
+    // assigns nothing AND clears nothing.
+    //
+    // WHY AN EXPLICIT MASTER STICKS. That same nullptr is what makes this hold:
+    // the recheck fires every tick for a bot master, calls FindNewMaster, gets
+    // nullptr, and leaves `master` exactly as it found it. The assignment below
+    // is made once per poll and is not overwritten in between.
+    //
+    // THE OBSERVER EFFECT THAT HID ALL OF THIS. With SelfBotLevel = 3 a human
+    // logging in as the leader IS a selfbot, IsSelfBot(groupLeader) goes true,
+    // and every follower is handed him with `+follow` on the spot
+    // (PlayerbotAI.cpp:440-448). Every in-game verification passed for exactly
+    // as long as somebody was watching, and the bug was live the instant the
+    // client closed. Nothing about this may be checked with anyone logged in.
+    //
+    // `+follow` IS GRANTED WITH THE MASTER, BECAUSE UPSTREAM TREATS THEM AS ONE
+    // ACT. Its own assignment sets the master and adds the strategy in the same
+    // breath (PlayerbotAI.cpp:443, then :448). Doing only the first half leaves
+    // a bot holding a master it has no reason to walk toward, and this poll
+    // would log "now follows" for a character that cannot - a log line that
+    // reads as success while the feature is inert, which is the exact failure
+    // infra#2819 exists to stamp out. So the strategy is checked every poll,
+    // not only when the master changes, and its absence is said out loud.
+    //
+    // NO ResetStrategies(), AND NOT FOR THE REASON IT FIRST APPEARS. Upstream
+    // calls it alongside its own assignment (PlayerbotAI.cpp:444). The obvious
+    // worry - that a reset hands followers `new rpg` back at relevance 3.0-11.0
+    // against follow's 1.0 and reproduces the 937-yard scatter of infra#2812 -
+    // is WRONG, and it is worth knowing why, because it is the difference
+    // between a nuisance and a re-run of that scatter: `new rpg` is added only
+    // for a bot that is ungrouped or is the group leader (AiFactory.cpp:602),
+    // itself behind an IsRandomBot gate (AiFactory.cpp:591). A grouped follower
+    // passes neither. Nor would a reset strip `follow`: it is in the default
+    // non-combat set for every non-battleground bot (AiFactory.cpp:584), and
+    // ResetStrategies rebuilds from exactly that (PlayerbotAI.cpp:1872-1874).
+    //
+    // The real reason to leave it alone is smaller and duller: a reset discards
+    // every OTHER strategy the bridge has applied and rebuilds from class
+    // defaults, which is churn this pass has no need of. Only the master was
+    // missing, so only the master is set - and the one strategy that must
+    // accompany it is added, never removed.
+    //
+    // WHAT UPSTREAM DOES DO ON LOGOUT. When the person playing the leader logs
+    // out, RandomPlayerbotMgr::OnPlayerLogout clears the followers' master
+    // (RandomPlayerbotMgr.cpp:2515) AND calls ResetStrategies on each of them
+    // (RandomPlayerbotMgr.cpp:2518) - every single time the client closes,
+    // which is the precise moment this feature exists to cover. By the two
+    // citations above that leaves `follow` present and `new rpg` absent, so the
+    // next poll re-points them at the leader and the family keeps following.
+    // Other bridge-applied strategy state is lost until the bridge's next cycle.
+    //
+    // NO DANGLING MASTER, AND NOT BY LUCK. `master` is a raw Player*; held
+    // across a logout it is a use-after-free on the next FollowAction tick,
+    // which dereferences it (FollowActions.cpp:104). Upstream already clears
+    // it: WorldSession::LogoutPlayer calls OnPlayerbotLogout for any player
+    // (WorldSession.cpp:721 - ahead of the `redirecting` guard that gates the
+    // other logout hook at WorldSession.cpp:850-857), which reaches
+    // RandomPlayerbotMgr::OnPlayerLogout (Playerbots.cpp:457), which clears the
+    // master of every bot in its PlayerBotMap that pointed at the departing
+    // player (RandomPlayerbotMgr.cpp:2509-2515). These five ARE in that map:
+    // KeepRosterOnline logs them in with sRandomPlayerbotMgr.AddPlayerBot and a
+    // masterAccountId of 0, which routes the login callback to
+    // RandomPlayerbotMgr::instance() (PlayerbotMgr.cpp:186), OnBotLoginOperation
+    // resolves the same holder (PlayerbotOperations.h:499), and OnBotLogin
+    // inserts them (PlayerbotMgr.cpp:468). Bot logouts take the same road:
+    // LogoutPlayerBot calls botWorldSessionPtr->LogoutPlayer(true)
+    // (PlayerbotMgr.cpp:408). This module therefore keeps no Player* of its own
+    // between polls - the guarantee covers PlayerbotAI::master and nothing else.
+    //
+    // NO CHANGE TO COMMAND DELIVERY. Commands are delivered through the
+    // character's own session with the bot itself as the speaker, and
+    // PlayerbotSecurity::CheckLevelFor short-circuits on `from == bot`
+    // (PlayerbotSecurity.cpp:178) before the master is consulted at all. A bot
+    // that now has a master is no more and no less commandable than before.
+    void KeepRosterFollowing(Group* group, std::vector<Player*> const& present)
+    {
+        if (!group)
+            return;
+
+        // The leader the GROUP actually has, not the one the roster prefers.
+        // Those differ for one poll every time leadership drifts, and a family
+        // following the character that is about to stop leading is a party
+        // split in two for thirty seconds.
+        Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
+        if (!leader)
+            return;
+
+        // THE LEADER FOLLOWS NOBODY. RandomPlayerbotMgr::OnPlayerLogin hands a
+        // master to every bot grouped with an arriving character when its own
+        // master is null or is a bot (RandomPlayerbotMgr.cpp:2582-2586), and
+        // that includes the leader. A leader following one of his own followers
+        // is a cohesion loop with no fixed point: the party converges on
+        // nothing and drifts as a clump. A human driving this character is a
+        // selfbot, whose master is himself, so HasGameClientMaster() is true
+        // and he is left alone.
+        if (PlayerbotAI* leaderAI = GET_PLAYERBOT_AI(leader))
+        {
+            if (leaderAI->GetMaster() && !leaderAI->HasGameClientMaster())
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' leads, so he follows nobody", leader->GetName());
+                leaderAI->SetMaster(nullptr);
+            }
+        }
+
+        for (Player* p : present)
+        {
+            if (p == leader)
+                continue;
+            // `present` is the roster; a member left out because the party was
+            // full is not in this group and must not be pointed at its leader.
+            if (p->GetGroup() != group)
+                continue;
+
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(p);
+            if (!botAI)
+                continue;   // somebody is sitting at this one; nothing to set
+
+            // A HUMAN AT THE KEYBOARD WINS, and owns this character outright -
+            // master and strategies both. HasGameClientMaster() is upstream's
+            // own test for "the master is a real player or a selfbot" -
+            // `return IsRealPlayer(master) || IsSelfBot(master);`
+            // (PlayerbotAI.cpp:4459, declared public at PlayerbotAI.h:544). It
+            // is null-safe both ways: IsRealPlayer null-checks
+            // (PlayerbotAI.cpp:4394) and IsSelfBot goes through
+            // GET_PLAYERBOT_AI (PlayerbotAI.cpp:4400). Without this, the poll
+            // would take the family back off the person playing every thirty
+            // seconds, forever.
+            if (botAI->HasGameClientMaster())
+                continue;
+
+            // SetMaster is public - PlayerbotAI.h:571, inside the `public:`
+            // block opened at PlayerbotAI.h:386 - so this needs no patch to the
+            // pinned tree. Assigned only when it is actually wrong: saying "now
+            // follows" every thirty seconds would stop the line being evidence
+            // of anything.
+            if (botAI->GetMaster() != leader)
+            {
+                botAI->SetMaster(leader);
+                LOG_INFO("module.overseer", "overseer: '{}' now follows '{}'",
+                         p->GetName(), leader->GetName());
+            }
+
+            // CHECKED EVERY POLL, NOT ONLY WHEN THE MASTER CHANGES. A follow
+            // strategy that goes missing under a master that is already correct
+            // would otherwise never be noticed, and that is precisely the
+            // silently-inert case: a master assigned, nothing following it, and
+            // a log that said "now follows" once and looked fine ever after.
+            //
+            // WARN, not INFO, and granted rather than assumed. `follow` is an
+            // AiFactory default for every non-battleground bot
+            // (AiFactory.cpp:584), so its absence means something took it off.
+            // Adding it silently would paper over that; refusing to add it
+            // would leave the master pointing at nobody. So: add it, and say
+            // that it had to be added. HasStrategy is PlayerbotAI.h:416 and
+            // ChangeStrategy PlayerbotAI.h:407, both public; the "+name" form
+            // and the BOT_STATE_NON_COMBAT state are upstream's own pairing at
+            // PlayerbotAI.cpp:448.
+            if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' had a master but no follow strategy - granting "
+                         "it, because a master nobody walks toward is not cohesion",
+                         p->GetName());
+                botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+            }
+        }
     }
 
     // Point the roster at the quests they keep talking about.
