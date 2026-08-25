@@ -1,0 +1,72 @@
+-- mod-overseer: a finished command row says whether the BOT CHANGED
+-- (infra#2819, part of infra#2597).
+--
+-- WHAT WAS WRONG. `delivered` was written the instant
+-- PlayerbotAI::HandleCommand accepted the row. That is not when the command
+-- acts. A whispered command lands in PlayerbotAI::chatCommands
+-- (PlayerbotAI.cpp:1107) and is drained on the bot's next AI tick by
+-- HandleCommands (PlayerbotAI.cpp:553-588), so `delivered` means "the row was
+-- handed over" and nothing at all about the bot.
+--
+-- The case that forced this:
+--
+--     4049  01:42:57  Ugga  nc -new rpg  delivered
+--     4184  01:52:57  Ugga  nc -new rpg  delivered
+--     01:57:17  probe: Ugga still has `new rpg`
+--
+-- Both rows read `delivered`. Her strategy did not change either time. Three
+-- other characters got the identical command in the identical batch and it
+-- worked for all three, both times. The worldserver log across the whole
+-- window contained only `holding` lines - the module logged the command it
+-- HELD and said nothing about the one it SENT. So the queue reported success,
+-- the log reported nothing, and a deterministic, twice-reproduced failure was
+-- not merely hard to diagnose but unobservable. WHY it happens is still
+-- unknown and this migration does not claim otherwise; what changes is that
+-- the next occurrence writes a row that looks different from the ones that
+-- worked.
+--
+-- THE THREE-WAY SPLIT.
+--
+--   delivered  Carried out, with nothing to read back: chat, gm, probe, give,
+--              share, and any bot command with no checkable post-condition.
+--              ITS MEANING IS UNCHANGED, which is why nothing renames it -
+--              every row already in this table stays correct, and the
+--              worldserver image and the bridge image (which read this column
+--              from Python) can deploy in either order.
+--   applied    A strategy command - `nc +x`, `nc -x`, `co +x`, `co -x` -
+--              whose effect was READ BACK off the bot's own live engine and
+--              holds. The first status in this queue's history that has ever
+--              meant "the bot changed".
+--   unchanged  The bot accepted it and its live strategy list is the same as
+--              before. NOT an error: nothing failed, nothing happened. This
+--              is what rows 4049 and 4184 would have read. `result` carries
+--              the lists the verdict was made against, so the diagnosis needs
+--              no second round trip to a probe.
+--   verifying  In flight, between the hand-off and the read-back. A row sits
+--              here for at most VERIFY_GRACE_MS (mod_overseer.cpp) and
+--              resolves as soon as the post-condition holds. The bridge does
+--              not report it, exactly as it does not report 'claimed', and
+--              sweeps it to 'error' if a worldserver restart loses the
+--              in-memory read-back that would have finished it.
+--
+-- WHY THIS IS AN ALTER, AND WHY IT APPENDS.
+--
+-- Two separate traps in one column.
+--
+--   * CREATE TABLE IF NOT EXISTS is a no-op against a table that already
+--     exists, so adding a value by editing 2026_08_21_00_overseer.sql would
+--     do nothing whatsoever to the live table. That has bitten this codebase
+--     twice.
+--   * MySQL stores an ENUM as the ORDINAL of its value, not the string.
+--     Inserting 'applied' between 'delivered' and 'error' would silently
+--     relabel every 'error' row ever written as 'applied' - a rewrite of
+--     history with no error and no log line. The four existing values
+--     therefore keep their exact positions and the three new ones are
+--     APPENDED, which is index-only and touches no row.
+--
+-- Applied once by dbimport, which records it in acore_characters.updates.
+
+ALTER TABLE `overseer_command`
+  MODIFY COLUMN `status`
+    ENUM('pending','claimed','delivered','error','verifying','applied','unchanged')
+    NOT NULL DEFAULT 'pending';

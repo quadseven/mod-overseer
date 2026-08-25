@@ -29,6 +29,15 @@
  *                     (AcceptQuestAction.cpp:139). Neither divider nor packet
  *                     is touched here; see 2026_08_24_03_overseer_share.sql.
  *
+ *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
+ *     row out. It has never meant the BOT CHANGED, because a whispered
+ *     command is only queued when HandleCommand accepts it and acts a tick
+ *     later - and it was read as "applied" anyway, for a whole night, by two
+ *     people. So a strategy command (`nc +x`, `nc -x`, `co +x`, `co -x`) now
+ *     parks in `verifying`, its effect is read back off the live engine, and
+ *     it ends as `applied` or `unchanged`. See the `outcome` section below
+ *     and 2026_08_24_04_overseer_outcome.sql for the whole argument.
+ *
  *  2. Presence snapshots. Every few seconds the positions and vitals of every
  *     online character are written to acore_characters.overseer_snapshot,
  *     which is what the live map reads. The characters table itself only
@@ -196,6 +205,13 @@ constexpr uint8 MAX_TALENT_TAB = 2;
 constexpr uint32 CHAT_FLUSH_MS = 1000;
 // One world tick must never stall on a burst of queued commands.
 constexpr uint32 COMMANDS_PER_POLL = 20;
+// How long a strategy command may go unobserved before the queue says so
+// (infra#2819). The bot's AI ticks far faster than this; the window is three
+// command polls rather than one so that a bot which happens to be mid-anything
+// is not reported as broken for being a tick late. A check that starts holding
+// earlier is resolved earlier - this is only the point at which "it still has
+// not changed" becomes the answer instead of the question.
+constexpr uint32 VERIFY_GRACE_MS = 6000;
 // WoW's own chat limit, in BYTES - which is what the client sends and what
 // std::string measures. Escaping can nearly double it (a backslash per quote),
 // and overseer_chat.text is VARCHAR(512) CHARACTERS, so the worst case still
@@ -929,8 +945,13 @@ public:
         }
         if (_commandTimer >= COMMAND_POLL_MS)
         {
+            // The REAL elapsed time, read before the reset. The read-back
+            // window is measured in it, and a world under load overshoots
+            // COMMAND_POLL_MS - reporting the nominal interval would make
+            // `waited_ms` a restatement of the constant instead of a fact.
+            uint32 const sincePoll = _commandTimer;
             _commandTimer = 0;
-            DeliverPendingCommands();
+            DeliverPendingCommands(sincePoll);
         }
         if (_snapshotTimer >= SNAPSHOT_MS)
         {
@@ -2036,6 +2057,276 @@ private:
         CharacterDatabase.Execute(ss.str().c_str());
     }
 
+    // ------------------------------------------------------- outcome --
+    //
+    // WHAT A FINISHED ROW IS ALLOWED TO CLAIM (infra#2819).
+    //
+    // WHAT WAS WRONG. `status = "delivered"` was written the instant
+    // PlayerbotAI::HandleCommand accepted the row. HandleCommand accepting a
+    // row is not the command acting: the line lands in
+    // PlayerbotAI::chatCommands (PlayerbotAI.cpp:1107) and is drained on the
+    // bot's NEXT AI tick (PlayerbotAI.cpp:553-588). So the queue's only
+    // success status was written before anyone - including this module - knew
+    // whether the bot had changed, and it was read as "applied" by two
+    // engineers, repeatedly, in writing.
+    //
+    // THE CASE. `nc -new rpg` was sent to Ugga twice:
+    //
+    //     4049  01:42:57  Ugga  nc -new rpg  delivered
+    //     4184  01:52:57  Ugga  nc -new rpg  delivered
+    //     01:57:17  probe: Ugga STILL HAS `new rpg`
+    //
+    // Both rows read `delivered`. Her strategy did not change either time.
+    // Three other characters received the identical command in the identical
+    // batch and it worked for all three, both times. And the worldserver log
+    // across the whole window contained only `holding` lines - the block
+    // below logged the command it HELD and said nothing about the one it
+    // SENT. Queue says success, log says nothing, and a deterministic,
+    // twice-reproduced, single-character failure is not hard to diagnose, it
+    // is unobservable.
+    //
+    // WHY THIS IS NOT A GUESS AT THE CAUSE. It is not one. The cause is
+    // unknown and two hypotheses have already been built and falsified - a
+    // delivery race (which predicted self-correction on the next cycle and
+    // did not self-correct) and the goal-beneficiary path (nothing re-adds
+    // the strategy, and `goals.reconcile` emits DriveQuest, never a
+    // StrategyCommand). This changes what the INSTRUMENTS say, so the next
+    // occurrence writes a row that is visibly different from the rows that
+    // worked, and the next person starts from evidence rather than a third
+    // unfalsifiable chain.
+    //
+    // WHAT IS CHECKED. Only a post-condition this module can actually read.
+    // `nc +x` / `nc -x` / `co +x` / `co -x` name a strategy and an engine, and
+    // PlayerbotAI::GetStrategies answers off the LIVE engine - the same
+    // accessor ProbeStrategies uses (see the note there on why the persisted
+    // playerbots_db_store copy is not good enough). Everything else - chat,
+    // gm, probe, give, share, `follow`, `summon`, a dot-command - has no
+    // post-condition of this shape and keeps `delivered` with its old meaning
+    // exactly. NOT redefining `delivered` is what keeps this one change:
+    // every row already in the table stays correct, and the worldserver image
+    // and the bridge image, which deploy separately, work in either order.
+    //
+    // WHAT IS DELIBERATELY NOT CHANGED. The per-verb throttle below spaces
+    // held commands on a fixed 2s TIMER and nothing verifies the bot has
+    // ticked - a timer, not a handshake. That is a real defect and it is a
+    // SEPARATE one. It is demonstrably not eating commands across the board
+    // (Grug takes `nc +new rpg` and `nc +grind` in one batch every cycle and
+    // holds both) and it is not what happens to Ugga. It is left exactly as
+    // it is, on purpose.
+
+    // One `+name` or `-name` out of a strategy command, and the answer the
+    // engine is expected to give afterwards.
+    struct StrategyItem
+    {
+        std::string name;    // lowercased, sign stripped
+        bool combat{false};  // `co` -> the combat engine, `nc` -> non-combat
+        bool want{false};    // '+' -> present afterwards, '-' -> absent
+        bool before{false};  // what the engine said BEFORE the hand-off
+        bool after{false};   // ...and at the verdict
+    };
+
+    // A command handed to a bot whose effect has not been observed yet. Held
+    // in memory rather than in the row: the row already says `verifying`, and
+    // a worldserver that dies here loses the read-back exactly as it loses an
+    // in-flight `claimed` row today. The bridge sweeps both (bridge.py
+    // _expire_stale_claims), so the failure mode is one that already exists
+    // and already has an owner rather than a new one.
+    struct StrategyCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        std::string command;
+        uint32 waitedMs{0};
+        std::vector<StrategyItem> items;
+    };
+
+    // World thread only - both DeliverPendingCommands and ResolveStrategyChecks
+    // run from OnUpdate - so unguarded, like _lastAim. Bounded by construction:
+    // at most COMMANDS_PER_POLL entries are added per poll and every entry is
+    // resolved within VERIFY_GRACE_MS.
+    std::vector<StrategyCheck> _pendingChecks;
+
+    // `nc -new rpg`, `co +grind,-loot`. Returns false for everything with no
+    // post-condition to read: a different verb, `~` (toggle) or `?` (query),
+    // an empty or malformed list. False is not a failure - it is this module
+    // declining to claim more than it can check, and the row takes the
+    // unchanged-in-meaning `delivered`.
+    //
+    // A strategy whose REGISTERED name differs from the typed one would read
+    // as `unchanged`. That is still true rather than wrong - the list really
+    // does not contain what was asked for - and the verdict carries the whole
+    // live list, so an operator sees which it is in one look.
+    static bool ParseStrategyChange(std::string const& command, std::vector<StrategyItem>& out)
+    {
+        std::string::size_type const space = command.find(' ');
+        if (space == std::string::npos)
+            return false;
+
+        std::string const verb = LowerName(command.substr(0, space));
+        // `d` (the dead engine) is not here on purpose: nothing in this system
+        // sends one, and a verb nobody uses is a verb nobody has tested.
+        if (verb != "nc" && verb != "co")
+            return false;
+        bool const combat = (verb == "co");
+
+        std::vector<StrategyItem> items;
+        std::string const rest = command.substr(space + 1);
+        std::string::size_type at = 0;
+        while (at <= rest.size())
+        {
+            std::string::size_type const comma = rest.find(',', at);
+            std::string piece = rest.substr(
+                at, comma == std::string::npos ? std::string::npos : comma - at);
+            at = (comma == std::string::npos) ? rest.size() + 1 : comma + 1;
+
+            std::string::size_type const first = piece.find_first_not_of(" \t");
+            if (first == std::string::npos)
+                return false;
+            std::string::size_type const last = piece.find_last_not_of(" \t");
+            piece = piece.substr(first, last - first + 1);
+
+            if (piece[0] != '+' && piece[0] != '-')
+                return false;
+            std::string const name = LowerName(piece.substr(1));
+            if (name.empty())
+                return false;
+
+            StrategyItem item;
+            item.name = name;
+            item.combat = combat;
+            item.want = (piece[0] == '+');
+            items.push_back(item);
+        }
+
+        if (items.empty())
+            return false;
+        out = items;
+        return true;
+    }
+
+    // Is `item.name` in the bot's live list for its engine?
+    //
+    // The engine is chosen by an if/else over the two enumerators rather than
+    // by holding one in a variable, so mod-playerbots' enum TYPE is never
+    // named here. This file only compiles on push and an unqualified nested
+    // name has already cost a build; the call shape below is character for
+    // character the one ProbeStrategies already compiles with.
+    static bool StrategyPresent(PlayerbotAI* botAI, StrategyItem const& item)
+    {
+        auto contains = [&item](auto const& live)
+        {
+            for (std::string const& name : live)
+                if (LowerName(name) == item.name)
+                    return true;
+            return false;
+        };
+
+        if (item.combat)
+            return contains(botAI->GetStrategies(BOT_STATE_COMBAT));
+        return contains(botAI->GetStrategies(BOT_STATE_NON_COMBAT));
+    }
+
+    // Read the engines back and end every check that can be ended.
+    //
+    // Resolves EARLY - as soon as the post-condition holds - so the usual
+    // cost of verifying is one extra poll, not VERIFY_GRACE_MS. Only a check
+    // that is still not satisfied when the window closes becomes `unchanged`,
+    // which is the row this whole section exists to be able to write.
+    void ResolveStrategyChecks(uint32 elapsedMs)
+    {
+        std::vector<StrategyCheck> stillWaiting;
+        stillWaiting.reserve(_pendingChecks.size());
+
+        for (StrategyCheck& check : _pendingChecks)
+        {
+            check.waitedMs += elapsedMs;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
+            PlayerbotAI* botAI = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
+            if (!botAI)
+            {
+                // Said out loud rather than dropped. A character that logged
+                // out mid-check is a perfectly good explanation, and an
+                // explanation is the thing that was missing.
+                LOG_WARN("module.overseer",
+                         "overseer: command {} ('{}' for '{}') cannot be verified - the "
+                         "character is no longer in the world",
+                         check.id, check.command, check.targetName);
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    "left the world before the change could be read back", check.id,
+                    g_runToken);
+                continue;
+            }
+
+            bool holds = true;
+            for (StrategyItem& item : check.items)
+            {
+                item.after = StrategyPresent(botAI, item);
+                if (item.after != item.want)
+                    holds = false;
+            }
+
+            if (!holds && check.waitedMs < VERIFY_GRACE_MS)
+            {
+                stillWaiting.push_back(check);
+                continue;
+            }
+
+            // EVERY VERDICT WRITES `result`, so no row ends without saying
+            // what it was judged on. The live lists ride along whole: the
+            // point of this issue is that diagnosing the Ugga case required a
+            // separate probe minutes later, and a verdict that names only its
+            // own conclusion would have kept that round trip.
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(holds ? "applied" : "unchanged")
+              << ",\"command\":" << J(check.command)
+              << ",\"waited_ms\":" << check.waitedMs
+              << ",\"items\":[";
+            bool first = true;
+            for (StrategyItem const& item : check.items)
+            {
+                if (!first)
+                    o << ",";
+                first = false;
+                o << "{\"strategy\":" << J(item.name)
+                  << ",\"engine\":" << J(item.combat ? "combat" : "non_combat")
+                  << ",\"sign\":" << J(item.want ? "+" : "-")
+                  << ",\"before\":" << (item.before ? "true" : "false")
+                  << ",\"after\":" << (item.after ? "true" : "false")
+                  << ",\"holds\":" << (item.after == item.want ? "true" : "false") << "}";
+            }
+            o << "],\"live\":" << ProbeStrategies(bot) << "}";
+
+            char const* status = holds ? "applied" : "unchanged";
+            char const* detail =
+                holds ? "" : "the bot accepted it and its live strategy list did not change";
+
+            if (holds)
+                LOG_INFO("module.overseer",
+                         "overseer: command {} ('{}' for '{}') applied - read back off the "
+                         "live engine after {}ms",
+                         check.id, check.command, check.targetName, check.waitedMs);
+            else
+                // WARN, not INFO. This is the line whose absence made the
+                // original failure invisible, and INFO is where it would be
+                // lost again.
+                LOG_WARN("module.overseer",
+                         "overseer: command {} ('{}' for '{}') CHANGED NOTHING - accepted by "
+                         "the bot, and its live strategy list is unchanged after {}ms; "
+                         "see overseer_command.result for the lists",
+                         check.id, check.command, check.targetName, check.waitedMs);
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(o.str()), check.id, g_runToken);
+        }
+
+        _pendingChecks.swap(stillWaiting);
+    }
+
     // ONE COMMAND PER VERB PER CHARACTER PER POLL.
     //
     // WHAT WAS WRONG. The goal supervisor hands the party leader three orders
@@ -2085,8 +2376,13 @@ private:
     // the goal loop and the roster loop insert independently, so any two `nc`
     // rows that happen to be pending together collide the same way. The queue
     // is where the constraint actually lives.
-    void DeliverPendingCommands()
+    void DeliverPendingCommands(uint32 sincePollMs)
     {
+        // Before anything new goes out: end the checks from earlier polls that
+        // can now be ended. First, so a `verifying` row never outlives its
+        // answer by a whole poll.
+        ResolveStrategyChecks(sincePollMs);
+
         QueryResult result = CharacterDatabase.Query(
             "SELECT id, target_name, command, kind, channel, target_arg FROM overseer_command "
             "WHERE status = 'pending' ORDER BY id ASC LIMIT {}",
@@ -2199,8 +2495,43 @@ private:
                 detail = DoShare(player, targetArg, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
+                // READ THE ENGINE FIRST. `before` is only meaningful taken on
+                // this side of the hand-off, and it is what separates "the
+                // command did nothing" from "there was nothing to do".
+                StrategyCheck check;
+                bool const checkable = ParseStrategyChange(command, check.items);
+                if (checkable)
+                {
+                    for (StrategyItem& item : check.items)
+                        item.before = StrategyPresent(botAI, item);
+                }
+
                 botAI->HandleCommand(CHAT_MSG_WHISPER, command, player);
-                status = "delivered";
+
+                // THE HAND-OFF IS LOGGED. Until this line the module logged
+                // only the command it HELD, so the log for the Ugga window
+                // contained `holding` lines and no trace whatsoever of the
+                // two commands that actually went out (infra#2819).
+                LOG_INFO("module.overseer",
+                         "overseer: handed command {} ('{}') to '{}'; {}",
+                         id, command, targetName,
+                         checkable ? "reading the live strategy list back before it counts"
+                                   : "no post-condition to read back");
+
+                if (checkable)
+                {
+                    check.id = id;
+                    check.targetName = targetName;
+                    check.command = command;
+                    _pendingChecks.push_back(check);
+                    // NOT a success status. A whispered command has not acted
+                    // yet - it is drained on the bot's next AI tick - so the
+                    // row stays in flight until ResolveStrategyChecks has
+                    // looked. This is the single line the issue is about.
+                    status = "verifying";
+                }
+                else
+                    status = "delivered";
             }
             else
                 detail = "target has no bot AI (selfbot not enabled?)";
