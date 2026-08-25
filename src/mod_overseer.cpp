@@ -1475,11 +1475,114 @@ private:
     // unreachable aim degrades to that same behaviour rather than to standing
     // still - which is the whole reason the fallback is kept.
     //
-    // The column and this reader ship in the same image: mod-overseer applies
-    // its own SQL at worldserver startup, so the two cannot disagree. The
-    // bridge is a separate deployment and guards its write on 1054 instead.
+    // THE DDL AND THIS READER SHIP IN DIFFERENT IMAGES. The coupling is
+    // infra#2846 - "module code and SQL move together" - which pinned the two
+    // dev images to one build after #2824's migration silently never applied.
+    // That fixed the DEPLOYMENT half. This is the CODE half: the reader has to
+    // survive the pair coming apart anyway, because a pin is a discipline and
+    // this is a guarantee.
+    //
+    // An earlier version of this comment claimed the opposite: that a column
+    // and its reader are carried by one image and therefore cannot disagree,
+    // and that mod-overseer applies its own SQL at worldserver startup. It was
+    // false in both halves, it was the stated reason the query below needed no
+    // degrade, and the family stopped questing because of it.
+    //
+    // WHERE EACH HALF ACTUALLY LIVES. The DDL is in this module's
+    // data/sql/characters/base/, which reaches a container only through the
+    // DB-IMPORT image: production/oke/manifests/wow/30-db-import.yaml:117 says
+    // it outright - "only db-import gets `COPY data data`, so the worldserver
+    // has no SQL" - and that is why the worldserver is started with
+    // AC_PLAYERBOTS_UPDATES_ENABLE_DATABASES=0 (50-worldserver.yaml:407). The
+    // migrations are applied by the `db-upgrade` initContainer, which runs the
+    // DB-IMPORT image (50-worldserver.yaml:148). The reader - this file - is
+    // compiled into the WORLDSERVER image (50-worldserver.yaml:172). Two
+    // digests, pinned independently in that one manifest and bumped
+    // independently. Bumping the worldserver alone is a routine one-line
+    // change, and it puts new module code in front of an old schema. That is
+    // not hypothetical: it is what the dev world was running when this was
+    // found.
+    //
+    // WHAT MYSQL DOES ABOUT IT. A SELECT naming a column the table does not
+    // have fails WHOLE - error 1054, no partial rows - and
+    // CharacterDatabase.Query hands that back as a null QueryResult,
+    // indistinguishable from "no rows matched". So every `if (!result) return;`
+    // in this file reads a missing column as "there is nothing to do", which is
+    // the right answer ONLY when the column in question is the entire reason
+    // the query is being run.
+    //
+    // SO EACH LATE-ADDED COLUMN IS READ ON ITS OWN. LoadQuestAims and
+    // LoadTravelAims below each select one column and each return an EMPTY map
+    // when the read comes back null. Every caller already handles an empty map,
+    // because that is also what "nobody is aimed" looks like - which is why
+    // there is no 1054 test anywhere here and does not need to be: the error
+    // case and the empty case want the same answer. A missing `travel_npc`
+    // costs the errands. A missing `drive_quest` costs the council's aim and
+    // leaves the leader's own-log fallback and the repick memory running. What
+    // neither can do any more is take the whole drive off the air.
+    //
+    // The roster query itself is left holding `name`/`enabled` (the CREATE
+    // TABLE, 2026_08_23_00) and `lead` (2026_08_23_01) - all older than this
+    // drive and read unguarded by KeepRosterGrouped as well (:1148). If those
+    // are missing there is no roster feature at all, and no behaviour to
+    // degrade to.
+
+    // Every enabled character with a standing council aim, name -> quest id.
+    // Absent means 0, "no opinion", the sentinel the column itself defines
+    // (2026_08_24_00_overseer_roster_drive_quest.sql) - so a row filtered out
+    // here, a row that was never written, and a column that does not exist are
+    // all the same thing to the caller, deliberately.
+    std::map<std::string, uint32> LoadQuestAims()
+    {
+        std::map<std::string, uint32> aims;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, drive_quest FROM overseer_roster "
+            "WHERE enabled = 1 AND drive_quest <> 0");
+        if (!result)
+            return aims;  // nobody aimed, or no such column - same answer
+        do
+        {
+            Field* fields = result->Fetch();
+            aims[fields[0].Get<std::string>()] = fields[1].Get<uint32>();
+        } while (result->NextRow());
+        return aims;
+    }
+
+    // Every enabled character with an outstanding errand, name -> target.
+    // Absent means '', "stay with the family"
+    // (2026_08_25_00_overseer_roster_travel_npc.sql).
+    //
+    // ONE READER, TWO CALLERS, AND NO SHARED STATE. DriveQuests needs this to
+    // run the arbitration and DriveTravel needs it to run the errands. They are
+    // on SEPARATE timers - QUEST_POLL_MS and TRAVEL_POLL_MS - so there is no
+    // tick they reliably share and no single snapshot that could serve both
+    // without being stale for one of them. Sharing the QUERY instead of a
+    // cached result keeps each drive reading the table as it stands when it
+    // runs, and keeps DriveTravel from having to know that DriveQuests exists -
+    // which TravelHoldsTheWheel forbids, for the reason set out there.
+    std::map<std::string, std::string> LoadTravelAims()
+    {
+        std::map<std::string, std::string> aims;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, travel_npc FROM overseer_roster "
+            "WHERE enabled = 1 AND travel_npc <> ''");
+        if (!result)
+            return aims;  // no errands, or no such column - same answer
+        do
+        {
+            Field* fields = result->Fetch();
+            aims[fields[0].Get<std::string>()] = fields[1].Get<std::string>();
+        } while (result->NextRow());
+        return aims;
+    }
+
     void DriveQuests()
     {
+        // Read first, and each on its own, so that neither aim column can stop
+        // this drive from running - see above.
+        std::map<std::string, uint32> const aims = LoadQuestAims();
+        std::map<std::string, std::string> const travelAims = LoadTravelAims();
+
         QueryResult result = CharacterDatabase.Query(
             // EVERY enabled member, not only the leader (infra#2801, "quest
             // together"). Handing a quest in is reachable only through the rpg
@@ -1489,12 +1592,15 @@ private:
             // because the FALLBACK below stays leader-only: an unaimed
             // follower carrying `new rpg` is the 937-yard scatter, and the aim
             // is the only thing holding the party to one destination.
-            // `travel_npc` comes back for ONE reason: to decide whether this
-            // drive should be steering this character at all. It is never
-            // written here and never acted on beyond that decision - see the
-            // arbitration below.
-            "SELECT name, drive_quest, `lead`, travel_npc FROM overseer_roster "
+            //
+            // Neither AIM column is here. `drive_quest` and `travel_npc` are
+            // read by their own guarded loaders above, so that a schema older
+            // than either one costs that aim and not this whole drive
+            // (infra#2846).
+            "SELECT name, `lead` FROM overseer_roster "
             "WHERE enabled = 1");
+        // A roster query that comes back empty means there is no roster. That
+        // IS nothing to do, and it is the one case where returning is right.
         if (!result)
             return;
 
@@ -1502,9 +1608,17 @@ private:
         {
             Field* fields = result->Fetch();
             std::string const name = fields[0].Get<std::string>();
-            uint32 const aim = fields[1].Get<uint32>();
-            bool const isLead = fields[2].Get<uint8>() != 0;
-            std::string const travelTarget = fields[3].Get<std::string>();
+            bool const isLead = fields[1].Get<uint8>() != 0;
+
+            // Absent from a map is the column's own "no opinion" value, which
+            // is also what a column the schema does not have degrades to. Every
+            // decision below is written against those sentinels already, so
+            // nothing downstream has to know which of the two it is looking at.
+            auto const aimIt = aims.find(name);
+            uint32 const aim = aimIt == aims.end() ? 0u : aimIt->second;
+            auto const travelIt = travelAims.find(name);
+            std::string const travelTarget =
+                travelIt == travelAims.end() ? std::string() : travelIt->second;
 
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot)
@@ -2316,23 +2430,25 @@ private:
 
     void DriveTravel()
     {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT name, travel_npc FROM overseer_roster "
-            "WHERE enabled = 1 AND travel_npc <> ''");
-        if (!result)
+        // THE SAME READ THE QUEST DRIVE'S ARBITRATION USES (infra#2846), so the
+        // two can never be looking at different answers to "who is on an
+        // errand". The WHERE clause that used to live here lives in the loader:
+        // an empty target never reaches this loop, exactly as before.
+        std::map<std::string, std::string> const aims = LoadTravelAims();
+        if (aims.empty())
         {
-            // No errands anywhere, so nothing this loop remembers is still true.
+            // No errands anywhere, so nothing this loop remembers is still
+            // true. A schema with no `travel_npc` lands here too, which is the
+            // correct degrade for this drive and always was: no column, no
+            // errands, nobody sent anywhere.
             PruneTravelState(std::set<std::string>());
             return;
         }
 
         std::set<std::string> stillAimed;
 
-        do
+        for (auto const& [name, target] : aims)
         {
-            Field* fields = result->Fetch();
-            std::string const name = fields[0].Get<std::string>();
-            std::string const target = fields[1].Get<std::string>();
             // Recorded before any refusal below, because the ROW still exists:
             // the prune is about rows that vanished, not about characters this
             // loop declined to move.
@@ -2504,7 +2620,7 @@ private:
                          name, target, entry,
                          bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
             }
-        } while (result->NextRow());
+        }
 
         PruneTravelState(stillAimed);
     }
