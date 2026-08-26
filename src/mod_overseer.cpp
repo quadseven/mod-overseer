@@ -1548,6 +1548,55 @@ private:
         return aims;
     }
 
+    // The character behind a name, ONLY if it is safe to steer this tick.
+    //
+    // FOUND AND STEERABLE ARE DIFFERENT THINGS, and this module learned the
+    // difference from a segfault. ObjectAccessor::FindPlayerByName answers
+    // "is there a Player object with this name" - not "is that object in the
+    // world and finished being set up". Between those two states sits exactly
+    // the window infra#2663's POV streaming opens several times an hour: a
+    // real client logs in as a family character, the altbot holding that name
+    // is evicted, and for a moment the name resolves to a Player that is
+    // mid-teardown or mid-login with a PlayerbotAI that is being destroyed.
+    // Three drives then did this, unguarded:
+    //
+    //     Player* bot = ObjectAccessor::FindPlayerByName(name);
+    //     if (!bot) continue;
+    //     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+    //     if (!botAI) continue;
+    //     ... botAI->rpgInfo.ChangeToDoQuest(...)
+    //
+    // and a non-null pointer to a half-destroyed AI passes both checks.
+    //
+    // THE EVIDENCE. worldserver exited 139 (SIGSEGV) with its log cut off
+    // mid-line, part-way through DriveQuests' own message:
+    //
+    //     15:14:59 overseer: 'Grog' re-asserting chosen quest 418 ...
+    //     15:14:59 overseer: 'Grug' now working quest 5 ...
+    //     15:14:59 overseer: 'Ugga' re-asserting chosen quest 418 (Thelsamar
+    //              Blood Sausages) - the 30-minute            <- ends here
+    //
+    // Two entries in the same loop had already been steered; the third died on
+    // the call after the log. Thirty-nine seconds earlier the stream agent had
+    // logged `selfbot already attached for Og` - a real client taking over a
+    // family character. Six such exits in twenty hours, all while that feature
+    // was in use.
+    //
+    // This is a correlation and a missing guard, not a backtrace, so the guard
+    // is written to be correct regardless of whether that race is the whole
+    // story: nothing here should ever have been steering a character that is
+    // not in the world with a live session.
+    //
+    // IsInWorld() is the check this file already makes before touching a
+    // watcher (:507) and a snapshot subject (:4338). The drives simply never
+    // adopted it.
+    static PlayerbotAI* SteerableAI(Player* bot)
+    {
+        if (!bot || !bot->IsInWorld() || !bot->GetSession())
+            return nullptr;
+        return GET_PLAYERBOT_AI(bot);
+    }
+
     // Every enabled character with an outstanding errand, name -> target.
     // Absent means '', "stay with the family"
     // (2026_08_25_00_overseer_roster_travel_npc.sql).
@@ -1620,11 +1669,11 @@ private:
             std::string const travelTarget =
                 travelIt == travelAims.end() ? std::string() : travelIt->second;
 
+            // SteerableAI, not a bare lookup: a name can resolve to a
+            // Player that is mid-login or mid-teardown, and its AI pointer is
+            // non-null right up until it is freed. See SteerableAI above.
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot)
-                continue;
-
-            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
                 continue;
 
@@ -2454,11 +2503,11 @@ private:
             // loop declined to move.
             stillAimed.insert(name);
 
+            // SteerableAI, not a bare lookup: a name can resolve to a
+            // Player that is mid-login or mid-teardown, and its AI pointer is
+            // non-null right up until it is freed. See SteerableAI above.
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot)
-                continue;
-
-            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
                 continue;
 
@@ -2668,8 +2717,11 @@ private:
             uint8 const specTab = fields[1].Get<uint8>();
             uint8 const trainedLevel = fields[2].Get<uint8>();
 
+            // Same guard as the other two drives: this one goes on to send
+            // the character to a trainer, so a half-built Player is just as
+            // unsafe here. See SteerableAI above.
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot)
+            if (!SteerableAI(bot))
                 continue;
 
             uint8 const level = bot->GetLevel();
