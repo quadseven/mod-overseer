@@ -3778,6 +3778,26 @@ private:
     // Run a dot-command through the character's OWN session, so it carries
     // that account's real security level. A non-GM account is refused by the
     // core exactly as if the player had typed it.
+    //
+    // AND FOR A BOT THAT SECURITY LEVEL IS ALWAYS SEC_PLAYER, WHATEVER THE
+    // ACCOUNT SAYS. mod-playerbots builds bot sessions with the level as a
+    // hardcoded constructor argument and never reads `account_access`:
+    //
+    //     new WorldSession(botAccountId, "", 0x0, nullptr, SEC_PLAYER, ...)
+    //         -- PlayerbotMgr.cpp:203, and identically at
+    //            RandomPlayerbotFactory.cpp:701 and TravelMgr.cpp:3393,
+    //            so it is the module's uniform posture, not one path's slip.
+    //
+    // So GRANTING gmlevel 3 TO A BOT'S ACCOUNT DOES NOTHING - not after a
+    // relog, not after a worldserver restart. Two sessions independently
+    // assumed otherwise on 2026-08-25, granted it, saw `.additem` refused,
+    // and re-granted before reading this constructor. The rows were later
+    // deleted precisely because an inert gmlevel 3 sitting in the table is
+    // worse than none: the next reader concludes those characters have it.
+    //
+    // kind='gm' is therefore usable ONLY on a character whose session came
+    // from a REAL CLIENT LOGIN. If a dot-command has to run against the
+    // family, a human logs in and types it; there is no server-side road.
     static char const* DoGmCommand(Player* player, std::string const& command, char const*& status)
     {
         WorldSession* session = player->GetSession();
