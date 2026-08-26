@@ -101,6 +101,10 @@
 #include "Playerbots.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "Creature.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "Trainer.h"
 #include "World.h"
 #include "WorldSession.h"
 
@@ -185,6 +189,22 @@ constexpr time_t TRAVEL_BACKSTOP_SECONDS = 20 * 60;
 // that dwell, so the last poll of the errand and the first poll of the quest
 // drive can never be the same poll. See TravelHoldsTheWheel.
 constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
+
+// How often the unlearn drive looks for a profession the roster has asked a
+// character to give up (infra#2757).
+//
+// WHY IT IS NOT THE TRAVEL POLL, WHICH IT SITS NEXT TO. Unlearning needs no
+// journey - it is a spellbook action - and it is the PREREQUISITE for the
+// journey being worth making: a character standing at the tailoring trainer
+// with both primary slots full learns nothing. Tying it to travel would
+// deadlock the pair, since the slot would not free until the character
+// arrived and arriving would achieve nothing until the slot freed.
+//
+// WHY THIRTY SECONDS AND NOT FASTER. This is a rare, deliberate, destructive
+// act - a handful of times in the family's whole life. The poll exists to
+// pick up a request a human or the bridge has just written, and half a minute
+// is well inside how long the walk to the trainer takes anyway.
+constexpr uint32 PROFESSION_POLL_MS = 30000;
 
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
@@ -964,6 +984,7 @@ public:
         _trainTimer += diff;
         _questTimer += diff;
         _travelTimer += diff;
+        _professionTimer += diff;
         _eventTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
@@ -1022,6 +1043,17 @@ public:
         {
             _travelTimer = 0;
             DriveTravel();
+        }
+        // AFTER DriveTravel, on purpose. Both can run in the same tick, and
+        // when they do the order that helps is travel first: a character that
+        // has just arrived gets its learn attempt on this tick, discovers the
+        // slot is still full, says so, and the unlearn that clears it runs
+        // moments later - so the NEXT travel poll finds a free slot waiting.
+        // The other order costs nothing either; it just takes one more poll.
+        if (_professionTimer >= PROFESSION_POLL_MS)
+        {
+            _professionTimer = 0;
+            DriveProfessions();
         }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
@@ -2334,8 +2366,13 @@ private:
     // upstream's MapId check while removing its zone check. A cross-continent
     // errand needs a boat, and a character that accepted one would fail far
     // more confusingly than one that refuses.
+    // `wantSkill` narrows a TRAINER role to trainers that can actually start
+    // this character in that primary profession (infra#2757). 0 means "no
+    // opinion", which is every errand that is not a profession errand and is
+    // byte for byte the behaviour this function has always had.
     bool ResolveTravelTarget(Player* bot, std::string const& target,
-                             uint32& outEntry, WorldPosition& outPos)
+                             uint32& outEntry, WorldPosition& outPos,
+                             uint32 wantSkill = 0)
     {
         BuildTravelIndex();
 
@@ -2363,6 +2400,16 @@ private:
                 return false;
         }
 
+        // ONLY A TRAINER ROLE IS NARROWED, and the restraint is deliberate. A
+        // learn errand paired with, say, a vendor aim is somebody sending this
+        // character somewhere else on purpose; silently finding no vendor that
+        // teaches tailoring and reporting "no such spawn" would be a worse
+        // answer than simply going to the vendor. A bare creature entry is left
+        // alone for the same reason: naming one NPC is naming one NPC.
+        bool const narrowToSkill =
+            wantSkill && !wantedEntry &&
+            (wantedFlag & (UNIT_NPC_FLAG_TRAINER | UNIT_NPC_FLAG_TRAINER_PROFESSION));
+
         uint32 const mapId = bot->GetMapId();
         float bestDist = 0.f;
         bool found = false;
@@ -2371,6 +2418,8 @@ private:
             if (spawn.mapId != mapId)
                 continue;
             if (wantedEntry ? spawn.entry != wantedEntry : !(spawn.npcFlags & wantedFlag))
+                continue;
+            if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
                 continue;
 
             float const dist = bot->GetDistance2d(spawn.x, spawn.y);
@@ -2383,6 +2432,521 @@ private:
             }
         }
         return found;
+    }
+
+    // ----------------------------------------------------------- professions --
+    //
+    // THE TRANSACTION HALF (infra#2757). infra#2783 delivered TRAVEL: a
+    // character can be aimed at a profession trainer and it walks there. Its
+    // own note said what it was not - "it does not train, buy, repair or sign
+    // anything" - and that missing verb is this section.
+    //
+    // WHAT WAS ALREADY DONE, AND IT IS MOST OF IT. The DECISION has existed and
+    // been correct for days. professions.py holds the family's assignment with
+    // the reasoning beside each row, professions.plan() opens one trade at a
+    // time in a deliberate order, and `overseer_trade` had been carrying the
+    // answer since 2026-08-26 02:15 -
+    //
+    //     Og  unlearn  alchemy   (171)  planned
+    //     Og  learn    tailoring (197)  planned
+    //
+    // - two rows nothing in the worldserver could see, because `overseer_trade`
+    // is a Python table and this module reads `overseer_roster`. Nothing here
+    // decides anything. It executes a decision that was already made, and it
+    // refuses to execute one the roster does not also declare.
+    //
+    // THE THREE THINGS THAT STOPPED IT, AND WHERE EACH IS ANSWERED.
+    //
+    //   1. A FOLLOWER CANNOT RUN AN ERRAND. Only `new rpg` reaches
+    //      NewRpgWanderNpcAction, the family carry it on the leader alone, and
+    //      giving a follower both `new rpg` and `follow` is the 937-yard
+    //      scatter of infra#2812. NOT ANSWERED HERE, AND DELIBERATELY NOT: the
+    //      answer is that an errand MOVES THE LEADERSHIP, so the character with
+    //      the errand becomes the one traveller and the other four follow it.
+    //      That is a decision about who leads, it is made in Python
+    //      (bridge._head_now), and this module already implements it - the
+    //      `lead` column moves, KeepRosterGrouped promotes, KeepRosterFollowing
+    //      re-points the other four. The invariant this epic depends on is
+    //      untouched: exactly one character carries `new rpg`, and it is the
+    //      group leader. Nothing below hands `new rpg` to anybody.
+    //
+    //   2. NOBODY TRAINED ON ARRIVAL. TrainOnArrival is that verb, and it is
+    //      built on the core's own Trainer::TeachSpell rather than on a second
+    //      copy of it - see the note there.
+    //
+    //   3. BOTH PRIMARY SLOTS ARE FULL. UnlearnProfession is that verb, behind
+    //      a price the requester has to have agreed to in advance.
+    //
+    // AND A FOURTH NOBODY HAD NAMED, WHICH WOULD HAVE MADE THE OTHER THREE
+    // POINTLESS. See the guard in TrainRoster: the level-up sweep steals a
+    // primary profession out of thin air the moment a slot is free, which is
+    // where the alchemy all five hold actually came from.
+
+    // What the roster says about one character's trades.
+    struct ProfessionPlan
+    {
+        // The primary professions this character is MEANT to end up with. This
+        // is the permission: nothing is learned that is not in here, and
+        // nothing in here is ever unlearned. See the column comment in
+        // 2026_08_26_00_overseer_roster_professions.sql.
+        std::set<uint32> wanted;
+        uint32 learnSkill = 0;
+        uint32 unlearnSkill = 0;
+        uint32 unlearnMax = 0;
+    };
+
+    // The DBC's own word for a skill line, for the logs. Read rather than
+    // tabulated: a table of names in this file would be a third spelling of
+    // something goals.SKILL_IDS and SkillLineStore already agree about, and the
+    // only thing a third spelling can add is a way to disagree.
+    static char const* SkillName(uint32 skill)
+    {
+        if (SkillLineEntry const* line = sSkillLineStore.LookupEntry(skill))
+            if (line->name[LOCALE_enUS])
+                return line->name[LOCALE_enUS];
+        return "an unnamed skill";
+    }
+
+    // Which primary profession, if any, this trainer spell would START somebody
+    // in. 0 for everything else - a recipe, a rank-up, a class spell, a
+    // secondary skill.
+    //
+    // TWO SHAPES, AND trainer_spell CONTAINS BOTH. A row may name the
+    // profession spell itself, or a wrapper whose SPELL_EFFECT_LEARN_SPELL
+    // effect names it. Trainer::GetSpellState walks the second shape for
+    // exactly this reason (Trainer.cpp:176-188), so both are asked here, in the
+    // same order and through the same members.
+    //
+    // IsPrimaryProfessionSkill is the core's own test - one lookup, one
+    // category check (SpellMgr.cpp:38-48) - and it is what keeps cooking,
+    // fishing and first aid out of this. Those cost no slot, all five already
+    // hold them, and an errand for one would be an errand for nothing.
+    static uint32 SkillStartedBySpell(uint32 spellId)
+    {
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info)
+            return 0;
+
+        auto primaryOf = [](uint32 candidate) -> uint32
+        {
+            if (!candidate)
+                return 0;
+            SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(candidate);
+            if (!node)
+                return 0;
+            return IsPrimaryProfessionSkill(node->skill) ? node->skill : 0;
+        };
+
+        if (uint32 const direct = primaryOf(spellId))
+            return direct;
+
+        for (SpellEffectInfo const& effect : info->GetEffects())
+        {
+            if (!effect.IsEffect(SPELL_EFFECT_LEARN_SPELL))
+                continue;
+            if (uint32 const taught = primaryOf(effect.TriggerSpell))
+                return taught;
+        }
+        return 0;
+    }
+
+    // Every primary profession this trainer ENTRY can start somebody in.
+    //
+    // THIS IS WHAT MAKES THE ERRAND LAND SOMEWHERE USEFUL, and its absence was
+    // a blocker nobody had written down. `travel_npc` = 'profession trainer'
+    // resolves to the nearest spawn carrying UNIT_NPC_FLAG_TRAINER_PROFESSION,
+    // and that flag is worn by cooking instructors and fishing trainers as
+    // cheerfully as by tailors. Aim a mage at it in Elwynn and he walks
+    // confidently to a cook. Arriving would be logged, the errand would be
+    // released as done, and he would learn nothing - travel that reports
+    // success and delivers nothing, which is this epic's signature failure
+    // wearing yet another hat.
+    //
+    // Keyed by ENTRY and not by spawn: the answer is a property of the
+    // template, and every spawn of a trainer gives the same one.
+    std::set<uint32> const& TrainerStartedSkills(uint32 entry)
+    {
+        auto const it = _trainerSkills.find(entry);
+        if (it != _trainerSkills.end())
+            return it->second;
+
+        std::set<uint32>& skills = _trainerSkills[entry];
+        if (Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry))
+            for (Trainer::Spell const& spell : trainer->GetSpells())
+                if (uint32 const skill = SkillStartedBySpell(spell.SpellId))
+                    skills.insert(skill);
+        return skills;
+    }
+
+    // The spell THIS trainer would sell THIS character to start THIS skill, or
+    // 0 if there is no such spell or it is not currently available to them.
+    //
+    // CanTeachSpell is asked here rather than trusted later because it is the
+    // one place the refusals are legible: it folds "already known", "too low a
+    // level", "wrong race or class" and - the one that matters most here - "no
+    // free primary profession slot" into a single answer (Trainer.cpp:134-150).
+    static uint32 TrainerSpellForSkill(Trainer::Trainer* trainer, Player* bot, uint32 skill)
+    {
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+        {
+            if (SkillStartedBySpell(spell.SpellId) != skill)
+                continue;
+            if (!trainer->CanTeachSpell(bot, &spell))
+                continue;
+            return spell.SpellId;
+        }
+        return 0;
+    }
+
+    // Every enabled character the roster has an OPINION about, name -> plan.
+    //
+    // READ ON ITS OWN, like LoadQuestAims and LoadTravelAims and for the same
+    // reason: these four columns ship in the DB-IMPORT image and this reader
+    // ships in the WORLDSERVER image, the two are pinned and bumped
+    // independently, and a SELECT naming a column that does not exist fails
+    // whole - error 1054, handed back as a null QueryResult that is
+    // indistinguishable from "no rows matched". An empty map is the correct
+    // degrade: no opinions, so nothing is learned and nothing is unlearned,
+    // which is exactly the behaviour this module had yesterday.
+    //
+    // `professions <> ''` IS THE GATE, IN THE WHERE CLAUSE. A character with no
+    // declared end state can produce no plan at all, so a stray `learn_skill`
+    // on a row nobody has decided about is not merely refused later - it is
+    // never even loaded.
+    std::map<std::string, ProfessionPlan> LoadProfessionPlans()
+    {
+        std::map<std::string, ProfessionPlan> plans;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, professions, learn_skill, unlearn_skill, unlearn_max "
+            "FROM overseer_roster WHERE enabled = 1 AND professions <> ''");
+        if (!result)
+            return plans;  // nobody assigned, or no such columns - same answer
+
+        do
+        {
+            Field* fields = result->Fetch();
+            ProfessionPlan plan;
+
+            // Comma-separated skill ids. Anything unparseable is 0 and is
+            // dropped, so a malformed column narrows the permission rather than
+            // widening it - which is the only direction a parse error may fail
+            // in when the value being parsed is a permission.
+            std::string const wanted = fields[1].Get<std::string>();
+            for (size_t start = 0; start <= wanted.size();)
+            {
+                size_t const comma = wanted.find(',', start);
+                size_t const len = comma == std::string::npos ? std::string::npos : comma - start;
+                if (uint32 const id = static_cast<uint32>(
+                        std::strtoul(wanted.substr(start, len).c_str(), nullptr, 10)))
+                    plan.wanted.insert(id);
+                if (comma == std::string::npos)
+                    break;
+                start = comma + 1;
+            }
+
+            plan.learnSkill = fields[2].Get<uint16>();
+            plan.unlearnSkill = fields[3].Get<uint16>();
+            plan.unlearnMax = fields[4].Get<uint16>();
+            plans[fields[0].Get<std::string>()] = plan;
+        } while (result->NextRow());
+        return plans;
+    }
+
+    void ClearLearnAim(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET learn_skill = 0 WHERE name = '{}'", Esc(name));
+    }
+
+    // The price dies with the request, for the same reason ClearTravelAim
+    // erases the clock: a leftover `unlearn_max` would be inherited by the NEXT
+    // request against the same character, and the next one might be for a skill
+    // worth a great deal more than this one was.
+    void ClearUnlearnRequest(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET unlearn_skill = 0, unlearn_max = 0 WHERE name = '{}'",
+            Esc(name));
+        _unlearnRefused.erase(name);
+    }
+
+    // Give up a profession, on purpose, out loud, and never as a side effect.
+    //
+    // WHY THIS IS ITS OWN VERB AND NOT A STEP INSIDE "LEARN". Making room is
+    // the obvious thing to fold into learning - the character needs a slot, so
+    // free one - and folding it in is precisely how a family loses Grug's 41
+    // points of herbalism to a line of code nobody read. Destroying work is not
+    // a detail of acquiring work. It is asked for separately, priced
+    // separately, logged separately, and recorded as its own event.
+    //
+    // WHAT IT ACTUALLY DOES IS ONE LINE, AND IT IS THE CLIENT'S OWN LINE.
+    // Unlearning a profession in 3.3.5 is a spellbook action, not a trainer
+    // one: the client sends CMSG_UNLEARN_SKILL and
+    // WorldSession::HandleUnlearnSkillOpcode does exactly this, behind exactly
+    // this guard (SkillHandler.cpp:91-100). Player::SetSkill with a zero value
+    // then clears the skill fields and calls removeSpell on every ability
+    // hanging off the line (Player.cpp:5523-5539), and removeSpell hands the
+    // primary profession point back (Player.cpp:3561-3567) - which is the slot
+    // this whole errand exists to open. So no part of this is a bespoke
+    // mechanism; it is the same code path a person clicking the button walks.
+    void UnlearnProfession(std::string const& name, Player* bot, ProfessionPlan const& plan)
+    {
+        uint32 const skill = plan.unlearnSkill;
+        char const* const skillName = SkillName(skill);
+
+        // THE THREE REFUSALS THAT CAN NEVER BECOME RIGHT clear the request, so
+        // that a bad row is said once rather than every thirty seconds forever.
+        // A log line repeated two thousand times a day is not a louder warning,
+        // it is a quieter one.
+        if (!IsPrimaryProfessionSkill(skill))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was asked to give up skill {} ({}), which is not a "
+                     "primary profession - only those cost a slot, so there is nothing "
+                     "here to make room. Dropping the request", name, skill, skillName);
+            ClearUnlearnRequest(name);
+            return;
+        }
+
+        // THE GATE. The roster's declared end state outranks the instruction,
+        // always and in this direction only. Ugga is assigned herbalism and
+        // alchemy and already holds both; this is what makes a stray request
+        // against her harmless without anybody having remembered her.
+        if (plan.wanted.count(skill))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was asked to give up {} ({}), which the roster also "
+                     "says it should END UP with. The declared end state wins - dropping "
+                     "the request rather than the profession", name, skillName, skill);
+            ClearUnlearnRequest(name);
+            return;
+        }
+
+        if (!bot->HasSkill(skill))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' was asked to give up {} ({}) and does not have it - "
+                     "already true, so the request is done", name, skillName, skill);
+            ClearUnlearnRequest(name);
+            return;
+        }
+
+        // THE PRICE, AND THE ONE REFUSAL THAT IS LEFT STANDING. A requester
+        // whose picture of the world is stale should get a refusal it can
+        // answer by raising the price, not one that erases the request and
+        // makes the disagreement disappear. Said once per (character, skill)
+        // because it is re-evaluated every poll and would otherwise be the
+        // loudest line in the log while being the least urgent.
+        uint16 const value = bot->GetPureSkillValue(skill);
+        if (value > plan.unlearnMax)
+        {
+            auto const said = _unlearnRefused.find(name);
+            if (said == _unlearnRefused.end() || said->second != skill)
+            {
+                _unlearnRefused[name] = skill;
+                LOG_WARN("module.overseer",
+                         "overseer: REFUSING to take {} ({}) off '{}'. It stands at {} and "
+                         "the request only agreed to destroy {}. Nothing has been lost. "
+                         "Raise unlearn_max to {} if that loss is really intended",
+                         skillName, skill, name, static_cast<uint32>(value),
+                         plan.unlearnMax, static_cast<uint32>(value));
+            }
+            return;
+        }
+
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' is GIVING UP {} ({}) at {}/{} - deliberately, because the "
+                 "roster asked for it and agreed to the cost. This destroys those {} points "
+                 "and every recipe hanging off them, and there is no undo",
+                 name, skillName, skill, static_cast<uint32>(value),
+                 static_cast<uint32>(bot->GetPureMaxSkillValue(skill)),
+                 static_cast<uint32>(value));
+
+        bot->SetSkill(static_cast<uint16>(skill), 0, 0, 0);  // Player.h:2111
+
+        // READ BACK, NOT ASSUMED. "delivered is not worked" is the rule this
+        // whole epic was built out of, and a verb that logs its own success
+        // without looking is the thing that rule exists to stop.
+        if (bot->HasSkill(skill))
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' still has {} ({}) after SetSkill cleared it - the "
+                      "unlearn did not take. Leaving the request standing", name,
+                      skillName, skill);
+            return;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' no longer has {} ({}) and now holds {} free primary "
+                 "profession slot(s)", name, skillName, skill,
+                 bot->GetFreePrimaryProfessionPoints());
+        RecordEvent(bot, "unlearn", skill, skillName,
+                    "gave up this profession to make room for the one the family assigned");
+        ClearUnlearnRequest(name);
+    }
+
+    // Learn the assigned trade from the trainer this character is standing at.
+    //
+    // Returns TRUE when the errand is finished with - learned, already true, or
+    // impossible for a reason that will not change - and FALSE when the
+    // character should stay put and let the next poll try again. A false is not
+    // an error path: the commonest one is "the slot is still full", which the
+    // unlearn drive clears a few seconds later.
+    //
+    // WHY Trainer::TeachSpell AND NOT A COPY OF IT. mod-playerbots has a copy -
+    // TrainerAction::Iterate reimplements the loop and calls CastSpell or
+    // learnSpell itself (TrainerAction.cpp:92-137) - and this module could have
+    // a third. It must not, for two reasons. The first is that the copy is
+    // wrong for this job: TrainerAction learns EVERYTHING the trainer offers,
+    // which at a profession trainer means whatever primary it happens to reach
+    // first, and this errand is about ONE named trade. The second is that
+    // TeachSpell is where the money is taken, the free-slot rule is enforced
+    // and the client is told (Trainer.cpp:81-118). Reimplementing it is how a
+    // profession appears in `character_skills` without a trainer having been
+    // paid or visited, which is infra#2782 and is the thing professions.py
+    // refuses to do by design.
+    //
+    // NO SELECTION PROBLEM, WHICH professions.py LISTED AS A BLOCKER. That note
+    // was about TrainerAction, which reads the MASTER's selected unit and so
+    // could never be driven for a family that has one (TrainerAction.cpp:75-82).
+    // Going under it to the core's own Trainer object makes selection
+    // irrelevant: the creature is passed in, because this module already knows
+    // which one it sent the character to.
+    bool TrainOnArrival(std::string const& name, Player* bot, uint32 entry,
+                        ProfessionPlan const& plan)
+    {
+        uint32 const skill = plan.learnSkill;
+        if (!skill)
+            return true;   // arriving WAS the whole errand
+
+        char const* const skillName = SkillName(skill);
+
+        if (!plan.wanted.count(skill))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was sent to learn {} ({}), which the roster does not "
+                     "say it should hold. Refusing and dropping the errand - the declared "
+                     "end state is the only permission there is", name, skillName, skill);
+            ClearLearnAim(name);
+            return true;
+        }
+
+        if (bot->HasSkill(skill))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' already has {} ({}) - nothing to learn", name,
+                     skillName, skill);
+            ClearLearnAim(name);
+            return true;
+        }
+
+        // BOTH SLOTS STILL FULL. Not an error and not a refusal - it is the
+        // errand arriving in the wrong order, and the unlearn drive runs on its
+        // own poll. Staying put is the right answer: walking away from the
+        // trainer and coming back is a five-minute round trip for a condition
+        // that clears in thirty seconds.
+        if (!bot->GetFreePrimaryProfessionPoints())
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is at the trainer for {} ({}) but holds two primary "
+                     "professions already, so there is no slot to put it in. Waiting here "
+                     "for the unlearn", name, skillName, skill);
+            return false;
+        }
+
+        // Resolved now rather than carried: DriveTravel measures arrival
+        // against the recorded SPAWN POINT, which is a position and not a
+        // creature. TRAVEL_ARRIVED_YARDS is the radius this module already
+        // calls "there", so it is the radius the creature is looked for in
+        // rather than a second, differently-argued number.
+        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+        if (!npc || !npc->IsAlive())
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is standing on the spawn point of creature {} and it "
+                     "is not there - despawned, phased or dead. Cannot learn {} here yet",
+                     name, entry, skillName);
+            return false;
+        }
+
+        Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
+        if (!trainer || !trainer->IsTrainerValidForPlayer(bot))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: creature {} ('{}') will not train '{}' - it is either not a "
+                     "trainer at all or not one this character may use. Dropping the errand",
+                     entry, npc->GetName(), name);
+            ClearLearnAim(name);
+            return true;
+        }
+
+        uint32 const spellId = TrainerSpellForSkill(trainer, bot, skill);
+        if (!spellId)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' reached '{}' (creature {}) and it cannot teach {} ({}) "
+                     "to this character. Dropping the errand so a fresh one can pick a "
+                     "trainer that can", name, npc->GetName(), entry, skillName, skill);
+            ClearLearnAim(name);
+            return true;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is buying {} ({}) from '{}' (creature {}, spell {})",
+                 name, skillName, skill, npc->GetName(), entry, spellId);
+
+        trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
+
+        // THE READ-BACK, and it is the whole point of the exercise. TeachSpell
+        // returns void and reports its failures to the CLIENT - a packet no bot
+        // has anybody to show it to (Trainer.cpp:88-108). So the only way to
+        // know whether a character learned a trade is to ask the character. A
+        // `delivered` here would mean nothing at all.
+        if (!bot->HasSkill(skill))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was not taught {} ({}) by '{}'. TeachSpell reports its "
+                     "reason only to a client, so the likely ones are money - it holds {} "
+                     "copper - or a slot that closed between the check and the sale. "
+                     "Leaving the errand standing for the next poll",
+                     name, skillName, skill, npc->GetName(), bot->GetMoney());
+            return false;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' LEARNED {} ({}) at {}/{} from '{}' - taught by a trainer it "
+                 "was sent to, not granted out of thin air",
+                 name, skillName, skill,
+                 static_cast<uint32>(bot->GetPureSkillValue(skill)),
+                 static_cast<uint32>(bot->GetPureMaxSkillValue(skill)), npc->GetName());
+        RecordEvent(bot, "learn", skill, skillName,
+                    "learned this profession from a trainer it was sent to");
+        ClearLearnAim(name);
+        return true;
+    }
+
+    // The unlearn drive. Its own poll, because unlearning needs no NPC and no
+    // journey: it is the prerequisite that makes the journey worth taking, and
+    // making it wait for one would deadlock the pair - the character cannot
+    // learn until a slot is free, and the slot would not free until it arrived.
+    void DriveProfessions()
+    {
+        std::map<std::string, ProfessionPlan> const plans = LoadProfessionPlans();
+        for (auto const& [name, plan] : plans)
+        {
+            if (!plan.unlearnSkill)
+                continue;
+
+            // SteerableAI for the same reason every other drive uses it: a name
+            // resolves to a Player that is mid-login or mid-teardown several
+            // times an hour while POV streaming runs, and this one writes to
+            // the character's skills.
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(bot))
+                continue;
+
+            UnlearnProfession(name, bot, plan);
+        }
     }
 
     // Only `new rpg` walks a character to an NPC: it owns the `wander npc
@@ -2484,6 +3048,13 @@ private:
         // errand". The WHERE clause that used to live here lives in the loader:
         // an empty target never reaches this loop, exactly as before.
         std::map<std::string, std::string> const aims = LoadTravelAims();
+        // Read once for the whole sweep rather than per character: the errands
+        // and the trades are the same handful of rows, and this is the read
+        // that decides both WHERE a character is sent and what it does when it
+        // gets there. An empty map - nobody assigned, or the columns are not
+        // deployed yet - degrades this loop to exactly what it did before:
+        // travel, and no transaction.
+        std::map<std::string, ProfessionPlan> const plans = LoadProfessionPlans();
         if (aims.empty())
         {
             // No errands anywhere, so nothing this loop remembers is still
@@ -2511,10 +3082,16 @@ private:
             if (!botAI)
                 continue;
 
+            auto const planIt = plans.find(name);
+            ProfessionPlan const* const plan =
+                planIt == plans.end() ? nullptr : &planIt->second;
+            uint32 const wantSkill = plan ? plan->learnSkill : 0;
+
             TravelState& state = _travelState[name];
-            if (state.target != target)
+            if (state.target != target || state.learn != wantSkill)
             {
                 state.target = target;
+                state.learn = wantSkill;
                 state.since = std::time(nullptr);
                 state.entry = 0;
                 state.pinned = false;
@@ -2562,7 +3139,7 @@ private:
                 entry = state.entry;
                 pos = WorldPosition(state.mapId, state.x, state.y, state.z);
             }
-            else if (!ResolveTravelTarget(bot, target, entry, pos))
+            else if (!ResolveTravelTarget(bot, target, entry, pos, wantSkill))
             {
                 // Said unconditionally: the errand is released on this line and
                 // its state erased with it, so there is no second poll of this
@@ -2583,11 +3160,47 @@ private:
             // Distance can be, and it is the thing the errand actually means.
             if (bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()) <= TRAVEL_ARRIVED_YARDS)
             {
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' reached '{}' (creature {}) - errand done, releasing",
-                         name, target, entry);
-                ClearTravelAim(name);
-                continue;
+                // ARRIVING IS NO LONGER THE WHOLE ERRAND (infra#2757). Where
+                // the roster has asked this character to learn a trade, the
+                // errand is finished when it has been LEARNED - or when it is
+                // certain it cannot be here. TrainOnArrival answers exactly
+                // that question and nothing else; a character with no learn
+                // aim gets `true` on its first line and this reads as it
+                // always did.
+                if (plan && !TrainOnArrival(name, bot, entry, *plan))
+                {
+                    // NOT RELEASED, AND DELIBERATELY NOT `continue`. Falling
+                    // through reaches the re-issue guard below, which renews
+                    // the WANDER_NPC lease - so a character waiting for its
+                    // slot to free keeps standing at the trainer instead of
+                    // going IDLE when upstream's five-minute clock lapses
+                    // (statusWanderNpcDuration, NewRpgAction.h:65). The
+                    // twenty-minute backstop immediately below is what stops
+                    // this being forever, and it is reached on this path.
+                    //
+                    // SAID ONCE PER ERRAND, not once per poll. `arrived` is
+                    // already this state's "said already" flag and it is reset
+                    // whenever the errand changes, so it carries exactly the
+                    // meaning wanted here. TrainOnArrival says WHY it is not
+                    // finished on its own line; repeating that the character is
+                    // standing still every fifteen seconds would bury it.
+                    if (!state.arrived)
+                    {
+                        state.arrived = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' has reached '{}' (creature {}) and is "
+                                 "holding position there - the errand is not finished yet",
+                                 name, target, entry);
+                    }
+                }
+                else
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' reached '{}' (creature {}) - errand done, "
+                             "releasing", name, target, entry);
+                    ClearTravelAim(name);
+                    continue;
+                }
             }
 
             // BACKSTOP. An errand that can never land must not pin a character
@@ -2741,7 +3354,51 @@ private:
             PlayerbotFactory factory(bot, level);
             factory.InitSkills();
             factory.InitClassSpells();
+
+            // THE FOURTH BLOCKER, AND THE ONE NOBODY HAD NAMED (infra#2757,
+            // infra#2782). This is also where the alchemy all five hold came
+            // from, and until it was closed the other three fixes were
+            // pointless: freeing a slot for tailoring would simply have handed
+            // the slot to whatever the sweep below reached first, within sixty
+            // seconds, forever.
+            //
+            // WHAT InitAvailableSpells ACTUALLY DOES. It walks EVERY Tradeskill
+            // and Class trainer template in the world and learns every spell
+            // CanTeachSpell says yes to, with no NPC, no money and no journey
+            // (PlayerbotFactory.cpp:3210-3253). CanTeachSpell refuses a primary
+            // profession's first rank on exactly one condition - that the
+            // character has no free primary profession point
+            // (Trainer.cpp:145-148). So while a slot is open, the first
+            // profession in trainer-template order is taken out of thin air.
+            // That is why all five hold the SAME profession at 1/75 rather than
+            // five different ones: it was never a roll, it was an iteration
+            // order. AiPlayerbot.ClassMatchingProfessionChance could not have
+            // helped, because InitTradeSkills - the function that reads it -
+            // returns at its first line for anyone who is not a random bot
+            // (PlayerbotFactory.cpp:2755-2758).
+            //
+            // WHAT THE GUARD DOES, AND WHAT IT DELIBERATELY DOES NOT. Zeroing
+            // the free-slot counter for the duration of the sweep makes
+            // CanTeachSpell refuse primary FIRST RANKS and nothing else.
+            // Journeyman and higher ranks are not first ranks, recipes are not
+            // first ranks, and no class spell is - so every reason this module
+            // calls InitAvailableSpells at all still works, and a character
+            // that already holds a trade still gets its rank-ups. The only
+            // thing that becomes impossible is acquiring a profession without a
+            // trainer, which is the thing that was never meant to happen.
+            //
+            // Restored unconditionally, because a character left holding zero
+            // free slots could never learn the trade it is being sent to learn -
+            // which would swap one silent blocker for another.
+            uint32 const freeProfessionSlots = bot->GetFreePrimaryProfessionPoints();
+            if (freeProfessionSlots)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has {} free primary profession slot(s); holding "
+                         "them shut for the trainer-table sweep so it cannot take one "
+                         "without a trainer", name, freeProfessionSlots);
+            bot->SetFreePrimaryProfessions(0);  // Player.h:1796
             factory.InitAvailableSpells();
+            bot->SetFreePrimaryProfessions(static_cast<uint16>(freeProfessionSlots));
 
             if (hasTree)
                 SpendTalents(bot, static_cast<uint32>(specTab));
@@ -4442,6 +5099,7 @@ private:
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
     uint32 _travelTimer = 0;
+    uint32 _professionTimer = 0;
 
     // ---------------------------------------------------------------- travel --
     //
@@ -4460,6 +5118,19 @@ private:
     std::vector<TravelSpawn> _travelSpawns;
     bool _travelIndexBuilt = false;
 
+    // Which primary professions each trainer ENTRY can start somebody in
+    // (infra#2757). Keyed by creature entry, not by spawn: the same trainer is
+    // spawned once, but the question "can this one teach tailoring" is about
+    // the template, and every spawn of it has the same answer.
+    //
+    // WHY THIS IS CACHED AND NOT ASKED PER RESOLVE. Answering it walks the
+    // trainer's whole spell list and resolves a SpellInfo per entry. Doing that
+    // for every profession-trainer spawn on the map, on the world thread, every
+    // fifteen seconds, to answer a question whose answer never changes, is the
+    // same waste BuildTravelIndex already refused for spawns. Filled lazily by
+    // TrainerStartsSkill on the first errand that asks.
+    std::map<uint32, std::set<uint32>> _trainerSkills;
+
     // What DriveTravel knew about each errand last time round, so an aim that
     // can never land is given up on rather than renewed forever, and so
     // "arrived" is announced once instead of every poll. World thread only -
@@ -4468,6 +5139,13 @@ private:
     struct TravelState
     {
         std::string target;   // the column value as this loop last saw it
+        // What the errand was FOR, as of the last poll. A changed learn skill
+        // is a changed errand even when the target keyword has not moved,
+        // because the resolve is narrowed by it - see ResolveTravelTarget.
+        // Without this the pinned spawn from the previous trade would be kept
+        // and the character would walk to a trainer for a skill it is no
+        // longer being sent to learn.
+        uint32 learn{0};
         time_t since{0};      // when that target was first seen
         uint32 entry{0};      // the spawn it resolved to
         bool pinned{false};   // ...and which it is NOT resolved away from again
@@ -4478,6 +5156,13 @@ private:
         bool arrived{false};  // announced already
     };
     std::map<std::string, TravelState> _travelState;
+
+    // The unlearn this module has already refused for each character, so a
+    // standing disagreement about the price is said once rather than twice a
+    // minute forever (infra#2757). Name -> the skill id refused. Cleared when
+    // the request is cleared, and lost on restart - which costs one repeated
+    // log line and no correctness, exactly like _travelHandback above.
+    std::map<std::string, uint32> _unlearnRefused;
     // When travel last let go of a character, so the quest drive does not pick
     // it up on the same tick the errand ended. Written by ClearTravelAim and by
     // PruneTravelState - every way an errand can end - and read only by
