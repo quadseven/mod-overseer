@@ -1657,12 +1657,48 @@ private:
         return aims;
     }
 
+    // Every enabled character's job mode (infra#2834), name -> mode. Absent
+    // means the schema's own default, 'quest'
+    // (2026_08_26_01_overseer_roster_job.sql) - so a row nobody has touched, a
+    // row explicitly set to 'quest', and a `job` column that does not exist
+    // yet are all the same thing to DriveQuests, deliberately: read-on-its-own,
+    // same discipline as LoadQuestAims and LoadTravelAims and for the same
+    // reason (the DDL and this reader ship in different images).
+    //
+    // ONLY 'quest' IS EXCLUDED FROM THE QUERY rather than every mode fetched
+    // and filtered here: DriveQuests only ever needs to know "should I stand
+    // down", so the map holds exactly the characters whose mode is something
+    // other than quest, and absence from it already means "drive as normal" -
+    // no separate default branch to keep in sync with the schema's DEFAULT.
+    std::map<std::string, std::string> LoadJobs()
+    {
+        std::map<std::string, std::string> jobs;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, job FROM overseer_roster "
+            "WHERE enabled = 1 AND job <> '' AND job <> 'quest'");
+        if (!result)
+            return jobs;  // everybody questing, or no such column - same answer
+        do
+        {
+            Field* fields = result->Fetch();
+            jobs[fields[0].Get<std::string>()] = fields[1].Get<std::string>();
+        } while (result->NextRow());
+        return jobs;
+    }
+
     void DriveQuests()
     {
         // Read first, and each on its own, so that neither aim column can stop
         // this drive from running - see above.
         std::map<std::string, uint32> const aims = LoadQuestAims();
         std::map<std::string, std::string> const travelAims = LoadTravelAims();
+        // infra#2834: everybody NOT holding job 'quest'. Checked first in the
+        // loop below, before any quest aim or travel arbitration - a
+        // character told to farm or rest should not have a quest re-asserted
+        // out from under it just because nothing farm-specific exists yet to
+        // replace the assertion with. See LoadJobs above for what absence
+        // from this map means.
+        std::map<std::string, std::string> const jobs = LoadJobs();
 
         QueryResult result = CharacterDatabase.Query(
             // EVERY enabled member, not only the leader (infra#2801, "quest
@@ -1690,6 +1726,23 @@ private:
             Field* fields = result->Fetch();
             std::string const name = fields[0].Get<std::string>();
             bool const isLead = fields[1].Get<uint8>() != 0;
+
+            // THE JOB GATE (infra#2834). A character whose schedule says
+            // something other than 'quest' gets no quest aim asserted and no
+            // fallback to its own log - it is stood down from this drive
+            // entirely, the same shape as the travel hand-off just below.
+            // Deliberately does NOT touch strategies or rpgInfo: nothing yet
+            // exists to positively drive farm/dungeon/grind/etc (see
+            // jobs.py's IMPLEMENTED), so the honest behaviour is "stop
+            // questing", not a mode this file cannot yet make good on.
+            auto const jobIt = jobs.find(name);
+            if (jobIt != jobs.end())
+            {
+                LOG_DEBUG("module.overseer",
+                          "overseer: '{}' job is '{}', not quest - the quest "
+                          "drive stands down for it", name, jobIt->second);
+                continue;
+            }
 
             // Absent from a map is the column's own "no opinion" value, which
             // is also what a column the schema does not have degrades to. Every
@@ -4012,11 +4065,12 @@ private:
             char const* status = "error";
             char const* detail = "";
 
-            // Bot orders only. 'chat', 'gm', 'probe', 'give' and 'share' do
-            // not go through PlayerbotAI::HandleCommand and share no trigger,
-            // so nothing they do can be overwritten by the row after them.
+            // Bot orders only. 'chat', 'gm', 'probe', 'give', 'share' and
+            // 'job' do not go through PlayerbotAI::HandleCommand and share no
+            // trigger, so nothing they do can be overwritten by the row
+            // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
-                && kind != "share")
+                && kind != "share" && kind != "job")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -4097,6 +4151,8 @@ private:
                 detail = DoGive(player, targetArg, command, status, rowResult);
             else if (kind == "share")
                 detail = DoShare(player, targetArg, command, status, rowResult);
+            else if (kind == "job")
+                detail = DoJob(player, command, status);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -4479,6 +4535,52 @@ private:
             out = ProbeBags(bot);
         else
             return "unknown probe (state|spells|talents|strategies|gear|bags)";
+
+        status = "delivered";
+        return "";
+    }
+
+    // The job-schedule vocabulary (infra#2834). DUPLICATED, ON PURPOSE AND
+    // UNAVOIDABLY, in production/scripts/wow-overseer/jobs.py - same
+    // situation as TravelRoles above, and for the same reason: a compiled
+    // module and a Python process share no schema. tests/test_job_mode.py
+    // compares the two keys in both directions.
+    //
+    // Only 'quest' does anything beyond writing the column - see the job gate
+    // in DriveQuests above. Every other name here is still a VALID thing to
+    // set: this list is what tells DoJob a name is real, not what tells it
+    // a name is built.
+    static std::vector<std::string> const& JobModes()
+    {
+        static std::vector<std::string> const modes = {
+            "quest", "farm", "dungeon", "grind", "gear hunt", "craft",
+            "town run", "train", "rest", "bank", "reputation", "guild business",
+        };
+        return modes;
+    }
+
+    // Set `player`'s job-schedule mode (infra#2834). `command` is the mode
+    // name verbatim - it was already validated by jobs.resolve on the Python
+    // side before being written to overseer_command, but that side sent a
+    // string over a boundary this module does not trust any string across,
+    // so it is checked again here against the same list mod-overseer would
+    // otherwise silently accept anything into.
+    //
+    // A PLAIN COLUMN WRITE, not a strategy change: nothing here touches
+    // rpgInfo or ChangeStrategy. Only the quest-drive GATE (DriveQuests, the
+    // jobs map read at the top of its loop) reacts to this column today -
+    // every mode besides 'quest' means "the quest drive stands down", full
+    // stop, until each mode gets its own drive built.
+    static char const* DoJob(Player* player, std::string const& command, char const*& status)
+    {
+        std::string const mode = LowerName(command);
+        auto const& modes = JobModes();
+        if (std::find(modes.begin(), modes.end(), mode) == modes.end())
+            return "unknown job mode";
+
+        CharacterDatabase.DirectExecute(
+            "UPDATE overseer_roster SET job = '{}' WHERE name = '{}'",
+            mode, player->GetName());
 
         status = "delivered";
         return "";

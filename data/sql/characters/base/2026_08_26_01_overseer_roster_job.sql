@@ -1,0 +1,49 @@
+-- What the family is currently trying to do: the RimWorld-style job schedule
+-- (infra#2834). Evan's own words: "i should be able to be like, its farming
+-- time, sort of like rim world job schedule times, they should quest, farm,
+-- dungeon, level, grind, try to get specific gear from something".
+--
+-- THE FAMILY HAD EXACTLY ONE MODE BEFORE THIS COLUMN EXISTED. DriveQuests
+-- always drove every enabled character onto a quest - the council's aim, or
+-- the leader's own log as a fallback - with no way to say "stop questing,
+-- gather for a while" and no way for the family to decide that for
+-- themselves either. This column is the gate.
+--
+-- ONE COLUMN, WHOLE FAMILY, ON PURPOSE. A job is not a per-character aim the
+-- way `drive_quest` is: mod-overseer keeps `new rpg` on the party leader
+-- alone (the "ONLY THE TRAVELLER" rule in mod_overseer.cpp, infra#2812 -
+-- 937 yards of scatter the first time this was violated), so a mode that
+-- differed per character would put an independent travel intent back on
+-- more than one bot. `production/scripts/wow-overseer/jobs.py` writes this
+-- column onto every enabled roster row in one pass for exactly that reason -
+-- its own docstring explains it further, and is not repeated here.
+--
+-- WHAT THIS PASS ACTUALLY WIRES: 'quest' (the default, and the only value
+-- that changes anything beyond the gate itself) and the honest stand-down
+-- for every other named mode. DriveQuests (mod_overseer.cpp) now reads this
+-- column and skips a character entirely when its job is not 'quest' - no
+-- quest aim is asserted, no fallback to the leader's log runs. It does NOT
+-- yet make anybody farm, run a dungeon, grind, craft, or anything else in
+-- jobs.MODES: those modes are named so a person setting one gets an honest
+-- reply (jobs.describe says so explicitly), not a silently ignored request.
+-- Building each of those into an actual drive is the follow-up list this
+-- migration's own PR states rather than half-implements.
+--
+-- WHY A NAME AND NOT A NUMBER, unlike overseer_roster.professions. A job
+-- mode is a decision a PERSON states in a sentence - "it's farming time" -
+-- the same category travel_npc is (a council/chat vocabulary), not a value
+-- that already exists twice in two schemas the way a skill id does. See
+-- travel_npc's own migration (2026_08_25_00) for the fuller version of this
+-- same argument.
+--
+-- WHY THE C++ SIDE IS READ ON ITS OWN, exactly like drive_quest and
+-- travel_npc before it (see the long comment above LoadQuestAims in
+-- mod_overseer.cpp for the full mechanism: the DDL and the reader ship in
+-- DIFFERENT images, and a SELECT naming a column the table does not have
+-- fails WHOLE). A missing `job` column costs the gate, not the whole quest
+-- drive: DriveQuests treats an unreadable column exactly like every row
+-- reading 'quest' - the default this column itself declares - so a stale
+-- worldserver keeps today's behaviour rather than freezing the family.
+ALTER TABLE `overseer_roster`
+    ADD COLUMN `job` VARCHAR(20) NOT NULL DEFAULT 'quest'
+        COMMENT 'Job-schedule mode (infra#2834): quest, farm, dungeon, grind, gear hunt, craft, town run, train, rest, bank, reputation, guild business. Only quest is wired to a behaviour change today; every other value stands the quest drive down and nothing yet replaces it.';
