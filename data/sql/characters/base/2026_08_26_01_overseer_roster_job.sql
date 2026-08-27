@@ -1,5 +1,5 @@
 -- What the family is currently trying to do: the RimWorld-style job schedule
--- (infra#2834). Evan's own words: "i should be able to be like, its farming
+-- (infra#2834). The operator's own words: "i should be able to be like, its farming
 -- time, sort of like rim world job schedule times, they should quest, farm,
 -- dungeon, level, grind, try to get specific gear from something".
 --
