@@ -1,0 +1,43 @@
+Subject: [PATCH] FindStoneFor: drop the sharpening stone from the weightstone list
+
+WHY THIS PATCH EXISTS
+    `uPrioritizedWeightStoneIds` - the list consulted for MACE, MACE2, STAFF
+    and FIST weapons - contains ELEMENTAL_SHARPENING_STONE. That is a
+    copy-paste from the sharpening-stone list three lines above. A sharpening
+    stone is a bladed-weapon enchant; handing one to a mace produces exactly
+    the same SPELL_FAILED_EQUIPPED_ITEM_CLASS rejection that 0001 fixes, only
+    at level 60+, since item 18262 is level 60 content.
+
+    There is no correct value to put in its place: mod-playerbots' own
+    `enum WeightstoneId` (src/Bot/PlayerbotAI.h:200-208) has no elemental
+    tier, because no Elemental Weightstone item exists - the weightstone
+    progression goes Dense (12643) straight to Fel (28420). So the entry is
+    deleted rather than corrected.
+
+    This is a pure removal from a static initialiser list. It cannot change
+    the shape of any type or signature, so it carries no compile risk beyond
+    the patch itself applying.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+    mod-playerbots removing ELEMENTAL_SHARPENING_STONE from
+    `uPrioritizedWeightStoneIds`. When that lands and AC_MODULE_SHA is bumped
+    past it, this patch stops applying and fails the build on purpose - at
+    which point delete this file.
+
+    Upstream PR: not yet opened. Add the link here when it is.
+
+APPLIES TO
+    mod-playerbots @ 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312, on top of 0001
+    src/Bot/PlayerbotAI.cpp:5567-5569 (uPrioritizedWeightStoneIds)
+
+--- a/src/Bot/PlayerbotAI.cpp
++++ b/src/Bot/PlayerbotAI.cpp
+@@ -5574,7 +5574,7 @@
+         SOLID_SHARPENING_STONE,      HEAVY_SHARPENING_STONE, COARSE_SHARPENING_STONE,    ROUGH_SHARPENING_STONE};
+ 
+     static const std::vector<uint32_t> uPrioritizedWeightStoneIds = {
+-        ADAMANTITE_WEIGHTSTONE, FEL_WEIGHTSTONE,    ELEMENTAL_SHARPENING_STONE, DENSE_WEIGHTSTONE, SOLID_WEIGHTSTONE,
++        ADAMANTITE_WEIGHTSTONE, FEL_WEIGHTSTONE,    DENSE_WEIGHTSTONE, SOLID_WEIGHTSTONE,
+         HEAVY_WEIGHTSTONE,      COARSE_WEIGHTSTONE, ROUGH_WEIGHTSTONE};
+ 
+     Item* stone = nullptr;
