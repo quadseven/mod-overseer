@@ -177,6 +177,27 @@ constexpr uint32 QUEST_POLL_MS = 20000;
 // spent part of every five minutes wandering off on its own.
 constexpr uint32 TRAVEL_POLL_MS = 15000;
 
+// How often the engagement-safety drive checks the roster for a character
+// that is both unaccompanied and unaimed (infra#2925/#2891 - watched live:
+// Grug revived alone after a group wipe in Burning Steppes, with no group, no
+// quest, and no travel aim pointing him anywhere, and walked straight into a
+// `??`-conned dragonkin). Faster than the quest/travel polls on purpose: the
+// failure this drive exists to stop is a WALK, not a multi-minute errand, and
+// a character that revives alone can be in front of something lethal within
+// seconds. Still a poll, not a hook on the AI tick - see DriveEngagementSafety
+// for why that distinction matters on a worldserver that has already
+// segfaulted twice today.
+constexpr uint32 ENGAGEMENT_POLL_MS = 8000;
+
+// The level difference at which AzerothCore's own client-facing con-color
+// math would show a target as `??` - unknown, maximum danger - rather than a
+// number. This is the SAME signal the game already computes for the
+// nameplate/tooltip frame; it is not a threshold invented for this drive.
+// Ten is the standard WoW figure for that boundary (elite or not), and using
+// it here means "would this read as `??` to a human looking at it" rather
+// than a number picked to fit one incident.
+constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
+
 // How close counts as arrived. INTERACTION_DISTANCE is 5.0 yards and is what
 // the game uses to decide whether a player may talk to an NPC at all; this is
 // deliberately looser, because arrival is measured against the SPAWN POINT out
@@ -1312,6 +1333,7 @@ public:
         _travelTimer += diff;
         _professionTimer += diff;
         _eventTimer += diff;
+        _engagementTimer += diff;
         _deathTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
@@ -1370,6 +1392,17 @@ public:
         {
             _travelTimer = 0;
             DriveTravel();
+        }
+        // AFTER DriveQuests and DriveTravel, so an aim either of them just
+        // asserted or released this same tick is what this drive sees too -
+        // there is no reason for this to be looking at a tick-stale answer to
+        // "does this character have an aim" when the two drives that OWN that
+        // answer already ran. See DriveEngagementSafety for the rest of the
+        // reasoning; this does not touch either drive above it.
+        if (_engagementTimer >= ENGAGEMENT_POLL_MS)
+        {
+            _engagementTimer = 0;
+            DriveEngagementSafety();
         }
         // AFTER DriveTravel, on purpose. Both can run in the same tick, and
         // when they do the order that helps is travel first: a character that
@@ -3697,6 +3730,200 @@ private:
         PruneTravelState(stillAimed);
     }
 
+    // ---------------------------------------------------------- engagement --
+    //
+    // WHAT WAS WATCHED. The family wiped as a group in Burning Steppes
+    // (level 45-55) against a named elite and its trash - a group's own bad
+    // call, and out of scope here. What happened minutes later was not a
+    // group decision at all: Grug revived alone, with no group, no quest aim
+    // and no travel aim pointing him anywhere, and walked straight at a
+    // `??`-conned dragonkin and died again. His combat engine still carried
+    // `pull`, `tank` and `tank assist`, correctly - he is the family's
+    // protection warrior and those are exactly the strategies that job needs
+    // WHILE GROUPED AND TANKING CONTENT THE GROUP CHOSE. Nothing turned them
+    // off when the group and the choosing both stopped being true.
+    //
+    // THE GATE. A character counts as having a reason to be somewhere when
+    // either the council gave it one - `drive_quest` or `travel_npc`, read
+    // through the SAME guarded loaders DriveQuests and DriveTravel already
+    // use, so a late-added column degrades this drive exactly the way it
+    // degrades theirs (infra#2846) rather than in some new way of its own -
+    // or it is actually accompanied: grouped, with at least one OTHER roster
+    // member in that same group and in the world right now. Not merely
+    // holding a Group* - KeepRosterGrouped keeps this family in one party
+    // long after a wipe scatters who is actually online, which is precisely
+    // the gap that was watched: Grug's own group membership almost certainly
+    // survived the wipe intact. Nothing had gone anywhere.
+    //
+    // A character with neither is stripped of the strategies that go looking
+    // for a NEW fight - `pull`, `aoe`, `grind` - through the exact mechanism
+    // DeliverPendingCommands already uses to grant them: ChangeStrategy on
+    // BOT_STATE_COMBAT, read back with the same StrategyPresent this file
+    // already uses to verify a whispered command. This is not a parallel
+    // system; it is the same one, run the other direction.
+    //
+    // WHAT THIS DELIBERATELY DOES NOT TOUCH. `tank` and `tank assist` stay,
+    // even here: a bot drawn into a fight it did not choose - its own party's,
+    // or something that simply finds it - should still be able to hold aggro
+    // off whoever needs it, and stripping those would be gating a REACTION,
+    // not an initiation. `co +flee` is not relied on as the fix, either -
+    // Grog carried it into yesterday's death and it did not save him, so it
+    // is used below as one layer, not the whole answer. The single-traveller
+    // arbitration (TravelHoldsTheWheel, DriveQuests, DriveTravel, SteerableAI)
+    // is not called here and this drive does not write rpgInfo, `master`, or
+    // any travel/quest state - it only ever touches the combat strategy list.
+    //
+    // THE BACKSTOP. If a character is unaccompanied, unaimed, and ALREADY
+    // fighting something the client's own con-color math would show as `??`
+    // (CON_COLOR_UNKNOWN_LEVEL_DIFF - the level gap the brief for this fix
+    // says to use, not one invented for this incident), `flee` is added on
+    // top of whatever strategies it already has. This is additive and
+    // reactive on purpose: it is what runs when the strip above was too late,
+    // because the bot already had `pull` live before this drive ever saw it
+    // unaccompanied - which is exactly Grug's case.
+    //
+    // WHY A POLL AND NOT A HOOK ON THE AI TICK. A target-selection guard
+    // inside mod-playerbots itself (PullAction, GrindingStrategy) would catch
+    // this before a single step is taken, which this cannot. It would also
+    // add a branch to the tick every bot in the world runs every update, on a
+    // worldserver that has SIGSEGV'd twice today (infra#2891) with its cause
+    // not yet closed. Everything this function reads is a pointer already
+    // proven valid by SteerableAI, and every decision is a level comparison
+    // or a strategy-list lookup - cheap, and nothing here can throw or block.
+    // That trade - a several-second window instead of zero, in exchange for
+    // touching nothing upstream compiles on its own hot path - is the one
+    // made here; the precise version stays out of scope for today (see
+    // infra#2912, which exists to find out WHY the family keeps drifting
+    // somewhere lethal in the first place).
+    //
+    // OUT OF SCOPE, ALSO ON PURPOSE. This does not refuse an incoming
+    // `co +pull` at delivery time. A grant that lands while a character is
+    // unaccompanied is undone here on the next poll instead, within
+    // ENGAGEMENT_POLL_MS - self-healing rather than refused outright.
+    // Gating DeliverPendingCommands too would close that few-second window,
+    // but that function's own history (COMMANDS_PER_POLL, the trigger-
+    // collision fix above it) is exactly why that 2-second loop is treated as
+    // its own hot path in this file, and closing a several-second window is
+    // not worth adding risk to it today.
+    void DriveEngagementSafety()
+    {
+        // THE SAME READERS DriveQuests AND DriveTravel USE. Not a fresh query
+        // of these columns: one guarded loader per column, so a schema older
+        // than either degrades this drive exactly like it degrades theirs -
+        // to "nobody has an opinion", never to "nothing runs".
+        std::map<std::string, uint32> const questAims = LoadQuestAims();
+        std::map<std::string, std::string> const travelAims = LoadTravelAims();
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        // No roster, nothing to guard - the same "nothing to do" reading
+        // every other roster-wide drive in this file gives a null result.
+        if (!result)
+            return;
+
+        static char const* const INITIATOR_STRATEGIES[] = {"pull", "aoe", "grind"};
+
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+
+            // SteerableAI, not a bare lookup - see SteerableAI above and
+            // infra#2891: a name can resolve to a Player mid-login or
+            // mid-teardown, with a PlayerbotAI that is non-null right up
+            // until it is freed.
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            bool const aimed = questAims.count(name) != 0 || travelAims.count(name) != 0;
+
+            // Accompanied means another roster member is in the SAME group
+            // and actually in the world right now - see the comment above
+            // this function for why a bare Group* is not enough.
+            bool accompanied = false;
+            if (Group* group = bot->GetGroup())
+            {
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* member = ref->GetSource();
+                    if (member && member != bot && member->IsInWorld())
+                    {
+                        accompanied = true;
+                        break;
+                    }
+                }
+            }
+
+            if (aimed || accompanied)
+                continue;
+
+            // THE STRIP. Built from what is actually present, so the
+            // ChangeStrategy call and the log line both say only what
+            // changed - the same discipline ResolveStrategyChecks already
+            // applies to a whispered command's own verdict.
+            std::string change;
+            std::string strippedList;
+            for (char const* strategy : INITIATOR_STRATEGIES)
+            {
+                if (!StrategyPresent(botAI, StrategyItem{strategy, true}))
+                    continue;
+                if (!change.empty())
+                {
+                    change += ',';
+                    strippedList += ", ";
+                }
+                change += '-';
+                change += strategy;
+                strippedList += strategy;
+            }
+
+            if (!change.empty())
+            {
+                // .c_str(): ChangeStrategy is called elsewhere in this file
+                // only with string literals, so this is the one call site
+                // that has to work whether the parameter type upstream picked
+                // is std::string or a bare const char*.
+                botAI->ChangeStrategy(change.c_str(), BOT_STATE_COMBAT);
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is alone (no live groupmate) and unaimed (no "
+                         "quest or travel aim) - stripping {} from its combat engine so "
+                         "it stops choosing new fights; tank/tank assist are left alone "
+                         "for if something finds it anyway",
+                         name, strippedList);
+            }
+
+            // THE BACKSTOP. Only reached for a character already judged
+            // unaccompanied and unaimed above - a bot legitimately tanking
+            // for its grouped family is never evaluated against this at all.
+            if (!bot->IsInCombat())
+                continue;
+            Unit* victim = bot->GetVictim();
+            if (!victim)
+                continue;
+
+            uint32 const botLevel = uint32(bot->GetLevel());
+            uint32 const victimLevel = uint32(victim->GetLevel());
+            if (victimLevel < botLevel + CON_COLOR_UNKNOWN_LEVEL_DIFF)
+                continue;
+
+            if (StrategyPresent(botAI, StrategyItem{"flee", true}))
+                continue;
+
+            botAI->ChangeStrategy("+flee", BOT_STATE_COMBAT);
+            // WARN, not INFO: this is the line that fires when the strip
+            // above ran too late, and its absence is exactly how yesterday's
+            // family death stayed invisible until somebody was watching.
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) is alone, unaimed, and already fighting "
+                     "'{}' (level {}) - that will `??` by the con-color math this module "
+                     "was told to use ({}+ level gap) - forcing +flee as a backstop; this "
+                     "is NOT proven to save a character on its own (see infra#2891/#2912)",
+                     name, botLevel, victim->GetName(), victimLevel,
+                     CON_COLOR_UNKNOWN_LEVEL_DIFF);
+        } while (result->NextRow());
+    }
+
     // Teach the roster what a character of its level would already know.
     //
     // WHY THIS EXISTS AT ALL. mod-playerbots does this job properly on levelup -
@@ -5645,6 +5872,7 @@ private:
     uint32 _questTimer = 0;
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
+    uint32 _engagementTimer = 0;
 
     // ---------------------------------------------------------------- travel --
     //
