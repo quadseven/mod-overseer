@@ -1,0 +1,118 @@
+name: Build against the pinned core
+
+# Proves this module actually compiles against the pinned AzerothCore +
+# mod-playerbots, on GitHub's own free public runners - deliberately NOT
+# self-hosted infrastructure. This module used to live inside quadseven/infra
+# and every build of it ran on that repo's self-hosted pool, sharing a NAS
+# with everything else on that homelab; if the NAS is slow, this module's own
+# CI has no reason to be. This workflow's whole point is having none of that
+# dependency.
+#
+# Compile-only. No image push, no registry, no secrets - this proves the code
+# builds, nothing more. The pinned core ships its own Dockerfile
+# (apps/docker/Dockerfile); this reuses it rather than hand-rolling a second
+# build definition that could pass or fail for reasons unrelated to whether
+# the module itself is correct.
+#
+# Parallelism is the pinned core's own -j$(nproc+1), unmodified - there is no
+# build-arg to override it (checked the actual Dockerfile rather than assume
+# one existed). On a standard 2-core public runner that is -j3, which is
+# naturally conservative; nothing here artificially constrains it further.
+#
+# CACHED, deliberately, on GitHub's own cache storage - NOT the self-hosted
+# buildkitd/registry this module used to depend on. A GitHub-hosted runner is
+# a fresh VM every run; without this every build here would be full-cold
+# (~40-90 min going by this org's own infra history) forever. The cache is a
+# buildx LOCAL exporter, which is what actually persists the Dockerfile's own
+# `--mount=type=cache,target=/ccache` contents across runs - restoring the
+# directory alone would not do that; the cache lives in buildx's own metadata,
+# not just the raw ccache files. Keyed on the two pinned SHAs, so a version
+# bump correctly starts cold rather than silently reusing a stale cache.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  CORE_SHA: efe123fab543c5faf3c477674ec17a18fd59f09f
+  MODULE_SHA: 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          path: mod-overseer
+
+      - name: Clone the pinned core + mod-playerbots
+        env:
+          # Same pins quadseven/infra's UPSTREAM-PINS.env carries. Kept here
+          # rather than fetched from that (private-adjacent) repo at runtime,
+          # so this workflow has zero dependency on it - the whole point.
+          CORE_REPO: https://github.com/mod-playerbots/azerothcore-wotlk.git
+          MODULE_REPO: https://github.com/mod-playerbots/mod-playerbots.git
+        run: |
+          set -euo pipefail
+          git clone -q "$CORE_REPO" acore
+          git -C acore checkout -q "$CORE_SHA"
+
+          mkdir -p acore/modules
+          git -C acore/modules clone -q "$MODULE_REPO" mod-playerbots
+          git -C acore/modules/mod-playerbots checkout -q "$MODULE_SHA"
+          rm -rf acore/modules/mod-playerbots/.git
+
+          cp -r mod-overseer acore/modules/mod-overseer
+          rm -rf acore/modules/mod-overseer/.git
+
+          test -f acore/apps/docker/Dockerfile
+          test -d acore/modules/mod-playerbots/src
+          test -d acore/modules/mod-overseer/src
+          echo "core:   $(git -C acore rev-parse HEAD)"
+          echo "module: $MODULE_SHA"
+          ls -1 acore/modules
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3
+
+      - name: Restore build cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: cache
+        with:
+          path: /tmp/buildx-cache
+          key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
+
+      - name: Build (compile only, no push)
+        working-directory: acore
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --cache-from type=local,src=/tmp/buildx-cache \
+            --cache-to type=local,dest=/tmp/buildx-cache-new,mode=max \
+            -f apps/docker/Dockerfile \
+            -t mod-overseer-buildcheck:local \
+            --load \
+            .
+
+      # actions/cache is immutable per key - the SAME key cannot be
+      # overwritten, only created once. Writing to a fresh -new directory and
+      # saving under the identical key this run tried to restore is what lets
+      # a later run on the same pins pick up whatever THIS run produced,
+      # rather than the save silently no-opping against an existing key.
+      - name: Save build cache
+        if: always()
+        run: |
+          rm -rf /tmp/buildx-cache
+          mv /tmp/buildx-cache-new /tmp/buildx-cache 2>/dev/null || true
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/buildx-cache
+          key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
