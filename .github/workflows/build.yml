@@ -92,8 +92,15 @@ jobs:
         # there. All five patches are applied, not just 0005, to match exactly
         # what actually ships live rather than guess which subset this module
         # truly needs.
+        #
+        # `bash apply-patches.sh`, not `./apply-patches.sh`: the exec bit does
+        # not survive every path this file can take to get here (it was lost
+        # once already, committing from a Windows/git-bash checkout where
+        # chmod does not reliably reach git's tracked file mode) - "permission
+        # denied, exit 126" is a bad way to lose 20 minutes of a cached build.
+        # Invoking the interpreter directly needs no exec bit at all.
         working-directory: mod-overseer
-        run: ./apply-patches.sh "$GITHUB_WORKSPACE/acore"
+        run: bash apply-patches.sh "$GITHUB_WORKSPACE/acore"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3
