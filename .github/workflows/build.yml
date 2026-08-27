@@ -29,7 +29,7 @@ name: Build against the pinned core
 # not just the raw ccache files. Keyed on the two pinned SHAs, so a version
 # bump correctly starts cold rather than silently reusing a stale cache.
 #
-# PUBLISHES TO GHCR (2026-08-27, Evan's explicit ask). The compile-check build
+# PUBLISHES TO GHCR (2026-08-27, the operator's explicit ask). The compile-check build
 # above stays exactly as it was - proven, unchanged, --load into a local-only
 # tag. A SEPARATE step re-runs the identical build, now warm from that step's
 # cache, and pushes it to ghcr.io/quadseven/mod-overseer. That split is
