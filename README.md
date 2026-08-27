@@ -40,3 +40,10 @@ build AzerothCore normally.
 Pin by commit SHA, not a branch — `main` moves. Whoever consumes this should
 verify the module actually built after bumping the pin (a compile is not a
 proof it works) before trusting it in whatever the module ends up steering.
+
+## Contributing
+
+`main` requires a pull request — direct pushes are rejected (deletion and
+force-push are blocked too). This is enforced by a GitHub Repository Ruleset,
+codified in `quadseven/infra`'s `pulumi/github/repos.py` (the `mod-overseer`
+entry), not by anything in this repo.
