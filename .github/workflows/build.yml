@@ -28,7 +28,30 @@ name: Build against the pinned core
 # directory alone would not do that; the cache lives in buildx's own metadata,
 # not just the raw ccache files. Keyed on the two pinned SHAs, so a version
 # bump correctly starts cold rather than silently reusing a stale cache.
-
+#
+# PUBLISHES TO GHCR (2026-08-27, Evan's explicit ask). The compile-check build
+# above stays exactly as it was - proven, unchanged, --load into a local-only
+# tag. A SEPARATE step re-runs the identical build, now warm from that step's
+# cache, and pushes it to ghcr.io/quadseven/mod-overseer. That split is
+# deliberate: if the push step ever breaks (auth, registry-side outage,
+# whatever), the compile-check that every other PR here actually gates on is
+# untouched and keeps answering "does the code build" on its own.
+#
+# WHY THIS EXISTS: the whole point of moving this module public (infra#2930)
+# was removing its dependency on quadseven/infra's self-hosted NAS-backed
+# registry - which spent 2026-08-26/27 throwing 504s and DNS failures under
+# the NAS's own RAID expansion. A public GHCR image is pullable by anyone,
+# including the WoW session on a Windows box with no path into that
+# infrastructure at all, with zero dependency on anything that broke tonight.
+#
+# TAGGED BY THIS REPO'S OWN COMMIT SHA (github.sha), not CORE_SHA/MODULE_SHA -
+# those identify the pinned upstream, this tag identifies which mod-overseer
+# revision got built against them, matching the SHA-pin convention this
+# module was extracted to follow (see README's "Consuming it" section) rather
+# than a floating branch tag. `latest` is pushed alongside purely for human
+# discovery (`docker pull .../mod-overseer` with no tag) - anything that
+# needs a stable reference should pin the SHA tag, same as everywhere else in
+# this fleet.
 on:
   push:
     branches: [main]
@@ -41,11 +64,17 @@ concurrency:
 env:
   CORE_SHA: efe123fab543c5faf3c477674ec17a18fd59f09f
   MODULE_SHA: 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312
+  GHCR_IMAGE: ghcr.io/quadseven/mod-overseer
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    permissions:
+      contents: read
+      # Required to push to ghcr.io using the workflow's own GITHUB_TOKEN -
+      # no PAT, no secret, nothing to rotate or leak.
+      packages: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -140,3 +169,29 @@ jobs:
         with:
           path: /tmp/buildx-cache
           key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Deliberately a SECOND buildx invocation rather than adding --push to
+      # the compile-check step above: buildx cannot --load and --push in the
+      # same call, and keeping the compile-check untouched means the gate
+      # every PR here actually depends on cannot be affected by anything
+      # below this line. Warm from the cache the compile-check just
+      # populated, so this is a re-tag-and-upload, not a second cold build -
+      # the Dockerfile's layers already exist locally.
+      - name: Push to GHCR
+        working-directory: acore
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --cache-from type=local,src=/tmp/buildx-cache \
+            -f apps/docker/Dockerfile \
+            -t "${GHCR_IMAGE}:${{ github.sha }}" \
+            -t "${GHCR_IMAGE}:latest" \
+            --push \
+            .
