@@ -1,0 +1,53 @@
+Subject: [PATCH] FindStoneFor: reject items that are not weapons
+
+WHY THIS PATCH EXISTS
+    Every shield-carrying bot spams the red client error "Must have a Axe
+    equipped", roughly every ten seconds, forever, while out of combat.
+
+    `PlayerbotAI::FindStoneFor` switches on `pProto->SubClass` and never looks
+    at `pProto->Class`. The item subclass enums are per-class and they overlap:
+    in the pinned core fork's `src/server/game/Entities/Item/ItemTemplate.h`,
+    `ITEM_SUBCLASS_WEAPON_POLEARM = 6` (line 350) and
+    `ITEM_SUBCLASS_ARMOR_SHIELD = 6` (line 396) are the same integer, as are
+    `ITEM_SUBCLASS_WEAPON_MACE2 = 5` (line 349) and
+    `ITEM_SUBCLASS_ARMOR_BUCKLER = 5` (line 395).
+
+    So a shield in the off hand is read as a polearm, `ImbueWithStoneAction`
+    is handed a sharpening stone for it, and the server rejects the cast with
+    SPELL_FAILED_EQUIPPED_ITEM_CLASS. The failure never stops: the retry guard
+    in ImbueAction.cpp is `GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) == 0`, and
+    the only thing that would set that enchantment is the cast that fails.
+
+    Full root-cause analysis, with the packet path and the reason the client
+    renders the error as "Axe":
+    plans/2026-08-23-playerbots-must-have-axe-equipped.md
+
+WHAT WOULD LET THIS PATCH BE DELETED
+    mod-playerbots gaining any item-class check in `FindStoneFor`. When that
+    lands and AC_MODULE_SHA is bumped past it, this patch will stop applying
+    and fail the build on purpose - at which point delete this file.
+
+    Upstream PR: not yet opened. Add the link here when it is.
+
+APPLIES TO
+    mod-playerbots @ 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312
+    src/Bot/PlayerbotAI.cpp:5554-5601 (FindStoneFor)
+
+--- a/src/Bot/PlayerbotAI.cpp
++++ b/src/Bot/PlayerbotAI.cpp
+@@ -5560,6 +5560,15 @@
+     if (!item_template)
+         return nullptr;
+ 
++    // Sharpening stones and weightstones are weapon enchants, but the
++    // subclass checks below cannot tell a weapon from a piece of armour on
++    // their own: the subclass enums overlap. ITEM_SUBCLASS_ARMOR_SHIELD and
++    // ITEM_SUBCLASS_WEAPON_POLEARM are both 6, and ITEM_SUBCLASS_ARMOR_BUCKLER
++    // and ITEM_SUBCLASS_WEAPON_MACE2 are both 5, so without this guard an
++    // off-hand shield reads as a polearm and is handed a sharpening stone.
++    if (item_template->Class != ITEM_CLASS_WEAPON)
++        return nullptr;
++
+     static const std::vector<uint32_t> uPrioritizedSharpStoneIds = {
+         ADAMANTITE_SHARPENING_STONE, FEL_SHARPENING_STONE,   ELEMENTAL_SHARPENING_STONE, DENSE_SHARPENING_STONE,
+         SOLID_SHARPENING_STONE,      HEAVY_SHARPENING_STONE, COARSE_SHARPENING_STONE,    ROUGH_SHARPENING_STONE};

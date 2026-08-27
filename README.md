@@ -40,3 +40,17 @@ build AzerothCore normally.
 Pin by commit SHA, not a branch — `main` moves. Whoever consumes this should
 verify the module actually built after bumping the pin (a compile is not a
 proof it works) before trusting it in whatever the module ends up steering.
+
+## A real build dependency, not just source
+
+This module compiles against a handful of small patches to `mod-playerbots`
+that live in `patches/mod-playerbots/` here — copied from `quadseven/infra`
+(the private repo this module was extracted from), not fetched from it at
+build time. `apply-patches.sh` applies them the same way infra's own build
+does. `patches/README.md` explains the mechanics; the short version is that
+`0005-wander-npc-can-be-aimed.patch` is the one this module's own source
+actually calls into (`NewRpgInfo::WanderNpc::npcEntry`,
+`ChangeToWanderNpc(entry, pos)`) — upstream mod-playerbots has neither. If you
+bump the pinned `mod-playerbots` SHA and a patch stops applying, that is
+usually good news: upstream likely merged the same fix. Delete the patch, or
+rebase it — see `patches/README.md`.

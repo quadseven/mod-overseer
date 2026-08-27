@@ -1,0 +1,107 @@
+Subject: [PATCH] quest POI: allow a cross-zone quest turn-in
+
+infra#2801. Bots stood around with finished quests they could never hand in,
+and it was never a pathfinding failure - they never attempted to move at all.
+
+`NewRpgDoQuestAction::DoCompletedQuest` asks `GetQuestPOIPosAndObjectiveIdx`
+where to hand a quest in. In its `toComplete` branch that lookup discarded any
+reward POI outside the bot's CURRENT ZONE, and any 1500+ yards away. When every
+candidate is discarded the vector comes back empty, the function returns false,
+and `DoCompletedQuest` calls `ChangeToIdle()` at NewRpgAction.cpp:580-581 -
+BEFORE the `MoveFarTo` at :604 is ever reached.
+
+Measured on the live realm:
+
+    Grug                (-9328,  -804)  Elwynn Forest, zone 12
+    quest 109 reward    (-10509,  1045) Sentinel Hill, Westfall, MapID 0
+    distance2d          2194 yards
+
+Both filters rejected it independently - the zone check because Westfall is not
+Elwynn, the cap because 2194 >= 1500 - so relaxing only one would have changed
+nothing. All three of that character's completed quests turn in outside the
+zone (109 Westfall, 1097 and 1638 Stormwind).
+
+WHY THIS APPLIES TO EVERY BOT AND NOT A PRIVILEGED FEW
+
+An earlier revision gated this on `IsRandomBot` so only operator-created
+characters were freed, on the reasoning that the filters protect
+RandomPlayerbotMgr's placement of the random population into level-appropriate
+zones. The operator's decision is that every bot should have the same freedom:
+they are meant to level up as a living world, and a population that cannot hand
+in a quest whose giver is one zone away does not level.
+
+The filters were never load-bearing for correctness. Nothing downstream needs
+the POI to be in-zone - `MoveFarTo` routes to any same-map destination through
+`PathGenerator` and already recovers from a wedged path by teleporting after
+five failed attempts (NewRpgBaseAction.cpp:97-113). They were a containment
+heuristic, and containment is precisely what is being traded away on purpose.
+
+THE COST, STATED PLAINLY: every bot holding an out-of-zone turn-in may now
+compute a long path, where before it computed none. On a realm running several
+hundred bots on a worldserver already measured at 273% CPU that is a real
+increase in pathfinding work, not a theoretical one. It is bounded by the 5000
+cap, by `IsWaitingForLastMove` throttling recomputation while a spline is
+walking, and by the fact that only bots with a COMPLETE out-of-zone quest are
+affected at any moment rather than the whole population at once. It should be
+watched after this lands.
+
+WHAT IS DELIBERATELY LEFT ALONE
+
+  * `qPoi.MapId != bot->GetMapId()` - kept. There is no navmesh across the
+    ocean; a cross-continent turn-in needs a boat or a zeppelin, and a bot that
+    accepted such a POI would fail far more confusingly than a clean refusal.
+
+  * The INCOMPLETE branch further down, which has its own copy of the 1500 cap.
+    Turn-ins are BOUNDED - walk there, hand in, done. Objective-hunting is
+    open-ended, and widening it would scatter parties across the world chasing
+    mobs, a failure already measured on this realm at 937 yards of spread with
+    the healer 600 yards from the tank.
+
+  * The cap is RAISED to 5000, not removed. 2194 is what was actually needed;
+    unbounded, a level 5 in Elwynn could set off for Booty Bay.
+
+Verified against the pins in UPSTREAM-PINS.env:
+  module 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312
+This revision uses NO new upstream member at all - it only changes a constant
+and deletes a condition, so there is nothing here the compiler has not already
+been proving on every build.
+
+diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+index d213d0b..6a51181 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+@@ -859,7 +859,13 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
+                 dy += point.y * weights[i];
+             }
+ 
+-            if (bot->GetDistance2d(dx, dy) >= 1500.0f)
++            // infra#2801: 5000 rather than 1500. A quest turn-in is very often
++            // in the next zone over - Grug's was 2194 yards away in Westfall
++            // while he stood in Elwynn - and at 1500 every such POI was
++            // discarded before the bot ever tried to walk. Raised rather than
++            // removed so a level 5 in Elwynn still will not set off for Booty
++            // Bay.
++            if (bot->GetDistance2d(dx, dy) >= 5000.0f)
+                 continue;
+ 
+             float dz = std::max(bot->GetMap()->GetHeight(dx, dy, MAX_HEIGHT), bot->GetMap()->GetWaterLevel(dx, dy));
+@@ -867,8 +873,17 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
+             if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
+                 continue;
+ 
+-            if (bot->GetZoneId() != bot->GetMap()->GetZoneId(bot->GetPhaseMask(), dx, dy, dz))
+-                continue;
++            // THE SAME-ZONE FILTER IS GONE. It is what stranded every bot with
++            // an out-of-zone turn-in: the POI was discarded, poiInfo came back
++            // empty, and DoCompletedQuest idled at NewRpgAction.cpp:580-581
++            // WITHOUT EVER REACHING THE MoveFarTo AT :604. The bot did not
++            // fail to walk there, it never attempted to. Nothing downstream
++            // needs the POI to be in-zone: MoveFarTo routes to any same-map
++            // destination through PathGenerator and teleport-recovers from a
++            // wedged path after five failed attempts (:97-113).
++            //
++            // The MapId check above is deliberately kept - there is no navmesh
++            // across an ocean, and a cross-continent turn-in needs a boat.
+ 
+             poiInfo.push_back({{dx, dy}, qPoi.ObjectiveIndex});
+         }
