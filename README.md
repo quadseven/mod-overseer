@@ -54,3 +54,10 @@ actually calls into (`NewRpgInfo::WanderNpc::npcEntry`,
 bump the pinned `mod-playerbots` SHA and a patch stops applying, that is
 usually good news: upstream likely merged the same fix. Delete the patch, or
 rebase it — see `patches/README.md`.
+
+## Contributing
+
+`main` requires a pull request — direct pushes are rejected (deletion and
+force-push are blocked too). This is enforced by a GitHub Repository Ruleset,
+codified in `quadseven/infra`'s `pulumi/github/repos.py` (the `mod-overseer`
+entry), not by anything in this repo.
