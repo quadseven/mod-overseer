@@ -60,6 +60,18 @@
  *  5. Retention. Chat and events are swept on a timer. A 500-bot world talks
  *     constantly and nothing here is worth keeping for long.
  *
+ *  6. Death record (infra#2912). overseer_event's 'death' kind is a per-hour
+ *     COUNT with no room for WHY - it answers "is this still happening", not
+ *     "what happened this time". overseer_death is the second half: one
+ *     un-coalesced row per death, carrying the killer, the health trend
+ *     leading up to it, and what strategy/aim/job was steering the character,
+ *     assembled entirely from state already sitting in memory from the other
+ *     drives - see the death-context comment ahead of OverseerEventScript.
+ *     Deployment note: this is built for whatever realm's worldserver runs
+ *     it (namespace-agnostic - a database-level concern) and is NOT wired
+ *     into the live `wow` family's deployment by this change; see this
+ *     table's own migration for the full argument.
+ *
  * The database is the whole interface on purpose: no listening socket, no new
  * network surface on the worldserver. Anything that can reach MySQL (which is
  * cluster-internal) can observe and command; nothing else can.
@@ -285,6 +297,22 @@ constexpr uint32 EVENT_FLUSH_MS = 5000;
 // anything anyone is still arguing about, short enough that a bug firing every
 // ten seconds cannot grow the table without bound.
 constexpr uint32 EVENT_RETENTION_DAYS = 14;
+
+// How often the death queue is written (infra#2912). Faster than the event
+// flush on purpose: a death is not a repeat-and-coalesce fact like the axe
+// error events are, it is the whole reason this table exists, and losing one
+// to a worldserver restart between polls is losing the one sample that
+// mattered. Not sub-second either - RecordDeath already runs synchronously in
+// the death hook with no query of its own, so nothing is gained by writing
+// faster than a person could plausibly be watching a Discord channel.
+constexpr uint32 DEATH_FLUSH_MS = 3000;
+
+// A permadeath realm's whole population is disposable and the family is five
+// characters - a fortnight of one-row-per-death from either can never
+// approach the volume EVENT_RETENTION_DAYS was chosen to bound. Kept anyway,
+// separately, so the two tables' retention can be tuned independently once
+// there is a cohort's worth of rows to look at.
+constexpr uint32 DEATH_RETENTION_DAYS = 90;
 
 // The hour an event fell in, as the grouping half of the unique key. See
 // 2026_08_24_02_overseer_event.sql for why the timeline is coarsened to an
@@ -696,6 +724,258 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
     pending.level = actor->GetLevel();
     ++pending.occurrences;
 }
+
+// ------------------------------------------------------------- death context --
+//
+// infra#2912. Reading a death back from acore_characters is a photograph
+// taken up to fifteen minutes late - PlayerSaveInterval is 900000 - and the
+// state that would explain it (what was steering the character, how its
+// health had been trending, who was actually swinging at it) is gone by the
+// time anyone looks. This section exists to answer those questions AT THE
+// MOMENT OF DEATH, from state this module already has sitting in memory from
+// drives that were already running - never by adding a query to the death
+// path itself. RecordDeath, below, does no database work of any kind.
+//
+// THREE SMALL CACHES, EACH FED BY A DRIVE THAT WAS ALREADY POLLING.
+//
+//   g_hpHistory   - last known (health, max_health) and the last tick a
+//                   roster character was seen at full health. Refreshed every
+//                   SNAPSHOT_MS by WriteSnapshot, which already walks every
+//                   online player for the live map.
+//
+//                   "Health at death" is deliberately NOT read off the
+//                   Player* inside a death hook. By the time ANY death hook
+//                   fires - OnPlayerKilledByCreature, OnPlayerPVPKill, or
+//                   OnPlayerJustDied - Unit::setDeathState has already called
+//                   SetHealth(0) (Unit.cpp:11414, pinned core
+//                   efe123fab543c5faf3c477674ec17a18fd59f09f), from inside
+//                   Unit::Kill (Unit.cpp:14165) which runs BEFORE the
+//                   killed-by hooks fire (Unit.cpp:14304, :14311) and well
+//                   before Player::KillPlayer/OnPlayerJustDied, which does not
+//                   run until the victim's own next Player::Update tick
+//                   (PlayerUpdates.cpp:324). The live value is always zero by
+//                   every vantage point this module has. The last SAMPLED
+//                   reading is the only place a pre-death number still
+//                   exists, which is also exactly what the epic asked for:
+//                   "HP at time of death and time since last full-health
+//                   reading" (infra#2912) describes this cache, not the live
+//                   Player*.
+//
+//   g_aimSnapshot - last known job / quest aim / travel target. Refreshed
+//                   every QUEST_POLL_MS by DriveQuests, which already loads
+//                   all three every pass (LoadJobs, LoadQuestAims,
+//                   LoadTravelAims) - RememberAim there is a cache write next
+//                   to a read that was happening anyway, not a new one.
+//
+//   g_pendingKill - who landed the killing blow, if anyone. Captured by
+//                   OnPlayerKilledByCreature / OnPlayerPVPKill below at the
+//                   instant Unit::Kill names a killer - see the comment on
+//                   those two hooks for why a death hook cannot discover this
+//                   any other way once it fires.
+//
+// A cache read here can be up to one poll interval stale (five seconds for
+// health, twenty for the aim). That is a WORSE bound than "at the moment it
+// happens" and a categorically better one than acore_characters' fifteen
+// minutes, and it costs the death path nothing: every number in it was
+// already being computed for another reason on the world thread.
+struct HpReading
+{
+    uint32 health = 0;
+    uint32 maxHealth = 0;
+    time_t lastFullHealthAt = 0;   // 0 = never seen at full since this cache warmed
+    time_t sampledAt = 0;
+};
+std::mutex g_hpHistoryMutex;
+std::map<std::string, HpReading> g_hpHistory;  // key: lowercased character name
+
+struct AimSnapshot
+{
+    std::string job;            // overseer_roster.job as DriveQuests last saw it
+    uint32 questAim = 0;        // overseer_roster.drive_quest, 0 = none
+    std::string travelTarget;   // overseer_roster.travel_npc, '' = none
+};
+std::mutex g_aimMutex;
+std::map<std::string, AimSnapshot> g_aimSnapshot;  // key: lowercased character name
+
+struct PendingKill
+{
+    std::string killerType;   // 'creature' | 'player'
+    std::string killerName;
+    uint32 killerEntry = 0;   // creature template entry; 0 for a player killer
+};
+std::mutex g_killMutex;
+std::map<std::string, PendingKill> g_pendingKill;  // key: lowercased victim name
+
+// Called from WriteSnapshot, world thread only - see that function.
+void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
+{
+    std::lock_guard<std::mutex> guard(g_hpHistoryMutex);
+    HpReading& r = g_hpHistory[LowerName(name)];
+    r.health = health;
+    r.maxHealth = maxHealth;
+    r.sampledAt = std::time(nullptr);
+    if (maxHealth > 0 && health >= maxHealth)
+        r.lastFullHealthAt = r.sampledAt;
+}
+
+// Called from DriveQuests, world thread only - see that function.
+void RememberAim(std::string const& name, std::string const& job, uint32 questAim,
+                 std::string const& travelTarget)
+{
+    std::lock_guard<std::mutex> guard(g_aimMutex);
+    AimSnapshot& a = g_aimSnapshot[LowerName(name)];
+    a.job = job;
+    a.questAim = questAim;
+    a.travelTarget = travelTarget;
+}
+
+// Called from the two kill hooks below, whatever thread Unit::Kill happens to
+// be running the victim's death on - map-update, same as every other event
+// hook in this file (see the file header). Memory only, same discipline as
+// RecordEvent: no database work, no resolving anything not already handed in.
+void RememberKiller(Player* killed, std::string const& killerType,
+                    std::string const& killerName, uint32 killerEntry)
+{
+    if (!killed || !OnRoster(killed->GetName()))
+        return;
+    std::lock_guard<std::mutex> guard(g_killMutex);
+    PendingKill& k = g_pendingKill[LowerName(killed->GetName())];
+    k.killerType = killerType;
+    k.killerName = killerName;
+    k.killerEntry = killerEntry;
+}
+
+// One recorded death, queued for the world thread to write. NOT a repeat of
+// overseer_event's 'death' kind: that row is an hourly-bucketed COUNT with no
+// room for a killer, a health trend, or an aim - answering "is this still
+// happening" - and this table exists because the epic's actual question is
+// "what happened THIS time" (infra#2912). The two are deliberately
+// independent; OnPlayerJustDied below writes to both.
+struct PendingDeath
+{
+    std::string characterName;
+    uint32 characterGuid = 0;
+    uint8 level = 0;
+    uint16 mapId = 0;
+    uint32 zoneId = 0;
+    float x = 0.f, y = 0.f, z = 0.f;
+
+    std::string killerType;    // 'creature' | 'player' | 'environment'
+    std::string killerName;
+    uint32 killerEntry = 0;
+
+    uint32 healthAtDeath = 0;           // last SAMPLED reading - see cache comment above
+    uint32 maxHealthAtDeath = 0;
+    uint32 secondsSinceFullHealth = 0;  // 0 if never sampled at full since cache warmed
+
+    std::string job;
+    uint32 questAim = 0;
+    std::string travelTarget;
+
+    uint8 grouped = 0;
+    uint8 groupSize = 0;
+    std::string groupLeader;
+};
+std::mutex g_deathMutex;
+std::vector<PendingDeath> g_deathQueue;
+uint64 g_droppedDeaths = 0;
+
+// A death is never coalesced, unlike g_eventQueue. Every keyed queue in this
+// file exists because the SAME fact repeating is not new information; a
+// death is never the same fact twice, and this whole table exists to keep
+// each one. Same shape as g_chatQueue for the identical reason - see its own
+// comment - bounded so a runaway hook can never grow this without limit.
+constexpr size_t MAX_DEATH_QUEUE = 200;
+
+// The one place a death's full context is captured. Runs on whatever thread
+// OnPlayerJustDied fires on - a map-update thread, per the file header - so
+// it does NO database work: it reads three in-memory caches and the
+// still-valid Player* (KillPlayer has not yet destroyed anything; the object
+// is merely dead), and pushes a struct under a mutex. FlushDeaths, called
+// only from OnUpdate on the world thread, is the only code that touches
+// MySQL for this table.
+void RecordDeath(Player* player)
+{
+    if (!player)
+        return;
+    if (!OnRoster(player->GetName()))
+        return;
+
+    std::string const lower = LowerName(player->GetName());
+    std::time_t const now = std::time(nullptr);
+
+    PendingDeath d;
+    d.characterName = player->GetName();
+    d.characterGuid = player->GetGUID().GetCounter();
+    d.level = player->GetLevel();
+    d.mapId = static_cast<uint16>(player->GetMapId());
+    d.zoneId = player->GetZoneId();
+    d.x = player->GetPositionX();
+    d.y = player->GetPositionY();
+    d.z = player->GetPositionZ();
+
+    if (Group* group = player->GetGroup())
+    {
+        d.grouped = 1;
+        d.groupSize = static_cast<uint8>(group->GetMembersCount());
+        if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+            d.groupLeader = leader->GetName();
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(g_hpHistoryMutex);
+        auto it = g_hpHistory.find(lower);
+        if (it != g_hpHistory.end())
+        {
+            d.healthAtDeath = it->second.health;
+            d.maxHealthAtDeath = it->second.maxHealth;
+            d.secondsSinceFullHealth = it->second.lastFullHealthAt
+                ? static_cast<uint32>(now - it->second.lastFullHealthAt)
+                : 0;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(g_aimMutex);
+        auto it = g_aimSnapshot.find(lower);
+        if (it != g_aimSnapshot.end())
+        {
+            d.job = it->second.job;
+            d.questAim = it->second.questAim;
+            d.travelTarget = it->second.travelTarget;
+        }
+    }
+
+    // The killer, if this death arrived through one of the two kill hooks
+    // below - CONSUMED, not copied: a stale entry left behind by a PREVIOUS
+    // death on this same character must never attach itself to this one, so
+    // it is erased whether or not it is used. Absent means the death did not
+    // route through Unit::Kill with a non-null killer at all - fall damage,
+    // drowning, fatigue, lava, a GM command - and 'environment' is itself the
+    // honest answer to "what killed them" for that whole class of death,
+    // rather than a blank the reporting layer has to interpret.
+    {
+        std::lock_guard<std::mutex> guard(g_killMutex);
+        auto it = g_pendingKill.find(lower);
+        if (it != g_pendingKill.end())
+        {
+            d.killerType = it->second.killerType;
+            d.killerName = it->second.killerName;
+            d.killerEntry = it->second.killerEntry;
+            g_pendingKill.erase(it);
+        }
+    }
+    if (d.killerType.empty())
+        d.killerType = "environment";
+
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    if (g_deathQueue.size() >= MAX_DEATH_QUEUE)
+    {
+        ++g_droppedDeaths;
+        return;
+    }
+    g_deathQueue.push_back(std::move(d));
+}
 }  // namespace
 
 /*
@@ -832,6 +1112,23 @@ public:
  *   OnPlayerEquip                 PlayerScript.h:418   PlayerStorage.cpp:2928,
  *                                                      2936, 2960
  *   OnPlayerJustDied              PlayerScript.h:234   Player.cpp:4651
+ *   OnPlayerPVPKill               PlayerScript.h:252   Unit.cpp:14304
+ *   OnPlayerKilledByCreature      PlayerScript.h:264   Unit.cpp:14311
+ *
+ * THE TWO KILL HOOKS EXIST FOR ONE FACT ONLY: WHO. OnPlayerJustDied's own
+ * signature is `(Player* player)` - no killer, verified against the pinned
+ * core the same way as everything else here - because by the time it fires
+ * (Player::KillPlayer, called from Player::Update on the VICTIM's own next
+ * tick after death, PlayerUpdates.cpp:324) Unit::CombatStop has already run
+ * and cleared whatever the victim was fighting. OnPlayerPVPKill and
+ * OnPlayerKilledByCreature fire earlier, from the KILLER's side of
+ * Unit::Kill (Unit.cpp:13986), while `killer` is still a live local variable
+ * naming exactly who landed the blow - a Player* or a Creature*, handed to
+ * the hook directly, never inferred. infra#2912 needed that name and this is
+ * the only vantage point in the pinned core that has it. Both are pure
+ * capture: they touch no database and drive nothing, they only remember the
+ * name (RememberKiller, in the death-context section above this class) for
+ * OnPlayerJustDied to pick up moments later when it assembles the death row.
  *
  * TWO OF THOSE NAMES LIE, AND BOTH LIES MATTER.
  *
@@ -890,6 +1187,8 @@ public:
         PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
         PLAYERHOOK_ON_EQUIP,
         PLAYERHOOK_ON_PLAYER_JUST_DIED,
+        PLAYERHOOK_ON_PVP_KILL,
+        PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE,
     }) {}
 
     // Fires on the way DOWN as well - the hook is named for a change, not a
@@ -955,15 +1254,42 @@ public:
                     "slot " + std::to_string(static_cast<uint32>(slot)));
     }
 
+    // Who landed the killing blow, captured while `killer` is still a live
+    // local variable in Unit::Kill (Unit.cpp:14304) - see the long comment
+    // above this class for why OnPlayerJustDied itself cannot get this. Pure
+    // capture, no database work: RememberKiller only ever touches memory.
+    void OnPlayerPVPKill(Player* killer, Player* killed) override
+    {
+        if (!killer || !killed)
+            return;
+        RememberKiller(killed, "player", killer->GetName(), 0);
+    }
+
+    // Same capture, the creature-killed-a-player side (Unit.cpp:14311).
+    void OnPlayerKilledByCreature(Creature* killer, Player* killed) override
+    {
+        if (!killer || !killed)
+            return;
+        RememberKiller(killed, "creature", killer->GetName(), killer->GetEntry());
+    }
+
     // Deaths carry no subject, so every death in an hour lands on one row with
     // a count. That is deliberate: "Grug died nine times between 02:00 and
     // 03:00" is the observation worth having, and nine rows saying "died" with
     // nothing to tell them apart is not nine times more information.
+    //
+    // RecordDeath (infra#2912) writes a SEPARATE, un-coalesced row to
+    // overseer_death with the context that answers WHY, not just that it
+    // happened again - see the death-context section above this class for the
+    // whole design. Both calls run in the same hook on purpose: one fact,
+    // recorded twice at two different resolutions, is simpler to reason about
+    // than two hooks that could someday disagree about when a death occurred.
     void OnPlayerJustDied(Player* player) override
     {
         if (!player)
             return;
         RecordEvent(player, "death", 0, "", "");
+        RecordDeath(player);
     }
 };
 
@@ -986,6 +1312,7 @@ public:
         _travelTimer += diff;
         _professionTimer += diff;
         _eventTimer += diff;
+        _deathTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
@@ -1065,6 +1392,11 @@ public:
             _eventTimer = 0;
             FlushEvents();
         }
+        if (_deathTimer >= DEATH_FLUSH_MS)
+        {
+            _deathTimer = 0;
+            FlushDeaths();
+        }
         if (_sweepTimer >= CHAT_SWEEP_MS)
         {
             _sweepTimer = 0;
@@ -1078,6 +1410,13 @@ public:
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_event WHERE last_seen < NOW() - INTERVAL {} DAY",
                 EVENT_RETENTION_DAYS);
+            // Swept on created_at, unlike overseer_event: a death is never
+            // updated after the fact (see PendingDeath's own comment on why
+            // it is never coalesced), so there is no last_seen for a still-
+            // happening problem to protect - only a first and only occurrence.
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_death WHERE created_at < NOW() - INTERVAL {} DAY",
+                DEATH_RETENTION_DAYS);
         }
     }
 
@@ -1736,13 +2075,6 @@ private:
             // jobs.py's IMPLEMENTED), so the honest behaviour is "stop
             // questing", not a mode this file cannot yet make good on.
             auto const jobIt = jobs.find(name);
-            if (jobIt != jobs.end())
-            {
-                LOG_DEBUG("module.overseer",
-                          "overseer: '{}' job is '{}', not quest - the quest "
-                          "drive stands down for it", name, jobIt->second);
-                continue;
-            }
 
             // Absent from a map is the column's own "no opinion" value, which
             // is also what a column the schema does not have degrades to. Every
@@ -1753,6 +2085,31 @@ private:
             auto const travelIt = travelAims.find(name);
             std::string const travelTarget =
                 travelIt == travelAims.end() ? std::string() : travelIt->second;
+
+            // infra#2912: the aim cache RecordDeath reads, kept fresh here
+            // rather than queried fresh in the death path - see the
+            // death-context comment above OverseerEventScript for why. Written
+            // for EVERY roster row this loop sees, including one the job gate
+            // is about to stand down, because a death while farming still
+            // deserves its job recorded accurately.
+            RememberAim(name, jobIt == jobs.end() ? "quest" : jobIt->second, aim,
+                       travelTarget);
+
+            // THE JOB GATE (infra#2834). A character whose schedule says
+            // something other than 'quest' gets no quest aim asserted and no
+            // fallback to its own log - it is stood down from this drive
+            // entirely, the same shape as the travel hand-off just below.
+            // Deliberately does NOT touch strategies or rpgInfo: nothing yet
+            // exists to positively drive farm/dungeon/grind/etc (see
+            // jobs.py's IMPLEMENTED), so the honest behaviour is "stop
+            // questing", not a mode this file cannot yet make good on.
+            if (jobIt != jobs.end())
+            {
+                LOG_DEBUG("module.overseer",
+                          "overseer: '{}' job is '{}', not quest - the quest "
+                          "drive stands down for it", name, jobIt->second);
+                continue;
+            }
 
             // SteerableAI, not a bare lookup: a name can resolve to a
             // Player that is mid-login or mid-teardown, and its AI pointer is
@@ -3714,6 +4071,82 @@ private:
         CharacterDatabase.Execute(ss.str().c_str());
     }
 
+    // Write the queued deaths (infra#2912). Same shape as FlushEvents - one
+    // multi-row INSERT per tick, built on the world thread only, because
+    // EscapeString borrows the shared synchronous connection with no lock of
+    // its own (see the file header) - with one difference: the batch is a
+    // VECTOR, not a keyed map, because a death is never coalesced (see
+    // PendingDeath's own comment for why).
+    //
+    // NEVER LET THIS THROW OR BLOCK THE KILL PATH. It cannot: by the time
+    // this runs, the death that produced each row has already finished -
+    // RecordDeath only ever touches memory, and this function is called from
+    // OnUpdate on a timer, never from inside a death hook. If overseer_death
+    // does not exist yet on this schema (the DDL and this reader ship in
+    // DIFFERENT images - see EachLateColumnIsReadOnceAndGuardedOnItsOwn's
+    // reasoning, which applies here to a whole table rather than one column),
+    // CharacterDatabase.Execute logs the failure and returns; it does not
+    // throw, and nothing upstream of it - a bot's own death - is put at risk
+    // either way, because nothing here runs on that path.
+    void FlushDeaths()
+    {
+        std::vector<PendingDeath> batch;
+        uint64 dropped = 0;
+        {
+            std::lock_guard<std::mutex> guard(g_deathMutex);
+            if (g_deathQueue.empty() && !g_droppedDeaths)
+                return;
+            batch.swap(g_deathQueue);
+            dropped = g_droppedDeaths;
+            g_droppedDeaths = 0;
+        }
+
+        if (dropped)
+            LOG_WARN("module.overseer", "overseer: dropped {} deaths (queue full)", dropped);
+
+        if (batch.empty())
+            return;
+
+        std::ostringstream ss;
+        ss << "INSERT INTO overseer_death (character_name, character_guid, level, "
+              "map, zone, pos_x, pos_y, pos_z, killer_type, killer_name, killer_entry, "
+              "health_at_death, max_health_at_death, seconds_since_full_health, "
+              "job, quest_aim, travel_target, grouped, group_size, group_leader) VALUES ";
+        bool first = true;
+        for (PendingDeath const& d : batch)
+        {
+            if (!first)
+                ss << ',';
+            first = false;
+            ss << '(' << "'" << Esc(d.characterName) << "'," << d.characterGuid
+               << ',' << static_cast<uint32>(d.level)
+               << ',' << static_cast<uint32>(d.mapId)
+               << ',' << d.zoneId
+               << ',' << d.x << ',' << d.y << ',' << d.z
+               << ",'" << Esc(d.killerType) << "'"
+               << ",'" << Esc(d.killerName) << "'"
+               << ',' << d.killerEntry
+               << ',' << d.healthAtDeath
+               << ',' << d.maxHealthAtDeath
+               << ',' << d.secondsSinceFullHealth
+               << ",'" << Esc(d.job) << "'"
+               << ',' << d.questAim
+               << ",'" << Esc(d.travelTarget) << "'"
+               << ',' << static_cast<uint32>(d.grouped)
+               << ',' << static_cast<uint32>(d.groupSize)
+               << ",'" << Esc(d.groupLeader) << "'"
+               << ')';
+        }
+        CharacterDatabase.Execute(ss.str().c_str());
+
+        LOG_INFO("module.overseer",
+                 "overseer: recorded {} death(s), most recently '{}' at level {} "
+                 "in zone {} (killer: {} '{}')",
+                 batch.size(), batch.back().characterName,
+                 static_cast<uint32>(batch.back().level), batch.back().zoneId,
+                 batch.back().killerType, batch.back().killerName);
+    }
+
     // ------------------------------------------------------- outcome --
     //
     // WHAT A FINISHED ROW IS ALLOWED TO CLAIM (infra#2819).
@@ -5177,6 +5610,16 @@ private:
                << (group ? group->GetLeaderGUID().GetCounter() : 0) << ','
                << p->GetTarget().GetCounter()
                << ')';
+
+            // infra#2912: the health-history cache RecordDeath reads. Gated to
+            // the roster, same as RecordEvent - the point is the five named
+            // characters, and there is no reason to pay a map-and-mutex touch
+            // per tick for the other five hundred. Written here rather than in
+            // a hook because there is no per-tick "health changed" hook in the
+            // pinned core cheap enough to use on a 500-bot world; sampling
+            // alongside a walk that was happening anyway costs nothing extra.
+            if (OnRoster(p->GetName()))
+                RememberHealth(p->GetName(), p->GetHealth(), p->GetMaxHealth());
         }
 
         if (!first)
@@ -5312,6 +5755,7 @@ private:
     };
     std::map<std::string, AimState> _lastAim;
     uint32 _eventTimer = 0;
+    uint32 _deathTimer = 0;
     bool _watchLoaded = false;
 };
 
