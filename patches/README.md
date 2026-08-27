@@ -112,3 +112,16 @@ feature but still builds; 0005 ADDS an overload that `mod-overseer` calls
 compile 45 minutes into a build on `main`. Rebase it, or delete it and adapt the
 call site in `mod_overseer.cpp` in the SAME commit. `UPSTREAM-PINS.env` carries
 the full argument, and it is the file you are more likely to have open.
+
+**`mod-playerbots/0006-wander-random-has-a-home-anchor.patch`** fixes
+RPG_WANDER_RANDOM's random-walk-with-no-leash: `MoveRandomNear()` took a
+`center` parameter that was never read, so every wander step originated from
+the bot's own live position with nothing bounding how far the accumulated
+walk could drift - which is how an under-20 family ended up standing next to
+an elite in a high-level zone with nothing chasing them. Like 0001-0004, this
+is a straight upstream-behaviour fix, not an added API: `mod-overseer` calls
+nothing this patch adds, so dropping it (because upstream took an equivalent
+fix, or because the pin moved and it no longer applies) costs the bound, not
+the compile. Rebase it onto the new pin, or delete it once upstream's own fix
+lands. See the patch's own header for the full trace to `NewRpgBaseAction.cpp`
+and `NewRpgAction.cpp` at the pinned SHA.
