@@ -143,6 +143,21 @@ Execute in mod-playerbots; if either grows an equivalent bound, delete this
 patch and drop straight back to upstream's version. No upstream PR is open yet
 for this fix.
 
+ORDER DEPENDENCY ON 0005
+
+This patch's `NewRpgInfo.cpp`/`NewRpgInfo.h` hunks are generated against the
+tree AFTER 0005-wander-npc-can-be-aimed.patch is applied, not against the raw
+pin - 0005 inserts a `ChangeToWanderNpc(uint32, WorldPosition)` overload
+immediately before `ChangeToWanderRandom`, and `apply-patches.sh` always
+applies this directory in filename order (0001 before 0006), so this is the
+tree state this patch will actually see. Generating it against the raw pin
+instead produced a patch whose NewRpgInfo.cpp/.h hunks looked correct by eye
+but failed `git apply` in CI with "patch does not apply" against the real
+build order - caught by an actual `workflow_dispatch` run
+(quadseven/mod-overseer run 33070774545), not by inspection. If 0005 is ever
+deleted, rebase this patch's two NewRpgInfo hunks onto the un-aimed
+`ChangeToWanderNpc()` context.
+
 APPLIES TO
 
 Repo: https://github.com/mod-playerbots/mod-playerbots.git
@@ -151,15 +166,16 @@ Functions: NewRpgBaseAction::MoveRandomNear, NewRpgWanderRandomAction::Execute,
 NewRpgInfo::ChangeToWanderRandom, and the WanderRandom variant member.
 
 Verified against the pins in UPSTREAM-PINS.env:
-  module 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312
+  module 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312, with 0001-0005 applied first
 `Position const*`, `WorldPosition(WorldObject const*)`, `sqrt`/`pow`/`atan2`/
 `irand`/`rand_norm` and the `M_PI`-based cone-angle pattern all already appear
 in NewRpgBaseAction.cpp at this pin (MoveFarTo, MoveNearRpgTarget). Nothing
 new is asked of the compiler beyond what this same file already includes and
-uses.
+uses. `git apply --check` verified locally, in sequence after 0001-0005,
+against a fresh clone of the pinned SHA.
 
 diff --git a/src/Ai/World/Rpg/Action/NewRpgAction.cpp b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
-index 8880159a..2932cc9f 100644
+index 8b521d38..c32440d2 100644
 --- a/src/Ai/World/Rpg/Action/NewRpgAction.cpp
 +++ b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
 @@ -100,7 +100,7 @@ bool TellRpgStatusAction::Execute(Event event)
@@ -185,9 +201,9 @@ index 8880159a..2932cc9f 100644
          return true;
  
 -    return MoveRandomNear();
-+    // leash the wander to where it started. `data.anchor` is set
-+    // once, when ChangeToWanderRandom() puts the bot into this state, and is
-+    // NOT refreshed here - refreshing it every tick would just re-center the
++    // Leash the wander to where it started. `data.anchor` is set once, when
++    // ChangeToWanderRandom() puts the bot into this state, and is NOT
++    // refreshed here - refreshing it every tick would just re-center the
 +    // leash on wherever drift had already carried the bot, which defeats it.
 +    NewRpgInfo& info = botAI->rpgInfo;
 +    auto* dataPtr = std::get_if<NewRpgInfo::WanderRandom>(&info.data);
@@ -198,7 +214,7 @@ index 8880159a..2932cc9f 100644
  
  bool NewRpgWanderNpcAction::Execute(Event /*event*/)
 diff --git a/src/Ai/World/Rpg/Action/NewRpgAction.h b/src/Ai/World/Rpg/Action/NewRpgAction.h
-index 7d7b3a9c..46388734 100644
+index 7d7b3a9c..0a041a89 100644
 --- a/src/Ai/World/Rpg/Action/NewRpgAction.h
 +++ b/src/Ai/World/Rpg/Action/NewRpgAction.h
 @@ -88,6 +88,10 @@ class NewRpgWanderRandomAction : public NewRpgBaseAction
@@ -206,14 +222,14 @@ index 7d7b3a9c..46388734 100644
      NewRpgWanderRandomAction(PlayerbotAI* botAI) : NewRpgBaseAction(botAI, "new rpg wander random") {}
      bool Execute(Event event) override;
 +
-+    // max distance (yards) a bot may drift from the position it
-+    // was standing at when RPG_WANDER_RANDOM began. See NewRpgInfo::WanderRandom::anchor.
++    // Max distance (yards) a bot may drift from the position it was standing
++    // at when RPG_WANDER_RANDOM began. See NewRpgInfo::WanderRandom::anchor.
 +    const float maxDriftFromAnchor = 100.0f;
  };
  
  class NewRpgWanderNpcAction : public NewRpgBaseAction
 diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
-index d213d0bb..aec54433 100644
+index 6a511817..00f7ef71 100644
 --- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
 +++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
 @@ -230,7 +230,7 @@ bool NewRpgBaseAction::MoveWorldObjectTo(ObjectGuid guid, float distance)
@@ -230,16 +246,16 @@ index d213d0bb..aec54433 100644
      const float y = bot->GetPositionY();
      const float z = bot->GetPositionZ();
 +
-+    // with no bound, every step here originates from the bot's
-+    // OWN current position with no memory of where it started - a random
-+    // walk with no leash. Each single step is short (moveStep, typically
-+    // 8-15y), but nothing stops the accumulated walk from crossing a zone
-+    // boundary over many ticks; that is how a sub-20 family ended up in
-+    // Burning Steppes. When a homeAnchor is supplied, already being at or
-+    // past maxHomeDist from it switches this call into "leash" mode: instead
-+    // of sampling a fresh random direction each attempt, the step angle is
-+    // biased back toward home, so the bot reliably closes distance rather
-+    // than continuing to wander outward.
++    // With no bound, every step here originates from the bot's OWN current
++    // position with no memory of where it started - a random walk with no
++    // leash. Each single step is short (moveStep, typically 8-15y), but
++    // nothing stops the accumulated walk from crossing a zone boundary over
++    // many ticks; that is how a sub-20 family ended up in Burning Steppes.
++    // When a homeAnchor is supplied, already being at or past maxHomeDist
++    // from it switches this call into "leash" mode: instead of sampling a
++    // fresh random direction each attempt, the step angle is biased back
++    // toward home, so the bot reliably closes distance rather than
++    // continuing to wander outward.
 +    bool leashing = false;
 +    float homeX = 0.0f, homeY = 0.0f;
 +    if (homeAnchor && maxHomeDist > 0.0f)
@@ -292,7 +308,7 @@ index d213d0bb..aec54433 100644
          PathGenerator path(bot);
          path.CalculatePath(dx, dy, dz);
          PathType type = path.GetPathType();
-@@ -1112,7 +1159,7 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
+@@ -1127,7 +1174,7 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
      {
          case RPG_WANDER_RANDOM:
          {
@@ -302,7 +318,7 @@ index d213d0bb..aec54433 100644
          }
          case RPG_WANDER_NPC:
 diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.h b/src/Ai/World/Rpg/Action/NewRpgBaseAction.h
-index 65222fd9..93c046c8 100644
+index 65222fd9..170e0b53 100644
 --- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.h
 +++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.h
 @@ -36,7 +36,18 @@ protected:
@@ -310,27 +326,27 @@ index 65222fd9..93c046c8 100644
      bool MoveFarTo(WorldPosition dest);
      bool MoveWorldObjectTo(ObjectGuid guid, float distance = INTERACTION_DISTANCE);
 -    bool MoveRandomNear(float moveStep = 50.0f, MovementPriority priority = MovementPriority::MOVEMENT_NORMAL, WorldObject* center = nullptr);
-+    // `homeAnchor` + `maxHomeDist` bound the random step to a
-+    // leash around a fixed point (e.g. where RPG_WANDER_RANDOM began) instead
-+    // of letting each step originate from wherever the bot has already
-+    // drifted to. Both default off so every other caller (quest wander,
-+    // grind-spot idle shuffle, outdoor-pvp patrol) is unaffected. `center` is
-+    // pre-existing and, at this pin, unused by the implementation - it is
-+    // left alone rather than repurposed, since it is typed as a live
-+    // WorldObject* (the outdoor-pvp call site passes a capture point) and a
-+    // wander anchor is a fixed position captured at state-entry, not a
-+    // WorldObject that can be dereferenced later.
++    // `homeAnchor` + `maxHomeDist` bound the random step to a leash around a
++    // fixed point (e.g. where RPG_WANDER_RANDOM began) instead of letting
++    // each step originate from wherever the bot has already drifted to. Both
++    // default off so every other caller (quest wander, grind-spot idle
++    // shuffle, outdoor-pvp patrol) is unaffected. `center` is pre-existing
++    // and, at this pin, unused by the implementation - it is left alone
++    // rather than repurposed, since it is typed as a live WorldObject* (the
++    // outdoor-pvp call site passes a capture point) and a wander anchor is a
++    // fixed position captured at state-entry, not a WorldObject that can be
++    // dereferenced later.
 +    bool MoveRandomNear(float moveStep = 50.0f, MovementPriority priority = MovementPriority::MOVEMENT_NORMAL, WorldObject* center = nullptr,
 +                         Position const* homeAnchor = nullptr, float maxHomeDist = 0.0f);
      bool ForceToWait(uint32 duration, MovementPriority priority = MovementPriority::MOVEMENT_NORMAL);
  
      /* QUEST RELATED CHECK */
 diff --git a/src/Ai/World/Rpg/NewRpgInfo.cpp b/src/Ai/World/Rpg/NewRpgInfo.cpp
-index a01bcec0..116db5ac 100644
+index 7db0ba87..facf42cc 100644
 --- a/src/Ai/World/Rpg/NewRpgInfo.cpp
 +++ b/src/Ai/World/Rpg/NewRpgInfo.cpp
-@@ -26,10 +26,12 @@ void NewRpgInfo::ChangeToWanderNpc()
-     data = WanderNpc{};
+@@ -41,10 +41,12 @@ void NewRpgInfo::ChangeToWanderNpc(uint32 npcEntry, WorldPosition pos)
+     data = wander;
  }
  
 -void NewRpgInfo::ChangeToWanderRandom()
@@ -345,24 +361,24 @@ index a01bcec0..116db5ac 100644
  
  void NewRpgInfo::ChangeToDoQuest(uint32 questId, const Quest* quest)
 diff --git a/src/Ai/World/Rpg/NewRpgInfo.h b/src/Ai/World/Rpg/NewRpgInfo.h
-index 53a4c629..ad2afbfd 100644
+index 415002c4..fffbe406 100644
 --- a/src/Ai/World/Rpg/NewRpgInfo.h
 +++ b/src/Ai/World/Rpg/NewRpgInfo.h
-@@ -42,6 +42,10 @@ struct NewRpgInfo
+@@ -53,6 +53,10 @@ struct NewRpgInfo
      struct WanderRandom
      {
          WanderRandom() = default;
-+        // where the bot was standing when it entered WANDER_RANDOM.
++        // Where the bot was standing when it entered WANDER_RANDOM.
 +        // MoveRandomNear() leashes each step to stay within a bounded radius of
 +        // this point instead of drifting from wherever the bot happens to be.
 +        WorldPosition anchor{};
      };
      // RPG_DO_QUEST
      struct DoQuest
-@@ -102,7 +106,7 @@ struct NewRpgInfo
-     void ChangeToGoGrind(WorldPosition pos);
-     void ChangeToGoCamp(WorldPosition pos);
+@@ -115,7 +119,7 @@ struct NewRpgInfo
      void ChangeToWanderNpc();
+     // infra#2783: the aimable form. See WanderNpc above.
+     void ChangeToWanderNpc(uint32 npcEntry, WorldPosition pos);
 -    void ChangeToWanderRandom();
 +    void ChangeToWanderRandom(WorldPosition anchor);
      void ChangeToDoQuest(uint32 questId, const Quest* quest);
