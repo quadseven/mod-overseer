@@ -94,8 +94,10 @@
 
 #include "CharacterCache.h"
 #include "Chat.h"
+#include "Corpse.h"
 #include "Log.h"
 #include "DatabaseEnv.h"
+#include "GameGraveyard.h"
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Guild.h"
@@ -188,6 +190,17 @@ constexpr uint32 TRAVEL_POLL_MS = 15000;
 // for why that distinction matters on a worldserver that has already
 // segfaulted twice today.
 constexpr uint32 ENGAGEMENT_POLL_MS = 8000;
+
+// HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
+// Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
+// "died too many times, get yourself unstuck" escape hatch
+// (ReviveFromCorpseAction/FindCorpseAction, dCount >= 5, calling
+// RandomPlayerbotMgr::Revive -> RandomTeleportGrindForLevel -> RandomTeleport)
+// is the thing this drive exists to back up - see DriveStuckRevival below for
+// why that escape hatch never reaches a grouped non-leader. 45s is long
+// enough that a working corpse-run has already succeeded, short enough that a
+// genuinely stuck character is not left dead for minutes.
+constexpr int64 STUCK_REVIVAL_DEAD_SECONDS = 45;
 
 // The level difference at which AzerothCore's own client-facing con-color
 // math would show a target as `??` - unknown, maximum danger - rather than a
@@ -1403,6 +1416,10 @@ public:
         {
             _engagementTimer = 0;
             DriveEngagementSafety();
+            // Same cadence, deliberately - see DriveStuckRevival's own WHY
+            // block. Reuses this timer rather than adding a new one; there is
+            // no reason this needs a different poll interval.
+            DriveStuckRevival();
         }
         // AFTER DriveTravel, on purpose. Both can run in the same tick, and
         // when they do the order that helps is travel first: a character that
@@ -3921,6 +3938,110 @@ private:
                      "is NOT proven to save a character on its own (see infra#2891/#2912)",
                      name, botLevel, victim->GetName(), victimLevel,
                      CON_COLOR_UNKNOWN_LEVEL_DIFF);
+        } while (result->NextRow());
+    }
+
+    // ---------------------------------------------------------- stuck dead --
+    //
+    // WHAT WAS WATCHED. The family found repeatedly dead at the identical
+    // spot in Burning Steppes, over and over, sometimes only seconds apart -
+    // confirmed live, not guessed: overseer_death timestamps for the same
+    // four characters (Ugga, Grog, Bork, Og) clustered at the same
+    // coordinates for over an hour, health always observed at ~1 the moment
+    // it was checked, positions never once moving between deaths.
+    //
+    // THE ACTUAL MECHANISM, read from the pinned mod-playerbots source, not
+    // guessed. mod-playerbots already has an escape hatch for exactly this -
+    // a character that keeps failing to recover its corpse (dCount >= 5,
+    // ReviveFromCorpseAction.cpp / FindCorpseAction.cpp) gets routed to
+    // RandomPlayerbotMgr::Revive(), which calls RandomTeleportGrindForLevel()
+    // -> RandomTeleport() to relocate it away from wherever it keeps dying.
+    // RandomTeleport() (RandomPlayerbotMgr.cpp) opens with a silent early
+    // return: `if (bot->GetGroup() && !bot->GetGroup()->IsLeader(bot->GetGUID()))
+    // return;` - a grouped character that is not the party leader gets
+    // NOTHING. No log, no fallback, the function simply does not act.
+    //
+    // KeepRosterGrouped keeps this family in one permanent party (see its own
+    // comment elsewhere in this file) specifically so they behave like a
+    // party, not five strangers - and that is exactly what makes four of the
+    // five structurally ineligible for this rescue path. Grug leads the
+    // party, so his own repeated deaths (independently still a live problem)
+    // at least have a working escape hatch; Ugga, Grog, Bork and Og do not,
+    // and never will while grouped under him. This is a real interaction
+    // between two features that individually make sense - "stay grouped as a
+    // family" and "don't randomly scatter a bot that's usefully following its
+    // group" - and neither side is wrong in isolation.
+    //
+    // WHY THIS IS FIXED HERE AND NOT IN mod-playerbots. RandomTeleport's
+    // leader gate is shared by every grouped bot on the server, not just this
+    // roster - loosening it changes behaviour for the whole 500-bot
+    // population for a problem that is specific to a family kept
+    // permanently grouped by mod-overseer's own design. This drive is the
+    // narrower, correctly-scoped fix: it only ever acts on this roster, and
+    // only on a character the built-in path has already had a full
+    // STUCK_REVIVAL_DEAD_SECONDS to reach and has not.
+    //
+    // WHAT THIS DOES NOT TOUCH. Grug (or any roster member who is, or
+    // becomes, the actual party leader) already has a working path through
+    // RandomTeleport and is left alone here - this drive only ever fires for
+    // a character the leader gate would otherwise strand.
+    void DriveStuckRevival()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+
+            // SteerableAI, not a bare lookup - see SteerableAI above and
+            // infra#2891: a name can resolve to a Player mid-login or
+            // mid-teardown, with a PlayerbotAI that is non-null right up
+            // until it is freed.
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            if (bot->IsAlive())
+                continue;
+
+            Corpse* corpse = bot->GetCorpse();
+            if (!corpse)
+                continue;  // ghost with no corpse yet, or already past this
+
+            // Leader or ungrouped: RandomTeleport's own path already reaches
+            // this character, this drive has nothing to add.
+            Group* group = bot->GetGroup();
+            if (!group || group->IsLeader(bot->GetGUID()))
+                continue;
+
+            int64 const deadFor = time(nullptr) - corpse->GetGhostTime();
+            if (deadFor < STUCK_REVIVAL_DEAD_SECONDS)
+                continue;
+
+            GraveyardStruct const* grave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
+            if (!grave)
+                continue;
+
+            // Mirrors exactly what SpiritHealerAction::Execute already does
+            // on a successful revive (ResurrectPlayer + SpawnCorpseBones) -
+            // this is not a new resurrection mechanism, it is the same one,
+            // reached without depending on the gate that was silently
+            // skipping this character.
+            bot->TeleportTo(grave->Map, grave->x, grave->y, grave->z, 0.f);
+            bot->ResurrectPlayer(0.5f);
+            bot->SpawnCorpseBones();
+
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' has been dead for {}s, grouped but not the party "
+                     "leader - mod-playerbots' own auto-relocate-after-repeated-deaths "
+                     "(RandomTeleport, RandomPlayerbotMgr.cpp) silently skips any grouped "
+                     "non-leader, so it would never reach a graveyard on its own; "
+                     "resurrected directly at the nearest graveyard instead",
+                     name, deadFor);
         } while (result->NextRow());
     }
 
