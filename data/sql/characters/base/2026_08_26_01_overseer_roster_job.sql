@@ -44,6 +44,15 @@
 -- drive: DriveQuests treats an unreadable column exactly like every row
 -- reading 'quest' - the default this column itself declares - so a stale
 -- worldserver keeps today's behaviour rather than freezing the family.
+-- IF NOT EXISTS, added after the fact (infra#2912 background). AzerothCore's
+-- updater hashes this whole FILE, comments included - a later commit that
+-- only redacted a name out of a comment above changed the hash without
+-- changing this statement at all, and the updater's own "the file changed,
+-- reapply it" response to that treated an unconditional ADD COLUMN as safe
+-- to run twice. It is not: it crash-loops db-import with a duplicate-column
+-- error against any database (like a live-data restore) that already has
+-- this column from the ORIGINAL apply. Idempotent now, so a hash change from
+-- a comment-only edit - which will happen again - costs nothing.
 ALTER TABLE `overseer_roster`
-    ADD COLUMN `job` VARCHAR(20) NOT NULL DEFAULT 'quest'
+    ADD COLUMN IF NOT EXISTS `job` VARCHAR(20) NOT NULL DEFAULT 'quest'
         COMMENT 'Job-schedule mode (infra#2834): quest, farm, dungeon, grind, gear hunt, craft, town run, train, rest, bank, reputation, guild business. Only quest is wired to a behaviour change today; every other value stands the quest drive down and nothing yet replaces it.';
