@@ -1,0 +1,241 @@
+Subject: [PATCH] a revived bot at critical health has no self-preservation until it is too late
+
+WHY THIS PATCH EXISTS
+
+infra's wow-dev family (Grug, Ugga, Grog, Bork, Og) was found live tonight in
+an active death loop: 34-36 deaths per character in one hour, all to the same
+creature (a Flamescale Wyrmkin, well above their level), almost all at the
+identical position. This is not the wander-drift bug patch 0006 already
+fixed - 0006 stops a HEALTHY bot from wandering into danger. This is what
+happens once a bot is ALREADY dead next to something lethal.
+
+CONFIRMED LIVE, NOT GUESSED. Polling `overseer_snapshot` (the 5-second live
+presence table, not the periodic character-save snapshot) every 4 seconds
+during an active death showed exactly this sequence for one bot:
+
+    health=0  in_combat=0  pos=(-7929.6,-1353.2)   <- just died
+    health=1  in_combat=0  pos=(-7923.6,-1353.2)   <- revived
+    health=1  in_combat=0  pos=(-7923.6,-1353.2)   <- 5s later, unmoved
+    health=1  in_combat=0  pos=(-7923.6,-1353.2)   <- 10s later, unmoved
+    health=1  in_combat=0  pos=(-7923.6,-1353.2)   <- 15s later, unmoved
+    health=1  in_combat=0  pos=(-7923.6,-1353.2)   <- 20s later, unmoved
+
+Alive, at 1 of 503 health, out of combat, motionless, for the entire
+observation window - until the same creature returns and kills it again.
+
+TWO GAPS, BOTH REQUIRED TO ACTUALLY BREAK THE LOOP:
+
+1. GrindTargetValue::FindTargetForGrinding() (src/Ai/Base/Value/
+   GrindTargetValue.cpp) checks the bot's `attackers` list FIRST, before the
+   `possible targets` list, and returns any living attacker completely
+   unfiltered - no level-gap check, no elite check - while the exact same
+   two checks already exist a few lines below for every other candidate.
+   The moment the Wyrmkin re-notices a bot standing on top of it, this is
+   why the bot's own AI chooses to keep fighting it rather than disengage.
+
+2. DeadStrategy.cpp routes a dead bot through "find corpse" / "revive from
+   corpse", and AiFactory::AddDefaultNonCombatStrategies - the strategy set
+   that governs a bot the instant it is alive again but not yet back in
+   combat - never adds "flee" at all (confirmed by reading the function; it
+   is added only inside AddDefaultCombatStrategies). FleeStrategy's existing
+   "critical health" -> "flee" trigger (FleeStrategy.cpp) is real, but
+   FleeAction needs AI_VALUE(Unit*, "current target"), which only combat
+   target-selection ever sets - it is empty for a bot that just revived out
+   of combat, so even where "flee" happens to be loaded, this specific
+   trigger's action is a guaranteed no-op at the one moment it matters most.
+
+WHY A NEW ACTION RATHER THAN REUSING FleeAction
+
+FleeManager (Mgr/Move/FleeManager.h), which FleeAction itself calls
+internally, does not actually need a target unit - it takes a `Player* bot`
+and a distance, and scores candidate destination points by distance from
+nearby creatures; the `followAngle` constructor argument is marked
+`[[maybe_unused]]` in FleeManager's own header. FleeAction only requires a
+target because it computes ITS OWN angle from `target->GetAngle(bot)` before
+calling FleeManager - that computation is what breaks with no target, not
+FleeManager itself. RetreatFromDangerAction calls FleeManager directly with
+a placeholder angle, which FleeManager's own destination search ignores, so
+it works with no target at all.
+
+THE FIX, IN TWO PARTS
+
+- GrindTargetValue.cpp: the attackers loop gets the same level-gap (>4,
+  non-player) and elite (rank > CREATURE_ELITE_NORMAL, no "can fight elite")
+  checks already applied to `possible targets`, so a bot no longer commits to
+  fighting back against something that already proved lethal.
+- A new RetreatFromDangerAction (MovementActions.h/.cpp), registered in
+  ActionContext.h as "retreat from danger", wired to the EXISTING "critical
+  health" trigger in FleeStrategy.cpp, and "flee" added to the non-combat
+  engine in AiFactory.cpp (class-agnostic - added once, before the per-class
+  switch, since critical-health self-preservation is not a class feature).
+  This is the action that actually runs the moment a bot is alive again at
+  critical health, regardless of whether combat has resumed yet.
+
+Neither half alone is sufficient: the grind-target gate stops the bot from
+VOLUNTEERING to re-engage, but does nothing to physically move it away from
+a spot the creature will simply re-notice it at; the retreat action moves the
+bot away, but without the grind-target gate a bot could still choose to walk
+back and re-engage on its own initiative once healed.
+
+NOT ADDRESSED BY THIS PATCH: the underlying question of whether "revive from
+corpse" (self-resurrect at the death location) or auto-release-to-graveyard
+is the right default for a group without a real player master - that is a
+separate design question this patch deliberately does not touch. This patch
+only ensures that WHEREVER a bot ends up after reviving, being at critical
+health and out of combat is not a state it can be stuck motionless in.
+
+diff --git a/src/Ai/Base/ActionContext.h b/src/Ai/Base/ActionContext.h
+index aa5e4175..d6c4db29 100644
+--- a/src/Ai/Base/ActionContext.h
++++ b/src/Ai/Base/ActionContext.h
+@@ -97,6 +97,7 @@ public:
+         creators["reach party member to heal"] = &ActionContext::reach_party_member_to_heal;
+         creators["reach party member to resurrect"] = &ActionContext::reach_party_member_to_resurrect;
+         creators["flee"] = &ActionContext::flee;
++        creators["retreat from danger"] = &ActionContext::retreat_from_danger;
+         creators["flee with pet"] = &ActionContext::flee_with_pet;
+         creators["avoid aoe"] = &ActionContext::avoid_aoe;
+         creators["combat formation move"] = &ActionContext::combat_formation_move;
+@@ -315,6 +316,7 @@ private:
+     static Action* reach_party_member_to_heal(PlayerbotAI* botAI) { return new ReachPartyMemberToHealAction(botAI); }
+     static Action* reach_party_member_to_resurrect(PlayerbotAI* botAI) { return new ReachPartyMemberToResurrectAction(botAI); }
+     static Action* flee(PlayerbotAI* botAI) { return new FleeAction(botAI); }
++    static Action* retreat_from_danger(PlayerbotAI* botAI) { return new RetreatFromDangerAction(botAI); }
+     static Action* flee_with_pet(PlayerbotAI* botAI) { return new FleeWithPetAction(botAI); }
+     static Action* avoid_aoe(PlayerbotAI* botAI) { return new AvoidAoeAction(botAI); }
+     static Action* combat_formation_move(PlayerbotAI* botAI) { return new CombatFormationMoveAction(botAI); }
+diff --git a/src/Ai/Base/Actions/MovementActions.cpp b/src/Ai/Base/Actions/MovementActions.cpp
+index 4ea6cbdb..cf1af5b2 100644
+--- a/src/Ai/Base/Actions/MovementActions.cpp
++++ b/src/Ai/Base/Actions/MovementActions.cpp
+@@ -1840,6 +1840,22 @@ bool FleeAction::isUseful()
+     return true;
+ }
+ 
++bool RetreatFromDangerAction::Execute(Event /*event*/)
++{
++    // followAngle is unused by FleeManager's own destination search (see the
++    // class declaration in MovementActions.h for why) - 0.0f is a
++    // placeholder, not a chosen direction.
++    FleeManager manager(bot, distance, 0.0f);
++    if (!manager.isUseful())
++        return false;
++
++    float rx, ry, rz;
++    if (!manager.CalculateDestination(&rx, &ry, &rz))
++        return false;
++
++    return MoveTo(bot->GetMapId(), rx, ry, rz);
++}
++
+ bool FleeWithPetAction::Execute(Event /*event*/)
+ {
+     if (bot->GetPet())
+diff --git a/src/Ai/Base/Actions/MovementActions.h b/src/Ai/Base/Actions/MovementActions.h
+index cbf44550..16b840f0 100644
+--- a/src/Ai/Base/Actions/MovementActions.h
++++ b/src/Ai/Base/Actions/MovementActions.h
+@@ -98,6 +98,31 @@ private:
+     float distance;
+ };
+ 
++// infra: FleeAction (above) needs AI_VALUE(Unit*, "current target") to pick a
++// direction, and that value is only ever set by combat target-selection - it
++// stays empty for a bot that just revived out of combat at critical health,
++// which is exactly the family's death-loop state (revive at 1 hp next to
++// whatever killed them, "current target" unset, "flee" a no-op, nothing else
++// moves them, the same creature kills them again). FleeManager itself
++// (Mgr/Move/FleeManager.h) needs no target at all - it scores candidate
++// points by distance from nearby creatures and only takes an angle to seed
++// the search, not to aim away from one specific unit. This class calls it
++// directly so recovering from critical health does not depend on a combat
++// target existing.
++class RetreatFromDangerAction : public MovementAction
++{
++public:
++    RetreatFromDangerAction(PlayerbotAI* botAI, float distance = sPlayerbotAIConfig.fleeDistance)
++        : MovementAction(botAI, "retreat from danger"), distance(distance)
++    {
++    }
++
++    bool Execute(Event event) override;
++
++private:
++    float distance;
++};
++
+ class FleeWithPetAction : public MovementAction
+ {
+ public:
+diff --git a/src/Ai/Base/Strategy/FleeStrategy.cpp b/src/Ai/Base/Strategy/FleeStrategy.cpp
+index d8919309..a5ace870 100644
+--- a/src/Ai/Base/Strategy/FleeStrategy.cpp
++++ b/src/Ai/Base/Strategy/FleeStrategy.cpp
+@@ -15,6 +15,17 @@ void FleeStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
+         new TriggerNode("outnumbered", { NextAction("flee", ACTION_EMERGENCY + 9) }));
+     triggers.push_back(
+         new TriggerNode("critical health", { NextAction("flee", ACTION_MEDIUM_HEAL) }));
++
++    // infra: "flee" (above) needs a combat target to pick a direction and is
++    // only ever added to the COMBAT engine (AiFactory::AddDefaultCombatStrategies),
++    // never to the non-combat one. A bot that revives at critical health has
++    // no combat target yet - it is out of combat by definition immediately
++    // after resurrecting - so nothing here has ever applied to that moment.
++    // This is the second half of the fix for infra's wow-dev death loop:
++    // "flee" is now also added to the non-combat engine (AiFactory.cpp), and
++    // this is the action that actually works without a target once it is.
++    triggers.push_back(
++        new TriggerNode("critical health", { NextAction("retreat from danger", ACTION_EMERGENCY + 8) }));
+ }
+ 
+ void FleeFromAddsStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
+diff --git a/src/Ai/Base/Value/GrindTargetValue.cpp b/src/Ai/Base/Value/GrindTargetValue.cpp
+index c8cdfbeb..fcd5f074 100644
+--- a/src/Ai/Base/Value/GrindTargetValue.cpp
++++ b/src/Ai/Base/Value/GrindTargetValue.cpp
+@@ -44,6 +44,24 @@ Unit* GrindTargetValue::FindTargetForGrinding(uint32 assistCount)
+         if (!unit || !unit->IsAlive())
+             continue;
+ 
++        // infra: an attacker was returned here unconditionally, bypassing
++        // the level-gap and elite checks applied a few lines below to every
++        // OTHER candidate. That is how a level 15-19 bot chooses to keep
++        // fighting a creature that already proved lethal: the moment it is
++        // in the "attackers" list, this loop hands it back as the grind
++        // target with zero safety filtering, every single tick, including
++        // the tick immediately after reviving next to it. Applying the same
++        // two checks here that already gate "possible targets" closes that
++        // gap without touching anything else in this function.
++        if (!bot->InBattleground() && (int)unit->GetLevel() - (int)bot->GetLevel() > 4 &&
++            !unit->GetGUID().IsPlayer())
++            continue;
++
++        if (Creature* creature = unit->ToCreature())
++            if (CreatureTemplate const* creatureTemplate = creature->GetCreatureTemplate())
++                if (creatureTemplate->rank > CREATURE_ELITE_NORMAL && !AI_VALUE(bool, "can fight elite"))
++                    continue;
++
+         return unit;
+     }
+ 
+diff --git a/src/Bot/Factory/AiFactory.cpp b/src/Bot/Factory/AiFactory.cpp
+index 1dbb382e..37de304c 100644
+--- a/src/Bot/Factory/AiFactory.cpp
++++ b/src/Bot/Factory/AiFactory.cpp
+@@ -506,6 +506,16 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
+ {
+     uint8 tab = GetPlayerSpecTab(player);
+ 
++    // infra: class-agnostic, added here rather than per-class below. Without
++    // this, "flee" only ever exists in the combat engine (see
++    // AddDefaultCombatStrategies), so a bot that revives at critical health
++    // - out of combat by definition, immediately after resurrecting - has no
++    // self-preservation strategy loaded at all until combat starts again,
++    // by which point it is often one hit from dying a second time in the
++    // same spot. See FleeStrategy.cpp's "retreat from danger" trigger, which
++    // is the half of "flee" that actually works without a combat target.
++    nonCombatEngine->addStrategy("flee", false);
++
+     switch (player->getClass())
+     {
+         case CLASS_PRIEST:
