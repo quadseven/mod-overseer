@@ -1,0 +1,73 @@
+Subject: [PATCH] TEMPORARY: log FleeManager::isUseful()'s real decision
+
+WHY THIS PATCH EXISTS, AND WHY IT IS TEMPORARY
+
+Even with 0007 (critical-health-out-of-combat-retreat) deployed, the wow-dev
+family's death loop did not stop - confirmed live, ~6 deaths/character/10min,
+unchanged. Earlier diagnostic logging (now removed) proved RetreatFromDanger-
+Action::Execute() fires correctly but FleeManager::isUseful() returns false,
+so the action bails before ever calling CalculateDestination().
+
+Five independently-queried AI models all guessed isUseful() gates on whether
+a flee DESTINATION exists (terrain/navmesh reasoning). Reading the actual
+pinned source (src/Mgr/Move/FleeManager.cpp) shows this is wrong: isUseful()
+never touches destinations. It only asks whether anything in "possible
+targets no los" is within its own GetAttackDistance() of the bot's
+startPosition - a question about whether fleeing is warranted at all, not
+whether it is possible.
+
+GetAttackDistance (core AzerothCore, Creature.cpp) is the aggro/detection
+radius, not melee reach - base 20yd, growing ~1yd per level the player is
+under the creature, capped at 25yd under. Against a much-higher-level
+Flamescale Wyrmkin, that is close to the 45yd ceiling, which should make this
+check trivially true if the creature is anywhere near the bot. So this
+should not be failing - and finding out WHY it does anyway is the point of
+this patch.
+
+This is instrumentation only, no behavior change: logs the candidate count,
+each candidate's name/entry/distance/attackDistance, and which branch is
+taken. DELETE THIS PATCH in the same commit as whatever real fix the logs
+point to - it is not meant to ship.
+
+APPLIES TO: mod-playerbots @ 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312,
+src/Mgr/Move/FleeManager.cpp, after 0001-0007.
+
+--- a/src/Mgr/Move/FleeManager.cpp
++++ b/src/Mgr/Move/FleeManager.cpp
+@@ -174,17 +174,26 @@
+ bool FleeManager::isUseful()
+ {
+     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+     if (!botAI)
+     {
++        LOG_ERROR("playerbots", "[FLEE-DEBUG] {}: isUseful no botAI", bot->GetName());
+         return false;
+     }
+     GuidVector units = *botAI->GetAiObjectContext()->GetValue<GuidVector>("possible targets no los");
++    LOG_ERROR("playerbots", "[FLEE-DEBUG] {}: isUseful checking {} possible targets, startPos=({:.1f},{:.1f},{:.1f})",
++        bot->GetName(), units.size(), startPosition.GetPositionX(), startPosition.GetPositionY(), startPosition.GetPositionZ());
+     for (GuidVector::iterator i = units.begin(); i != units.end(); ++i)
+     {
+         Creature* creature = botAI->GetCreature(*i);
+         if (!creature)
++        {
++            LOG_ERROR("playerbots", "[FLEE-DEBUG] {}: candidate guid not a creature, skip", bot->GetName());
+             continue;
++        }
+ 
+-        if (startPosition.sqDistance(WorldPosition(creature)) <
+-            creature->GetAttackDistance(bot) * creature->GetAttackDistance(bot))
++        float sqd = startPosition.sqDistance(WorldPosition(creature));
++        float ad = creature->GetAttackDistance(bot);
++        LOG_ERROR("playerbots", "[FLEE-DEBUG] {}: candidate={} entry={} dist={:.1f} attackDist={:.1f} -> {}",
++            bot->GetName(), creature->GetName(), creature->GetEntry(), sqrt(sqd), ad, (sqd < ad * ad ? "TRUE" : "false"));
++        if (sqd < ad * ad)
+             return true;
+ 
+         // float d = ServerFacade::instance().GetDistance2d(unit, bot);
+         // if (ServerFacade::instance().IsDistanceLessThan(d, sPlayerbotAIConfig.aggroDistance)) return true;
+     }
+ 
++    LOG_ERROR("playerbots", "[FLEE-DEBUG] {}: isUseful FALSE, no candidate matched", bot->GetName());
+     return false;
+ }
