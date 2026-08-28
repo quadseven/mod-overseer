@@ -125,3 +125,21 @@ fix, or because the pin moved and it no longer applies) costs the bound, not
 the compile. Rebase it onto the new pin, or delete it once upstream's own fix
 lands. See the patch's own header for the full trace to `NewRpgBaseAction.cpp`
 and `NewRpgAction.cpp` at the pinned SHA.
+
+**`mod-playerbots/0007-critical-health-out-of-combat-retreat.patch`** fixes
+the death loop 0006 doesn't: a bot that revives at critical health right next
+to what killed it has no self-preservation until combat resumes, because
+`AddDefaultNonCombatStrategies` (`AiFactory.cpp`) never adds `"flee"`, and
+even where the existing `"critical health"` trigger does fire, `FleeAction`
+needs a combat target that doesn't exist yet. Two changes: `GrindTargetValue`'s
+`attackers` loop gets the same level-gap/elite safety check `possible targets`
+already has a few lines below it, so a bot stops choosing to re-engage
+something that already proved lethal; and a new `RetreatFromDangerAction`
+(calls `FleeManager` directly, which needs no target) is wired to `"critical
+health"` and added to the non-combat engine, so a revived bot actually moves
+away instead of standing still. Confirmed live against infra's wow-dev family
+mid-death-loop before writing this, not guessed: `overseer_snapshot` showed
+one bot motionless at 1/503 health, out of combat, for 20+ seconds straight
+before being killed again by the same creature. Like 0006, a straight
+upstream-behaviour fix - `mod-overseer` calls nothing this patch adds, so
+dropping it costs the retreat, not the compile.
