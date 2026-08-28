@@ -202,6 +202,29 @@ constexpr uint32 ENGAGEMENT_POLL_MS = 8000;
 // genuinely stuck character is not left dead for minutes.
 constexpr int64 STUCK_REVIVAL_DEAD_SECONDS = 45;
 
+// WHEN THE NEAREST GRAVEYARD IS ITSELF THE THING KILLING THEM.
+// Resurrecting at the closest graveyard is right almost everywhere, and it is
+// what this drive did first. Measured on wow-dev 2026-08-28 it doubled the
+// death rate: 4.94 deaths/character/10min before, 10.03 after, over a 34-minute
+// window (173 deaths). The family were dying at Burning Steppes graveyard 1469
+// (-7923.56, -1353.23), which has four level 57-58 Flamescale Wyrmkin spawned
+// 31 yards away - inside the aggro radius of a level 15-19 character. Every
+// resurrection handed them straight back to the same mob, so a FASTER revive
+// meant a FASTER death. The run carried its own control group: Grug, the only
+// one this drive skipped at the time, died 22 times while the four it revived
+// died 35-39 each.
+//
+// So a graveyard that a character keeps dying at is not a rescue, and the
+// module already has the evidence to know which is which - it writes every
+// death to overseer_death with a position and a timestamp. Repeated deaths in
+// one small area mean the local graveyard is not working; go home instead.
+// Deliberately measured in the module's OWN telemetry rather than by zone or
+// creature id: nothing here is specific to Burning Steppes or to one mob, and
+// a trap built somewhere else reads identically.
+constexpr uint64 STUCK_REVIVAL_TRAP_DEATHS = 3;
+constexpr uint32 STUCK_REVIVAL_TRAP_MINUTES = 15;
+constexpr float STUCK_REVIVAL_TRAP_RADIUS = 100.0f;
+
 // The level difference at which AzerothCore's own client-facing con-color
 // math would show a target as `??` - unknown, maximum danger - rather than a
 // number. This is the SAME signal the game already computes for the
@@ -3981,10 +4004,24 @@ private:
     // only on a character the built-in path has already had a full
     // STUCK_REVIVAL_DEAD_SECONDS to reach and has not.
     //
-    // WHAT THIS DOES NOT TOUCH. Grug (or any roster member who is, or
-    // becomes, the actual party leader) already has a working path through
-    // RandomTeleport and is left alone here - this drive only ever fires for
-    // a character the leader gate would otherwise strand.
+    // CORRECTION, 2026-08-28: THIS DRIVE USED TO SKIP THE PARTY LEADER, AND
+    // THAT WAS WRONG. The original reasoning was that RandomTeleport's leader
+    // gate strands only grouped NON-leaders, so a leader still had a working
+    // path. Checked against the pinned module source rather than assumed, that
+    // is not what happens for this roster. RandomPlayerbotMgr::ProcessBot - the
+    // function containing the whole dead -> Revive() -> RandomTeleportGrindForLevel()
+    // rescue - is reached only when IsRandomBot(player) is true
+    // (RandomPlayerbotMgr.cpp, the `if (!sRandomPlayerbotMgr.IsRandomBot(player))
+    // update = false;` guard before the ProcessBot call). IsRandomBot in turn
+    // requires the account to be in the configured random-bot account list,
+    // which is built from AiPlayerbot.RandomBotAccountPrefix ("rndbot"). This
+    // family logs in on its own named accounts - GRUG, UGGA, GROG, BORK, OG -
+    // so IsRandomBot is false for every one of them and that rescue path never
+    // runs for ANY roster member, leader or not. The leader gate is real but it
+    // was never the operative one here. Confirmed by measurement: the skipped
+    // leader stayed dead longest of the five rather than being rescued.
+    //
+    // So this drive now covers the whole enabled roster.
     void DriveStuckRevival()
     {
         QueryResult result = CharacterDatabase.Query(
@@ -4012,15 +4049,57 @@ private:
             if (!corpse)
                 continue;  // ghost with no corpse yet, or already past this
 
-            // Leader or ungrouped: RandomTeleport's own path already reaches
-            // this character, this drive has nothing to add.
-            Group* group = bot->GetGroup();
-            if (!group || group->IsLeader(bot->GetGUID()))
-                continue;
-
             int64 const deadFor = time(nullptr) - corpse->GetGhostTime();
             if (deadFor < STUCK_REVIVAL_DEAD_SECONDS)
                 continue;
+
+            // Has this character been dying over and over in one small area?
+            // If so the local graveyard is feeding it back to whatever killed
+            // it, and reviving there again is the harm, not the fix - see
+            // STUCK_REVIVAL_TRAP_* above for the measurement that established
+            // this.
+            uint64 recentDeathsHere = 0;
+            if (QueryResult trap = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+                    "AND created_at >= NOW() - INTERVAL {} MINUTE AND map = {} "
+                    "AND POW(pos_x - {}, 2) + POW(pos_y - {}, 2) <= {}",
+                    Esc(name), STUCK_REVIVAL_TRAP_MINUTES, corpse->GetMapId(),
+                    corpse->GetPositionX(), corpse->GetPositionY(),
+                    STUCK_REVIVAL_TRAP_RADIUS * STUCK_REVIVAL_TRAP_RADIUS))
+                recentDeathsHere = trap->Fetch()[0].Get<uint64>();
+
+            if (recentDeathsHere >= STUCK_REVIVAL_TRAP_DEATHS)
+            {
+                // Home, not the graveyard. m_homebind* is the character's own
+                // bind point - the destination its own Hearthstone would use -
+                // so this is the existing in-game escape, reached without the
+                // 10-second cast that combat here interrupts every time.
+                //
+                // The LEADER's bind point when there is one, so the family
+                // lands together and mod-overseer's follow logic just works.
+                // Sending each to its own bind would scatter this roster
+                // across two starting zones (measured: Elwynn and Dun Morogh,
+                // ~2000 yards apart) and leave the party split on arrival.
+                Player* home = bot;
+                if (Group* group = bot->GetGroup())
+                    if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+                        home = leader;
+
+                bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                home->m_homebindY, home->m_homebindZ, 0.f);
+                bot->ResurrectPlayer(1.0f);
+                bot->SpawnCorpseBones();
+
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has died {} times within {}yd in the last {}min - "
+                         "the nearest graveyard is inside whatever is killing it, so reviving "
+                         "there again would only speed the loop up (measured: doing exactly "
+                         "that doubled this roster's death rate). Sent home to '{}'s bind "
+                         "point instead",
+                         name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
+                         STUCK_REVIVAL_TRAP_MINUTES, home->GetName());
+                continue;
+            }
 
             GraveyardStruct const* grave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
             if (!grave)
@@ -4029,18 +4108,18 @@ private:
             // Mirrors exactly what SpiritHealerAction::Execute already does
             // on a successful revive (ResurrectPlayer + SpawnCorpseBones) -
             // this is not a new resurrection mechanism, it is the same one,
-            // reached without depending on the gate that was silently
-            // skipping this character.
+            // reached without depending on a path that never runs for this
+            // roster at all.
             bot->TeleportTo(grave->Map, grave->x, grave->y, grave->z, 0.f);
             bot->ResurrectPlayer(0.5f);
             bot->SpawnCorpseBones();
 
             LOG_WARN("module.overseer",
-                     "overseer: '{}' has been dead for {}s, grouped but not the party "
-                     "leader - mod-playerbots' own auto-relocate-after-repeated-deaths "
-                     "(RandomTeleport, RandomPlayerbotMgr.cpp) silently skips any grouped "
-                     "non-leader, so it would never reach a graveyard on its own; "
-                     "resurrected directly at the nearest graveyard instead",
+                     "overseer: '{}' has been dead for {}s - mod-playerbots' own "
+                     "auto-relocate-after-repeated-deaths (RandomTeleport, "
+                     "RandomPlayerbotMgr.cpp) is gated behind IsRandomBot, which is false "
+                     "for this roster's named accounts, so it would never reach a graveyard "
+                     "on its own; resurrected at the nearest graveyard instead",
                      name, deadFor);
         } while (result->NextRow());
     }
