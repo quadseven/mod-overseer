@@ -2288,6 +2288,50 @@ private:
             if (!botAI)
                 continue;
 
+            // THE DUNGEON GATE. Same shape as the job gate above and the
+            // travel hand-off below: something else is steering, so this drive
+            // takes its hands off the wheel.
+            //
+            // WHY IT HAS TO EXIST. A quest aim inside an instance is not merely
+            // useless, it is actively destructive. Measured live in Deadmines
+            // with the whole party inside, at full health, nobody in combat:
+            //
+            //     22:47:06  'Ugga' now working quest 14 (The People's Militia)
+            //     22:47:26  'Ugga' now working quest 22 (Goretusk Liver Pie)
+            //     22:47:46  'Ugga' now working quest 14 (The People's Militia)
+            //     22:48:06  'Ugga' now working quest 22 (Goretusk Liver Pie)
+            //     22:48:26  'Ugga' now working quest 14 (The People's Militia)
+            //
+            // Two OUTDOOR Westfall quests, alternating every twenty seconds,
+            // for half an hour. Neither objective exists on this map, so
+            // neither aim can ever be satisfied and neither can ever be
+            // abandoned - and each re-assertion overwrites the rpgInfo the
+            // dungeon run needs. The party did not move, did not fight, and did
+            // not gain a single point of XP in thirty minutes while this ran.
+            //
+            // A dungeon is the one place where "carry on questing" is knowably
+            // wrong: quest POIs live on the outdoor map, and a character that
+            // walked into an instance did so because something else decided it
+            // should be there.
+            //
+            // DELIBERATELY MAP-BASED, NOT STRATEGY-BASED. Gating on "has the
+            // dungeon clear strategy" would mean a character that entered
+            // before the arming drive's next poll still gets a quest aim
+            // written over it in that window, which is exactly the race this is
+            // here to close. Being on an instance map is the fact; the strategy
+            // is a consequence of it.
+            if (Map* map = bot->GetMap())
+            {
+                if (map->IsDungeon())
+                {
+                    LOG_DEBUG("module.overseer",
+                              "overseer: '{}' is inside map {} - the quest drive "
+                              "stands down for the dungeon run",
+                              name, static_cast<uint32>(bot->GetMapId()));
+                    continue;
+                }
+            }
+
             // The aim as this loop last saw it, so a standing complaint is made
             // once rather than three times a minute forever. Nothing here is
             // read as a decision: the roster row remains the only real state.
