@@ -4333,11 +4333,58 @@ private:
             if (bot->IsAlive())
                 continue;
 
+            // WHERE THE CORPSE IS, AND WHY ASKING THE PLAYER IS NOT ENOUGH.
+            // Player::GetCorpse() resolves through the player's CURRENT map, so
+            // it answers null for a corpse lying on a different one. That is not
+            // an edge case here, it is the normal result of a wipe in an
+            // instance: the party releases, the ghosts land at an outdoor
+            // graveyard on map 0, and every corpse stays on the instance map.
+            //
+            // The old code read that null as "ghost with no corpse yet, or
+            // already past this" and skipped. For a ghost whose corpse is on
+            // another map, neither is true and neither ever becomes true, so it
+            // was skipped on every pass, forever. Measured on the dev world:
+            // five characters wiped inside a dungeon, released to the graveyard
+            // outside, and sat there as ghosts with this drive logging nothing
+            // at all - the one path that could have recovered them was the one
+            // returning early.
+            //
+            // So the corpse is read from the table when the map-scoped lookup
+            // cannot see it. `corpse.time` is the same ghost time
+            // Corpse::GetGhostTime() returns, and the position columns are the
+            // same ones the trap check below needs, so the two paths agree by
+            // construction rather than by luck.
             Corpse* corpse = bot->GetCorpse();
-            if (!corpse)
-                continue;  // ghost with no corpse yet, or already past this
+            int64 ghostTime = 0;
+            uint32 corpseMap = 0;
+            float corpseX = 0.f;
+            float corpseY = 0.f;
 
-            int64 const deadFor = time(nullptr) - corpse->GetGhostTime();
+            if (corpse)
+            {
+                ghostTime = corpse->GetGhostTime();
+                corpseMap = corpse->GetMapId();
+                corpseX = corpse->GetPositionX();
+                corpseY = corpse->GetPositionY();
+            }
+            else if (QueryResult row = CharacterDatabase.Query(
+                         "SELECT time, mapId, posX, posY FROM corpse WHERE guid = {}",
+                         bot->GetGUID().GetCounter()))
+            {
+                Field* f = row->Fetch();
+                ghostTime = int64(f[0].Get<uint32>());
+                corpseMap = f[1].Get<uint16>();
+                corpseX = f[2].Get<float>();
+                corpseY = f[3].Get<float>();
+            }
+
+            // Still nothing: a ghost genuinely without a corpse anywhere. That
+            // is the case the original guard was written for and it is left
+            // alone - there is no death to time from and nothing to recover to.
+            if (!ghostTime)
+                continue;
+
+            int64 const deadFor = time(nullptr) - ghostTime;
             if (deadFor < STUCK_REVIVAL_DEAD_SECONDS)
                 continue;
 
@@ -4351,8 +4398,8 @@ private:
                     "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
                     "AND created_at >= NOW() - INTERVAL {} MINUTE AND map = {} "
                     "AND POW(pos_x - {}, 2) + POW(pos_y - {}, 2) <= {}",
-                    Esc(name), STUCK_REVIVAL_TRAP_MINUTES, corpse->GetMapId(),
-                    corpse->GetPositionX(), corpse->GetPositionY(),
+                    Esc(name), STUCK_REVIVAL_TRAP_MINUTES, corpseMap,
+                    corpseX, corpseY,
                     STUCK_REVIVAL_TRAP_RADIUS * STUCK_REVIVAL_TRAP_RADIUS))
                 recentDeathsHere = trap->Fetch()[0].Get<uint64>();
 
