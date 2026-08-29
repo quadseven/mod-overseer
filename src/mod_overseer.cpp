@@ -2320,6 +2320,12 @@ private:
             // written over it in that window, which is exactly the race this is
             // here to close. Being on an instance map is the fact; the strategy
             // is a consequence of it.
+            //
+            // Members read at the pinned core, cited so the guard in
+            // tests/test_quest_aim.py can hold them to it:
+            //   GetMap     Object.h:631     Map* GetMap() const
+            //   IsDungeon  Map.h:298        bool IsDungeon() const
+            //   GetMapId   Position.h:281   uint32 GetMapId() const
             if (Map* map = bot->GetMap())
             {
                 if (map->IsDungeon())
