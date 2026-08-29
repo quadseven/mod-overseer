@@ -3691,11 +3691,14 @@ private:
         bot->GetSession()->HandleAreaTriggerOpcode(packet);
 
         if (bot->GetMapId() == before)
-            // Refused, and the ordinary reason is the last few yards: this
-            // module calls a character arrived at TRAVEL_ARRIVED_YARDS, which
-            // is wider than most trigger radii - the Deadmines portal's is 7
-            // against an arrival of 12. Not an error, and NOT the end of the
-            // errand. The caller keeps walking and knocks again next poll.
+            // Refused, and the ordinary reason is the last few yards. The
+            // handler's own IsInAreaTriggerRadius is the authority and it is
+            // stricter than arrival: a `trigger:` aim carries no creature, so
+            // it arrives on TRAVEL_ARRIVED_POSITION_YARDS (5) against the
+            // Deadmines portal's radius of 7 - inside it, but a trigger may be
+            // tighter still, and a path may stop short of where it aimed. Not
+            // an error, and NOT the end of the errand. The caller keeps walking
+            // and knocks again next poll.
             return false;
 
         LOG_INFO("module.overseer",
