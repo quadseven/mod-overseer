@@ -121,6 +121,9 @@
 #include "Trainer.h"
 #include "World.h"
 #include "WorldSession.h"
+#include "TradeData.h"
+#include "Opcodes.h"
+#include "WorldPacket.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4974,12 +4977,13 @@ private:
             char const* status = "error";
             char const* detail = "";
 
-            // Bot orders only. 'chat', 'gm', 'probe', 'give', 'share' and
-            // 'job' do not go through PlayerbotAI::HandleCommand and share no
+            // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
+            // 'share' and 'job' do not go through PlayerbotAI::HandleCommand
+            // and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
-                && kind != "share" && kind != "job")
+                && kind != "trade" && kind != "share" && kind != "job")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -5058,6 +5062,8 @@ private:
                 detail = DoProbe(player, command, status, rowResult);
             else if (kind == "give")
                 detail = DoGive(player, targetArg, command, status, rowResult);
+            else if (kind == "trade")
+                detail = DoTrade(player, targetArg, command, status, rowResult);
             else if (kind == "share")
                 detail = DoShare(player, targetArg, command, status, rowResult);
             else if (kind == "job")
@@ -5821,6 +5827,223 @@ private:
         status = "delivered";
         return "";
     }
+
+    // --------------------------------------------------------------- trade --
+    //
+    // Hand ONE item from one living character to another through the core's
+    // real trade, so it happens in the world instead of in the database.
+    //
+    // WHY, WHEN give ALREADY MOVES ITEMS CORRECTLY. It does, and it stays.
+    // But give is three database writes: nothing renders, nothing animates,
+    // and a camera pointed at either character sees an item appear in a bag
+    // with no visible cause. mod-overseer#14 asked for the item to move "in
+    // the world, not a DB UPDATE teleporting it". This is that path; give
+    // remains the one to reach for when the two are nowhere near each other.
+    //
+    // WHY THIS IS REACHABLE WHEN THE NOTE ABOVE DoGive SAYS IT IS NOT. That
+    // note is about mod-playerbots trade, and every word of it still holds:
+    // its chat command targets the bot's master (TradeAction.cpp:26-38), and
+    // CheckTrade takes a bot-to-bot branch whenever the master is not a real
+    // player (TradeStatusAction.cpp:165-200), which a selfbot is not
+    // (PlayerbotAI.cpp:4389-4395). None of that is used here.
+    //
+    // The CORE's trade is a different machine. Its handlers are public on
+    // WorldSession (WorldSession.h:684 opens the opcodes-handlers public
+    // section; the trade handlers sit at :893-902), they take Player pointers
+    // rather than a client, and the two that matter ignore their packet
+    // argument outright (TradeHandler.cpp:237 and :692 both take
+    // WorldPacket& /*recvPacket*/). Both characters are real Player objects
+    // on one worldserver, so the exchange is a sequence of ordinary calls.
+    //
+    // WHAT COMPLETES IT. The second accept: HandleAcceptTradeOpcode gates the
+    // exchange on his_trade->IsAccepted() (TradeHandler.cpp:340) and only
+    // then runs moveItems inside a CharacterDatabase transaction, frees both
+    // TradeData, and reports to both sessions. The atomicity is the core's,
+    // which is why - unlike DoGive - this function opens no transaction.
+    //
+    // ORDERING THAT IS NOT OPTIONAL. TradeData::SetItem clears the accepted
+    // flag on BOTH sides every time it is called (TradeData.cpp:64-65), so the
+    // item goes in BEFORE either accept. Reversed, the window sits open for
+    // ever while this function believes it succeeded - the precise failure
+    // this module exists to stop reporting as success. It is checked at the
+    // end by reading the item's owner back rather than by trusting the calls.
+    //
+    // WHY EVERY CONDITION IS TESTED HERE AS WELL AS BY THE CORE. Initiate
+    // refuses for a dozen reasons and reports each one by sending a status
+    // packet to a session, which a module cannot read back. Testing them first
+    // is what lets detail NAME the wall that was hit; the core then tests
+    // them again and remains the authority.
+    static char const* DoTrade(Player* giver, std::string const& receiverName,
+                               std::string const& command, char const*& status,
+                               std::string& out)
+    {
+        auto refuse = [&](char const* reason, char const* detail) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(reason)
+              << ",\"from\":" << J(giver->GetName())
+              << ",\"to\":" << J(receiverName)
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+            return detail;
+        };
+
+        GiveSpec const spec = ParseGiveSpec(command);
+        if (!spec.valid)
+            return refuse("malformed item spec",
+                          "malformed trade: want guid:<item_instance.guid> or entry:<id>");
+
+        if (receiverName.empty())
+            return refuse("no receiver", "no receiver (put the receiving character in target_arg)");
+
+        Player* receiver = ObjectAccessor::FindPlayerByName(receiverName);
+        if (!receiver)
+            return refuse("receiver offline", "receiver not online");
+
+        if (receiver == giver)
+            return refuse("same character", "giver and receiver are the same character");
+
+        WorldSession* giverSession = giver->GetSession();
+        WorldSession* receiverSession = receiver->GetSession();
+        if (!giverSession || !receiverSession)
+            return refuse("no session", "one of the characters has no session");
+
+        // Each of these is a condition HandleInitiateTradeOpcode
+        // (TradeHandler.cpp:721-840) tests and answers with a status packet.
+        // Named here so the row says which one.
+        if (!giver->IsAlive())
+            return refuse("giver dead", "giver is dead");
+        if (!receiver->IsAlive())
+            return refuse("receiver dead", "receiver is dead");
+        if (giver->IsInFlight() || receiver->IsInFlight())
+            return refuse("in flight", "one of the characters is on a flight path");
+        if (giver->HasUnitState(UNIT_STATE_STUNNED) || receiver->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse("stunned", "one of the characters is stunned");
+        if (giverSession->isLogingOut() || receiverSession->isLogingOut())
+            return refuse("logging out", "one of the characters is logging out");
+        if (giver->GetTradeData() || receiver->GetTradeData())
+            return refuse("already trading", "one of the characters is already in a trade");
+        if (giver->GetLevel() < sWorld->getIntConfig(CONFIG_TRADE_LEVEL_REQ))
+            return refuse("below trade level", "giver is below the trade level requirement");
+
+        // The one that is normally false for a travelling group rather than
+        // rarely false. TRADE_DISTANCE is 11.11 yards (ObjectDefines.h:29).
+        if (!giver->IsWithinDistInMap(receiver, TRADE_DISTANCE, false))
+            return refuse("too far apart", "characters are too far apart to trade");
+
+        Item* item = FindCarriedItem(giver, spec.byGuid, spec.key);
+        if (!item)
+            return refuse("item not found",
+                          spec.byGuid ? "no carried item with that guid on the giver"
+                                      : "no carried item with that entry on the giver");
+
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return refuse("no item template", "item has no template");
+
+        ObjectGuid const itemGuid = item->GetGUID();
+        uint32 const itemEntry = item->GetEntry();
+        uint32 const itemCount = item->GetCount();
+        std::string const itemName = proto->Name1;
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"from\":" << J(giver->GetName())
+              << ",\"to\":" << J(receiver->GetName())
+              << ",\"item_guid\":" << itemGuid.GetCounter()
+              << ",\"entry\":" << itemEntry
+              << ",\"name\":" << J(itemName)
+              << ",\"count\":" << itemCount
+              << ",\"method\":\"trade\"}";
+            out = o.str();
+        };
+
+        // Soulbound named separately for the same reason DoGive names it: it
+        // is the one refusal that is permanent, and an operator told only
+        // "cannot be traded" will retry it for ever.
+        if (item->IsSoulBound())
+        {
+            describe("refused", "item is soulbound to the giver");
+            return "item is soulbound and can never be handed over";
+        }
+        if (!item->CanBeTraded())
+        {
+            describe("refused", "item cannot be traded (non-empty bag, worn bag, being looted, "
+                                "or bound by enchant)");
+            return "item cannot be handed over";
+        }
+
+        // Asked before anything opens, so a receiver with no room costs a row
+        // rather than a hung trade window.
+        ItemPosCountVec dest;
+        InventoryResult const msg = receiver->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+        if (msg != EQUIP_ERR_OK)
+        {
+            describe("refused", "receiver cannot store the item");
+            return msg == EQUIP_ERR_INVENTORY_FULL ? "receiver bags are full"
+                                                   : "receiver cannot store the item";
+        }
+
+        // ---- drive the core's own state machine ----------------------------
+
+        WorldPacket initiate(CMSG_INITIATE_TRADE, 8);
+        initiate << receiver->GetGUID();
+        giverSession->HandleInitiateTradeOpcode(initiate);
+
+        TradeData* giverTrade = giver->GetTradeData();
+        if (!giverTrade || !receiver->GetTradeData())
+        {
+            // Everything it tests was tested above, so reaching here means a
+            // condition this function does not know about - a script hook
+            // (OnPlayerCanInitTrade), a faction rule, or a spectator state.
+            giver->TradeCancel(false);
+            describe("refused", "the core refused to open the trade window");
+            return "the core refused to open the trade window";
+        }
+
+        // Cosmetic, and the reason this is worth doing at all: it is what puts
+        // the trade window on screen for anyone watching either character.
+        WorldPacket begin(CMSG_BEGIN_TRADE, 0);
+        receiverSession->HandleBeginTradeOpcode(begin);
+
+        // BEFORE the accepts. See the ordering note above.
+        giverTrade->SetItem(TradeSlots(0), item);
+
+        WorldPacket accept(CMSG_ACCEPT_TRADE, 0);
+        giverSession->HandleAcceptTradeOpcode(accept);
+        receiverSession->HandleAcceptTradeOpcode(accept);
+
+        // ---- believe nothing; read the item back ---------------------------
+        //
+        // A completed trade frees both TradeData and leaves the item owned by
+        // the receiver. Either half still being true means it did not
+        // complete, and a window left open would otherwise be reported as a
+        // success by a function that only counted its own calls.
+        if (giver->GetTradeData() || receiver->GetTradeData())
+        {
+            giver->TradeCancel(false);
+            describe("refused", "the trade did not complete and was cancelled");
+            return "the trade did not complete";
+        }
+
+        Item* moved = receiver->GetItemByGuid(itemGuid);
+        if (!moved)
+        {
+            describe("refused", "the trade closed but the receiver does not hold the item");
+            return "the trade closed but the item did not move";
+        }
+
+        LOG_INFO("module.overseer", "overseer: traded item {} (entry {}) from '{}' to '{}'",
+                 itemGuid.GetCounter(), itemEntry, giver->GetName(), receiver->GetName());
+
+        describe("moved", "");
+        status = "delivered";
+        return "";
+    }
+
 
     // --------------------------------------------------------------- share --
     //
