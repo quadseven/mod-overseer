@@ -3820,9 +3820,14 @@ private:
             if (state.since && std::time(nullptr) - state.since > TRAVEL_BACKSTOP_SECONDS)
             {
                 LOG_INFO("module.overseer",
-                         "overseer: '{}' was sent to '{}' and has not got any nearer "
-                         "than {} yards for {} minutes - releasing the errand as "
-                         "unreachable", name, target, static_cast<uint32>(state.closest),
+                         // "releasing the errand as unreachable" is kept on ONE
+                         // source line on purpose: infra's guard test greps this
+                         // function for the phrase to prove every release path
+                         // says why it fired, and a phrase split across two
+                         // string literals is invisible to it.
+                         "overseer: '{}' was sent to '{}' and has not got any nearer than "
+                         "{} yards for {} minutes - releasing the errand as unreachable",
+                         name, target, static_cast<uint32>(state.closest),
                          static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
                 ClearTravelAim(name);
                 continue;
