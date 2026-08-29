@@ -153,3 +153,20 @@ alongside EQUIP and REPLACE and voted NEED on it, which is why a priest won a
 two-handed axe she can never equip. Both roll sites now greed on it instead.
 Originated and proven compiling in the public `quadseven/mod-overseer` repo
 before landing here.
+
+**`mod-playerbots/0012-an-aimed-wander-may-name-a-place.patch` fixes upstream
+behaviour, same category as 0001-0004 and 0006-0008, 0010** - dropping it costs
+the fix but the build still compiles clean. Nothing could put a party inside a
+dungeon: the clear command refuses outside an instance and has no travel verb,
+the dungeon finder draws its list from the random-bot manager so roster
+characters never queue, and the map holds zero `quest_poi` rows so no held quest
+can lead the way either. That left walking in, which the travel machinery was
+already capable of - except an aim could only name a CREATURE, and an instance
+portal is an areatrigger with no entry to name (the nearest spawn to the one
+this was written for is 22.8 yards away, outside the trigger's 7 yard radius,
+so aiming at it stops short). This makes the aimed-wander branch gate on the
+POSITION rather than the entry, so an aim may say "go here" and mean it. A
+wander the bot chose for itself still carries an empty position and is
+untouched. The walk itself needed no change; it was always positional, and the
+entry was only ever consulted on arrival. Pairs with `at:<map>:<x>,<y>,<z>` in
+this module's own travel aim.

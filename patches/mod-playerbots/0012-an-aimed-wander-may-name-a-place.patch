@@ -1,0 +1,103 @@
+Subject: [PATCH] an aimed wander may name a place, not only a creature
+
+WHY THIS PATCH EXISTS
+
+Nothing could put a party inside a dungeon, and the reason was not distance.
+
+Three mechanisms exist and all three refuse. The clear command refuses outside
+an instance (DungeonClearChatActions.cpp) and deliberately has no travel verb -
+it clears a dungeon, it does not get you to one. The dungeon finder draws its
+list from the random-bot manager, so characters on named roster accounts get an
+empty list and never queue; it is also unsteerable, inserting every eligible
+dungeon rather than the one asked for. And a quest cannot lead the way either:
+measured against the world database, the Deadmines map has ZERO quest_poi rows,
+so a held dungeon quest gives the travel machinery no destination inside.
+
+That left walking in, the way a player does. The machinery for it already
+existed and was already proven over long distances - but it could only be
+pointed at a creature. NewRpgWanderNpcAction's aimed branch, added so a bot
+could be SENT to a named NPC, gates on `npcEntry` being non-zero:
+
+    if (data.npcEntry && data.pos != WorldPosition())
+
+An instance portal is not a creature. It is an areatrigger, and the nearest
+spawned creature to the one this was written for sits 22.8 yards away - well
+outside the trigger's 7 yard radius, so aiming at that creature stops short and
+never crosses it. There was no way to say "walk to this spot", because every
+target had to be something with a GUID standing on it.
+
+WHAT THIS CHANGES
+
+The gate becomes the POSITION rather than the entry. `pos` is written only by
+the two-argument ChangeToWanderNpc, so a wander the bot selected for itself
+still carries an empty `pos` and still falls through untouched - the behaviour
+of every unaimed bot on the realm is byte for byte what it was. What is newly
+expressible is an aim with a position and no entry, meaning: go there, and
+arriving is the errand.
+
+The walk itself needed no change at all. It was always positional - MoveFarTo
+takes the coordinates and the entry is consulted only on arrival, to find
+something to interact with. This patch simply stops requiring that something to
+exist.
+
+For the motivating case the arrival branch is usually never reached: the walk
+closes to INTERACTION_DISTANCE, the portal's trigger radius is wider than that,
+so the bot crosses the trigger and changes map before it can arrive. Where a
+place genuinely has nothing at it, idling is the honest answer and upstream's
+own status clock releases the aim with no special case.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream growing any way to send a bot to a location rather than to a creature -
+a coordinate aim, an areatrigger aim, or a travel verb on the dungeon module.
+Any of those makes this redundant. Deleting it without one costs the ability to
+enter a dungeon at all; it does not break the compile.
+
+APPLIES TO
+
+mod-playerbots at the pinned SHA, src/Ai/World/Rpg/Action/NewRpgAction.cpp,
+NewRpgWanderNpcAction::Execute - specifically the aimed-wander block. Depends
+on the aimed-wander block existing, so it must apply after the patch that adds
+it.
+
+diff --git a/src/Ai/World/Rpg/Action/NewRpgAction.cpp b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
+index acf0082f..26d49f1a 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
+@@ -407,11 +407,35 @@ bool NewRpgWanderNpcAction::Execute(Event /*event*/)
+     // where it was sent. It is still bounded, and by upstream's own clock: the
+     // status self-expires to IDLE after statusWanderNpcDuration, which releases
+     // the aim with no special case anywhere.
+-    if (data.npcEntry && data.pos != WorldPosition())
++    // A DESTINATION WITH NO NPC NAMED IS A PLACE, NOT A CREATURE. The gate is
++    // the POSITION, not the entry: `pos` is written only by the two-argument
++    // ChangeToWanderNpc, so a wander the bot chose for itself still has an
++    // empty `pos` and still falls straight through, byte for byte as before.
++    // Leaving `npcEntry` 0 asks for the walk WITHOUT the arrival interaction,
++    // which is what "go to this spot" means and what no aim could previously
++    // express - every target had to be something with a GUID standing on it.
++    //
++    // The motivating case is an instance portal. Its areatrigger teleports on
++    // contact, and the trigger radius is wider than the distance this walk
++    // closes to, so a bot aimed at the trigger's own coordinates crosses it and
++    // changes map mid-walk - the arrival branch below is usually never reached
++    // at all. Nothing else can put a party inside a dungeon: the clear command
++    // refuses outside one and does not travel, and the dungeon finder draws its
++    // list from the random-bot manager, which roster characters are not in.
++    if (data.pos != WorldPosition())
+     {
+         if (bot->GetDistance(data.pos) > INTERACTION_DISTANCE)
+             return MoveFarTo(data.pos);
+ 
++        // Arriving IS the whole errand when no NPC was named. Idle rather than
++        // hunt for a creature the caller never asked for; the status expires on
++        // upstream's own clock and whoever set the aim decides what is next.
++        if (!data.npcEntry)
++        {
++            info.ChangeToIdle();
++            return true;
++        }
++
+         Creature* aimedNpc = bot->FindNearestCreature(data.npcEntry, INTERACTION_DISTANCE * 3);
+         if (!aimedNpc || !aimedNpc->IsAlive())
+         {
