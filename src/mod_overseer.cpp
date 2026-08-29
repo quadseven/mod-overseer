@@ -2982,6 +2982,52 @@ private:
             return true;
         }
 
+        // A PORTAL: `trigger:<areatrigger id>`. The same walk as `at:` above,
+        // except the module knows on arrival that the destination is a doorway
+        // and can knock on it.
+        //
+        // WHY THIS IS NOT JUST `at:` WITH THE PORTAL'S COORDINATES. It was,
+        // and it got the family to the Deadmines portal and no further:
+        // measured on the dev world, four of them stood 5, 7, 10 and 10 yards
+        // from a trigger of radius 7 and nothing happened. Nothing was wrong
+        // with the walk. An areatrigger fires from CMSG_AREATRIGGER, which the
+        // game CLIENT sends when it notices it has touched one
+        // (WorldSession::HandleAreaTriggerOpcode, MiscHandler.cpp:691, the only
+        // caller of the teleport at :807). The server never sweeps player
+        // positions against triggers, so a character with no client walks over
+        // a portal and the portal never hears about it. Walking in "like a
+        // player" turns out to depend on a part of the player that a bot
+        // does not have.
+        //
+        // Upstream does simulate that packet - AreaTriggerAction.cpp builds one
+        // and hands it to the same handler - but only on two paths, neither of
+        // which a roster character is ever on: a HUMAN master walking through
+        // first (PlayerbotAI.cpp:160 registers it as a master-incoming packet),
+        // and the old TravelNode graph, which the NewRpg walk this module
+        // steers does not use.
+        //
+        // The id is taken rather than coordinates because the trigger table is
+        // then the single source of both WHERE to walk and WHAT to knock on,
+        // and the two cannot drift apart.
+        if (target.rfind("trigger:", 0) == 0)
+        {
+            std::istringstream in(target.substr(8));
+            uint32 id = 0;
+            if (!(in >> id) || !id)
+                return false;
+            AreaTrigger const* at = sObjectMgr->GetAreaTrigger(id);
+            if (!at)
+                return false;
+            // Same reasoning as the map check above: once through, the trigger
+            // is on a map this character has left, this refuses, and the
+            // caller's existing release path ends the errand.
+            if (!bot || bot->GetMapId() != at->map)
+                return false;
+            outEntry = 0;  // a doorway is not a creature
+            outPos = WorldPosition(at->map, at->x, at->y, at->z);
+            return true;
+        }
+
         BuildTravelIndex();
 
         uint32 wantedEntry = 0;
@@ -3608,6 +3654,56 @@ private:
         return false;
     }
 
+    // KNOCK ON THE DOOR THE CHARACTER HAS WALKED TO. Returns true ONLY if it
+    // actually went through, because that is the only thing the caller may read
+    // as the errand being finished.
+    //
+    // THIS IS NOT A TELEPORT THE MODULE PERFORMS, and the difference is the
+    // whole reason it is allowed to exist. It sends the packet a game client
+    // would have sent on touching the trigger, to the handler that would have
+    // received it - the same two lines upstream's own AreaTriggerAction.cpp
+    // uses. That handler re-checks IsInAreaTriggerRadius (MiscHandler.cpp:716)
+    // and refuses a character not genuinely standing in the trigger, so nothing
+    // here can move a character that has not walked to the door on its own legs.
+    // The check is the server's, not ours, which is what makes it trustworthy.
+    bool StepThroughAreaTrigger(std::string const& name, Player* bot,
+                                std::string const& target)
+    {
+        if (target.rfind("trigger:", 0) != 0)
+            return false;
+
+        std::istringstream in(target.substr(8));
+        uint32 id = 0;
+        if (!(in >> id) || !id)
+            return false;
+
+        // A trigger with no teleport attached is a place, not a doorway. There
+        // is nothing to step through and the walk was the whole errand, so this
+        // says so rather than claiming a crossing that did not happen.
+        if (!sObjectMgr->GetAreaTriggerTeleport(id))
+            return false;
+
+        uint32 const before = bot->GetMapId();
+
+        WorldPacket packet(CMSG_AREATRIGGER);
+        packet << id;
+        packet.rpos(0);
+        bot->GetSession()->HandleAreaTriggerOpcode(packet);
+
+        if (bot->GetMapId() == before)
+            // Refused, and the ordinary reason is the last few yards: this
+            // module calls a character arrived at TRAVEL_ARRIVED_YARDS, which
+            // is wider than most trigger radii - the Deadmines portal's is 7
+            // against an arrival of 12. Not an error, and NOT the end of the
+            // errand. The caller keeps walking and knocks again next poll.
+            return false;
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' walked into area trigger {} and is now on map {}",
+                 name, id, static_cast<uint32>(bot->GetMapId()));
+        return true;
+    }
+
     // Give the errand back. THE ONE TERMINAL PATH - every release in DriveTravel
     // goes through here, which is why it does three things and not one.
     //
@@ -3776,6 +3872,16 @@ private:
                 entry ? TRAVEL_ARRIVED_YARDS : TRAVEL_ARRIVED_POSITION_YARDS;
             if (distance <= arriveWithin)
             {
+                // A DOORWAY IS ANSWERED FIRST, because for a `trigger:` aim
+                // going through IS the errand and everything below is about
+                // errands that end where the character is standing.
+                bool const doorway = target.rfind("trigger:", 0) == 0;
+                if (doorway && StepThroughAreaTrigger(name, bot, target))
+                {
+                    ClearTravelAim(name);
+                    continue;
+                }
+
                 // ARRIVING IS NO LONGER THE WHOLE ERRAND (infra#2757). Where
                 // the roster has asked this character to learn a trade, the
                 // errand is finished when it has been LEARNED - or when it is
@@ -3783,7 +3889,18 @@ private:
                 // that question and nothing else; a character with no learn
                 // aim gets `true` on its first line and this reads as it
                 // always did.
-                if (plan && !TrainOnArrival(name, bot, entry, *plan))
+                if (doorway)
+                {
+                    // INSIDE ARRIVAL RANGE BUT NOT THROUGH THE DOOR, which for
+                    // a portal is the normal last step rather than a fault: the
+                    // arrival radius is wider than the trigger's. Deliberately
+                    // NOT released and deliberately not `continue`, so the walk
+                    // below carries the character the last few yards in. The
+                    // backstop still bounds it, and now bounds the right thing:
+                    // a character that has stopped getting nearer to a door it
+                    // cannot open is exactly what it is for.
+                }
+                else if (plan && !TrainOnArrival(name, bot, entry, *plan))
                 {
                     // NOT RELEASED, AND DELIBERATELY NOT `continue`. Falling
                     // through reaches the re-issue guard below, which renews
