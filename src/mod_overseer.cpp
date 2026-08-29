@@ -1807,6 +1807,55 @@ private:
                          "overseer: '{}' leads, so he follows nobody", leader->GetName());
                 leaderAI->SetMaster(nullptr);
             }
+
+            // AND THE LEADER MUST ACTUALLY CARRY `new rpg`, BECAUSE NOTHING
+            // ELSE IN THE WORLD EVER GRANTS IT TO THIS FAMILY.
+            //
+            // This file states the invariant in three places - "exactly one
+            // character carries `new rpg`, and it is the group leader" - and
+            // then says, correctly, "Nothing below hands `new rpg` to
+            // anybody". The invariant was ASSUMED to be established by
+            // upstream. It is not, and cannot be: AiFactory.cpp:615 is the
+            // ONLY site that ever adds "new rpg", and it sits inside
+            // `if ((sRandomPlayerbotMgr.IsRandomBot(player)) && ...)` opened
+            // at AiFactory.cpp:591. The family are roster characters on real
+            // accounts, not random bots, so that gate is false for all five
+            // forever - INCLUDING the leader. Zero characters carry it, not
+            // one, and the invariant this epic depends on has never once held.
+            //
+            // The failure is silent and looks exactly like success, which is
+            // why it survived so long: `rpgInfo.ChangeToDoQuest()` sets the
+            // STATUS and logs "now working quest N", but only the `new rpg`
+            // STRATEGY runs NewRpgAction, the thing that reads that status and
+            // walks the character to the objective. Status set, nothing
+            // executing it, a confident log line, and five characters standing
+            // in a field (infra#2795 / mod-overseer#29).
+            //
+            // MEASURED, not reasoned: the family stood motionless at
+            // (-8950, -132.5) in Elwynn for over an hour holding actionable
+            // quests - several already COMPLETE and needing only the walk back
+            // to a giver - across a full worldserver restart and a fresh quest
+            // aim. One `nc +new rpg` to the leader and they were moving within
+            // fifteen seconds, the other four following him.
+            //
+            // Granted like `follow` below and for the same reason: checked
+            // every poll rather than once, because a strategy that goes
+            // missing under a leader that is otherwise correct is precisely
+            // the silently-inert case. WARN rather than INFO because reaching
+            // here means the character could not have been questing.
+            //
+            // A HUMAN AT THE KEYBOARD IS LEFT ALONE, same test the master
+            // assignment above uses: a selfbot's own strategy list is the
+            // player's business.
+            if (!leaderAI->HasGameClientMaster() &&
+                !leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' leads but did not carry `new rpg` - granting it, "
+                         "because a quest status nothing executes is a character standing "
+                         "in a field", leader->GetName());
+                leaderAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+            }
         }
 
         for (Player* p : present)
