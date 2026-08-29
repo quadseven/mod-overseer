@@ -154,6 +154,23 @@ two-handed axe she can never equip. Both roll sites now greed on it instead.
 Originated and proven compiling in the public `quadseven/mod-overseer` repo
 before landing here.
 
+**`mod-playerbots/0010-quest-poi-unloaded-grid-is-not-a-bad-poi.patch` fixes
+upstream behaviour, same category as 0001-0004 and 0006-0008** - dropping it
+costs the fix but the build still compiles clean. A quest whose turn-in lies
+in another zone was rejected outright, and the reason was not the distance cap
+0003 already raised: the height lookup at the destination returned the
+invalid-height sentinel, because a grid nobody has ever stood on is not paged
+in and cannot answer for its own terrain. The rejection was circular - the
+character could not travel there because the height was unknown, and the
+height was unknown because nothing had travelled there. Confirmed live rather
+than reasoned: a probe logged `POI reject: BAD-HEIGHT dz=-100000.0 at
+(-10499,-1158) dist=1843` every twenty seconds for hours while the nearest
+character sat 1,897 yards away. The fix forgives an unanswerable height ONLY
+when `IsGridLoaded()` is false, so a loaded grid reporting a bad height is
+still rejected exactly as before; it is safe because the POI struct carries
+only x and y, so nothing downstream ever wanted that z. Cross-zone turn-ins
+began completing within minutes of deploying it.
+
 **`mod-playerbots/0012-an-aimed-wander-may-name-a-place.patch` fixes upstream
 behaviour, same category as 0001-0004 and 0006-0008, 0010** - dropping it costs
 the fix but the build still compiles clean. Nothing could put a party inside a
