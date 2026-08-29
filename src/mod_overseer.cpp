@@ -245,6 +245,35 @@ constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
 // finished from across the room.
 constexpr float TRAVEL_ARRIVED_YARDS = 12.0f;
 
+// The same question for an aimed POSITION, and it needs a different answer.
+// Everything above reasons about a creature: the slack exists because the
+// spawn point is not where the creature is standing. A position does not
+// patrol. Nothing about it justifies twelve yards, and one thing forbids it -
+// the object most often standing on an aimed position is an instance
+// areatrigger, and those are SMALLER than the tolerance meant to reach them:
+//
+//     areatrigger 78   (-11208.5, 1685.34, 25.7612)   radius 7   DeadMines
+//
+// Arriving within 12 yards of a 7 yard trigger is arriving OUTSIDE it. The
+// errand then completes as a SUCCESS, the quest drive resumes, and the
+// character walks away from a door it was touching. Measured live on the dev
+// world, and it reads as a clean run in the log, which is why it survived so
+// long:
+//
+//     15:41:43  'Ugga' sent to 'at:0:-11208.5,1685.34,25.76' - creature 0 at 2391 yards
+//     15:47:28  'Ugga' reached 'at:0:-11208.5,1685.34,25.76' - errand done, releasing
+//     15:48:13  'Ugga' is off its travel errand - the quest drive picks up again
+//
+// The walk was never the problem. 2391 yards were covered without incident,
+// and the aim was the trigger's own coordinate to the decimal. Six minutes
+// after "arriving" she was over a thousand yards away and gathering again.
+//
+// Five yards, because it must be strictly inside the smallest trigger this is
+// aimed at (7) while staying reachable by a path that ends on a doorstep.
+// INTERACTION_DISTANCE is the same 5.0 and is the game's own answer to "close
+// enough to act on a thing", which is exactly the question here.
+constexpr float TRAVEL_ARRIVED_POSITION_YARDS = 5.0f;
+
 // How long a character may be sent somewhere before the errand is given up on.
 // The primary release is ARRIVING; this is the backstop for a target that
 // cannot be reached at all - the far side of an ocean, inside an instance, a
@@ -3740,7 +3769,12 @@ private:
             // Distance can be, and it is the thing the errand actually means.
             float const distance =
                 bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY());
-            if (distance <= TRAVEL_ARRIVED_YARDS)
+            // `entry` is zero for an `at:<map>:<x>,<y>,<z>` aim and non-zero
+            // for a creature, which is the whole distinction the two
+            // tolerances are about - see TRAVEL_ARRIVED_POSITION_YARDS.
+            float const arriveWithin =
+                entry ? TRAVEL_ARRIVED_YARDS : TRAVEL_ARRIVED_POSITION_YARDS;
+            if (distance <= arriveWithin)
             {
                 // ARRIVING IS NO LONGER THE WHOLE ERRAND (infra#2757). Where
                 // the roster has asked this character to learn a trade, the
