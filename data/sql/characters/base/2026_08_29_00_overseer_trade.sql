@@ -1,0 +1,78 @@
+-- Hand an item from one family member to another through a REAL trade, the
+-- way two players do it, instead of a database move (mod-overseer#14).
+--
+-- WHY THIS EXISTS WHEN kind='give' ALREADY WORKS. `give` moves the item
+-- correctly and atomically, and it stays. What it cannot do is HAPPEN in the
+-- world: it is three database writes, so nothing renders, nothing animates,
+-- and a camera pointed at either character sees an item appear in a bag with
+-- no cause. The operator asked to watch the family trade with each other, and
+-- a transaction is not something you can watch. #14's own acceptance criteria
+-- already said the item must move "in the world, not a DB UPDATE teleporting
+-- it"; this is that.
+--
+-- WHY THE MODULE AUTHOR RULED THIS OUT, AND WHY IT IS NOW REACHABLE. The note
+-- above DoGive is correct about mod-playerbots: its trade chat command targets
+-- the bot's master and nothing else (TradeAction.cpp:26-38), and
+-- TradeStatusAction::CheckTrade takes a bot-to-bot branch whenever the master
+-- is not a real player (TradeStatusAction.cpp:165-200), which a selfbot never
+-- is (PlayerbotAI::IsRealPlayer, PlayerbotAI.cpp:4389-4395). That branch will
+-- not accept a one-sided gift, so the window hangs open while the action
+-- reports success. All of that remains true and none of it is used here.
+--
+-- What was never ruled out is the CORE's own trade, which is a different
+-- machine entirely. Every handler on it is public on WorldSession
+-- (WorldSession.h:684 opens `public: // opcodes handlers`, the trade handlers
+-- are at :893-902), it operates on two Player pointers rather than on a
+-- client, and the two halves that matter ignore their packet argument
+-- outright - HandleAcceptTradeOpcode and HandleBeginTradeOpcode both take
+-- `WorldPacket& /*recvPacket*/` (TradeHandler.cpp:237, :692). Both characters
+-- are real Player objects on one worldserver, so the whole exchange is a
+-- sequence of ordinary calls:
+--
+--     HandleInitiateTradeOpcode   TradeHandler.cpp:721  builds both TradeData
+--     TradeData::SetItem          TradeData.cpp:54      public, no packet
+--     HandleAcceptTradeOpcode     TradeHandler.cpp:237  each side, in turn
+--
+-- The second accept is what completes it: the handler gates the exchange on
+-- `his_trade->IsAccepted()` (TradeHandler.cpp:340) and only then runs
+-- moveItems inside a CharacterDatabase transaction, deletes both TradeData,
+-- and reports status to both sessions. That is the core's own atomicity, not
+-- one this module had to invent.
+--
+-- ORDERING THAT IS NOT OPTIONAL. TradeData::SetItem clears the accepted flag
+-- on BOTH sides every time it is called (TradeData.cpp:64-65), so the item
+-- goes in before either accept. Reversing it produces a trade window that sits
+-- open forever - the exact failure this module exists to stop reporting as
+-- success.
+--
+-- WHAT THE CORE CHECKS, AND WHY THIS CHECKS IT FIRST ANYWAY. Initiate refuses
+-- for a dozen reasons (dead, stunned, in flight, logging out, wrong faction,
+-- under the level requirement, already trading, out of range) and every one of
+-- them is reported by sending a status packet to a session, which a module
+-- cannot read back. So each condition is tested here BEFORE the call, purely
+-- so the refusal can be named in `detail` and `result`. The core then tests
+-- them again and is the authority; this side is only there so an operator
+-- reading a row learns which wall was hit.
+--
+-- PROXIMITY IS THE REAL ONE, and it is not hypothetical. TRADE_DISTANCE is
+-- 11.11 yards (ObjectDefines.h:29). Measured on the dev family while writing
+-- this, the four followers stood 19.5, 19.5, 44.6 and 47.6 yards from the
+-- leader - a travelling group is normally NOT in trade range, so "too far
+-- apart" is the common refusal rather than an edge case, and deciding when
+-- two characters are close enough belongs to whatever schedules the trade.
+--
+-- Column re-use, no new columns, same shape as kind='give':
+--   target_name  the GIVER
+--   target_arg   the RECEIVER
+--   command      which item: `guid:<item_instance.guid>` or `entry:<id>`
+--   detail       short refusal reason, or empty on success
+--   result       JSON: outcome, reason, from, to, item guid/entry/name/count
+--
+-- ENUM values cannot be added by re-running the CREATE TABLE: the base file is
+-- `CREATE TABLE IF NOT EXISTS`, a no-op against an existing table, so the
+-- column keeps whatever value set it already has. It takes an explicit ALTER.
+-- (The same trap is documented on the 'give' and 'share' migrations; it has
+-- bitten this codebase more than once.)
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade')
+        NOT NULL DEFAULT 'bot';
