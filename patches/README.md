@@ -143,3 +143,13 @@ one bot motionless at 1/503 health, out of combat, for 20+ seconds straight
 before being killed again by the same creature. Like 0006, a straight
 upstream-behaviour fix - `mod-overseer` calls nothing this patch adds, so
 dropping it costs the retreat, not the compile.
+
+**`mod-playerbots/0008-bad-equip-is-a-greed-not-a-need.patch` fixes upstream
+behaviour, same category as 0001-0004, 0006 and 0007** - dropping it costs the
+fix but the build still compiles clean. `ITEM_USAGE_BAD_EQUIP` is the value
+`ItemUsageValue` returns when a bot has decided it should NOT equip an item,
+including when its CLASS cannot use it at all; `LootRollAction` listed it
+alongside EQUIP and REPLACE and voted NEED on it, which is why a priest won a
+two-handed axe she can never equip. Both roll sites now greed on it instead.
+Originated and proven compiling in the public `quadseven/mod-overseer` repo
+before landing here.
