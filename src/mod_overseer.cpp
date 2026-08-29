@@ -1485,6 +1485,11 @@ public:
             // block. Reuses this timer rather than adding a new one; there is
             // no reason this needs a different poll interval.
             DriveStuckRevival();
+            // Same cadence again, and after the revival drive on purpose: a
+            // character resurrected on this tick is alive by the time this one
+            // asks, so a party that just recovered from a wipe inside the
+            // instance is re-armed on the same pass rather than the next.
+            DriveDungeonClear();
         }
         // AFTER DriveTravel, on purpose. Both can run in the same tick, and
         // when they do the order that helps is travel first: a character that
@@ -4310,6 +4315,95 @@ private:
     // leader stayed dead longest of the five rather than being rescued.
     //
     // So this drive now covers the whole enabled roster.
+    // ARM THE DUNGEON MODULE, BECAUSE NOTHING ELSE EVER DOES.
+    //
+    // mod-dungeon-clear is built, pinned, loaded and configured. The worldserver
+    // says so at startup:
+    //
+    //     mod-dungeon-clear: registered DungeonClear contexts
+    //     (strategy/action/trigger/value) into all class registries
+    //
+    // and then it sits there. Registering a strategy is not enabling it. The
+    // module waits for `dc on`, and no code path in this module, in
+    // mod-playerbots, or anywhere else has ever issued it. The family has been
+    // walking into dungeons with ordinary open-world logic - no pull discipline,
+    // no room pre-clear, no boss handling - and losing, which reads from the
+    // outside as "the bots are bad at dungeons" when the dungeon brain was
+    // simply switched off.
+    //
+    // TWO FACTS SHAPE THIS DRIVE, both learned by hand before it existed.
+    //
+    // ONE: `dc on` IS REFUSED OUTSIDE AN INSTANCE. Issued at the portal it comes
+    // back accepted-and-inert - the command surface reports `delivered`, the
+    // result is null, and the strategy list is unchanged. So this cannot be done
+    // once at the start of a run; it has to happen after the character is
+    // actually inside, which is what IsDungeon() gates.
+    //
+    // TWO: IT DOES NOT SURVIVE A RESTART. Strategies live in the bot's engine,
+    // not in a table, so every worldserver bounce silently disarms the module
+    // and nothing re-applies it. That is why this is a DRIVE and not a one-shot:
+    // the HasStrategy check makes it idempotent while armed and self-healing
+    // after any restart, teardown, or relog.
+    //
+    // WHY THE CHAT COMMAND AND NOT ChangeStrategy DIRECTLY. `dc on` does more
+    // than add two strategies: it seeds the run's pull setting and camp through
+    // the module's own ApplyPullSetting. Adding the strategies by hand would
+    // produce a half-armed run whose state the module never initialised, which
+    // is a worse failure than not arming at all because it looks armed.
+    // HandleCommand is the same hand-off DeliverPendingCommands uses.
+    //
+    // NOT DISARMED ON THE WAY OUT, deliberately. Leaving an instance is not the
+    // same as ending a run - a wipe puts the party outside at a graveyard with
+    // the run still meaningfully in progress - and the module's own `dc` verbs
+    // own that lifecycle. This drive only ever turns the brain ON.
+    void DriveDungeonClear()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+
+            // SteerableAI, not a bare lookup - a name can resolve to a Player
+            // mid-login or mid-teardown with a PlayerbotAI that is non-null
+            // right up until it is freed.
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            // A corpse cannot start a dungeon run, and the dead strategy set
+            // does not carry the dungeon contexts anyway.
+            if (!bot->IsAlive())
+                continue;
+
+            Map* map = bot->GetMap();
+            if (!map || !map->IsDungeon())
+                continue;
+
+            // Already armed. This is the line that makes the drive idempotent:
+            // once `dc on` has taken, every later poll stops here.
+            if (botAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
+                continue;
+
+            botAI->HandleCommand(CHAT_MSG_WHISPER, "dc on", bot);
+
+            // SAID ON EVERY ATTEMPT, NOT ONCE. If the command takes, the
+            // HasStrategy check above silences this on the next poll and the
+            // line appears exactly once per run. If it keeps appearing, the
+            // command is being refused for a reason nobody has found yet, and a
+            // repeating line is how that becomes visible instead of a dungeon
+            // brain that is quietly off.
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is inside map {} and the dungeon clear was not "
+                     "armed - issuing 'dc on'",
+                     name, static_cast<uint32>(bot->GetMapId()));
+        } while (result->NextRow());
+    }
+
     void DriveStuckRevival()
     {
         QueryResult result = CharacterDatabase.Query(
