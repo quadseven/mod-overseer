@@ -252,6 +252,16 @@ constexpr float TRAVEL_ARRIVED_YARDS = 12.0f;
 // released merely because the lease lapsed, which is what renewal is for.
 constexpr time_t TRAVEL_BACKSTOP_SECONDS = 20 * 60;
 
+// How much nearer a character must get before the backstop above accepts that
+// the errand is working and starts its clock again. Compared against the
+// CLOSEST the character has ever been on this errand, not against the previous
+// poll, which is what makes a small number safe here: the best distance only
+// ratchets downward, so a bot circling or jammed against scenery cannot keep
+// beating it, while a bot actually walking beats it every poll. Wide enough to
+// clear the jitter of a bot that has stopped, narrow enough to be nothing next
+// to a real journey.
+constexpr float TRAVEL_PROGRESS_YARDS = 10.0f;
+
 // How long travel keeps the wheel after an errand ends (PR #2840 review).
 // OnUpdate runs DriveQuests BEFORE DriveTravel, so without a grace the poll
 // that releases an arrived errand can be followed immediately by a
@@ -3665,6 +3675,7 @@ private:
                 state.entry = 0;
                 state.pinned = false;
                 state.arrived = false;
+                state.closest = 0.f;
             }
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -3727,7 +3738,9 @@ private:
             // NewRpgAction.h:99), so the bot's state stops naming the target
             // almost immediately and cannot be asked "did you get there".
             // Distance can be, and it is the thing the errand actually means.
-            if (bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()) <= TRAVEL_ARRIVED_YARDS)
+            float const distance =
+                bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY());
+            if (distance <= TRAVEL_ARRIVED_YARDS)
             {
                 // ARRIVING IS NO LONGER THE WHOLE ERRAND (infra#2757). Where
                 // the roster has asked this character to learn a trade, the
@@ -3772,14 +3785,44 @@ private:
                 }
             }
 
+            // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63). The backstop below
+            // exists to catch a character STANDING STILL, and it used to
+            // approximate that as "taking a while" - which is a different thing,
+            // and wrong in the one case that matters most. Measured on the dev
+            // world: a character aimed at the Deadmines portal from Elwynn was
+            // released 586 yards short, having walked 2347 of 2933 yards at 112
+            // yards a minute, about five minutes from arriving. It was released
+            // as UNREACHABLE while it was visibly reaching it, and the log said
+            // so in those words. Nothing was stuck; the journey was simply
+            // longer than a constant that had only ever been asked about
+            // trainers in the same city.
+            //
+            // So ask the question the backstop is actually for. `closest` only
+            // ever ratchets DOWNWARD, so beating it means the character has got
+            // nearer than it has ever been on this errand - which no bot jammed
+            // against scenery, circling, or standing in a field can keep doing,
+            // and which a walking bot does on every poll. A target that truly
+            // cannot be reached still gets released: the character closes to
+            // whatever range it can manage, stops improving, and the clock then
+            // runs out undisturbed. The bound is on being stuck, where it
+            // belongs, rather than on distance.
+            if (!state.closest || distance < state.closest - TRAVEL_PROGRESS_YARDS)
+            {
+                state.closest = distance;
+                state.since = std::time(nullptr);
+            }
+
             // BACKSTOP. An errand that can never land must not pin a character
             // to it forever - that is a character standing still, which is the
             // state this whole epic exists to stop mistaking for a working one.
+            // Read with the progress check above: "since" now means since the
+            // character last got nearer, not since the errand was issued.
             if (state.since && std::time(nullptr) - state.since > TRAVEL_BACKSTOP_SECONDS)
             {
                 LOG_INFO("module.overseer",
-                         "overseer: '{}' was sent to '{}' over {} minutes ago and never "
-                         "arrived - releasing the errand as unreachable", name, target,
+                         "overseer: '{}' was sent to '{}' and has not got any nearer "
+                         "than {} yards for {} minutes - releasing the errand as "
+                         "unreachable", name, target, static_cast<uint32>(state.closest),
                          static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
                 ClearTravelAim(name);
                 continue;
@@ -6433,6 +6476,10 @@ private:
         float y{0.f};
         float z{0.f};
         bool arrived{false};  // announced already
+        // The nearest this character has ever been to this errand's target, and
+        // 0 while it has not been measured yet. The backstop's memory of whether
+        // the walk is going anywhere - see the progress check in DriveTravel.
+        float closest{0.f};
     };
     std::map<std::string, TravelState> _travelState;
 
