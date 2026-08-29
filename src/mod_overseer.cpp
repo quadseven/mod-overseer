@@ -2909,6 +2909,40 @@ private:
                              uint32& outEntry, WorldPosition& outPos,
                              uint32 wantSkill = 0)
     {
+        // A PLACE, NOT A CREATURE: `at:<map>:<x>,<y>,<z>`. Answered before the
+        // NPC index is even built, because no spawn is involved - the aim names
+        // ground. This is what lets a party reach an instance portal, which is
+        // an areatrigger and so has no entry to name; see the mod-playerbots
+        // patch that lets an aimed wander carry a position with no entry.
+        //
+        // THE MAP IS PART OF THE AIM, and refusing when it does not match is
+        // what ENDS the errand rather than a special case that has to know
+        // about portals. Walk onto a portal and the trigger changes your map
+        // mid-walk; on the next poll this returns false, and the caller's
+        // existing release path clears the aim exactly as it would for a spawn
+        // that is no longer there. Arriving and being teleported away are the
+        // same observable event from here, and both mean the errand is over.
+        if (target.rfind("at:", 0) == 0)
+        {
+            // Parsed with the stream the file already includes rather than
+            // sscanf, which would need a header this translation unit does not
+            // pull in - and the separators are checked rather than assumed, so
+            // a malformed aim is refused instead of silently reaching a
+            // half-parsed coordinate.
+            std::istringstream in(target.substr(3));
+            uint32 m = 0;
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            char c1 = 0, c2 = 0, c3 = 0;
+            if (!(in >> m >> c1 >> x >> c2 >> y >> c3 >> z) ||
+                c1 != ':' || c2 != ',' || c3 != ',')
+                return false;
+            if (!bot || bot->GetMapId() != m)
+                return false;
+            outEntry = 0;  // deliberately: the walk is the whole errand
+            outPos = WorldPosition(m, x, y, z);
+            return true;
+        }
+
         BuildTravelIndex();
 
         uint32 wantedEntry = 0;
