@@ -1,0 +1,120 @@
+Subject: [PATCH] a bot needs on loot it has already decided it cannot equip
+
+WHY THIS PATCH EXISTS
+
+The requirement recorded in mod-overseer#10, paraphrased: a bot should greed
+on what is merely useful and need only when the item is genuinely a need for
+that character. The proven counter-example, from a real drop: a green two-handed Severing Axe rolled, and
+UGGA THE PRIEST won it with a NEED roll. She can never equip a two-handed axe.
+It has sat in her bags ever since (mod-overseer#14 counts seven such weapons).
+
+That is not a scoring near-miss or a talent-weighting subtlety. The bot had
+ALREADY correctly worked out it could not use the item, and the loot code threw
+that answer away.
+
+THE MECHANISM, TRACED AT THIS PIN
+
+ItemUsageValue::QueryItemUsageForEquip (src/Ai/Base/Value/ItemUsageValue.cpp)
+decides equippability BY CLASS before it scores anything:
+
+    if (itemProto->Class == ITEM_CLASS_WEAPON &&
+        !sRandomItemMgr.CanEquipWeapon(itemProto, bot->getClass()))
+        shouldEquip = false;                                       (~line 235)
+
+A priest offered a two-handed axe lands here: shouldEquip = false. The very
+next block turns that into a return value:
+
+    Item* oldItem = bot->GetItemByPos(dest + i);
+    if (!oldItem)
+    {
+        if (shouldEquipInSlot)  return ITEM_USAGE_EQUIP;
+        else                    return ITEM_USAGE_BAD_EQUIP;       (~line 297)
+    }
+
+So ITEM_USAGE_BAD_EQUIP is the value that means "this bot should NOT equip
+this item" - and it covers BOTH "wrong class entirely" and "equippable but
+does not clear equipUpgradeThreshold". Every other consumer treats it that
+way; BuyAction, for one, groups it with BROKEN_EQUIP.
+
+LootRollAction did not:
+
+    case ITEM_CLASS_WEAPON:
+    case ITEM_CLASS_ARMOR:
+        if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE ||
+            usage == ITEM_USAGE_BAD_EQUIP)
+            vote = NEED;                                           (line 67)
+
+BAD_EQUIP - the "I cannot use this" answer - voted NEED. LootRollAction::
+CalculateRollVote had the identical bug, listing ITEM_USAGE_BAD_EQUIP in the
+same case group as EQUIP and REPLACE (line 127).
+
+THE FIX
+
+Both sites now treat BAD_EQUIP as GREED. In Execute() removing it from the
+NEED condition is sufficient: BAD_EQUIP != ITEM_USAGE_NONE, so it falls to the
+existing `else if (usage != ITEM_USAGE_NONE) vote = GREED;` on the next line.
+In CalculateRollVote it moves into the GREED case group.
+
+This is exactly mod-overseer#10's stated rule - NEED is equippable AND an
+upgrade, GREED is everything else - and it makes the Severing Axe test in
+mod-overseer#14 pass: the axe becomes a greed for Ugga, so it goes to whoever
+greeds highest instead of being locked behind a need she should never have won.
+
+WHAT IT DELIBERATELY DOES NOT CHANGE
+
+An item in an EMPTY slot that the bot's class CAN equip but that the stat
+calculator scores at zero also returns BAD_EQUIP, and now greeds rather than
+needs. That is correct under #10's rule (a zero-weight item is not a need) and
+it still gets won - GREED is a real roll, not a pass, while LootGreedRollLevel
+is 1, which is what this realm runs.
+
+RollAction::Execute (line ~240) has the same three-way test but only calls
+DoRandomRoll for a /roll link a human asked for. Left alone on purpose - it is
+not a group loot vote and needs its own decision.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream making BAD_EQUIP not a NEED in LootRollAction, or splitting the enum
+so "wrong class" and "equippable but not an upgrade" stop sharing one value.
+
+APPLIES TO
+
+mod-playerbots @ 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312, on top of local
+patches 0001-0007. Touches only LootRollAction::Execute and
+LootRollAction::CalculateRollVote.
+
+diff --git a/src/Ai/Base/Actions/LootRollAction.cpp b/src/Ai/Base/Actions/LootRollAction.cpp
+index fd0674ca..4737d63f 100644
+--- a/src/Ai/Base/Actions/LootRollAction.cpp
++++ b/src/Ai/Base/Actions/LootRollAction.cpp
+@@ -64,7 +64,16 @@ bool LootRollAction::Execute(Event /*event*/)
+             {
+                 case ITEM_CLASS_WEAPON:
+                 case ITEM_CLASS_ARMOR:
+-                    if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE || usage == ITEM_USAGE_BAD_EQUIP)
++                    // infra: BAD_EQUIP is deliberately NOT a NEED. It is the
++                    // value ItemUsageValue returns when the bot has already
++                    // decided it should NOT equip this - including when
++                    // CanEquipWeapon/CanEquipArmor says its CLASS cannot use
++                    // the item at all (ItemUsageValue.cpp sets shouldEquip =
++                    // false there, and an empty slot then falls straight to
++                    // BAD_EQUIP). Needing on it threw that verdict away and
++                    // is why a priest won a two-handed axe she can never
++                    // equip. It still GREEDs, via the branch below.
++                    if (usage == ITEM_USAGE_EQUIP || usage == ITEM_USAGE_REPLACE)
+                         vote = NEED;
+                     else if (usage != ITEM_USAGE_NONE)
+                         vote = GREED;
+@@ -124,9 +133,11 @@ RollVote LootRollAction::CalculateRollVote(ItemTemplate const* proto, ItemUsage
+         case ITEM_USAGE_EQUIP:
+         case ITEM_USAGE_REPLACE:
+         case ITEM_USAGE_GUILD_TASK:
+-        case ITEM_USAGE_BAD_EQUIP:
+             needVote = NEED;
+             break;
++        // infra: same rule as Execute() above - BAD_EQUIP means the bot
++        // itself decided not to equip this, so it greeds rather than needs.
++        case ITEM_USAGE_BAD_EQUIP:
+         case ITEM_USAGE_SKILL:
+         case ITEM_USAGE_USE:
+         case ITEM_USAGE_AH:
