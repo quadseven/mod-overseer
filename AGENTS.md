@@ -117,6 +117,23 @@ beyond the README and an example config file to know what to change.
 None of this is policy. It is the set of mistakes that have actually been
 made here, written down so they are made once.
 
+### Always fix the code. Never reach for an admin shortcut.
+
+When characters are stuck, an operator-level command will almost always unstick
+them faster than a patch will. Do not use it. A GM revive, a GM teleport, a hand
+edit of a row the server owns - each one removes the evidence that something is
+broken and buys a few minutes at the cost of the fix.
+
+This is the standing instruction from the operator, and it has already paid for
+itself: characters wedged as ghosts after a wipe looked like a case for a
+one-off revive, and chasing the code instead found that `Player::GetCorpse()` is
+map-scoped, so every character that releases out of an instance was invisible to
+the recovery drive and skipped forever. A revive would have cleared the symptom
+and left that in place for every future wipe.
+
+The corollary is that "stuck" is a bug report, not an inconvenience. Measure it,
+find the line, and change the line.
+
 ### `delivered` is not `done`. Read the world back.
 
 The command surface reports that a command reached a character, not that
