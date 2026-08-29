@@ -2,9 +2,9 @@ Subject: [PATCH] a bot needs on loot it has already decided it cannot equip
 
 WHY THIS PATCH EXISTS
 
-The operator's ask, in his words: "They should greed roll on things that are
-greed and need on others when it's truly a need" (mod-overseer#10). The proven
-counter-example, from a real drop: a green two-handed Severing Axe rolled, and
+The requirement recorded in mod-overseer#10, paraphrased: a bot should greed
+on what is merely useful and need only when the item is genuinely a need for
+that character. The proven counter-example, from a real drop: a green two-handed Severing Axe rolled, and
 UGGA THE PRIEST won it with a NEED roll. She can never equip a two-handed axe.
 It has sat in her bags ever since (mod-overseer#14 counts seven such weapons).
 
