@@ -4638,10 +4638,29 @@ private:
             if (!bot->IsAlive())
                 continue;
 
-            // The same predicate the other drives stand down on, read the
-            // other way round: this is the one drive that acts BECAUSE a run
-            // is in progress.
-            if (!InDungeonRun(bot))
+            // GEOGRAPHY, NOT THE RUN. THIS DRIVE CANNOT WAIT FOR ITS OWN
+            // PRECONDITION.
+            //
+            // This read `InDungeonRun(bot)` for one release, and that was a
+            // deadlock. InDungeonRun requires an open run row; this drive is
+            // the only thing that opens one. So no run existed, the drive
+            // skipped, the run was never created, and it skipped again forever.
+            // Measured live: four characters standing inside an instance and
+            // zero rows in overseer_dungeon_run, indefinitely.
+            //
+            // It is the same failure class the run record was introduced to end
+            // - a guard whose condition can never become true - reintroduced
+            // while refactoring the guards that came before it. The lesson is
+            // narrow and worth stating: a component that CREATES a state may
+            // never gate itself on that state existing.
+            //
+            // So this one drive keeps asking the map. Being on an instance map
+            // is what makes a run possible, and this is the drive whose job is
+            // to turn possible into real. Every OTHER drive still asks
+            // InDungeonRun, because for them the run genuinely is the
+            // precondition.
+            Map* map = bot->GetMap();
+            if (!map || !map->IsDungeon())
                 continue;
 
             // Already armed. This is the line that makes the drive idempotent:
