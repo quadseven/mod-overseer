@@ -4663,16 +4663,36 @@ private:
             if (!map || !map->IsDungeon())
                 continue;
 
-            // Already armed. This is the line that makes the drive idempotent:
-            // once `dc on` has taken, every later poll stops here.
+            // THE HEARTBEAT IS TOUCHED FOR EVERY CHARACTER SEEN INSIDE,
+            // BEFORE ANY OTHER DECISION, AND THAT ORDER IS THE WHOLE POINT.
+            //
+            // This call used to sit BELOW the already-armed check, and that was
+            // a bug the world found in fourteen minutes. Arming happens at most
+            // once per character per run - the check right below exists to make
+            // sure of it - so a heartbeat written only on the arming path is
+            // written once and then never again. It went cold 120 seconds
+            // later, the run closed as abandoned with three characters standing
+            // inside it, and every drive resumed steering people in a dungeon:
+            //
+            //     id 1  map 36  ended  "heartbeat cold - nobody from the
+            //                           roster seen on the map"
+            //     Bork map 36  Grug map 36  Ugga map 36
+            //
+            // The lesson is about what the signal MEANS. `last_progress_at`
+            // answers "when was somebody last seen in here", so it belongs to
+            // being seen, not to being armed. Anything conditional on work
+            // still being needed is the wrong place for a liveness signal,
+            // because liveness outlives the work.
+            //
+            // Opening also stays here rather than below: by the time anything
+            // is steering, the thing that owns the steering already exists.
+            OpenOrTouchRun(name, bot->GetMapId());
+
+            // Already armed. This is the line that makes the ARMING idempotent:
+            // once `dc on` has taken, every later poll stops here. It must stay
+            // below the heartbeat, for the reason above.
             if (botAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
                 continue;
-
-            // The run is opened BEFORE the module is armed, so that by the
-            // time anything is steering, the thing that owns the steering
-            // already exists. The other order leaves a window where a character
-            // is armed but unowned.
-            OpenOrTouchRun(name, bot->GetMapId());
 
             botAI->HandleCommand(CHAT_MSG_WHISPER, "dc on", bot);
 
