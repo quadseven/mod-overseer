@@ -3730,21 +3730,37 @@ private:
             return true;
         }
 
-        if (bot->HasSkill(skill))
-        {
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' already has {} ({}) - nothing to learn", name,
-                     skillName, skill);
-            ClearLearnAim(name);
-            return true;
-        }
+        // NOT A SHORTCUT ANY MORE. This used to read "bot->HasSkill(skill) means
+        // done" and clear the errand right here - correct for a brand-new
+        // profession, wrong for #74: characters already HOLD herbalism, capped
+        // at Apprentice (75), standing next to nodes that need up to 120.
+        // Holding a skill and holding it AT ITS CEILING are different facts,
+        // and only a trainer selling the next tier tells them apart. So a
+        // character who already has this skill is not finished here - it falls
+        // through to the same trainer lookup a first-time learner uses, and
+        // TrainerSpellForSkill (by way of Trainer::CanTeachSpell and
+        // GetSpellState's chain check, Trainer.cpp:187-189) is what already
+        // knows whether Journeyman/Expert/Artisan/Master is the spell this
+        // trainer would sell this character next - or that none is, either
+        // because the ceiling has not actually been reached yet or because
+        // this trainer's highest tier is the one already held.
+        bool const alreadyHasSkill = bot->HasSkill(skill);
 
-        // BOTH SLOTS STILL FULL. Not an error and not a refusal - it is the
-        // errand arriving in the wrong order, and the unlearn drive runs on its
-        // own poll. Staying put is the right answer: walking away from the
-        // trainer and coming back is a five-minute round trip for a condition
-        // that clears in thirty seconds.
-        if (!bot->GetFreePrimaryProfessionPoints())
+        // BOTH SLOTS STILL FULL. Only an ACQUISITION needs one -
+        // Trainer::CanTeachSpell checks GetFreePrimaryProfessionPoints solely
+        // for a spell whose effect is SPELL_EFFECT_LEARN_SPELL triggering a
+        // first-rank spell (Trainer.cpp:141-149), which is what STARTING a
+        // profession looks like. A tier-up spell (Journeyman Herbalism and
+        // the like) sets the skill directly and carries no such effect, so it
+        // costs no slot and must not wait on one - a character raising a
+        // skill it already holds would otherwise wait here forever behind two
+        // professions it has no intention of dropping. Not an error and not a
+        // refusal for the acquisition case either - it is the errand arriving
+        // in the wrong order, and the unlearn drive runs on its own poll.
+        // Staying put is the right answer: walking away from the trainer and
+        // coming back is a five-minute round trip for a condition that clears
+        // in thirty seconds.
+        if (!alreadyHasSkill && !bot->GetFreePrimaryProfessionPoints())
         {
             LOG_INFO("module.overseer",
                      "overseer: '{}' is at the trainer for {} ({}) but holds two primary "
@@ -3794,6 +3810,10 @@ private:
                  "overseer: '{}' is buying {} ({}) from '{}' (creature {}, spell {})",
                  name, skillName, skill, npc->GetName(), entry, spellId);
 
+        // Read before the purchase too, so the read-back below has something
+        // to compare against - see the comment on `succeeded`.
+        uint32 const maxBefore = static_cast<uint32>(bot->GetPureMaxSkillValue(skill));
+
         trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
 
         // THE READ-BACK, and it is the whole point of the exercise. TeachSpell
@@ -3801,7 +3821,16 @@ private:
         // has anybody to show it to (Trainer.cpp:88-108). So the only way to
         // know whether a character learned a trade is to ask the character. A
         // `delivered` here would mean nothing at all.
-        if (!bot->HasSkill(skill))
+        //
+        // HasSkill ALONE ANSWERS THE WRONG QUESTION for a character raising a
+        // skill it already holds: HasSkill is true before this purchase and
+        // still true after a purchase that failed, so it would report success
+        // on a sale that changed nothing. The fact that actually moves when
+        // this succeeds is the ceiling, so that is what gets compared.
+        bool const succeeded = alreadyHasSkill
+            ? static_cast<uint32>(bot->GetPureMaxSkillValue(skill)) > maxBefore
+            : bot->HasSkill(skill);
+        if (!succeeded)
         {
             LOG_WARN("module.overseer",
                      "overseer: '{}' was not taught {} ({}) by '{}'. TeachSpell reports its "
@@ -3813,13 +3842,15 @@ private:
         }
 
         LOG_INFO("module.overseer",
-                 "overseer: '{}' LEARNED {} ({}) at {}/{} from '{}' - taught by a trainer it "
+                 "overseer: '{}' {} {} ({}) at {}/{} from '{}' - taught by a trainer it "
                  "was sent to, not granted out of thin air",
-                 name, skillName, skill,
+                 name, alreadyHasSkill ? "RAISED THE CAP ON" : "LEARNED", skillName, skill,
                  static_cast<uint32>(bot->GetPureSkillValue(skill)),
                  static_cast<uint32>(bot->GetPureMaxSkillValue(skill)), npc->GetName());
         RecordEvent(bot, "learn", skill, skillName,
-                    "learned this profession from a trainer it was sent to");
+                    alreadyHasSkill
+                        ? "trained the next tier of this skill from a trainer it was sent to"
+                        : "learned this profession from a trainer it was sent to");
         ClearLearnAim(name);
         return true;
     }
