@@ -317,6 +317,16 @@ constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
 // is well inside how long the walk to the trainer takes anyway.
 constexpr uint32 PROFESSION_POLL_MS = 30000;
 
+// How long a dungeon run's heartbeat may go cold before it is considered over.
+// The arming drive touches it on every pass while anyone from the roster is
+// inside, so a cold heartbeat means nobody has been seen in there.
+//
+// GENEROUS ON PURPOSE. Closing a run early re-opens the very stranding the run
+// record exists to prevent - every drive resumes steering a character who is
+// still inside an instance. Closing late costs only a finished row lingering,
+// which nothing suffers from. Two minutes is many arming passes.
+constexpr uint32 RUN_COLD_SECONDS = 120;
+
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
 // thirty-eight times in twelve minutes and travelled 0.0 yards, because its
@@ -2226,8 +2236,156 @@ private:
     {
         if (!bot)
             return false;
+
+        // GEOGRAPHY IS NECESSARY AND NOT SUFFICIENT. Being on an instance map
+        // is what makes a run POSSIBLE; an open run row is what makes one
+        // REAL. Slice 1 asked only the first question, and three independent
+        // reviews named the same defect: "a character can be in a dungeon
+        // without an active run, and this code will still stand down all
+        // drives even though no run exists to arbitrate."
+        //
+        // That mattered because a character inside with no run would have had
+        // every drive stand down on it and nothing pick it back up - the same
+        // stranding shape this drive family has produced four times. Ownership
+        // inferred from position produces a state nobody owns.
         Map* map = bot->GetMap();
-        return map && map->IsDungeon();
+        if (!map || !map->IsDungeon())
+            return false;
+
+        return ActiveRunOnMap(bot->GetMapId());
+    }
+
+    // Is a run open on this map? Cached for the length of a tick because every
+    // steering drive asks the same question about the same handful of
+    // characters, and the answer cannot change between two drives in one tick.
+    static bool ActiveRunOnMap(uint32 mapId)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT 1 FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} LIMIT 1",
+            mapId);
+        return result != nullptr;
+    }
+
+    // Open a run, or keep the open one alive. Called by the arming drive, which
+    // is the component that already notices a character is inside.
+    //
+    // ONE RUN PER MAP, not per character: the five of them share an instance and
+    // a run is the thing they share. A second character walking in joins the
+    // run that exists rather than starting a rival one.
+    static void OpenOrTouchRun(std::string const& leaderName, uint32 mapId)
+    {
+        // ONE STATEMENT, BECAUSE TWO WOULD BE A RACE. The first draft asked
+        // "is there an active run?" and inserted if not. A review caught it at
+        // once: two characters stepping through the portal in the same tick
+        // both see no run and both insert, and the one-run-per-map invariant
+        // this whole slice rests on is gone. A SELECT-then-INSERT is not a
+        // claim, it is a hope.
+        //
+        // The table carries a generated `active_map` column - the map id while
+        // active, NULL once ended - under a unique key. NULLs do not collide,
+        // so any number of finished runs may share a map while at most one live
+        // run ever can. This insert is therefore atomic in both directions: the
+        // winner opens the run, the loser touches its heartbeat, and neither
+        // needs to know which it was.
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_dungeon_run (leader_name, map_id, state) "
+            "VALUES ('{}', {}, 'active') "
+            "ON DUPLICATE KEY UPDATE last_progress_at = NOW()",
+            Esc(leaderName), mapId);
+
+        // SAYING WHICH IT WAS, WITHOUT ASKING THE INSERT. The statement above
+        // is deliberately atomic, which means it cannot report whether it
+        // opened a run or touched one - and losing the open from the log would
+        // be a real loss, because a run that begins silently is exactly as hard
+        // to reason about as one that ends silently.
+        //
+        // So it is read back rather than inferred: a row whose heartbeat has
+        // never moved off its own start time is one nobody had touched before
+        // this call. That is a query, but only on the arming path, which
+        // already only runs for a character that is inside and unarmed.
+        if (QueryResult opened = CharacterDatabase.Query(
+                "SELECT id FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} "
+                "AND last_progress_at = started_at LIMIT 1", mapId))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: opened dungeon run {} on map {} - '{}' is the first of "
+                     "the roster inside, so the run now owns whoever is in there",
+                     opened->Fetch()[0].Get<uint32>(), mapId, leaderName);
+        }
+    }
+
+    // Close any run whose map no longer holds a single roster character.
+    //
+    // SAID OUT LOUD, ALWAYS. A run that ends silently is indistinguishable from
+    // a run that is still open and doing nothing, and telling those two apart is
+    // the whole reason this table exists.
+    void CloseAbandonedRuns()
+    {
+        // CLOSED ON A COLD HEARTBEAT, NOT ON AN EMPTY ROOM.
+        //
+        // The first draft asked FindPlayerByName for each roster member and
+        // closed the run when none answered. Review caught the hole: that
+        // lookup finds players who are ONLINE, not players who are on the map.
+        // A character that walked in and then logged out is still in the
+        // instance, the lookup returns nothing, the run closes as abandoned,
+        // and when they come back a second run opens on a map that already had
+        // one - breaking the exact invariant this table exists to hold.
+        //
+        // The suggested remedy was to enumerate Map::GetPlayers() instead, but
+        // reaching a Map* means already having a player on it, which is the
+        // same question being asked. So the answer is not a better census.
+        //
+        // It is the heartbeat, which is already here. The arming drive touches
+        // last_progress_at on every pass while anyone from the roster is inside.
+        // A run whose heartbeat has gone cold is therefore one nobody has been
+        // seen in for a while - which covers an empty instance, a logged-out
+        // character, and a server that stopped ticking, without needing to tell
+        // those three apart.
+        //
+        // The grace period is generous on purpose. Closing early re-opens the
+        // stranding this slice exists to prevent; closing late costs only that
+        // a finished run lingers as a row, which nothing suffers from.
+        QueryResult runs = CharacterDatabase.Query(
+            "SELECT id, map_id, TIMESTAMPDIFF(SECOND, last_progress_at, NOW()) "
+            "FROM overseer_dungeon_run WHERE state = 'active' "
+            "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+            RUN_COLD_SECONDS);
+        if (!runs)
+            return;
+
+        do
+        {
+            Field* f = runs->Fetch();
+            uint32 const runId = f[0].Get<uint32>();
+            uint32 const mapId = f[1].Get<uint32>();
+            uint32 const coldFor = f[2].Get<uint32>();
+
+            // THE COLD CONDITION IS REPEATED IN THE UPDATE, DELIBERATELY.
+            //
+            // Selecting cold runs and then closing them by id alone is the same
+            // mistake as the SELECT-then-INSERT this file already fixed one
+            // function above, and it was made again here in the fix for that
+            // one: between the SELECT and this write, the arming drive can
+            // touch last_progress_at, and an id-only UPDATE would close a run
+            // that had just come back to life. That is a premature close, which
+            // is precisely the stranding this whole slice exists to prevent -
+            // every drive resumes steering a character who is still inside.
+            //
+            // Carrying the predicate into the write makes the close atomic with
+            // the decision to close. A run refreshed in that window simply is
+            // not matched, and the next pass will judge it fresh.
+            CharacterDatabase.Execute(
+                "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
+                "ended_reason = 'heartbeat cold - nobody from the roster seen on the map' "
+                "WHERE id = {} AND state = 'active' "
+                "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+                runId, RUN_COLD_SECONDS);
+
+            LOG_INFO("module.overseer",
+                     "overseer: closed dungeon run {} on map {} - its heartbeat had been "
+                     "cold for {}s, so nobody from the roster has been inside",
+                     runId, mapId, coldFor);
+        } while (runs->NextRow());
     }
 
     void DriveQuests()
@@ -4453,6 +4611,11 @@ private:
     // own that lifecycle. This drive only ever turns the brain ON.
     void DriveDungeonClear()
     {
+        // Retire runs nobody is in before considering new ones, so a party that
+        // left and came back opens a fresh run rather than inheriting a stale
+        // one's heartbeat.
+        CloseAbandonedRuns();
+
         QueryResult result = CharacterDatabase.Query(
             "SELECT name FROM overseer_roster WHERE enabled = 1");
         if (!result)
@@ -4485,6 +4648,12 @@ private:
             // once `dc on` has taken, every later poll stops here.
             if (botAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
                 continue;
+
+            // The run is opened BEFORE the module is armed, so that by the
+            // time anything is steering, the thing that owns the steering
+            // already exists. The other order leaves a window where a character
+            // is armed but unowned.
+            OpenOrTouchRun(name, bot->GetMapId());
 
             botAI->HandleCommand(CHAT_MSG_WHISPER, "dc on", bot);
 
