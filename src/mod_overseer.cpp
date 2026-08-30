@@ -2194,6 +2194,42 @@ private:
         return jobs;
     }
 
+    // IS A RUN IN PROGRESS FOR THIS CHARACTER, AND THEREFORE IS THIS DRIVE
+    // ALLOWED TO STEER IT AT ALL?
+    //
+    // WHY THIS IS ONE FUNCTION AND NOT A CHECK PER DRIVE. This module runs
+    // several independent periodic drives - quests, travel, professions,
+    // engagement safety, dungeon arming, revival - and every one of them writes
+    // to the same characters. There was no arbitration, only gates added one at
+    // a time as each collision was discovered in production. The quest drive
+    // overwriting a dungeon run was not a bug in the quest drive; it was the
+    // design working as built.
+    //
+    // Six independent model reviews of this architecture all returned the same
+    // verdict and the same remedy: the party and the RUN should be the unit of
+    // control, not the character and the tick, and exactly one component may
+    // steer while a run is active (see the epic). This predicate is the first
+    // slice of that: a single named concept the drives agree on, replacing
+    // literal `GetMap()->IsDungeon()` checks copy-pasted into whichever drive
+    // last collided with something.
+    //
+    // BEING ON AN INSTANCE MAP IS THE FACT, deliberately, rather than "holds the
+    // dungeon-clear strategy". A character that entered before the arming drive's
+    // next poll would otherwise be steered by everything else in that window,
+    // which is the race this closes. The strategy is a consequence of being
+    // inside; the map is the cause.
+    //
+    // Members read at the pinned core:
+    //   GetMap     Object.h:631     Map* GetMap() const
+    //   IsDungeon  Map.h:298        bool IsDungeon() const
+    static bool InDungeonRun(Player* bot)
+    {
+        if (!bot)
+            return false;
+        Map* map = bot->GetMap();
+        return map && map->IsDungeon();
+    }
+
     void DriveQuests()
     {
         // Read first, and each on its own, so that neither aim column can stop
@@ -2326,16 +2362,12 @@ private:
             //   GetMap     Object.h:631     Map* GetMap() const
             //   IsDungeon  Map.h:298        bool IsDungeon() const
             //   GetMapId   Position.h:281   uint32 GetMapId() const
-            if (Map* map = bot->GetMap())
+            if (InDungeonRun(bot))
             {
-                if (map->IsDungeon())
-                {
-                    LOG_DEBUG("module.overseer",
-                              "overseer: '{}' is inside map {} - the quest drive "
-                              "stands down for the dungeon run",
-                              name, static_cast<uint32>(bot->GetMapId()));
-                    continue;
-                }
+                LOG_DEBUG("module.overseer",
+                          "overseer: '{}' is in a dungeon run - the quest drive "
+                          "stands down", name);
+                continue;
             }
 
             // The aim as this loop last saw it, so a standing complaint is made
@@ -3654,6 +3686,19 @@ private:
             if (!SteerableAI(bot))
                 continue;
 
+            // The same stand-down every steering drive now shares. Giving up a
+            // trade is a decision about what a character does in the WORLD, and
+            // there is no trainer inside an instance to make it good on - so
+            // this belongs to the run, not to the profession plan, exactly as
+            // the quest aim does.
+            if (InDungeonRun(bot))
+            {
+                LOG_DEBUG("module.overseer",
+                          "overseer: '{}' is in a dungeon run - the profession "
+                          "drive stands down", name);
+                continue;
+            }
+
             UnlearnProfession(name, bot, plan);
         }
     }
@@ -4430,8 +4475,10 @@ private:
             if (!bot->IsAlive())
                 continue;
 
-            Map* map = bot->GetMap();
-            if (!map || !map->IsDungeon())
+            // The same predicate the other drives stand down on, read the
+            // other way round: this is the one drive that acts BECAUSE a run
+            // is in progress.
+            if (!InDungeonRun(bot))
                 continue;
 
             // Already armed. This is the line that makes the drive idempotent:
