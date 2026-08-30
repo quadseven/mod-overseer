@@ -4580,9 +4580,50 @@ private:
                 continue;
             }
 
+            // NO GRAVEYARD ON THIS MAP IS NOT A REASON TO WALK AWAY.
+            //
+            // This used to be `if (!grave) continue;`, and that stranded every
+            // character who died INSIDE AN INSTANCE. Measured: `game_graveyard`
+            // holds ZERO rows on map 36, because the Deadmines graveyards are
+            // outdoor ones, so the lookup comes back empty for a character
+            // standing in the instance. A body lay there for 29 minutes while
+            // this drive ran the whole time and never once considered it - over
+            // the same window the drive logged exactly two revivals, both for a
+            // character who had died outside.
+            //
+            // THE SAME SHAPE AS THE CORPSE BUG THIS DRIVE ALREADY HAD (#79):
+            // an early return whose comment reads as a transient case and whose
+            // reality is permanent. A map does not grow a graveyard while you
+            // wait. Every `continue` on this path has to answer "can this
+            // condition change on its own?" - and when it cannot, skipping is
+            // stranding.
+            //
+            // It matters more here than it looks. Upstream's own rescue is
+            // gated behind IsRandomBot, which is false for this roster, so
+            // without this fallback a death inside an instance has NO recovery
+            // path at all: not upstream's, not this one. It also silently
+            // freezes dungeon runs, because the party holds position waiting
+            // for a member who is never coming back.
+            //
+            // The bind point is the fallback because it is the one destination
+            // that always exists, it is the character's OWN in-game escape, and
+            // the trap branch directly above already relies on it working.
             GraveyardStruct const* grave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
             if (!grave)
+            {
+                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
+                                bot->m_homebindY, bot->m_homebindZ, 0.f);
+                bot->ResurrectPlayer(0.5f);
+                bot->SpawnCorpseBones();
+
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been dead for {}s on map {}, which has no "
+                         "graveyard of its own - dying inside an instance leaves nothing "
+                         "for GetClosestGraveyard to return, so it was sent to its own "
+                         "bind point instead of being left where it fell",
+                         name, deadFor, static_cast<uint32>(bot->GetMapId()));
                 continue;
+            }
 
             // Mirrors exactly what SpiritHealerAction::Execute already does
             // on a successful revive (ResurrectPlayer + SpawnCorpseBones) -
