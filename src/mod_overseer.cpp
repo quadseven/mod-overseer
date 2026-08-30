@@ -1848,6 +1848,42 @@ private:
         if (!leader)
             return;
 
+        // NOBODY IN THIS FAMILY IS EVER AWAY.
+        //
+        // The 3.3.5 client flags itself Away after a stretch with no keyboard
+        // or mouse input, and the recorded client never has any: it is an
+        // unattended window that exists to be filmed while the server's AI
+        // drives the character. So it sets Away, the AI moves the character and
+        // clears it, the client idles and sets it again, forever. The operator
+        // watching the stream sees the chat pane fill with it:
+        //
+        //     You are now Away: Away        (x14, in one screenshot)
+        //
+        // It is not only noise. An Away character is one the world treats as
+        // idle, and idle is what gets a session closed - the same class of
+        // problem the base config already fights with CloseIdleConnections = 0.
+        // Three times on 2026-08-30 the recorded client was found back at the
+        // character-select screen with the agent still reporting it healthy,
+        // and each time the dungeon brain went off with it, because the run's
+        // only authorized issuer is that selfbot.
+        //
+        // Cleared rather than toggled: ToggleAFK (Player.h:1149) FLIPS the
+        // flag, so calling it on a character that is not away would set it.
+        // RemovePlayerFlag (Player.h:1127, public from Player.h:1091) is
+        // idempotent, and isAFK (Player.h:1151) keeps the log honest - it says
+        // something only on the polls where there was actually something to
+        // clear.
+        for (Player* p : present)
+        {
+            if (!p || !p->isAFK())
+                continue;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' had flagged itself Away - clearing it, because an "
+                     "unattended client with no keyboard is not a person who stepped out",
+                     p->GetName());
+            p->RemovePlayerFlag(PLAYER_FLAGS_AFK);
+        }
+
         // THE LEADER FOLLOWS NOBODY. RandomPlayerbotMgr::OnPlayerLogin hands a
         // master to every bot grouped with an arriving character when its own
         // master is null or is a bot (RandomPlayerbotMgr.cpp:2582-2586), and
@@ -1901,11 +1937,34 @@ private:
             // the silently-inert case. WARN rather than INFO because reaching
             // here means the character could not have been questing.
             //
-            // A HUMAN AT THE KEYBOARD IS LEFT ALONE, same test the master
-            // assignment above uses: a selfbot's own strategy list is the
-            // player's business.
-            if (!leaderAI->HasGameClientMaster() &&
-                !leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            // A HUMAN AT THE KEYBOARD IS LEFT ALONE - AND A FILMED SELFBOT IS
+            // NOT ONE. This guard used to ask HasGameClientMaster(), which is
+            // `IsRealPlayer(master) || IsSelfBot(master)`
+            // (PlayerbotAI.cpp:4459). Execution only reaches here inside
+            // `if (PlayerbotAI* leaderAI = GET_PLAYERBOT_AI(leader))`, and
+            // IsRealPlayer is `player && !GET_PLAYERBOT_AI(player)`
+            // (PlayerbotAI.cpp:4389) - so the real-player half is ALWAYS false
+            // here and the test could only ever exempt a SELFBOT. That is the
+            // one case it must not exempt.
+            //
+            // The recorded character is a selfbot with nobody at its keyboard:
+            // an unattended client that exists to be filmed while the server's
+            // AI drives it. Measured on the dev world 2026-08-30, the grant
+            // fired twice while nobody was logged in:
+            //
+            //     16:17:30 'Grug' leads but did not carry `new rpg` - granting it
+            //     16:18:00 'Grug' leads but did not carry `new rpg` - granting it
+            //
+            // then the recorder attached at 16:22:03, HasGameClientMaster()
+            // went true, and it never fired again. A strategy probe either side
+            // is decisive: `new rpg` present at 14:53, gone at 16:22. Four
+            // minutes later the travel drive reported the LEADER unwalkable,
+            // and followers travel by following - so one exempted character
+            // froze all five, in a field, gathering herbs, for hours.
+            //
+            // A genuine person is still left alone: no PlayerbotAI means no
+            // leaderAI and this whole block is skipped.
+            if (!leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' leads but did not carry `new rpg` - granting it, "
@@ -1938,7 +1997,22 @@ private:
             // GET_PLAYERBOT_AI (PlayerbotAI.cpp:4400). Without this, the poll
             // would take the family back off the person playing every thirty
             // seconds, forever.
-            if (botAI->HasGameClientMaster())
+            // ONLY AN ACTUAL PERSON WINS, not merely "a master with a client".
+            // HasGameClientMaster() counts a SELFBOT master too, and the
+            // recorded character is exactly that - so every follower whose
+            // master was the filmed character got skipped here forever.
+            //
+            // Measured on the dev world 2026-08-30: moving `lead` to a true bot
+            // re-formed the party ("'Grog' now leads the party") and NOT ONE
+            // follower was re-pointed. No `now follows 'Grog'` line was ever
+            // emitted, because all four still had the filmed selfbot as master.
+            // Leadership could neither walk nor be handed away while the
+            // recorder was attached.
+            //
+            // IsRealPlayer is null-safe (PlayerbotAI.cpp:4389-4394), so a
+            // master of nullptr falls through to the assignment below, which is
+            // what should happen to a follower that has lost its master.
+            if (IsRealPlayer(botAI->GetMaster()))
                 continue;
 
             // SetMaster is public - PlayerbotAI.h:571, inside the `public:`
@@ -1968,7 +2042,44 @@ private:
             // ChangeStrategy PlayerbotAI.h:407, both public; the "+name" form
             // and the BOT_STATE_NON_COMBAT state are upstream's own pairing at
             // PlayerbotAI.cpp:448.
-            if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+            // INSIDE A RUN, `follow` IS THE THING STOPPING THE DUNGEON.
+            //
+            // `follow` exists for the overworld, where five free-roaming
+            // characters scatter - that is the 937-yard spread it cured. Inside
+            // an instance the reason evaporates and the cure becomes the
+            // disease: the party is pinned to whatever the master is doing, and
+            // the dungeon AI - which steers each character itself - cannot move
+            // anybody.
+            //
+            // Measured on the dev world 2026-08-30: four characters stood
+            // inside The Deadmines for six minutes at BYTE-IDENTICAL
+            // coordinates, at full health, out of combat, every one of them
+            // probing `dungeon clear` present and the run row active with a
+            // fresh heartbeat. The brain was on and inert. Sending `nc -follow`
+            // to the tank alone, changing nothing else, started it moving on
+            // the next poll:
+            //
+            //     before  Bork@-42,-370  (unchanged for six minutes)
+            //     after   Bork@-59,-368 -> -64,-385 -> -77,-373
+            //
+            // RESTORATION NEEDS NO SEPARATE PATH, which is why this is an
+            // inversion of the existing grant rather than a new drive: the
+            // grant below already runs every poll, so the moment InDungeonRun
+            // goes false the very next poll hands `follow` back and the
+            // overworld cohesion returns on its own. A restore written as its
+            // own branch would be a second thing to keep in sync with this one.
+            if (InDungeonRun(p))
+            {
+                if (botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is in a dungeon run - dropping `follow` so the "
+                             "dungeon AI can steer it; it comes back on the poll after the "
+                             "run ends", p->GetName());
+                    botAI->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+                }
+            }
+            else if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' had a master but no follow strategy - granting "
