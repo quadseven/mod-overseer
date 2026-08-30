@@ -3824,6 +3824,88 @@ private:
         return true;
     }
 
+    // FLIGHT POINT DISCOVERY ON ARRIVAL (#68). Discovering a flight point is
+    // not a proximity effect - it is answered entirely by the packet the
+    // CLIENT sends when it opens a flight master's taxi window
+    // (WorldSession::HandleTaxiQueryAvailableNodes, which calls
+    // SendLearnNewTaxiNode when the node is not yet known - TaxiHandler.cpp).
+    // A bot has no client to send that packet, so walking a character up to a
+    // flight master and leaving it there - which is all an ordinary travel
+    // errand already does - discovers nothing on its own. This is the same
+    // shape as Trainer::TeachSpell above: the thing that would normally
+    // answer a client packet is called directly, and the result is read back
+    // rather than trusted, because SetTaximaskNode reports nothing anywhere a
+    // bot could see it either.
+    //
+    // WHY THIS RUNS FOR EVERY CREATURE ARRIVAL, NOT ONLY A `flight master`
+    // AIM. TravelRoles already resolves the `flight master` keyword to the
+    // nearest UNIT_NPC_FLAG_FLIGHTMASTER spawn, but nothing yet SENDS a
+    // character there on purpose - that decision (which zone, which
+    // character, when) belongs to whatever plans travel, not to the arrival
+    // handler, and is deliberately not made here. What this drive DOES have
+    // is every character that ends up standing next to a flight master
+    // anyway, on the way to a trainer, a vendor, or a quest turn-in.
+    // Discovering it there is "cheap while already there" in the literal
+    // sense infra#68 asks for, and it costs nothing extra: a creature that is
+    // not a flight master simply fails the HasNpcFlag check below and this is
+    // a no-op.
+    void DiscoverFlightPointOnArrival(std::string const& name, Player* bot, uint32 entry)
+    {
+        if (!entry)
+            return;   // an `at:`/`trigger:` aim names no creature to check
+
+        // Same radius DriveTravel already measured "arrived" against, and the
+        // same call TrainOnArrival uses above to turn a spawn point back into
+        // the live creature standing near it.
+        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+        if (!npc || !npc->IsAlive())
+            return;
+
+        // Unit.h:764 - the same flag TravelRoles keys the `flight master`
+        // keyword on (UNIT_NPC_FLAG_FLIGHTMASTER, 8192) and the same one
+        // travel.ROLES maps on the Python side.
+        if (!npc->HasNpcFlag(UNIT_NPC_FLAG_FLIGHTMASTER))
+            return;
+
+        // ObjectMgr.h:817 - the (x, y, z, mapid, teamId) overload, called
+        // with the bot's own position rather than the WorldLocation overload
+        // so no implicit WorldObject-to-WorldLocation conversion has to be
+        // trusted. Player.h:2142 - GetTeamId(true) is the same call
+        // WorldSession::SendTaxiStatus makes (TaxiHandler.cpp) to answer the
+        // identical "is this the character's own team's node" question.
+        uint32 const node = sObjectMgr->GetNearestTaxiNode(
+            bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+            bot->GetMapId(), bot->GetTeamId(true));
+        if (!node)
+            return;   // no taxi node registered this close - nothing to learn
+
+        // Player.h:1160 (m_taxi is a public member), PlayerTaxi.h:35
+        // (IsTaximaskNodeKnown).
+        if (bot->m_taxi.IsTaximaskNodeKnown(node))
+            return;   // already known - the ordinary case after the first visit
+
+        // PlayerTaxi.h:42 (SetTaximaskNode) - the same function
+        // SendLearnNewTaxiNode calls from the packet handler a real client
+        // would have triggered. Its own return value is read rather than
+        // trusted, and the mask is asked again afterward for the same reason
+        // TrainOnArrival asks HasSkill: this call has no client to report
+        // failure to, so the world is the only source of truth about whether
+        // it worked.
+        bot->m_taxi.SetTaximaskNode(node);
+        if (!bot->m_taxi.IsTaximaskNodeKnown(node))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' stood at flight master '{}' (creature {}) but taxi "
+                     "node {} did not register as known afterward", name, npc->GetName(),
+                     entry, node);
+            return;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' discovered flight point {} at '{}' (creature {})",
+                 name, node, npc->GetName(), entry);
+    }
+
     // The unlearn drive. Its own poll, because unlearning needs no NPC and no
     // journey: it is the prerequisite that makes the journey worth taking, and
     // making it wait for one would deadlock the pair - the character cannot
@@ -4189,6 +4271,12 @@ private:
                 }
                 else
                 {
+                    // Opportunistic, and deliberately BEFORE the errand is
+                    // cleared rather than after: `entry` and `bot` are both
+                    // already in hand here, and this is a no-op for anything
+                    // that is not a flight master. See DiscoverFlightPointOnArrival.
+                    DiscoverFlightPointOnArrival(name, bot, entry);
+
                     LOG_INFO("module.overseer",
                              "overseer: '{}' reached '{}' (creature {}) - errand done, "
                              "releasing", name, target, entry);
