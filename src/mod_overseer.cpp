@@ -4609,6 +4609,34 @@ private:
     // same as ending a run - a wipe puts the party outside at a graveyard with
     // the run still meaningfully in progress - and the module's own `dc` verbs
     // own that lifecycle. This drive only ever turns the brain ON.
+    // A groupmate the dungeon module will accept a command FROM.
+    //
+    // IsAuthorized wants an issuer that is either not a bot at all, or is a
+    // selfbot - and in both cases a member of the target's group. Every roster
+    // character is a bot, so the only candidate is whichever one is currently
+    // a selfbot, which is the character being observed. `IsSelfBot` is a free
+    // function declared at PlayerbotAI.h:80.
+    //
+    // Returns null rather than falling back to the bot itself, because the bot
+    // itself is precisely the issuer that is always rejected, and retrying with
+    // it is how this went unnoticed for so long.
+    static Player* AuthorizedDcIssuer(Player* bot)
+    {
+        if (!bot)
+            return nullptr;
+        Group* group = bot->GetGroup();
+        if (!group)
+            return nullptr;
+
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (member && IsSelfBot(member))
+                return member;
+        }
+        return nullptr;
+    }
+
     void DriveDungeonClear()
     {
         // Retire runs nobody is in before considering new ones, so a party that
@@ -4688,13 +4716,51 @@ private:
             // is steering, the thing that owns the steering already exists.
             OpenOrTouchRun(name, bot->GetMapId());
 
+            // WHO ISSUES THE COMMAND DECIDES WHETHER IT IS OBEYED, and for a
+            // year of runs the answer has been "nobody may".
+            //
+            // mod-dungeon-clear refuses dc commands from a true bot
+            // (DungeonClearChatActions.cpp:60, IsAuthorized): if the ISSUER has
+            // a PlayerbotAI and is not a selfbot, it returns false before
+            // looking at anything else. This module issued `dc on` with the
+            // receiving bot as its own issuer, so every single one was rejected
+            // and the module sat idle inside every run. Its own log said so the
+            // whole time:
+            //
+            //     DC command refused for Grog: Not authorized to enable dungeon clear
+            //
+            // Nothing upstream of that noticed, because the command surface
+            // reports `delivered` - which means the bot RECEIVED it - and a
+            // strategy probe afterwards shows "dungeon clear" present, which
+            // comes from the contexts the module registers at STARTUP and not
+            // from the command taking. Two separate checks both looked like
+            // confirmation and neither was.
+            //
+            // The rule accepts an issuer who is a selfbot AND a member of the
+            // target's group. The roster is one permanent party and the
+            // observed character is always in it, so there is normally exactly
+            // such an issuer available - it just was never the one used.
+            Player* issuer = AuthorizedDcIssuer(bot);
+            if (!issuer)
+            {
+                // SAID, NOT SKIPPED. A run whose brain could not be switched on
+                // is the single most consequential thing this module can fail
+                // at, and it has failed at it silently for its whole life.
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is inside map {} but no groupmate may issue a "
+                         "dungeon-clear command - the module refuses a true bot as issuer "
+                         "and no selfbot is in the party, so the dungeon brain stays OFF",
+                         name, static_cast<uint32>(bot->GetMapId()));
+                continue;
+            }
+
             // Already armed. This is the line that makes the ARMING idempotent:
             // once `dc on` has taken, every later poll stops here. It must stay
             // below the heartbeat, for the reason above.
             if (botAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
                 continue;
 
-            botAI->HandleCommand(CHAT_MSG_WHISPER, "dc on", bot);
+            botAI->HandleCommand(CHAT_MSG_WHISPER, "dc on", issuer);
 
             // SAID ON EVERY ATTEMPT, NOT ONCE. If the command takes, the
             // HasStrategy check above silences this on the next poll and the
