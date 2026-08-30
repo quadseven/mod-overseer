@@ -4638,22 +4638,61 @@ private:
             if (!bot->IsAlive())
                 continue;
 
-            // The same predicate the other drives stand down on, read the
-            // other way round: this is the one drive that acts BECAUSE a run
-            // is in progress.
-            if (!InDungeonRun(bot))
+            // GEOGRAPHY, NOT THE RUN. THIS DRIVE CANNOT WAIT FOR ITS OWN
+            // PRECONDITION.
+            //
+            // This read `InDungeonRun(bot)` for one release, and that was a
+            // deadlock. InDungeonRun requires an open run row; this drive is
+            // the only thing that opens one. So no run existed, the drive
+            // skipped, the run was never created, and it skipped again forever.
+            // Measured live: four characters standing inside an instance and
+            // zero rows in overseer_dungeon_run, indefinitely.
+            //
+            // It is the same failure class the run record was introduced to end
+            // - a guard whose condition can never become true - reintroduced
+            // while refactoring the guards that came before it. The lesson is
+            // narrow and worth stating: a component that CREATES a state may
+            // never gate itself on that state existing.
+            //
+            // So this one drive keeps asking the map. Being on an instance map
+            // is what makes a run possible, and this is the drive whose job is
+            // to turn possible into real. Every OTHER drive still asks
+            // InDungeonRun, because for them the run genuinely is the
+            // precondition.
+            Map* map = bot->GetMap();
+            if (!map || !map->IsDungeon())
                 continue;
 
-            // Already armed. This is the line that makes the drive idempotent:
-            // once `dc on` has taken, every later poll stops here.
+            // THE HEARTBEAT IS TOUCHED FOR EVERY CHARACTER SEEN INSIDE,
+            // BEFORE ANY OTHER DECISION, AND THAT ORDER IS THE WHOLE POINT.
+            //
+            // This call used to sit BELOW the already-armed check, and that was
+            // a bug the world found in fourteen minutes. Arming happens at most
+            // once per character per run - the check right below exists to make
+            // sure of it - so a heartbeat written only on the arming path is
+            // written once and then never again. It went cold 120 seconds
+            // later, the run closed as abandoned with three characters standing
+            // inside it, and every drive resumed steering people in a dungeon:
+            //
+            //     id 1  map 36  ended  "heartbeat cold - nobody from the
+            //                           roster seen on the map"
+            //     Bork map 36  Grug map 36  Ugga map 36
+            //
+            // The lesson is about what the signal MEANS. `last_progress_at`
+            // answers "when was somebody last seen in here", so it belongs to
+            // being seen, not to being armed. Anything conditional on work
+            // still being needed is the wrong place for a liveness signal,
+            // because liveness outlives the work.
+            //
+            // Opening also stays here rather than below: by the time anything
+            // is steering, the thing that owns the steering already exists.
+            OpenOrTouchRun(name, bot->GetMapId());
+
+            // Already armed. This is the line that makes the ARMING idempotent:
+            // once `dc on` has taken, every later poll stops here. It must stay
+            // below the heartbeat, for the reason above.
             if (botAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
                 continue;
-
-            // The run is opened BEFORE the module is armed, so that by the
-            // time anything is steering, the thing that owns the steering
-            // already exists. The other order leaves a window where a character
-            // is armed but unowned.
-            OpenOrTouchRun(name, bot->GetMapId());
 
             botAI->HandleCommand(CHAT_MSG_WHISPER, "dc on", bot);
 
