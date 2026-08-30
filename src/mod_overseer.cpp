@@ -1971,6 +1971,25 @@ private:
                          "because a quest status nothing executes is a character standing "
                          "in a field", leader->GetName());
                 leaderAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+
+                // READ IT BACK, BECAUSE A GRANT THAT DOES NOT TAKE IS EXACTLY
+                // WHAT HID THIS BUG. The old code granted and moved on, so the
+                // log showed a confident "granting it" on every poll while the
+                // strategy was never actually held - a line that reads as
+                // success is worse than no line at all. The command surface
+                // already works this way ("reading the live strategy list back
+                // before it counts"); this is the same discipline on the path
+                // that runs without anybody asking.
+                //
+                // ERROR rather than WARN: if this fires, the leader cannot walk
+                // and therefore neither can the family, which is the single
+                // most consequential state this module can be in.
+                if (!leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' still does not carry `new rpg` after being "
+                              "granted it - the leader cannot be sent anywhere and the "
+                              "followers travel by following, so nobody will move",
+                              leader->GetName());
             }
         }
 
