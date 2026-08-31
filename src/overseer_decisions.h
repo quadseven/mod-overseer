@@ -26,6 +26,12 @@
  * with them, and `static` became namespace scope so a caller outside this file
  * can name them.
  *
+ * WHAT ELSE IS IN HERE. Anything this module decides that needs nothing from
+ * the world belongs in this pair of files, not only the dungeon-run predicates
+ * that started it. The ratchet at the bottom is the second tenant: the "has it
+ * got anywhere, and if not, give up" rule that four separate drives were each
+ * carrying their own copy of.
+ *
  * AzerothCore's module build globs modules/<module>/src for sources and adds
  * that directory to the include path (CollectSourceFiles and
  * CollectIncludeDirectories, both driven from the core's own
@@ -38,6 +44,7 @@
 #ifndef MOD_OVERSEER_DECISIONS_H
 #define MOD_OVERSEER_DECISIONS_H
 
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -125,6 +132,129 @@ bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members);
 // that is harder to test twice.
 std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
                                     float doorstepYards);
+
+// ------------------------------------------------------------- the ratchet --
+//
+// "HAS IT GOT ANYWHERE, AND IF NOT, FOR HOW LONG?" - a question this module
+// asks in five places, and one that was written out five times, with five
+// clocks and five constants, before it was written once here.
+//
+// WHY THE MEASUREMENT MATTERS MORE THAN THE CLOCK. This was learned expensively
+// on the travel backstop (#63), and that backstop's own comment is the argument
+// for all of them. It exists to catch a character STANDING STILL, and it used
+// to approximate that as "taking a while" - which is a different thing, and
+// wrong in the one case that matters most. Measured on the dev world: a
+// character aimed at the Deadmines portal from Elwynn was released 586 yards
+// short, having walked 2347 of 2933 yards at 112 yards a minute, about five
+// minutes from arriving. It was released as UNREACHABLE while it was visibly
+// reaching it, and the log said so in those words. Nothing was stuck; the
+// journey was simply longer than a constant that had only ever been asked about
+// trainers in the same city.
+//
+// So ask the question a backstop is actually for. The best reading only ever
+// ratchets one way, so beating it means the subject has done something it has
+// not managed before on this errand - which no bot jammed against scenery,
+// circling, or standing in a field can keep doing, and which a walking bot does
+// on every poll. A target that truly cannot be reached still gets given up on:
+// the character closes to whatever range it can manage, stops improving, and
+// the clock then runs out undisturbed. The bound is on being stuck, where it
+// belongs, rather than on distance or on patience alone.
+//
+// WHAT IS SHARED, AND WHAT IS DELIBERATELY NOT. Shared: the comparison, the
+// mark it is made against, the clock that restarts when the mark is beaten, and
+// the verdict when it has not restarted for long enough. Not shared, and left
+// at each site: what to DO about a stall. Travel releases the errand, a
+// crossing gives up on the door, a stalled follower has its movement generator
+// cleared and may be nudged again later, a quest that went nowhere collects a
+// strike. Those are four reactions to one fact, and they are the only part that
+// was ever really different.
+//
+// THE READINGS ARE NOT ALL THE SAME EITHER, so that is a parameter below rather
+// than an average. One caller measures how near it has got to something it was
+// sent to; one counts things that have already happened; two measure how far
+// they have moved from a mark dropped where they were last seen going
+// somewhere. Three rules, three different answers to the same numbers, and all
+// three named.
+//
+// ONE OF THE FIVE IS NOT HERE, ON PURPOSE. The quest-aim backstop
+// (DRIVE_AIM_BACKSTOP_SECONDS) has no measurement to ratchet: its progress is
+// "the roster names a different quest", an identity rather than a distance, and
+// its clock is additionally carried forward across a travel hand-back by an
+// amount only that drive knows. It is a plain deadline and it stays one.
+// Handing it a distance it does not have, so that this list could read evenly,
+// would be inventing a rule rather than sharing one.
+
+// WHAT A READING MEANS. Named for what the number IS rather than for a
+// direction, because the meaning is what differs between the sites and the
+// direction follows from it.
+enum class RatchetReading
+{
+    // A DISTANCE TO SOMETHING THE SUBJECT IS TRYING TO REACH. Progress is
+    // getting NEARER than it has ever been, by more than `margin`, so the mark
+    // only ever falls. A mark of ZERO means no reading has been taken yet and
+    // never "already arrived": the caller measures with
+    // WorldObject::GetDistance2d, which clamps at zero once the subject is
+    // within its own size of the target, and it settles arrival before it asks
+    // this.
+    DistanceToTarget,
+
+    // A COUNT OF THINGS THAT HAVE ALREADY HAPPENED. Progress is a bigger count
+    // than has ever been seen. Zero is a REAL reading here (nothing has
+    // happened yet) rather than an unset one, and that is the whole difference
+    // from the distance above: the first poll of a crossing nobody has
+    // crossed yet is not progress, so the clock its caller started when the
+    // phase began is left running rather than restarted.
+    CountAchieved,
+
+    // A DISTANCE FROM A MARK THE CALLER MOVES to wherever the subject now is.
+    // The subject is not going anywhere in particular and there is nothing to
+    // get nearer to; the question is whether it has got anywhere AT ALL since
+    // the mark was dropped. Any reading past `margin` counts, and the mark goes
+    // back to nothing rather than to the reading, because the next reading is
+    // measured from the new mark and starts from zero again.
+    DistanceFromLastMark,
+};
+
+// One site's whole rule, in one constant a reader can take in at once.
+struct RatchetLimits
+{
+    RatchetReading reading{RatchetReading::DistanceToTarget};
+    float margin{0.f};  // how much better a reading has to be before it counts
+    // How long without progress is long enough. ZERO MEANS THE CALLER COUNTS,
+    // and one caller does: the quest re-pick's patience is three consecutive
+    // picks that went nowhere, not a number of minutes, so it asks
+    // RatchetProgressed below and keeps its own count rather than growing a
+    // timer it never had just to be able to use the whole function.
+    time_t patienceSeconds{0};
+};
+
+// What one subject's ratchet remembers between polls. Every site that keeps one
+// keeps it inside its own per-character state, world-thread only and unguarded,
+// and loses it on a restart - which costs one restarted clock and no
+// correctness, exactly as each of those states already documented for itself.
+struct RatchetState
+{
+    float best{0.f};  // the best reading so far, in the sense named above
+    time_t since{0};  // when `best` was last beaten
+};
+
+struct RatchetVerdict
+{
+    bool progressed{false};  // this reading beat the mark; the clock restarted
+    bool stalled{false};     // no progress for longer than `patienceSeconds`
+};
+
+// Does this reading count as progress? The comparison half of Ratchet on its
+// own, for the site whose patience is counted in tries rather than in seconds
+// and which therefore has no clock to keep. Pure in the strongest sense: it
+// changes nothing and reads nothing but its arguments.
+bool RatchetProgressed(float reading, float best, RatchetLimits const& limits);
+
+// The whole thing: compare, then either restart the clock or say how long it
+// has been running. A poll that progressed is never also stalled - it has just
+// restarted the clock - so the two verdicts read as the alternatives they are.
+RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
+                       RatchetLimits const& limits);
 
 }  // namespace OverseerDecisions
 
