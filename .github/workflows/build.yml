@@ -58,7 +58,7 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: build
+  group: verify-ratchet-zero-119
   cancel-in-progress: false
 
 env:
@@ -71,14 +71,65 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     permissions:
+      # contents: read ALONE on this throwaway branch. The GHCR login and push
+      # steps are deleted below and packages: write goes with them, so nothing
+      # here can publish an image built from unmerged code even by accident.
       contents: read
-      # Required to push to ghcr.io using the workflow's own GITHUB_TOKEN -
-      # no PAT, no secret, nothing to rotate or leak.
-      packages: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           path: mod-overseer
+
+      # THROWAWAY-BRANCH ONLY (#119 verification). Builds the pure decisions
+      # module on its own against .ci/proof_119.cpp, TWICE - once with the fix
+      # and once with the sources exactly as they stand on the branch this is
+      # stacked on - and compares the seven verdicts. The travel line must
+      # differ and every other line must not.
+      - name: Prove the zero-vs-absent defect and its fix
+        working-directory: mod-overseer
+        run: |
+          set -euo pipefail
+          g++ --version | head -1
+
+          # FETCH_HEAD and not a remote-tracking name: actions/checkout only
+          # configures a refspec for the branch it checked out, so the tracking
+          # ref for the base branch is not guaranteed to exist here.
+          git fetch -q --depth 1 origin main
+          mkdir -p /tmp/before
+          git show FETCH_HEAD:src/overseer_decisions.h   > /tmp/before/overseer_decisions.h
+          git show FETCH_HEAD:src/overseer_decisions.cpp > /tmp/before/overseer_decisions.cpp
+
+          build_and_run() {  # $1 = label, $2 = directory of the decisions module
+            g++ -std=c++17 -Wall -Wextra -Werror -I"$2"                 "$2/overseer_decisions.cpp" .ci/proof_119.cpp -o "/tmp/$1.bin"
+            "/tmp/$1.bin" | tee "/tmp/$1.txt"
+          }
+
+          echo "===== BEFORE: main, unfixed ====="
+          build_and_run before /tmp/before
+          echo "===== AFTER: this branch, fixed ====="
+          build_and_run after "$PWD/src"
+
+          echo "===== what the fix changed ====="
+          diff /tmp/before.txt /tmp/after.txt || true
+
+          fail=0
+          grep -qx 'travel_arrive_then_stand_stalls=never' /tmp/before.txt || {
+            echo "UNPROVEN: the unfixed build was expected never to stall here"; fail=1; }
+          grep -q '^travel_arrive_then_stand_stalls=yes' /tmp/after.txt || {
+            echo "UNFIXED: the fixed build still never stalls here"; fail=1; }
+          diff <(grep -v '^travel_arrive_then_stand_stalls' /tmp/before.txt)                <(grep -v '^travel_arrive_then_stand_stalls' /tmp/after.txt) || {
+            echo "NOT NARROW: a verdict other than the bug changed"; fail=1; }
+
+          # The control that would catch the fix leaking into the wrong reading.
+          # A crossing nobody ever crosses reads zero on every poll, and zero is
+          # a REAL count there: it has to keep stalling on BOTH builds.
+          for f in before after; do
+            grep -q '^crossing_nobody_through_stalls=yes' "/tmp/$f.txt" || {
+              echo "LEAKED: $f no longer stalls a crossing that nobody crosses"; fail=1; }
+            grep -q '^follow_not_moving_stalls=yes' "/tmp/$f.txt" || {
+              echo "LEAKED: $f no longer stalls a follower that never moves"; fail=1; }
+          done
+          exit $fail
 
       - name: Clone the pinned core + mod-playerbots
         env:
@@ -169,29 +220,3 @@ jobs:
         with:
           path: /tmp/buildx-cache
           key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
-
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Deliberately a SECOND buildx invocation rather than adding --push to
-      # the compile-check step above: buildx cannot --load and --push in the
-      # same call, and keeping the compile-check untouched means the gate
-      # every PR here actually depends on cannot be affected by anything
-      # below this line. Warm from the cache the compile-check just
-      # populated, so this is a re-tag-and-upload, not a second cold build -
-      # the Dockerfile's layers already exist locally.
-      - name: Push to GHCR
-        working-directory: acore
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --cache-from type=local,src=/tmp/buildx-cache \
-            -f apps/docker/Dockerfile \
-            -t "${GHCR_IMAGE}:${{ github.sha }}" \
-            -t "${GHCR_IMAGE}:latest" \
-            --push \
-            .
