@@ -296,6 +296,14 @@ constexpr time_t TRAVEL_BACKSTOP_SECONDS = 20 * 60;
 // to a real journey.
 constexpr float TRAVEL_PROGRESS_YARDS = 10.0f;
 
+// The travel backstop's whole rule in one place: what the reading means, how
+// much better a reading has to be before it counts, and how long without one
+// is long enough. See OverseerDecisions::Ratchet, which four drives now share
+// rather than each keeping a copy of this shape.
+constexpr OverseerDecisions::RatchetLimits TRAVEL_RATCHET{
+    OverseerDecisions::RatchetReading::DistanceToTarget,
+    TRAVEL_PROGRESS_YARDS, TRAVEL_BACKSTOP_SECONDS};
+
 // How long travel keeps the wheel after an errand ends (PR #2840 review).
 // OnUpdate runs DriveQuests BEFORE DriveTravel, so without a grace the poll
 // that releases an arrived errand can be followed immediately by a
@@ -336,6 +344,16 @@ constexpr time_t FOLLOW_STALL_SECONDS = 5 * 60;
 // that single attempt actually landing, with nothing native to notice if it
 // does not.
 constexpr float FOLLOW_STALL_GAP_YARDS = 100.0f;
+
+// The follower-stall ratchet. DistanceFromLastMark and not DistanceToTarget:
+// a follower is not being sent anywhere, so there is nothing for it to get
+// nearer to and the reading is how far it has moved from where it was last
+// seen moving. FOLLOW_STALL_GAP_YARDS is deliberately NOT in here - it is an
+// extra condition on this site's reaction, not part of what counts as
+// progress: a follower right beside its leader may stand still all it likes.
+constexpr OverseerDecisions::RatchetLimits FOLLOW_STALL_RATCHET{
+    OverseerDecisions::RatchetReading::DistanceFromLastMark,
+    FOLLOW_STALL_JITTER_YARDS, FOLLOW_STALL_SECONDS};
 
 // How often the unlearn drive looks for a profession the roster has asked a
 // character to give up (infra#2757).
@@ -421,6 +439,15 @@ constexpr float DUNGEON_DOORSTEP_RADIUS_YARDS = 5.0f;
 // honestly take.
 constexpr time_t DUNGEON_CROSSING_BACKSTOP_SECONDS = 5 * 60;
 
+// The crossing ratchet. CountAchieved, with no margin: the reading is how many
+// members are already through, one more is one more, and there is no jitter in
+// a count for a margin to absorb. Zero is a real reading here rather than an
+// unmeasured one, which is what keeps the clock the phase transition started
+// running while nobody has crossed yet.
+constexpr OverseerDecisions::RatchetLimits DUNGEON_CROSSING_RATCHET{
+    OverseerDecisions::RatchetReading::CountAchieved,
+    0.f, DUNGEON_CROSSING_BACKSTOP_SECONDS};
+
 // How long CLEARING waits for the dungeon brain to come on before it says, out
 // loud, that the run is being fought with open-world logic (#88).
 //
@@ -471,6 +498,19 @@ constexpr time_t QUEST_GIVE_UP_COOLDOWN_SECONDS = 900;
 // that is demonstrably going somewhere, and directional travel clears forty
 // yards easily while a bounded random walk does not.
 constexpr float QUEST_PROGRESS_YARDS = 45.0f;
+
+// The quest re-pick ratchet, and the one whose patience is NOT a clock. Same
+// reading as the follower stall - how far it has got from a mark dropped where
+// the streak began - and a patience of zero, which says the caller counts:
+// this site gives up after QUEST_REPICK_STRIKES consecutive picks that went
+// nowhere, not after a number of minutes. Strikes and minutes are not the same
+// bound (a bot on a long route stays in RPG_DO_QUEST and never reaches this
+// code at all, so the polls that strike it are not evenly spaced), and turning
+// one into the other to make this list read evenly would be a behaviour change
+// wearing a refactor's clothes.
+constexpr OverseerDecisions::RatchetLimits QUEST_REPICK_RATCHET{
+    OverseerDecisions::RatchetReading::DistanceFromLastMark,
+    QUEST_PROGRESS_YARDS, 0};
 
 // How long a chosen quest is allowed to sit unfulfilled before the aim is given
 // up on. The PRIMARY release is the aimed quest being handed in; this is only
@@ -2351,16 +2391,32 @@ private:
             FollowStallState& stall = _followStall[p->GetName()];
             float const movedFromLast =
                 stall.seen ? p->GetDistance2d(stall.x, stall.y) : 0.f;
-            if (!stall.seen || movedFromLast > FOLLOW_STALL_JITTER_YARDS)
+            OverseerDecisions::RatchetVerdict const progress =
+                OverseerDecisions::Ratchet(stall.progress, movedFromLast,
+                                           std::time(nullptr), FOLLOW_STALL_RATCHET);
+
+            // THE MARK IS DROPPED HERE, not inside the ratchet, because it is
+            // a position and the ratchet is fed one number. `progress.since`
+            // is assigned with it for the one case the ratchet cannot see -
+            // the very first poll, when there is no mark to measure from and
+            // the reading is not a reading at all. On every other poll that
+            // reaches this branch the ratchet has already set it, to the same
+            // second.
+            if (!stall.seen || progress.progressed)
             {
                 stall.seen = true;
                 stall.x = p->GetPositionX();
                 stall.y = p->GetPositionY();
-                stall.since = std::time(nullptr);
+                stall.progress.since = std::time(nullptr);
                 stall.nudged = 0;
             }
+            // A NUDGE, NOT A GIVE-UP, and that is why the verdict is only one
+            // of three things asked here. There is nothing to release: a
+            // follower has no errand, so the reaction is to clear a stale
+            // movement generator and let it be tried again later, which is
+            // what the cooldown below is for.
             else if (p->GetDistance2d(leader) > FOLLOW_STALL_GAP_YARDS &&
-                     std::time(nullptr) - stall.since > FOLLOW_STALL_SECONDS &&
+                     progress.stalled &&
                      std::time(nullptr) - stall.nudged > FOLLOW_STALL_SECONDS)
             {
                 LOG_WARN("module.overseer",
@@ -3156,10 +3212,29 @@ private:
                 bool const stillActionable = heldStatus == QUEST_STATUS_INCOMPLETE ||
                                              heldStatus == QUEST_STATUS_COMPLETE;
 
-                float const dx = bot->GetPositionX() - repick.fromX;
-                float const dy = bot->GetPositionY() - repick.fromY;
-                bool const moved =
-                    (dx * dx + dy * dy) > (QUEST_PROGRESS_YARDS * QUEST_PROGRESS_YARDS);
+                // HAS IT GOT ANYWHERE AT ALL SINCE THE MARK - the same rule the
+                // follower-stall check asks, through the same function, so the
+                // two cannot drift apart. The mark is where this character
+                // stood when the strike streak began, and the branch below
+                // moves it, so the best distance from it is always zero.
+                //
+                // ONLY THE COMPARISON HALF. This site's patience is
+                // QUEST_REPICK_STRIKES consecutive picks, not a number of
+                // minutes, so it counts its own strikes below rather than
+                // taking a verdict from a clock it never had. See
+                // QUEST_REPICK_RATCHET.
+                //
+                // Position::GetExactDist2d (Position.h:170, and `struct
+                // Position` at Position.h:26 so public) rather than the squared
+                // comparison it replaces: it is sqrt of exactly that same sum
+                // (Position.h:161), so the threshold is unmoved. Deliberately
+                // NOT WorldObject::GetDistance2d (Object.h:538), which the
+                // follower stall does want but this does not - it subtracts the
+                // character's own size and clamps at zero, which would quietly
+                // shift a 45-yard threshold by a bot's width.
+                bool const moved = OverseerDecisions::RatchetProgressed(
+                    bot->GetExactDist2d(repick.fromX, repick.fromY),  // Position.h:170
+                    0.f, QUEST_REPICK_RATCHET);
 
                 if (!stillActionable)
                 {
@@ -3170,8 +3245,8 @@ private:
                 }
                 else if (moved)
                 {
-                    // Going somewhere. Restart the count and the origin so the
-                    // next streak is measured from where it actually is.
+                    // Going somewhere. Restart the count and drop a fresh mark
+                    // so the next streak is measured from where it actually is.
                     repick.strikes = 0;
                     repick.fromX = bot->GetPositionX();
                     repick.fromY = bot->GetPositionY();
@@ -4567,11 +4642,13 @@ private:
             {
                 state.target = target;
                 state.learn = wantSkill;
-                state.since = std::time(nullptr);
                 state.entry = 0;
                 state.pinned = false;
                 state.arrived = false;
-                state.closest = 0.f;
+                // A new errand is a new ratchet: nothing measured yet, and the
+                // clock starts now rather than carrying the last errand's over.
+                state.progress.best = 0.f;
+                state.progress.since = std::time(nullptr);
             }
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -4713,39 +4790,23 @@ private:
                 }
             }
 
-            // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63). The backstop below
-            // exists to catch a character STANDING STILL, and it used to
-            // approximate that as "taking a while" - which is a different thing,
-            // and wrong in the one case that matters most. Measured on the dev
-            // world: a character aimed at the Deadmines portal from Elwynn was
-            // released 586 yards short, having walked 2347 of 2933 yards at 112
-            // yards a minute, about five minutes from arriving. It was released
-            // as UNREACHABLE while it was visibly reaching it, and the log said
-            // so in those words. Nothing was stuck; the journey was simply
-            // longer than a constant that had only ever been asked about
-            // trainers in the same city.
-            //
-            // So ask the question the backstop is actually for. `closest` only
-            // ever ratchets DOWNWARD, so beating it means the character has got
-            // nearer than it has ever been on this errand - which no bot jammed
-            // against scenery, circling, or standing in a field can keep doing,
-            // and which a walking bot does on every poll. A target that truly
-            // cannot be reached still gets released: the character closes to
-            // whatever range it can manage, stops improving, and the clock then
-            // runs out undisturbed. The bound is on being stuck, where it
-            // belongs, rather than on distance.
-            if (!state.closest || distance < state.closest - TRAVEL_PROGRESS_YARDS)
-            {
-                state.closest = distance;
-                state.since = std::time(nullptr);
-            }
+            // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63). This is the site the
+            // lesson was measured on and the rule is now written down once, in
+            // OverseerDecisions::Ratchet, which carries that measurement and the
+            // whole argument with it. What is left here is the reading -
+            // distance to the thing this character was sent to - and, below,
+            // what this drive does about a stall, which is the only part that
+            // was ever this site's own.
+            OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
+                state.progress, distance, std::time(nullptr), TRAVEL_RATCHET);
 
             // BACKSTOP. An errand that can never land must not pin a character
             // to it forever - that is a character standing still, which is the
             // state this whole epic exists to stop mistaking for a working one.
-            // Read with the progress check above: "since" now means since the
-            // character last got nearer, not since the errand was issued.
-            if (state.since && std::time(nullptr) - state.since > TRAVEL_BACKSTOP_SECONDS)
+            // Read with the progress check above: a stall means the character
+            // has not got nearer for TRAVEL_BACKSTOP_SECONDS, not that the
+            // errand has simply been outstanding that long.
+            if (progress.stalled)
             {
                 LOG_INFO("module.overseer",
                          // "releasing the errand as unreachable" is kept on ONE
@@ -4755,7 +4816,7 @@ private:
                          // string literals is invisible to it.
                          "overseer: '{}' was sent to '{}' and has not got any nearer than "
                          "{} yards for {} minutes - releasing the errand as unreachable",
-                         name, target, static_cast<uint32>(state.closest),
+                         name, target, static_cast<uint32>(state.progress.best),
                          static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
                 ClearTravelAim(name);
                 continue;
@@ -5784,14 +5845,14 @@ private:
         bool loggedStagedWaiting{false};
         bool loggedArmed{false};
         bool loggedUnarmed{false};
-        // A crossing's progress clock, and the count it measures progress BY -
-        // see DUNGEON_CROSSING_BACKSTOP_SECONDS. `crossedCount` only ever
-        // ratchets upward within one crossing, the same shape TravelState's
-        // `closest` uses for the same purpose: a number that cannot be beaten
-        // by a party standing still is a number a backstop can trust. Shared
-        // by ENTER and EXIT because only one crossing is ever in progress.
-        time_t crossingSince{0};
-        uint32 crossedCount{0};
+        // A crossing's progress, kept in the shared ratchet - see
+        // DUNGEON_CROSSING_RATCHET. The reading is the count already through,
+        // which only ratchets upward within one crossing: a number that cannot
+        // be beaten by a party standing still is a number a backstop can
+        // trust, which is the same reason the travel drive measures distance
+        // the same way and now through the same function. Shared by ENTER and
+        // EXIT because only one crossing is ever in progress.
+        OverseerDecisions::RatchetState crossing;
         // WHETHER THE DUNGEON BRAIN HAS EVER BEEN SEEN ON DURING THIS RUN, and
         // when CLEARING started asking. Together these are what make a DISARM
         // tellable from a run that was never armed at all: strategies live in
@@ -5950,13 +6011,14 @@ private:
         // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63's lesson, applied to a
         // different journey). One more member through is the only thing that
         // counts as progress here, and it is a fact a party standing at a door
-        // cannot fake.
-        if (through > coord.crossedCount)
-        {
-            coord.crossedCount = through;
-            coord.crossingSince = std::time(nullptr);
+        // cannot fake. The comparison and the clock are the shared ratchet;
+        // the log-once flag is this site's own reaction to progress and stays
+        // with it.
+        OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
+            coord.crossing, static_cast<float>(through), std::time(nullptr),
+            DUNGEON_CROSSING_RATCHET);
+        if (progress.progressed)
             coord.loggedCrossingWaiting = false;
-        }
 
         if (OverseerDecisions::DungeonRunAllThrough(states))
             return DungeonCrossingResult::Through;
@@ -5964,10 +6026,10 @@ private:
         // BACKSTOP. A crossing that can never finish must not pin the party to
         // a door forever - that is five characters standing still, which is the
         // state this epic exists to stop mistaking for a working one. Read with
-        // the progress check above, "since" means since somebody last actually
-        // crossed.
-        if (coord.crossingSince &&
-            std::time(nullptr) - coord.crossingSince > DUNGEON_CROSSING_BACKSTOP_SECONDS)
+        // the progress check above, a stall means nobody has crossed for
+        // DUNGEON_CROSSING_BACKSTOP_SECONDS, not that the crossing has simply
+        // been going on that long.
+        if (progress.stalled)
         {
             LOG_WARN("module.overseer",
                      "overseer: dungeon run {} has got {} of {} through areatrigger {} and "
@@ -6259,8 +6321,8 @@ private:
             if (inside)
             {
                 coord.phase = DungeonRunPhase::Exiting;
-                coord.crossingSince = std::time(nullptr);
-                coord.crossedCount = 0;
+                coord.crossing.best = 0.f;
+                coord.crossing.since = std::time(nullptr);
                 coord.loggedCrossingAim = false;
                 coord.loggedCrossingWaiting = false;
                 // The staging aim is cleared here rather than left to lapse:
@@ -6705,8 +6767,8 @@ private:
             // staging point" is false BY SUCCEEDING. A barrier re-checked after
             // it is met is a barrier that can never be passed.
             coord.phase = DungeonRunPhase::Enter;
-            coord.crossingSince = std::time(nullptr);
-            coord.crossedCount = 0;
+            coord.crossing.best = 0.f;
+            coord.crossing.since = std::time(nullptr);
             coord.loggedCrossingAim = false;
             coord.loggedCrossingWaiting = false;
             LOG_INFO("module.overseer",
@@ -8917,10 +8979,13 @@ private:
     struct FollowStallState
     {
         bool seen{false};      // false until the first position is recorded
-        float x{0.f};          // the position a stall is measured FROM
+        float x{0.f};          // the mark a stall is measured FROM
         float y{0.f};
-        time_t since{0};       // when the character was last seen this far
-                                // from `x, y` - i.e. when it last actually moved
+        // The shared ratchet's memory: how far this character has got from
+        // that mark, and when it last got far enough to count. The mark
+        // itself stays here because it is a POSITION and the ratchet deals
+        // in one number.
+        OverseerDecisions::RatchetState progress;
         time_t nudged{0};      // when a recovery was last tried, so a stall
                                 // that survives one MotionMaster::Clear() is
                                 // not clobbered again every poll
@@ -8984,7 +9049,6 @@ private:
         // and the character would walk to a trainer for a skill it is no
         // longer being sent to learn.
         uint32 learn{0};
-        time_t since{0};      // when that target was first seen
         uint32 entry{0};      // the spawn it resolved to
         bool pinned{false};   // ...and which it is NOT resolved away from again
         uint32 mapId{0};      // where that spawn is, so a map change drops the pin
@@ -8992,10 +9056,12 @@ private:
         float y{0.f};
         float z{0.f};
         bool arrived{false};  // announced already
-        // The nearest this character has ever been to this errand's target, and
-        // 0 while it has not been measured yet. The backstop's memory of whether
-        // the walk is going anywhere - see the progress check in DriveTravel.
-        float closest{0.f};
+        // The backstop's memory of whether the walk is going anywhere: the
+        // nearest this character has ever been to this errand's target, 0 while
+        // that has not been measured yet, and when it last got nearer. Kept in
+        // the shared ratchet - see TRAVEL_RATCHET and
+        // OverseerDecisions::Ratchet.
+        OverseerDecisions::RatchetState progress;
     };
     std::map<std::string, TravelState> _travelState;
 
