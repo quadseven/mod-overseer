@@ -2061,44 +2061,30 @@ private:
             // ChangeStrategy PlayerbotAI.h:407, both public; the "+name" form
             // and the BOT_STATE_NON_COMBAT state are upstream's own pairing at
             // PlayerbotAI.cpp:448.
-            // INSIDE A RUN, `follow` IS THE THING STOPPING THE DUNGEON.
+            // `follow` IS DROPPED INSIDE A RUN NO LONGER - IT WAS THE ONLY
+            // THING HOLDING THE PARTY TOGETHER.
             //
-            // `follow` exists for the overworld, where five free-roaming
-            // characters scatter - that is the 937-yard spread it cured. Inside
-            // an instance the reason evaporates and the cure becomes the
-            // disease: the party is pinned to whatever the master is doing, and
-            // the dungeon AI - which steers each character itself - cannot move
-            // anybody.
+            // The drop shipped on the hypothesis that mod-dungeon-clear steers
+            // each character itself, so the pin to a master was all that stood
+            // between an armed party and a cleared dungeon. Measured on the dev
+            // world 2026-08-30, that hypothesis is false. With `follow` gone the
+            // party does not fan out and fight; it simply stops, and any attempt
+            // to push it with per-character waypoints arrives PIECEMEAL:
             //
-            // Measured on the dev world 2026-08-30: four characters stood
-            // inside The Deadmines for six minutes at BYTE-IDENTICAL
-            // coordinates, at full health, out of combat, every one of them
-            // probing `dungeon clear` present and the run row active with a
-            // fresh heartbeat. The brain was on and inert. Sending `nc -follow`
-            // to the tank alone, changing nothing else, started it moving on
-            // the next poll:
+            //     Bork and Grog reached the tank's corpse first, pulled a
+            //     Defias Miner and an Evoker with no healer in range, and both
+            //     died. Ugga - the priest - was still walking. `Grog has died.
+            //     Bork has died.`
             //
-            //     before  Bork@-42,-370  (unchanged for six minutes)
-            //     after   Bork@-59,-368 -> -64,-385 -> -77,-373
+            // A five-man that arrives one at a time is five deaths, not a
+            // clear. Until something actually drives the party as a group,
+            // `follow` behind the tank IS the group behaviour, and taking it
+            // away costs the healer her position beside the people she heals.
             //
-            // RESTORATION NEEDS NO SEPARATE PATH, which is why this is an
-            // inversion of the existing grant rather than a new drive: the
-            // grant below already runs every poll, so the moment InDungeonRun
-            // goes false the very next poll hands `follow` back and the
-            // overworld cohesion returns on its own. A restore written as its
-            // own branch would be a second thing to keep in sync with this one.
-            if (InDungeonRun(p))
-            {
-                if (botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
-                {
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' is in a dungeon run - dropping `follow` so the "
-                             "dungeon AI can steer it; it comes back on the poll after the "
-                             "run ends", p->GetName());
-                    botAI->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
-                }
-            }
-            else if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+            // The pin is real and still worth solving - see the second gate in
+            // #100, where UpdateAIGroupMaster re-adds `follow` every tick - but
+            // it is not solved by removing the only cohesion this party has.
+            if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' had a master but no follow strategy - granting "
