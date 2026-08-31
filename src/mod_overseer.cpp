@@ -2862,9 +2862,9 @@ private:
     // The errand column's reader lives on TravelAimBook (`_travelAims.Load()`),
     // with the same read-on-its-own discipline as the two loaders either side of
     // it and the same degrade on a schema that has no `travel_npc`. It is over
-    // there because it is one of the four things that have to move together
-    // whenever that column moves - see that class for the whole argument, and
-    // for why this file no longer has a raw UPDATE of it anywhere.
+    // there because setting, clearing and reading that column are one ownership
+    // and not three - see that class for the whole argument, and for why the
+    // only UPDATE of `travel_npc` left anywhere is the one inside it.
 
     // Every enabled character's job mode (infra#2834), name -> mode. Absent
     // means the schema's own default, 'quest'
