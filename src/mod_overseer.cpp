@@ -301,6 +301,37 @@ constexpr float TRAVEL_PROGRESS_YARDS = 10.0f;
 // drive can never be the same poll. See TravelHoldsTheWheel.
 constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
 
+// A follower that has stopped, and never closes the gap (#70).
+//
+// Two followers stopped at a zone border on the dev world 2026-08-30 and
+// sat at the same coordinates for eighteen minutes, jittering ONE TO EIGHT
+// YARDS, while the leader kept walking and the 265-yard gap to the rest of
+// the party never closed. See KeepRosterFollowing's own stall check below
+// for why this drive - not UpdateAIGroupMaster, not the stuck triggers -
+// is the only thing left that could have noticed.
+//
+// JITTER BOUND. Wider than TRAVEL_PROGRESS_YARDS because the measured
+// jitter (one to eight yards) is the noise floor this has to clear without
+// tripping on a follower that is genuinely closing the gap one step at a
+// time.
+constexpr float FOLLOW_STALL_JITTER_YARDS = 10.0f;
+
+// HOW LONG BEFORE A STANDING FOLLOWER COUNTS AS STUCK RATHER THAN
+// REPATHING. Shorter than the measured eighteen minutes on purpose - the
+// point is to act long before a stall reaches that severity - and several
+// multiples of PARTY_POLL_MS (30s) so a single slow path search or a normal
+// pause at a corner is never mistaken for a stall.
+constexpr time_t FOLLOW_STALL_SECONDS = 5 * 60;
+
+// How far behind counts as "should already be closing, and is not".
+// AiPlayerbot.SightDistance (default: PlayerbotAIConfig.cpp:109) is the
+// exact distance at which upstream's own Follow() stops chasing
+// continuously and switches to a single discrete MoveTo per attempt
+// (MovementActions.cpp:1180-1224) - past this line the follower depends on
+// that single attempt actually landing, with nothing native to notice if it
+// does not.
+constexpr float FOLLOW_STALL_GAP_YARDS = 100.0f;
+
 // How often the unlearn drive looks for a profession the roster has asked a
 // character to give up (infra#2757).
 //
@@ -2140,6 +2171,117 @@ private:
                          "it, because a master nobody walks toward is not cohesion",
                          p->GetName());
                 botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+            }
+
+            // A FOLLOWER THAT HAS STOPPED, AND NEVER CLOSES THE GAP (#70).
+            //
+            // Everything above this checks that `follow` and the master are
+            // PRESENT. Neither one says whether following is actually
+            // WORKING - and measured on the dev world 2026-08-30, it can be
+            // both present and correct while the character never moves
+            // again: two followers sat at the same coordinates for eighteen
+            // minutes, jittering one to eight yards, full health, out of
+            // combat, still grouped, master and `follow` both intact the
+            // entire time, while the leader kept walking and the 265-yard
+            // gap to the rest of the party never closed.
+            //
+            // NEITHER KNOWN GATE EXPLAINS IT. UpdateAIGroupMaster re-enters
+            // every tick (PlayerbotAI.cpp:397, :439-448) but only acts when
+            // FindNewMaster() returns non-null, and for a plain-bot leader
+            // (not a selfbot) FindNewMaster() returns nullptr for every one
+            // of these five - see the WHY block above KeepRosterFollowing
+            // for the citations, confirmed again here by reading
+            // PlayerbotAI::FindNewMaster (PlayerbotAI.cpp:4410-4449): the
+            // loop over group members only returns non-null for a member
+            // with no PlayerbotAI or that IS a selfbot, and none of these
+            // five bots are either. So nothing upstream is watching a
+            // follower that stands still while a correctly-assigned master
+            // walks away.
+            //
+            // THE STUCK TRIGGER DOES NOT COVER IT EITHER, AND THE REASON
+            // ASSUMED GOING IN WAS WRONG. mod-playerbots ships
+            // MoveStuckTrigger/MoveLongStuckTrigger for exactly this shape
+            // of problem (StuckTriggers.cpp:13-53), wired to a "reset"
+            // action through the "maintenance" strategy
+            // (MaintenanceStrategy.cpp:53-60). The guess going in was that
+            // `IsRealPlayer(botAI->GetMaster())` inside IsActive()
+            // (StuckTriggers.cpp:14-15) suppresses it for these bots because
+            // their master can be a selfbot. Checked directly and that guess
+            // is WRONG: IsRealPlayer is `player && !GET_PLAYERBOT_AI(player)`
+            // (PlayerbotAI.cpp:4389-4394), and every master this function
+            // ever assigns is another roster BOT - selfbot or plain - which
+            // always has a PlayerbotAI, so IsRealPlayer(master) is false
+            // here regardless and never suppresses anything. The real reason
+            // the trigger never fires is upstream: "maintenance" is only
+            // ever added inside `if ((sRandomPlayerbotMgr.IsRandomBot(
+            // player)) ...)` (AiFactory.cpp:591), and both call sites that
+            // would add it are themselves commented out
+            // (AiFactory.cpp:627-628, :656-657). Roster characters are on
+            // named accounts and are therefore never random bots - the same
+            // gate this file's own notes already say to suspect first - so
+            // the strategy carrying the trigger is never added to any of
+            // these five, present-master guard or not.
+            //
+            // THE LEVER: a stale movement generator, not a GM shortcut.
+            // Beyond AiPlayerbot.SightDistance (100 yards by default -
+            // PlayerbotAIConfig.cpp:109 - which the measured 265-yard gap is
+            // already past), upstream's own Follow() stops chasing
+            // continuously and switches to a single discrete MoveTo per
+            // attempt (MovementActions.cpp:1180-1224), reissued only when
+            // the previous target is not a "duplicate" of the last one
+            // commanded (MovementActions.cpp:899-909). A generator that
+            // keeps producing small motion without ever arriving - which is
+            // what "jittering one to eight yards" for eighteen minutes looks
+            // like - is exactly the state MotionMaster::Clear()
+            // (MotionMaster.h:193, public from :160) exists to discard: it
+            // drops whatever the current movement generator is doing and
+            // leaves the bot idle, so the NEXT `follow` tick starts a fresh
+            // MoveTo at the leader's now-current position instead of
+            // whatever the stale one was repeating. GetMotionMaster() is
+            // public (Unit.h:1758, public from Unit.h:666).
+            //
+            // NOT CLAIMED PROVEN - MEASURED SEPARATELY FROM INFERRED. This
+            // module does not run against the live world to confirm a fix
+            // takes; the standing instruction is to never touch the running
+            // world to shortcut evidence. What is measured is the
+            // detection: the position telemetry this function already reads
+            // every poll is everything the issue asked it to use. The
+            // recovery below is the least this function can safely try with
+            // public API only - and it is loud about trying, so if it does
+            // not clear the stall the log already has the timestamp,
+            // position and gap the next attempt needs.
+            //
+            // ONE NUDGE PER STALL, NOT ONE PER POLL. FOLLOW_STALL_SECONDS
+            // already waits out normal repathing before acting once; acting
+            // again every poll after that would just interrupt whatever the
+            // fresh MoveTo above is in the middle of doing.
+            // GetDistance2d(x, y) (Object.h:538, public from :479) rather
+            // than a hand-rolled sqrt: it is the same 2D distance the engine
+            // itself already uses everywhere else in this file.
+            FollowStallState& stall = _followStall[p->GetName()];
+            float const movedFromLast =
+                stall.seen ? p->GetDistance2d(stall.x, stall.y) : 0.f;
+            if (!stall.seen || movedFromLast > FOLLOW_STALL_JITTER_YARDS)
+            {
+                stall.seen = true;
+                stall.x = p->GetPositionX();
+                stall.y = p->GetPositionY();
+                stall.since = std::time(nullptr);
+                stall.nudged = 0;
+            }
+            else if (p->GetDistance2d(leader) > FOLLOW_STALL_GAP_YARDS &&
+                     std::time(nullptr) - stall.since > FOLLOW_STALL_SECONDS &&
+                     std::time(nullptr) - stall.nudged > FOLLOW_STALL_SECONDS)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has not moved more than {} yards in over {} "
+                         "minutes and is {} yards from '{}' - clearing its movement "
+                         "so the next follow tick starts fresh",
+                         p->GetName(), static_cast<uint32>(FOLLOW_STALL_JITTER_YARDS),
+                         static_cast<uint32>(FOLLOW_STALL_SECONDS / 60),
+                         static_cast<uint32>(p->GetDistance2d(leader)), leader->GetName());
+                p->GetMotionMaster()->Clear();
+                stall.nudged = std::time(nullptr);
             }
         }
     }
@@ -7369,6 +7511,28 @@ private:
     // is unguarded like _travelState and _lastAim above, and lost on restart,
     // which costs at most one extra grace period.
     std::map<std::string, int64> _awaitingRelease;
+
+    // What KeepRosterFollowing knew about each follower's position last
+    // time round, so a stall is measured against ITS OWN best position
+    // rather than the previous poll - the same closest-ratchet shape as
+    // TravelState::closest above, applied to "has this character actually
+    // moved" instead of "has this errand gotten nearer". Written and read
+    // only from KeepRosterFollowing on the world thread, so it is unguarded
+    // like _travelState and _awaitingRelease, and lost on restart, which
+    // costs at most one extra grace period before a stall is acted on
+    // again.
+    struct FollowStallState
+    {
+        bool seen{false};      // false until the first position is recorded
+        float x{0.f};          // the position a stall is measured FROM
+        float y{0.f};
+        time_t since{0};       // when the character was last seen this far
+                                // from `x, y` - i.e. when it last actually moved
+        time_t nudged{0};      // when a recovery was last tried, so a stall
+                                // that survives one MotionMaster::Clear() is
+                                // not clobbered again every poll
+    };
+    std::map<std::string, FollowStallState> _followStall;
 
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
