@@ -1710,6 +1710,53 @@ private:
         // promotes whoever is left, so a character taken over at the keyboard
         // and handed back comes home a member. Corrected here rather than with
         // `.group leader`, which needs GM security a bot session does not have.
+        // THE LOWEST LEVEL LEADS, AND THAT IS THE WHOLE POINT OF THE FAMILY.
+        //
+        // WHAT WAS WRONG. Every character quested for itself. The quest drive
+        // picks each one's objective out of its OWN log, and `travel_npc` is a
+        // per-character column, so five characters pursued five errands in
+        // five places and the party existed on paper only. Measured over one
+        // day: the spread went from four levels to SIX, because whoever was
+        // already ahead kept earning while whoever was behind was somewhere
+        // else entirely, or parked.
+        //
+        // WHY LEADERSHIP IS THE LEVER AND NOT A NEW DRIVE. The follower
+        // machinery already points the whole party at its leader, and the
+        // leader is the only character the travel and quest drives will
+        // actually send anywhere (`new rpg` is carried by the leader alone).
+        // So whoever leads decides where five characters go and what they
+        // fight. Handing that to the character who is BEHIND turns the party's
+        // default behaviour into "help the one who needs it" without inventing
+        // any new steering at all: the rest arrive by following, and they fight
+        // what the leader pulls because tank-assist already keys on that.
+        //
+        // Level is read off the live Player rather than the roster, because a
+        // ding between polls should move leadership on the next one rather
+        // than wait for a row to be rewritten (Unit.h:1104, public from
+        // Unit.h:666).
+        //
+        // TIES BREAK BY NAME so the choice is stable. Two characters at the
+        // same level must not hand leadership back and forth every poll - the
+        // party would spend its life turning around.
+        //
+        // `lead` REMAINS AN OVERRIDE, and deliberately so: it is how a person
+        // says "no, this one leads" for a run that needs a specific character
+        // in front. Absent that, the default is the character who is behind.
+        if (wantsToLead.empty())
+        {
+            Player const* lowest = nullptr;
+            for (Player const* p : present)
+            {
+                if (!p)
+                    continue;
+                if (!lowest || p->GetLevel() < lowest->GetLevel() ||
+                    (p->GetLevel() == lowest->GetLevel() && p->GetName() < lowest->GetName()))
+                    lowest = p;
+            }
+            if (lowest)
+                wantsToLead = lowest->GetName();
+        }
+
         if (!wantsToLead.empty())
         {
             if (Player* head = ObjectAccessor::FindPlayerByName(wantsToLead))
@@ -1718,8 +1765,10 @@ private:
                 {
                     group->ChangeLeader(head->GetGUID());
                     group->SendUpdate();
-                    LOG_INFO("module.overseer", "overseer: '{}' now leads the party",
-                             wantsToLead);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' now leads the party at level {} - the family "
+                             "follows whoever is furthest behind, so its errands become "
+                             "everybody's", wantsToLead, static_cast<uint32>(head->GetLevel()));
                 }
             }
         }
