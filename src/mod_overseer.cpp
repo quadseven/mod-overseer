@@ -4959,11 +4959,76 @@ private:
                 corpseY = f[3].Get<float>();
             }
 
-            // Still nothing: a ghost genuinely without a corpse anywhere. That
-            // is the case the original guard was written for and it is left
-            // alone - there is no death to time from and nothing to recover to.
+            // NOBODY IS THERE TO CLICK RELEASE.
+            //
+            // No ghost time and no corpse row used to mean "nothing to recover
+            // to", and for a true bot it does. For a character with a CLIENT
+            // attached it means the opposite: it is dead, sitting on the
+            // "You have died. Release to the nearest graveyard?" prompt, and
+            // waiting for a button press from a person who is not there.
+            //
+            // A corpse only exists AFTER the release. So the very state that
+            // needs rescuing is the one that produces none of the evidence the
+            // rest of this drive reads, and it was skipped on every pass -
+            // forever, silently. Measured on the dev world 2026-08-30: one
+            // character lay dead inside an instance for EIGHT MINUTES with this
+            // drive logging nothing, and once five clients were running rather
+            // than one, two of the five were sitting on that prompt at the same
+            // moment.
+            //
+            // The button is not special. Its opcode handler does exactly two
+            // things (MiscHandler.cpp:59-100, CMSG_REPOP_REQUEST):
+            //
+            //     GetPlayer()->BuildPlayerRepop();
+            //     GetPlayer()->RepopAtGraveyard();
+            //
+            // Both are public (Player.h:2074-2075, public from Player.h:1091),
+            // so the server can do for itself what it was waiting to be told.
+            //
+            // TIMED FROM OUR OWN FIRST SIGHTING, because there is no ghost
+            // clock yet - that is the whole point. The map is keyed by name and
+            // cleared the moment the character is alive again, so a character
+            // that dies twice is timed from each death rather than the first.
+            //
+            // THE GRACE IS DELIBERATE AND NOT ZERO. A healer in the party may
+            // resurrect a corpse, which is better than a graveyard run because
+            // it keeps the body where the fight was. Releasing instantly would
+            // take that option away from every death. So this waits the same
+            // STUCK_REVIVAL_DEAD_SECONDS the ghost path waits, and only then
+            // concludes that nobody is coming.
             if (!ghostTime)
+            {
+                bool const released = bot->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+                if (released)
+                {
+                    _awaitingRelease.erase(name);
+                    continue;
+                }
+
+                int64 const now = time(nullptr);
+                auto const seen = _awaitingRelease.find(name);
+                if (seen == _awaitingRelease.end())
+                {
+                    _awaitingRelease[name] = now;
+                    continue;
+                }
+                if (now - seen->second < STUCK_REVIVAL_DEAD_SECONDS)
+                    continue;
+
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been dead {}s on the release prompt with nobody "
+                         "at the keyboard to answer it - releasing on its behalf, because a "
+                         "corpse only exists after the release and every other recovery path "
+                         "here waits for one", name, now - seen->second);
+                bot->BuildPlayerRepop();
+                bot->RepopAtGraveyard();
+                _awaitingRelease.erase(name);
                 continue;
+            }
+
+            // Alive again, or released and now a ghost: either way this is no
+            // longer a character waiting on a prompt.
+            _awaitingRelease.erase(name);
 
             int64 const deadFor = time(nullptr) - ghostTime;
             if (deadFor < STUCK_REVIVAL_DEAD_SECONDS)
@@ -7247,6 +7312,15 @@ private:
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
+    // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
+    //
+    // There is no ghost clock for this state - a corpse, and therefore a ghost
+    // time, only exists after the release - so the drive has to keep its own.
+    // Written and read only from DriveStuckRevival on the world thread, so it
+    // is unguarded like _travelState and _lastAim above, and lost on restart,
+    // which costs at most one extra grace period.
+    std::map<std::string, int64> _awaitingRelease;
+
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
     uint32 _engagementTimer = 0;
