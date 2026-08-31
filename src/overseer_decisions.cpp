@@ -129,10 +129,16 @@ bool RatchetProgressed(float reading, float best, RatchetLimits const& limits)
     switch (limits.reading)
     {
         case RatchetReading::DistanceToTarget:
-            // `!best` is "no reading yet" here and not "arrived" - see the
-            // enum. It is also exactly the test the travel backstop this came
-            // from was already making against its own `closest`.
-            return !best || reading < best - limits.margin;
+            // NO `!best` GUARD HERE ANY MORE (#119). It read a mark of zero as
+            // "no reading yet", and zero is a real distance the caller reaches
+            // whenever the subject is standing on the point it was sent to -
+            // GetDistance2d clamps at zero once it is within its own size of
+            // the target. The mark then could never be beaten and the clock
+            // was restarted every poll for failing to beat it, so the backstop
+            // could not fire at all. "There is no mark" is now
+            // RatchetState::measured, which Ratchet checks before it asks
+            // this, and `best` here is only ever a mark that was really taken.
+            return reading < best - limits.margin;
         case RatchetReading::CountAchieved:
         case RatchetReading::DistanceFromLastMark:
             // The same comparison for both, which is not a coincidence worth
@@ -148,7 +154,22 @@ RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
                        RatchetLimits const& limits)
 {
     RatchetVerdict verdict;
-    verdict.progressed = RatchetProgressed(reading, state.best, limits);
+
+    // THE FIRST DISTANCE IS THE MARK, and this is the only place that can tell
+    // a first reading from a repeat one (#119). A distance the subject is
+    // trying to shrink has nothing to be nearer than until something has been
+    // measured, so the first reading is progress whatever it is - including
+    // 0.0f, which is what a character standing on its target measures and
+    // which the falsy guard this replaces mistook for an unmeasured mark
+    // forever. The other two readings are deliberately NOT given this rule:
+    // they start from a real mark of zero, and the crossing backstop's clock
+    // depends on a first poll with nobody through not counting as progress.
+    bool const firstDistance =
+        !state.measured && limits.reading == RatchetReading::DistanceToTarget;
+    state.measured = true;
+
+    verdict.progressed =
+        firstDistance || RatchetProgressed(reading, state.best, limits);
 
     if (verdict.progressed)
     {

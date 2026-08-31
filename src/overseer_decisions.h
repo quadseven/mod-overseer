@@ -191,11 +191,36 @@ enum class RatchetReading
 {
     // A DISTANCE TO SOMETHING THE SUBJECT IS TRYING TO REACH. Progress is
     // getting NEARER than it has ever been, by more than `margin`, so the mark
-    // only ever falls. A mark of ZERO means no reading has been taken yet and
-    // never "already arrived": the caller measures with
-    // WorldObject::GetDistance2d, which clamps at zero once the subject is
-    // within its own size of the target, and it settles arrival before it asks
-    // this.
+    // only ever falls, and the FIRST reading is always progress because there
+    // is nothing yet to be nearer than.
+    //
+    // ZERO IS A REAL DISTANCE HERE AND MUST NOT DOUBLE AS "NO READING YET"
+    // (#119). The caller measures with WorldObject::GetDistance2d(float, float),
+    // which subtracts the subject's own size and clamps the remainder at zero:
+    //
+    //     float d = GetExactDist2d(x, y) - GetObjectSize();
+    //     return d > 0.0f ? d : 0.0f;
+    //     (azerothcore-wotlk @ efe123fa,
+    //      src/server/game/Entities/Object/Object.cpp:1323-1327)
+    //
+    // so every subject standing within its own size of the point reads as
+    // exactly 0.0f, not as a near miss.
+    //
+    // THAT IS A DISC, NOT A KNIFE EDGE. GetObjectSize() is the subject's own
+    // UNIT_FIELD_COMBATREACH where it has one and DEFAULT_WORLD_OBJECT_SIZE
+    // times its scale where it does not (Object.cpp:2892-2895), and neither
+    // branch can be zero - those constants are 1.5 and 0.389 respectively
+    // (ObjectDefines.h:44-45). A `trigger:` or `at:` errand aims at a
+    // coordinate the character is meant to end up standing on, so zero is the
+    // NORMAL reading for exactly the errands that most need a backstop, not a
+    // corner case that needed the character to land on a single point.
+    //
+    // Zero is also the identity for the two readings below, which grow, and
+    // the ABSORBING value for this one, which shrinks - nothing is ever nearer
+    // than zero. So a zero mark mistaken for an absent one is a mark that can
+    // never be beaten, on a clock that is restarted every poll for failing to
+    // beat it. `RatchetState::measured` says which it is instead, and the
+    // value is left free to mean only what it measures.
     DistanceToTarget,
 
     // A COUNT OF THINGS THAT HAVE ALREADY HAPPENED. Progress is a bigger count
@@ -234,6 +259,27 @@ struct RatchetLimits
 // correctness, exactly as each of those states already documented for itself.
 struct RatchetState
 {
+    // HAS A READING EVER BEEN FED TO THIS RATCHET. Not derivable from `best`,
+    // and that is the entire reason it exists: for DistanceToTarget a reading
+    // of exactly 0.0f is both reachable and common (see the enum above), so
+    // `best == 0.f` cannot be asked to mean "unmeasured" without misreading a
+    // subject standing on its target as one that has never been measured.
+    //
+    // WHY A FLAG AND NOT A SENTINEL VALUE. A sentinel would have to live in
+    // `best`, which is shared by all three readings, and the only values that
+    // cannot collide with a real distance are negative or non-finite. A
+    // negative default silently changes the two readings that GROW, whose test
+    // is `reading > best + margin`: the crossing's first poll with nobody
+    // through would start counting as progress, which is precisely the
+    // behaviour its own comment depends on not happening. A NaN default is
+    // worse in the other direction - every comparison against it is false, so
+    // the first distance would never be progress and the clock would never
+    // start. A flag changes nothing outside the one case it is asked about.
+    //
+    // This is also the shape the module already uses for the same problem:
+    // FollowStallState::seen is a bool for "there is no mark yet", kept apart
+    // from a mark the subject is standing on.
+    bool measured{false};
     float best{0.f};  // the best reading so far, in the sense named above
     time_t since{0};  // when `best` was last beaten
 };
@@ -244,10 +290,20 @@ struct RatchetVerdict
     bool stalled{false};     // no progress for longer than `patienceSeconds`
 };
 
-// Does this reading count as progress? The comparison half of Ratchet on its
-// own, for the site whose patience is counted in tries rather than in seconds
-// and which therefore has no clock to keep. Pure in the strongest sense: it
-// changes nothing and reads nothing but its arguments.
+// Does this reading count as progress against a mark that EXISTS? The
+// comparison half of Ratchet on its own, for the site whose patience is
+// counted in tries rather than in seconds and which therefore has no clock to
+// keep. Pure in the strongest sense: it changes nothing and reads nothing but
+// its arguments.
+//
+// "A MARK THAT EXISTS" IS THE PRECONDITION, and it is the caller's to meet.
+// This function is handed a `best`, not a RatchetState, so it has no way to
+// know whether one was ever taken - and for DistanceToTarget the answer
+// changes the verdict, since the first reading is progress whatever it is.
+// Ratchet below answers that from `RatchetState::measured` before it gets
+// here. The one site that calls this directly measures DistanceFromLastMark
+// against a mark it drops itself, which is always real and always at zero, so
+// the question does not arise there.
 bool RatchetProgressed(float reading, float best, RatchetLimits const& limits);
 
 // The whole thing: compare, then either restart the clock or say how long it

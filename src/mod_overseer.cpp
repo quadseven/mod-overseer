@@ -294,6 +294,18 @@ constexpr time_t TRAVEL_BACKSTOP_SECONDS = 20 * 60;
 // beating it, while a bot actually walking beats it every poll. Wide enough to
 // clear the jitter of a bot that has stopped, narrow enough to be nothing next
 // to a real journey.
+//
+// ONCE THE CHARACTER IS INSIDE THIS MARGIN OF ITS BEST, THE CLOCK RUNS, and
+// that is the intent rather than a gap in it. A character that has closed to
+// the last few yards and stopped improving is either about to be released by
+// the arrival check above or is held by something arrival cannot settle - a
+// door it cannot step through, a trainer that cannot teach it - and those are
+// the cases the backstop is for. Before #119 the most important of them
+// escaped it anyway, and only that one: a character standing ON the aimed point
+// measures exactly 0.0f, and a best of zero was misread as "never measured",
+// which counted as progress and restarted the clock on every poll. A character
+// stopped at 40 yards was bounded correctly the whole time; a character stopped
+// at 0 was not bounded at all.
 constexpr float TRAVEL_PROGRESS_YARDS = 10.0f;
 
 // The travel backstop's whole rule in one place: what the reading means, how
@@ -4647,7 +4659,11 @@ private:
                 state.arrived = false;
                 // A new errand is a new ratchet: nothing measured yet, and the
                 // clock starts now rather than carrying the last errand's over.
-                state.progress.best = 0.f;
+                // ASSIGNED WHOLE rather than field by field, because "nothing
+                // measured yet" is now two fields and clearing one of them
+                // would leave the previous errand's mark behind wearing this
+                // errand's clock - see OverseerDecisions::RatchetState.
+                state.progress = OverseerDecisions::RatchetState{};
                 state.progress.since = std::time(nullptr);
             }
 
@@ -6321,7 +6337,11 @@ private:
             if (inside)
             {
                 coord.phase = DungeonRunPhase::Exiting;
-                coord.crossing.best = 0.f;
+                // Assigned whole, for the reason DriveTravel's own reset
+                // gives: "nothing measured yet" is more than one field now,
+                // and clearing part of it leaves the previous crossing's
+                // memory behind wearing this crossing's clock.
+                coord.crossing = OverseerDecisions::RatchetState{};
                 coord.crossing.since = std::time(nullptr);
                 coord.loggedCrossingAim = false;
                 coord.loggedCrossingWaiting = false;
@@ -6767,7 +6787,9 @@ private:
             // staging point" is false BY SUCCEEDING. A barrier re-checked after
             // it is met is a barrier that can never be passed.
             coord.phase = DungeonRunPhase::Enter;
-            coord.crossing.best = 0.f;
+            // Assigned whole - see the ENTER-side reset in DriveDungeonRun
+            // and OverseerDecisions::RatchetState.
+            coord.crossing = OverseerDecisions::RatchetState{};
             coord.crossing.since = std::time(nullptr);
             coord.loggedCrossingAim = false;
             coord.loggedCrossingWaiting = false;
@@ -9057,10 +9079,13 @@ private:
         float z{0.f};
         bool arrived{false};  // announced already
         // The backstop's memory of whether the walk is going anywhere: the
-        // nearest this character has ever been to this errand's target, 0 while
-        // that has not been measured yet, and when it last got nearer. Kept in
-        // the shared ratchet - see TRAVEL_RATCHET and
-        // OverseerDecisions::Ratchet.
+        // nearest this character has ever been to this errand's target, when it
+        // last got nearer, and whether anything has been measured at all. That
+        // last flag is not spare (#119): the nearest distance is 0.0f for a
+        // character standing on its target, so it cannot also mean "not
+        // measured yet" without the backstop's clock being restarted forever
+        // on exactly the errands it exists to bound. Kept in the shared ratchet
+        // - see TRAVEL_RATCHET and OverseerDecisions::Ratchet.
         OverseerDecisions::RatchetState progress;
     };
     std::map<std::string, TravelState> _travelState;
