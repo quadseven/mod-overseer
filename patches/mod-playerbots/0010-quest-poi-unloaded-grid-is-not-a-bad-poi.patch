@@ -1,0 +1,122 @@
+Subject: [PATCH] quest POI: an unloaded grid is not a bad destination
+
+infra#2801 follow-on. Patch 0003 raised the turn-in POI cap to 5000 and dropped
+the zone check so a quest could be handed in one zone away. It was correct and
+it was not enough: every such POI was still discarded, silently, one filter
+further down.
+
+    float dz = std::max(GetHeight(dx, dy, MAX_HEIGHT), GetWaterLevel(dx, dy));
+    if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
+        continue;
+
+`GetHeight` returns INVALID_HEIGHT for terrain that is not in memory, which is
+the normal state of anywhere the bot is not standing. So the check does not
+mean "this is a bad place to walk to" - for anything far enough away to be
+worth a MoveFarTo, it means "I have not loaded that yet".
+
+MEASURED, not reasoned. A temporary probe (retired in this same commit) logged
+the following every tick for an hour, for a character holding a COMPLETE quest:
+
+    [MFT] Grug: POI reject: quest=5 BAD-HEIGHT dz=-100000.0 at (-10499,-1158) dist=1905
+    [MFT] Grug: POI LOOKUP FAILED quest=5 (toComplete) - every candidate rejected
+
+dz = -100000 is INVALID_HEIGHT. The distance passed the 5000 cap and the zone
+check no longer exists, so this height test was the only thing left rejecting
+it. With the candidate list empty the lookup returns false, DoCompletedQuest
+calls ChangeToIdle, and the module re-picks the same quest twenty seconds
+later. The character oscillated inside a 40-yard box, 1900 yards from a
+turn-in it had already earned, indefinitely.
+
+WHY FORGIVING IT IS SAFE
+
+  * Nothing downstream wants this z. POIInfo carries x and y only
+    (NewRpgBaseAction.h) - dz is computed, tested, and thrown away.
+  * MoveFarTo routes through PathGenerator, which resolves its own endpoint and
+    already recovers from a wedged path by teleporting after five failed
+    attempts. It does not need an accurate destination z to begin.
+  * The POI is recomputed as the bot closes. By the time the grid is loaded the
+    real height is used, so the provisional value only ever covers the approach.
+
+WHAT IS NOT FORGIVEN: a grid that IS loaded and still reports an invalid
+height. That is a genuinely bad location and is rejected exactly as before.
+`Map::IsGridLoaded(float, float)` (Map.h:213) is the discriminator, and it is
+public and phase-independent.
+
+The identical test in DoCompletedQuest is treated the same way, because it is
+the "double check" of a value the lookup deliberately no longer treats as
+fatal - leaving it would reinstate the wedge one line later.
+
+WHAT WOULD LET THIS PATCH BE DELETED: upstream distinguishing "unknown height"
+from "invalid height" at either site, or POIInfo carrying a z that is resolved
+lazily.
+
+NUMBERED 0010, NOT 0008: 0008-bad-equip-is-a-greed-not-a-need landed on main
+while this was being investigated, and 0009 is the probe this commit retires.
+Two temp patches previously collided on 0008; this avoids a third.
+
+APPLIES TO: mod-playerbots @ 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312,
+NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx (toComplete branch) and
+NewRpgDoQuestAction::DoCompletedQuest.
+diff --git a/src/Ai/World/Rpg/Action/NewRpgAction.cpp b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
+index c32440d2..acf0082f 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
+@@ -636,9 +636,19 @@ bool NewRpgDoQuestAction::DoCompletedQuest(NewRpgInfo::DoQuest& data)
+         // z = MAX_HEIGHT as we do not know accurate z
+         float dz = std::max(bot->GetMap()->GetHeight(dx, dy, MAX_HEIGHT), bot->GetMap()->GetWaterLevel(dx, dy));
+ 
+-        // double check for GetQuestPOIPosAndObjectiveIdx
++        // infra: the same unloaded-grid forgiveness the POI lookup now applies
++        // (NewRpgBaseAction.cpp). This is the "double check" of a value that
++        // lookup deliberately no longer treats as fatal, so rejecting here
++        // would reinstate the wedge one line later. A provisional z of the
++        // bot's own is enough for MoveFarTo, which routes through
++        // PathGenerator and resolves its own endpoint; the POI is recomputed
++        // as the bot closes and the real height is picked up then.
+         if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
+-            return false;
++        {
++            if (bot->GetMap()->IsGridLoaded(dx, dy))
++                return false;
++            dz = bot->GetPositionZ();
++        }
+ 
+         WorldPosition pos(bot->GetMapId(), dx, dy, dz);
+         data.lastReachPOI = 0;
+diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+index 00f7ef71..9f4df925 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+@@ -917,8 +917,31 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
+ 
+             float dz = std::max(bot->GetMap()->GetHeight(dx, dy, MAX_HEIGHT), bot->GetMap()->GetWaterLevel(dx, dy));
+ 
++            // infra: AN UNLOADED GRID IS NOT A BAD DESTINATION.
++            //
++            // GetHeight returns INVALID_HEIGHT for terrain that simply is not
++            // in memory, which is the normal state of anywhere the bot is not
++            // standing. Patch 0003 raised this branch's cap to 5000 and
++            // dropped the zone check precisely so a turn-in one zone away
++            // could be chosen - and then every such POI was still discarded
++            // here, silently, because its grid is not loaded. Measured: a
++            // reward POI 1905 yards away returned dz = -100000 on every tick
++            // for an hour, the candidate list came back empty, DoCompletedQuest
++            // called ChangeToIdle, and the module re-picked the same quest
++            // twenty seconds later, forever.
++            //
++            // Only an unloaded grid is forgiven. If the grid IS loaded and the
++            // height is still invalid the POI is genuinely bad and is rejected
++            // exactly as before. Nothing downstream needs this z: POIInfo
++            // carries x and y only, and MoveFarTo routes through PathGenerator,
++            // which resolves its own endpoint - and the POI is recomputed as
++            // the bot closes, by which point the grid is loaded and the real
++            // height is used.
+             if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
+-                continue;
++            {
++                if (bot->GetMap()->IsGridLoaded(dx, dy))
++                    continue;
++            }
+ 
+             // THE SAME-ZONE FILTER IS GONE. It is what stranded every bot with
+             // an out-of-zone turn-in: the POI was discarded, poiInfo came back
