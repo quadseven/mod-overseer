@@ -125,6 +125,11 @@
 #include "Opcodes.h"
 #include "WorldPacket.h"
 
+// The decisions this module makes that need nothing from the world. Its own
+// header so that something other than this translation unit can reach them -
+// see overseer_decisions.h for why that was worth a file.
+#include "overseer_decisions.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -5798,183 +5803,21 @@ private:
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
-    // THE BARRIER PREDICATE, KEPT FREE OF EVERY CORE TYPE ON PURPOSE. Nothing
-    // here touches Player, Map, or PlayerbotAI - it is fed plain facts the
-    // caller already gathered, so it can be exercised directly by a unit test
-    // with no world, no bot, and no database, and so a change to how the facts
-    // are gathered can never also silently change what BARRIER requires.
+    // THE BARRIER AND CROSSING PREDICATES NOW LIVE IN overseer_decisions.h,
+    // unchanged. They were written free of every core type so that a unit test
+    // could exercise them with no world, no bot and no database, and they said
+    // so in their own comments - but as private members of this class, in a
+    // .cpp with no header, there was nothing such a test could include and
+    // nothing it could link. Moving them is what makes the seam they already
+    // describe reachable; that header carries the whole argument and their
+    // comments verbatim.
     //
-    // ALL THREE CONDITIONS ARE FROM THE EPIC, VERBATIM: "hold until ALL are
-    // within ~10y, alive, and out of combat." Fails closed: an empty roster or
-    // any member this poll could not even find (a name that resolved to
-    // nobody, or a distance never measured because the character is on a
-    // different map) reads as barrier-not-met, never as vacuously met -
-    // exactly the "geography is necessary but not sufficient" lesson
-    // InDungeonRun above already had to learn once.
-    struct DungeonRunMemberState
-    {
-        std::string name;
-        bool seen{false};              // false = not found in the world this poll
-        bool alive{false};
-        bool inCombat{false};
-        float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
-    };
-
-    static bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
-                                     float radiusYards)
-    {
-        if (members.empty())
-            return false;
-
-        for (DungeonRunMemberState const& member : members)
-        {
-            if (!member.seen)
-                return false;
-            if (!member.alive)
-                return false;
-            if (member.inCombat)
-                return false;
-            if (member.distanceFromStage < 0.f || member.distanceFromStage > radiusYards)
-                return false;
-        }
-        return true;
-    }
-
-    // Why a member is failing BARRIER, for the one log line BARRIER prints
-    // while it waits. Kept separate from the predicate above so the predicate
-    // itself stays a plain bool with nothing to format - a pure function that
-    // also builds strings is a pure function that is harder to test twice.
-    static std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
-                                                  float radiusYards)
-    {
-        std::string blockers;
-        for (DungeonRunMemberState const& member : members)
-        {
-            std::string why;
-            if (!member.seen)
-                why = "not seen";
-            else if (!member.alive)
-                why = "dead";
-            else if (member.inCombat)
-                why = "in combat";
-            else if (member.distanceFromStage < 0.f)
-                why = "wrong map";
-            else if (member.distanceFromStage > radiusYards)
-                why = std::to_string(static_cast<int>(member.distanceFromStage)) + "y away";
-            else
-                continue;
-
-            if (!blockers.empty())
-                blockers += ", ";
-            blockers += member.name + " (" + why + ")";
-        }
-        return blockers;
-    }
-
-    // THE CROSSING PREDICATES, KEPT FREE OF EVERY CORE TYPE FOR THE SAME REASON
-    // THE BARRIER ONE IS. Nothing below touches Player, Map or PlayerbotAI, so
-    // "when may the party be knocked through" can be exercised by a unit test
-    // with no world, and a change to how the facts are gathered can never
-    // silently change what a crossing requires.
-    //
-    // ONE SHAPE FOR BOTH DIRECTIONS. `through` means "on the far side of this
-    // door", which for ENTER is the instance map and for EXIT is the map
-    // outside it. ENTER and EXIT differ in which trigger and which far side,
-    // and in nothing else, so they share these predicates rather than owning a
-    // copy each - a party that can get in and cannot get out is a worse failure
-    // than one that never went in, and two copies is how the second one rots.
-    //
-    // WHY THIS IS NOT DungeonRunMemberState WITH A DIFFERENT CENTRE. A member
-    // that is ALREADY THROUGH is on another map, which to the barrier predicate
-    // reads as "wrong map" and therefore as not-met - the one state a crossing
-    // most needs to distinguish would have been indistinguishable from failure.
-    // Being through is a third answer, not a bad distance, so it is a field of
-    // its own.
-    struct DungeonRunEntryState
-    {
-        std::string name;
-        bool seen{false};             // false = not found in the world this poll
-        bool alive{false};
-        bool inCombat{false};
-        bool through{false};          // already on the far side of the door
-        float distanceFromDoor{-1.f}; // negative = not measured (through, wrong map, or !seen)
-    };
-
-    // Is every member either already through, or standing on the doorstep alive
-    // and out of combat? Fails closed on an empty roster and on any member this
-    // poll could not find, exactly as the barrier predicate does and for the
-    // same reason: a knock for a party that is not all there is the tank
-    // entering alone with extra steps.
-    static bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
-                                     float doorstepYards)
-    {
-        if (members.empty())
-            return false;
-
-        for (DungeonRunEntryState const& member : members)
-        {
-            if (member.through)
-                continue;
-            if (!member.seen)
-                return false;
-            if (!member.alive)
-                return false;
-            if (member.inCombat)
-                return false;
-            if (member.distanceFromDoor < 0.f || member.distanceFromDoor > doorstepYards)
-                return false;
-        }
-        return true;
-    }
-
-    // Is the crossing finished? Separate from the readiness predicate above
-    // because "everybody is through" and "everybody may be knocked" are
-    // different questions with different answers on every poll in between, and
-    // a single function answering both would have to be asked which it meant.
-    static bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members)
-    {
-        if (members.empty())
-            return false;
-
-        for (DungeonRunEntryState const& member : members)
-            if (!member.through)
-                return false;
-        return true;
-    }
-
-    // Why a member is not through yet, for the one line ENTER prints while it
-    // waits. Kept out of the predicates for the reason DungeonRunBarrierBlockers
-    // already gives: a pure function that also builds strings is a pure function
-    // that is harder to test twice.
-    static std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
-                                               float doorstepYards)
-    {
-        std::string blockers;
-        for (DungeonRunEntryState const& member : members)
-        {
-            if (member.through)
-                continue;
-
-            std::string why;
-            if (!member.seen)
-                why = "not seen";
-            else if (!member.alive)
-                why = "dead";
-            else if (member.inCombat)
-                why = "in combat";
-            else if (member.distanceFromDoor < 0.f)
-                why = "wrong map";
-            else if (member.distanceFromDoor > doorstepYards)
-                why = std::to_string(static_cast<int>(member.distanceFromDoor)) + "y from the door";
-            else
-                why = "at the door, not through";
-
-            if (!blockers.empty())
-                blockers += ", ";
-            blockers += member.name + " (" + why + ")";
-        }
-        return blockers;
-    }
+    // WHAT STAYED HERE, AND WHY THE LINE IS WHERE IT IS: everything below
+    // touches the world. DungeonRunCensus needs an AreaTrigger and a Player,
+    // DungeonRunKnock sends a packet. They are the mechanical half of a
+    // crossing and were never testable without a world, so moving them would
+    // have moved the core types into the file whose whole value is not having
+    // any.
 
     // ---- the mechanical half of a crossing, shared by ENTER and EXIT ----
     //
@@ -5985,17 +5828,17 @@ private:
     // Where every roster member stands relative to one door. `throughMapId` is
     // the map a member is on once it is through - the instance map for ENTER,
     // the map outside it for EXIT.
-    static std::vector<DungeonRunEntryState> DungeonRunCensus(
+    static std::vector<OverseerDecisions::DungeonRunEntryState> DungeonRunCensus(
         std::vector<std::string> const& members, AreaTrigger const* door,
         uint32 throughMapId, uint32& through)
     {
         through = 0;
 
-        std::vector<DungeonRunEntryState> states;
+        std::vector<OverseerDecisions::DungeonRunEntryState> states;
         states.reserve(members.size());
         for (std::string const& name : members)
         {
-            DungeonRunEntryState state;
+            OverseerDecisions::DungeonRunEntryState state;
             state.name = name;
 
             // SteerableAI, not a bare lookup - a name can resolve to a Player
@@ -6043,7 +5886,7 @@ private:
     // holds. The ordering argument is in the section comment above and applies
     // in both directions: the leader is the anchor every follower is standing
     // next to, so he is the last thing that may move.
-    uint32 DungeonRunKnock(std::vector<DungeonRunEntryState> const& states,
+    uint32 DungeonRunKnock(std::vector<OverseerDecisions::DungeonRunEntryState> const& states,
                            std::string const& leaderName, uint32 triggerId)
     {
         std::ostringstream doorAim;
@@ -6054,7 +5897,7 @@ private:
         uint32 crossed = 0;
         for (bool leaderPass : passes)
         {
-            for (DungeonRunEntryState const& state : states)
+            for (OverseerDecisions::DungeonRunEntryState const& state : states)
             {
                 if (state.through)
                     continue;
@@ -6101,7 +5944,7 @@ private:
                                                DungeonRunCoordinatorState& coord)
     {
         uint32 through = 0;
-        std::vector<DungeonRunEntryState> const states =
+        std::vector<OverseerDecisions::DungeonRunEntryState> const states =
             DungeonRunCensus(members, door, throughMapId, through);
 
         // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63's lesson, applied to a
@@ -6115,7 +5958,7 @@ private:
             coord.loggedCrossingWaiting = false;
         }
 
-        if (DungeonRunAllThrough(states))
+        if (OverseerDecisions::DungeonRunAllThrough(states))
             return DungeonCrossingResult::Through;
 
         // BACKSTOP. A crossing that can never finish must not pin the party to
@@ -6131,7 +5974,8 @@ private:
                      "nobody else has crossed for {} minutes - giving up. Still short: {}",
                      what, through, static_cast<uint32>(states.size()), triggerId,
                      static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60),
-                     DungeonRunEntryBlockers(states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+                     OverseerDecisions::DungeonRunEntryBlockers(
+                         states, DUNGEON_DOORSTEP_RADIUS_YARDS));
             return DungeonCrossingResult::GaveUp;
         }
 
@@ -6156,8 +6000,8 @@ private:
         // `> DUNGEON_DOORSTEP_RADIUS_YARDS` on its own, so writing an aim that
         // could only be refused is not a case to special-case, it is a case
         // that never arises. Both still show up in the holds line below.
-        DungeonRunEntryState const* leaderState = nullptr;
-        for (DungeonRunEntryState const& state : states)
+        OverseerDecisions::DungeonRunEntryState const* leaderState = nullptr;
+        for (OverseerDecisions::DungeonRunEntryState const& state : states)
             if (state.name == leaderName)
                 leaderState = &state;
 
@@ -6188,7 +6032,7 @@ private:
             }
         }
 
-        if (!DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))
+        if (!OverseerDecisions::DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))
         {
             if (!coord.loggedCrossingWaiting)
             {
@@ -6197,7 +6041,8 @@ private:
                          "overseer: dungeon run {} holds - {} of {} are through areatrigger "
                          "{} and the rest are not on the doorstep yet: {}",
                          what, through, static_cast<uint32>(states.size()), triggerId,
-                         DungeonRunEntryBlockers(states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+                         OverseerDecisions::DungeonRunEntryBlockers(
+                             states, DUNGEON_DOORSTEP_RADIUS_YARDS));
             }
             return DungeonCrossingResult::Working;
         }
@@ -6640,7 +6485,7 @@ private:
             // DungeonRunPhase::StagedInside and DungeonRunPhase::Clearing, both
             // of which are about who is inside rather than about a door.
             uint32 inside = 0;
-            std::vector<DungeonRunEntryState> const states =
+            std::vector<OverseerDecisions::DungeonRunEntryState> const states =
                 DungeonRunCensus(members, door, portal->insideMapId, inside);
 
             // NOBODY LEFT INSIDE MEANS THE RUN IS OVER, however it ended - a
@@ -6661,7 +6506,7 @@ private:
 
             if (coord.phase == DungeonRunPhase::StagedInside)
             {
-                if (!DungeonRunAllThrough(states))
+                if (!OverseerDecisions::DungeonRunAllThrough(states))
                 {
                     // SOME IN, SOME OUT. Said out loud once rather than held
                     // silently: a party split across a portal is the exact
@@ -6675,8 +6520,8 @@ private:
                                  "party is split - {} of {} are in there. Still outside: {}",
                                  portal->insideMapId, inside,
                                  static_cast<uint32>(states.size()),
-                                 DungeonRunEntryBlockers(states,
-                                                         DUNGEON_DOORSTEP_RADIUS_YARDS));
+                                 OverseerDecisions::DungeonRunEntryBlockers(
+                                     states, DUNGEON_DOORSTEP_RADIUS_YARDS));
                     }
                     return;
                 }
@@ -6720,7 +6565,7 @@ private:
             // recorded once would then be a verdict that is quietly false.
             uint32 armed = 0;
             std::string unarmed;
-            for (DungeonRunEntryState const& state : states)
+            for (OverseerDecisions::DungeonRunEntryState const& state : states)
             {
                 if (!state.through)
                     continue;   // outside: only a character in the instance can be armed
@@ -6820,11 +6665,11 @@ private:
         // leader (see the section comment above) - so a follower's own
         // aliveness, combat state and distance are facts only this poll can
         // measure, not facts the GATHERING phase already established for it.
-        std::vector<DungeonRunMemberState> states;
+        std::vector<OverseerDecisions::DungeonRunMemberState> states;
         states.reserve(members.size());
         for (std::string const& name : members)
         {
-            DungeonRunMemberState state;
+            OverseerDecisions::DungeonRunMemberState state;
             state.name = name;
 
             // SteerableAI, not a bare lookup - the same reason every other
@@ -6851,7 +6696,7 @@ private:
             states.push_back(state);
         }
 
-        if (DungeonRunBarrierMet(states, DUNGEON_BARRIER_RADIUS_YARDS))
+        if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_BARRIER_RADIUS_YARDS))
         {
             // THE BARRIER IS A ONE-WAY DOOR INTO ENTER, not a condition ENTER
             // keeps re-asking. Once the party is gathered, the next thing that
@@ -6880,7 +6725,8 @@ private:
             coord.loggedBarrierWaiting = true;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER holds - {}",
-                     DungeonRunBarrierBlockers(states, DUNGEON_BARRIER_RADIUS_YARDS));
+                     OverseerDecisions::DungeonRunBarrierBlockers(
+                         states, DUNGEON_BARRIER_RADIUS_YARDS));
         }
     }
 
