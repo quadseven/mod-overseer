@@ -124,4 +124,47 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
     return blockers;
 }
 
+bool RatchetProgressed(float reading, float best, RatchetLimits const& limits)
+{
+    switch (limits.reading)
+    {
+        case RatchetReading::DistanceToTarget:
+            // `!best` is "no reading yet" here and not "arrived" - see the
+            // enum. It is also exactly the test the travel backstop this came
+            // from was already making against its own `closest`.
+            return !best || reading < best - limits.margin;
+        case RatchetReading::CountAchieved:
+        case RatchetReading::DistanceFromLastMark:
+            // The same comparison for both, which is not a coincidence worth
+            // tidying away: they differ in what the mark BECOMES on progress,
+            // below, not in what beats it. A mark the caller moves is always
+            // measured from zero.
+            return reading > best + limits.margin;
+    }
+    return false;
+}
+
+RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
+                       RatchetLimits const& limits)
+{
+    RatchetVerdict verdict;
+    verdict.progressed = RatchetProgressed(reading, state.best, limits);
+
+    if (verdict.progressed)
+    {
+        state.best =
+            limits.reading == RatchetReading::DistanceFromLastMark ? 0.f : reading;
+        state.since = now;
+        return verdict;
+    }
+
+    // A patience of zero means the caller counts, and a `since` of zero means
+    // no clock has been started yet. Neither can stall, and neither is a
+    // degenerate case to be papered over: they are two sites saying, in the
+    // only place it can be said once, that they do not want this half.
+    verdict.stalled = limits.patienceSeconds != 0 && state.since != 0 &&
+                      now - state.since > limits.patienceSeconds;
+    return verdict;
+}
+
 }  // namespace OverseerDecisions
