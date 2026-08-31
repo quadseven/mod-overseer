@@ -1022,7 +1022,7 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
 //   g_aimSnapshot - last known job / quest aim / travel target. Refreshed
 //                   every QUEST_POLL_MS by DriveQuests, which already loads
 //                   all three every pass (LoadJobs, LoadQuestAims,
-//                   LoadTravelAims) - RememberAim there is a cache write next
+//                   TravelAimBook::Load) - RememberAim there is a cache write
 //                   to a read that was happening anyway, not a new one.
 //
 //   g_pendingKill - who landed the killing blow, if anyone. Captured by
@@ -1234,6 +1234,265 @@ void RecordDeath(Player* player)
     }
     g_deathQueue.push_back(std::move(d));
 }
+
+// ----------------------------------------------------------- errand column --
+//
+// THE ONE OWNER OF `overseer_roster.travel_npc`, AND OF EVERYTHING THAT MOVES
+// WITH IT.
+//
+// WHY THIS IS A THING AND NOT THREE LOOSE MEMBERS ON THE WORLD SCRIPT. That
+// column is the only one on the roster with two writers, and until this existed
+// the two wrote it differently. Setting or clearing it is never just a write:
+// three things move together and only one of them is in the table.
+//
+//   * THE COLUMN, which is what every reader asks. DriveTravel reads it to run
+//     the errand, DriveQuests' arbitration reads it to decide who steers, and
+//     DriveEngagementSafety reads it to decide whether a character is
+//     unattended.
+//   * THE ERRAND MEMORY (`_state`), which is the walk in flight: the spawn this
+//     errand pinned, the closest the character has ever got to it, and the clock
+//     the backstop reads. It belongs to ONE errand, not to a character, so it
+//     has to die with the errand it was about.
+//   * THE HAND-BACK CLOCK (`_handback`), the moment travel let go, which
+//     TravelHoldsTheWheel reads to keep the quest drive off the wheel for
+//     TRAVEL_HANDBACK_SECONDS afterwards.
+//
+// DriveTravel always moved all three, through one function. The dungeon run
+// coordinator wrote the column raw in eight places and moved neither of the
+// other two, so a release it drove was only reconciled a poll later by
+// PruneVanished below - and an aim it re-issued at a target the previous errand
+// had already failed at inherited that errand's clock, and was released as
+// unreachable on its first poll having walked nowhere. That is the same bug
+// Release's own comment describes, reached through the one door nothing was
+// watching. What was seen on the dev world was aims overwritten mid-run, and a
+// leader walking back out of a dungeon under a staging aim that had outlived
+// the thing it was staging for.
+//
+// So the side effects stop being something a call site can forget. Nothing
+// outside this writes the column: both drives go through Claim and Release, and
+// each of those does the whole of its own job or none of it.
+//
+// TWO NAMED WRITES, NOT ONE WRITE WITH A FLAG. Claim TAKES the wheel and
+// Release HANDS IT BACK, and the hand-back clock belongs to exactly one of
+// those two acts. A `bool stampHandback` parameter would have made "does this
+// stamp the clock" a question every call site answers again, which is how the
+// asymmetry got here in the first place. Two verbs make it a property of what
+// is being done rather than of who is doing it.
+class TravelAimBook
+{
+public:
+    // What DriveTravel knew about each errand last time round, so an aim that
+    // can never land is given up on rather than renewed forever, and so
+    // "arrived" is announced once instead of every poll. World thread only -
+    // DriveTravel runs from OnUpdate - so unguarded, like _lastAim. Lost on
+    // restart, which only restarts the backstop clock.
+    struct TravelState
+    {
+        std::string target;   // the column value as this loop last saw it
+        // What the errand was FOR, as of the last poll. A changed learn skill
+        // is a changed errand even when the target keyword has not moved,
+        // because the resolve is narrowed by it - see ResolveTravelTarget.
+        // Without this the pinned spawn from the previous trade would be kept
+        // and the character would walk to a trainer for a skill it is no
+        // longer being sent to learn.
+        uint32 learn{0};
+        uint32 entry{0};      // the spawn it resolved to
+        bool pinned{false};   // ...and which it is NOT resolved away from again
+        uint32 mapId{0};      // where that spawn is, so a map change drops the pin
+        float x{0.f};
+        float y{0.f};
+        float z{0.f};
+        bool arrived{false};  // announced already
+        // The backstop's memory of whether the walk is going anywhere: the
+        // nearest this character has ever been to this errand's target, 0 while
+        // that has not been measured yet, and when it last got nearer. Kept in
+        // the shared ratchet - see TRAVEL_RATCHET and
+        // OverseerDecisions::Ratchet.
+        //
+        // IT HAS NO LIFETIME OF ITS OWN, and that is the whole of this class's
+        // interaction with #118. The ratchet lives INSIDE the errand record, so
+        // every way an errand can end already takes it: Release and
+        // PruneVanished erase the record, Claim erases it before writing a new
+        // aim, and the first poll of the new errand default-constructs a fresh
+        // one which DriveTravel's own `target != target` branch then starts the
+        // clock on. Nothing here reads or writes `best`, so the meaning of a
+        // zero mark stays entirely OverseerDecisions::Ratchet's to define.
+        OverseerDecisions::RatchetState progress;
+    };
+
+    // Every enabled character with an outstanding errand, name -> target.
+    // Absent means '', "stay with the family"
+    // (2026_08_25_00_overseer_roster_travel_npc.sql).
+    //
+    // ONE READER, THREE CALLERS, AND NO CACHED RESULT. DriveQuests needs this to
+    // run the arbitration, DriveTravel needs it to run the errands, and
+    // DriveEngagementSafety needs it to tell an unattended character from a
+    // character on an errand. They are on SEPARATE timers - QUEST_POLL_MS,
+    // TRAVEL_POLL_MS and ENGAGEMENT_POLL_MS - so there is no tick they reliably
+    // share and no single snapshot that could serve all three without being
+    // stale for some of them. Sharing the QUERY instead of a cached result keeps
+    // each drive reading the table as it stands when it runs, and keeps
+    // DriveTravel from having to know that DriveQuests exists - which
+    // TravelHoldsTheWheel forbids, for the reason set out there.
+    //
+    // A null result is an EMPTY MAP and not an error, deliberately: a schema
+    // older than this column fails the SELECT whole (MySQL 1054), and "nobody is
+    // aimed" is the answer every caller already handles. See the schema-drift
+    // block above LoadQuestAims for the whole argument.
+    std::map<std::string, std::string> Load() const
+    {
+        std::map<std::string, std::string> aims;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, travel_npc FROM overseer_roster "
+            "WHERE enabled = 1 AND travel_npc <> ''");
+        if (!result)
+            return aims;  // no errands, or no such column - same answer
+        do
+        {
+            Field* fields = result->Fetch();
+            aims[fields[0].Get<std::string>()] = fields[1].Get<std::string>();
+        } while (result->NextRow());
+        return aims;
+    }
+
+    // TAKE THE WHEEL. The dungeon run coordinator is the only caller: it aims
+    // the leader at a staging point or at a door, because the leader is the only
+    // character that can be aimed at all (CanBeSentToNpc) and the followers
+    // travel by following him.
+    //
+    // THIS DOES NOT STAMP THE HAND-BACK CLOCK, AND THAT IS THE WHOLE REASON IT
+    // IS A SEPARATE VERB FROM Release. The hand-back is a promise that the quest
+    // drive will not grab a character on the tick travel let go of it. Nothing
+    // is being let go of here - an aim is being taken - and the aim itself is
+    // already what stands the quest drive down (TravelHoldsTheWheel, case 1). A
+    // clock stamped here would be a hand-back that never happened.
+    //
+    // THE ERRAND MEMORY DIES WITH THE ERRAND IT WAS ABOUT. A new aim is a new
+    // errand even when the string happens to match one this character failed at
+    // before, and inheriting the old pin and the old backstop clock is exactly
+    // the failure Release's comment describes: released as unreachable on its
+    // first poll, having walked nowhere. DriveTravel's own `state.target !=
+    // target` reset cannot cover this, because the case that bites is the one
+    // where the target is the SAME.
+    //
+    // AND IT IS IDEMPOTENT AGAINST THE AIM ALREADY IN FLIGHT, which is what lets
+    // the coordinator call it on every poll of a crossing without a guard of its
+    // own. `_state[name].target` IS the column as DriveTravel last read it, so
+    // "is this character already walking to exactly this" is answerable from
+    // here without asking the database a second time - which is what the
+    // coordinator used to do, with a whole-roster SELECT, once per poll.
+    // Re-issuing over the walk in flight would reset the pin and restart the
+    // backstop clock every five seconds, and would also defeat DriveTravel's own
+    // re-issue guard, which exists because ChangeToWanderNpc resets `lastReach`
+    // and `startT`.
+    //
+    // WHEN THERE IS NO MEMORY TO CONSULT the write happens unconditionally, and
+    // costs nothing: the character has no errand in flight for this loop to
+    // disturb, the UPDATE writes the same string the previous poll wrote, and
+    // erasing an entry that is not there is a no-op. The memory is at most one
+    // TRAVEL_POLL_MS behind the table, and the same is true in the other
+    // direction: if the bridge overwrites or clears this column, the next
+    // DriveTravel poll re-reads it and the poll after that claims again.
+    void Claim(std::string const& name, std::string const& target)
+    {
+        auto const it = _state.find(name);
+        if (it != _state.end() && it->second.target == target)
+            return;
+
+        // Esc() rather than a bare interpolation, the same discipline every
+        // other write in this file applies: the name came out of a table a
+        // person edits, and a later change to the aim format cannot silently
+        // reopen the question.
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
+            Esc(target), Esc(name));
+        _state.erase(name);
+    }
+
+    // GIVE THE ERRAND BACK. THE ONE TERMINAL PATH - every release, in either
+    // drive, goes through here, which is why it does three things and not one.
+    void Release(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
+        // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
+        // twenty-minute backstop, and a state entry outliving its errand is
+        // inherited by the NEXT errand at the same target - which is then
+        // released as unreachable on its first poll, having walked nowhere.
+        _state.erase(name);
+        // And the quest drive keeps its hands off for a moment: see
+        // TravelHoldsTheWheel, case 2.
+        //
+        // STAMPED WHETHER OR NOT ANYTHING WAS ACTUALLY OUTSTANDING, on purpose.
+        // Asking the table first would cost a query to save at most one
+        // QUEST_POLL_MS of a stand-down that costs nothing - the quest drive
+        // re-asserts the same aim on its next poll - and a conditional side
+        // effect is a side effect a future caller can find itself on the wrong
+        // side of. Unconditional is what makes this impossible to skip.
+        _handback[name] = std::time(nullptr);
+    }
+
+    // An errand can also end without either drive touching it: the bridge owns
+    // the column too and clears it when it re-aims the family. Such a row simply
+    // stops coming back from Load(), so nothing INSIDE DriveTravel's loop can
+    // see it go, and its state entry would sit there with a running clock
+    // waiting to poison the next errand. Comparing the memory against the rows
+    // that did come back is the only place that absence is visible.
+    void PruneVanished(std::set<std::string> const& stillAimed)
+    {
+        for (auto it = _state.begin(); it != _state.end();)
+        {
+            if (stillAimed.count(it->first))
+            {
+                ++it;
+                continue;
+            }
+            // The character may be mid-walk under an aim nobody is renewing any
+            // more, so this is a release like any other and takes the same grace.
+            _handback[it->first] = std::time(nullptr);
+            it = _state.erase(it);
+        }
+    }
+
+    // HAS TRAVEL LET GO OF THIS CHARACTER TOO RECENTLY FOR THE QUEST DRIVE TO
+    // PICK IT UP? Case 2 of the arbitration, and the only part of it that is
+    // about this column's own bookkeeping rather than about what a character can
+    // be asked to do - which is why the rest of TravelHoldsTheWheel stays where
+    // it is, with the strategy check it needs.
+    //
+    // Sweeps the entry once it lapses: a refusal that outlives its reason is its
+    // own bug, the same shape the repick memory's give-up set already uses
+    // (infra#2801).
+    bool WithinHandbackGrace(std::string const& name)
+    {
+        auto const it = _handback.find(name);
+        if (it == _handback.end())
+            return false;
+        if (std::time(nullptr) - it->second < TRAVEL_HANDBACK_SECONDS)
+            return true;
+        _handback.erase(it);
+        return false;
+    }
+
+    // The walk in flight, for the loop that is actually walking it. DriveTravel
+    // owns what goes IN this record - the pin, the progress, the "said already"
+    // flag - and this owns its LIFETIME: it is created here on demand, and
+    // destroyed by Claim, Release and PruneVanished, which are every way an
+    // errand can begin or end.
+    TravelState& StateFor(std::string const& name)
+    {
+        return _state[name];
+    }
+
+private:
+    std::map<std::string, TravelState> _state;
+    // When travel last let go of a character, so the quest drive does not pick
+    // it up on the same tick the errand ended. Written by Release and by
+    // PruneVanished - every way an errand can end - and read only by
+    // WithinHandbackGrace, which sweeps an entry once it lapses. World thread
+    // only, like everything else on this loop.
+    std::map<std::string, time_t> _handback;
+};
 }  // namespace
 
 /*
@@ -2515,7 +2774,7 @@ private:
     // the query is being run.
     //
     // SO EACH LATE-ADDED COLUMN IS READ ON ITS OWN. LoadQuestAims and
-    // LoadTravelAims below each select one column and each return an EMPTY map
+    // TravelAimBook::Load each select one column and each return an EMPTY map
     // when the read comes back null. Every caller already handles an empty map,
     // because that is also what "nobody is aimed" looks like - which is why
     // there is no 1054 test anywhere here and does not need to be: the error
@@ -2600,40 +2859,19 @@ private:
         return GET_PLAYERBOT_AI(bot);
     }
 
-    // Every enabled character with an outstanding errand, name -> target.
-    // Absent means '', "stay with the family"
-    // (2026_08_25_00_overseer_roster_travel_npc.sql).
-    //
-    // ONE READER, TWO CALLERS, AND NO SHARED STATE. DriveQuests needs this to
-    // run the arbitration and DriveTravel needs it to run the errands. They are
-    // on SEPARATE timers - QUEST_POLL_MS and TRAVEL_POLL_MS - so there is no
-    // tick they reliably share and no single snapshot that could serve both
-    // without being stale for one of them. Sharing the QUERY instead of a
-    // cached result keeps each drive reading the table as it stands when it
-    // runs, and keeps DriveTravel from having to know that DriveQuests exists -
-    // which TravelHoldsTheWheel forbids, for the reason set out there.
-    std::map<std::string, std::string> LoadTravelAims()
-    {
-        std::map<std::string, std::string> aims;
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT name, travel_npc FROM overseer_roster "
-            "WHERE enabled = 1 AND travel_npc <> ''");
-        if (!result)
-            return aims;  // no errands, or no such column - same answer
-        do
-        {
-            Field* fields = result->Fetch();
-            aims[fields[0].Get<std::string>()] = fields[1].Get<std::string>();
-        } while (result->NextRow());
-        return aims;
-    }
+    // The errand column's reader lives on TravelAimBook (`_travelAims.Load()`),
+    // with the same read-on-its-own discipline as the two loaders either side of
+    // it and the same degrade on a schema that has no `travel_npc`. It is over
+    // there because setting, clearing and reading that column are one ownership
+    // and not three - see that class for the whole argument, and for why the
+    // only UPDATE of `travel_npc` left anywhere is the one inside it.
 
     // Every enabled character's job mode (infra#2834), name -> mode. Absent
     // means the schema's own default, 'quest'
     // (2026_08_26_01_overseer_roster_job.sql) - so a row nobody has touched, a
     // row explicitly set to 'quest', and a `job` column that does not exist
     // yet are all the same thing to DriveQuests, deliberately: read-on-its-own,
-    // same discipline as LoadQuestAims and LoadTravelAims and for the same
+    // same discipline as LoadQuestAims and TravelAimBook::Load and for the same
     // reason (the DDL and this reader ship in different images).
     //
     // ONLY 'quest' IS EXCLUDED FROM THE QUERY rather than every mode fetched
@@ -2846,7 +3084,7 @@ private:
         // Read first, and each on its own, so that neither aim column can stop
         // this drive from running - see above.
         std::map<std::string, uint32> const aims = LoadQuestAims();
-        std::map<std::string, std::string> const travelAims = LoadTravelAims();
+        std::map<std::string, std::string> const travelAims = _travelAims.Load();
         // infra#2834: everybody NOT holding job 'quest'. Checked first in the
         // loop below, before any quest aim or travel arbitration - a
         // character told to farm or rest should not have a quest re-asserted
@@ -3971,7 +4209,7 @@ private:
 
     // Every enabled character the roster has an OPINION about, name -> plan.
     //
-    // READ ON ITS OWN, like LoadQuestAims and LoadTravelAims and for the same
+    // READ ON ITS OWN, like LoadQuestAims and TravelAimBook::Load and for the same
     // reason: these four columns ship in the DB-IMPORT image and this reader
     // ships in the WORLDSERVER image, the two are pinned and bumped
     // independently, and a SELECT naming a column that does not exist fails
@@ -4029,7 +4267,7 @@ private:
             "UPDATE overseer_roster SET learn_skill = 0 WHERE name = '{}'", Esc(name));
     }
 
-    // The price dies with the request, for the same reason ClearTravelAim
+    // The price dies with the request, for the same reason TravelAimBook::Release
     // erases the clock: a leftover `unlearn_max` would be inherited by the NEXT
     // request against the same character, and the next one might be for a skill
     // worth a great deal more than this one was.
@@ -4487,14 +4725,11 @@ private:
         //
         //    A grace keyed by name and swept when it lapses is the shape the
         //    repick memory's give-up set already uses (infra#2801): a refusal
-        //    that outlives its reason is its own bug.
-        auto const it = _travelHandback.find(name);
-        if (it == _travelHandback.end())
-            return false;
-        if (std::time(nullptr) - it->second < TRAVEL_HANDBACK_SECONDS)
-            return true;
-        _travelHandback.erase(it);
-        return false;
+        //    that outlives its reason is its own bug. The clock itself belongs
+        //    to the errand column and is kept with it - every way an errand can
+        //    end stamps it, and there is now exactly one place each of those
+        //    lives. See TravelAimBook.
+        return _travelAims.WithinHandbackGrace(name);
     }
 
     // KNOCK ON THE DOOR THE CHARACTER HAS WALKED TO. Returns true ONLY if it
@@ -4550,46 +4785,13 @@ private:
         return true;
     }
 
-    // Give the errand back. THE ONE TERMINAL PATH - every release in DriveTravel
-    // goes through here, which is why it does three things and not one.
-    //
-    // Esc() rather than a bare interpolation for the same reason every other
-    // write in this file uses it: the name came out of a table a person edits.
-    void ClearTravelAim(std::string const& name)
-    {
-        CharacterDatabase.Execute(
-            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
-        // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
-        // twenty-minute backstop, and a state entry outliving its errand is
-        // inherited by the NEXT errand at the same target - which is then
-        // released as unreachable on its first poll, having walked nowhere.
-        _travelState.erase(name);
-        // And the quest drive keeps its hands off for a moment: see
-        // TravelHoldsTheWheel, case 2.
-        _travelHandback[name] = std::time(nullptr);
-    }
-
-    // An errand can also end without this loop touching it: the bridge owns the
-    // column and clears it when it re-aims the family. Such a row simply stops
-    // coming back from the query, so nothing INSIDE the loop can see it go, and
-    // its state entry would sit there with a running clock waiting to poison the
-    // next errand. Comparing the map against the rows that did come back is the
-    // only place that absence is visible.
-    void PruneTravelState(std::set<std::string> const& stillAimed)
-    {
-        for (auto it = _travelState.begin(); it != _travelState.end();)
-        {
-            if (stillAimed.count(it->first))
-            {
-                ++it;
-                continue;
-            }
-            // The character may be mid-walk under an aim nobody is renewing any
-            // more, so this is a release like any other and takes the same grace.
-            _travelHandback[it->first] = std::time(nullptr);
-            it = _travelState.erase(it);
-        }
-    }
+    // The release path, the prune and the errand memory all live on
+    // TravelAimBook now - `_travelAims.Release()`, `_travelAims.PruneVanished()`
+    // and `_travelAims.StateFor()`. They moved together because they always
+    // WERE together: releasing an errand is a column write, an erase of that
+    // errand's memory and a stamp of the hand-back clock, and a caller that does
+    // one of the three has done none of the job. The dungeon run coordinator
+    // used to do exactly that in eight places; see that class for what it cost.
 
     void DriveTravel()
     {
@@ -4597,7 +4799,7 @@ private:
         // two can never be looking at different answers to "who is on an
         // errand". The WHERE clause that used to live here lives in the loader:
         // an empty target never reaches this loop, exactly as before.
-        std::map<std::string, std::string> const aims = LoadTravelAims();
+        std::map<std::string, std::string> const aims = _travelAims.Load();
         // Read once for the whole sweep rather than per character: the errands
         // and the trades are the same handful of rows, and this is the read
         // that decides both WHERE a character is sent and what it does when it
@@ -4611,7 +4813,7 @@ private:
             // true. A schema with no `travel_npc` lands here too, which is the
             // correct degrade for this drive and always was: no column, no
             // errands, nobody sent anywhere.
-            PruneTravelState(std::set<std::string>());
+            _travelAims.PruneVanished(std::set<std::string>());
             return;
         }
 
@@ -4637,7 +4839,7 @@ private:
                 planIt == plans.end() ? nullptr : &planIt->second;
             uint32 const wantSkill = plan ? plan->learnSkill : 0;
 
-            TravelState& state = _travelState[name];
+            TravelAimBook::TravelState& state = _travelAims.StateFor(name);
             if (state.target != target || state.learn != wantSkill)
             {
                 state.target = target;
@@ -4701,7 +4903,7 @@ private:
                          "overseer: '{}' was sent to '{}' and there is no such spawn on "
                          "map {} - releasing the errand", name, target,
                          static_cast<uint32>(bot->GetMapId()));
-                ClearTravelAim(name);
+                _travelAims.Release(name);
                 continue;
             }
 
@@ -4726,7 +4928,7 @@ private:
                 bool const doorway = target.rfind("trigger:", 0) == 0;
                 if (doorway && StepThroughAreaTrigger(name, bot, target))
                 {
-                    ClearTravelAim(name);
+                    _travelAims.Release(name);
                     continue;
                 }
 
@@ -4785,7 +4987,7 @@ private:
                     LOG_INFO("module.overseer",
                              "overseer: '{}' reached '{}' (creature {}) - errand done, "
                              "releasing", name, target, entry);
-                    ClearTravelAim(name);
+                    _travelAims.Release(name);
                     continue;
                 }
             }
@@ -4818,7 +5020,7 @@ private:
                          "{} yards for {} minutes - releasing the errand as unreachable",
                          name, target, static_cast<uint32>(state.progress.best),
                          static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
-                ClearTravelAim(name);
+                _travelAims.Release(name);
                 continue;
             }
 
@@ -4890,7 +5092,7 @@ private:
             }
         }
 
-        PruneTravelState(stillAimed);
+        _travelAims.PruneVanished(stillAimed);
     }
 
     // ---------------------------------------------------------- engagement --
@@ -4975,7 +5177,7 @@ private:
         // than either degrades this drive exactly like it degrades theirs -
         // to "nobody has an opinion", never to "nothing runs".
         std::map<std::string, uint32> const questAims = LoadQuestAims();
-        std::map<std::string, std::string> const travelAims = LoadTravelAims();
+        std::map<std::string, std::string> const travelAims = _travelAims.Load();
 
         QueryResult result = CharacterDatabase.Query(
             "SELECT name FROM overseer_roster WHERE enabled = 1");
@@ -5719,9 +5921,9 @@ private:
     // instance once they are inside it. Before entry there is exactly one
     // party and exactly one run it could be gathering for, so the state below
     // is a single in-process struct - unguarded, world-thread-only, following
-    // the same pattern _travelState and _awaitingRelease already document
-    // (see their comments) - rather than a table this slice has no second
-    // reader for yet.
+    // the same pattern TravelAimBook's errand memory and _awaitingRelease
+    // already document (see their comments) - rather than a table this slice
+    // has no second reader for yet.
     struct DungeonPortal
     {
         char const* keyword;       // matched against the leader's job target (future: multiple dungeons)
@@ -5825,9 +6027,9 @@ private:
     };
 
     // World-thread-only, unguarded, lost on restart - same discipline as
-    // _travelState and _awaitingRelease (see their comments): OnUpdate is the
-    // only caller of DriveDungeonRun, and a restart costs one re-gather, not
-    // correctness.
+    // TravelAimBook's errand memory and _awaitingRelease (see their comments):
+    // OnUpdate is the only caller of DriveDungeonRun, and a restart costs one
+    // re-gather, not correctness.
     struct DungeonRunCoordinatorState
     {
         DungeonRunPhase phase{DungeonRunPhase::Idle};
@@ -6047,12 +6249,29 @@ private:
         // alone and ahead of everyone following him, which is the failure this
         // state exists to prevent. `at:` only ever walks.
         //
-        // WRITTEN ONLY WHEN THERE IS NOTHING ALREADY WALKING HIM. The errand
-        // column is read through the same guarded loader DriveTravel and the
-        // quest drive's arbitration both use, so the three can never disagree
-        // about whether an errand is outstanding. Re-issuing over a live aim is
-        // what ChangeToWanderNpc's own re-issue guard exists to prevent, and
-        // doing it from out here would defeat it.
+        // CLAIMED RATHER THAN WRITTEN, and the guard that used to sit here is
+        // gone with the raw write. This used to run a whole-roster SELECT of
+        // `travel_npc` on every poll of a crossing purely to avoid stamping on a
+        // live errand - a mutex improvised on a column because nothing owned it.
+        // TravelAimBook owns it now, and Claim is idempotent against the walk in
+        // flight from the memory it already keeps, so re-issuing over the aim
+        // this state wrote last poll cannot happen and costs no query to avoid.
+        // That is the thing the guard was written for: ChangeToWanderNpc's own
+        // re-issue guard resets `lastReach` and `startT`, and defeating it from
+        // out here is what would oscillate.
+        //
+        // WHAT THE GUARD ALSO DID BY ACCIDENT, AND DELIBERATELY NO LONGER DOES.
+        // It refused to write while ANY other aim was outstanding, including one
+        // this same coordinator had written moments earlier. BARRIER is satisfied
+        // at DUNGEON_BARRIER_RADIUS_YARDS (10) while DriveTravel only releases a
+        // staged `at:` errand at TRAVEL_ARRIVED_POSITION_YARDS (5), so a leader
+        // that settles between those two figures reaches ENTER with its staging
+        // errand still live - and the old guard then refused the door aim until
+        // that errand's twenty-minute backstop fired. A crossing that cannot be
+        // started because the walk to its own doorstep is still finishing is the
+        // party standing still, which is the state this epic exists to stop
+        // mistaking for a working one. A run supersedes an errand; Claim takes
+        // the wheel and says so in its name.
         //
         // ONE COMPARISON COVERS THREE CASES, and deliberately: a leader already
         // through and a leader on some third map both carry a NEGATIVE
@@ -6068,19 +6287,13 @@ private:
                 leaderState = &state;
 
         if (leaderState &&
-            leaderState->distanceFromDoor > DUNGEON_DOORSTEP_RADIUS_YARDS &&
-            !LoadTravelAims().count(leaderName))
+            leaderState->distanceFromDoor > DUNGEON_DOORSTEP_RADIUS_YARDS)
         {
             std::ostringstream aim;
             // AreaTrigger::map/x/y/z  ObjectMgr.h:425,426,427,428
             aim << "at:" << door->map << ':' << door->x << ',' << door->y << ',' << door->z;
 
-            // Esc() even though every character in a coordinate string is
-            // already safe - the same discipline every other write in this file
-            // applies to a value going into SQL.
-            CharacterDatabase.Execute(
-                "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
-                Esc(aim.str()), Esc(leaderName));
+            _travelAims.Claim(leaderName, aim.str());
 
             if (!coord.loggedCrossingAim)
             {
@@ -6252,13 +6465,15 @@ private:
             aim << "at:" << portal->outsideMapId << ':' << portal->stageX << ','
                 << portal->stageY << ',' << portal->stageZ;
 
-            // Esc() even though every character in a coordinate string is
-            // already safe - the same discipline every other write in this
-            // file applies to a value going into SQL, so a later change to
-            // the format string cannot silently reopen the question.
-            CharacterDatabase.Execute(
-                "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
-                Esc(aim.str()), Esc(leaderName));
+            // CLAIM, not a raw UPDATE: the run supersedes whatever the leader
+            // was doing, and taking the wheel also drops any errand memory left
+            // over from the last time this exact staging point was aimed at -
+            // which is the case DriveTravel's own `target != target` reset
+            // cannot see, because the target is the same string. Without that,
+            // a re-gather after a given-up crossing inherits the failed
+            // crossing's backstop clock and is released as unreachable on its
+            // first poll, having walked nowhere. See TravelAimBook.
+            _travelAims.Claim(leaderName, aim.str());
 
             coord = DungeonRunCoordinatorState();
             coord.phase = DungeonRunPhase::Gathering;
@@ -6325,14 +6540,12 @@ private:
                 coord.crossing.since = std::time(nullptr);
                 coord.loggedCrossingAim = false;
                 coord.loggedCrossingWaiting = false;
-                // The staging aim is cleared here rather than left to lapse:
+                // The staging aim is released here rather than left to lapse:
                 // EXIT writes its own aim at the exit trigger, and an errand
                 // pointing at the entrance is one DriveTravel would refuse from
                 // inside anyway (ResolveTravelTarget checks the map), releasing
                 // it on a line that says "no such spawn" and reads as a fault.
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
-                    Esc(leaderName));
+                _travelAims.Release(leaderName);
                 LOG_INFO("module.overseer",
                          "overseer: '{}' job left 'dungeon' while the party was inside - "
                          "the run is over, so EXIT walks them back out through the door "
@@ -6350,10 +6563,17 @@ private:
                      "overseer: '{}' job left 'dungeon' before the party was staged "
                      "inside - the dungeon run coordinator stands down and clears its "
                      "staging aim", leaderName);
-            if (leaderAI)
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
-                    Esc(leaderName));
+            // AND THE `if (leaderAI)` THAT USED TO GATE THIS IS GONE. Releasing
+            // an errand is a write to a roster row and an erase of this module's
+            // own memory of it; neither needs the character to be in the world,
+            // and the check below is the one that does. What the gate actually
+            // did was leak the staging aim in the one case where nothing else
+            // would ever clear it: the coordinator returns to IDLE on this line,
+            // so a leader that is mid-login or logged out when its job leaves
+            // 'dungeon' kept a live aim at a dungeon portal with no coordinator
+            // left to own it. That is the "outlived its purpose" shape this
+            // whole change is about.
+            _travelAims.Release(leaderName);
             coord = DungeonRunCoordinatorState();
             return;
         }
@@ -6376,6 +6596,16 @@ private:
                      "overseer: '{}' is already inside a dungeon run - the staging "
                      "coordinator had not finished BARRIER, but entry has already "
                      "happened by some other path; returning to IDLE", leaderName);
+            // AND THE STAGING AIM GOES WITH THE COORDINATOR THAT OWNED IT. It
+            // points at a spot on the OUTSIDE map, the leader is now on the
+            // inside one, and nothing is left here to clear it. DriveTravel
+            // would eventually release it on a line reading "there is no such
+            // spawn on map {} - releasing the errand", which is true and reads
+            // as a fault; worse, anything that puts a member back on the outside
+            // map before that poll (a wipe releases to a graveyard out there)
+            // finds a live aim walking it to the dungeon door. Released where
+            // the reason is known. Same argument as the ENTER success path.
+            _travelAims.Release(leaderName);
             coord = DungeonRunCoordinatorState();
             return;
         }
@@ -6440,9 +6670,7 @@ private:
                           "overseer: dungeon run wanted areatrigger {} and this world's "
                           "tables do not have it - there is no door to walk through, so the "
                           "run is given up rather than held forever", triggerId);
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
-                    Esc(leaderName));
+                _travelAims.Release(leaderName);
                 coord = DungeonRunCoordinatorState();
                 return;
             }
@@ -6455,6 +6683,20 @@ private:
                     case DungeonCrossingResult::Through:
                         coord.phase = DungeonRunPhase::StagedInside;
                         coord.loggedStagedWaiting = false;
+                        // THE DOOR AIM DIES WITH THE CROSSING IT WAS FOR, and
+                        // this release is new. ENTER aims the leader at the
+                        // entrance trigger's own coordinates, which are on the
+                        // OUTSIDE map; the party is now on the inside one. Left
+                        // standing, DriveTravel refuses it on its next poll -
+                        // "there is no such spawn on map {}" - which is true and
+                        // reads as a fault rather than as the aim having simply
+                        // done its job. And in the window before that poll, any
+                        // member put back outside (a wipe releases to a
+                        // graveyard on the outside map) is under a live aim
+                        // walking it back to the dungeon door. That is the
+                        // staging aim outliving its purpose, which is what this
+                        // column's two writers used to do to each other.
+                        _travelAims.Release(leaderName);
                         LOG_INFO("module.overseer",
                                  "overseer: all {} roster members went through areatrigger "
                                  "{} and are on map {} - ENTER done, STAGED_INSIDE holds",
@@ -6469,9 +6711,7 @@ private:
                         // will adopt that run on its next poll rather than
                         // trying to re-gather a party that is no longer in one
                         // place. The crossing itself already said who was left.
-                        CharacterDatabase.Execute(
-                            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
-                            Esc(leaderName));
+                        _travelAims.Release(leaderName);
                         coord = DungeonRunCoordinatorState();
                         return;
 
@@ -6493,9 +6733,7 @@ private:
                                  "the coordinator returns to IDLE",
                                  static_cast<uint32>(members.size()), triggerId,
                                  portal->outsideMapId);
-                        CharacterDatabase.Execute(
-                            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
-                            Esc(leaderName));
+                        _travelAims.Release(leaderName);
                         coord = DungeonRunCoordinatorState();
                         return;
 
@@ -6532,9 +6770,7 @@ private:
                                   "coordinator returns to IDLE and will adopt the run again "
                                   "next poll; if this repeats, the party cannot reach its "
                                   "own exit", triggerId, portal->insideMapId);
-                        CharacterDatabase.Execute(
-                            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
-                            Esc(leaderName));
+                        _travelAims.Release(leaderName);
                         coord = DungeonRunCoordinatorState();
                         return;
 
@@ -8963,8 +9199,8 @@ private:
     // There is no ghost clock for this state - a corpse, and therefore a ghost
     // time, only exists after the release - so the drive has to keep its own.
     // Written and read only from DriveStuckRevival on the world thread, so it
-    // is unguarded like _travelState and _lastAim above, and lost on restart,
-    // which costs at most one extra grace period.
+    // is unguarded like TravelAimBook's own maps and _lastAim above, and lost
+    // on restart, which costs at most one extra grace period.
     std::map<std::string, int64> _awaitingRelease;
 
     // What KeepRosterFollowing knew about each follower's position last
@@ -8973,9 +9209,9 @@ private:
     // TravelState::closest above, applied to "has this character actually
     // moved" instead of "has this errand gotten nearer". Written and read
     // only from KeepRosterFollowing on the world thread, so it is unguarded
-    // like _travelState and _awaitingRelease, and lost on restart, which
-    // costs at most one extra grace period before a stall is acted on
-    // again.
+    // like TravelAimBook's errand memory and _awaitingRelease, and lost on
+    // restart, which costs at most one extra grace period before a stall is
+    // acted on again.
     struct FollowStallState
     {
         bool seen{false};      // false until the first position is recorded
@@ -9034,49 +9270,21 @@ private:
     // TrainerStartsSkill on the first errand that asks.
     std::map<uint32, std::set<uint32>> _trainerSkills;
 
-    // What DriveTravel knew about each errand last time round, so an aim that
-    // can never land is given up on rather than renewed forever, and so
-    // "arrived" is announced once instead of every poll. World thread only -
-    // DriveTravel runs from OnUpdate - so unguarded, like _lastAim. Lost on
-    // restart, which only restarts the backstop clock.
-    struct TravelState
-    {
-        std::string target;   // the column value as this loop last saw it
-        // What the errand was FOR, as of the last poll. A changed learn skill
-        // is a changed errand even when the target keyword has not moved,
-        // because the resolve is narrowed by it - see ResolveTravelTarget.
-        // Without this the pinned spawn from the previous trade would be kept
-        // and the character would walk to a trainer for a skill it is no
-        // longer being sent to learn.
-        uint32 learn{0};
-        uint32 entry{0};      // the spawn it resolved to
-        bool pinned{false};   // ...and which it is NOT resolved away from again
-        uint32 mapId{0};      // where that spawn is, so a map change drops the pin
-        float x{0.f};
-        float y{0.f};
-        float z{0.f};
-        bool arrived{false};  // announced already
-        // The backstop's memory of whether the walk is going anywhere: the
-        // nearest this character has ever been to this errand's target, 0 while
-        // that has not been measured yet, and when it last got nearer. Kept in
-        // the shared ratchet - see TRAVEL_RATCHET and
-        // OverseerDecisions::Ratchet.
-        OverseerDecisions::RatchetState progress;
-    };
-    std::map<std::string, TravelState> _travelState;
+    // `overseer_roster.travel_npc`, AND the two pieces of memory that have to
+    // move with it - the errand in flight and the hand-back clock. One object,
+    // because they were only ever one thing: see TravelAimBook for why the
+    // column having two writers with different manners was a bug and not a
+    // style. Both drives reach the column through this and nothing else. World
+    // thread only, like everything else on these loops.
+    TravelAimBook _travelAims;
 
     // The unlearn this module has already refused for each character, so a
     // standing disagreement about the price is said once rather than twice a
     // minute forever (infra#2757). Name -> the skill id refused. Cleared when
     // the request is cleared, and lost on restart - which costs one repeated
-    // log line and no correctness, exactly like _travelHandback above.
+    // log line and no correctness, exactly like the hand-back clock inside
+    // _travelAims.
     std::map<std::string, uint32> _unlearnRefused;
-    // When travel last let go of a character, so the quest drive does not pick
-    // it up on the same tick the errand ended. Written by ClearTravelAim and by
-    // PruneTravelState - every way an errand can end - and read only by
-    // TravelHoldsTheWheel, which sweeps an entry once it lapses. World thread
-    // only, like everything else on this loop.
-    std::map<std::string, time_t> _travelHandback;
     // What DriveQuests knew about each traveller's aim last time round, so a
     // standing complaint is logged once instead of three times a minute, an
     // aim that never lands can be given up on, and a turn-in of the WRONG
