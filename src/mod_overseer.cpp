@@ -398,7 +398,13 @@ constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
 // once is worth doing, which is the whole content of ENTER.
 constexpr float DUNGEON_DOORSTEP_RADIUS_YARDS = 5.0f;
 
-// How long ENTER may make no progress before the run is given up (#88).
+// How long a crossing may make no progress before the run is given up (#88).
+//
+// ONE NUMBER FOR BOTH DOORS, because ENTER and EXIT are the same state twice.
+// They differ in which areatrigger and which map is the far side, and in
+// nothing else - so a party that can get in on a five minute bound and can only
+// get out on some other one would be two behaviours to reason about where there
+// is only one.
 //
 // KEYED ON PROGRESS, NOT ON ELAPSED TIME - the same lesson #63 taught the
 // travel backstop, which used to release a character that was visibly walking
@@ -408,7 +414,22 @@ constexpr float DUNGEON_DOORSTEP_RADIUS_YARDS = 5.0f;
 // crossing is. Five minutes is sixty DUNGEON_RUN_POLL_MS polls and far longer
 // than closing the last DUNGEON_STAGING_STANDOFF_YARDS to the door can
 // honestly take.
-constexpr time_t DUNGEON_ENTER_BACKSTOP_SECONDS = 5 * 60;
+constexpr time_t DUNGEON_CROSSING_BACKSTOP_SECONDS = 5 * 60;
+
+// How long CLEARING waits for the dungeon brain to come on before it says, out
+// loud, that the run is being fought with open-world logic (#88).
+//
+// THIS IS A REPORTING CLOCK, NOT A RETRY CLOCK. The coordinator never issues
+// `dc on` - DriveDungeonClear owns that and re-tries on its own cadence. What
+// this bounds is how long "armed" may remain unverified before the failure
+// stops being invisible, and invisibility is the whole problem: the module sat
+// unarmed inside every run for its entire life while `delivered` and a startup
+// context registration both read as confirmation.
+//
+// A minute is many arming passes and many DUNGEON_RUN_POLL_MS polls, and short
+// enough that the line lands while the party is still on the first pull rather
+// than after the wipe.
+constexpr time_t DUNGEON_ARMING_GRACE_SECONDS = 60;
 
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
@@ -5536,11 +5557,12 @@ private:
     // Miner and an Evoker with no healer in range, and both died. Ugga was
     // still walking." Nobody owned the decision to wait.
     //
-    // THIS SLICE IS THE FIRST FOUR STATES - GATHERING, BARRIER, ENTER and
-    // STAGED_INSIDE, which is everything up to and including getting the whole
-    // party onto the instance map together. CLEARING, LOOT, EXIT and
-    // WIPE_RECOVER are later slices; this coordinator deliberately stops the
-    // moment the party is staged inside and does nothing further.
+    // WHAT IS BUILT: GATHERING, BARRIER, ENTER, STAGED_INSIDE, CLEARING and
+    // EXIT. LOOT and WIPE_RECOVER are not, and LOOT's absence is a measurement
+    // rather than a deferral - see the end-of-run comment in DriveDungeonRun
+    // for why "the dungeon is cleared" is not a fact available to this module
+    // for map 36 today, and why a signal that reads as success before anything
+    // has happened is worse than no signal.
     //
     // IT STILL NEVER WRITES `dc on`. DriveDungeonClear (above) already owns
     // arming the dungeon brain, and it is the only thing that may: `dc on` is
@@ -5658,6 +5680,20 @@ private:
         // to be kept in step - it is the teleport row's target, written down.
         uint32 entryTriggerId;     // walked to, and knocked on, to get IN
         uint32 insideMapId;        // the map that trigger lands on
+        // AND THE WAY BACK OUT, WHICH IS A DOOR AND NOT A BIND POINT. Read from
+        // the same two tables and quoted for the same reason:
+        //
+        //   data/sql/base/db_world/areatrigger.sql
+        //     (119,36,-14.3628,-393.38,64.5605,6,0,0,0,0)
+        //   data/sql/base/db_world/areatrigger_teleport.sql
+        //     (119,'DeadMines Instance Start',0,-11208.3,1672.52,24.66,4.55217)
+        //
+        // so trigger 119 stands inside on map 36 with radius 6, and going
+        // through it lands back on map 0 a few yards from where the party went
+        // in. That is the whole reason EXIT is a crossing rather than a
+        // teleport home: a cross-map bind point would scatter five characters
+        // across two continents and end the run somewhere nobody chose.
+        uint32 exitTriggerId;      // walked to, and knocked on, to get OUT
         // Deadmines: areatrigger 78 (-11208.5, 1685.34, 25.7612), radius 7 -
         // see TRAVEL_ARRIVED_POSITION_YARDS above for how that number was
         // measured. Staging point is that same point stood off along X by
@@ -5680,12 +5716,33 @@ private:
     // name one either).
     static DungeonPortal const* FindDungeonPortal(std::string const& keyword)
     {
-        static DungeonPortal const portals[] = {
-            {"deadmines", 0, 78, 36,
+        for (DungeonPortal const& portal : DungeonPortals())
+            if (keyword == portal.keyword)
+                return &portal;
+        return nullptr;
+    }
+
+    static std::vector<DungeonPortal> const& DungeonPortals()
+    {
+        static std::vector<DungeonPortal> const portals = {
+            {"deadmines", 0, 78, 36, 119,
              -11208.5f + DUNGEON_STAGING_STANDOFF_YARDS, 1685.34f, 25.7612f},
         };
-        for (DungeonPortal const& portal : portals)
-            if (keyword == portal.keyword)
+        return portals;
+    }
+
+    // WHICH RUN IS THIS, ASKED FROM THE INSIDE. A worldserver restart wipes the
+    // coordinator's in-process state (see DungeonRunCoordinatorState) while the
+    // party is left standing in an instance and the run row is left open in the
+    // database, so "the leader is inside a dungeon I have a portal row for" is
+    // how a run in progress is recognised again after a bounce. Without this the
+    // coordinator would return to IDLE, see InDungeonRun, decide the run belongs
+    // to somebody else, and never watch the arming or walk anyone out - which is
+    // exactly the "notices a restart" obligation the epic asks for, unfulfilled.
+    static DungeonPortal const* FindDungeonPortalByInsideMap(uint32 mapId)
+    {
+        for (DungeonPortal const& portal : DungeonPortals())
+            if (mapId == portal.insideMapId)
                 return &portal;
         return nullptr;
     }
@@ -5696,7 +5753,9 @@ private:
         Gathering,     // leader aimed at the staging point, still walking
         Barrier,       // leader has arrived; waiting for the whole roster
         Enter,         // the party closes the last yards to the door and crosses together
-        StagedInside   // every member is on the instance map; handed to the clearing drive
+        StagedInside,  // every member is on the instance map; handed to the clearing drive
+        Clearing,      // the run is under way; the coordinator watches that the brain is on
+        Exiting        // the run is over; the party goes back out the door it came in
     };
 
     // World-thread-only, unguarded, lost on restart - same discipline as
@@ -5715,17 +5774,27 @@ private:
         // bury the one line that matters.
         bool loggedGathering{false};
         bool loggedBarrierWaiting{false};
-        bool loggedEnterAim{false};
-        bool loggedEnterWaiting{false};
-        bool loggedStagedInside{false};
+        bool loggedCrossingAim{false};
+        bool loggedCrossingWaiting{false};
         bool loggedStagedWaiting{false};
-        // ENTER's progress clock, and the count it measures progress BY -
-        // see DUNGEON_ENTER_BACKSTOP_SECONDS. `enteredCount` only ever
-        // ratchets upward within one ENTER, the same shape TravelState's
+        bool loggedArmed{false};
+        bool loggedUnarmed{false};
+        // A crossing's progress clock, and the count it measures progress BY -
+        // see DUNGEON_CROSSING_BACKSTOP_SECONDS. `crossedCount` only ever
+        // ratchets upward within one crossing, the same shape TravelState's
         // `closest` uses for the same purpose: a number that cannot be beaten
-        // by a party standing still is a number a backstop can trust.
-        time_t enterSince{0};
-        uint32 enteredCount{0};
+        // by a party standing still is a number a backstop can trust. Shared
+        // by ENTER and EXIT because only one crossing is ever in progress.
+        time_t crossingSince{0};
+        uint32 crossedCount{0};
+        // WHETHER THE DUNGEON BRAIN HAS EVER BEEN SEEN ON DURING THIS RUN, and
+        // when CLEARING started asking. Together these are what make a DISARM
+        // tellable from a run that was never armed at all: strategies live in
+        // the bot's engine and not in a table, so a worldserver bounce takes
+        // them away silently, and "armed, then not" is a different event from
+        // "never armed" with a different cause and a different log line.
+        bool armedSeen{false};
+        time_t armedSince{0};
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
@@ -5802,26 +5871,33 @@ private:
         return blockers;
     }
 
-    // THE ENTRY PREDICATES, KEPT FREE OF EVERY CORE TYPE FOR THE SAME REASON
+    // THE CROSSING PREDICATES, KEPT FREE OF EVERY CORE TYPE FOR THE SAME REASON
     // THE BARRIER ONE IS. Nothing below touches Player, Map or PlayerbotAI, so
     // "when may the party be knocked through" can be exercised by a unit test
     // with no world, and a change to how the facts are gathered can never
-    // silently change what ENTER requires.
+    // silently change what a crossing requires.
+    //
+    // ONE SHAPE FOR BOTH DIRECTIONS. `through` means "on the far side of this
+    // door", which for ENTER is the instance map and for EXIT is the map
+    // outside it. ENTER and EXIT differ in which trigger and which far side,
+    // and in nothing else, so they share these predicates rather than owning a
+    // copy each - a party that can get in and cannot get out is a worse failure
+    // than one that never went in, and two copies is how the second one rots.
     //
     // WHY THIS IS NOT DungeonRunMemberState WITH A DIFFERENT CENTRE. A member
-    // that is ALREADY THROUGH is on the instance map, which to the barrier
-    // predicate reads as "wrong map" and therefore as not-met - the one state
-    // ENTER most needs to distinguish would have been indistinguishable from
-    // failure. Being inside is a third answer, not a bad distance, so it is a
-    // field of its own.
+    // that is ALREADY THROUGH is on another map, which to the barrier predicate
+    // reads as "wrong map" and therefore as not-met - the one state a crossing
+    // most needs to distinguish would have been indistinguishable from failure.
+    // Being through is a third answer, not a bad distance, so it is a field of
+    // its own.
     struct DungeonRunEntryState
     {
         std::string name;
         bool seen{false};             // false = not found in the world this poll
         bool alive{false};
         bool inCombat{false};
-        bool inside{false};           // already on the instance map - through the door
-        float distanceFromDoor{-1.f}; // negative = not measured (inside, wrong map, or !seen)
+        bool through{false};          // already on the far side of the door
+        float distanceFromDoor{-1.f}; // negative = not measured (through, wrong map, or !seen)
     };
 
     // Is every member either already through, or standing on the doorstep alive
@@ -5837,7 +5913,7 @@ private:
 
         for (DungeonRunEntryState const& member : members)
         {
-            if (member.inside)
+            if (member.through)
                 continue;
             if (!member.seen)
                 return false;
@@ -5855,13 +5931,13 @@ private:
     // because "everybody is through" and "everybody may be knocked" are
     // different questions with different answers on every poll in between, and
     // a single function answering both would have to be asked which it meant.
-    static bool DungeonRunAllInside(std::vector<DungeonRunEntryState> const& members)
+    static bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members)
     {
         if (members.empty())
             return false;
 
         for (DungeonRunEntryState const& member : members)
-            if (!member.inside)
+            if (!member.through)
                 return false;
         return true;
     }
@@ -5876,7 +5952,7 @@ private:
         std::string blockers;
         for (DungeonRunEntryState const& member : members)
         {
-            if (member.inside)
+            if (member.through)
                 continue;
 
             std::string why;
@@ -5891,13 +5967,271 @@ private:
             else if (member.distanceFromDoor > doorstepYards)
                 why = std::to_string(static_cast<int>(member.distanceFromDoor)) + "y from the door";
             else
-                why = "outside, at the door";
+                why = "at the door, not through";
 
             if (!blockers.empty())
                 blockers += ", ";
             blockers += member.name + " (" + why + ")";
         }
         return blockers;
+    }
+
+    // ---- the mechanical half of a crossing, shared by ENTER and EXIT ----
+    //
+    // These two touch the world and so cannot be pure like the predicates
+    // above; they are still written once rather than twice, for the reason the
+    // predicates give.
+
+    // Where every roster member stands relative to one door. `throughMapId` is
+    // the map a member is on once it is through - the instance map for ENTER,
+    // the map outside it for EXIT.
+    static std::vector<DungeonRunEntryState> DungeonRunCensus(
+        std::vector<std::string> const& members, AreaTrigger const* door,
+        uint32 throughMapId, uint32& through)
+    {
+        through = 0;
+
+        std::vector<DungeonRunEntryState> states;
+        states.reserve(members.size());
+        for (std::string const& name : members)
+        {
+            DungeonRunEntryState state;
+            state.name = name;
+
+            // SteerableAI, not a bare lookup - a name can resolve to a Player
+            // mid-login or mid-teardown. A member this poll cannot find is the
+            // "not seen" case both predicates fail closed on.
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(member))
+            {
+                states.push_back(state);
+                continue;
+            }
+
+            state.seen = true;
+            // IsAlive  Unit.h:1793  bool IsAlive() const
+            state.alive = member->IsAlive();
+            // IsInCombat  Unit.h:936  bool IsInCombat() const
+            state.inCombat = member->IsInCombat();
+
+            // GetMapId  Position.h:281  uint32 GetMapId() const
+            uint32 const memberMap = member->GetMapId();
+            if (memberMap == throughMapId)
+            {
+                state.through = true;
+                ++through;
+            }
+            // AreaTrigger::map  ObjectMgr.h:425  uint32 map
+            else if (memberMap == door->map)
+            {
+                // AreaTrigger::x  ObjectMgr.h:426  float x
+                // AreaTrigger::y  ObjectMgr.h:427  float y
+                // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+                state.distanceFromDoor = member->GetDistance2d(door->x, door->y);
+            }
+
+            states.push_back(state);
+        }
+        return states;
+    }
+
+    // KNOCK, FOLLOWERS FIRST AND THE LEADER LAST. Returns how many actually
+    // changed map, which is the only thing that may be read as having crossed.
+    //
+    // A pair of passes rather than a sort, because the only thing being ordered
+    // is "is this the leader", and the leader is a name the caller already
+    // holds. The ordering argument is in the section comment above and applies
+    // in both directions: the leader is the anchor every follower is standing
+    // next to, so he is the last thing that may move.
+    uint32 DungeonRunKnock(std::vector<DungeonRunEntryState> const& states,
+                           std::string const& leaderName, uint32 triggerId)
+    {
+        std::ostringstream doorAim;
+        doorAim << "trigger:" << triggerId;
+        std::string const doorTarget = doorAim.str();
+
+        bool const passes[2] = {false, true};
+        uint32 crossed = 0;
+        for (bool leaderPass : passes)
+        {
+            for (DungeonRunEntryState const& state : states)
+            {
+                if (state.through)
+                    continue;
+                if ((state.name == leaderName) != leaderPass)
+                    continue;
+
+                Player* member = ObjectAccessor::FindPlayerByName(state.name);
+                if (!SteerableAI(member))
+                    continue;   // gone since the census - next poll
+
+                // Returns true ONLY if the character actually changed map. A
+                // refusal is the handler's own IsInAreaTriggerRadius being
+                // stricter than the doorstep gate, and is not an error: the
+                // member stays where it is and is knocked for again next poll.
+                if (StepThroughAreaTrigger(state.name, member, doorTarget))
+                    ++crossed;
+            }
+        }
+        return crossed;
+    }
+
+    // What one poll of a crossing decided. Named rather than returned as a pair
+    // of bools, because "still working", "everybody is through" and "the
+    // backstop fired" are three outcomes and a caller that gets two bools can
+    // be written to handle a fourth combination that does not exist.
+    enum class DungeonCrossingResult : uint8
+    {
+        Working,   // walking, holding, or knocking - nothing decided this poll
+        Through,   // every member is on the far side
+        GaveUp     // no progress for DUNGEON_CROSSING_BACKSTOP_SECONDS
+    };
+
+    // ONE CROSSING, RUN ONCE PER POLL, IN EITHER DIRECTION. `what` is the state
+    // name for the log lines ("ENTER" / "EXIT") so the reader of a log can tell
+    // which door is being knocked on without inferring it from a trigger id.
+    //
+    // The caller owns what a result MEANS - which phase comes next, whether
+    // giving up returns to IDLE or says something else - because that is the
+    // only part that genuinely differs between the two directions.
+    DungeonCrossingResult DriveDungeonCrossing(std::vector<std::string> const& members,
+                                               std::string const& leaderName,
+                                               AreaTrigger const* door, uint32 triggerId,
+                                               uint32 throughMapId, char const* what,
+                                               DungeonRunCoordinatorState& coord)
+    {
+        uint32 through = 0;
+        std::vector<DungeonRunEntryState> const states =
+            DungeonRunCensus(members, door, throughMapId, through);
+
+        // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63's lesson, applied to a
+        // different journey). One more member through is the only thing that
+        // counts as progress here, and it is a fact a party standing at a door
+        // cannot fake.
+        if (through > coord.crossedCount)
+        {
+            coord.crossedCount = through;
+            coord.crossingSince = std::time(nullptr);
+            coord.loggedCrossingWaiting = false;
+        }
+
+        if (DungeonRunAllThrough(states))
+            return DungeonCrossingResult::Through;
+
+        // BACKSTOP. A crossing that can never finish must not pin the party to
+        // a door forever - that is five characters standing still, which is the
+        // state this epic exists to stop mistaking for a working one. Read with
+        // the progress check above, "since" means since somebody last actually
+        // crossed.
+        if (coord.crossingSince &&
+            std::time(nullptr) - coord.crossingSince > DUNGEON_CROSSING_BACKSTOP_SECONDS)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} has got {} of {} through areatrigger {} and "
+                     "nobody else has crossed for {} minutes - giving up. Still short: {}",
+                     what, through, static_cast<uint32>(states.size()), triggerId,
+                     static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60),
+                     DungeonRunEntryBlockers(states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+            return DungeonCrossingResult::GaveUp;
+        }
+
+        // WALK THE LEADER THE LAST YARDS, AND ONLY THE LEADER, with an `at:`
+        // aim on the door's own coordinates. Deliberately NOT a `trigger:` aim:
+        // that would have DriveTravel step the LEADER through on arrival,
+        // alone and ahead of everyone following him, which is the failure this
+        // state exists to prevent. `at:` only ever walks.
+        //
+        // WRITTEN ONLY WHEN THERE IS NOTHING ALREADY WALKING HIM. The errand
+        // column is read through the same guarded loader DriveTravel and the
+        // quest drive's arbitration both use, so the three can never disagree
+        // about whether an errand is outstanding. Re-issuing over a live aim is
+        // what ChangeToWanderNpc's own re-issue guard exists to prevent, and
+        // doing it from out here would defeat it.
+        //
+        // ONE COMPARISON COVERS THREE CASES, and deliberately: a leader already
+        // through and a leader on some third map both carry a NEGATIVE
+        // distanceFromDoor, and neither can be walked to this door by an `at:`
+        // aim - ResolveTravelTarget refuses an `at:` whose map is not the
+        // character's own. A negative distance fails
+        // `> DUNGEON_DOORSTEP_RADIUS_YARDS` on its own, so writing an aim that
+        // could only be refused is not a case to special-case, it is a case
+        // that never arises. Both still show up in the holds line below.
+        DungeonRunEntryState const* leaderState = nullptr;
+        for (DungeonRunEntryState const& state : states)
+            if (state.name == leaderName)
+                leaderState = &state;
+
+        if (leaderState &&
+            leaderState->distanceFromDoor > DUNGEON_DOORSTEP_RADIUS_YARDS &&
+            !LoadTravelAims().count(leaderName))
+        {
+            std::ostringstream aim;
+            // AreaTrigger::map/x/y/z  ObjectMgr.h:425,426,427,428
+            aim << "at:" << door->map << ':' << door->x << ',' << door->y << ',' << door->z;
+
+            // Esc() even though every character in a coordinate string is
+            // already safe - the same discipline every other write in this file
+            // applies to a value going into SQL.
+            CharacterDatabase.Execute(
+                "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
+                Esc(aim.str()), Esc(leaderName));
+
+            if (!coord.loggedCrossingAim)
+            {
+                coord.loggedCrossingAim = true;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} walks '{}' the last {:.0f}y onto "
+                         "areatrigger {} ({}) - the followers come with him by following, "
+                         "and nobody is knocked through until everybody is on the doorstep",
+                         what, leaderName, leaderState->distanceFromDoor, triggerId,
+                         aim.str());
+            }
+        }
+
+        if (!DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))
+        {
+            if (!coord.loggedCrossingWaiting)
+            {
+                coord.loggedCrossingWaiting = true;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} holds - {} of {} are through areatrigger "
+                         "{} and the rest are not on the doorstep yet: {}",
+                         what, through, static_cast<uint32>(states.size()), triggerId,
+                         DungeonRunEntryBlockers(states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+            }
+            return DungeonCrossingResult::Working;
+        }
+
+        uint32 const crossed = DungeonRunKnock(states, leaderName, triggerId);
+        if (crossed)
+        {
+            coord.loggedCrossingWaiting = false;
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} knocked on areatrigger {} for the whole "
+                     "party at once - {} crossed onto map {} this poll, {} of {} are now "
+                     "through",
+                     what, triggerId, crossed, throughMapId, through + crossed,
+                     static_cast<uint32>(states.size()));
+            return DungeonCrossingResult::Working;
+        }
+
+        // EVERYBODY ON THE DOORSTEP AND NOT ONE CROSSED. Said, not skipped. The
+        // gate is DUNGEON_DOORSTEP_RADIUS_YARDS (5) against triggers of radius
+        // 7 and 6, so this should not happen - and if it starts happening, a
+        // line is how that becomes visible rather than a party quietly standing
+        // at a door until the backstop fires.
+        if (!coord.loggedCrossingWaiting)
+        {
+            coord.loggedCrossingWaiting = true;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} has every member within {:.0f}y of "
+                     "areatrigger {} and the server refused all of them - its own "
+                     "IsInAreaTriggerRadius is the authority and is stricter than that "
+                     "gate. Knocking again next poll, bounded by the {} minute backstop",
+                     what, DUNGEON_DOORSTEP_RADIUS_YARDS, triggerId,
+                     static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60));
+        }
+        return DungeonCrossingResult::Working;
     }
 
     void DriveDungeonRun()
@@ -5954,15 +6288,54 @@ private:
             if (!leaderAI)
                 return;  // mid-login/mid-teardown - try again next poll
 
-            // ALREADY INSIDE. Either DriveDungeonClear's geography-based open
-            // already has this run (a run started before this coordinator
-            // existed, or one entered by some path outside it), or the leader
-            // is standing in a dungeon with job still set to 'dungeon' from a
-            // PREVIOUS run that has not been cleared yet. Either way there is
-            // no staging left to do - GATHERING/BARRIER is for BEFORE entry -
-            // so this coordinator stays out of it rather than guessing.
+            // ALREADY INSIDE - SO ADOPT THE RUN RATHER THAN STAND CLEAR OF IT.
+            //
+            // This used to return, on the reasoning that GATHERING/BARRIER is
+            // for BEFORE entry and there was no staging left to do. That was
+            // true and it left a hole the size of a worldserver restart. The
+            // coordinator's state is in-process and unguarded on purpose (see
+            // DungeonRunCoordinatorState), so a bounce puts it back at IDLE
+            // while the party is still standing in the instance and the run row
+            // is still open - and a bounce ALSO wipes every `dungeon clear`
+            // strategy, because strategies live in the bot's engine and not in
+            // a table. A coordinator that returns here would then never watch
+            // the re-arming it is supposed to watch, and never walk anybody out
+            // either. The obligation to notice a restart would be unfulfilled
+            // by construction.
+            //
+            // ADOPTION IS GATED ON KNOWING THE WAY OUT, which is what makes it
+            // safe rather than a guess: only a dungeon this module has a portal
+            // row for is adopted, and a portal row carries the exit trigger. A
+            // leader standing in some other instance is a run this coordinator
+            // could not finish, so it still stands clear of it and says so.
             if (InDungeonRun(leader))
+            {
+                // GetMapId  Position.h:281  uint32 GetMapId() const
+                DungeonPortal const* inside =
+                    FindDungeonPortalByInsideMap(leader->GetMapId());
+                if (!inside)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is in a dungeon run on map {}, which this "
+                             "coordinator has no portal row for - it knows no way out of "
+                             "there, so it stays out of the run rather than owning one it "
+                             "could not finish",
+                             leaderName, static_cast<uint32>(leader->GetMapId()));
+                    return;
+                }
+
+                coord = DungeonRunCoordinatorState();
+                coord.phase = DungeonRunPhase::Clearing;
+                coord.portalKeyword = inside->keyword;
+                coord.armedSince = std::time(nullptr);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is already inside a dungeon run on map {} - "
+                         "adopting it at CLEARING. The staging half is over and there is "
+                         "nothing to gather; what is left to own is whether the dungeon "
+                         "brain is on, and the way back out",
+                         leaderName, inside->insideMapId);
                 return;
+            }
 
             DungeonPortal const* portal = FindDungeonPortal("deadmines");
             if (!portal)
@@ -6013,13 +6386,63 @@ private:
         Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
         PlayerbotAI* leaderAI = SteerableAI(leader);
 
-        if (leaderJob != "dungeon")
+        // THE JOB LEAVING 'dungeon' IS WHAT ENDS A RUN, and it is the only
+        // honest end-of-run signal this module has today.
+        //
+        // The state machine in the epic has the run end when the dungeon is
+        // CLEARED, and that fact is not available here. It was looked for
+        // rather than assumed absent: InstanceScript exposes GetEncounterCount
+        // (InstanceScript.h:278) and GetBossState (InstanceScript.h:252), which
+        // would answer "is every encounter DONE" generically - but Deadmines'
+        // own script does not use that framework at all. Its data types are
+        // TYPE_RHAHK_ZOR and TYPE_CANNON (deadmines.h), door events kept in a
+        // private `_encounters` array, and it never calls SetBossState. So
+        // GetEncounterCount is zero for map 36 and "all encounters done" would
+        // be vacuously TRUE the moment the party walked in. A signal that reads
+        // as success before anything has happened is worse than no signal, so
+        // an automatic CLEARING -> LOOT -> EXIT is deliberately not built here.
+        //
+        // What IS real is the operator, or the bridge, taking the job off
+        // 'dungeon'. Until now that stood the coordinator down and left five
+        // characters standing in an instance with every other drive stood down
+        // on them - the stranding shape this epic exists to end, reached by the
+        // one path that was supposed to end a run cleanly.
+        if (leaderJob != "dungeon" && coord.phase != DungeonRunPhase::Exiting)
         {
+            bool const inside = coord.phase == DungeonRunPhase::StagedInside ||
+                                coord.phase == DungeonRunPhase::Clearing;
+            if (inside)
+            {
+                coord.phase = DungeonRunPhase::Exiting;
+                coord.crossingSince = std::time(nullptr);
+                coord.crossedCount = 0;
+                coord.loggedCrossingAim = false;
+                coord.loggedCrossingWaiting = false;
+                // The staging aim is cleared here rather than left to lapse:
+                // EXIT writes its own aim at the exit trigger, and an errand
+                // pointing at the entrance is one DriveTravel would refuse from
+                // inside anyway (ResolveTravelTarget checks the map), releasing
+                // it on a line that says "no such spawn" and reads as a fault.
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
+                    Esc(leaderName));
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' job left 'dungeon' while the party was inside - "
+                         "the run is over, so EXIT walks them back out through the door "
+                         "they came in by rather than leaving them in an instance with "
+                         "every other drive stood down on them", leaderName);
+                return;
+            }
+
+            // GATHERING, BARRIER or ENTER: the party is not staged inside, so
+            // there is no crossing to reverse from here. If somebody did get
+            // through during an ENTER that is being stood down, IDLE adopts
+            // that run on its next poll and EXIT becomes reachable again - the
+            // adoption path exists precisely so this does not have to guess.
             LOG_INFO("module.overseer",
-                     "overseer: '{}' job left 'dungeon' mid-run - the dungeon run "
-                     "coordinator stands down and clears its staging aim. Anyone already "
-                     "inside stays inside; the run record and the clearing drive own "
-                     "them from here, not this coordinator", leaderName);
+                     "overseer: '{}' job left 'dungeon' before the party was staged "
+                     "inside - the dungeon run coordinator stands down and clears its "
+                     "staging aim", leaderName);
             if (leaderAI)
                 CharacterDatabase.Execute(
                     "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
@@ -6079,29 +6502,37 @@ private:
             return;
         }
 
+        // ENTER, STAGED_INSIDE, CLEARING and EXIT all need the same two facts:
+        // which door this run uses, and where it stands. Resolved once here
+        // rather than in four places, because a run that could resolve its door
+        // for one state and not another would be four bugs waiting.
         if (coord.phase == DungeonRunPhase::Enter ||
-            coord.phase == DungeonRunPhase::StagedInside)
+            coord.phase == DungeonRunPhase::StagedInside ||
+            coord.phase == DungeonRunPhase::Clearing ||
+            coord.phase == DungeonRunPhase::Exiting)
         {
+            bool const leaving = coord.phase == DungeonRunPhase::Exiting;
+            uint32 const triggerId =
+                leaving ? portal->exitTriggerId : portal->entryTriggerId;
+
             // THE DOOR'S OWN COORDINATES, READ BACK OUT OF THE TRIGGER TABLE
             // and not carried in DungeonPortal next to them - see that struct's
             // comment. Read on every poll rather than cached: it is a hash
             // lookup in a store loaded once at startup, and a cached copy is
             // one more thing that can be stale.
             // GetAreaTrigger  ObjectMgr.h:868  AreaTrigger const* GetAreaTrigger(uint32) const
-            AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal->entryTriggerId);
+            AreaTrigger const* door = sObjectMgr->GetAreaTrigger(triggerId);
             if (!door)
             {
                 // SAID AND ENDED, NOT SKIPPED. A missing trigger is not a
                 // condition that becomes true later - this world's tables do
-                // not have the door - and holding a party at a staging point
-                // for a door that does not exist is the "guard whose condition
-                // can never change" shape this file has now paid for three
-                // times.
+                // not have the door - and holding a party for a door that does
+                // not exist is the "guard whose condition can never change"
+                // shape this file has now paid for three times.
                 LOG_ERROR("module.overseer",
                           "overseer: dungeon run wanted areatrigger {} and this world's "
-                          "tables do not have it - there is no door to walk into, so the "
-                          "run is given up rather than held forever",
-                          portal->entryTriggerId);
+                          "tables do not have it - there is no door to walk through, so the "
+                          "run is given up rather than held forever", triggerId);
                 CharacterDatabase.Execute(
                     "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
                     Esc(leaderName));
@@ -6109,298 +6540,274 @@ private:
                 return;
             }
 
-            // THE WHOLE ROSTER, MEASURED THIS POLL, for the reason BARRIER's
-            // own comment gives below: a follower reaches the door by
-            // FOLLOWING, so its position, aliveness and combat state are facts
-            // only this poll can establish for it.
-            std::vector<DungeonRunEntryState> states;
-            states.reserve(members.size());
-            uint32 inside = 0;
-            for (std::string const& name : members)
+            if (coord.phase == DungeonRunPhase::Enter)
             {
-                DungeonRunEntryState state;
-                state.name = name;
-
-                // SteerableAI, not a bare lookup - a name can resolve to a
-                // Player mid-login or mid-teardown. A member this poll cannot
-                // find is the "not seen" case both predicates fail closed on.
-                Player* member = ObjectAccessor::FindPlayerByName(name);
-                if (!SteerableAI(member))
+                switch (DriveDungeonCrossing(members, leaderName, door, triggerId,
+                                             portal->insideMapId, "ENTER", coord))
                 {
-                    states.push_back(state);
-                    continue;
+                    case DungeonCrossingResult::Through:
+                        coord.phase = DungeonRunPhase::StagedInside;
+                        coord.loggedStagedWaiting = false;
+                        LOG_INFO("module.overseer",
+                                 "overseer: all {} roster members went through areatrigger "
+                                 "{} and are on map {} - ENTER done, STAGED_INSIDE holds",
+                                 static_cast<uint32>(members.size()), triggerId,
+                                 portal->insideMapId);
+                        return;
+
+                    case DungeonCrossingResult::GaveUp:
+                        // Back to IDLE rather than to BARRIER. Anyone who did
+                        // get through is inside a real run, and the run record
+                        // plus the clearing drive own them from there; IDLE
+                        // will adopt that run on its next poll rather than
+                        // trying to re-gather a party that is no longer in one
+                        // place. The crossing itself already said who was left.
+                        CharacterDatabase.Execute(
+                            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
+                            Esc(leaderName));
+                        coord = DungeonRunCoordinatorState();
+                        return;
+
+                    case DungeonCrossingResult::Working:
+                        return;
                 }
+                return;
+            }
 
-                state.seen = true;
-                // IsAlive  Unit.h:1793  bool IsAlive() const
-                state.alive = member->IsAlive();
-                // IsInCombat  Unit.h:936  bool IsInCombat() const
-                state.inCombat = member->IsInCombat();
-
-                // GetMapId  Position.h:281  uint32 GetMapId() const
-                uint32 const memberMap = member->GetMapId();
-                if (memberMap == portal->insideMapId)
+            if (coord.phase == DungeonRunPhase::Exiting)
+            {
+                switch (DriveDungeonCrossing(members, leaderName, door, triggerId,
+                                             portal->outsideMapId, "EXIT", coord))
                 {
-                    state.inside = true;
-                    ++inside;
-                }
-                // AreaTrigger::map  ObjectMgr.h:425  uint32 map
-                else if (memberMap == door->map)
-                {
-                    // AreaTrigger::x  ObjectMgr.h:426  float x
-                    // AreaTrigger::y  ObjectMgr.h:427  float y
-                    // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
-                    state.distanceFromDoor = member->GetDistance2d(door->x, door->y);
-                }
+                    case DungeonCrossingResult::Through:
+                        LOG_INFO("module.overseer",
+                                 "overseer: all {} roster members came back out through "
+                                 "areatrigger {} and are on map {} - the run is over and "
+                                 "the coordinator returns to IDLE",
+                                 static_cast<uint32>(members.size()), triggerId,
+                                 portal->outsideMapId);
+                        CharacterDatabase.Execute(
+                            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
+                            Esc(leaderName));
+                        coord = DungeonRunCoordinatorState();
+                        return;
 
-                states.push_back(state);
+                    case DungeonCrossingResult::GaveUp:
+                        // THE PARTY IS STILL INSIDE AND THE COORDINATOR HAS
+                        // STOPPED TRYING, which is worth an ERROR rather than
+                        // the WARN the crossing already printed: an EXIT that
+                        // cannot finish leaves characters in an instance with
+                        // every other drive stood down on them, and that is the
+                        // stranding shape this whole epic exists to end. The
+                        // run row's own cold-heartbeat close is the only thing
+                        // left, and it takes RUN_COLD_SECONDS to notice.
+                        //
+                        // THE FIRST THING TO SUSPECT IF THIS FIRES IS THE
+                        // ARMED DUNGEON BRAIN, and it is named here so nobody
+                        // has to rediscover it. While `dungeon clear` is held,
+                        // mod-dungeon-clear is steering these characters too,
+                        // and it has no idea the run is over - so it can walk
+                        // them back toward the instance while the travel aim
+                        // walks them toward the door. Disarming from here is
+                        // NOT the fix and was rejected on purpose:
+                        // DriveDungeonClear re-arms any unarmed character on an
+                        // instance map on its very next pass, so a `dc off`
+                        // issued here would be undone within seconds and the
+                        // two would fight instead of one of them winning. The
+                        // real fix is for that drive to learn that a run can be
+                        // over, which is a change to its lifecycle and belongs
+                        // with the `dc` verbs that own it - not a second
+                        // opinion asserted from out here.
+                        LOG_ERROR("module.overseer",
+                                  "overseer: dungeon run EXIT could not get the party back "
+                                  "out through areatrigger {} - they are still on map {} "
+                                  "with every other drive stood down on them. The "
+                                  "coordinator returns to IDLE and will adopt the run again "
+                                  "next poll; if this repeats, the party cannot reach its "
+                                  "own exit", triggerId, portal->insideMapId);
+                        CharacterDatabase.Execute(
+                            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
+                            Esc(leaderName));
+                        coord = DungeonRunCoordinatorState();
+                        return;
+
+                    case DungeonCrossingResult::Working:
+                        return;
+                }
+                return;
+            }
+
+            // DungeonRunPhase::StagedInside and DungeonRunPhase::Clearing, both
+            // of which are about who is inside rather than about a door.
+            uint32 inside = 0;
+            std::vector<DungeonRunEntryState> const states =
+                DungeonRunCensus(members, door, portal->insideMapId, inside);
+
+            // NOBODY LEFT INSIDE MEANS THE RUN IS OVER, however it ended - a
+            // wipe that released everyone to a graveyard, a party that walked
+            // back out, a worldserver bounce. The coordinator does not try to
+            // tell those apart, because it does not act differently on any of
+            // them: IDLE re-gathers on the next poll if the job is still
+            // 'dungeon', and WIPE_RECOVER is a later slice.
+            if (!inside)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: the dungeon run holds nobody any more - not one roster "
+                         "member is on map {}, so the run is over however it ended; "
+                         "returning to IDLE", portal->insideMapId);
+                coord = DungeonRunCoordinatorState();
+                return;
             }
 
             if (coord.phase == DungeonRunPhase::StagedInside)
             {
-                if (DungeonRunAllInside(states))
+                if (!DungeonRunAllThrough(states))
                 {
-                    if (!coord.loggedStagedInside)
+                    // SOME IN, SOME OUT. Said out loud once rather than held
+                    // silently: a party split across a portal is the exact
+                    // state the barrier exists to prevent, and it having
+                    // happened AFTER entry is a fact worth reading in a log.
+                    if (!coord.loggedStagedWaiting)
                     {
-                        coord.loggedStagedInside = true;
-                        coord.loggedStagedWaiting = false;
-                        // THE ONE LINE THIS WHOLE EPIC WAS OPENED TO MAKE
-                        // POSSIBLE, so it says what is now true rather than
-                        // what was attempted.
-                        LOG_INFO("module.overseer",
-                                 "overseer: dungeon run STAGED_INSIDE satisfied - all {} "
-                                 "roster members are on map {} together. The dungeon-clear "
-                                 "drive arms the brain from here; CLEARING, LOOT and EXIT "
-                                 "are the next slice (mod-overseer#88) and the coordinator "
-                                 "holds",
+                        coord.loggedStagedWaiting = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run is staged inside map {} but the "
+                                 "party is split - {} of {} are in there. Still outside: {}",
+                                 portal->insideMapId, inside,
                                  static_cast<uint32>(states.size()),
-                                 portal->insideMapId);
+                                 DungeonRunEntryBlockers(states,
+                                                         DUNGEON_DOORSTEP_RADIUS_YARDS));
                     }
                     return;
                 }
 
-                // NOBODY LEFT INSIDE MEANS THE RUN IS OVER, however it ended -
-                // a wipe that released everyone to a graveyard, a party that
-                // walked back out, a worldserver bounce. The coordinator does
-                // not try to tell those apart, because it does not act
-                // differently on any of them: IDLE will re-gather on the next
-                // poll if the job is still 'dungeon', and WIPE_RECOVER is a
-                // later slice.
-                if (!inside)
-                {
-                    LOG_INFO("module.overseer",
-                             "overseer: dungeon run STAGED_INSIDE holds nobody any more - "
-                             "not one roster member is on map {}, so the run is over "
-                             "however it ended; returning to IDLE",
-                             portal->insideMapId);
-                    coord = DungeonRunCoordinatorState();
-                    return;
-                }
-
-                // SOME IN, SOME OUT. Said out loud once rather than held
-                // silently: a party split across a portal is the exact state
-                // the barrier exists to prevent, and it having happened AFTER
-                // entry is a fact worth reading in a log.
-                coord.loggedStagedInside = false;
-                if (!coord.loggedStagedWaiting)
-                {
-                    coord.loggedStagedWaiting = true;
-                    LOG_WARN("module.overseer",
-                             "overseer: dungeon run is staged inside map {} but the party "
-                             "is split - {} of {} are in there. Still outside: {}",
-                             portal->insideMapId, inside,
-                             static_cast<uint32>(states.size()),
-                             DungeonRunEntryBlockers(states, DUNGEON_DOORSTEP_RADIUS_YARDS));
-                }
-                return;
-            }
-
-            // DungeonRunPhase::Enter
-            //
-            // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63's lesson, applied to
-            // a different journey). One more member through is the only thing
-            // that counts as progress here, and it is a fact that cannot be
-            // faked by a party standing at the door.
-            if (inside > coord.enteredCount)
-            {
-                coord.enteredCount = inside;
-                coord.enterSince = std::time(nullptr);
-                coord.loggedEnterWaiting = false;
-            }
-
-            if (DungeonRunAllInside(states))
-            {
-                coord.phase = DungeonRunPhase::StagedInside;
-                coord.loggedStagedInside = false;
-                coord.loggedStagedWaiting = false;
+                coord.phase = DungeonRunPhase::Clearing;
+                coord.armedSeen = false;
+                coord.armedSince = std::time(nullptr);
+                coord.loggedArmed = false;
+                coord.loggedUnarmed = false;
+                // THE LINE THIS WHOLE EPIC WAS OPENED TO MAKE POSSIBLE, so it
+                // says what is now true rather than what was attempted.
                 LOG_INFO("module.overseer",
-                         "overseer: all {} roster members went through areatrigger {} and "
-                         "are on map {} - ENTER done, STAGED_INSIDE holds",
-                         static_cast<uint32>(states.size()), portal->entryTriggerId,
-                         portal->insideMapId);
+                         "overseer: dungeon run STAGED_INSIDE satisfied - all {} roster "
+                         "members are on map {} together. CLEARING watches that the dungeon "
+                         "brain actually comes on",
+                         static_cast<uint32>(states.size()), portal->insideMapId);
                 return;
             }
 
-            // BACKSTOP. An ENTER that can never finish must not pin the party
-            // to a door forever - that is five characters standing still, which
-            // is the state this epic exists to stop mistaking for a working
-            // one. Read with the progress check above, "since" means since
-            // somebody last actually crossed.
-            if (coord.enterSince &&
-                std::time(nullptr) - coord.enterSince > DUNGEON_ENTER_BACKSTOP_SECONDS)
-            {
-                LOG_WARN("module.overseer",
-                         "overseer: dungeon run ENTER has got {} of {} through areatrigger "
-                         "{} and nobody else has crossed for {} minutes - giving the run up "
-                         "and returning to IDLE. Still outside: {}",
-                         inside, static_cast<uint32>(states.size()), portal->entryTriggerId,
-                         static_cast<uint32>(DUNGEON_ENTER_BACKSTOP_SECONDS / 60),
-                         DungeonRunEntryBlockers(states, DUNGEON_DOORSTEP_RADIUS_YARDS));
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
-                    Esc(leaderName));
-                coord = DungeonRunCoordinatorState();
-                return;
-            }
-
-            // WALK THE LEADER THE LAST YARDS, AND ONLY THE LEADER. The staging
-            // point deliberately stands DUNGEON_STAGING_STANDOFF_YARDS off the
-            // door so the whole gather circle sits outside the trigger; ENTER
-            // is where that standoff is spent. This is an `at:` aim on the
-            // door's own coordinates, not a `trigger:` one, because a
-            // `trigger:` aim would have DriveTravel step the LEADER through on
-            // arrival - alone, ahead of everyone following him, which is the
-            // failure this state exists to prevent. `at:` only ever walks.
+            // DungeonRunPhase::Clearing
             //
-            // WRITTEN ONLY WHEN THERE IS NOTHING ALREADY WALKING HIM. The
-            // errand column is read through the same guarded loader DriveTravel
-            // and the quest drive's arbitration both use, so the three can
-            // never disagree about whether an errand is outstanding. Re-issuing
-            // over a live aim is what ChangeToWanderNpc's own re-issue guard
-            // exists to prevent, and doing it from out here would defeat it.
-            DungeonRunEntryState const* leaderState = nullptr;
+            // THIS STATE ARMS NOTHING. DriveDungeonClear already owns arming
+            // and is the only thing that may - see this section's own comment
+            // and that drive's. What is missing, and what this adds, is a
+            // RUN-LEVEL VERDICT on whether the arming worked, because every
+            // signal that looked like one has already been wrong once:
+            //
+            //   - the command surface reports `delivered`, which means the bot
+            //     received the whisper. `dc on` outside an instance is refused
+            //     and still reports delivered with a null result.
+            //   - a strategy probe showing "dungeon clear" was read as
+            //     confirmation while every command was in fact being refused
+            //     for an unauthorized issuer (#96).
+            //
+            // So the fact this reads is the LIVE strategy list off the engine
+            // itself, per character, which is what the `strategies` probe reads
+            // (ProbeStrategies) and what DriveDungeonClear's own idempotence
+            // check reads. It is asked every poll rather than once, because
+            // strategies live in the bot's engine and not in a table: a
+            // worldserver bounce takes them away silently, and a verdict
+            // recorded once would then be a verdict that is quietly false.
+            uint32 armed = 0;
+            std::string unarmed;
             for (DungeonRunEntryState const& state : states)
-                if (state.name == leaderName)
-                    leaderState = &state;
-
-            //
-            // ONE COMPARISON COVERS THREE CASES, and deliberately: a leader
-            // already through and a leader on some third map both carry a
-            // NEGATIVE distanceFromDoor, and neither can be walked to this door
-            // by an `at:` aim - ResolveTravelTarget refuses an `at:` whose map
-            // is not the character's own. A negative distance fails
-            // `> DUNGEON_DOORSTEP_RADIUS_YARDS` on its own, so writing an aim
-            // that could only be refused is not a case to special-case, it is a
-            // case that never arises. Both still show up in the ENTER-holds
-            // line below, which is where they belong.
-            if (leaderState &&
-                leaderState->distanceFromDoor > DUNGEON_DOORSTEP_RADIUS_YARDS &&
-                !LoadTravelAims().count(leaderName))
             {
-                std::ostringstream aim;
-                // AreaTrigger::map/x/y/z  ObjectMgr.h:425,426,427,428
-                aim << "at:" << door->map << ':' << door->x << ',' << door->y << ','
-                    << door->z;
+                if (!state.through)
+                    continue;   // outside: only a character in the instance can be armed
 
-                // Esc() even though every character in a coordinate string is
-                // already safe - the same discipline every other write in this
-                // file applies to a value going into SQL.
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
-                    Esc(aim.str()), Esc(leaderName));
+                Player* member = ObjectAccessor::FindPlayerByName(state.name);
+                PlayerbotAI* memberAI = SteerableAI(member);
+                if (!memberAI)
+                    continue;
 
-                if (!coord.loggedEnterAim)
+                // HasStrategy  PlayerbotAI.h:416  bool HasStrategy(std::string const, BotState)
+                if (memberAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
                 {
-                    coord.loggedEnterAim = true;
-                    LOG_INFO("module.overseer",
-                             "overseer: dungeon run ENTER walks '{}' the last {:.0f}y from "
-                             "the staging point onto areatrigger {} ({}) - the followers "
-                             "come with him by following, and nobody is knocked through "
-                             "until everybody is on the doorstep",
-                             leaderName, leaderState->distanceFromDoor,
-                             portal->entryTriggerId, aim.str());
+                    ++armed;
+                    continue;
                 }
+
+                if (!unarmed.empty())
+                    unarmed += ", ";
+                unarmed += state.name;
             }
 
-            if (!DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))
+            if (armed && armed == inside)
             {
-                if (!coord.loggedEnterWaiting)
+                if (!coord.loggedArmed)
                 {
-                    coord.loggedEnterWaiting = true;
+                    coord.loggedArmed = true;
+                    coord.loggedUnarmed = false;
                     LOG_INFO("module.overseer",
-                             "overseer: dungeon run ENTER holds - {} of {} are through "
-                             "areatrigger {} and the rest are not on the doorstep yet: {}",
-                             inside, static_cast<uint32>(states.size()),
-                             portal->entryTriggerId,
-                             DungeonRunEntryBlockers(states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+                             "overseer: dungeon run CLEARING verified - all {} roster "
+                             "members inside map {} hold `dungeon clear`, read off their "
+                             "own engines rather than off a command status. The dungeon "
+                             "module drives the run from here",
+                             armed, portal->insideMapId);
                 }
+                coord.armedSeen = true;
+                coord.armedSince = std::time(nullptr);
                 return;
             }
 
-            // KNOCK, FOLLOWERS FIRST AND THE LEADER LAST. The ordering argument
-            // is in the section comment above; the mechanism is the verb #72
-            // already landed, called once per member rather than reimplemented.
-            //
-            // A pair of passes rather than a sort, because the only thing being
-            // ordered is "is this the leader", and the leader is a name this
-            // function already holds.
-            std::ostringstream doorAim;
-            doorAim << "trigger:" << portal->entryTriggerId;
-            std::string const doorTarget = doorAim.str();
-
-            bool const passes[2] = {false, true};
-            uint32 crossed = 0;
-            for (bool leaderPass : passes)
+            // ARMED, AND THEN NOT. This is the worldserver-bounce case and it
+            // gets its own line, because "the brain went off" and "the brain
+            // never came on" have different causes and the log should not make
+            // a reader guess which happened. Nothing is issued here: the
+            // clearing drive re-arms on its own next pass - it is a drive and
+            // not a one-shot precisely so a restart heals - and the next poll
+            // of this state verifies that it did.
+            if (coord.armedSeen)
             {
-                for (DungeonRunEntryState const& state : states)
-                {
-                    if (state.inside)
-                        continue;
-                    if ((state.name == leaderName) != leaderPass)
-                        continue;
-
-                    Player* member = ObjectAccessor::FindPlayerByName(state.name);
-                    if (!SteerableAI(member))
-                        continue;   // gone since the census above - next poll
-
-                    // Returns true ONLY if the character actually changed map,
-                    // because that is the only thing that may be read as having
-                    // crossed. A refusal is the handler's own
-                    // IsInAreaTriggerRadius being stricter than the gate above,
-                    // and is not an error: the member stays where it is and is
-                    // knocked for again next poll.
-                    if (StepThroughAreaTrigger(state.name, member, doorTarget))
-                        ++crossed;
-                }
-            }
-
-            if (crossed)
-            {
-                coord.loggedEnterWaiting = false;
-                LOG_INFO("module.overseer",
-                         "overseer: dungeon run ENTER knocked on areatrigger {} for the "
-                         "whole party at once - {} crossed onto map {} this poll, {} of {} "
-                         "are now through",
-                         portal->entryTriggerId, crossed, portal->insideMapId,
-                         inside + crossed, static_cast<uint32>(states.size()));
-                return;
-            }
-
-            // EVERYBODY ON THE DOORSTEP AND NOT ONE CROSSED. Said, not skipped.
-            // The gate above is DUNGEON_DOORSTEP_RADIUS_YARDS (5) against a
-            // trigger of radius 7, so this should not happen - and if it starts
-            // happening, a repeating line is how that becomes visible rather
-            // than a party quietly standing at a door until the backstop fires.
-            if (!coord.loggedEnterWaiting)
-            {
-                coord.loggedEnterWaiting = true;
+                coord.armedSeen = false;
+                coord.armedSince = std::time(nullptr);
+                coord.loggedArmed = false;
+                // CLEARED, NOT SET, so the grace check below can still
+                // escalate this. A disarm that heals produces one WARN and then
+                // the verified line again; a disarm that never heals produces
+                // that WARN and then the ERROR a minute later, which is the
+                // difference between a worldserver bounce and a run being
+                // fought with the brain off.
+                coord.loggedUnarmed = false;
                 LOG_WARN("module.overseer",
-                         "overseer: dungeon run ENTER has every member within {:.0f}y of "
-                         "areatrigger {} and the server refused all of them - its own "
-                         "IsInAreaTriggerRadius is the authority and is stricter than that "
-                         "gate. Knocking again next poll, bounded by the {} minute backstop",
-                         DUNGEON_DOORSTEP_RADIUS_YARDS, portal->entryTriggerId,
-                         static_cast<uint32>(DUNGEON_ENTER_BACKSTOP_SECONDS / 60));
+                         "overseer: dungeon run CLEARING was armed and is not any more - "
+                         "{} of {} inside map {} still hold `dungeon clear`. Strategies "
+                         "live in the bot's engine and not in a table, so a worldserver "
+                         "bounce disarms them silently; the clearing drive re-arms and this "
+                         "re-checks. Not armed: {}",
+                         armed, inside, portal->insideMapId, unarmed);
+                return;
+            }
+
+            // NEVER ARMED, AND THE GRACE HAS LAPSED. ERROR rather than WARN:
+            // a run whose brain is off is the single most consequential state
+            // this module can be in, it has been in it for its entire life, and
+            // the only reason that survived so long is that nothing ever said
+            // so. Said once per lapse rather than every poll, and re-armed
+            // state clears the flag, so a line here means it is still true.
+            if (coord.armedSince &&
+                std::time(nullptr) - coord.armedSince > DUNGEON_ARMING_GRACE_SECONDS &&
+                !coord.loggedUnarmed)
+            {
+                coord.loggedUnarmed = true;
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run CLEARING has {} of {} inside map {} "
+                          "holding `dungeon clear` after {}s - the dungeon brain is OFF for "
+                          "the rest and they are fighting a five-man with open-world logic. "
+                          "The clearing drive's own log says why it could not arm them. "
+                          "Not armed: {}",
+                          armed, inside, portal->insideMapId,
+                          static_cast<uint32>(DUNGEON_ARMING_GRACE_SECONDS), unarmed);
             }
             return;
         }
@@ -6453,10 +6860,10 @@ private:
             // staging point" is false BY SUCCEEDING. A barrier re-checked after
             // it is met is a barrier that can never be passed.
             coord.phase = DungeonRunPhase::Enter;
-            coord.enterSince = std::time(nullptr);
-            coord.enteredCount = 0;
-            coord.loggedEnterAim = false;
-            coord.loggedEnterWaiting = false;
+            coord.crossingSince = std::time(nullptr);
+            coord.crossedCount = 0;
+            coord.loggedCrossingAim = false;
+            coord.loggedCrossingWaiting = false;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER satisfied - all {} roster members "
                      "alive, out of combat and within {:.0f}y of the staging point. ENTER "
