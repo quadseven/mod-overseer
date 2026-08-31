@@ -327,6 +327,25 @@ constexpr uint32 PROFESSION_POLL_MS = 30000;
 // which nothing suffers from. Two minutes is many arming passes.
 constexpr uint32 RUN_COLD_SECONDS = 120;
 
+// How often the GATHERING/BARRIER coordinator polls (mod-overseer#88, slice
+// "the party owns the run" - staging half only). Faster than QUEST_POLL_MS on
+// purpose: the failure this closes is "Bork and Grog reached the tank's
+// corpse first, pulled a Defias Miner and an Evoker with no healer in range,
+// and both died. Ugga was still walking" (epic #88) - a party that has
+// already lost members while the slowest one is still 900 yards out. The
+// barrier has to notice "everyone is here" within a few seconds of it
+// becoming true, not within the twenty seconds the quest drive can tolerate
+// for an errand that is not safety-critical.
+constexpr uint32 DUNGEON_RUN_POLL_MS = 5000;
+
+// How close counts as "at the staging point" for BARRIER, and how close
+// counts as "close enough to each other" for the barrier predicate itself.
+// Ten yards because that is the figure the epic's six independently-converged
+// designs all named for the gather radius - none of them is a WoW-native
+// constant the way INTERACTION_DISTANCE is (see TRAVEL_ARRIVED_POSITION_YARDS
+// above), so this is that consensus number, not a measurement.
+constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
+
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
 // thirty-eight times in twelve minutes and travelled 0.0 yards, because its
@@ -1423,6 +1442,7 @@ public:
         _eventTimer += diff;
         _engagementTimer += diff;
         _deathTimer += diff;
+        _dungeonRunTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
@@ -1475,6 +1495,17 @@ public:
         {
             _questTimer = 0;
             DriveQuests();
+        }
+        // BEFORE DriveTravel, so a staging aim this poll writes onto the
+        // leader's travel_npc is picked up by DriveTravel the SAME tick
+        // rather than waiting a full TRAVEL_POLL_MS - the same reasoning
+        // DriveEngagementSafety's own placement below documents for why order
+        // inside one OnUpdate matters when two drives can run in the same
+        // tick.
+        if (_dungeonRunTimer >= DUNGEON_RUN_POLL_MS)
+        {
+            _dungeonRunTimer = 0;
+            DriveDungeonRun();
         }
         if (_travelTimer >= TRAVEL_POLL_MS)
         {
@@ -5195,6 +5226,459 @@ private:
         } while (result->NextRow());
     }
 
+    // ------------------------------------------------------ dungeon run: gather --
+    //
+    // mod-overseer#88 ("the party owns the run"): six independent model
+    // reviews of this codebase, given the same brief with no sight of each
+    // other's answers, converged unprompted on the same state machine -
+    //
+    //     IDLE -> GATHERING -> BARRIER -> ENTER -> STAGED_INSIDE -> CLEARING
+    //          -> LOOT -> EXIT -> IDLE
+    //
+    // - and the same diagnosis of why one is needed: "drives are concurrent
+    // controllers with no arbitration - like five drivers stepping on the same
+    // pedals" (qwen3-coder, quoted in the epic). The measured failure this
+    // closes: "Bork and Grog reached the tank's corpse first, pulled a Defias
+    // Miner and an Evoker with no healer in range, and both died. Ugga was
+    // still walking." Nobody owned the decision to wait.
+    //
+    // THIS SLICE IS THE FIRST TWO STATES ONLY - GATHERING and BARRIER, the
+    // staging half. ENTER (triggering entry for the whole party together),
+    // STAGED_INSIDE, CLEARING, LOOT, EXIT and WIPE_RECOVER are later slices;
+    // this coordinator deliberately stops the moment the barrier condition is
+    // met and does nothing further. DriveDungeonClear (above) already owns
+    // what happens once characters are actually inside an instance map - this
+    // section never touches that, and never writes `dc on` or anything else
+    // that would count as entry.
+    //
+    // WHY THIS OWNS ONLY THE LEADER'S MOVEMENT, AND NOT A NEW WALK MECHANISM.
+    // `new rpg` - the strategy that lets a character be aimed at all, via
+    // NewRpgWanderNpcAction - is deliberately carried by the LEADER alone
+    // (see CanBeSentToNpc and the 937-yard scatter it fixed). A follower
+    // travels by FOLLOWING, not by being aimed. So GATHERING reuses the exact
+    // same mechanism DriveTravel already owns - `overseer_roster.travel_npc`,
+    // resolved by ResolveTravelTarget and walked by DriveTravel/rpgInfo - by
+    // writing the leader an `at:<map>:<x>,<y>,<z>` aim at a staging point.
+    // That is deliberately NOT a `trigger:` aim: `trigger:` makes DriveTravel
+    // itself step the character through the areatrigger on arrival
+    // (StepThroughAreaTrigger) via CMSG_AREATRIGGER, which IS entry - the one
+    // thing this slice must not do. `at:` only ever walks; nothing here can
+    // cross a map boundary.
+    //
+    // A second, independent walk mechanism (MoveTo/MotionMaster called
+    // directly from this function) was considered and rejected: it would be a
+    // second thing writing motion for the leader alongside DriveTravel, which
+    // is exactly the "concurrent controllers with no arbitration" shape the
+    // epic is about. Reusing DriveTravel means there is still only one thing
+    // that ever moves a character - the coordinator only ever writes the
+    // COLUMN DriveTravel already reads, the same way DriveQuests hands the
+    // wheel to DriveTravel via TravelHoldsTheWheel instead of moving anyone
+    // itself.
+    //
+    // WHY THE STAGING POINT IS A STANDOFF FROM THE PORTAL TRIGGER, NOT THE
+    // TRIGGER ITSELF. TRAVEL_ARRIVED_POSITION_YARDS above already explains why
+    // an `at:` aim on the trigger's own coordinates is dangerous even without
+    // a `trigger:` step: a character walking to open ground stops improving
+    // once it is "close enough" and may keep drifting the last few yards on
+    // its own pathing noise, and the Deadmines portal (areatrigger 78, radius
+    // 7) is small enough that noise alone could carry someone through it while
+    // this coordinator still believes it is holding a barrier. Standing off by
+    // DUNGEON_STAGING_STANDOFF_YARDS keeps the whole staging circle
+    // (DUNGEON_BARRIER_RADIUS_YARDS, 10y) outside the trigger's own radius.
+    //
+    // WHAT TRIGGERS A RUN. `job = 'dungeon'` has existed on `overseer_roster`
+    // since 2026_08_26_01_overseer_roster_job.sql and been read by the job
+    // gate in DriveQuests since it landed - but "nothing yet exists to
+    // positively drive farm/dungeon/grind/etc" (that gate's own comment). This
+    // is the first thing that actually acts on `job = 'dungeon'` rather than
+    // merely standing another drive down for it. Keyed off the LEADER's job
+    // column, because the leader is the only one that can be aimed at all and
+    // the bridge (production/scripts/wow-overseer/jobs.py) sets the whole
+    // roster's job together.
+    //
+    // ONE COORDINATOR, NOT ONE ROW PER MAP. `overseer_dungeon_run` (opened by
+    // DriveDungeonClear) is keyed by map because several characters share an
+    // instance once they are inside it. Before entry there is exactly one
+    // party and exactly one run it could be gathering for, so the state below
+    // is a single in-process struct - unguarded, world-thread-only, following
+    // the same pattern _travelState and _awaitingRelease already document
+    // (see their comments) - rather than a table this slice has no second
+    // reader for yet.
+    struct DungeonPortal
+    {
+        char const* keyword;       // matched against the leader's job target (future: multiple dungeons)
+        uint32 outsideMapId;       // the map the portal is approached FROM
+        // Deadmines: areatrigger 78 (-11208.5, 1685.34, 25.7612), radius 7 -
+        // see TRAVEL_ARRIVED_POSITION_YARDS above for how that number was
+        // measured. Staging point is that same point stood off along X by
+        // DUNGEON_STAGING_STANDOFF_YARDS, which is NOT independently
+        // confirmed to be clear, walkable ground - #100 already tracks the
+        // live-verification obligation for this epic and this staging point
+        // belongs on that list before a run is ever run for real.
+        float stageX, stageY, stageZ;
+    };
+
+    // Standoff from the portal trigger's own coordinates, chosen so the whole
+    // gather circle (DUNGEON_BARRIER_RADIUS_YARDS) sits outside the trigger's
+    // radius (7y for Deadmines) with room to spare - see the staging-point
+    // comment above.
+    static constexpr float DUNGEON_STAGING_STANDOFF_YARDS = 20.0f;
+
+    // Only Deadmines for this slice. A second dungeon is a second row here,
+    // not a second code path - deliberately not built until a second dungeon
+    // is actually asked for (see jobs.py's IMPLEMENTED, which does not yet
+    // name one either).
+    static DungeonPortal const* FindDungeonPortal(std::string const& keyword)
+    {
+        static DungeonPortal const portals[] = {
+            {"deadmines", 0, -11208.5f + DUNGEON_STAGING_STANDOFF_YARDS, 1685.34f, 25.7612f},
+        };
+        for (DungeonPortal const& portal : portals)
+            if (keyword == portal.keyword)
+                return &portal;
+        return nullptr;
+    }
+
+    enum class DungeonRunPhase : uint8
+    {
+        Idle,        // nobody has asked for a run
+        Gathering,   // leader aimed at the staging point, still walking
+        Barrier      // leader has arrived; waiting for the whole roster
+    };
+
+    // World-thread-only, unguarded, lost on restart - same discipline as
+    // _travelState and _awaitingRelease (see their comments): OnUpdate is the
+    // only caller of DriveDungeonRun, and a restart costs one re-gather, not
+    // correctness.
+    struct DungeonRunCoordinatorState
+    {
+        DungeonRunPhase phase{DungeonRunPhase::Idle};
+        std::string portalKeyword;   // which DungeonPortal this run is for
+        // Said once per phase entry rather than once per poll - the log-once
+        // flags every other drive in this file already uses (`arrived` in
+        // TravelState, `stuckLogged` in RepickMemory) for the same reason:
+        // BARRIER can legitimately hold for minutes while a slow follower
+        // catches up, and repeating "still waiting" every five seconds would
+        // bury the one line that matters.
+        bool loggedGathering{false};
+        bool loggedBarrierWaiting{false};
+        bool loggedBarrierMet{false};
+    };
+    DungeonRunCoordinatorState _dungeonRunCoordinator;
+
+    // THE BARRIER PREDICATE, KEPT FREE OF EVERY CORE TYPE ON PURPOSE. Nothing
+    // here touches Player, Map, or PlayerbotAI - it is fed plain facts the
+    // caller already gathered, so it can be exercised directly by a unit test
+    // with no world, no bot, and no database, and so a change to how the facts
+    // are gathered can never also silently change what BARRIER requires.
+    //
+    // ALL THREE CONDITIONS ARE FROM THE EPIC, VERBATIM: "hold until ALL are
+    // within ~10y, alive, and out of combat." Fails closed: an empty roster or
+    // any member this poll could not even find (a name that resolved to
+    // nobody, or a distance never measured because the character is on a
+    // different map) reads as barrier-not-met, never as vacuously met -
+    // exactly the "geography is necessary but not sufficient" lesson
+    // InDungeonRun above already had to learn once.
+    struct DungeonRunMemberState
+    {
+        std::string name;
+        bool seen{false};              // false = not found in the world this poll
+        bool alive{false};
+        bool inCombat{false};
+        float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
+    };
+
+    static bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
+                                     float radiusYards)
+    {
+        if (members.empty())
+            return false;
+
+        for (DungeonRunMemberState const& member : members)
+        {
+            if (!member.seen)
+                return false;
+            if (!member.alive)
+                return false;
+            if (member.inCombat)
+                return false;
+            if (member.distanceFromStage < 0.f || member.distanceFromStage > radiusYards)
+                return false;
+        }
+        return true;
+    }
+
+    // Why a member is failing BARRIER, for the one log line BARRIER prints
+    // while it waits. Kept separate from the predicate above so the predicate
+    // itself stays a plain bool with nothing to format - a pure function that
+    // also builds strings is a pure function that is harder to test twice.
+    static std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
+                                                  float radiusYards)
+    {
+        std::string blockers;
+        for (DungeonRunMemberState const& member : members)
+        {
+            std::string why;
+            if (!member.seen)
+                why = "not seen";
+            else if (!member.alive)
+                why = "dead";
+            else if (member.inCombat)
+                why = "in combat";
+            else if (member.distanceFromStage < 0.f)
+                why = "wrong map";
+            else if (member.distanceFromStage > radiusYards)
+                why = std::to_string(static_cast<int>(member.distanceFromStage)) + "y away";
+            else
+                continue;
+
+            if (!blockers.empty())
+                blockers += ", ";
+            blockers += member.name + " (" + why + ")";
+        }
+        return blockers;
+    }
+
+    void DriveDungeonRun()
+    {
+        // `job` is read through the SAME guarded loader LoadJobs() already
+        // gives DriveQuests, not inlined into this query - infra#2846: a
+        // schema older than one of these columns must cost that column, not
+        // the whole roster read. Inlining `job` here would null this entire
+        // query - and therefore `name` and `lead` with it - on exactly the
+        // schema this coordinator most needs to degrade gracefully on.
+        std::map<std::string, std::string> const jobs = LoadJobs();
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        std::vector<std::string> members;
+        std::string leaderName;
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            bool const isLead = fields[1].Get<uint8>() != 0;
+            members.push_back(name);
+            if (isLead)
+                leaderName = name;
+        } while (result->NextRow());
+
+        // No leader on the roster at all is a roster-shape problem this drive
+        // cannot fix, and every step below needs one to aim.
+        if (leaderName.empty())
+            return;
+
+        // LoadJobs() ONLY returns rows whose job is set and is NOT 'quest' -
+        // see its own comment for why absence already means "quest, or the
+        // column does not exist yet", which for THIS drive both mean
+        // "nothing to gather toward".
+        auto const jobIt = jobs.find(leaderName);
+        std::string const leaderJob = jobIt == jobs.end() ? std::string("quest") : jobIt->second;
+
+        DungeonRunCoordinatorState& coord = _dungeonRunCoordinator;
+
+        if (coord.phase == DungeonRunPhase::Idle)
+        {
+            // job != 'dungeon' is the ordinary case - most polls, this drive
+            // has nothing to do, same as every other job-gated drive in this
+            // file when the roster is questing.
+            if (leaderJob != "dungeon")
+                return;
+
+            Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
+            PlayerbotAI* leaderAI = SteerableAI(leader);
+            if (!leaderAI)
+                return;  // mid-login/mid-teardown - try again next poll
+
+            // ALREADY INSIDE. Either DriveDungeonClear's geography-based open
+            // already has this run (a run started before this coordinator
+            // existed, or one entered by some path outside it), or the leader
+            // is standing in a dungeon with job still set to 'dungeon' from a
+            // PREVIOUS run that has not been cleared yet. Either way there is
+            // no staging left to do - GATHERING/BARRIER is for BEFORE entry -
+            // so this coordinator stays out of it rather than guessing.
+            if (InDungeonRun(leader))
+                return;
+
+            DungeonPortal const* portal = FindDungeonPortal("deadmines");
+            if (!portal)
+                return;  // no known portal for this job yet - nothing to gather toward
+
+            std::ostringstream aim;
+            aim << "at:" << portal->outsideMapId << ':' << portal->stageX << ','
+                << portal->stageY << ',' << portal->stageZ;
+
+            // Esc() even though every character in a coordinate string is
+            // already safe - the same discipline every other write in this
+            // file applies to a value going into SQL, so a later change to
+            // the format string cannot silently reopen the question.
+            CharacterDatabase.Execute(
+                "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
+                Esc(aim.str()), Esc(leaderName));
+
+            coord.phase = DungeonRunPhase::Gathering;
+            coord.portalKeyword = "deadmines";
+            coord.loggedGathering = false;
+            coord.loggedBarrierWaiting = false;
+            coord.loggedBarrierMet = false;
+
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run requested (job=dungeon on leader '{}') - "
+                     "aiming it at the Deadmines staging point ({}) outside the portal; "
+                     "GATHERING begins",
+                     leaderName, aim.str());
+            return;
+        }
+
+        // Both GATHERING and BARRIER need to know the portal being staged
+        // for and whether the operator has since cancelled the run (job no
+        // longer 'dungeon') or the run already opened by some other path.
+        DungeonPortal const* portal = FindDungeonPortal(coord.portalKeyword);
+        if (!portal)
+        {
+            // Should be unreachable - the keyword was just resolved above -
+            // but a coordinator that trusts its own cached keyword forever is
+            // exactly the "guard whose condition can never become true" shape
+            // the run table's own migration warns against. Fail back to IDLE
+            // rather than dereference nothing.
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run coordinator lost its portal ('{}') - "
+                     "returning to IDLE", coord.portalKeyword);
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
+        PlayerbotAI* leaderAI = SteerableAI(leader);
+
+        if (leaderJob != "dungeon")
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' job left 'dungeon' mid-gather - the dungeon run "
+                     "coordinator stands down and clears its staging aim", leaderName);
+            if (leaderAI)
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'",
+                    Esc(leaderName));
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        if (!leaderAI)
+            return;  // mid-login/mid-teardown - hold phase, try again next poll
+
+        if (InDungeonRun(leader))
+        {
+            // Entered by some other path while this coordinator was still
+            // staging - a human command, a different drive, a relog that
+            // landed inside. Not this slice's problem to solve (ENTER is out
+            // of scope here), but it must not keep believing it owns a gather
+            // that is already over.
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is already inside a dungeon run - the staging "
+                     "coordinator had not finished BARRIER, but entry has already "
+                     "happened by some other path; returning to IDLE", leaderName);
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        if (coord.phase == DungeonRunPhase::Gathering)
+        {
+            if (!coord.loggedGathering)
+            {
+                coord.loggedGathering = true;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is walking to the staging point - followers "
+                         "reach it by following, not by their own aim", leaderName);
+            }
+
+            // GetMapId  Position.h:281  uint32 GetMapId() const
+            // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+            if (leader->GetMapId() != portal->outsideMapId)
+                return;  // still travelling, or on a different map entirely - keep waiting
+
+            float const distance = leader->GetDistance2d(portal->stageX, portal->stageY);
+            if (distance > DUNGEON_BARRIER_RADIUS_YARDS)
+                return;
+
+            coord.phase = DungeonRunPhase::Barrier;
+            coord.loggedBarrierWaiting = false;
+            coord.loggedBarrierMet = false;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' reached the staging point ({:.0f}y out) - GATHERING "
+                     "done, BARRIER holds until the whole roster is alive, out of combat "
+                     "and within {:.0f}y",
+                     leaderName, distance, DUNGEON_BARRIER_RADIUS_YARDS);
+            return;
+        }
+
+        // DungeonRunPhase::Barrier
+        //
+        // THE WHOLE ROSTER IS RE-CHECKED HERE, NOT JUST THE MEMBERS DriveTravel
+        // MOVED. The barrier is about who would walk into the instance
+        // together, and a follower reaches the staging point by FOLLOWING the
+        // leader (see the section comment above) - so a follower's own
+        // aliveness, combat state and distance are facts only this poll can
+        // measure, not facts the GATHERING phase already established for it.
+        std::vector<DungeonRunMemberState> states;
+        states.reserve(members.size());
+        for (std::string const& name : members)
+        {
+            DungeonRunMemberState state;
+            state.name = name;
+
+            // SteerableAI, not a bare lookup - the same reason every other
+            // drive in this file uses it: a name can resolve to a Player
+            // mid-login or mid-teardown. A member this poll cannot even find
+            // is exactly the "not seen" case the predicate fails closed on.
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(member))
+            {
+                states.push_back(state);
+                continue;
+            }
+
+            state.seen = true;
+            // IsAlive  Unit.h:1793  bool IsAlive() const
+            state.alive = member->IsAlive();
+            // IsInCombat  Unit.h:936  bool IsInCombat() const
+            state.inCombat = member->IsInCombat();
+            // GetMapId  Position.h:281  uint32 GetMapId() const
+            if (member->GetMapId() == portal->outsideMapId)
+                // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+                state.distanceFromStage = member->GetDistance2d(portal->stageX, portal->stageY);
+
+            states.push_back(state);
+        }
+
+        if (DungeonRunBarrierMet(states, DUNGEON_BARRIER_RADIUS_YARDS))
+        {
+            if (!coord.loggedBarrierMet)
+            {
+                coord.loggedBarrierMet = true;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run BARRIER satisfied - all {} roster members "
+                         "alive, out of combat and within {:.0f}y of the staging point. "
+                         "ENTER is out of scope for this slice (mod-overseer#88) - the "
+                         "coordinator holds here", static_cast<uint32>(states.size()),
+                         DUNGEON_BARRIER_RADIUS_YARDS);
+            }
+            return;
+        }
+
+        coord.loggedBarrierMet = false;
+        if (!coord.loggedBarrierWaiting)
+        {
+            coord.loggedBarrierWaiting = true;
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run BARRIER holds - {}",
+                     DungeonRunBarrierBlockers(states, DUNGEON_BARRIER_RADIUS_YARDS));
+        }
+    }
+
     // Teach the roster what a character of its level would already know.
     //
     // WHY THIS EXISTS AT ALL. mod-playerbots does this job properly on levelup -
@@ -7373,6 +7857,14 @@ private:
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
     uint32 _engagementTimer = 0;
+    // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
+    // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is
+    // safety-critical for the same reason DriveEngagementSafety is - see
+    // DUNGEON_RUN_POLL_MS above - and either existing cadence would be either
+    // too slow (quest) or would tie this drive's interval to a constant that
+    // is free to change for engagement-safety reasons that have nothing to do
+    // with gathering a party.
+    uint32 _dungeonRunTimer = 0;
 
     // ---------------------------------------------------------------- travel --
     //
