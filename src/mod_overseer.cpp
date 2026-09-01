@@ -7641,10 +7641,27 @@ private:
             // be walked here by an `at:` aim at all - ResolveTravelTarget
             // refuses one whose map is not the character's own - so it is left
             // to the blockers line rather than given an errand that could only
-            // be refused. The LEADER is excluded because he is what the staging
-            // point IS: escorting him to where he already stands would claim
-            // over the GATHERING errand he may still be finishing.
-            if (name != leaderName && state.distanceFromStage > DUNGEON_BARRIER_RADIUS_YARDS)
+            // be refused.
+            //
+            // THE LEADER IS ESCORTED AT ANY DISTANCE, INCLUDING NONE, and that
+            // is not a no-op. BARRIER opens at DUNGEON_BARRIER_RADIUS_YARDS (10)
+            // while DriveTravel calls an `at:` errand done at
+            // TRAVEL_ARRIVED_POSITION_YARDS (5), so without this the leader
+            // arrives, his errand is released, his own `new rpg` goes idle and
+            // NewRpgStatusUpdateAction sends him off to grind or quest while the
+            // barrier is still waiting for the stragglers he is the anchor for.
+            // Escorting him holds him on the spot instead (see DriveTravel's
+            // escort arrival branch). It claims the identical aim string
+            // GATHERING already wrote, so TravelAimBook::Claim is idempotent
+            // against the walk still in flight, and it grants him nothing - he
+            // carries `new rpg` in his own right and keeps it.
+            //
+            // A follower is escorted only while it is genuinely short of the
+            // staging point. Inside the radius the leader is right there, so
+            // `follow` is both sufficient and preferable.
+            bool const isLeader = name == leaderName;
+            if (state.distanceFromStage >= 0.f &&
+                (isLeader || state.distanceFromStage > DUNGEON_BARRIER_RADIUS_YARDS))
                 EscortToward(name, stageTarget, "BARRIER");
 
             states.push_back(state);
