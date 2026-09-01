@@ -4886,22 +4886,10 @@ private:
             bot->GetMapId(), team);
         if (!fromNode)
             return false;
-        uint32 const toNode = sObjectMgr->GetNearestTaxiNode(
-            dest.GetPositionX(), dest.GetPositionY(), dest.GetPositionZ(),
-            dest.GetMapId(), team);
-        // Same node at both ends means the destination is served by the node
-        // the character is already standing nearest to: there is nothing to
-        // fly, and the walk below is the whole trip.
-        if (!toNode || toNode == fromNode)
-            return false;
-
         // DBCStores.h - the same store Player::ActivateTaxiPathTo looks the
-        // start node up in (Player.cpp:10469), read here for the arrival
-        // node's POSITION, which is what makes the comparison below a
-        // flight-adjusted distance rather than a guess.
+        // start node up in (Player.cpp:10469).
         TaxiNodesEntry const* const departure = sTaxiNodesStore.LookupEntry(fromNode);
-        TaxiNodesEntry const* const arrival = sTaxiNodesStore.LookupEntry(toNode);
-        if (!departure || !arrival)
+        if (!departure)
             return false;
 
         // The creature that has to be walked to and talked to. Resolved
@@ -4927,101 +4915,196 @@ private:
             TRAVEL_FLIGHT_NODE_MATCH_YARDS * TRAVEL_FLIGHT_NODE_MATCH_YARDS)
             return false;
 
-        // THE FLIGHT-ADJUSTED DISTANCE, which is the decision this issue
-        // actually asks for. Not "is there a flight" - there nearly always is
-        // - but "does flying put me nearer than walking would", counting both
-        // walks the flight adds: to the flight master here, and from the
-        // arrival node to the destination there.
+        // How far the flight costs before it has flown anywhere. Half of the
+        // flight-adjusted comparison below, and constant across every
+        // candidate arrival node, so it is measured once out here.
         float const toMaster =
             bot->GetDistance2d(fmPos.GetPositionX(), fmPos.GetPositionY());
-        float const landDx = arrival->x - dest.GetPositionX();
-        float const landDy = arrival->y - dest.GetPositionY();
-        float const fromLanding = std::sqrt(landDx * landDx + landDy * landDy);
-        if (toMaster + fromLanding + TRAVEL_FLIGHT_SAVING_YARDS >= walkYards)
-            return false;
 
-        // TravelNode.h:585, public. A precomputed BFS over the whole taxi
-        // graph, built once at startup by TravelMgr (TravelMgr.cpp:4361), so
-        // this is a map lookup rather than a search. Fewer than two nodes is
-        // no route: ActivateTaxiPathTo refuses that outright.
-        std::vector<uint32> const path = sTravelNodeMap.FindTaxiPath(fromNode, toNode);
-        if (path.size() < 2)
-            return false;
-
-        for (uint32 hop : path)
+        // WHERE TO LAND, AND WHY IT IS NOT SIMPLY THE NEAREST NODE. The
+        // nearest taxi node to an errand is the obvious answer and it is
+        // regularly the wrong one, in two different ways that both end as a
+        // character walking:
+        //
+        //   * IT MAY BE ONE NOBODY HAS DISCOVERED. Landing is only possible at
+        //     a node already in the taximask, and the nearest node to a
+        //     destination is frequently in a zone the family has never walked
+        //     to. Taking it and giving up loses every flight to a node that IS
+        //     known and only slightly further out.
+        //   * IT MAY NOT BE A FLIGHT POINT AT ALL. TaxiNodes.dbc carries rows
+        //     that are usable-looking but have no taxi paths attached - node
+        //     168 "Filming" sits in Elwynn Forest, nearer to a good deal of
+        //     that zone than Stormwind is, and connects to nothing.
+        //
+        // So the candidates are the character's OWN known nodes on the
+        // destination's map, nearest to the errand first. That is both the
+        // player's question - "which of my flight points is closest to where I
+        // am going" - and the only set any of these can actually land at.
+        std::vector<std::pair<float, uint32>> candidates;
+        for (uint32 id = 1; id < sTaxiNodesStore.GetNumRows(); ++id)
         {
-            if (bot->m_taxi.IsTaximaskNodeKnown(hop))  // PlayerTaxi.h:35
+            // PlayerTaxi.h:35. Asked before the store lookup because it is a
+            // bit test against an array and this loop runs over every node in
+            // the DBC.
+            if (id == fromNode || !bot->m_taxi.IsTaximaskNodeKnown(id))
+                continue;
+            TaxiNodesEntry const* const node = sTaxiNodesStore.LookupEntry(id);
+            if (!node || node->map_id != dest.GetMapId())
+                continue;
+            float const dx = node->x - dest.GetPositionX();
+            float const dy = node->y - dest.GetPositionY();
+            candidates.emplace_back(std::sqrt(dx * dx + dy * dy), id);
+        }
+        // Nearest to the errand first, so the first candidate that survives
+        // every check below is also the best one - and so the loop can stop
+        // the moment a candidate is too far to be worth flying to, because
+        // every candidate after it is further still.
+        std::sort(candidates.begin(), candidates.end());
+
+        for (auto const& candidate : candidates)
+        {
+            float const fromLanding = candidate.first;
+            uint32 const toNode = candidate.second;
+
+            // THE FLIGHT-ADJUSTED DISTANCE, which is the decision this issue
+            // actually asks for. Not "is there a flight" - there nearly always
+            // is - but "does flying put me nearer than walking would",
+            // counting both walks the flight adds: to the flight master here,
+            // and from the arrival node to the errand there. `break` and not
+            // `continue`: the candidates only get further from the errand from
+            // here on, so none of them can beat a walk either.
+            if (toMaster + fromLanding + TRAVEL_FLIGHT_SAVING_YARDS >= walkYards)
+                break;
+
+            // TravelNode.h:585, public. A precomputed BFS over the whole taxi
+            // graph, built once at startup by TravelMgr (TravelMgr.cpp:4361),
+            // so this is a map lookup rather than a search. Fewer than two
+            // nodes is no route: ActivateTaxiPathTo refuses that outright.
+            std::vector<uint32> const path = sTravelNodeMap.FindTaxiPath(fromNode, toNode);
+            if (path.size() < 2)
                 continue;
 
-            // SAID ONCE PER ERRAND. This is the report #68 asks for in place
-            // of a silent no-op, and it is the line that turns "they never
-            // fly" into "they never fly BECAUSE nobody has walked to node N
-            // yet" - which is a fixable sentence and the other one is not.
-            if (!state.flightSaid)
+            // EVERY HOP AFTER THE FIRST HAS TO BE KNOWN, and the first one
+            // deliberately does not. WorldSession::HandleActivateTaxiExpress-
+            // Opcode checks every node of a route against the taximask
+            // (TaxiHandler.cpp:185), but a real client only ever sends that
+            // packet after opening the flight master's window, which learns
+            // the node it is standing at (SendLearnNewTaxiNode). Upstream's
+            // NewRpgTravelFlightAction makes exactly that call before
+            // activating, so the departure node is learned on arrival the same
+            // way a player learns it - and requiring it in advance would be
+            // stricter than the game, not safer than it.
+            uint32 unknownHop = 0;
+            for (size_t hop = 1; hop < path.size(); ++hop)
             {
-                state.flightSaid = true;
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' is sent to '{}' {} yards away and could fly node "
-                         "{} to node {}, but has not discovered node {} on that route - "
-                         "walking instead",
-                         name, state.target, static_cast<uint32>(walkYards),
-                         fromNode, toNode, hop);
+                if (!bot->m_taxi.IsTaximaskNodeKnown(path[hop]))
+                {
+                    unknownHop = path[hop];
+                    break;
+                }
             }
-            return false;
+            if (unknownHop)
+            {
+                // SAID ONCE PER ERRAND. This is the report #68 asks for in
+                // place of a silent no-op, and it is the line that turns "they
+                // never fly" into "they never fly BECAUSE nobody has walked to
+                // node N yet" - which is a fixable sentence and the other one
+                // is not.
+                if (!state.flightSaid)
+                {
+                    state.flightSaid = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is sent to '{}' {} yards away and could fly "
+                             "node {} to node {}, but has not discovered node {} on that "
+                             "route - trying a nearer node, or walking",
+                             name, state.target, static_cast<uint32>(walkYards),
+                             fromNode, toNode, unknownHop);
+                }
+                continue;
+            }
+
+            // THE FARE, CHECKED HERE RATHER THAN DISCOVERED AT THE COUNTER.
+            // Player::ActivateTaxiPathTo sums the same per-hop costs and
+            // refuses the whole flight if the character cannot pay
+            // (Player.cpp:10557) - but it refuses by sending
+            // ERR_TAXINOTENOUGHMONEY to a client that does not exist, upstream
+            // turns that into RPG_IDLE, and the visible result is a character
+            // that walked to a flight master, stood there, and then walked on.
+            // That is the silent no-op #68 asks not to have.
+            //
+            // ObjectMgr.h:819, the same GetTaxiPath the activation itself
+            // uses. Deliberately the UNDISCOUNTED total: the reputation
+            // discount Player::ActivateTaxiPathTo applies needs the flight
+            // master creature in hand, which is a walk away, and it only ever
+            // makes the fare SMALLER - so this can refuse a flight that would
+            // in fact have been affordable, and can never let one through that
+            // would not.
+            uint32 fare = 0;
+            bool flyable = true;
+            for (size_t hop = 1; hop < path.size(); ++hop)
+            {
+                uint32 hopPath = 0;
+                uint32 hopCost = 0;
+                sObjectMgr->GetTaxiPath(path[hop - 1], path[hop], hopPath, hopCost);
+                if (!hopPath)
+                {
+                    // The BFS graph and the DBC disagree about this hop. Not
+                    // this route's fault to fix; try the next candidate.
+                    flyable = false;
+                    break;
+                }
+                fare += hopCost;
+            }
+            if (!flyable)
+                continue;
+
+            if (bot->GetMoney() < fare)   // Player.h, GetMoney
+            {
+                if (!state.flightSaid)
+                {
+                    state.flightSaid = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is sent to '{}' {} yards away and could fly "
+                             "node {} to node {}, but the fare is {} copper and it holds "
+                             "{} - walking instead",
+                             name, state.target, static_cast<uint32>(walkYards),
+                             fromNode, toNode, fare, bot->GetMoney());
+                }
+                continue;
+            }
+
+            // NewRpgInfo.h:107. From here the errand belongs to upstream's
+            // flight action until it lands or the leg's own backstop takes it
+            // back.
+            botAI->rpgInfo.ChangeToTravelFlight(fmEntry, fmPos, path);
+            state.flights++;
+            state.flightSince = std::time(nullptr);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' {} yards away and flies instead - "
+                     "node {} to node {} in {} hops for {} copper, boarding at flight "
+                     "master {} {} yards off, landing {} yards from the errand",
+                     name, state.target, static_cast<uint32>(walkYards), fromNode, toNode,
+                     static_cast<uint32>(path.size() - 1), fare, fmEntry,
+                     static_cast<uint32>(toMaster), static_cast<uint32>(fromLanding));
+            return true;
         }
 
-        // THE FARE, CHECKED HERE RATHER THAN DISCOVERED AT THE COUNTER.
-        // Player::ActivateTaxiPathTo sums the same per-hop costs and refuses
-        // the whole flight if the character cannot pay (Player.cpp:10557) -
-        // but it refuses by sending ERR_TAXINOTENOUGHMONEY to a client that
-        // does not exist, upstream turns that into RPG_IDLE, and the visible
-        // result is a character that walked to a flight master, stood there,
-        // and then walked on. That is the silent no-op #68 asks not to have.
-        //
-        // ObjectMgr.h:819, the same GetTaxiPath the activation itself uses.
-        // Deliberately the UNDISCOUNTED total: the reputation discount
-        // Player::ActivateTaxiPathTo applies needs the flight master creature
-        // in hand, which is a walk away, and it only ever makes the fare
-        // SMALLER - so this can refuse a flight that would in fact have been
-        // affordable, and can never let one through that would not.
-        uint32 fare = 0;
-        for (size_t hop = 1; hop < path.size(); ++hop)
+        // NO CANDIDATE SURVIVED, and the character walks. Said once per errand
+        // and only when a flight was genuinely in reach - a character with no
+        // known node on this map at all, or none that beats walking, is not
+        // interesting and would bury the cases that are.
+        if (!state.flightSaid && !candidates.empty() &&
+            toMaster + candidates.front().first + TRAVEL_FLIGHT_SAVING_YARDS < walkYards)
         {
-            uint32 hopPath = 0;
-            uint32 hopCost = 0;
-            sObjectMgr->GetTaxiPath(path[hop - 1], path[hop], hopPath, hopCost);
-            if (!hopPath)
-                return false;   // no such flight: the graph and the DBC disagree
-            fare += hopCost;
+            state.flightSaid = true;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' {} yards away and holds {} flight "
+                     "points on this map, but none of them has a route from node {} it "
+                     "can fly - walking instead",
+                     name, state.target, static_cast<uint32>(walkYards),
+                     static_cast<uint32>(candidates.size()), fromNode);
         }
-        if (bot->GetMoney() < fare)   // Player.h, GetMoney
-        {
-            if (!state.flightSaid)
-            {
-                state.flightSaid = true;
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' is sent to '{}' {} yards away and could fly node "
-                         "{} to node {}, but the fare is {} copper and it holds {} - "
-                         "walking instead",
-                         name, state.target, static_cast<uint32>(walkYards),
-                         fromNode, toNode, fare, bot->GetMoney());
-            }
-            return false;
-        }
-
-        // NewRpgInfo.h:107. From here the errand belongs to upstream's flight
-        // action until it lands or the leg's own backstop takes it back.
-        botAI->rpgInfo.ChangeToTravelFlight(fmEntry, fmPos, path);
-        state.flights++;
-        state.flightSince = std::time(nullptr);
-        LOG_INFO("module.overseer",
-                 "overseer: '{}' is sent to '{}' {} yards away and flies instead - node {} "
-                 "to node {} in {} hops for {} copper, boarding at flight master {} {} "
-                 "yards off, landing {} yards from the errand",
-                 name, state.target, static_cast<uint32>(walkYards), fromNode, toNode,
-                 static_cast<uint32>(path.size() - 1), fare, fmEntry,
-                 static_cast<uint32>(toMaster), static_cast<uint32>(fromLanding));
-        return true;
+        return false;
     }
 
     // The unlearn drive. Its own poll, because unlearning needs no NPC and no
