@@ -601,6 +601,9 @@ enum ChatKindMask : uint32
 struct WatchEntry
 {
     std::string name;
+    // Resolved once on the world thread in ReloadWatchList so that the chat
+    // hooks, which run on map threads, never have to resolve anything.
+    ObjectGuid guid;
     uint32 channels = KIND_NONE;
 };
 
@@ -800,7 +803,34 @@ bool Interested(uint32 kind)
     return kind != KIND_NONE && (g_watchUnion.load(std::memory_order_relaxed) & kind) != 0;
 }
 
-// Resolve each watcher that wants this kind, skipping any who are offline.
+// Hand every watcher that wants this kind to `fn`, as a GUID and a name.
+//
+// WHY NO Player* IS RESOLVED HERE, WHICH IS THE WHOLE POINT (#125).
+// This runs on whatever thread the speech happened on - for a bot, a map
+// update thread, and there is more than one of those. The core's own header
+// says this about the call this function used to make:
+//
+//     // these functions return objects if found in whole world
+//     // ACCESS LIKE THAT IS NOT THREAD SAFE
+//     Player* FindPlayerByName(std::string const& name, bool checkInWorld = true);
+//
+// and it means it literally. FindPlayerByName resolves through
+// PlayerNameMapHolder, a bare static std::unordered_map with NO lock at all -
+// unlike HashMapHolder immediately above it in the same file, which takes a
+// shared_mutex on every operation. The distinction is deliberate and it is a
+// trap. Meanwhile ObjectAccessor::RemoveObject erases from that same unlocked
+// map and Map::DeleteFromWorld then does `delete player`, and both run on a
+// map thread because mod-playerbots logs bots out from inside the AI tick.
+// One map thread walking the bucket chain while another erases from it and
+// frees the Player is a data race AND a use-after-free, and it was killing
+// this worldserver every few minutes with a bare SIGSEGV and no backtrace.
+//
+// So the rule is now: the chat hot path never touches a global player
+// container. Callers get a GUID and answer audibility from it. Where a caller
+// genuinely needs the object, it resolves through the map-scoped
+// ObjectAccessor::GetPlayer(WorldObject const&, guid), which the same header
+// lists under "these functions return objects only if in map of specified
+// object" - that is, the map the calling thread already owns.
 template <typename F>
 void ForEachWatcher(uint32 kind, F&& fn)
 {
@@ -809,21 +839,46 @@ void ForEachWatcher(uint32 kind, F&& fn)
     {
         if (!(entry.channels & kind))
             continue;
-        if (Player* watcher = ObjectAccessor::FindPlayerByName(entry.name))
-            if (watcher->IsInWorld())
-                fn(watcher);
+        if (entry.guid.IsEmpty())
+            continue;
+        fn(entry.guid, entry.name);
     }
+}
+
+// Is this character online right now?
+//
+// The returned pointer is used as a boolean and IS NEVER DEREFERENCED, which
+// is what makes this safe to ask from a map thread. FindConnectedPlayer reads
+// HashMapHolder under its shared_mutex, so the container access is
+// synchronised; what is unsafe about the whole-world accessors is touching an
+// object another map's thread owns, and that never happens here. The answer
+// can go stale immediately - a watcher who logs out mid-line leaves one row
+// saying they heard it - which is a log artefact and not a fault. It answers
+// "connected" rather than "in world", so it is also true during the moment of
+// a loading screen; that window is smaller than the staleness above and costs
+// the same nothing.
+bool WatcherOnline(ObjectGuid guid)
+{
+    return ObjectAccessor::FindConnectedPlayer(guid) != nullptr;
 }
 
 // Mirror of Guild::BroadcastToGuild's recipient test: guild membership plus
 // the matching listen right. Keeping this in one place is what stops the hook
 // path and the Discord-origin path drifting apart.
-bool GuildCanHear(Guild* guild, Player* watcher, uint32 kind)
+// Takes a GUID rather than a Player* so the chat hooks never have to resolve
+// one - see ForEachWatcher. This is Guild::HasRankRight's own body with the
+// player->GetGUID() step removed. GetMember answering for THIS guild is
+// already the membership test the old GetGuildId() comparison was making, and
+// it reads the guild's roster rather than a cached field on the player.
+bool GuildCanHear(Guild* guild, ObjectGuid guid, uint32 kind)
 {
-    if (!guild || !watcher || watcher->GetGuildId() != guild->GetId())
+    if (!guild)
         return false;
-    return guild->HasRankRight(
-        watcher, kind == KIND_OFFICER ? GR_RIGHT_OFFCHATLISTEN : GR_RIGHT_GCHATLISTEN);
+    Guild::Member const* member = guild->GetMember(guid);
+    if (!member)
+        return false;
+    uint32 const right = (kind == KIND_OFFICER) ? GR_RIGHT_OFFCHATLISTEN : GR_RIGHT_GCHATLISTEN;
+    return (guild->GetRankRights(member->GetRankId()) & right) != GR_RIGHT_EMPTY;
 }
 
 // Capture a line for a send that did NOT pass through the chat hooks.
@@ -839,10 +894,10 @@ void CaptureBypassed(Player* sender, uint32 kind, std::string const& text, Pred&
 {
     if (!Interested(kind))
         return;
-    ForEachWatcher(kind, [&](Player* watcher)
+    ForEachWatcher(kind, [&](ObjectGuid guid, std::string const& name)
     {
-        if (heard(watcher))
-            RecordHeard(sender, watcher->GetName(), kind, text, "");
+        if (heard(guid))
+            RecordHeard(sender, name, kind, text, "");
     });
 }
 
@@ -1176,8 +1231,13 @@ void RecordDeath(Player* player)
     {
         d.grouped = 1;
         d.groupSize = static_cast<uint8>(group->GetMembersCount());
-        if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
-            d.groupLeader = leader->GetName();
+        // Group::GetLeaderName reads a string cached on the Group itself, so
+        // this resolves no Player at all. It used to call
+        // ObjectAccessor::FindPlayer and then dereference the result, which is
+        // the same map-thread hazard as the chat hooks (#125): the leader
+        // of a split party is on another map, owned by another map thread, and
+        // free to be deleted while this one reads its name.
+        d.groupLeader = group->GetLeaderName();
     }
 
     {
@@ -1534,11 +1594,22 @@ public:
                     : (kind == KIND_EMOTE) ? sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_TEXTEMOTE)
                     : sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_SAY);
 
-        ForEachWatcher(kind, [&](Player* watcher)
+        ForEachWatcher(kind, [&](ObjectGuid guid, std::string const& name)
         {
             // The speaker hears themselves - that line belongs in their log.
-            if (watcher == player || player->IsWithinDistInMap(watcher, range))
-                RecordHeard(player, watcher->GetName(), kind, msg, "");
+            if (guid == player->GetGUID())
+            {
+                RecordHeard(player, name, kind, msg, "");
+                return;
+            }
+            // Map-scoped resolution, and nothing is lost by it: audibility
+            // here is distance on the same map, so a watcher the speaker's
+            // map does not hold could never have satisfied IsWithinDistInMap
+            // in the first place. GetPlayer also checks IsInWorld, which is
+            // the other half of what the old name lookup was doing.
+            if (Player* watcher = ObjectAccessor::GetPlayer(*player, guid))
+                if (player->IsWithinDistInMap(watcher, range))
+                    RecordHeard(player, name, kind, msg, "");
         });
         return true;
     }
@@ -1550,10 +1621,12 @@ public:
         if (!Interested(KIND_WHISPER))
             return true;
 
-        ForEachWatcher(KIND_WHISPER, [&](Player* watcher)
+        ForEachWatcher(KIND_WHISPER, [&](ObjectGuid guid, std::string const& name)
         {
-            if (watcher == player || watcher == receiver)
-                RecordHeard(player, watcher->GetName(), KIND_WHISPER, msg, "");
+            // Pure identity, so no lookup of any kind is needed: a watcher who
+            // is one of the two ends of this whisper is online by definition.
+            if (guid == player->GetGUID() || (receiver && guid == receiver->GetGUID()))
+                RecordHeard(player, name, KIND_WHISPER, msg, "");
         });
         return true;
     }
@@ -1572,13 +1645,17 @@ public:
         bool subgroupOnly = (kind == KIND_PARTY) && group->isRaidGroup();
         uint8 senderSub = subgroupOnly ? group->GetMemberGroup(player->GetGUID()) : 0;
 
-        ForEachWatcher(kind, [&](Player* watcher)
+        ForEachWatcher(kind, [&](ObjectGuid guid, std::string const& name)
         {
-            if (!group->IsMember(watcher->GetGUID()))
+            if (!group->IsMember(guid))
                 return;
-            if (subgroupOnly && group->GetMemberGroup(watcher->GetGUID()) != senderSub)
+            if (subgroupOnly && group->GetMemberGroup(guid) != senderSub)
                 return;
-            RecordHeard(player, watcher->GetName(), kind, msg, "");
+            // Group membership survives logout, so the offline skip that the
+            // old name resolution did implicitly has to be made explicit.
+            if (!WatcherOnline(guid))
+                return;
+            RecordHeard(player, name, kind, msg, "");
         });
         return true;
     }
@@ -1594,10 +1671,11 @@ public:
         if (!guild || !Interested(kind))
             return true;
 
-        ForEachWatcher(kind, [&](Player* watcher)
+        ForEachWatcher(kind, [&](ObjectGuid guid, std::string const& name)
         {
-            if (GuildCanHear(guild, watcher, kind))
-                RecordHeard(player, watcher->GetName(), kind, msg, "");
+            // Guild membership survives logout just as group membership does.
+            if (GuildCanHear(guild, guid, kind) && WatcherOnline(guid))
+                RecordHeard(player, name, kind, msg, "");
         });
         return true;
     }
@@ -7248,6 +7326,40 @@ private:
 
                 if (entry.channels != KIND_NONE)
                 {
+                    // Resolved HERE, on the world thread, precisely so that the
+                    // chat hooks never resolve anything - see ForEachWatcher.
+                    // CharacterCache covers offline characters too, so a watch
+                    // row written before its character ever logs in still arms
+                    // correctly, and because this list is rebuilt wholesale on
+                    // every poll a character created later is picked up on the
+                    // next one.
+                    std::string canonical = entry.name;
+                    if (normalizePlayerName(canonical))
+                        entry.guid = sCharacterCache->GetCharacterGuidByName(canonical);
+
+                    // Carry the realm's own spelling, not the row's. heardBy
+                    // used to come from Player::GetName() and the relay matches
+                    // on it, so a row written as "og" must still record "Og".
+                    if (!entry.guid.IsEmpty())
+                        sCharacterCache->GetCharacterNameByGuid(entry.guid, entry.name);
+
+                    if (entry.guid.IsEmpty())
+                    {
+                        // Said once per name rather than once per poll. The old
+                        // behaviour for a misspelled row was to capture nothing
+                        // at all, forever, with nothing in the log to say why -
+                        // which is the exact failure the roster comment above
+                        // says this file exists to abolish.
+                        static std::set<std::string> warned;
+                        if (warned.insert(entry.name).second)
+                            LOG_WARN("module.overseer",
+                                     "overseer: chat watch row names '{}', which is not a character "
+                                     "this realm knows - capturing nothing for it. Check the spelling "
+                                     "in overseer_chat_watch.",
+                                     entry.name);
+                        continue;
+                    }
+
                     unionMask |= entry.channels;
                     next.push_back(std::move(entry));
                 }
@@ -8031,11 +8143,13 @@ private:
             else
                 group->BroadcastPacket(&data, false);
 
-            CaptureBypassed(player, KindFromName(channel), text, [&](Player* w)
+            CaptureBypassed(player, KindFromName(channel), text, [&](ObjectGuid w)
             {
-                if (!group->IsMember(w->GetGUID()))
+                if (!group->IsMember(w))
                     return false;
-                return !subgroupOnly || group->GetMemberGroup(w->GetGUID()) == senderSub;
+                if (subgroupOnly && group->GetMemberGroup(w) != senderSub)
+                    return false;
+                return WatcherOnline(w);
             });
         }
         else if (channel == "guild" || channel == "officer")
@@ -8056,8 +8170,8 @@ private:
 
             guild->BroadcastToGuild(player->GetSession(), officerOnly, text, LANG_UNIVERSAL);
             uint32 kind = KindFromName(channel);
-            CaptureBypassed(player, kind, text,
-                            [&](Player* w) { return GuildCanHear(guild, w, kind); });
+            CaptureBypassed(player, kind, text, [&](ObjectGuid w)
+                            { return GuildCanHear(guild, w, kind) && WatcherOnline(w); });
         }
         else
             return "unknown chat channel";
