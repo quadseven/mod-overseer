@@ -4869,9 +4869,11 @@ private:
         // disagree about who can be sent anywhere.
         if (!CanBeSentToNpc(botAI))
             return false;
-        // Player::ActivateTaxiPathTo refuses a bot that is in combat, stunned,
-        // rooted or already flying (Player.cpp:10414), and a dead one has no
-        // business walking to a flight master at all. Refusing to DECIDE here
+        // Player::ActivateTaxiPathTo refuses a bot that is logging out, in
+        // combat, stunned or rooted (Player.cpp:10415), and refuses a MOUNTED
+        // one at a flight master (Player.cpp:10428) - which a character
+        // already on a taxi is. A dead one has no business walking to a
+        // flight master at all. Refusing to DECIDE here
         // is better than deciding and having the activation fail at the far
         // end, because a failed activation spends one of the errand's two
         // flights on nothing.
@@ -5354,7 +5356,7 @@ private:
             // A CHARACTER IN THE AIR IS NOT DECIDED ABOUT AT ALL (#68). It
             // cannot be walked anywhere - Player::ActivateTaxiPathTo has
             // already taken its movement, and NewRpgTravelFlightAction returns
-            // without acting for exactly this reason (NewRpgAction.cpp:638) -
+            // without acting for exactly this reason (NewRpgAction.cpp:639) -
             // so every branch below is either meaningless or harmful here.
             // Deliberately asked of the WORLD rather than of this module's own
             // memory of the leg, so a flight upstream started on its own is
@@ -5523,7 +5525,7 @@ private:
                              "on the flight and walking",
                              name, target,
                              static_cast<uint32>(TRAVEL_FLIGHT_BACKSTOP_SECONDS / 60));
-                    botAI->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:111
+                    botAI->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
                     state.flightSince = 0;
                     // Deliberately NOT `continue`: falling through re-issues
                     // the walk below on this same poll, so the errand loses
