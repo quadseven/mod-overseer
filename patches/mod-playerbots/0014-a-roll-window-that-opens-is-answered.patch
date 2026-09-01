@@ -1,0 +1,185 @@
+Subject: [PATCH] loot: a roll window that opens is answered
+
+WHY THIS PATCH EXISTS
+
+A party of five runs Group Loot with the threshold at Uncommon. Everything
+below the threshold distributes normally. Everything at or above it opens a
+roll window that NOBODY answers - not need, not greed, not pass. Sixty seconds
+later the roll expires and the item is gone.
+
+THE ONLY PACKET THAT SAYS "A ROLL WINDOW OPENED" IS THROWN AWAY
+
+There are two packets with similar names and they are not interchangeable:
+
+    SMSG_LOOT_START_ROLL   Group::SendLootStartRoll - the window OPENING, sent
+                           once per roll to every member whose vote is still
+                           NOT_EMITED_YET. This is the one that starts a clock.
+    SMSG_LOOT_ROLL         Group::SendLootRoll - the "somebody has rolled"
+                           broadcast, emitted only AFTER a vote (or an
+                           auto-pass) already exists.
+
+The module binds the first one like this:
+
+    botOutgoingPacketHandlers.AddHandler(SMSG_LOOT_START_ROLL, "master loot roll");
+
+and `"master loot roll"` is a name that NO trigger context registers. Grepped
+every NamedObjectContext<Trigger> in the module - base, chat, world packet,
+every class context, every dungeon and raid context. The string appears exactly
+four times and not one of them is a trigger creator:
+
+    LootRollAction.h                 the action's own name
+    WorldPacketActionContext.h       the ACTION creator
+    WorldPacketHandlerStrategy.cpp   a TriggerNode asking for the name
+    PlayerbotAI.cpp                  the packet binding above
+
+Both consumers of that name fail closed, and both fail SILENTLY:
+
+    ExternalEventHelper::HandlePacket   Trigger* trigger = GetTrigger(name);
+                                        if (!trigger) return;      <- dropped
+    Engine::ProcessTriggers             if (!trigger) continue;    <- skipped
+
+So the packet is received, queued by PacketHandlingHelper::AddPacket (which
+only queues opcodes that have a handler name, so it does queue this one), and
+then discarded one step later. MasterLootRollAction is unreachable code and the
+TriggerNode that asks for it has never once resolved.
+
+WHAT WAS LEFT DRIVING THE VOTE
+
+Exactly one thing: a random poll.
+
+    triggers.push_back(new TriggerNode("very often", { NextAction("loot roll", relevance) }));
+
+`"very often"` is RandomTrigger(botAI, "often", 3):
+
+    bool RandomTrigger::IsActive()
+    {
+        if (getMSTime() - lastCheck < sPlayerbotAIConfig.repeatDelay)
+            return false;
+        lastCheck = getMSTime();
+        int32 k = (int32)(probability / sPlayerbotAIConfig.randomChangeMultiplier);
+        if (k < 1) k = 1;
+        return (rand() % k) == 0;
+    }
+
+That is the right shape for a chore with no deadline - repair, sell greys. A
+loot roll has a deadline: the sixty seconds the packet itself declares. A
+repeated coin flip against a wall clock is not a mechanism for meeting one.
+
+WHY THE PREVIOUS ATTEMPT AT THIS DID NOT WORK
+
+The patch this one replaces bound SMSG_LOOT_ROLL to `"loot roll"`. That packet
+is the "somebody has rolled" broadcast quoted above. In a party where nobody
+manages to roll, it is never sent, so it can never bootstrap the first vote.
+Verified against the pinned core rather than assumed: Group::SendLootRoll is
+only ever called from CountRollVote (after a vote is recorded), from
+CountTheRoll, and from the auto-pass sweep in GroupLoot for members who fail
+CanRollOnItem. None of those happen at window-open for a party that is
+eligible to roll. That patch was built on the belief that SMSG_LOOT_ROLL was
+the roll-opening packet. It is not, so it is replaced here rather than left in
+the tree to mislead the next reader.
+
+THE FIX
+
+Bind SMSG_LOOT_START_ROLL to `"loot roll"` - a name that IS registered
+(WorldPacketTriggerContext::loot_roll -> WorldPacketTrigger) and that already
+has a TriggerNode in every one of a bot's engines, because
+WorldPacketHandlerStrategy's constructor pushes `"loot roll"` into `supported`
+and PassThroughStrategy::InitTriggers turns every supported name into a node at
+relevance 100.
+
+Traced end to end before writing it:
+
+    WorldSession::SendPacket -> sScriptMgr->OnPlayerbotPacketSent, which runs
+        BEFORE the `if (!m_Socket) return;` - so a character with a real client
+        attached gets this too, not only a spawned bot
+    -> PlayerbotAI::HandleBotOutgoingPacket, default case -> AddPacket
+    -> PacketHandlingHelper::Handle drains the WHOLE queue, not one per tick
+    -> ExternalEventHelper::HandlePacket -> WorldPacketTrigger::ExternalEvent
+       sets triggered = true
+    -> UpdateAIInternal runs botOutgoingPacketHandlers.Handle immediately
+       before DoNextAction, so the fire lands on the SAME tick
+    -> Engine::ProcessTriggers -> MultiplyAndPush at relevance 100
+    -> Engine::DoNextAction: Queue::Peek returns the HIGHEST relevance basket,
+       and both minimal-tick filters are `< 100`, so a relevance-100 loot roll
+       survives a minimal tick and cannot be starved behind a lower one
+    -> LootRollAction::Execute, which ignores the packet payload entirely and
+       rescans group->GetRolls() for every roll where this bot's own vote is
+       still NOT_EMITED_YET, then calls Group::CountRollVote directly.
+
+Ignoring the payload is a feature here, not a shortcut: one fire answers every
+open roll, and a second fire is idempotent because an answered vote is skipped.
+Queue::Push also coalesces by action name, so a packet fire landing in the same
+tick as the random poll cannot double-push.
+
+The random poll is left in place. It is not wrong, only insufficient on its
+own for something with a countdown.
+
+WHAT THIS DELIBERATELY DOES NOT DO
+
+It adds no selfbot or IsRandomBot branch, and it removes none. There is no such
+gate on this path: IsRealPlayer(player) is `player && !GET_PLAYERBOT_AI(player)`,
+so a selfbot's master (itself, which has bot AI) reads as NOT a real player and
+lands on the same branch as a spawned bot everywhere this path checks. The two
+selfbot mentions near this code (StoreLootAction's isUseful, and
+ItemUsageValue's master-quest deferral) both make a selfbot MORE permissive,
+not less.
+
+It does not touch LootRollAction's vote logic. That logic is already correct
+after 0008 and 0013; it was simply never asked to run on time.
+
+It removes the "master loot roll" TriggerNode rather than registering a trigger
+for it. MasterLootRollAction is strictly weaker than the action already wired
+here: it parses one roll out of the packet and votes with CalculateRollVote
+alone, bypassing the armour-token branch, the recipe branch, and the
+weapon/armour branch that 0008 and 0013 exist to get right. Wiring it up would
+have re-introduced the bugs those two patches fixed, on the deterministic path.
+
+NOT VERIFIED LIVE. This is traced from source against the pinned trees and
+proven to apply and compile; it has not been watched resolving a real roll on a
+running world. That is the acceptance test, and it is on the linked issue.
+
+A NOTE ON THE COMMENT PREFIX. This uses `// local:` rather than the `// infra:`
+some older patches use. These files are copied byte-identical into a public
+repository whose policy forbids naming a private repository anywhere in it, in
+any form, and that older prefix names one. `// local:` carries the same meaning -
+this is our change, not upstream - without doing that. Do not 'correct' it back
+for consistency.
+
+---
+--- a/src/Ai/Base/Strategy/WorldPacketHandlerStrategy.cpp
++++ b/src/Ai/Base/Strategy/WorldPacketHandlerStrategy.cpp
+@@ -62,7 +62,12 @@ void WorldPacketHandlerStrategy::InitTriggers(std::vector<TriggerNode*>& trigger
+     triggers.push_back(new TriggerNode("see spell", { NextAction("see spell", relevance) }));
+     triggers.push_back(new TriggerNode("release spirit", { NextAction("release", relevance) }));
+     triggers.push_back(new TriggerNode("revive from corpse", { NextAction("revive from corpse", relevance) }));
+-    triggers.push_back(new TriggerNode("master loot roll", { NextAction("master loot roll", relevance) }));
++    // local: the "master loot roll" TriggerNode was removed, not rewired. No trigger context
++    // registers that name, so it resolved to nullptr and was skipped on every tick; and
++    // MasterLootRollAction is strictly weaker than LootRollAction anyway - it votes on one
++    // roll with CalculateRollVote(proto) alone, skipping the armour-token, recipe and
++    // weapon/armour branches. Its packet (SMSG_LOOT_START_ROLL) now feeds "loot roll", which
++    // is registered and already has a node here. See PlayerbotAI's constructor.
+ 
+     // quest ?
+     //triggers.push_back(new TriggerNode("quest confirm", { NextAction("quest confirm", relevance) }));
+--- a/src/Bot/PlayerbotAI.cpp
++++ b/src/Bot/PlayerbotAI.cpp
+@@ -198,7 +198,17 @@ PlayerbotAI::PlayerbotAI(Player* bot)
+     botOutgoingPacketHandlers.AddHandler(SMSG_LFG_PROPOSAL_UPDATE, "lfg proposal");
+     botOutgoingPacketHandlers.AddHandler(SMSG_TEXT_EMOTE, "receive text emote");
+     botOutgoingPacketHandlers.AddHandler(SMSG_EMOTE, "receive emote");
+-    botOutgoingPacketHandlers.AddHandler(SMSG_LOOT_START_ROLL, "master loot roll");
++    // local: SMSG_LOOT_START_ROLL is the packet that says "a roll window just opened", and it
++    // used to be bound to the event name "master loot roll" - a name NO trigger context
++    // registers. Both consumers of that name fail closed and silently:
++    // ExternalEventHelper::HandlePacket returns when GetTrigger(name) is null, and
++    // Engine::ProcessTriggers skips a TriggerNode whose name resolves to null. So the packet
++    // was queued and then discarded, and MasterLootRollAction was unreachable.
++    // "loot roll" IS registered (WorldPacketTriggerContext::loot_roll) and already has a
++    // TriggerNode in every engine via WorldPacketHandlerStrategy's `supported` list, so this
++    // runs LootRollAction the moment the window opens rather than leaving a 60-second
++    // deadline to the "very often" random poll.
++    botOutgoingPacketHandlers.AddHandler(SMSG_LOOT_START_ROLL, "loot roll");
+     botOutgoingPacketHandlers.AddHandler(SMSG_ARENA_TEAM_INVITE, "arena team invite");
+     botOutgoingPacketHandlers.AddHandler(SMSG_GROUP_DESTROYED, "group destroyed");
+     botOutgoingPacketHandlers.AddHandler(SMSG_GROUP_LIST, "group list");
