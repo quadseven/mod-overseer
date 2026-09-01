@@ -133,6 +133,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <map>
@@ -5958,6 +5959,13 @@ private:
     // DUNGEON_STAGING_STANDOFF_YARDS keeps the whole staging circle
     // (DUNGEON_BARRIER_RADIUS_YARDS, 10y) outside the trigger's own radius.
     //
+    // WHICH DIRECTION IT STANDS OFF IN IS NOT A FREE CHOICE (#121). A doorway
+    // has one walkable approach and three walls, so a standoff picked by
+    // guesswork is three times more likely to be inside rock than on the
+    // corridor. ResolveDungeonStagingPoint takes the bearing from the world
+    // instead - see its comment - and resolves the ground height where the
+    // point lands rather than carrying the doorway's own down a cliff.
+    //
     // WHAT TRIGGERS A RUN. `job = 'dungeon'` has existed on `overseer_roster`
     // since 2026_08_26_01_overseer_roster_job.sql and been read by the job
     // gate in DriveQuests since it landed - but "nothing yet exists to
@@ -6040,21 +6048,43 @@ private:
         // teleport home: a cross-map bind point would scatter five characters
         // across two continents and end the run somewhere nobody chose.
         uint32 exitTriggerId;      // walked to, and knocked on, to get OUT
-        // Deadmines: areatrigger 78 (-11208.5, 1685.34, 25.7612), radius 7 -
-        // see TRAVEL_ARRIVED_POSITION_YARDS above for how that number was
-        // measured. Staging point is that same point stood off along X by
-        // DUNGEON_STAGING_STANDOFF_YARDS, which is NOT independently
-        // confirmed to be clear, walkable ground - #100 already tracks the
-        // live-verification obligation for this epic and this staging point
-        // belongs on that list before a run is ever run for real.
-        float stageX, stageY, stageZ;
+        // THERE IS NO stageX/stageY/stageZ HERE ANY MORE, and #121 is why.
+        // The staging point used to be written down as the entry trigger's own
+        // coordinates stood off along +X, carrying the trigger's Z unchanged,
+        // with a comment saying it was not independently confirmed to be clear
+        // walkable ground. It was not: the approach to areatrigger 78 runs
+        // along Y, +X goes into the wall of the Moonbrook shaft, and the
+        // trigger's Z belongs to the shaft floor rather than to the clifftop
+        // the offset landed on. See ResolveDungeonStagingPoint, which derives
+        // it from these two triggers instead, so the table cannot drift from
+        // the world the way a fourth and fifth hand-written float did.
     };
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
-    // gather circle (DUNGEON_BARRIER_RADIUS_YARDS) sits outside the trigger's
-    // radius (7y for Deadmines) with room to spare - see the staging-point
-    // comment above.
+    // gather circle (DUNGEON_BARRIER_RADIUS_YARDS, 10) sits outside the
+    // trigger's own radius (7 for Deadmines) with room to spare: 20 > 10 + 7.
+    // That sum is the reason the standoff cannot simply BE the way-back-out
+    // landing point, which for Deadmines is only 12.8 yards from the door.
     static constexpr float DUNGEON_STAGING_STANDOFF_YARDS = 20.0f;
+
+    // HOW FAR ABOVE THE DOOR'S OWN Z THE GROUND PROBE STARTS. Map::GetHeight
+    // searches DOWNWARD from the z it is given, so a probe started from the
+    // terrain height would find the hillside above a tunnel rather than the
+    // tunnel. Started just above the door, it finds the floor the door stands
+    // on, which is the floor the party has to walk in along.
+    static constexpr float DUNGEON_STAGING_Z_PROBE_LIFT_YARDS = 2.0f;
+
+    // AND HOW FAR THE ANSWER MAY DIFFER FROM THE DOOR'S OWN Z BEFORE IT IS
+    // DISBELIEVED. This is the #121 defect expressed as a test rather than as
+    // prose: a staging point one short walk from a doorway is on the same
+    // floor as that doorway, so a height reading tens of yards away from it is
+    // either a different surface (the clifftop over the shaft, 27 yards up) or
+    // one of the two sentinels GetHeight returns when it has nothing - both of
+    // which are answers to refuse rather than to walk at. Doubling as the
+    // invalid-height guard is deliberate: -100000 and -200000 fail this test
+    // for the same reason a clifftop does, and needing no extra header to say
+    // so keeps the check where the argument for it is.
+    static constexpr float DUNGEON_STAGING_Z_SANITY_YARDS = 15.0f;
 
     // Only Deadmines for this slice. A second dungeon is a second row here,
     // not a second code path - deliberately not built until a second dungeon
@@ -6071,10 +6101,139 @@ private:
     static std::vector<DungeonPortal> const& DungeonPortals()
     {
         static std::vector<DungeonPortal> const portals = {
-            {"deadmines", 0, 78, 36, 119,
-             -11208.5f + DUNGEON_STAGING_STANDOFF_YARDS, 1685.34f, 25.7612f},
+            {"deadmines", 0, 78, 36, 119},
         };
         return portals;
+    }
+
+    // WHERE THE PARTY WAITS, DERIVED FROM THE DOOR INSTEAD OF WRITTEN DOWN
+    // BESIDE IT (#121).
+    //
+    // WHAT WAS WRONG. The staging point shipped as the entry trigger's own
+    // coordinates plus DUNGEON_STAGING_STANDOFF_YARDS along +X, with the
+    // trigger's Z copied across unchanged. Areatrigger 78 stands at the bottom
+    // of the Moonbrook shaft; the walkable approach to it runs along Y. So the
+    // standoff was applied perpendicular to the only way in, into the rock, and
+    // it took a floor-level Z to a place whose only surface is the clifftop
+    // about 27 yards higher. A point with no navmesh under it cannot be
+    // arrived at: the pathfinder returns the nearest polygon, the character
+    // walks at it, never gets there, and upstream's stuck detector teleports it
+    // - which is the repeating `Teleport ... as it stuck when moving far` the
+    // issue was filed on, and from the outside looks like flying and falling.
+    //
+    // WHICH WAY IS "AWAY FROM THE DOOR", ASKED OF THE WORLD RATHER THAN GUESSED.
+    // Every instance portal in this table already carries the answer, because
+    // the way back out has to land a player OUTSIDE the door it came from and
+    // facing away from it: `areatrigger_teleport` for the EXIT trigger is a
+    // position on the outside map that the game itself picked as standable
+    // ground in front of the entrance. The vector from the entry trigger to
+    // that landing point is therefore the approach corridor, measured by the
+    // people who built the corridor. For Deadmines it is (0.016, -0.9999) over
+    // 12.82 yards - which is to say almost exactly -Y, and nothing like the +X
+    // the old constant went.
+    //
+    // Doing it this way also means a second dungeon is still one more row in
+    // DungeonPortals() and no new floats to get wrong, which was the point of
+    // reading the door out of `areatrigger` rather than copying it in.
+    //
+    // AND THE Z IS RESOLVED WHERE THE POINT LANDS. Map::GetHeight searches down
+    // from the z it is handed, so it is handed the door's own z lifted clear by
+    // DUNGEON_STAGING_Z_PROBE_LIFT_YARDS - the shaft is a tunnel and a probe
+    // started at terrain height would find the hill on top of it. An answer
+    // further than DUNGEON_STAGING_Z_SANITY_YARDS from the door's own z is
+    // refused, and so is an unloaded grid (patch 0010's lesson: not in memory
+    // is not the same as not there), because the leader is usually a long way
+    // off when a run is asked for. The fallback is the way-back-out landing
+    // point's own z, which is real standable ground on this map by
+    // construction - 24.66 against the door's 25.7612 for Deadmines.
+    //
+    // MEASURED AGAINST THE PINNED CORE'S OWN EXTRACTED MAP AND MMAP DATA, not
+    // asserted. Reading the navmesh tile the bot pathfinder itself uses
+    // (mmaps/0005328.mmtile, map 0 grid 53/28) and the terrain grid beside it:
+    //
+    //   point on map 0                          walkable surface under it
+    //   areatrigger 78, the door                z 22.56 .. 25.23
+    //   areatrigger 119's landing point         z 24.96 .. 26.56
+    //   OLD staging point, +X 20y               z 52.98 and nothing lower
+    //   NEW staging point, corridor 20y         z 24.96 .. 26.56
+    //
+    // and along the corridor axis the floor is continuous from the door out to
+    // about 30 yards (z 23.9 rising to 27.1) and roughly 9 yards wide across.
+    // The old point's nearest walkable surface is 27 yards above the z the aim
+    // carried; the new one's is a quarter of a yard below it.
+    static bool ResolveDungeonStagingPoint(DungeonPortal const& portal, Player* leader,
+                                           float& outX, float& outY, float& outZ,
+                                           std::string& why)
+    {
+        // AreaTrigger  ObjectMgr.h:425-428  map/x/y/z
+        AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.entryTriggerId);
+        if (!door)
+        {
+            why = "the world database has no areatrigger " + std::to_string(portal.entryTriggerId);
+            return false;
+        }
+        if (door->map != portal.outsideMapId)
+        {
+            why = "areatrigger " + std::to_string(portal.entryTriggerId) + " stands on map " +
+                  std::to_string(door->map) + ", not the map this portal is approached from";
+            return false;
+        }
+
+        // AreaTriggerTeleport  ObjectMgr.h  target_mapId/target_X/target_Y/target_Z
+        AreaTriggerTeleport const* back = sObjectMgr->GetAreaTriggerTeleport(portal.exitTriggerId);
+        if (!back)
+        {
+            why = "areatrigger " + std::to_string(portal.exitTriggerId) +
+                  " has no teleport row, so there is no way back out to take a bearing from";
+            return false;
+        }
+        if (back->target_mapId != portal.outsideMapId)
+        {
+            why = "the way out of areatrigger " + std::to_string(portal.exitTriggerId) +
+                  " lands on map " + std::to_string(back->target_mapId) +
+                  ", not outside this portal";
+            return false;
+        }
+
+        float dx = back->target_X - door->x;
+        float dy = back->target_Y - door->y;
+        float const span = std::sqrt(dx * dx + dy * dy);
+        // A landing point on top of the door names no direction at all, and a
+        // normalise of it would be a divide by something near zero dressed up
+        // as a bearing. Refusing is the honest answer; inventing an axis is how
+        // the wall got walked into the first time.
+        if (span < 1.0f)
+        {
+            why = "the way back out lands on the door itself, so it names no approach axis";
+            return false;
+        }
+        dx /= span;
+        dy /= span;
+
+        outX = door->x + dx * DUNGEON_STAGING_STANDOFF_YARDS;
+        outY = door->y + dy * DUNGEON_STAGING_STANDOFF_YARDS;
+        outZ = back->target_Z;
+
+        // GetMap  Object.h:631  Map* GetMap() const
+        Map* map = leader ? leader->GetMap() : nullptr;
+        // IsGridLoaded  Map.h:213  bool IsGridLoaded(float x, float y) const
+        if (map && map->GetId() == portal.outsideMapId && map->IsGridLoaded(outX, outY))
+        {
+            // GetHeight  Map.h  float GetHeight(float x, float y, float z, ...) const
+            float const ground =
+                map->GetHeight(outX, outY, door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS);
+            if (std::fabs(ground - door->z) <= DUNGEON_STAGING_Z_SANITY_YARDS)
+                outZ = ground;
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: the map answers z={:.2f} at the '{}' staging point "
+                         "({:.2f}, {:.2f}) while areatrigger {} stands at z={:.2f} - that is "
+                         "another surface or no surface, so the way-back-out's own z={:.2f} "
+                         "is used instead",
+                         ground, portal.keyword, outX, outY, portal.entryTriggerId,
+                         door->z, back->target_Z);
+        }
+        return true;
     }
 
     // WHICH RUN IS THIS, ASKED FROM THE INSIDE. A worldserver restart wipes the
@@ -6112,6 +6271,15 @@ private:
     {
         DungeonRunPhase phase{DungeonRunPhase::Idle};
         std::string portalKeyword;   // which DungeonPortal this run is for
+        // WHERE THIS RUN IS GATHERING, RESOLVED ONCE WHEN IT STARTS. It lives
+        // with the run rather than with the portal because it is not a property
+        // of the portal at all: ResolveDungeonStagingPoint asks the map for the
+        // ground at the standoff, and the answer depends on whether that grid
+        // was in memory at the time. Re-resolving it every poll would let the
+        // barrier circle move under a party already standing in it the moment
+        // the grid loads, which is a gather that gets harder the closer it
+        // gets. Resolved once, walked to, held to.
+        float stageX{0.f}, stageY{0.f}, stageZ{0.f};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
         // TravelState, `stuckLogged` in RepickMemory) for the same reason:
@@ -6539,9 +6707,26 @@ private:
             if (!portal)
                 return;  // no known portal for this job yet - nothing to gather toward
 
+            // THE STAGING POINT IS RESOLVED HERE AND NOWHERE ELSE (#121), from
+            // the two areatriggers this portal already names. A run that cannot
+            // work out where to wait does not start and says why, because the
+            // alternative - staging at whatever a failed derivation left in
+            // three floats - is how a party ends up walking at solid rock.
+            float stageX = 0.f, stageY = 0.f, stageZ = 0.f;
+            std::string why;
+            if (!ResolveDungeonStagingPoint(*portal, leader, stageX, stageY, stageZ, why))
+            {
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run requested (job=dungeon on leader '{}') but "
+                          "the '{}' staging point cannot be worked out - {}. Nothing is "
+                          "aimed anywhere; fix the portal's areatrigger rows",
+                          leaderName, portal->keyword, why);
+                return;
+            }
+
             std::ostringstream aim;
-            aim << "at:" << portal->outsideMapId << ':' << portal->stageX << ','
-                << portal->stageY << ',' << portal->stageZ;
+            aim << "at:" << portal->outsideMapId << ':' << stageX << ','
+                << stageY << ',' << stageZ;
 
             // CLAIM, not a raw UPDATE: the run supersedes whatever the leader
             // was doing, and taking the wheel also drops any errand memory left
@@ -6556,12 +6741,17 @@ private:
             coord = DungeonRunCoordinatorState();
             coord.phase = DungeonRunPhase::Gathering;
             coord.portalKeyword = "deadmines";
+            coord.stageX = stageX;
+            coord.stageY = stageY;
+            coord.stageZ = stageZ;
 
             LOG_INFO("module.overseer",
                      "overseer: dungeon run requested (job=dungeon on leader '{}') - "
-                     "aiming it at the Deadmines staging point ({}) outside the portal; "
+                     "aiming it at the Deadmines staging point ({}) outside the portal, "
+                     "{:.0f}y back down the approach corridor from areatrigger {}; "
                      "GATHERING begins",
-                     leaderName, aim.str());
+                     leaderName, aim.str(), DUNGEON_STAGING_STANDOFF_YARDS,
+                     portal->entryTriggerId);
             return;
         }
 
@@ -6703,7 +6893,7 @@ private:
             if (leader->GetMapId() != portal->outsideMapId)
                 return;  // still travelling, or on a different map entirely - keep waiting
 
-            float const distance = leader->GetDistance2d(portal->stageX, portal->stageY);
+            float const distance = leader->GetDistance2d(coord.stageX, coord.stageY);
             if (distance > DUNGEON_BARRIER_RADIUS_YARDS)
                 return;
 
@@ -7067,7 +7257,7 @@ private:
             // GetMapId  Position.h:281  uint32 GetMapId() const
             if (member->GetMapId() == portal->outsideMapId)
                 // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
-                state.distanceFromStage = member->GetDistance2d(portal->stageX, portal->stageY);
+                state.distanceFromStage = member->GetDistance2d(coord.stageX, coord.stageY);
 
             states.push_back(state);
         }
