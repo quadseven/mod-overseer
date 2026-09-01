@@ -1975,7 +1975,25 @@ public:
             _dungeonRunTimer = 0;
             DriveDungeonRun();
         }
-        if (_travelTimer >= TRAVEL_POLL_MS)
+        // AND THE TRAVEL DRIVE POLLS FASTER WHILE A RUN IS ESCORTING (#122).
+        //
+        // An `at:` aim ends in patch 0012's ChangeToIdle the moment the walk
+        // closes to INTERACTION_DISTANCE, and NewRpgStatusUpdateAction turns
+        // RPG_IDLE into a randomly chosen status on the bot's next AI tick - so
+        // an escorted member standing on a doorstep waiting for the rest of the
+        // party is only held there by DriveTravel renewing the lease. At
+        // TRAVEL_POLL_MS that renewal is fifteen seconds behind the idle, which
+        // is long enough for a character to walk a hundred yards away from a
+        // door it had already reached. Matching the coordinator's own cadence
+        // makes the renewal never more than one coordinator poll late, so the
+        // party assembles instead of milling.
+        //
+        // Only while an escort exists. With none - which is every poll outside a
+        // dungeon run - this is TRAVEL_POLL_MS exactly as before, and the two
+        // extra loader queries per poll are not paid.
+        uint32 const travelPoll =
+            _dungeonEscorts.empty() ? TRAVEL_POLL_MS : DUNGEON_RUN_POLL_MS;
+        if (_travelTimer >= travelPoll)
         {
             _travelTimer = 0;
             DriveTravel();
@@ -2639,6 +2657,42 @@ private:
                          "it, because a master nobody walks toward is not cohesion",
                          p->GetName());
                 botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+            }
+
+            // AND `new rpg` COMES OFF A FOLLOWER NOBODY IS ESCORTING (#122).
+            //
+            // The invariant this family runs on is that exactly one character
+            // travels on its own and it is the leader; a follower that also
+            // carries `new rpg` outranks its own `follow` in the same engine
+            // ("new rpg status update" is relevance 11 against
+            // FollowMasterStrategy's 1) and walks off to grind, camp or quest
+            // wherever it likes. That was true before an escort existed and it
+            // stayed true because nothing ever granted it to a follower.
+            //
+            // Something does now, so the invariant needs an enforcer rather
+            // than a habit. A dungeon run leases the strategy to a member while
+            // it walks it to a doorway and hands it back through its own sweep
+            // (see the escort section beside CanBeSentToNpc); this is the
+            // backstop under that sweep, and it is deliberately a whole
+            // separate mechanism on a separate clock - a hand-back that only
+            // ever happens on the path that granted it is a hand-back that a
+            // crash, a leadership change or an unforeseen `return` can skip.
+            // Also catches an old leader demoted mid-run, who carries it in his
+            // own right until he stops being the leader.
+            if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
+                !IsEscorted(p->GetName()))
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' follows but carries `new rpg` with no escort "
+                         "asking for it - taking it back, because a follower that travels "
+                         "on its own is the scatter, not the family",
+                         p->GetName());
+                botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' still carries `new rpg` after being told to "
+                              "drop it - it will keep travelling on its own",
+                              p->GetName());
             }
 
             // A FOLLOWER THAT HAS STOPPED, AND NEVER CLOSES THE GAP (#70).
@@ -4770,12 +4824,165 @@ private:
     // taking it off the followers cured - so a follower cannot be sent
     // anywhere, and travels by following. HasStrategy is PlayerbotAI.h:416.
     //
+    // WITH ONE BOUNDED EXCEPTION, WHICH IS #122. Following is enough to cross
+    // open ground and is not enough to cross a doorway: an areatrigger has to
+    // be stood in by each character individually, and a follower has nothing in
+    // its AI that will take it the last few yards on its own. So the dungeon
+    // run coordinator may ESCORT a member - see the escort section below - and
+    // an escorted member is walked by this drive like any other. The invariant
+    // is unchanged in substance: outside a crossing, exactly one character
+    // carries `new rpg`, and it is the leader.
+    //
     // Named once because two callers need the same answer: DriveTravel, which
     // refuses such an errand out loud, and the arbitration below, which must
     // NOT stand the quest drive down for an errand that will never move anyone.
     bool CanBeSentToNpc(PlayerbotAI* botAI)
     {
         return botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+    }
+
+    // ------------------------------------------------------------- escort --
+    //
+    // WHAT AN ESCORT IS, AND WHY IT HAD TO EXIST (#122).
+    //
+    // A grouped follower has no way to move itself. `new rpg` is added in
+    // exactly one place upstream (AiFactory.cpp:615) and that place is gated
+    // twice over: on `IsRandomBot`, which a roster character on a named account
+    // can never be, and on `!GetGroup() || GetGroup()->GetLeaderGUID() ==
+    // GetGUID()`, which a follower can never be either. So a follower's whole
+    // repertoire is `follow` - and `follow` cannot cross an instance portal,
+    // because FollowAction only acts while the master is on the same map, and
+    // the thing that actually crosses is a CMSG_AREATRIGGER sent by a character
+    // standing inside the trigger's own radius. Measured live, twice: the
+    // leader walks in under his own power and the other four stop at the door.
+    //
+    // AN ESCORT IS A LEASE ON THAT ONE STRATEGY, HELD BY A RUN. While the
+    // coordinator wants a member at a particular point it escorts it there: the
+    // aim goes in `travel_npc` like every other aim, and DriveTravel grants
+    // `new rpg` at the instant it issues the walk - see the grant site, which
+    // is deliberately adjacent to ChangeToWanderNpc rather than anywhere
+    // earlier. A freshly granted `new rpg` starts at RPG_IDLE, and
+    // NewRpgStatusUpdateAction turns RPG_IDLE into a RANDOMLY CHOSEN status on
+    // its very next tick - GO_GRIND and GO_CAMP both pick a position out of the
+    // world and walk to it. Granting the strategy anywhere other than
+    // immediately before the aim is written into `rpgInfo` is therefore a race
+    // whose losing side is a follower wandering off across Westfall. Granting
+    // it one statement earlier leaves no tick in which the status is IDLE.
+    //
+    // AND IT IS A LEASE RATHER THAN A GRANT because `new rpg` outranks `follow`
+    // in the same engine - "new rpg status update" is relevance 11 against
+    // FollowMasterStrategy's 1 - so a follower that keeps it keeps ignoring its
+    // master. It is handed back the moment the run stops wanting the member
+    // where it asked for it.
+    //
+    // THE HAND-BACK IS A SWEEP, NOT TWELVE CALL SITES. DriveDungeonRun has a
+    // dozen ways to leave a phase (crossed, gave up, job cleared, portal row
+    // gone, leader vanished, adopted after a restart) and an escort that
+    // outlives ONE of them is the scatter this module spent three fixes
+    // removing. So the coordinator MARKS what it still wants at the point it
+    // wants it, and the next poll ends everything unmarked - the same shape
+    // TravelAimBook::PruneVanished already uses for aims, spread over two polls
+    // because a `return` cannot be made to run an epilogue. Five seconds of
+    // lag, and no way to forget.
+    //
+    // World-thread-only and unguarded, like the coordinator state it belongs
+    // to. A restart loses it, and a restart also wipes every strategy in every
+    // bot's engine, so the two are lost consistently.
+    struct DungeonEscort
+    {
+        // Whether THIS module granted `new rpg` for the escort, so only what
+        // was granted is taken back. The leader carries it in his own right and
+        // must keep it; taking it off him at the end of a crossing would strand
+        // the whole family, which is the bug this file already has three
+        // comments about.
+        bool granted{false};
+        // Whether the poll now running still wants this member escorted. Set by
+        // EscortToward, cleared and acted on by SweepDungeonEscorts.
+        bool wanted{false};
+        // What it was last asked to walk to, so "escorting X to Y" is said once
+        // per destination rather than once per five-second poll - the same
+        // log-once discipline every other drive in this file keeps.
+        std::string aim;
+    };
+    std::map<std::string, DungeonEscort> _dungeonEscorts;
+
+    bool IsEscorted(std::string const& name) const
+    {
+        return _dungeonEscorts.find(name) != _dungeonEscorts.end();
+    }
+
+    // Ask for a member to be walked to `aim`, and say so once. Idempotent: a
+    // re-ask while the same aim is in flight is what every poll of a crossing
+    // does, and TravelAimBook::Claim already refuses to disturb a walk it is
+    // holding the memory for.
+    void EscortToward(std::string const& name, std::string const& aim, char const* what)
+    {
+        DungeonEscort& escort = _dungeonEscorts[name];
+        escort.wanted = true;
+        _travelAims.Claim(name, aim);
+        if (escort.aim == aim)
+            return;
+
+        escort.aim = aim;
+        LOG_INFO("module.overseer",
+                 "overseer: dungeon run {} escorts '{}' to {} under its own power - "
+                 "following gets a character across open ground, it does not get one "
+                 "through a doorway", what, name, aim);
+    }
+
+    // Recorded by DriveTravel at the instant it grants the strategy, so the
+    // hand-back takes back exactly what was given and nothing else.
+    void NoteEscortGranted(std::string const& name)
+    {
+        auto it = _dungeonEscorts.find(name);
+        if (it != _dungeonEscorts.end())
+            it->second.granted = true;
+    }
+
+    void EndOneEscort(std::string const& name, bool granted)
+    {
+        _travelAims.Release(name);
+        if (!granted)
+            return;
+
+        Player* bot = ObjectAccessor::FindPlayerByName(name);
+        PlayerbotAI* botAI = SteerableAI(bot);
+        if (!botAI)
+            // Logged out, mid-teardown, or the worldserver bounced - either way
+            // the engine that held the strategy is gone with it. Nothing to
+            // hand back and nothing wrong.
+            return;
+
+        botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+        // READ BACK, because `delivered` is not `done` anywhere in this module
+        // and a strategy that failed to come off is a follower that never
+        // follows again.
+        if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' still carries `new rpg` after the escort ended - it "
+                      "will keep travelling on its own instead of following the leader",
+                      name);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' hands the wheel back to `follow` - its escort is over",
+                     name);
+    }
+
+    // Runs first, every poll of DriveDungeonRun, so no `return` in that
+    // function can leak an escort. See the section comment above.
+    void SweepDungeonEscorts()
+    {
+        for (auto it = _dungeonEscorts.begin(); it != _dungeonEscorts.end(); )
+        {
+            if (it->second.wanted)
+            {
+                it->second.wanted = false;
+                ++it;
+                continue;
+            }
+            EndOneEscort(it->first, it->second.granted);
+            it = _dungeonEscorts.erase(it);
+        }
     }
 
     // THE ARBITRATION between this drive and DriveQuests, in full. DriveQuests
@@ -4789,7 +4996,15 @@ private:
         //    the quest drive down for one would quietly take an unaimable
         //    follower out of the family's questing until somebody noticed the
         //    column. DriveTravel leaves such a row set on purpose and says so.
-        if (!travelTarget.empty() && CanBeSentToNpc(botAI))
+        //
+        //    AN ESCORTED MEMBER COUNTS AS AIMABLE BEFORE IT IS (#122). The lease
+        //    on `new rpg` is granted by DriveTravel at the instant it issues the
+        //    walk, so between the coordinator asking for a member and that walk
+        //    being issued there is a poll in which the member holds an aim it
+        //    cannot yet act on. A quest aim written over the top in that window
+        //    would be a second drive steering a character a run is holding at a
+        //    door.
+        if (!travelTarget.empty() && (CanBeSentToNpc(botAI) || IsEscorted(name)))
             return true;
 
         // 2. THE ERRAND HAS JUST ENDED, and the hand-back must not land on the
@@ -4944,7 +5159,16 @@ private:
             // once per errand rather than renewing an aim nothing will read.
             // CanBeSentToNpc is the shared predicate the arbitration also
             // asks, so this refusal and that decision can never disagree.
-            if (!CanBeSentToNpc(botAI))
+            //
+            // UNLESS A RUN IS ESCORTING IT (#122). An escorted member is one the
+            // dungeon run coordinator has asked to be somewhere it cannot get to
+            // by following - the last yards onto a portal, or the staging point a
+            // stalled follower never closed on. It does not carry `new rpg` yet
+            // and that is the point: it is granted below, at the instant the walk
+            // is issued, and taken back when the escort ends. See the escort
+            // section above for why those two things cannot be separated.
+            bool const escorted = IsEscorted(name);
+            if (!CanBeSentToNpc(botAI) && !escorted)
             {
                 if (!state.arrived)
                 {
@@ -5028,6 +5252,36 @@ private:
                     // backstop still bounds it, and now bounds the right thing:
                     // a character that has stopped getting nearer to a door it
                     // cannot open is exactly what it is for.
+                }
+                else if (escorted)
+                {
+                    // AN ESCORT ENDS WHEN THE RUN SAYS SO, NOT WHEN THE WALK
+                    // FINISHES, and this branch is the difference between a
+                    // party assembling at a door and a party dissolving at one.
+                    //
+                    // Releasing here would be the ordinary thing and it would be
+                    // wrong twice over. Patch 0012 has an arrived place-aim call
+                    // ChangeToIdle, and NewRpgStatusUpdateAction turns RPG_IDLE
+                    // into a randomly chosen status on the next tick - so the
+                    // first follower to reach the doorstep would pick GO_GRIND
+                    // and walk away while the coordinator was still waiting for
+                    // the fifth. Four members oscillating in and out of the
+                    // doorstep radius is a crossing that can never be ready.
+                    //
+                    // Falling through instead reaches the re-issue guard below,
+                    // which renews the WANDER_NPC lease every poll, so an
+                    // escorted member STANDS where it was sent until the
+                    // coordinator stops wanting it there and the sweep hands the
+                    // wheel back to `follow`. Exactly the reasoning the doorway
+                    // branch above already carries, for the same reason.
+                    if (!state.arrived)
+                    {
+                        state.arrived = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' has reached its escort point '{}' and holds "
+                                 "there - the run releases it, not the arrival",
+                                 name, target);
+                    }
                 }
                 else if (plan && !TrainOnArrival(name, bot, entry, *plan))
                 {
@@ -5135,14 +5389,66 @@ private:
             // because a worldserver restart or a relog loses it and an errand
             // has to survive both. A separate, never-consumed field makes the
             // state SAY which case it is instead of leaving it to be inferred.
+            //   4. A DIFFERENT PLACE (#122). `npcEntry` is ZERO for every
+            //      `at:<map>:<x>,<y>,<z>` aim - a place has no creature standing
+            //      on it, which is exactly what patch 0012 exists to allow - so
+            //      comparing entries alone makes every place look like every
+            //      other place, and a re-aim from the staging point to the door
+            //      would be skipped as "already walking there" until upstream's
+            //      five-minute lease happened to lapse. The whole point of a
+            //      crossing is moving the party from one place to a second one
+            //      twenty yards on, so the position has to be part of the
+            //      comparison. Compared against the errand's own resolved
+            //      position rather than the character's, because "am I already
+            //      walking to this" is a question about the aim and not about
+            //      progress toward it.
             if (botAI->rpgInfo.GetStatus() == RPG_WANDER_NPC)  // NewRpgInfo.h:99
             {
                 if (NewRpgInfo::WanderNpc const* wander =
                         std::get_if<NewRpgInfo::WanderNpc>(&botAI->rpgInfo.data))
                 {
-                    if (wander->npcEntry == entry)
+                    // GetPositionX/Y  Position.h:279,280 - spelled out rather
+                    // than asked of GetExactDist2d, because WorldPosition
+                    // (TravelMgr.h:82) declares its own overloads of that name
+                    // and a hidden base overload is a compile error found at
+                    // the wrong end of a six-minute build.
+                    float const ddx = wander->pos.GetPositionX() - pos.GetPositionX();
+                    float const ddy = wander->pos.GetPositionY() - pos.GetPositionY();
+                    bool const samePlace = entry || (ddx * ddx + ddy * ddy) <= 1.0f;
+                    if (wander->npcEntry == entry && samePlace)
                         continue;
                 }
+            }
+
+            // THE ESCORT'S GRANT, AND IT IS HERE FOR A REASON THAT WILL NOT
+            // SURVIVE BEING MOVED (#122). A freshly granted `new rpg` starts at
+            // RPG_IDLE, and NewRpgStatusUpdateAction turns RPG_IDLE into a
+            // randomly chosen status on its very next tick - two of the eight
+            // (GO_GRIND, GO_CAMP) pick a position out of the world and walk to
+            // it. Granting the strategy anywhere earlier than the statement
+            // before the aim is written leaves a window in which a follower
+            // wanders off instead of walking to the door. Granting it here
+            // leaves no such window: the status is never IDLE for a tick.
+            if (escorted && !CanBeSentToNpc(botAI))
+            {
+                botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+                if (!CanBeSentToNpc(botAI))
+                {
+                    // Read back rather than assumed, and loudly: an escort that
+                    // silently failed to take is a follower standing at a door
+                    // it will never walk to, which is the state the whole run
+                    // exists to stop mistaking for a working one.
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' is being escorted to '{}' but `new rpg` would "
+                              "not go on - nothing will walk it there",
+                              name, target);
+                    continue;
+                }
+                NoteEscortGranted(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' takes the wheel from `follow` for its escort to "
+                         "'{}' - handed back when the run stops wanting it there",
+                         name, target);
             }
 
             // patches/mod-playerbots/0005-wander-npc-can-be-aimed.patch adds this
@@ -5976,15 +6282,28 @@ private:
     // the bridge (production/scripts/wow-overseer/jobs.py) sets the whole
     // roster's job together.
     //
-    // WHY ENTER KNOCKS FOR EVERY MEMBER ITSELF INSTEAD OF AIMING THEM.
+    // WHY ENTER WALKS EVERY MEMBER AND THEN KNOCKS FOR EVERY MEMBER (#122).
     // Everything above is about the coordinator only ever writing the COLUMN
-    // DriveTravel reads, and ENTER keeps that for the only character it can:
-    // the leader, who is walked the last DUNGEON_STAGING_STANDOFF_YARDS to the
-    // door by an ordinary `at:` aim. A FOLLOWER cannot be aimed at all -
-    // DriveTravel refuses an errand on a character with no `new rpg`
-    // (CanBeSentToNpc) and says so rather than pretending, and this family
-    // carries `new rpg` on the leader alone on purpose. A follower reaches the
-    // door by following, and there is no column that makes it cross one.
+    // DriveTravel reads, and ENTER keeps exactly that - it just writes it for
+    // the whole party instead of for the leader alone. This used to aim the
+    // leader and say that "a follower reaches the door by following". Measured
+    // twice on the dev world, it does not: the leader crossed onto map 36 under
+    // his own power while the other four stayed outside, strung out over
+    // several hundred yards behind him, and he then fought the first pull alone
+    // and died.
+    //
+    // The reason is structural rather than incidental. `follow` is the whole of
+    // a follower's repertoire, because upstream adds `new rpg` in one place
+    // (AiFactory.cpp:615) behind two gates a roster follower can never pass -
+    // `IsRandomBot`, and "ungrouped or leading". And `follow` cannot cross a
+    // doorway: FollowAction only acts while the master is on the same map, and
+    // what actually crosses is a packet sent by a character standing inside the
+    // trigger's own radius. So the last twenty yards are done by an ESCORT: the
+    // coordinator leases `new rpg` to each member for the length of the
+    // crossing and aims it at the door with the same ordinary `at:` aim the
+    // leader gets. See the escort section beside CanBeSentToNpc for why the
+    // lease is granted at the instant the walk is issued and taken back by a
+    // sweep rather than by any one code path.
     //
     // So the knock is done here, once per member, and the knock is NOT
     // movement: StepThroughAreaTrigger sends the packet a game client would
@@ -6519,38 +6838,65 @@ private:
         // mistaking for a working one. A run supersedes an errand; Claim takes
         // the wheel and says so in its name.
         //
-        // ONE COMPARISON COVERS THREE CASES, and deliberately: a leader already
-        // through and a leader on some third map both carry a NEGATIVE
+        // EVERY MEMBER WALKS THE LAST YARDS ITSELF, NOT JUST THE LEADER (#122).
+        //
+        // This used to aim the leader alone, on the reasoning that a follower
+        // "comes with him by following". It does not, and the measurement is
+        // unambiguous: the leader reached map 36 under his own power twice
+        // while the other four stayed outside, strung out over several hundred
+        // yards. `follow` has no way to cross a doorway - FollowAction only
+        // acts while the master is on the same map, and what actually crosses
+        // is a packet sent by a character standing inside the trigger's own
+        // radius - and it is not reliably closing the last yards either.
+        //
+        // So each member that is on this door's map and not yet through is
+        // ESCORTED to it: same `at:` aim on the door's own coordinates, same
+        // column, same drive. Deliberately still NOT a `trigger:` aim - that
+        // would have DriveTravel step each character through the moment it
+        // arrived, which is the party trickling in one at a time and the leader
+        // possibly first. `at:` only ever walks; the knock below is what
+        // crosses, it happens for everybody at once, and it puts the leader
+        // last so the anchor is the last thing to move.
+        //
+        // ONE COMPARISON COVERS THREE CASES, and deliberately: a member already
+        // through and a member on some third map both carry a NEGATIVE
         // distanceFromDoor, and neither can be walked to this door by an `at:`
         // aim - ResolveTravelTarget refuses an `at:` whose map is not the
-        // character's own. A negative distance fails
-        // `> DUNGEON_DOORSTEP_RADIUS_YARDS` on its own, so writing an aim that
-        // could only be refused is not a case to special-case, it is a case
-        // that never arises. Both still show up in the holds line below.
+        // character's own. Testing `>= 0` keeps an aim that could only be
+        // refused from ever being written, and both cases still show up in the
+        // holds line below.
+        //
+        // THE DOORSTEP IS NOT THE CUT-OFF, which is the difference between a
+        // party assembling and a party dissolving. A member inside
+        // DUNGEON_DOORSTEP_RADIUS_YARDS keeps its escort so that DriveTravel
+        // holds it there (see that drive's escort arrival branch); dropping the
+        // escort on arrival would idle it, and an idle `new rpg` picks a random
+        // errand on its next tick. Members stand at the door until everyone is
+        // there.
+        std::ostringstream aim;
+        // AreaTrigger::map/x/y/z  ObjectMgr.h:425,426,427,428
+        aim << "at:" << door->map << ':' << door->x << ',' << door->y << ',' << door->z;
+        std::string const doorAim = aim.str();
+
         OverseerDecisions::DungeonRunEntryState const* leaderState = nullptr;
         for (OverseerDecisions::DungeonRunEntryState const& state : states)
+        {
             if (state.name == leaderName)
                 leaderState = &state;
+            if (!state.through && state.distanceFromDoor >= 0.f)
+                EscortToward(state.name, doorAim, what);
+        }
 
-        if (leaderState &&
-            leaderState->distanceFromDoor > DUNGEON_DOORSTEP_RADIUS_YARDS)
+        if (!coord.loggedCrossingAim)
         {
-            std::ostringstream aim;
-            // AreaTrigger::map/x/y/z  ObjectMgr.h:425,426,427,428
-            aim << "at:" << door->map << ':' << door->x << ',' << door->y << ',' << door->z;
-
-            _travelAims.Claim(leaderName, aim.str());
-
-            if (!coord.loggedCrossingAim)
-            {
-                coord.loggedCrossingAim = true;
-                LOG_INFO("module.overseer",
-                         "overseer: dungeon run {} walks '{}' the last {:.0f}y onto "
-                         "areatrigger {} ({}) - the followers come with him by following, "
-                         "and nobody is knocked through until everybody is on the doorstep",
-                         what, leaderName, leaderState->distanceFromDoor, triggerId,
-                         aim.str());
-            }
+            coord.loggedCrossingAim = true;
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} walks the party the last yards onto "
+                     "areatrigger {} ({}) - every member under its own power, and nobody "
+                     "is knocked through until everybody is on the doorstep. Leader '{}' "
+                     "is {:.0f}y out",
+                     what, triggerId, doorAim, leaderName,
+                     leaderState ? leaderState->distanceFromDoor : -1.f);
         }
 
         if (!OverseerDecisions::DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))
@@ -6602,6 +6948,16 @@ private:
 
     void DriveDungeonRun()
     {
+        // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN (#122). Everything
+        // this function escorts is marked as still wanted at the point it is
+        // wanted, and this ends whatever the previous poll stopped marking -
+        // including on the dozen paths out of this function that end a run and
+        // could each have forgotten. An escort that outlives its run is a
+        // follower that keeps `new rpg` and stops following, which is the
+        // scatter this module has already fixed three times. See the escort
+        // section beside CanBeSentToNpc.
+        SweepDungeonEscorts();
+
         // `job` is read through the SAME guarded loader LoadJobs() already
         // gives DriveQuests, not inlined into this query - infra#2846: a
         // schema older than one of these columns must cost that column, not
@@ -7231,6 +7587,28 @@ private:
         // leader (see the section comment above) - so a follower's own
         // aliveness, combat state and distance are facts only this poll can
         // measure, not facts the GATHERING phase already established for it.
+        //
+        // AND A MEMBER THAT FOLLOWING HAS NOT DELIVERED IS ESCORTED (#122, and
+        // the wound #70 measured). GATHERING deliberately escorts nobody: the
+        // leader is walking and the party's job is to follow him, which is what
+        // following is for and what it does well. BARRIER is the other case -
+        // the leader has arrived and stopped, so a member still short of the
+        // staging point is not "behind the leader", it is a follower that came
+        // off its path and will not close the gap. Measured live: leader inside,
+        // one member 27 yards out, the rest 220, 450 and 745 yards back, and
+        // none of them moving. The escort walks it to the point the party is
+        // already standing on, which is the only direction it can take a
+        // character - toward the family, never away from it.
+        //
+        // The barrier radius is the cut-off rather than the arrival radius on
+        // purpose: at 10 yards the leader is right there, so `follow` picks the
+        // member up as the escort hands back, and the escort never has to end on
+        // an arrival (which would idle it, see DriveTravel's escort branch).
+        std::ostringstream stageAim;
+        stageAim << "at:" << portal->outsideMapId << ':' << coord.stageX << ','
+                 << coord.stageY << ',' << coord.stageZ;
+        std::string const stageTarget = stageAim.str();
+
         std::vector<OverseerDecisions::DungeonRunMemberState> states;
         states.reserve(members.size());
         for (std::string const& name : members)
@@ -7258,6 +7636,16 @@ private:
             if (member->GetMapId() == portal->outsideMapId)
                 // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
                 state.distanceFromStage = member->GetDistance2d(coord.stageX, coord.stageY);
+
+            // A member on some other map carries a negative distance and cannot
+            // be walked here by an `at:` aim at all - ResolveTravelTarget
+            // refuses one whose map is not the character's own - so it is left
+            // to the blockers line rather than given an errand that could only
+            // be refused. The LEADER is excluded because he is what the staging
+            // point IS: escorting him to where he already stands would claim
+            // over the GATHERING errand he may still be finishing.
+            if (name != leaderName && state.distanceFromStage > DUNGEON_BARRIER_RADIUS_YARDS)
+                EscortToward(name, stageTarget, "BARRIER");
 
             states.push_back(state);
         }
