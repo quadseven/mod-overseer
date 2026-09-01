@@ -4932,10 +4932,15 @@ private:
         //     destination is frequently in a zone the family has never walked
         //     to. Taking it and giving up loses every flight to a node that IS
         //     known and only slightly further out.
-        //   * IT MAY NOT BE A FLIGHT POINT AT ALL. TaxiNodes.dbc carries rows
-        //     that are usable-looking but have no taxi paths attached - node
-        //     168 "Filming" sits in Elwynn Forest, nearer to a good deal of
-        //     that zone than Stormwind is, and connects to nothing.
+        //   * IT MAY BE A NODE NOBODY CAN EVER HOLD. TaxiNodes.dbc carries
+        //     rows that pass every mechanical test and have no flight master
+        //     standing at them. Node 168, "Filming", sits in Elwynn Forest at
+        //     (-9441, 65) - nearer than Stormwind to a good deal of that zone
+        //     - carries an alliance mount id, and has a real taxi path to
+        //     Stormwind. The nearest creature with UNIT_NPC_FLAG_FLIGHTMASTER
+        //     is 740 yards away, so nothing can ever discover it, and taking
+        //     it as the arrival node throws away the flight to Stormwind that
+        //     was genuinely available.
         //
         // So the candidates are the character's OWN known nodes on the
         // destination's map, nearest to the errand first. That is both the
