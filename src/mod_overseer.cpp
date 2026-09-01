@@ -351,11 +351,12 @@ constexpr time_t TRAVEL_FLIGHT_BACKSTOP_SECONDS = 10 * 60;
 
 // HOW MANY FLIGHTS ONE ERRAND MAY SPEND. Without a bound this oscillates: land
 // at a node, find the destination still far away, pick a flight from the node
-// just landed at, and go round again. Two rather than one so a flight that was
-// refused on arrival at the flight master - in combat, or short of coin - is
-// not the last word on the errand, and no more than two because a second hop
-// that still has not landed the character near the destination is evidence the
-// route is wrong, not that a third would fix it.
+// just landed at, and go round again. Two rather than one so a flight refused
+// at the counter for something that was not true when it was decided - the
+// character picked a fight on the way, most likely - is not the last word on
+// the errand, and no more than two because a second hop that still has not
+// landed the character near the destination is evidence the route is wrong,
+// not that a third would fix it.
 constexpr uint32 TRAVEL_FLIGHT_MAX_PER_ERRAND = 2;
 
 // How long travel keeps the wheel after an errand ends (PR #2840 review).
@@ -5016,7 +5017,7 @@ private:
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is sent to '{}' {} yards away and could fly "
                              "node {} to node {}, but has not discovered node {} on that "
-                             "route - trying a nearer node, or walking",
+                             "route - trying the next node out, or walking",
                              name, state.target, static_cast<uint32>(walkYards),
                              fromNode, toNode, unknownHop);
                 }
