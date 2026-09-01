@@ -58,7 +58,13 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: build
+  # THROWAWAY BRANCH: scoped to this ref rather than the shared `build` group.
+  # That group exists to serialise the runs that PUSH to GHCR; this branch has
+  # had its push steps trimmed, so it has nothing to serialise against - and
+  # sharing the group would mean a queued compile check either waits behind, or
+  # (because only one run may be queued at a time) CANCELS, another agent's
+  # queued build of main. Neither belongs to a check that publishes nothing.
+  group: build-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -170,28 +176,6 @@ jobs:
           path: /tmp/buildx-cache
           key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
 
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Deliberately a SECOND buildx invocation rather than adding --push to
-      # the compile-check step above: buildx cannot --load and --push in the
-      # same call, and keeping the compile-check untouched means the gate
-      # every PR here actually depends on cannot be affected by anything
-      # below this line. Warm from the cache the compile-check just
-      # populated, so this is a re-tag-and-upload, not a second cold build -
-      # the Dockerfile's layers already exist locally.
-      - name: Push to GHCR
-        working-directory: acore
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --cache-from type=local,src=/tmp/buildx-cache \
-            -f apps/docker/Dockerfile \
-            -t "${GHCR_IMAGE}:${{ github.sha }}" \
-            -t "${GHCR_IMAGE}:latest" \
-            --push \
-            .
+      # THROWAWAY BRANCH: the GHCR login and push steps are trimmed here so a
+      # compile check can be run on unmerged code without publishing an image
+      # from it. This branch is deleted once the run has answered.
