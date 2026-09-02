@@ -10005,31 +10005,13 @@ private:
                 return;
             }
 
-            DungeonPortal const* portal = FindDungeonPortal("deadmines");
-            if (!portal)
-                return;  // no known portal for this job yet - nothing to gather toward
-
-            // THE STAGING POINT IS RESOLVED HERE AND NOWHERE ELSE (#121), from
-            // the two areatriggers this portal already names. A run that cannot
-            // work out where to wait does not start and says why, because the
-            // alternative - staging at whatever a failed derivation left in
-            // three floats - is how a party ends up walking at solid rock.
-            float stageX = 0.f, stageY = 0.f, stageZ = 0.f;
-            std::string why;
-            if (!ResolveDungeonStagingPoint(*portal, leader, stageX, stageY, stageZ, why))
-            {
-                LOG_ERROR("module.overseer",
-                          "overseer: dungeon run requested (job=dungeon on leader '{}') but "
-                          "the '{}' staging point cannot be worked out - {}. Nothing is "
-                          "aimed anywhere; fix the portal's areatrigger rows",
-                          leaderName, portal->keyword, why);
-                return;
-            }
-
-            // HOW MANY RUNS ARE LEFT, ASKED BEFORE ANYBODY IS AIMED ANYWHERE
-            // (#144). The two stop conditions this module can prove are read
-            // here, at the one point where a run is about to begin, so that a
-            // campaign that is over never claims the wheel at all.
+            // HOW MANY RUNS ARE LEFT, ASKED BEFORE ANYTHING ELSE IS DONE
+            // (#144). Above the portal lookup and the staging-point derivation
+            // on purpose: a finished campaign is the common case once one ends,
+            // it is reached on every poll for as long as `job` stays 'dungeon',
+            // and ResolveDungeonStagingPoint asks the MAP for ground height.
+            // Doing that work to then decide there is no run is a map query
+            // every five seconds forever.
             DungeonCampaignCap const cap = LoadCampaignCap(leaderName);
             if (cap.known && cap.done >= cap.wanted)
             {
@@ -10053,9 +10035,30 @@ private:
                 return;
             }
 
-            // THE `loggedCampaignOver = false` THAT USED TO BE ON THIS LINE IS
-            // GONE, AND ITS ABSENCE IS THE FIX. Clearing the flag here, between
-            // the two stop conditions, re-armed the SECOND one on every poll:
+            DungeonPortal const* portal = FindDungeonPortal("deadmines");
+            if (!portal)
+                return;  // no known portal for this job yet - nothing to gather toward
+
+            // THE STAGING POINT IS RESOLVED HERE AND NOWHERE ELSE (#121), from
+            // the two areatriggers this portal already names. A run that cannot
+            // work out where to wait does not start and says why, because the
+            // alternative - staging at whatever a failed derivation left in
+            // three floats - is how a party ends up walking at solid rock.
+            float stageX = 0.f, stageY = 0.f, stageZ = 0.f;
+            std::string why;
+            if (!ResolveDungeonStagingPoint(*portal, leader, stageX, stageY, stageZ, why))
+            {
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run requested (job=dungeon on leader '{}') but "
+                          "the '{}' staging point cannot be worked out - {}. Nothing is "
+                          "aimed anywhere; fix the portal's areatrigger rows",
+                          leaderName, portal->keyword, why);
+                return;
+            }
+
+            // THERE IS NO `loggedCampaignOver = false` BETWEEN THE TWO STOP
+            // CONDITIONS, AND ITS ABSENCE IS THE FIX. Clearing the flag here
+            // re-armed the SECOND condition on every poll:
             // the campaign-over branch above did not fire (there is room in the
             // count), the flag was cleared, and the three-consecutive-failures
             // branch below then said its piece again five seconds later,
