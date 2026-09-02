@@ -6308,6 +6308,20 @@ private:
     //      except deterministic, ground-checked rather than pathfinder-checked,
     //      and required to make progress.
     //
+    // WHAT A STEPPED WALK COSTS, SO IT IS A CHOICE AND NOT A SURPRISE. Patch
+    // 0012 ends an arrived place-aim in ChangeToIdle, and RPG_IDLE becomes a
+    // randomly chosen status on the bot's next tick - so a character that
+    // reaches a STEPPING STONE is briefly loose in exactly the way a character
+    // that reaches its destination already was, and is held only by the next
+    // poll renewing the lease. That renewal is DUNGEON_RUN_POLL_MS (5 s) apart
+    // for anything escorted or catching up, which is every follower this
+    // stepping was built for, and TRAVEL_POLL_MS (15 s) for a leader walking
+    // its own errand - see the travel-poll cadence in OnUpdate, which already
+    // carries this argument for the arrival case. A stepped walk is also
+    // slower than a routed one, because the character finishes each step
+    // before the next poll gives it another. Both are paid only where the
+    // alternative was a straight line off a cliff.
+    //
     // AND A LEDGE IS APPROACHED FROM THE LOW SIDE, which falls out of 2 rather
     // than being a case of its own: the only steps the ground check allows are
     // ones where the surface holds continuously from the character's feet to
