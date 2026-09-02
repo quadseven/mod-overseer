@@ -554,20 +554,48 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_CROSSING_RATCHET{
     OverseerDecisions::RatchetReading::CountAchieved,
     0.f, DUNGEON_CROSSING_BACKSTOP_SECONDS};
 
-// How long CLEARING waits for the dungeon brain to come on before it says, out
-// loud, that the run is being fought with open-world logic (#88).
+// How long CLEARING waits for `dc on` to be ACCEPTED before it says, out loud,
+// that the run is being fought with open-world logic (#88, #140).
 //
 // THIS IS A REPORTING CLOCK, NOT A RETRY CLOCK. The coordinator never issues
-// `dc on` - DriveDungeonClear owns that and re-tries on its own cadence. What
-// this bounds is how long "armed" may remain unverified before the failure
-// stops being invisible, and invisibility is the whole problem: the module sat
-// unarmed inside every run for its entire life while `delivered` and a startup
-// context registration both read as confirmation.
+// `dc on` - DriveDungeonClear owns that. What this bounds is how long "armed"
+// may remain unverified before the failure stops being invisible, and
+// invisibility is the whole problem: the module sat unarmed inside every run
+// for its entire life while `delivered`, a startup context registration and
+// then (#140) an auto-installed strategy each read as confirmation in turn.
 //
-// A minute is many arming passes and many DUNGEON_RUN_POLL_MS polls, and short
-// enough that the line lands while the party is still on the first pull rather
-// than after the wipe.
+// A minute is several arming passes and many DUNGEON_RUN_POLL_MS polls, and
+// short enough that the line lands while the party is still on the first pull
+// rather than after the wipe.
 constexpr time_t DUNGEON_ARMING_GRACE_SECONDS = 60;
+
+// How long a REFUSED `dc on` waits before it is issued again (#140).
+//
+// An accepted `dc on` is never re-issued for the rest of that stay inside:
+// DcOnAction::Execute (DungeonClearChatActions.cpp:281-322) resets the whole
+// transient run state on every accepted call - approach FSM, skipped set,
+// cleared anchors, long-path cache - so a second `dc on` on a run that is
+// under way is a run restarted from the door. A refused one resets nothing
+// (it returns at :226, :250, :257 or :266, before any of that), so retrying a
+// refusal is safe, and some refusals are transient: "is dead - rez and try
+// again" (:265) clears itself the moment the revival drive lands. A minute is
+// the same order as DUNGEON_ARMING_GRACE_SECONDS, so a refusal that heals is
+// retried about once per grace rather than eight times a minute.
+constexpr time_t DUNGEON_DC_ON_RETRY_SECONDS = 60;
+
+// WHAT COUNTS AS THE RUN MOVING once `dc on` has been accepted (#140). The
+// only thing this module can read off the command is that DcOnAction returned
+// true; it cannot see the run's `enabled` flag (that lives on the leader's
+// value context behind headers this module deliberately does not include).
+// What it CAN see is the leader's position. A run the dungeon module is
+// driving walks its tank away from the door toward the first boss; a run it
+// is not driving stood at the Deadmines entrance for six hours at full health
+// with the strategy installed. Thirty yards is more than the party mills about
+// at the door and less than the walk to the first pull; two minutes is the
+// issue's own acceptance window and covers the module's own start-up (it
+// builds a long path before the first step).
+constexpr float DUNGEON_DC_ON_MOVE_YARDS = 30.f;
+constexpr time_t DUNGEON_DC_ON_MOVE_WINDOW_SECONDS = 120;
 
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
@@ -3455,13 +3483,27 @@ private:
         return result != nullptr;
     }
 
+    // The id of the active run on this map, or 0 when there is none. The
+    // arming drive keys "has `dc on` been issued" on it (#140) and the run
+    // coordinator asks the same question of the same key, so both read it
+    // from here rather than from two queries that could disagree.
+    static uint32 ActiveRunIdOnMap(uint32 mapId)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT id FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} LIMIT 1",
+            mapId);
+        return result ? result->Fetch()[0].Get<uint32>() : 0;
+    }
+
     // Open a run, or keep the open one alive. Called by the arming drive, which
-    // is the component that already notices a character is inside.
+    // is the component that already notices a character is inside. Returns the
+    // run's id, which is what the arming drive remembers having issued `dc on`
+    // for (#140); 0 only if the row vanished between the two statements.
     //
     // ONE RUN PER MAP, not per character: the five of them share an instance and
     // a run is the thing they share. A second character walking in joins the
     // run that exists rather than starting a rival one.
-    static void OpenOrTouchRun(std::string const& leaderName, uint32 mapId)
+    static uint32 OpenOrTouchRun(std::string const& leaderName, uint32 mapId)
     {
         // ONE STATEMENT, BECAUSE TWO WOULD BE A RACE. The first draft asked
         // "is there an active run?" and inserted if not. A review caught it at
@@ -3490,17 +3532,26 @@ private:
         //
         // So it is read back rather than inferred: a row whose heartbeat has
         // never moved off its own start time is one nobody had touched before
-        // this call. That is a query, but only on the arming path, which
-        // already only runs for a character that is inside and unarmed.
-        if (QueryResult opened = CharacterDatabase.Query(
-                "SELECT id FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} "
-                "AND last_progress_at = started_at LIMIT 1", mapId))
+        // this call. One query answers both "which run" and "was it just
+        // opened", on a path that runs once per ENGAGEMENT_POLL_MS per
+        // character inside.
+        QueryResult row = CharacterDatabase.Query(
+            "SELECT id, last_progress_at = started_at FROM overseer_dungeon_run "
+            "WHERE state = 'active' AND map_id = {} LIMIT 1", mapId);
+        if (!row)
+            return 0;
+
+        uint32 const runId = row->Fetch()[0].Get<uint32>();
+        // A comparison comes back from MySQL as a BIGINT, not the TINYINT a
+        // boolean column would be, so it is read as one.
+        if (row->Fetch()[1].Get<int64>() != 0)
         {
             LOG_INFO("module.overseer",
                      "overseer: opened dungeon run {} on map {} - '{}' is the first of "
                      "the roster inside, so the run now owns whoever is in there",
-                     opened->Fetch()[0].Get<uint32>(), mapId, leaderName);
+                     runId, mapId, leaderName);
         }
+        return runId;
     }
 
     // Close any run whose map no longer holds a single roster character.
@@ -7113,26 +7164,78 @@ private:
     // outside as "the bots are bad at dungeons" when the dungeon brain was
     // simply switched off.
     //
-    // TWO FACTS SHAPE THIS DRIVE, both learned by hand before it existed.
+    // THREE FACTS SHAPE THIS DRIVE, all learned by hand before or after it
+    // existed.
     //
-    // ONE: `dc on` IS REFUSED OUTSIDE AN INSTANCE. Issued at the portal it comes
-    // back accepted-and-inert - the command surface reports `delivered`, the
-    // result is null, and the strategy list is unchanged. So this cannot be done
-    // once at the start of a run; it has to happen after the character is
-    // actually inside, which is what IsDungeon() gates.
+    // ONE: `dc on` IS REFUSED OUTSIDE AN INSTANCE (DcOnAction::Execute,
+    // DungeonClearChatActions.cpp:247-251, "Not in a dungeon."). So this cannot
+    // be done once at the start of a run; it has to happen after the character
+    // is actually inside, which is what IsDungeon() gates.
     //
-    // TWO: IT DOES NOT SURVIVE A RESTART. Strategies live in the bot's engine,
-    // not in a table, so every worldserver bounce silently disarms the module
-    // and nothing re-applies it. That is why this is a DRIVE and not a one-shot:
-    // the HasStrategy check makes it idempotent while armed and self-healing
-    // after any restart, teardown, or relog.
+    // TWO: IT DOES NOT SURVIVE A RESTART. What `dc on` actually sets is the
+    // run's `enabled` flag (DungeonClearChatActions.cpp:281), which lives on
+    // the leader's value context in memory and dies with the worldserver. So
+    // every bounce silently disarms the run and nothing re-applies it. That is
+    // why this is a DRIVE and not a one-shot: it keeps asking, and its memory
+    // of having asked (below) is in-process, so a fresh process asks again.
     //
-    // WHY THE CHAT COMMAND AND NOT ChangeStrategy DIRECTLY. `dc on` does more
-    // than add two strategies: it seeds the run's pull setting and camp through
-    // the module's own ApplyPullSetting. Adding the strategies by hand would
-    // produce a half-armed run whose state the module never initialised, which
-    // is a worse failure than not arming at all because it looks armed.
-    // HandleCommand is the same hand-off DeliverPendingCommands uses.
+    // THREE, AND THIS IS #140: THE STRATEGY IS NOT THE RUN. For its first
+    // release this drive read `HasStrategy("dungeon clear")` as "already
+    // armed" and skipped. But the dungeon module's own gate installs that
+    // strategy on EVERY bot the moment it stands on a dungeon map, before
+    // anyone has asked for anything (DcStrategyGate::Reconcile,
+    // DcStrategyGate.cpp:60-112, invariant stated at DcStrategyGate.h:20-21;
+    // driven from login, map change and a throttled sweep, DcStrategyGate.h:24-37).
+    // So the gate said "armed" on a fresh process and again after every
+    // bounce, `dc on` was never issued, and five characters stood at the
+    // Deadmines entrance for six hours at full health with the strategy
+    // installed and the run's `enabled` flag off. What the triggers actually
+    // read is that flag (IsEnabled, DungeonClearTriggers.cpp:82-87), and the
+    // strategy is just the ladder they hang on. The strategy check is gone;
+    // nothing in this module reads the strategy as a proxy for anything.
+    //
+    // ONCE PER (RUN, CHARACTER, PROCESS, STAY INSIDE), NOT ONCE PER POLL.
+    // An accepted `dc on` re-issued while the run is enabled resets the
+    // run's transient state - approach FSM, cleared anchors, long path
+    // (DungeonClearChatActions.cpp:281-322) - so issuing it every poll would
+    // restart the run from the door eight times a minute. The record below
+    // is what makes this once: keyed on the run id the row was opened under,
+    // cleared when the character is seen OFF the dungeon map, because leaving
+    // the map is where the module itself strips the strategy and disables the
+    // run (TeardownOnStrip, DcStrategyGate.cpp:39-45 and :92-93), so a
+    // character that walks back in after a wipe needs a fresh `dc on` even
+    // though the run row is the same. A refusal is retried, slowly - see
+    // DUNGEON_DC_ON_RETRY_SECONDS.
+    //
+    // WHY DoSpecificAction AND NOT HandleCommand. Both end in the same place,
+    // DcOnAction::Execute, but only one of them says what happened.
+    // HandleCommand is void (PlayerbotAI.h:395): it queues the text
+    // (PlayerbotAI.cpp:1107), HandleCommands drains the queue later
+    // (PlayerbotAI.cpp:553-589) through a trigger the strategy has to be
+    // holding, and the action's result is thrown away at :580-585. So the
+    // return value the issue asks this module to log does not exist on that
+    // path. DoSpecificAction (PlayerbotAI.cpp:1773-1823) runs the action
+    // synchronously by name and returns its bool - and it is how the dungeon
+    // module's own `.dc on` command and addon button dispatch (RunDcCommand,
+    // DungeonClearCommand.cpp:53-66, through DungeonClearDispatch.h:41:
+    // `botAI->DoSpecificAction(action, Event("dc", param, issuer), true)`),
+    // so it is the module's own front door, not a side entrance.
+    // `silent` only suppresses the emote and the generic "failed" whisper
+    // (:1806-1812); DcRefuse's own reason is written inside Execute
+    // regardless.
+    //
+    // WHY NOT ChangeStrategy DIRECTLY. `dc on` does more than add two
+    // strategies: it sets `enabled`, registers the tank with the status
+    // publisher, seeds the pull setting and camp through the module's own
+    // ApplyPullSetting (DungeonClearChatActions.cpp:281-296). Adding the
+    // strategies by hand - which the gate already does anyway - arms nothing.
+    //
+    // WHAT A REFUSAL LOOKS LIKE. DcRefuse (DungeonClearChatActions.cpp:50-58)
+    // whispers the bot's MASTER, and the master of the tank is the tank, so
+    // that whisper goes nowhere - but the same function logs the reason at
+    // WARN whenever the master is a bot (:55-57: "DC command refused for X:
+    // why"), which covers the selfbot leader. This module logs that the call
+    // returned false, once per refusal streak, and points there for the why.
     //
     // NOT DISARMED ON THE WAY OUT, deliberately. Leaving an instance is not the
     // same as ending a run - a wipe puts the party outside at a graveyard with
@@ -7194,6 +7297,36 @@ private:
         return nullptr;
     }
 
+    // WHAT THIS PROCESS HAS SAID TO WHOM, per roster character (#140). This is
+    // the memory that turns a drive that re-issued every poll into one that
+    // issues once: the run id the last `dc on` was for, whether DcOnAction
+    // accepted it, when, and whether a refusal has already been said. Read by
+    // the run coordinator's CLEARING verdict as well, which is why it is not a
+    // local. World-thread-only, unguarded, lost on restart - the same
+    // discipline as DungeonRunCoordinatorState, and lost on restart is the
+    // point: a fresh process must issue again, because the flag it set died
+    // with the old one.
+    struct DcOnRecord
+    {
+        uint32 runId{0};
+        bool accepted{false};
+        time_t issuedAt{0};
+        bool loggedRefused{false};
+    };
+    std::map<std::string, DcOnRecord> _dcOnIssued;
+
+    // Has this process had `dc on` ACCEPTED for this character, for this run?
+    // Accepted means DcOnAction::Execute returned true - and for a character
+    // that is not the run's leader tank that is trivially true
+    // (DungeonClearChatActions.cpp:239-246), so "accepted for everyone inside"
+    // says the command took on whichever of them the module elected leader,
+    // and nothing more. See the CLEARING state for what more is required.
+    bool DcOnAccepted(std::string const& name, uint32 runId) const
+    {
+        auto const it = _dcOnIssued.find(name);
+        return it != _dcOnIssued.end() && it->second.runId == runId && it->second.accepted;
+    }
+
     void DriveDungeonClear()
     {
         // Retire runs nobody is in before considering new ones, so a party that
@@ -7216,11 +7349,6 @@ private:
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
-                continue;
-
-            // A corpse cannot start a dungeon run, and the dead strategy set
-            // does not carry the dungeon contexts anyway.
-            if (!bot->IsAlive())
                 continue;
 
             // GEOGRAPHY, NOT THE RUN. THIS DRIVE CANNOT WAIT FOR ITS OWN
@@ -7246,6 +7374,24 @@ private:
             // precondition.
             Map* map = bot->GetMap();
             if (!map || !map->IsDungeon())
+            {
+                // OFF THE MAP FORGETS THE ISSUE. This is where the dungeon
+                // module itself strips the strategy and disables the run
+                // (DcStrategyGate.cpp:39-45), so whatever this process said
+                // to this character no longer holds, and the next time it is
+                // seen inside it is asked again - same run row or not.
+                _dcOnIssued.erase(name);
+                continue;
+            }
+
+            // A corpse cannot start a dungeon run, and the dead strategy set
+            // does not carry the dungeon contexts anyway. BELOW the map check
+            // on purpose (#140): a character that died, released to a
+            // graveyard outside and is walking back in as a ghost must have
+            // its record forgotten on the way out, whether or not it was
+            // alive when this drive looked - the module disabled the run at
+            // the map change either way.
+            if (!bot->IsAlive())
                 continue;
 
             // THE HEARTBEAT IS TOUCHED FOR EVERY CHARACTER SEEN INSIDE,
@@ -7271,7 +7417,17 @@ private:
             //
             // Opening also stays here rather than below: by the time anything
             // is steering, the thing that owns the steering already exists.
-            OpenOrTouchRun(name, bot->GetMapId());
+            uint32 const runId = OpenOrTouchRun(name, bot->GetMapId());
+            if (!runId)
+            {
+                // The row was closed between the touch and the read-back. Not
+                // a state that lasts: the next pass touches it open again.
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is inside map {} but no active run row answered "
+                         "right after it was touched - trying again next pass",
+                         name, static_cast<uint32>(bot->GetMapId()));
+                continue;
+            }
 
             // WHO ISSUES THE COMMAND DECIDES WHETHER IT IS OBEYED, and for a
             // year of runs the answer has been "nobody may".
@@ -7313,24 +7469,74 @@ private:
                 continue;
             }
 
-            // Already armed. This is the line that makes the ARMING idempotent:
-            // once `dc on` has taken, every later poll stops here. It must stay
-            // below the heartbeat, for the reason above.
-            if (botAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
+            // ALREADY ISSUED FOR THIS RUN, BY THIS PROCESS, AND ACCEPTED: done
+            // for as long as this character stays inside. This is the line
+            // that makes the arming once rather than every poll, and it reads
+            // this module's own memory of what it did - not the strategy list,
+            // which the dungeon module fills in on its own (see THREE above).
+            // It must stay below the heartbeat, for the reason above.
+            DcOnRecord& record = _dcOnIssued[name];
+            time_t const now = std::time(nullptr);
+            if (record.runId == runId)
+            {
+                if (record.accepted)
+                    continue;
+                // Refused last time. Retried, but not every poll: a refusal
+                // that heals (a dead member revived) is caught within a
+                // minute, and one that does not is one WARN below and then
+                // silence rather than a line every eight seconds.
+                if (now - record.issuedAt < DUNGEON_DC_ON_RETRY_SECONDS)
+                    continue;
+            }
+
+            bool const wasRefused = record.runId == runId && !record.accepted;
+            // Event(source, param, owner)  Event.h:21-24; the owner is what
+            // IsAuthorized reads (DungeonClearChatActions.cpp:62).
+            bool const accepted =
+                botAI->DoSpecificAction("dc on", Event("dc", "", issuer), true);
+            record.runId = runId;
+            record.accepted = accepted;
+            record.issuedAt = now;
+
+            if (accepted)
+            {
+                // SAID ONCE PER ISSUE, and an issue happens once per stay. This
+                // is the line the issue asks for by name. "Accepted" is all it
+                // may claim: DcOnAction returned true, which for the elected
+                // leader tank means `enabled` is now set and for anyone else
+                // means nothing was refused. Whether the run then MOVES is the
+                // coordinator's verdict, not this one's.
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is inside map {} (run {}) - issuing 'dc on' as "
+                         "'{}': accepted{}",
+                         name, static_cast<uint32>(bot->GetMapId()), runId,
+                         issuer->GetName(),
+                         wasRefused ? " (after an earlier refusal)" : "");
+                record.loggedRefused = false;
                 continue;
+            }
 
-            botAI->HandleCommand(CHAT_MSG_WHISPER, "dc on", issuer);
-
-            // SAID ON EVERY ATTEMPT, NOT ONCE. If the command takes, the
-            // HasStrategy check above silences this on the next poll and the
-            // line appears exactly once per run. If it keeps appearing, the
-            // command is being refused for a reason nobody has found yet, and a
-            // repeating line is how that becomes visible instead of a dungeon
-            // brain that is quietly off.
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' is inside map {} and the dungeon clear was not "
-                     "armed - issuing 'dc on'",
-                     name, static_cast<uint32>(bot->GetMapId()));
+            // REFUSED, SAID ONCE PER STREAK. The reason is not available to
+            // this module - DcRefuse writes it to the dungeon module's own log
+            // (DungeonClearChatActions.cpp:55-57, "DC command refused for X:
+            // why") and whispers it to a master that, for the tank, is the
+            // tank - so this says that it was refused, by whom, and where to
+            // look. A false here can also mean the action is not registered
+            // at all (DoSpecificAction returns false through every engine
+            // answering UNKNOWN, PlayerbotAI.cpp:1816-1822), which is the
+            // "module not loaded" case and reads the same from here.
+            if (!record.loggedRefused)
+            {
+                record.loggedRefused = true;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is inside map {} (run {}) - issuing 'dc on' as "
+                         "'{}': REFUSED (DcOnAction returned false). The reason is in "
+                         "the dungeon module's own log under 'DC command refused for "
+                         "{}'; retrying every {}s and staying quiet until it takes",
+                         name, static_cast<uint32>(bot->GetMapId()), runId,
+                         issuer->GetName(), name,
+                         static_cast<uint32>(DUNGEON_DC_ON_RETRY_SECONDS));
+            }
         } while (result->NextRow());
     }
 
@@ -7617,13 +7823,15 @@ private:
     // REFUSED outside an instance (it reports `delivered` with a null result,
     // so the command surface cannot tell you it failed) and refused again
     // unless the issuer is a selfbot in the target's group. That drive gates on
-    // IsDungeon(), verifies the result by reading the live strategy list back
-    // with HasStrategy, and re-arms after a restart because strategies live in
-    // the engine and not in a table. Reproducing any of that here would be a
-    // second thing arming the same characters, which is the exact shape this
-    // epic exists to remove. STAGED_INSIDE therefore HANDS OVER rather than
-    // arming: it establishes the precondition that drive has been waiting for -
-    // every roster member on the instance map, together - and holds.
+    // IsDungeon(), issues once per (run, character, process, stay inside) and
+    // remembers what DcOnAction returned (#140), and issues again after a
+    // restart because that memory and the flag it set are both in-process.
+    // Reproducing any of that here would be a second thing arming the same
+    // characters, which is the exact shape this epic exists to remove.
+    // STAGED_INSIDE therefore HANDS OVER rather than arming: it establishes
+    // the precondition that drive has been waiting for - every roster member
+    // on the instance map, together - and holds. CLEARING then reads the
+    // drive's record and the leader's movement, not the strategy list.
     //
     // WHY THIS OWNS ONLY THE LEADER'S MOVEMENT, AND NOT A NEW WALK MECHANISM.
     // `new rpg` - the strategy that lets a character be aimed at all, via
@@ -8005,8 +8213,10 @@ private:
         bool loggedCrossingAim{false};
         bool loggedCrossingWaiting{false};
         bool loggedStagedWaiting{false};
-        bool loggedArmed{false};
-        bool loggedUnarmed{false};
+        bool loggedAccepted{false};
+        bool loggedNotAccepted{false};
+        bool loggedMoved{false};
+        bool loggedNotMoved{false};
         // A crossing's progress, kept in the shared ratchet - see
         // DUNGEON_CROSSING_RATCHET. The reading is the count already through,
         // which only ratchets upward within one crossing: a number that cannot
@@ -8015,14 +8225,19 @@ private:
         // the same way and now through the same function. Shared by ENTER and
         // EXIT because only one crossing is ever in progress.
         OverseerDecisions::RatchetState crossing;
-        // WHETHER THE DUNGEON BRAIN HAS EVER BEEN SEEN ON DURING THIS RUN, and
-        // when CLEARING started asking. Together these are what make a DISARM
-        // tellable from a run that was never armed at all: strategies live in
-        // the bot's engine and not in a table, so a worldserver bounce takes
-        // them away silently, and "armed, then not" is a different event from
-        // "never armed" with a different cause and a different log line.
-        bool armedSeen{false};
-        time_t armedSince{0};
+        // CLEARING'S TWO CLOCKS (#140). `awaitingSince` is when this state
+        // last started waiting for `dc on` to be accepted on everyone inside -
+        // set on entry, and again whenever that stops being true, so the
+        // grace is measured from the last change and not from a phase entry
+        // that may be an hour old. The anchor is where the leader stood when
+        // acceptance was first seen complete, and `anchorAt` when; the verdict
+        // that the run is actually MOVING is measured against those. Both are
+        // in-process on purpose: a bounce wipes them along with the flag they
+        // were verifying, and the adopted run starts both clocks again.
+        time_t awaitingSince{0};
+        bool anchorSet{false};
+        float anchorX{0.f}, anchorY{0.f};
+        time_t anchorAt{0};
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
@@ -8413,12 +8628,14 @@ private:
             // coordinator's state is in-process and unguarded on purpose (see
             // DungeonRunCoordinatorState), so a bounce puts it back at IDLE
             // while the party is still standing in the instance and the run row
-            // is still open - and a bounce ALSO wipes every `dungeon clear`
-            // strategy, because strategies live in the bot's engine and not in
-            // a table. A coordinator that returns here would then never watch
-            // the re-arming it is supposed to watch, and never walk anybody out
-            // either. The obligation to notice a restart would be unfulfilled
-            // by construction.
+            // is still open - and a bounce ALSO wipes the run's `enabled`
+            // flag, which lives on the leader's value context in memory
+            // (DungeonClearChatActions.cpp:281), along with this module's
+            // memory of having issued `dc on` (_dcOnIssued). A coordinator
+            // that returns here would then never watch the re-arming it is
+            // supposed to watch, and never walk anybody out either. The
+            // obligation to notice a restart would be unfulfilled by
+            // construction.
             //
             // ADOPTION IS GATED ON KNOWING THE WAY OUT, which is what makes it
             // safe rather than a guess: only a dungeon this module has a portal
@@ -8444,7 +8661,7 @@ private:
                 coord = DungeonRunCoordinatorState();
                 coord.phase = DungeonRunPhase::Clearing;
                 coord.portalKeyword = inside->keyword;
-                coord.armedSince = std::time(nullptr);
+                coord.awaitingSince = std::time(nullptr);
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is already inside a dungeon run on map {} - "
                          "adopting it at CLEARING. The staging half is over and there is "
@@ -8778,15 +8995,16 @@ private:
                         // and it has no idea the run is over - so it can walk
                         // them back toward the instance while the travel aim
                         // walks them toward the door. Disarming from here is
-                        // NOT the fix and was rejected on purpose:
-                        // DriveDungeonClear re-arms any unarmed character on an
-                        // instance map on its very next pass, so a `dc off`
-                        // issued here would be undone within seconds and the
-                        // two would fight instead of one of them winning. The
-                        // real fix is for that drive to learn that a run can be
-                        // over, which is a change to its lifecycle and belongs
-                        // with the `dc` verbs that own it - not a second
-                        // opinion asserted from out here.
+                        // NOT the fix and was rejected on purpose. When this
+                        // was written the arming drive re-issued to any
+                        // character whose strategy was missing, so a `dc off`
+                        // from here was undone within seconds; since #140 it
+                        // issues once per stay inside and would not, but a
+                        // `dc off` asserted from out here is still a second
+                        // opinion on a lifecycle the module's own `dc` verbs
+                        // own. The real fix is for that drive to learn that a
+                        // run can be over, which is a change to its lifecycle
+                        // and belongs with those verbs.
                         LOG_ERROR("module.overseer",
                                   "overseer: dungeon run EXIT could not get the party back "
                                   "out through areatrigger {} - they are still on map {} "
@@ -8849,10 +9067,12 @@ private:
                 }
 
                 coord.phase = DungeonRunPhase::Clearing;
-                coord.armedSeen = false;
-                coord.armedSince = std::time(nullptr);
-                coord.loggedArmed = false;
-                coord.loggedUnarmed = false;
+                coord.awaitingSince = std::time(nullptr);
+                coord.anchorSet = false;
+                coord.loggedAccepted = false;
+                coord.loggedNotAccepted = false;
+                coord.loggedMoved = false;
+                coord.loggedNotMoved = false;
                 // THE LINE THIS WHOLE EPIC WAS OPENED TO MAKE POSSIBLE, so it
                 // says what is now true rather than what was attempted.
                 LOG_INFO("module.overseer",
@@ -8867,9 +9087,9 @@ private:
             //
             // THIS STATE ARMS NOTHING. DriveDungeonClear already owns arming
             // and is the only thing that may - see this section's own comment
-            // and that drive's. What is missing, and what this adds, is a
-            // RUN-LEVEL VERDICT on whether the arming worked, because every
-            // signal that looked like one has already been wrong once:
+            // and that drive's. What this adds is a RUN-LEVEL VERDICT on
+            // whether the arming worked, and every signal that looked like one
+            // has now been wrong once:
             //
             //   - the command surface reports `delivered`, which means the bot
             //     received the whisper. `dc on` outside an instance is refused
@@ -8877,104 +9097,171 @@ private:
             //   - a strategy probe showing "dungeon clear" was read as
             //     confirmation while every command was in fact being refused
             //     for an unauthorized issuer (#96).
+            //   - this state then read the live strategy list off each engine
+            //     and called the run "verified" when all five held it (#140).
+            //     The dungeon module's gate installs that strategy on every
+            //     bot standing on a dungeon map, asked or not
+            //     (DcStrategyGate.cpp:60-112), so the line was always true and
+            //     never evidence: it was logged at 08:49 over a party that
+            //     stood at the door until 15:00.
             //
-            // So the fact this reads is the LIVE strategy list off the engine
-            // itself, per character, which is what the `strategies` probe reads
-            // (ProbeStrategies) and what DriveDungeonClear's own idempotence
-            // check reads. It is asked every poll rather than once, because
-            // strategies live in the bot's engine and not in a table: a
-            // worldserver bounce takes them away silently, and a verdict
-            // recorded once would then be a verdict that is quietly false.
-            uint32 armed = 0;
-            std::string unarmed;
+            // WHAT IS READ INSTEAD, IN TWO STEPS, EACH CLAIMING ONLY WHAT IT
+            // CAN. First, this module's own record of what DcOnAction
+            // RETURNED (_dcOnIssued, written by the drive): true for everyone
+            // inside means the command was accepted on whichever of them the
+            // module elected leader, and that is the whole claim - "accepted",
+            // not "driving". Second, the leader's POSITION: the module's
+            // triggers read the `enabled` flag that `dc on` set and walk the
+            // tank toward the first boss, and a tank that has moved more than
+            // DUNGEON_DC_ON_MOVE_YARDS from where it stood when the command
+            // was accepted is a run the module is driving, by the only measure
+            // this module can take without the module's headers. The flag
+            // itself, and the `dc status` reply that would report it, are out
+            // of reach: the reply is an addon-channel packet sent only to real
+            // clients in the group (DcStatusPublisher::SendAddonMessage,
+            // DcStatusPublisher.cpp:186-201), not party chat.
+            //
+            // A BOUNCE IS NOTICED BY CONSTRUCTION rather than by a separate
+            // "armed, then not" branch. What a worldserver restart wipes is
+            // the `enabled` flag, the drive's record and this state, all
+            // together; the adopted run starts at CLEARING with an empty
+            // record, the drive issues again, and this verifies again. There
+            // is no in-process event that turns the flag off while everyone
+            // stays inside, so there is nothing for such a branch to read.
+            uint32 const runId = ActiveRunIdOnMap(portal->insideMapId);
+            uint32 accepted = 0;
+            std::string notAccepted;
             for (OverseerDecisions::DungeonRunEntryState const& state : states)
             {
                 if (!state.through)
-                    continue;   // outside: only a character in the instance can be armed
+                    continue;   // outside: the drive only issues to a character inside
 
-                Player* member = ObjectAccessor::FindPlayerByName(state.name);
-                PlayerbotAI* memberAI = SteerableAI(member);
-                if (!memberAI)
-                    continue;
-
-                // HasStrategy  PlayerbotAI.h:416  bool HasStrategy(std::string const, BotState)
-                if (memberAI->HasStrategy("dungeon clear", BOT_STATE_NON_COMBAT))
+                if (runId && DcOnAccepted(state.name, runId))
                 {
-                    ++armed;
+                    ++accepted;
                     continue;
                 }
 
-                if (!unarmed.empty())
-                    unarmed += ", ";
-                unarmed += state.name;
+                if (!notAccepted.empty())
+                    notAccepted += ", ";
+                notAccepted += state.name;
             }
 
-            if (armed && armed == inside)
+            if (!accepted || accepted != inside)
             {
-                if (!coord.loggedArmed)
+                // NOT (OR NO LONGER) ACCEPTED ON EVERYONE INSIDE. If it was a
+                // moment ago, the clocks restart: the drive re-issues on its
+                // next pass and the grace is measured from now, not from an
+                // entry that may be an hour old.
+                if (coord.loggedAccepted)
                 {
-                    coord.loggedArmed = true;
-                    coord.loggedUnarmed = false;
-                    LOG_INFO("module.overseer",
-                             "overseer: dungeon run CLEARING verified - all {} roster "
-                             "members inside map {} hold `dungeon clear`, read off their "
-                             "own engines rather than off a command status. The dungeon "
-                             "module drives the run from here",
-                             armed, portal->insideMapId);
+                    coord.loggedAccepted = false;
+                    coord.anchorSet = false;
+                    coord.loggedMoved = false;
+                    coord.loggedNotMoved = false;
+                    coord.awaitingSince = std::time(nullptr);
                 }
-                coord.armedSeen = true;
-                coord.armedSince = std::time(nullptr);
+
+                // NEVER ACCEPTED, AND THE GRACE HAS LAPSED. ERROR rather than
+                // WARN: a run whose brain is off is the single most
+                // consequential state this module can be in, it has been in
+                // it for its entire life, and the only reason that survived so
+                // long is that nothing ever said so. Said once per lapse
+                // rather than every poll; acceptance clears the flag, so a
+                // line here means it is still true.
+                if (coord.awaitingSince &&
+                    std::time(nullptr) - coord.awaitingSince > DUNGEON_ARMING_GRACE_SECONDS &&
+                    !coord.loggedNotAccepted)
+                {
+                    coord.loggedNotAccepted = true;
+                    LOG_ERROR("module.overseer",
+                              "overseer: dungeon run CLEARING has 'dc on' accepted for {} of "
+                              "{} inside map {} after {}s - the dungeon brain is OFF for the "
+                              "rest and they are fighting a five-man with open-world logic. "
+                              "The clearing drive's own log says whether it was refused or "
+                              "never issued. Not accepted: {}",
+                              accepted, inside, portal->insideMapId,
+                              static_cast<uint32>(DUNGEON_ARMING_GRACE_SECONDS), notAccepted);
+                }
                 return;
             }
 
-            // ARMED, AND THEN NOT. This is the worldserver-bounce case and it
-            // gets its own line, because "the brain went off" and "the brain
-            // never came on" have different causes and the log should not make
-            // a reader guess which happened. Nothing is issued here: the
-            // clearing drive re-arms on its own next pass - it is a drive and
-            // not a one-shot precisely so a restart heals - and the next poll
-            // of this state verifies that it did.
-            if (coord.armedSeen)
+            // ACCEPTED ON EVERYONE INSIDE. Said once, claiming only that.
+            if (!coord.loggedAccepted)
             {
-                coord.armedSeen = false;
-                coord.armedSince = std::time(nullptr);
-                coord.loggedArmed = false;
-                // CLEARED, NOT SET, so the grace check below can still
-                // escalate this. A disarm that heals produces one WARN and then
-                // the verified line again; a disarm that never heals produces
-                // that WARN and then the ERROR a minute later, which is the
-                // difference between a worldserver bounce and a run being
-                // fought with the brain off.
-                coord.loggedUnarmed = false;
-                LOG_WARN("module.overseer",
-                         "overseer: dungeon run CLEARING was armed and is not any more - "
-                         "{} of {} inside map {} still hold `dungeon clear`. Strategies "
-                         "live in the bot's engine and not in a table, so a worldserver "
-                         "bounce disarms them silently; the clearing drive re-arms and this "
-                         "re-checks. Not armed: {}",
-                         armed, inside, portal->insideMapId, unarmed);
+                coord.loggedAccepted = true;
+                coord.loggedNotAccepted = false;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run CLEARING - 'dc on' accepted for all {} "
+                         "roster members inside map {}, read off what DcOnAction returned "
+                         "rather than off a strategy list. That is the command taking, not "
+                         "the run moving; watching for '{}' to move more than {:.0f}y "
+                         "within {}s",
+                         accepted, portal->insideMapId, leaderName,
+                         DUNGEON_DC_ON_MOVE_YARDS,
+                         static_cast<uint32>(DUNGEON_DC_ON_MOVE_WINDOW_SECONDS));
+            }
+
+            // THE MOVEMENT VERDICT, ON THE LEADER. Measured from where it
+            // stood when acceptance was first seen complete rather than from
+            // the door, because this module does not know where the interior
+            // is - the first boss is the dungeon module's knowledge - and the
+            // issue's own acceptance criterion is stated the same way. Only a
+            // leader this module can see is measured; mid-relog it is skipped
+            // for a poll and the anchor waits.
+            Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
+            if (!leader || leader->GetMapId() != portal->insideMapId)
+                return;
+
+            if (!coord.anchorSet)
+            {
+                coord.anchorSet = true;
+                coord.anchorX = leader->GetPositionX();
+                coord.anchorY = leader->GetPositionY();
+                coord.anchorAt = std::time(nullptr);
                 return;
             }
 
-            // NEVER ARMED, AND THE GRACE HAS LAPSED. ERROR rather than WARN:
-            // a run whose brain is off is the single most consequential state
-            // this module can be in, it has been in it for its entire life, and
-            // the only reason that survived so long is that nothing ever said
-            // so. Said once per lapse rather than every poll, and re-armed
-            // state clears the flag, so a line here means it is still true.
-            if (coord.armedSince &&
-                std::time(nullptr) - coord.armedSince > DUNGEON_ARMING_GRACE_SECONDS &&
-                !coord.loggedUnarmed)
+            if (coord.loggedMoved)
+                return;   // verified; nothing further to say until something changes
+
+            // Position::GetExactDist2d (Position.h:170) and not
+            // WorldObject::GetDistance2d, for the reason the quest re-pick
+            // ratchet gives: the latter subtracts the character's own size,
+            // and this is a question about ground covered.
+            float const moved = leader->GetExactDist2d(coord.anchorX, coord.anchorY);
+            time_t const waited = std::time(nullptr) - coord.anchorAt;
+            if (moved > DUNGEON_DC_ON_MOVE_YARDS)
             {
-                coord.loggedUnarmed = true;
+                coord.loggedMoved = true;
+                coord.loggedNotMoved = false;
+                // THE LINE THIS EPIC WAS OPENED TO MAKE TRUE, and the first
+                // version of it that is evidence.
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run CLEARING verified - '{}' has moved {:.0f}y "
+                         "from where it stood when 'dc on' was accepted, {}s later. The "
+                         "dungeon module is driving the run",
+                         leaderName, moved, static_cast<uint32>(waited));
+                return;
+            }
+
+            if (waited > DUNGEON_DC_ON_MOVE_WINDOW_SECONDS && !coord.loggedNotMoved)
+            {
+                coord.loggedNotMoved = true;
+                // ERROR, ONCE. This is the shape #140 was opened on: command
+                // accepted, strategy held, party at the door for six hours.
+                // Not retried from here - a second `dc on` on an enabled run
+                // resets it (see DUNGEON_DC_ON_RETRY_SECONDS) - and the why
+                // is in the dungeon module's own log, which is where the
+                // stall reasons it publishes end up.
                 LOG_ERROR("module.overseer",
-                          "overseer: dungeon run CLEARING has {} of {} inside map {} "
-                          "holding `dungeon clear` after {}s - the dungeon brain is OFF for "
-                          "the rest and they are fighting a five-man with open-world logic. "
-                          "The clearing drive's own log says why it could not arm them. "
-                          "Not armed: {}",
-                          armed, inside, portal->insideMapId,
-                          static_cast<uint32>(DUNGEON_ARMING_GRACE_SECONDS), unarmed);
+                          "overseer: dungeon run CLEARING - 'dc on' was accepted but '{}' "
+                          "has moved only {:.0f}y in {}s (needed more than {:.0f}y within "
+                          "{}s). The command took and the run is not moving; the dungeon "
+                          "module's own log has its stall reason, if it published one",
+                          leaderName, moved, static_cast<uint32>(waited),
+                          DUNGEON_DC_ON_MOVE_YARDS,
+                          static_cast<uint32>(DUNGEON_DC_ON_MOVE_WINDOW_SECONDS));
             }
             return;
         }
