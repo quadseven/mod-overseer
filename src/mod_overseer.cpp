@@ -6282,6 +6282,20 @@ private:
     // Nothing was wrong with any of those aims: each was a place somebody
     // wanted a character to be. What was missing was the ground in between.
     //
+    // WHAT IS PROVEN AND WHAT IS INFERRED, KEPT APART. The three source
+    // branches above are read out of the pinned core and are certain; so is
+    // the fact that every walk this module issues ends in a raw point handed
+    // to that generator once it is inside pathFinderDis. What is INFERRED is
+    // that this is what killed each of those ten characters: what was
+    // recorded is the aim, the coordinate, the self-kill and the timing, not a
+    // stack. Beyond seventy yards MoveFarTo does route first and commits to a
+    // waypoint the mesh gave it, so at long range the straight line is
+    // possible rather than certain - it needs that committed waypoint to be
+    // off the mesh in its turn, which PATHFIND_FARFROMPOLY explicitly allows
+    // (NewRpgBaseAction.cpp:123). The fix is written to the mechanism that can
+    // be read in the source, and the death table is what says whether it was
+    // the whole of it.
+    //
     // WHAT IS DONE ABOUT IT, IN ONE PLACE. Every place-aim this module issues
     // passes through GroundedStep on its way to the mover, and GroundedStep
     // answers one question: is the point the mover is about to be handed one it
