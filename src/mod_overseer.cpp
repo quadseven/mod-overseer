@@ -153,14 +153,13 @@ constexpr uint32 SNAPSHOT_MS = 5000;
 constexpr uint32 WATCH_RELOAD_MS = 30000;
 constexpr uint32 CHAT_SWEEP_MS = 300000;
 
-// How often to check that the roster is still logged in. A login is a query
-// holder plus a world-thread callback, so this is not free; 30s is far below
-// any interval a viewer would notice and far above the cost.
-constexpr uint32 ROSTER_POLL_MS = 30000;
-
-// Bots logged in per pass. A cap because the first pass after a restart would
-// otherwise queue every roster login into one world tick.
-constexpr uint32 ROSTER_LOGINS_PER_POLL = 3;
+// How often the roster is checked for a character playing with no client
+// attached (#131). This used to be the login cadence, and 30s was chosen
+// because a login is a query holder plus a world-thread callback. Nothing is
+// logged in any more; the pass is one roster SELECT and a handful of name
+// lookups, and what it catches is a character playing unobserved, which the
+// operator counts by the minute. So it runs at the snapshot cadence.
+constexpr uint32 ROSTER_POLL_MS = 5000;
 
 // How often to check the roster is still one party. Cheap - a pointer compare
 // per member until something is actually wrong.
@@ -1858,6 +1857,7 @@ public:
         PLAYERHOOK_ON_PLAYER_JUST_DIED,
         PLAYERHOOK_ON_PVP_KILL,
         PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE,
+        PLAYERHOOK_ON_BEFORE_LOGOUT,
     }) {}
 
     // Fires on the way DOWN as well - the hook is named for a change, not a
@@ -1960,6 +1960,61 @@ public:
         RecordEvent(player, "death", 0, "", "");
         RecordDeath(player);
     }
+
+    // NO FOLLOWER KEEPS A MASTER THAT IS ABOUT TO BE FREED (#131).
+    //
+    // KeepRosterFollowing points every follower's PlayerbotAI::master - a raw
+    // Player* - at the leader. Its own comment argues that upstream clears
+    // that pointer on logout, and it did, for the headless bots this module
+    // used to spawn: RandomPlayerbotMgr::OnPlayerLogout walks ITS OWN
+    // PlayerBotMap and nulls every master that pointed at the departing
+    // player (RandomPlayerbotMgr.cpp:2509-2515). Under #131 nobody on the
+    // roster is a headless bot any more. Each is a SELFBOT - a real session
+    // handed a PlayerbotAI by `self` (PlayerbotMgr.cpp:1064-1065, run at
+    // login by PlayerbotMgr::OnPlayerLogin when selfBotLevel > 2) - and a
+    // selfbot is in NO holder's map: AddPlayerbotData registers the AI and
+    // nothing else. So when the leader's client drops and its session logs
+    // the character out, that walk finds nobody, four followers keep a
+    // master that has just been deleted, and the very next AI tick does
+    // GET_PLAYERBOT_AI(master), which reads master->GetGUID() off freed
+    // memory (PlayerbotAI.cpp:433-434, PlayerbotMgr.cpp:1792). Upstream has
+    // the same hole for any party of selfbots; it is closed here for the
+    // family because this module is what points them at each other.
+    //
+    // WHY THIS HOOK. OnPlayerBeforeLogout is the first thing LogoutPlayer
+    // calls (WorldSession.cpp:716), unconditionally - ahead of the
+    // `redirecting` guard that gates OnPlayerLogout at :850 - and the Player
+    // is still whole. The group is walked rather than the roster resolved by
+    // name: the followers this module pointed at the leader are by
+    // construction in the leader's group, the group's member list is what
+    // the core itself walks on every thread, and the global name map is the
+    // unlocked container #125 exists to keep off any path that is not the
+    // world update (see ForEachWatcher).
+    void OnPlayerBeforeLogout(Player* player) override
+    {
+        // Roster only. A production world's hundreds of headless bots are
+        // covered by upstream's own walk, which is what this exists to
+        // replace for the one party upstream cannot see.
+        if (!player || !OnRoster(player->GetName()))
+            return;
+        Group* group = player->GetGroup();
+        if (!group)
+            return;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == player)
+                continue;
+            PlayerbotAI* memberAI = GET_PLAYERBOT_AI(member);
+            if (!memberAI || memberAI->GetMaster() != player)
+                continue;
+            memberAI->SetMaster(nullptr);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is logging out, so '{}' no longer follows it - "
+                     "the pointer would dangle otherwise",
+                     player->GetName(), member->GetName());
+        }
+    }
 };
 
 class OverseerWorldScript : public WorldScript
@@ -1992,9 +2047,9 @@ public:
             ReloadWatchList();
             // And the roster, for the same reason and a sharper one: the event
             // hooks record NOTHING until they know who is on it, so leaving
-            // this to the 30-second roster poll would mean a blind window
-            // after every restart - which is precisely when a character is
-            // most likely to do something worth having a record of.
+            // this to the roster poll would mean a blind window after every
+            // restart - which is precisely when a character is most likely to
+            // do something worth having a record of.
             ReloadRosterNames();
         }
         if (_commandTimer >= COMMAND_POLL_MS)
@@ -2020,7 +2075,7 @@ public:
         if (_rosterTimer >= ROSTER_POLL_MS)
         {
             _rosterTimer = 0;
-            KeepRosterOnline();
+            KeepRosterAttended();
         }
         if (_partyTimer >= PARTY_POLL_MS)
         {
@@ -2141,26 +2196,87 @@ public:
     }
 
 private:
-    // Log in the characters that are supposed to be playing (infra#2656).
+    // NOBODY ON THE ROSTER PLAYS WITHOUT A REAL CLIENT ATTACHED (#131).
     //
-    // AddPlayerBot with a master account of 0 is the whole trick. The
-    // permission gate in PlayerbotHolder::AddPlayerBot reads
+    // THE RULE, FROM THE OPERATOR, STATED AS AN ABSOLUTE: a family character
+    // is only ever playing while a real game client is logged in and streaming
+    // its point of view. The stream is the product; a character levelling,
+    // travelling and dying with nobody watching and nothing recording is
+    // content destroyed rather than produced. Measured during one multi-hour
+    // client outage: five characters gained levels, crossed three zones and
+    // fought, off camera, the whole time.
     //
-    //     bool isRndbot = !masterAccountId;
-    //     if (!isRndbot && !sameAccount && !sameGuild && !addClassBot && !linkedAccount)
+    // WHAT THIS REPLACES. This function used to be KeepRosterOnline: every
+    // roster character not found in the world was logged in as a headless
+    // bot through sRandomPlayerbotMgr.AddPlayerBot(guid, 0), so the family
+    // played continuously whether or not any client was attached. Then a real
+    // client logging in as that character EVICTED the bot: mod-playerbots'
+    // secure-login script intercepts CMSG_PLAYER_LOGIN, finds the altbot
+    // holding the same guid and force-logs it out through its holder
+    // (PlayerbotsSecureLogin.cpp:45-50), and LogoutPlayerBot then deletes the
+    // Player, its PlayerbotAI and its session in one call
+    // (PlayerbotMgr.cpp:408-410). Every client (re)connection was therefore a
+    // teardown of a character this module's drives were steering by name. A
+    // peer review of the segfault proposed exactly that as the crash: a
+    // roster name resolving, mid-eviction, to a Player whose AI is being
+    // destroyed, with SteerableAI's IsInWorld/GetSession guard being a
+    // check-then-use that cannot cover the botAI calls after it. The
+    // measurements fit - hundreds of headless bots run for days at restart 0
+    // where nothing ever evicts them, and the five client-attached characters
+    // crashed their world minutes after every reconnect. If a roster
+    // character is never spawned as a background bot, there is no bot
+    // session to evict, and the product rule and the stability fix are the
+    // same change.
     //
-    // so passing 0 skips it, and the login callback then takes the branch that
-    // needs no master session. That is what makes this unattended: no client,
-    // nobody logged in, no `.bot add` typed by a human.
+    // THE DISCRIMINATOR IS THE SESSION SOCKET, NOT THE PRESENCE OF A
+    // PlayerbotAI. A real client's session holds a WorldSocket; a spawned
+    // bot's session is constructed with none (PlayerbotMgr.cpp:203 passes
+    // nullptr for the socket and true for isBot). And a selfbot - the filmed
+    // character, a real session that has been handed a PlayerbotAI so the
+    // engine plays it - has BOTH a PlayerbotAI and a socket, which is why the
+    // AI cannot be the test. WorldSession::IsSocketClosed() is the core's own
+    // public answer: `!m_Socket || !m_Socket->IsOpen()` (WorldSession.cpp:657,
+    // declared public at WorldSession.h:1211), the same test Group.cpp:2435
+    // uses to decide whether a member can still be talked to.
     //
-    // These bots are deliberately NOT enrolled in RandomPlayerbotMgr's pool.
-    // Its bots come from `add` rows in playerbots_random_bots, which these
-    // characters do not have, so the periodic Randomize() that would re-roll a
-    // level 1 character's level and gear never reaches them.
+    // TWO WAYS A ROSTER CHARACTER CAN BE IN THE WORLD WITH NO SOCKET, and each
+    // gets the eviction its own session kind understands:
+    //
+    //   1. A HEADLESS BOT (session->IsBot()): somebody spawned it - an older
+    //      image of this module, a `.bot add`, anything. It is logged out
+    //      through the holder that owns it, the way the secure-login script
+    //      does: the master's PlayerbotMgr if it has a master with one, else
+    //      the random-bot holder. LogoutPlayerBot is synchronous and frees the
+    //      Player, so nothing here touches the pointer after the call.
+    //   2. A REAL SESSION WHOSE CLIENT WENT AWAY: the core keeps a
+    //      disconnected player in the world for up to 60 seconds so it can
+    //      resume (WorldSessionMgr.cpp:195, the offline-session sweep), and
+    //      that sweep also honours IsKicked(). KickPlayer with setKicked
+    //      (WorldSession.cpp:903-914) closes nothing that is not already
+    //      closed and marks the session, so the next session update logs the
+    //      character out instead of letting it stand there for a minute as a
+    //      selfbot with nobody watching. The supervisor's relog then goes
+    //      through an ordinary login rather than a resume; it loses nothing.
+    //
+    // ACROSS A RESTART the rule holds by construction: the core clears
+    // `characters.online` at startup and nothing in this module logs anybody
+    // in, so a roster character is offline until its client connects. And it
+    // does NOT fight the stream supervisors: a session with a live socket is
+    // exactly what a supervisor produces, and this never touches one.
+    //
+    // SCOPED TO THE ROSTER. Everything here iterates overseer_roster names.
+    // The hundreds of headless bots a production world runs on purpose are not
+    // on that roster and are not looked at.
+    //
+    // WHY A SWEEP AND NOT A LOGIN HOOK. OnPlayerLogin fires inside
+    // HandlePlayerLoginFromDB, before the holder has inserted the bot into its
+    // map, so LogoutPlayerBot called from there would find nothing to log out.
+    // A sweep a few seconds later finds it where the holder put it.
+
     // Read the roster and publish it to the event hooks. Split out of
-    // KeepRosterOnline so startup can prime the hooks without also queueing
-    // logins into the first ticks, which the roster timer's seeding
-    // deliberately avoids.
+    // KeepRosterAttended so startup can prime the hooks before the first
+    // roster poll, which the roster timer's seeding deliberately leaves for a
+    // few ticks.
     std::vector<std::string> ReloadRosterNames()
     {
         std::vector<std::string> names;
@@ -2176,36 +2292,84 @@ private:
         return names;
     }
 
-    void KeepRosterOnline()
+    // Does a real game client hold this character's session right now? This
+    // is the one question every drive in this module asks before steering a
+    // roster character, and the one the roster sweep asks before evicting
+    // one. See KeepRosterAttended for why the socket is the test.
+    static bool ClientAttached(Player const* player)
     {
-        // The whole list is read before any login is attempted, because the
-        // login loop stops after ROSTER_LOGINS_PER_POLL and the event hooks
-        // need the names of everybody on the roster, not of the first three.
+        if (!player || !player->IsInWorld())
+            return false;
+        WorldSession const* session = player->GetSession();
+        return session && !session->IsSocketClosed();
+    }
+
+    // Log a headless bot out through whichever holder owns it. Mirrors
+    // mod-playerbots' own eviction on a real login
+    // (PlayerbotsSecureLogin.cpp:31-50): a bot added by a master lives in
+    // that master's PlayerbotMgr map, anything else in the random-bot holder,
+    // and LogoutPlayerBot is a silent no-op on a holder that does not have
+    // the guid - so the same order of preference is used here. The Player is
+    // freed by the call; the caller must not use it afterwards.
+    static void EvictHeadlessBot(Player* bot)
+    {
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        ObjectGuid const guid = bot->GetGUID();
+        if (botAI)
+        {
+            if (Player* master = botAI->GetMaster())
+            {
+                if (PlayerbotMgr* mgr = GET_PLAYERBOT_MGR(master))
+                {
+                    if (mgr->GetPlayerBot(guid))
+                    {
+                        mgr->LogoutPlayerBot(guid);
+                        return;
+                    }
+                }
+            }
+        }
+        sRandomPlayerbotMgr.LogoutPlayerBot(guid);
+    }
+
+    void KeepRosterAttended()
+    {
+        // The whole list is read every pass, because the event hooks need the
+        // names of everybody on the roster and a row can be enabled between
+        // polls.
         std::vector<std::string> const names = ReloadRosterNames();
 
-        uint32 started = 0;
         for (std::string const& name : names)
         {
-            if (started >= ROSTER_LOGINS_PER_POLL)
-                break;
+            Player* player = ObjectAccessor::FindPlayerByName(name);
+            if (!player)
+                continue;   // offline, which is the correct state with no client
 
-            // Already playing. Checked by name rather than by tracking what we
-            // launched, so a character that logs out for any reason - a crash,
-            // a real player taking it over and leaving - comes back on the next
-            // pass without the module needing to have noticed why it went.
-            if (ObjectAccessor::FindPlayerByName(name))
-                continue;
+            if (ClientAttached(player))
+                continue;   // a real client is playing it; leave it alone
 
-            ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(name);
-            if (!guid)
+            WorldSession* session = player->GetSession();
+            if (!session)
+                continue;   // mid-teardown already; nothing to add
+
+            if (session->IsBot())
             {
-                LOG_WARN("module.overseer", "overseer: roster character '{}' does not exist", name);
-                continue;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is in the world as a headless bot with no client "
+                         "attached - logging it out, because the family only plays on "
+                         "camera", name);
+                EvictHeadlessBot(player);
+                continue;   // player is freed
             }
 
-            LOG_INFO("module.overseer", "overseer: logging in roster character '{}'", name);
-            sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
-            ++started;
+            if (session->IsKicked())
+                continue;   // already marked; the session sweep will take it
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' has lost its client (socket closed) - kicking the "
+                     "session so it logs out now rather than standing unobserved for "
+                     "the core's 60-second resume window", name);
+            session->KickPlayer("overseer: no client attached");
         }
     }
 
@@ -2249,7 +2413,13 @@ private:
             std::string const name = row[0].Get<std::string>();
             if (row[1].Get<uint8>() && wantsToLead.empty())
                 wantsToLead = name;
-            if (Player* p = ObjectAccessor::FindPlayerByName(name))
+            // Present means playing on camera (#131). A roster character in
+            // the world with no client is on its way out - KeepRosterAttended
+            // evicts it - and inviting it, pointing it at a leader or handing
+            // it leadership for the seconds in between would be steering a
+            // character nobody is watching.
+            Player* p = ObjectAccessor::FindPlayerByName(name);
+            if (ClientAttached(p))
                 present.push_back(p);
         } while (result->NextRow());
 
@@ -2459,15 +2629,15 @@ private:
     // other logout hook at WorldSession.cpp:850-857), which reaches
     // RandomPlayerbotMgr::OnPlayerLogout (Playerbots.cpp:457), which clears the
     // master of every bot in its PlayerBotMap that pointed at the departing
-    // player (RandomPlayerbotMgr.cpp:2509-2515). These five ARE in that map:
-    // KeepRosterOnline logs them in with sRandomPlayerbotMgr.AddPlayerBot and a
-    // masterAccountId of 0, which routes the login callback to
-    // RandomPlayerbotMgr::instance() (PlayerbotMgr.cpp:186), OnBotLoginOperation
-    // resolves the same holder (PlayerbotOperations.h:499), and OnBotLogin
-    // inserts them (PlayerbotMgr.cpp:468). Bot logouts take the same road:
-    // LogoutPlayerBot calls botWorldSessionPtr->LogoutPlayer(true)
-    // (PlayerbotMgr.cpp:408). This module therefore keeps no Player* of its own
-    // between polls - the guarantee covers PlayerbotAI::master and nothing else.
+    // player (RandomPlayerbotMgr.cpp:2509-2515). That covered these five
+    // while KeepRosterOnline logged them in as headless bots in that holder's
+    // map. It does NOT cover them now (#131): every roster character is a
+    // selfbot on a real session, and a selfbot is in no holder's map at all,
+    // so that walk finds nobody. OverseerEventScript::OnPlayerBeforeLogout
+    // is what clears the followers' master for the family now - see it for
+    // the whole argument. This module still keeps no Player* of its own
+    // between polls; the guarantee covers PlayerbotAI::master and nothing
+    // else.
     //
     // NO CHANGE TO COMMAND DELIVERY. Commands are delivered through the
     // character's own session with the bot itself as the speaker, and
@@ -3058,9 +3228,17 @@ private:
     // IsInWorld() is the check this file already makes before touching a
     // watcher (:507) and a snapshot subject (:4338). The drives simply never
     // adopted it.
+    //
+    // AND A REAL CLIENT MUST BE ATTACHED (#131). ClientAttached is the
+    // in-world-with-a-session check above plus the session socket, which is
+    // what separates a filmed character from a headless bot - see
+    // KeepRosterAttended. A roster character with no client is not steered by
+    // any drive, full stop: the sweep will have it out of the world within a
+    // poll, and until then nothing here moves it. Every drive already comes
+    // through this one function, so the rule is enforced in exactly one place.
     static PlayerbotAI* SteerableAI(Player* bot)
     {
-        if (!bot || !bot->IsInWorld() || !bot->GetSession())
+        if (!ClientAttached(bot))
             return nullptr;
         return GET_PLAYERBOT_AI(bot);
     }
@@ -10389,9 +10567,10 @@ private:
     uint32 _watchTimer = 0;
     uint32 _sweepTimer = 0;
     uint32 _chatFlushTimer = 0;
-    // Seeded so the first roster check runs one poll after startup rather than
-    // immediately: the character cache and the world are still settling in the
-    // first ticks, and a login queued into that is a login that quietly fails.
+    // The first roster sweep runs one poll after startup rather than
+    // immediately: the world is still settling in the first ticks, and there
+    // is nobody to evict yet because nothing logs a roster character in any
+    // more (#131) - only a client can.
     uint32 _rosterTimer = 0;
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
