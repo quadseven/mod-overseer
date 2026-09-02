@@ -211,6 +211,27 @@ constexpr uint32 ENGAGEMENT_POLL_MS = 8000;
 // genuinely stuck character is not left dead for minutes.
 constexpr int64 STUCK_REVIVAL_DEAD_SECONDS = 45;
 
+// HOW LONG THE HEALER GETS BEFORE THIS DRIVE STOPS WAITING FOR IT.
+// STUCK_REVIVAL_DEAD_SECONDS is an open-world number: out there nothing else
+// will ever revive a roster character, so 45s of nobody coming is proof. Inside
+// an instance with a run open that is not true. The dungeon module's own
+// post-combat rez (DcRezRecovery.cpp, EvaluateImpl) elects a living Priest,
+// Paladin, Shaman or Druid and walks it to the corpse, and it gives that walk
+// `DungeonClear.PostCombatRezTimeoutSecs` of out-of-combat time (90 by
+// default, mod_dungeon_clear.conf.dist:264-274; read at DcRezRecovery.cpp:245).
+// Measured on the first tank-driven run: the tank died 155 yards in, the
+// dungeon module logged that the healer was coming, and 45s later this drive
+// teleported the tank to the graveyard outside and resurrected it there. The
+// four followers then released ("DC tank gone") and the run was over, with the
+// tank alive in a field and everyone else inside.
+//
+// So a character dead on a dungeon map with a living resurrector in its party
+// gets the dungeon module's whole budget plus a margin before this drive
+// concludes nobody is coming. The margin covers what this drive cannot see:
+// the module's clock only runs OUT of combat and is reset by a fight, while
+// this one is wall time from the death.
+constexpr int64 STUCK_REVIVAL_HEALER_SECONDS = 90 + 30;
+
 // WHEN THE NEAREST GRAVEYARD IS ITSELF THE THING KILLING THEM.
 // Resurrecting at the closest graveyard is right almost everywhere, and it is
 // what this drive did first. Measured on wow-dev 2026-08-28 it doubled the
@@ -233,6 +254,52 @@ constexpr int64 STUCK_REVIVAL_DEAD_SECONDS = 45;
 constexpr uint64 STUCK_REVIVAL_TRAP_DEATHS = 3;
 constexpr uint32 STUCK_REVIVAL_TRAP_MINUTES = 15;
 constexpr float STUCK_REVIVAL_TRAP_RADIUS = 100.0f;
+
+// The living party member the dungeon module could send to a corpse, or null.
+//
+// Re-derived from DcRezRecovery::CanRecover (DcRezRecovery.cpp:361-377) with
+// core calls rather than by including that module's headers: a group member
+// on the SAME MAP as the dead character, alive, of a class that has a
+// resurrection spell (IsRezClass, DcRezRecovery.cpp:32-44: Priest, Paladin,
+// Shaman, Druid). Same map is the module's own filter (its snapshot drops any
+// member on another map, DcRezRecovery.cpp:79), and it is the right one here
+// too: a ghost that has released out of an instance is no longer something
+// that module will walk to.
+//
+// Members read at the pinned core:
+//   getClass        Unit.h:844        uint8 getClass() const
+//   IsAlive         Unit.h:1793       bool IsAlive() const
+//   GetGroup        Player.h:2520     Group* GetGroup()
+//   GetFirstMember  Group.h:252       GroupReference* GetFirstMember()
+//   GetMapId        Position.h:281    uint32 GetMapId() const
+//   CLASS_PALADIN 2, CLASS_PRIEST 5, CLASS_SHAMAN 7, CLASS_DRUID 11
+//                   SharedDefines.h:127,130,132,136
+static Player* LivingResurrectorFor(Player* dead)
+{
+    Group* group = dead ? dead->GetGroup() : nullptr;
+    if (!group)
+        return nullptr;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || member == dead || !member->IsAlive())
+            continue;
+        if (member->GetMapId() != dead->GetMapId())
+            continue;
+        switch (member->getClass())
+        {
+            case CLASS_PRIEST:
+            case CLASS_PALADIN:
+            case CLASS_SHAMAN:
+            case CLASS_DRUID:
+                return member;
+            default:
+                break;
+        }
+    }
+    return nullptr;
+}
 
 // The level difference at which AzerothCore's own client-facing con-color
 // math would show a target as `??` - unknown, maximum danger - rather than a
@@ -7355,7 +7422,66 @@ private:
                 continue;
 
             if (bot->IsAlive())
+            {
+                _healerExpected.erase(name);
                 continue;
+            }
+
+            // THE HEALER GETS THERE FIRST.
+            //
+            // Every recovery below - the release, the graveyard teleport, the
+            // forced resurrect - moves the character away from its corpse.
+            // In the open world that costs nothing, because nothing else was
+            // ever going to revive it (see STUCK_REVIVAL_DEAD_SECONDS). Inside
+            // an instance with a run open it costs the run: the dungeon
+            // module's post-combat rez is already walking a healer to this
+            // corpse, and a corpse that is teleported out from under it is a
+            // tank standing in a field outside while the party waits inside.
+            // Measured, once, on the first tank-driven run - see
+            // STUCK_REVIVAL_HEALER_SECONDS.
+            //
+            // So while all three hold - the character is dead ON a dungeon
+            // map (a ghost that has released out of the instance is on the
+            // outdoor map, and the dungeon module no longer counts it), a
+            // run is open for that map (InDungeonRun; without a run the
+            // dungeon module is not armed and nobody is coming), and a living
+            // resurrector shares its map - this drive stands down for
+            // STUCK_REVIVAL_HEALER_SECONDS from the death. It does not stand
+            // down forever: the dungeon module gives up after its own timeout
+            // and this drive is the only recovery a named-account roster has
+            // (see the IsRandomBot note above), so when the window passes, or
+            // the last resurrector dies, the recovery below runs unchanged.
+            //
+            // Said once per death, in each direction. _healerExpected
+            // remembers which deaths were announced and is cleared the moment
+            // the character is alive again, so a second death is announced
+            // again and the first is not repeated every poll.
+            auto const healerExpected = [&](int64 deadSeconds) -> bool
+            {
+                Player* rezzer = InDungeonRun(bot) ? LivingResurrectorFor(bot) : nullptr;
+                if (rezzer && deadSeconds < STUCK_REVIVAL_HEALER_SECONDS)
+                {
+                    if (_healerExpected.insert(name).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' is dead on map {} with '{}' alive in the "
+                                 "party and a dungeon run open - the dungeon module's "
+                                 "post-combat rez is expected to walk the healer to the "
+                                 "corpse, so this drive stands down for up to {}s before "
+                                 "recovering it itself",
+                                 name, static_cast<uint32>(bot->GetMapId()),
+                                 rezzer->GetName(), STUCK_REVIVAL_HEALER_SECONDS);
+                    return true;
+                }
+
+                if (_healerExpected.erase(name))
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is still dead after {}s and {} - the healer "
+                             "is no longer waited for; recovering as in the open world",
+                             name, deadSeconds,
+                             rezzer ? "the dungeon module's rez budget has passed"
+                                    : "no living resurrector is left on its map");
+                return false;
+            };
 
             // WHERE THE CORPSE IS, AND WHY ASKING THE PLAYER IS NOT ENOUGH.
             // Player::GetCorpse() resolves through the player's CURRENT map, so
@@ -7457,6 +7583,8 @@ private:
                 }
                 if (now - seen->second < STUCK_REVIVAL_DEAD_SECONDS)
                     continue;
+                if (healerExpected(now - seen->second))
+                    continue;
 
                 LOG_WARN("module.overseer",
                          "overseer: '{}' has been dead {}s on the release prompt with nobody "
@@ -7475,6 +7603,8 @@ private:
 
             int64 const deadFor = time(nullptr) - ghostTime;
             if (deadFor < STUCK_REVIVAL_DEAD_SECONDS)
+                continue;
+            if (healerExpected(deadFor))
                 continue;
 
             // Has this character been dying over and over in one small area?
@@ -11312,6 +11442,12 @@ private:
     // is unguarded like TravelAimBook's own maps and _lastAim above, and lost
     // on restart, which costs at most one extra grace period.
     std::map<std::string, int64> _awaitingRelease;
+
+    // WHICH DEATHS THIS DRIVE HAS SAID IT IS LEAVING TO THE HEALER, by name.
+    // Same ownership and lifetime as _awaitingRelease: DriveStuckRevival on
+    // the world thread only, cleared when the character is alive again, lost
+    // on restart at the cost of one repeated line.
+    std::set<std::string> _healerExpected;
 
     // What KeepRosterFollowing knew about each follower's position last
     // time round, so a stall is measured against ITS OWN best position
