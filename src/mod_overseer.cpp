@@ -9595,6 +9595,18 @@ private:
     // AGENTS.md's standing instruction is the general form of this: fix the
     // code, never reach for the admin shortcut.
     //
+    // AND IT RESETS EVERY NORMAL FIVE-MAN THE LEADER IS BOUND TO, NOT JUST THIS
+    // ONE. Group::ResetInstances walks the leader's whole bound-instance map for
+    // DUNGEON_DIFFICULTY_NORMAL (Group.cpp:2340-2341) and resets each entry that
+    // is not a raid and can be reset. That is not an oversight to work around -
+    // it is precisely what the button on a player's portrait does, and this
+    // function exists to do exactly what that button does. The family is a party
+    // of five running one dungeon at a time, so in practice the set is the one
+    // map. The VERIFICATION is scoped to the map this run is for, because that
+    // is the only one whose bind could send the party back into a cleared
+    // instance; a bind elsewhere that survived is somebody else's problem to
+    // notice.
+    //
     // THE VERIFICATION IS THE POINT OF THE FUNCTION. `delivered` is not `done`,
     // and a void call that reports its failure to a client the bot does not have
     // is the exact shape this module keeps being caught by. So the bind is read
@@ -9995,6 +10007,17 @@ private:
                 coord.capKnown = adoptedCap.known;
                 coord.runsWanted = adoptedCap.wanted;
 
+                // A RUN WITH NO NUMBER STILL HAS A PLACE IN THE SEQUENCE. An
+                // unstamped row (campaign_id 0 - somebody walked in by a path
+                // this coordinator did not drive) reads back as run 0, and
+                // leaving it there would make the NEXT run number 1 while
+                // dungeon_runs_done had already moved past 1. The counter on the
+                // roster row is the durable one, so the number is taken from it:
+                // whatever this run turns out to be, it is the one after the
+                // ones already counted.
+                if (!coord.runNumber)
+                    coord.runNumber = adoptedCap.done + 1;
+
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is already inside a dungeon run on map {} - "
                          "adopting it at CLEARING (run {} of campaign {}). The staging "
@@ -10208,8 +10231,11 @@ private:
                 return;
             }
 
-            // GATHERING, BARRIER or ENTER: the party is not staged inside, so
-            // there is no crossing to reverse from here. If somebody did get
+            // RESET, GATHERING, BARRIER or ENTER: the party is not staged
+            // inside, so there is no crossing to reverse from here. RESET is on
+            // that list since #144 and belongs there for the same reason as the
+            // rest: it happens entirely outside the instance, so a stand-down
+            // costs nothing but the wait. If somebody did get
             // through during an ENTER that is being stood down, IDLE adopts
             // that run on its next poll and EXIT becomes reachable again - the
             // adoption path exists precisely so this does not have to guess.
