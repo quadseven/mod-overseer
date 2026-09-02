@@ -118,6 +118,7 @@
 #include "Creature.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "Timer.h"
 #include "Trainer.h"
 #include "World.h"
 #include "WorldSession.h"
@@ -408,6 +409,57 @@ constexpr float FOLLOW_STALL_GAP_YARDS = 100.0f;
 constexpr OverseerDecisions::RatchetLimits FOLLOW_STALL_RATCHET{
     OverseerDecisions::RatchetReading::DistanceFromLastMark,
     FOLLOW_STALL_JITTER_YARDS, FOLLOW_STALL_SECONDS};
+
+// A FOLLOWER TOO FAR BEHIND TO BE FOLLOWING AT ALL (#138).
+//
+// Past AiPlayerbot.SightDistance (100, PlayerbotAIConfig.cpp:109) upstream's
+// Follow() stops chasing and issues one MoveTo(target, followDistance) per
+// attempt (MovementActions.cpp:1224). That MoveTo is a single straight step of
+// at most AiPlayerbot.SpellDistance (28.5, PlayerbotAIConfig.cpp:110) toward
+// the master, with its Z interpolated toward the MASTER'S Z before it is
+// clamped to the ground under the step (MovementActions.cpp:791-796). It knows
+// nothing about the navmesh between the two of them: a master on top of a
+// cliff pulls a follower at its foot straight at the rock face, a step at a
+// time, forever. Measured 2026-09-01: three followers self-killed at one
+// coordinate within twenty-four seconds while the leader was thousands of
+// yards away, and five more earlier that hour at a zone edge.
+//
+// So beyond this distance a follower is not following, it is stranded, and
+// the drive stops pretending otherwise: it is given the leader's position as
+// its OWN travel aim - the dungeon-run escort that already walks a member
+// across open ground under `new rpg` - and MoveFarTo routes it there along
+// the navmesh like any other errand. Five hundred because that is what the
+// issue's own acceptance criterion measures against, and because it is five
+// times SightDistance: a follower a hundred yards back is being chased one
+// step at a time and usually closes, one five hundred yards back is past
+// anything upstream will do for it.
+constexpr float FOLLOW_CATCH_UP_YARDS = 500.0f;
+
+// ...AND HOW CLOSE IT HAS TO GET BACK before it is handed back to `follow`.
+// FOLLOW_STALL_GAP_YARDS on purpose - SightDistance is the exact line inside
+// which upstream's Follow() chases continuously again (MovementActions.cpp:
+// 1180-1224), so this is where following starts working, not a guess. Well
+// under FOLLOW_CATCH_UP_YARDS so a follower on the line does not flap between
+// the two drives every poll.
+constexpr float FOLLOW_CATCH_UP_DONE_YARDS = FOLLOW_STALL_GAP_YARDS;
+
+// How far the leader may walk from the point a catching-up follower was aimed
+// at before the aim is refreshed. Half of FOLLOW_CATCH_UP_DONE_YARDS, and the
+// arithmetic is the reason: a follower that ARRIVES at its aim holds there
+// (see DriveTravel's escort arrival branch), and the hand-back above needs it
+// within FOLLOW_CATCH_UP_DONE_YARDS of the leader to fire. With the aim never
+// more than this far from the leader, arriving at it always lands inside that
+// radius, so the escort cannot end with the follower holding still out of
+// `follow`'s reach. Any larger and a leader who stopped just past the line
+// would leave the follower standing at a stale point forever.
+constexpr float FOLLOW_CATCH_UP_REAIM_YARDS = FOLLOW_CATCH_UP_DONE_YARDS / 2.0f;
+
+// Upstream's own fuse on MoveFarTo's stuck teleport: `stuckTime`, 90 seconds
+// (NewRpgBaseAction.h:76). Named here so the log line that reports the
+// teleport being kept out of reach can say what it was kept from, and so a
+// pin bump that changes it has one place to change. See the stuck-teleport
+// block in DriveTravel for what is done with it.
+constexpr uint32 UPSTREAM_MOVE_FAR_STUCK_SECONDS = 90;
 
 // How often the unlearn drive looks for a profession the roster has asked a
 // character to give up (infra#2757).
@@ -1436,6 +1488,11 @@ public:
         // silent on purpose: a flight that never happens and never explains
         // itself is indistinguishable from the bug #68 is about.
         bool flightSaid{false};
+        // "Already said that upstream's stuck teleport was about to fire", so a
+        // walk that keeps failing to get nearer is reported once per errand
+        // rather than every poll it is held on the ground (#138). See the
+        // stuck-teleport block in DriveTravel.
+        bool stuckSaid{false};
         // The backstop's memory of whether the walk is going anywhere: the
         // nearest this character has ever been to this errand's target, 0 while
         // that has not been measured yet, and when it last got nearer. Kept in
@@ -2118,7 +2175,10 @@ public:
         //
         // Only while an escort exists. With none - which is every poll outside a
         // dungeon run - this is TRAVEL_POLL_MS exactly as before, and the two
-        // extra loader queries per poll are not paid.
+        // extra loader queries per poll are not paid. A catch-up walk (#138)
+        // is an escort in this sense too and wants the same thing for the same
+        // reason: a follower that has reached where the leader stood is held
+        // there only by the lease being renewed.
         uint32 const travelPoll =
             _dungeonEscorts.empty() ? TRAVEL_POLL_MS : DUNGEON_RUN_POLL_MS;
         if (_travelTimer >= travelPoll)
@@ -2392,6 +2452,15 @@ private:
     // group, so it can add to a party but cannot create one.
     void KeepRosterGrouped()
     {
+        // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN (#138) - the same
+        // discipline DriveDungeonRun opens with, for the same reason: a
+        // catch-up walk is marked by KeepRosterFollowing at the bottom of
+        // this poll, and every early exit above it - no roster, fewer than
+        // two present, no group - has to end whatever the previous poll
+        // stopped marking, or a follower keeps `new rpg` after the party it
+        // was catching up to has gone.
+        SweepCatchUps();
+
         // Designated leader first, so a freshly formed party starts in the
         // right hands rather than being corrected afterwards.
         QueryResult result = CharacterDatabase.Query(
@@ -3102,6 +3171,13 @@ private:
                 p->GetMotionMaster()->Clear();
                 stall.nudged = std::time(nullptr);
             }
+
+            // AND A FOLLOWER TOO FAR BACK FOR ANY OF THE ABOVE TO HELP IS
+            // WALKED, NOT SNAPPED (#138). The stall check clears a generator
+            // that has stopped producing motion; it cannot help a follower
+            // whose every step is aimed straight at a cliff face. See
+            // FOLLOW_CATCH_UP_YARDS and DriveCatchUp.
+            DriveCatchUp(p, leader);
         }
     }
 
@@ -5342,10 +5418,18 @@ private:
     // WHAT IT CANNOT DO, STATED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT. Only
     // the character carrying the errand flies. An errand moves the leadership
     // (see the professions notes above), so that character is the group
-    // leader and the other four are on `follow` - they keep walking the
-    // overland route, exactly as they do today, and regroup at the far end.
-    // Flying the party as a group needs every member to hold every node on the
-    // route, which measurement says they do not, and is its own ticket.
+    // leader and the other four are on `follow`. Flying the party as a group
+    // needs every member to hold every node on the route, which measurement
+    // says they do not, and is its own ticket.
+    //
+    // AND SINCE #138 THE LEADER DOES NOT FLY AWAY FROM THEM EITHER. The
+    // assumption that used to sit here - that the followers "keep walking the
+    // overland route and regroup at the far end" - was measured false, with
+    // deaths; see the refusal inside, after the node checks. In practice this
+    // means a family leader flies only when every follower is already off the
+    // ground or off the map, which is rare, and that is the correct trade:
+    // #130's saving was minutes for one character, and the cost was the other
+    // four.
     //
     // Returns true when a flight was issued, in which case the caller must NOT
     // issue the walk this poll.
@@ -5414,6 +5498,72 @@ private:
         if (nodeDx * nodeDx + nodeDy * nodeDy >
             TRAVEL_FLIGHT_NODE_MATCH_YARDS * TRAVEL_FLIGHT_NODE_MATCH_YARDS)
             return false;
+
+        // THE LEADER DOES NOT BOARD WHILE A FOLLOWER IS ON FOOT (#138).
+        //
+        // The paragraph above this function still says the other four "keep
+        // walking the overland route and regroup at the far end". Measured
+        // 2026-09-01, they do not: the leader flew 4333 yards, landed, and
+        // within three minutes three followers had killed themselves at one
+        // coordinate in a zone with nothing hostile in it. Following works by
+        // stepping straight at the master (see FOLLOW_CATCH_UP_YARDS), and a
+        // master who has just crossed a mountain range by air is on the far
+        // side of terrain his followers now walk straight into. The flight
+        // was a saving of a few minutes for one character, paid for with the
+        // other four.
+        //
+        // So a flight is refused while anyone who would try to follow it is
+        // still on the ground: a live groupmate on the same map who is not
+        // himself in the air. A dead one is a ghost walking to its corpse and
+        // follows nobody (FollowActions.cpp:296-306); one on another map
+        // cannot follow across it (FollowActions.cpp:285); one already on a
+        // taxi is not on foot. ONLY THE GROUP LEADER IS HELD TO THIS. A
+        // follower on a catch-up walk carries `new rpg` too and reaches this
+        // same function; nobody follows a follower, so nothing is behind it
+        // to be dragged, and a follower that holds the nodes flying to where
+        // the leader stands is the closest thing to "everyone flies" the
+        // issue asks for that this module can do without every member
+        // holding every node.
+        //
+        // Said once per errand through `flightSaid`, like every other refusal
+        // here, and BEFORE the candidate search rather than after it: the
+        // search is the expensive half of this function and its answer would
+        // not be acted on. GetGroup Player.h; GetLeaderGUID Group.h:228;
+        // GetFirstMember Group.h:252, GetGroup Player.h:2520 - the same walk
+        // this file's other member loops use.
+        if (Group* group = bot->GetGroup())
+        {
+            if (group->GetLeaderGUID() == bot->GetGUID())
+            {
+                std::string onFoot;
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* member = ref->GetSource();
+                    if (!member || member == bot || !member->IsInWorld() ||
+                        !member->IsAlive() || member->IsInFlight() ||
+                        member->GetMapId() != bot->GetMapId())
+                        continue;
+                    if (!onFoot.empty())
+                        onFoot += ", ";
+                    onFoot += '\'' + member->GetName() + '\'';
+                }
+                if (!onFoot.empty())
+                {
+                    if (!state.flightSaid)
+                    {
+                        state.flightSaid = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' is sent to '{}' {} yards away and has a "
+                                 "departure node ({}) in reach, but {} would be left on foot "
+                                 "behind it - walking, because a party that follows a "
+                                 "leader across the sky arrives one cliff at a time",
+                                 name, state.target, static_cast<uint32>(walkYards),
+                                 fromNode, onFoot);
+                    }
+                    return false;
+                }
+            }
+        }
 
         // How far the flight costs before it has flown anywhere. Half of the
         // flight-adjusted comparison below, and constant across every
@@ -5735,12 +5885,33 @@ private:
         // per destination rather than once per five-second poll - the same
         // log-once discipline every other drive in this file keeps.
         std::string aim;
+        // WHOSE ESCORT THIS IS (#138). False: a dungeon run's, marked by
+        // EscortToward and swept by SweepDungeonEscorts on the coordinator's
+        // clock. True: the follow drive's catch-up, marked by CatchUpToward
+        // and swept by SweepCatchUps on the party's clock. Two sweeps rather
+        // than one because the two clocks differ by a factor of six, and a
+        // catch-up marked every thirty seconds would be ended by a sweep that
+        // runs every five. The run's escort outranks the catch-up: EscortToward
+        // takes an entry over unconditionally, CatchUpToward never touches an
+        // entry that is not its own.
+        bool catchUp{false};
+        // Where the catch-up aim was last pointed, so "has the leader moved
+        // far enough from it to re-aim" is answered from memory rather than by
+        // parsing the aim string back. Meaningful only while `catchUp`.
+        float x{0.f};
+        float y{0.f};
     };
     std::map<std::string, DungeonEscort> _dungeonEscorts;
 
     bool IsEscorted(std::string const& name) const
     {
         return _dungeonEscorts.find(name) != _dungeonEscorts.end();
+    }
+
+    bool IsCatchingUp(std::string const& name) const
+    {
+        auto const it = _dungeonEscorts.find(name);
+        return it != _dungeonEscorts.end() && it->second.catchUp;
     }
 
     // Ask for a member to be walked to `aim`, and say so once. Idempotent: a
@@ -5751,6 +5922,19 @@ private:
     {
         DungeonEscort& escort = _dungeonEscorts[name];
         escort.wanted = true;
+        // The run takes over a catch-up in progress rather than queueing
+        // behind it (#138): both walk the member toward the family, the run
+        // knows where the family is going, and the lease it inherits -
+        // `granted` - is handed back by the run's own sweep exactly as if the
+        // run had granted it.
+        if (escort.catchUp)
+        {
+            escort.catchUp = false;
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} takes over '{}' from its catch-up walk - "
+                     "the run's staging point is where the leader is going anyway",
+                     what, name);
+        }
         _travelAims.Claim(name, aim);
         if (escort.aim == aim)
             return;
@@ -5760,6 +5944,171 @@ private:
                  "overseer: dungeon run {} escorts '{}' to {} under its own power - "
                  "following gets a character across open ground, it does not get one "
                  "through a doorway", what, name, aim);
+    }
+
+    // THE CATCH-UP WALK (#138): a follower too far behind to be following is
+    // given the leader's position as its own aim, through the same lease a run
+    // uses, until `follow` can reach it again. Returns true when this call
+    // STARTED the walk, so the caller can say so once; a re-aim over a walk in
+    // progress is silent here and shows up as DriveTravel's own re-issue.
+    //
+    // Refuses to touch an escort a run holds: the run's staging point is the
+    // authority on where this member should be, and the run's sweep is the
+    // authority on when it stops. See DungeonEscort::catchUp.
+    bool CatchUpToward(std::string const& name, Player* leader)
+    {
+        DungeonEscort& escort = _dungeonEscorts[name];
+        bool const started = escort.aim.empty();
+        if (!started && !escort.catchUp)
+            return false;
+
+        std::ostringstream aim;
+        aim << "at:" << leader->GetMapId() << ':' << leader->GetPositionX() << ','
+            << leader->GetPositionY() << ',' << leader->GetPositionZ();
+
+        escort.catchUp = true;
+        escort.wanted = true;
+        escort.x = leader->GetPositionX();
+        escort.y = leader->GetPositionY();
+        escort.aim = aim.str();
+        _travelAims.Claim(name, escort.aim);
+        return started;
+    }
+
+    // Ends a catch-up the party's clock has stopped marking - the same shape
+    // as SweepDungeonEscorts, for the entries that sweep leaves alone. The
+    // ordinary end is DriveCatchUp's own, on the poll that measures the gap
+    // closed; this is the backstop for the polls that never reach it. Runs first,
+    // every poll of KeepRosterGrouped, before any `return` in that function
+    // or in KeepRosterFollowing can forget one: a party that dissolves, a
+    // leader that logs out, a roster that shrinks to one, all reach here on
+    // the next poll with nothing marked, and the walk ends and the wheel goes
+    // back to `follow`.
+    void SweepCatchUps()
+    {
+        for (auto it = _dungeonEscorts.begin(); it != _dungeonEscorts.end(); )
+        {
+            if (!it->second.catchUp)
+            {
+                ++it;
+                continue;
+            }
+            if (it->second.wanted)
+            {
+                it->second.wanted = false;
+                ++it;
+                continue;
+            }
+            EndOneEscort(it->first, it->second.granted);
+            it = _dungeonEscorts.erase(it);
+        }
+    }
+
+    // Is the leader standing somewhere a follower can be sent? A position in
+    // the air is not an aim - it is the exact landing point the issue is
+    // about. IsInFlight is Unit.h:1709 and IsFalling Unit.h:1718, both public;
+    // IsFalling reads the movement flags AND the spline (Unit.cpp:15957-15961),
+    // so a leader mid-drop off a ledge is caught as well as one on a taxi.
+    // Asked of the WORLD rather than of this module's own flight bookkeeping,
+    // for the reason DriveTravel's in-flight guard gives: a taxi upstream
+    // rolled on its own is still a taxi.
+    static bool OnTheGround(Player* p)
+    {
+        return p && p->IsInWorld() && !p->IsInFlight() && !p->IsFalling();
+    }
+
+    // ONE FOLLOWER, ONE POLL: should it be walking to the leader on its own,
+    // and if it already is, should it still be (#138). Called from
+    // KeepRosterFollowing for every follower in the group, after the master
+    // and `follow` are known to be correct - this is about whether following
+    // can WORK from where the follower stands, which is the question nothing
+    // above it asks. See FOLLOW_CATCH_UP_YARDS for the measurement.
+    void DriveCatchUp(Player* p, Player* leader)
+    {
+        std::string const name = p->GetName();
+        auto const it = _dungeonEscorts.find(name);
+        bool const escorted = it != _dungeonEscorts.end();
+        // A run holds this member. Its staging point is where the leader is
+        // going, so the run's walk IS the catch-up, and the run's sweep is the
+        // authority on when it stops.
+        if (escorted && !it->second.catchUp)
+            return;
+
+        // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Negative
+        // means "not on the leader's map", which an `at:` aim cannot cross -
+        // ResolveTravelTarget refuses a spawn on another map - and which
+        // following cannot cross either (FollowActions.cpp:285).
+        float const gap =
+            p->GetMapId() == leader->GetMapId() ? p->GetDistance2d(leader) : -1.f;
+
+        if (escorted)
+        {
+            // THE WAYS IT ENDS, each said once because each is a decision,
+            // and each ended HERE rather than left for the sweep: the sweep is
+            // the backstop for a poll that never got this far, and thirty
+            // seconds of a follower holding `new rpg` beside a leader it could
+            // simply follow is thirty seconds it might roll a status of its
+            // own. The read-back of the hand-back is EndOneEscort's line.
+            if (gap < 0.f || gap <= FOLLOW_CATCH_UP_DONE_YARDS)
+            {
+                if (gap < 0.f)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is no longer on the map '{}' is on - its "
+                             "catch-up walk ends, there is nowhere on this map to walk to",
+                             name, leader->GetName());
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is back within {} yards of '{}' - its "
+                             "catch-up walk ends and `follow` takes it from here",
+                             name, static_cast<uint32>(gap), leader->GetName());
+                EndOneEscort(name, it->second.granted);
+                _dungeonEscorts.erase(it);
+                return;
+            }
+
+            it->second.wanted = true;
+            // THE AIM FOLLOWS THE LEADER, BUT ONLY ACROSS SOLID GROUND. A
+            // leader who has walked on is re-aimed at, measured from memory of
+            // where the last aim pointed, at FOLLOW_CATCH_UP_REAIM_YARDS - see
+            // that constant for why the figure is what it is. A leader in the
+            // air is simply not re-aimed at: the follower keeps walking to the
+            // last place he stood, which is a place a character can stand.
+            //
+            // RE-CLAIMED EVERY POLL EITHER WAY, exactly as the run's
+            // EscortToward is. TravelAimBook::Claim is idempotent against the
+            // walk it remembers and writes only when that memory is gone -
+            // which is what DriveTravel's twenty-minute backstop does when it
+            // releases a walk as unreachable. Without this the follower would
+            // keep `new rpg` with no aim under it, and a `new rpg` with no aim
+            // goes IDLE and then wherever NewRpgStatusUpdateAction rolls.
+            if (OnTheGround(leader) &&
+                leader->GetDistance2d(it->second.x, it->second.y) > FOLLOW_CATCH_UP_REAIM_YARDS)
+                CatchUpToward(name, leader);
+            else
+                _travelAims.Claim(name, it->second.aim);
+            return;
+        }
+
+        // NOT WALKING YET. Should it be?
+        if (gap <= FOLLOW_CATCH_UP_YARDS)
+            return;
+        // A dead follower is a ghost walking to its corpse, which is
+        // DriveStuckRevival's business and not a distance from anybody; a
+        // follower already on a taxi is closing the gap faster than a walk
+        // would; a follower inside a run is the run's. And the leader has to
+        // be standing on something, for the reason OnTheGround gives.
+        if (!p->IsAlive() || p->IsInFlight() || InDungeonRun(p))
+            return;
+        if (!leader->IsAlive() || !OnTheGround(leader))
+            return;
+
+        if (CatchUpToward(name, leader))
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is {} yards behind '{}' - past anything `follow` "
+                     "will do for it, so it is released to walk to where the leader "
+                     "stands under its own aim, and handed back within {} yards",
+                     name, static_cast<uint32>(gap), leader->GetName(),
+                     static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS));
     }
 
     // Recorded by DriveTravel at the instant it grants the strategy, so the
@@ -5806,6 +6155,14 @@ private:
     {
         for (auto it = _dungeonEscorts.begin(); it != _dungeonEscorts.end(); )
         {
+            // A catch-up is marked on the party's clock and swept by
+            // SweepCatchUps; this sweep would end it five seconds after it
+            // started (#138).
+            if (it->second.catchUp)
+            {
+                ++it;
+                continue;
+            }
             if (it->second.wanted)
             {
                 it->second.wanted = false;
@@ -5980,6 +6337,7 @@ private:
                 state.flights = 0;
                 state.flightSince = 0;
                 state.flightSaid = false;
+                state.stuckSaid = false;
                 // A new errand is a new ratchet: nothing measured yet, and the
                 // clock starts now rather than carrying the last errand's over.
                 state.progress.best = 0.f;
@@ -6044,6 +6402,62 @@ private:
                     state.flightSince = std::time(nullptr);
                 continue;
             }
+
+            // UPSTREAM'S STUCK TELEPORT IS KEPT OUT OF REACH (#138). Every walk
+            // this drive issues runs through NewRpgBaseAction::MoveFarTo
+            // (NewRpgBaseAction.cpp:40), and MoveFarTo has a recovery of its
+            // own: after five re-entries with no five-yard improvement and
+            // `stuckTime` (90 s, NewRpgBaseAction.h:76) on the clock it stops
+            // walking and does `bot->TeleportTo(dest)`
+            // (NewRpgBaseAction.cpp:97-113). That is the "flying and falling
+            // to move, like an exploit" the operator has been describing: a
+            // character that cannot find a path is dropped onto its
+            // destination from wherever it stood, and the destination this
+            // module hands a catching-up follower is wherever the leader was
+            // standing - which, on a cliff or a mountain, is a fall.
+            //
+            // THE FOLLOW STRATEGY'S OWN TELEPORT IS ALREADY GONE, and that
+            // is worth writing down so nobody goes looking for it: Follow()'s
+            // teleport-to-master sits inside a block comment at the pin
+            // (MovementActions.cpp:1110-1161), and FollowAction::isUseful
+            // stands the action down outright while the master is in flight
+            // (FollowActions.cpp:267-268). MoveFarTo's is the one a roster
+            // character on an errand can still reach, and it is reached only
+            // through `new rpg`, which is to say only by the leader and by an
+            // escorted follower - exactly the two this drive is walking.
+            //
+            // THE LEVER IS THE CLOCK. `stuckTs` and `stuckAttempts` are plain
+            // public fields of the public `rpgInfo` struct (NewRpgInfo.h:20,
+            // :81-82), reset by upstream itself whenever the walk gets nearer
+            // (NewRpgBaseAction.cpp:91-95). Stamping them here on every poll
+            // is the same reset a five-yard improvement would have earned,
+            // and the poll is TRAVEL_POLL_MS (15 s) apart - DUNGEON_RUN_POLL_MS
+            // (5 s) while anyone is escorted - against a 90 s fuse, so the fuse
+            // can never burn down between two polls. A walk that genuinely
+            // cannot land is still bounded: the twenty-minute backstop below
+            // releases the errand as unreachable, on the ground, which is what
+            // "unreachable" should mean. Said once per errand when it was
+            // actually about to fire, because that is the moment worth having
+            // in the log: five attempts with no progress is a path problem
+            // somebody may want to look at, and the teleport used to hide it.
+            //
+            // Held BEFORE the stand-still branches below so an escorted member
+            // holding at its point - which MoveFarTo is not being asked to
+            // move, and so never counts against - is covered on the same terms
+            // as one still walking.
+            if (botAI->rpgInfo.stuckAttempts >= 5 && !state.stuckSaid)
+            {
+                state.stuckSaid = true;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has made no progress toward '{}' in {} tries and "
+                         "upstream would teleport it there after {} seconds - held on the "
+                         "ground instead, the errand's own {}-minute backstop decides",
+                         name, target, botAI->rpgInfo.stuckAttempts,
+                         UPSTREAM_MOVE_FAR_STUCK_SECONDS,
+                         static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
+            }
+            botAI->rpgInfo.stuckTs = getMSTime();   // Timer.h:103
+            botAI->rpgInfo.stuckAttempts = 0;
 
             // THE RESOLVED SPAWN IS PINNED FOR THE LIFE OF THE ERRAND (PR
             // #2840 review). ResolveTravelTarget picks the nearest spawn of the
@@ -6143,8 +6557,9 @@ private:
                         state.arrived = true;
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' has reached its escort point '{}' and holds "
-                                 "there - the run releases it, not the arrival",
-                                 name, target);
+                                 "there - the {} releases it, not the arrival",
+                                 name, target,
+                                 IsCatchingUp(name) ? "follow drive" : "run");
                     }
                 }
                 else if (plan && !TrainOnArrival(name, bot, entry, *plan))
@@ -6406,10 +6821,24 @@ private:
                 state.x = pos.GetPositionX();
                 state.y = pos.GetPositionY();
                 state.z = pos.GetPositionZ();
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' sent to '{}' - creature {} at {:.0f} yards",
-                         name, target, entry,
-                         bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
+                // A CATCH-UP RE-AIM IS NOT NEWS (#138). The walk was announced
+                // once by DriveCatchUp when it started; every re-aim after
+                // that is the same decision with the leader fifty yards
+                // further on, and at a leader's running pace that is one line
+                // per follower per party poll for the whole of a long walk.
+                // DEBUG keeps the trace for anyone reading at that level and
+                // keeps the INFO log to decisions.
+                if (IsCatchingUp(name))
+                    LOG_DEBUG("module.overseer",
+                              "overseer: '{}' re-aimed at '{}' for its catch-up walk, "
+                              "{:.0f} yards off",
+                              name, target,
+                              bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' sent to '{}' - creature {} at {:.0f} yards",
+                             name, target, entry,
+                             bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
             }
         }
 
@@ -8205,6 +8634,11 @@ private:
             if (!coord.loggedGathering)
             {
                 coord.loggedGathering = true;
+                // Still true as far as this coordinator is concerned: it
+                // escorts nobody during GATHERING. A follower that drops more
+                // than FOLLOW_CATCH_UP_YARDS behind on the way is picked up
+                // by the follow drive's own catch-up (#138), which is a
+                // property of following, not of the run.
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is walking to the staging point - followers "
                          "reach it by following, not by their own aim", leaderName);
