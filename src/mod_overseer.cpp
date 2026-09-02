@@ -105,7 +105,9 @@
 #include "ItemTemplate.h"
 #include "GuildMgr.h"
 #include "ObjectAccessor.h"
+#include "Map.h"
 #include "MapMgr.h"
+#include "PathGenerator.h"
 #include "ObjectMgr.h"
 #include "QuestDef.h"
 #include "Player.h"
@@ -636,6 +638,43 @@ constexpr uint32 TRAVEL_FLIGHT_MAX_PER_ERRAND = 2;
 // drive can never be the same poll. See TravelHoldsTheWheel.
 constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
 
+// THE GROUND UNDER AN AIM (#138). Four numbers, and the whole argument for
+// them is in the GroundedStep section beside the escort code.
+
+// HOW FAR A CHARACTER MAY BE SENT IN A STRAIGHT LINE across ground the navmesh
+// has no route over. Under pathFinderDis (70, NewRpgBaseAction.h:68), which is
+// the distance inside which MoveFarTo stops routing and walks straight at
+// whatever it was handed (NewRpgBaseAction.cpp:117-120) - so a step this long
+// is one the mover takes as a single straight walk, which is exactly the walk
+// the ground check has just made in software. It is most of one TRAVEL_POLL_MS
+// of running, so a stepped walk is slower than a routed one and not by much,
+// and a stepped walk only ever happens where the alternative was a fall.
+constexpr float TRAVEL_STEP_YARDS = 60.0f;
+
+// HOW OFTEN THE SURFACE IS SAMPLED ALONG SUCH A STEP. The core's own smooth
+// path is built on the same interval (SMOOTH_PATH_STEP_SIZE, PathGenerator.h:
+// 38) for the same reason: nothing worth walking around fits between two
+// samples this close together.
+constexpr float TRAVEL_GROUND_SAMPLE_YARDS = 4.0f;
+
+// HOW FAR THE SURFACE MAY FALL BETWEEN TWO SAMPLES before the step is refused.
+// Under MIN_FALL_DMG_DIST (13.48, Player.cpp:14175), the height below which the
+// core charges nothing for a fall - so a drop this check ALLOWS is one the
+// character can take without being hurt, and a drop it refuses is one that
+// would cost health. Measured from the LAST sample rather than from the start
+// of the step, so a long walk downhill is not mistaken for a cliff: what is
+// being refused is a single step into thin air, which is what a cliff is.
+constexpr float TRAVEL_GROUND_DROP_YARDS = 10.0f;
+
+// HOW FAR AN AIM'S OWN Z MAY BE CORRECTED onto the surface under it before the
+// correction is refused as relocating the aim rather than grounding it. Small
+// on purpose: an areatrigger's coordinates are the middle of its box, and the
+// handler that answers the knock measures the character against that box in
+// three dimensions (Player::IsInAreaTriggerRadius, Player.cpp:2216-2236), so a
+// correction of a few yards keeps a character inside the doorway it is being
+// walked onto while a correction of twenty would put it under the floor.
+constexpr float TRAVEL_GROUND_SNAP_YARDS = 5.0f;
+
 // A follower that has stopped, and never closes the gap (#70).
 //
 // Two followers stopped at a zone border on the dev world 2026-08-30 and
@@ -690,6 +729,12 @@ constexpr OverseerDecisions::RatchetLimits FOLLOW_STALL_RATCHET{
 // time, forever. Measured 2026-09-01: three followers self-killed at one
 // coordinate within twenty-four seconds while the leader was thousands of
 // yards away, and five more earlier that hour at a zone edge.
+//
+// DISTANCE IS NOT THE ONLY REASON ANY MORE (#138, reopened). A follower past
+// FOLLOW_STALL_GAP_YARDS whose next straight step goes over a drop is walked
+// too, however short the gap - see FollowStepHolds and DriveCatchUp. This
+// number is still what "stranded" means; it is no longer the only thing that
+// makes following dangerous.
 //
 // So beyond this distance a follower is not following, it is stranded, and
 // the drive stops pretending otherwise: it is given the leader's position as
@@ -1788,6 +1833,13 @@ public:
         // rather than every poll it is held on the ground (#138). See the
         // stuck-teleport block in DriveTravel.
         bool stuckSaid{false};
+        // "Already said that there was nowhere safe to step", so a character
+        // held at the top of a cliff by GroundedStep says so once per errand
+        // rather than every fifteen seconds (#138). Held to the same discipline
+        // as `flightSaid` above and cleared with the errand for the same
+        // reason: a refusal is about the journey being taken, not about the
+        // character taking it.
+        bool groundSaid{false};
         // The backstop's memory of whether the walk is going anywhere: the
         // nearest this character has ever been to this errand's target, 0 while
         // that has not been measured yet, and when it last got nearer. Kept in
@@ -5785,6 +5837,33 @@ private:
         if (!bot->IsAlive() || bot->IsInCombat() || bot->IsInFlight())
             return false;
 
+        // A CATCH-UP WALK DECIDES ABOUT FLYING ONCE (#138).
+        //
+        // The catch-up aim IS THE LEADER'S POSITION, and DriveCatchUp re-issues
+        // it every time the leader walks FOLLOW_CATCH_UP_REAIM_YARDS on. Each
+        // re-issue is a new value in `travel_npc`, which DriveTravel reads as a
+        // new errand and gives a fresh state - including `flights`, the budget
+        // whose entire job is to stop one journey buying two tickets. Measured
+        // 2026-09-02 between 16:12 and 16:21: one follower was "sent to ... and
+        // flies instead" FOUR TIMES in nine minutes, four different
+        // destinations, four fares and four walks back to a flight master,
+        // while she was on the ground and closing the gap the whole time.
+        //
+        // So the decision is SPENT WHEN IT IS MADE. `mayFly` is set by
+        // CatchUpToward when the walk starts and cleared here the first time
+        // this function gets far enough for flying to be a real option,
+        // whichever way it then goes. A re-aim while walking can never board a
+        // taxi. Placed after the cheap refusals above rather than at the top of
+        // the function so "once" means the first poll on which a flight was
+        // actually available, not the first poll on which one was impossible.
+        auto const chasing = _dungeonEscorts.find(name);
+        if (chasing != _dungeonEscorts.end() && chasing->second.catchUp)
+        {
+            if (!chasing->second.mayFly)
+                return false;
+            chasing->second.mayFly = false;
+        }
+
         // ObjectMgr.h:817, the same (x, y, z, mapid, teamId) overload and the
         // same GetTeamId(true) that DiscoverFlightPointOnArrival above uses to
         // answer the identical "whose node is this" question.
@@ -6147,6 +6226,271 @@ private:
         return botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
     }
 
+    // ------------------------------------------------ the ground under an aim --
+    //
+    // WHY AN AIM IS NOT A ROUTE, AND WHY THE DIFFERENCE KILLS PEOPLE (#138).
+    //
+    // #139 closed the sky falls - a leader boarding a taxi while its followers
+    // walked, and a follow strategy that snapped a stranded follower onto
+    // whatever the leader was standing on - and six hours of open world and a
+    // whole instance run went by with no self-kill at all. The falls did not
+    // stop. Measured 2026-09-02 between 19:07 and 19:19: ten of twenty-six
+    // deaths in one hour were SELF-KILLS - `overseer_death` with killer_name =
+    // character_name, which is fall damage - and every one of the ten was in
+    // Westfall, on map 0. Three of them are one event: 19:17:22, 19:17:22 and
+    // 19:17:25, and the line in the log immediately before each is the same
+    // line with a different name in it,
+    //
+    //     'Bork' takes the wheel from `follow` for its escort to
+    //     'at:0:-11022.8,1038.78,38.507'
+    //
+    // all three sent to the one point. Earlier the same afternoon two more died
+    // INSIDE an instance being walked onto areatrigger 119 at
+    // 'at:36:-14.3628,-393.38,64.5605' - a doorway standing on a ledge above the
+    // entrance ramp - one of them logged at "8y from the door" and found
+    // afterwards at z -20 in the ravine under it. Earlier still, three followers
+    // died at the Duskwood/Westfall border while the leader took the road, one
+    // of them under a bridge at z -20.
+    //
+    // ONE MECHANISM UNDER ALL OF IT, AND IT IS NOT A BUG IN ANY OF THE AIMS.
+    // An `at:` or `trigger:` aim is a POINT. This module writes it into
+    // `travel_npc`, DriveTravel hands it to ChangeToWanderNpc, patch 0012's
+    // aimed wander walks it with MoveFarTo. Inside pathFinderDis (70 yards,
+    // NewRpgBaseAction.h:68) MoveFarTo stops routing and hands the raw point
+    // to MoveTo with `exact_waypoint` set (NewRpgBaseAction.cpp:117-120), which
+    // skips the path search entirely and calls DoMovePoint
+    // (MovementActions.cpp:214-227), which is MotionMaster::MovePoint
+    // (MovementActions.cpp:1815-1822). That asks the core for a path - and the
+    // core's answer for a point it cannot reach is not "no":
+    //
+    //   * A destination whose navmesh polygon cannot be found - a doorway on a
+    //     ledge, a coordinate over a gorge, a corner the mesh does not cover -
+    //     takes PathGenerator's hole-in-the-mesh branch (PathGenerator.cpp:
+    //     275-286). For a PLAYER that branch is unconditional: the flag it
+    //     tests is `creature ? creature->CanFly() : true` and `_source` is a
+    //     player, so it builds a shortcut and types it PATHFIND_NORMAL |
+    //     PATHFIND_NOT_USING_PATH at :284. Not NOPATH. Normal.
+    //   * BuildShortcut is a TWO POINT path: here, and the destination
+    //     (PathGenerator.cpp:733-746).
+    //   * PointMovementGenerator follows a computed path only when it is not
+    //     NOPATH *and* has more than two points (PointMovementGenerator.cpp:66).
+    //     A two-point shortcut fails that test, so it splines a straight line
+    //     to the raw coordinates instead (:80).
+    //
+    // A straight line to a point on the far side of a drop is a walk off the
+    // edge, and the character is dead long before this module polls again.
+    // Nothing was wrong with any of those aims: each was a place somebody
+    // wanted a character to be. What was missing was the ground in between.
+    //
+    // WHAT IS DONE ABOUT IT, IN ONE PLACE. Every place-aim this module issues
+    // passes through GroundedStep on its way to the mover, and GroundedStep
+    // answers one question: is the point the mover is about to be handed one it
+    // can WALK to from where this character stands?
+    //
+    //   1. IF THE NAVMESH ROUTES THERE, hand the aim through untouched. The
+    //      mover computes the same path and walks it point to point along the
+    //      mesh - MovebyPath is linear unless SetSmooth is called
+    //      (MoveSplineInit.h:98, :159) - and a mesh path is made of walkable
+    //      polygons, so it does not leave the ground. This is the ordinary
+    //      case and it is byte for byte what this module did before.
+    //   2. IF IT DOES NOT, the mover would draw the straight line above, so it
+    //      is handed a SHORT STEP toward the destination instead - and only
+    //      after the ground under that step has been walked in software,
+    //      sampled every TRAVEL_GROUND_SAMPLE_YARDS and refused the moment the
+    //      surface falls further than TRAVEL_GROUND_DROP_YARDS below the last
+    //      footing. The next poll steps again from wherever the character then
+    //      stands. This is the "maximum straight-line step" and the "refusal to
+    //      step where the ground falls away" the issue asks for, and they are
+    //      the same mechanism.
+    //   3. IF THE DIRECT LINE IS REFUSED, the same short step is tried either
+    //      side of it, nearest bearing first, before giving up - the same shape
+    //      as MoveFarTo's own forward cone (NewRpgBaseAction.cpp:156-193),
+    //      except deterministic, ground-checked rather than pathfinder-checked,
+    //      and required to make progress.
+    //
+    // AND A LEDGE IS APPROACHED FROM THE LOW SIDE, which falls out of 2 rather
+    // than being a case of its own: the only steps the ground check allows are
+    // ones where the surface holds continuously from the character's feet to
+    // the step, and a surface that holds continuously up onto a ledge is a
+    // ramp. There is no bearing over the edge that passes.
+    //
+    // WHAT THIS DOES NOT DO, SAID SO IT IS NOT MISTAKEN FOR AN OVERSIGHT. It
+    // does not touch `follow`. A follower in formation is moved by
+    // MovementAction::Follow, which this module cannot reach without a patch,
+    // and its short step is straight too (MovementActions.cpp:791-796). What
+    // DriveCatchUp does about that is bounded, and stated there.
+
+    // The surface a character stands or swims on at (x, y), looked for
+    // downward from `from`. False when there is none in reach, which is what
+    // the edge of the world, a hole in the terrain and a drop of more than
+    // fifty yards all look like from here.
+    //
+    // Map.h:392, and the WATER level is what comes back where there is water
+    // to swim in, so a step into a river reads as a step onto its surface
+    // rather than a fifteen-yard drop to its bed. Asked of the map rather than
+    // of PathGenerator on purpose: this question is only ever reached because
+    // the navmesh has already failed to answer it.
+    static bool SurfaceAt(Player* bot, float x, float y, float from, float& out)
+    {
+        Map* map = bot->GetMap();
+        if (!map)
+            return false;
+        float const surface = map->GetWaterOrGroundLevel(
+            bot->GetPhaseMask(), x, y, from, nullptr, true, bot->GetCollisionHeight());
+        // GridTerrainData.h:27. Both INVALID_HEIGHT and the vmap's own
+        // "nothing here" value are far below any floor in the world, so one
+        // comparison catches both.
+        if (surface <= INVALID_HEIGHT)
+            return false;
+        out = surface;
+        return true;
+    }
+
+    // Does the ground hold, walking in a straight line from where `bot` stands
+    // to (toX, toY)? `footing` comes back as the surface at the far end, which
+    // is the Z the step should be aimed at: an aim's own Z is what put a
+    // character in the air in the first place.
+    static bool GroundHolds(Player* bot, float toX, float toY, float& footing)
+    {
+        float const fromX = bot->GetPositionX();
+        float const fromY = bot->GetPositionY();
+        float const dx = toX - fromX;
+        float const dy = toY - fromY;
+        float const span = std::sqrt(dx * dx + dy * dy);
+        footing = bot->GetPositionZ();
+        if (span < TRAVEL_GROUND_SAMPLE_YARDS)
+            return true;   // one stride, with nothing between to fall into
+
+        uint32 const samples =
+            static_cast<uint32>(span / TRAVEL_GROUND_SAMPLE_YARDS) + 1;
+        for (uint32 i = 1; i <= samples; ++i)
+        {
+            float const t = static_cast<float>(i) / static_cast<float>(samples);
+            float next = 0.f;
+            // Looked for from TRAVEL_GROUND_DROP_YARDS ABOVE the last footing
+            // rather than from the footing itself, so a step UPHILL finds the
+            // slope it is climbing rather than the valley floor beyond it. The
+            // asymmetry is the point: this check is about falling.
+            if (!SurfaceAt(bot, fromX + dx * t, fromY + dy * t,
+                           footing + TRAVEL_GROUND_DROP_YARDS, next))
+                return false;
+            if (footing - next > TRAVEL_GROUND_DROP_YARDS)
+                return false;
+            footing = next;
+        }
+        return true;
+    }
+
+    // Will the mover follow the navmesh from where `bot` stands to (x, y, z),
+    // or will it draw a straight line? The test is the mover's OWN
+    // (PointMovementGenerator.cpp:66) rather than a judgement of this module's,
+    // so the two can never disagree about what is about to happen.
+    static bool NavmeshRoutes(Player* bot, float x, float y, float z)
+    {
+        PathGenerator path(bot);   // PathGenerator.h:61
+        if (!path.CalculatePath(x, y, z))
+            return false;
+        return !(path.GetPathType() & PATHFIND_NOPATH) && path.GetPath().size() > 2;
+    }
+
+    // The point to hand the mover THIS POLL for a character wanted at `want`.
+    // False when every direction was refused, which the caller must read as "do
+    // not re-aim this poll" rather than as an error: standing still at the top
+    // of a cliff is the correct thing to do.
+    static bool GroundedStep(Player* bot, WorldPosition const& want, WorldPosition& step)
+    {
+        float wx = want.GetPositionX();
+        float wy = want.GetPositionY();
+        float wz = want.GetPositionZ();
+        float const span = bot->GetExactDist2d(wx, wy);   // Position.h:170
+
+        // THE AIM'S OWN Z IS CORRECTED ONTO THE SURFACE UNDER IT, and only
+        // when the character is near enough for that to be cheap: sampling the
+        // ground four thousand yards away would CREATE the map grid there
+        // (Map::GetGridTerrainData calls EnsureGridCreated, Map.cpp:1100-1107),
+        // which is a page of the world loaded to answer a question about a walk
+        // that has not started. Near the aim it is worth doing, because the two
+        // or three yards between a doorway's recorded coordinates and the floor
+        // under it are exactly the difference between the navmesh finding a
+        // polygon for it and not: GetPolyByLocation's first search reaches five
+        // yards above and below the point before it widens to fifty
+        // (PathGenerator.cpp:233, :247).
+        if (span <= TRAVEL_STEP_YARDS)
+        {
+            float surface = 0.f;
+            if (SurfaceAt(bot, wx, wy, wz + TRAVEL_GROUND_SNAP_YARDS, surface) &&
+                std::fabs(surface - wz) <= TRAVEL_GROUND_SNAP_YARDS)
+                wz = surface;
+        }
+
+        // 1. THE NAVMESH FIRST, AND USUALLY THE NAVMESH IS ENOUGH.
+        if (NavmeshRoutes(bot, wx, wy, wz))
+        {
+            step = WorldPosition(want.GetMapId(), wx, wy, wz);
+            return true;
+        }
+
+        // Standing on it already. Nothing to step toward and nothing to check;
+        // the arrival branches in DriveTravel are what act on this.
+        if (span < 1.0f)
+        {
+            step = WorldPosition(want.GetMapId(), wx, wy, wz);
+            return true;
+        }
+
+        // 2. AND OTHERWISE A SHORT STEP, OVER GROUND THAT HOLDS.
+        float const reach = std::min(span, TRAVEL_STEP_YARDS);
+        float const bearing = bot->GetAngle(wx, wy);   // Position.h:190
+        // The direct line, then either side of it, nearest bearing first.
+        // Seven and no more: this runs once per stepping character per poll and
+        // each candidate is a walk over the terrain. Thirty, sixty and ninety
+        // degrees, written in radians because that is what GetAngle returns.
+        static constexpr float FAN[] = {
+            0.f, 0.5236f, -0.5236f, 1.0472f, -1.0472f, 1.5708f, -1.5708f };
+        for (float delta : FAN)
+        {
+            float const angle = bearing + delta;
+            float const sx = bot->GetPositionX() + std::cos(angle) * reach;
+            float const sy = bot->GetPositionY() + std::sin(angle) * reach;
+            // A step to the side has to be a step FORWARD as well, or a
+            // character at a dead end walks in a circle around it forever.
+            float const ddx = wx - sx;
+            float const ddy = wy - sy;
+            if (delta != 0.f && std::sqrt(ddx * ddx + ddy * ddy) >= span)
+                continue;
+            float footing = 0.f;
+            if (!GroundHolds(bot, sx, sy, footing))
+                continue;
+            step = WorldPosition(want.GetMapId(), sx, sy, footing);
+            return true;
+        }
+        return false;
+    }
+
+    // Does the ground hold under the single straight step `follow` is about to
+    // take from this follower toward its master (#138)?
+    //
+    // Past SightDistance (100, PlayerbotAIConfig.cpp:109) upstream's Follow()
+    // stops chasing continuously and issues one MoveTo(target, followDistance)
+    // per attempt (MovementActions.cpp:1224). That MoveTo is a single straight
+    // step of at most SpellDistance (28.5, PlayerbotAIConfig.cpp:110) toward the
+    // master, with its Z interpolated toward the MASTER'S Z before being clamped
+    // to whatever is under the step (MovementActions.cpp:791-796). It consults
+    // nothing about what lies between. So the step is walked here first, over
+    // the same distance upstream is about to use.
+    static bool FollowStepHolds(Player* p, Player* leader)
+    {
+        float const dx = leader->GetPositionX() - p->GetPositionX();
+        float const dy = leader->GetPositionY() - p->GetPositionY();
+        float const span = std::sqrt(dx * dx + dy * dy);
+        if (span < 1.0f)
+            return true;
+        float const t = std::min(1.0f, sPlayerbotAIConfig.spellDistance / span);
+        float footing = 0.f;
+        return GroundHolds(p, p->GetPositionX() + dx * t, p->GetPositionY() + dy * t,
+                           footing);
+    }
+
     // ------------------------------------------------------------- escort --
     //
     // WHAT AN ESCORT IS, AND WHY IT HAD TO EXIST (#122).
@@ -6219,6 +6563,12 @@ private:
         // takes an entry over unconditionally, CatchUpToward never touches an
         // entry that is not its own.
         bool catchUp{false};
+        // WHETHER THIS CATCH-UP MAY STILL DECIDE TO FLY (#138). Set by
+        // CatchUpToward on the poll that STARTS the walk and spent by
+        // ConsiderFlight the first time flying is genuinely on the table,
+        // whichever way that decision then goes. Meaningful only while
+        // `catchUp`; see ConsiderFlight for the four fares it is about.
+        bool mayFly{false};
         // Where the catch-up aim was last pointed, so "has the leader moved
         // far enough from it to re-aim" is answered from memory rather than by
         // parsing the aim string back. Meaningful only while `catchUp`.
@@ -6292,6 +6642,12 @@ private:
 
         escort.catchUp = true;
         escort.wanted = true;
+        // THE FLIGHT DECISION BELONGS TO THE POLL THAT STARTS THE WALK (#138).
+        // Every re-aim below is a new `travel_npc` value and so a new errand
+        // with a fresh flight budget; without this the same journey would keep
+        // buying tickets. See ConsiderFlight.
+        if (started)
+            escort.mayFly = true;
         escort.x = leader->GetPositionX();
         escort.y = leader->GetPositionY();
         escort.aim = aim.str();
@@ -6373,7 +6729,15 @@ private:
             // seconds of a follower holding `new rpg` beside a leader it could
             // simply follow is thirty seconds it might roll a status of its
             // own. The read-back of the hand-back is EndOneEscort's line.
-            if (gap < 0.f || gap <= FOLLOW_CATCH_UP_DONE_YARDS)
+            //
+            // ...AND IT ONLY ENDS ONTO GROUND `follow` CAN ACTUALLY CROSS
+            // (#138). Being close enough to be followed is half the answer;
+            // the other half is whether the step `follow` would take from here
+            // goes over anything. Handing a follower back at the lip of a
+            // gorge is handing it back to the straight step that put the
+            // Duskwood three at the bottom of one. See FollowStepHolds.
+            if (gap < 0.f ||
+                (gap <= FOLLOW_CATCH_UP_DONE_YARDS && FollowStepHolds(p, leader)))
             {
                 if (gap < 0.f)
                     LOG_INFO("module.overseer",
@@ -6382,8 +6746,9 @@ private:
                              name, leader->GetName());
                 else
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' is back within {} yards of '{}' - its "
-                             "catch-up walk ends and `follow` takes it from here",
+                             "overseer: '{}' is back within {} yards of '{}' on ground it "
+                             "can cross - its catch-up walk ends and `follow` takes it "
+                             "from here",
                              name, static_cast<uint32>(gap), leader->GetName());
                 EndOneEscort(name, it->second.granted);
                 _dungeonEscorts.erase(it);
@@ -6414,7 +6779,31 @@ private:
         }
 
         // NOT WALKING YET. Should it be?
-        if (gap <= FOLLOW_CATCH_UP_YARDS)
+        //
+        // TWO REASONS, AND THE SECOND ONE IS NEW (#138). The first is
+        // distance: past FOLLOW_CATCH_UP_YARDS a follower is stranded rather
+        // than following. The second is the ground: measured 2026-09-02 at
+        // 17:09, the leader walked the Duskwood road from (-10234,-362) west
+        // to (-10523,137), and three followers took `follow`'s straight step
+        // across the gorge beside it instead of the road over it. All three
+        // died to themselves inside nine seconds, one of them found at z -20
+        // under the bridge. So a follower whose next step off the formation is
+        // into thin air is taken off `follow` and walked under its own aim,
+        // which goes through GroundedStep like every other aim this module
+        // writes.
+        //
+        // AND ONLY WHILE THE PARTY IS ALREADY STRUNG OUT, which is the bound
+        // that makes this safe to add at all. Inside FOLLOW_STALL_GAP_YARDS a
+        // follower is in formation beside the people it heals and tanks for,
+        // and taking `follow` off it there to walk it around a rock would cost
+        // the cohesion this file has three separate comments about. Past that
+        // line it is already depending on one discrete straight step per
+        // attempt landing (MovementActions.cpp:1224), and this check has just
+        // found that the step does not land - so there is nothing to preserve.
+        // A follower in formation - or on another map, which is what a
+        // negative gap means - is nothing this drive has an opinion about, and
+        // answering that first keeps every reading below off the common path.
+        if (gap <= FOLLOW_STALL_GAP_YARDS)
             return;
         // A dead follower is a ghost walking to its corpse, which is
         // DriveStuckRevival's business and not a distance from anybody; a
@@ -6430,12 +6819,21 @@ private:
         if (!leader->IsAlive() || !OnTheGround(leader))
             return;
 
+        // Asked LAST, because it is the only reading here that walks terrain,
+        // and by this point every cheaper reason to do nothing has been ruled
+        // out.
+        bool const stranded = gap > FOLLOW_CATCH_UP_YARDS;
+        if (!stranded && FollowStepHolds(p, leader))
+            return;
+
         if (CatchUpToward(name, leader))
             LOG_INFO("module.overseer",
-                     "overseer: '{}' is {} yards behind '{}' - past anything `follow` "
-                     "will do for it, so it is released to walk to where the leader "
-                     "stands under its own aim, and handed back within {} yards",
+                     "overseer: '{}' is {} yards behind '{}' and {} - so it is released "
+                     "to walk to where the leader stands under its own aim, and handed "
+                     "back within {} yards on ground it can cross",
                      name, static_cast<uint32>(gap), leader->GetName(),
+                     stranded ? "past anything `follow` will do for it"
+                              : "the step `follow` would take from there goes over a drop",
                      static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS));
     }
 
@@ -6666,6 +7064,7 @@ private:
                 state.flightSince = 0;
                 state.flightSaid = false;
                 state.stuckSaid = false;
+                state.groundSaid = false;
                 // A new errand is a new ratchet: nothing measured yet, and the
                 // clock starts now rather than carrying the last errand's over.
                 state.progress.best = 0.f;
@@ -7081,6 +7480,35 @@ private:
             //      position rather than the character's, because "am I already
             //      walking to this" is a question about the aim and not about
             //      progress toward it.
+            // THE POINT THE MOVER IS ACTUALLY HANDED (#138). `pos` is where
+            // the errand wants this character and stays that throughout -
+            // arrival, the ratchet and the backstop above all measure against
+            // it. `aimAt` is where the character may be SENT this poll without
+            // walking off something, which is the same point whenever the
+            // navmesh has a route and a short checked step when it does not.
+            // See the GroundedStep section for the whole argument.
+            //
+            // ONLY FOR A PLACE. `entry` is non-zero for a creature aim, and a
+            // creature stands on ground by construction: a spawn point is
+            // somewhere the world put something. Every death this answers was
+            // at an `at:` or a `trigger:`.
+            WorldPosition aimAt = pos;
+            if (!entry && !GroundedStep(bot, pos, aimAt))
+            {
+                if (!state.groundSaid)
+                {
+                    state.groundSaid = true;
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is sent to '{}', {} yards off, and there is no "
+                             "direction out of where it stands that does not step off "
+                             "something - holding it there rather than walking it off a "
+                             "cliff. The errand's own {}-minute backstop still bounds this",
+                             name, target, static_cast<uint32>(distance),
+                             static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
+                }
+                continue;
+            }
+
             if (botAI->rpgInfo.GetStatus() == RPG_WANDER_NPC)  // NewRpgInfo.h:99
             {
                 if (NewRpgInfo::WanderNpc const* wander =
@@ -7091,8 +7519,19 @@ private:
                     // (TravelMgr.h:82) declares its own overloads of that name
                     // and a hidden base overload is a compile error found at
                     // the wrong end of a six-minute build.
-                    float const ddx = wander->pos.GetPositionX() - pos.GetPositionX();
-                    float const ddy = wander->pos.GetPositionY() - pos.GetPositionY();
+                    //
+                    // COMPARED AGAINST THE STEP, NOT THE DESTINATION (#138).
+                    // The question this guard asks is "am I already walking to
+                    // the thing I am about to be given", and the thing about to
+                    // be given is `aimAt`. While a stepped walk is running that
+                    // point moves as the character does, so the walk is
+                    // re-issued each poll on purpose - which is what stepping
+                    // IS. MoveFarTo will not clobber the spline underneath it
+                    // either: it lets a committed move with more than ten yards
+                    // left run to its end before it acts on a new destination
+                    // (NewRpgBaseAction.cpp:57-83).
+                    float const ddx = wander->pos.GetPositionX() - aimAt.GetPositionX();
+                    float const ddy = wander->pos.GetPositionY() - aimAt.GetPositionY();
                     bool const samePlace = entry || (ddx * ddx + ddy * ddy) <= 1.0f;
                     if (wander->npcEntry == entry && samePlace)
                         continue;
@@ -7133,7 +7572,7 @@ private:
             // patches/mod-playerbots/0005-wander-npc-can-be-aimed.patch adds this
             // overload. The no-argument ChangeToWanderNpc() upstream ships takes
             // no target, which is the entire reason this feature did not exist.
-            botAI->rpgInfo.ChangeToWanderNpc(entry, pos);
+            botAI->rpgInfo.ChangeToWanderNpc(entry, aimAt);
 
             // Pinned to what it was actually SENT to, not to what was
             // resolved: a resolve that never reached ChangeToWanderNpc is not
