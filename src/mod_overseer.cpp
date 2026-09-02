@@ -305,6 +305,60 @@ constexpr OverseerDecisions::RatchetLimits TRAVEL_RATCHET{
     OverseerDecisions::RatchetReading::DistanceToTarget,
     TRAVEL_PROGRESS_YARDS, TRAVEL_BACKSTOP_SECONDS};
 
+// FLIGHT (#68). Five constants, and every one of them is a threshold on a
+// decision that did not exist before: whether to fly to an errand instead of
+// walking to it.
+//
+// HOW FAR A WALK HAS TO BE BEFORE FLYING IS EVEN CONSIDERED. A flight is not
+// free - the character walks to a flight master first, waits out the ride, and
+// lands at a node that is rarely on top of where it was going - so a short
+// errand is always quicker on foot. Measured against the trip this issue was
+// opened about: Lakeshire (Redridge) to Sentinel Hill (Westfall) is about
+// 3,400 yards overland and one direct taxi hop. Set well below that and well
+// above the errands that are already fine on foot: a dungeon staging point is
+// tens of yards, a trainer across a zone is a few hundred.
+constexpr float TRAVEL_FLIGHT_MIN_YARDS = 1500.0f;
+
+// HOW MUCH SHORTER THE FLIGHT-ADJUSTED TRIP HAS TO BE. The comparison is not
+// "is there a flight" but "does flying land me nearer", which is the
+// flight-adjusted distance this issue asks for: walking to the departure
+// flight master, plus walking from the arrival node to the destination, versus
+// walking the whole way. A margin on top of that keeps the decision away from
+// the case where the two are within noise of each other and the ride, the
+// dismount and the fare buy nothing.
+constexpr float TRAVEL_FLIGHT_SAVING_YARDS = 500.0f;
+
+// HOW FAR A TAXI NODE MAY BE FROM THE FLIGHT MASTER THAT STANDS FOR IT. Two
+// separate lookups have to agree before a flight is issued: the nearest taxi
+// node of the character's OWN team (sObjectMgr) and the nearest flight master
+// SPAWN of any team (this module's travel index). In a contested zone those
+// can be different places - the nearest flight master may be the other side's,
+// whose node the character can never use - and issuing a flight from a node no
+// creature here answers for is a character walking to a stranger and standing
+// there. When they disagree by more than this, refuse.
+constexpr float TRAVEL_FLIGHT_NODE_MATCH_YARDS = 100.0f;
+
+// HOW LONG THE FLIGHT LEG MAY RUN WITHOUT THE CHARACTER LEAVING THE GROUND.
+// Upstream's RPG_TRAVEL_FLIGHT has no timeout of its own: NewRpgAction only
+// leaves that status when a flight ENDS (NewRpgAction.cpp, the `inFlight &&
+// !IsInFlight()` transition), so a character that sets off for a flight master
+// it cannot reach stays in it forever. The errand's own twenty-minute backstop
+// cannot catch that either, because the walk to the flight master legitimately
+// moves AWAY from the destination and would look like a stall. So the leg is
+// bounded here instead, and generously: a flight master is usually a few
+// hundred yards away, and this is many multiples of that.
+constexpr time_t TRAVEL_FLIGHT_BACKSTOP_SECONDS = 10 * 60;
+
+// HOW MANY FLIGHTS ONE ERRAND MAY SPEND. Without a bound this oscillates: land
+// at a node, find the destination still far away, pick a flight from the node
+// just landed at, and go round again. Two rather than one so a flight refused
+// at the counter for something that was not true when it was decided - the
+// character picked a fight on the way, most likely - is not the last word on
+// the errand, and no more than two because a second hop that still has not
+// landed the character near the destination is evidence the route is wrong,
+// not that a third would fix it.
+constexpr uint32 TRAVEL_FLIGHT_MAX_PER_ERRAND = 2;
+
 // How long travel keeps the wheel after an errand ends (PR #2840 review).
 // OnUpdate runs DriveQuests BEFORE DriveTravel, so without a grace the poll
 // that releases an arrived errand can be followed immediately by a
@@ -1364,6 +1418,25 @@ public:
         float y{0.f};
         float z{0.f};
         bool arrived{false};  // announced already
+        // THE FLIGHT LEG (#68). Three fields, all scoped to ONE errand and all
+        // cleared with it, for the same reason the ratchet below is: a flight
+        // is a fact about the trip being taken, not about the character.
+        //
+        // `flights` is how many this errand has spent, bounded by
+        // TRAVEL_FLIGHT_MAX_PER_ERRAND so a badly placed node cannot make a
+        // character hop back and forth forever.
+        uint32 flights{0};
+        // When the leg now running was issued, or 0 when none is. This is the
+        // clock TRAVEL_FLIGHT_BACKSTOP_SECONDS runs on, and it is also how
+        // DriveTravel tells "this character is walking to a flight master I
+        // sent it to" from "this character is walking to its errand".
+        time_t flightSince{0};
+        // "Already said why this errand is not flying", so a character that
+        // would fly but holds no node for some hop of the route says so once
+        // per errand rather than every fifteen seconds. Reported rather than
+        // silent on purpose: a flight that never happens and never explains
+        // itself is indistinguishable from the bug #68 is about.
+        bool flightSaid{false};
         // The backstop's memory of whether the walk is going anywhere: the
         // nearest this character has ever been to this errand's target, 0 while
         // that has not been measured yet, and when it last got nearer. Kept in
@@ -4780,6 +4853,322 @@ private:
                  name, node, npc->GetName(), entry);
     }
 
+    // FLY INSTEAD OF WALKING, WHERE FLYING IS SHORTER (#68).
+    //
+    // WHAT THIS IS FOR. #93 made the family GATHER flight points and they now
+    // hold several each; nothing has ever made them USE one. Every errand this
+    // module issues is a walk, at any distance, and the measured cost of that
+    // is whole evenings spent crossing Westfall, Duskwood, Elwynn and Redridge
+    // on foot - including the trek this issue was opened about, which is a
+    // SINGLE direct taxi hop the leader already holds both ends of.
+    //
+    // NOTHING NEW IS BUILT. Everything below decides; upstream executes.
+    // mod-playerbots already has the whole flight machine and this module was
+    // simply never reaching for it:
+    //
+    //   * NewRpgInfo::ChangeToTravelFlight(entry, pos, path) puts the bot in
+    //     RPG_TRAVEL_FLIGHT with a route (NewRpgInfo.cpp:44).
+    //   * NewRpgTravelFlightAction, wired to the `travel flight status`
+    //     trigger by the same NewRpgStrategy that owns the `wander npc status`
+    //     trigger this module already drives (NewRpgStrategy.cpp), walks the
+    //     bot to the flight master, dismounts it, calls SendLearnNewTaxiNode
+    //     and then Player::ActivateTaxiPathTo (NewRpgAction.cpp:631).
+    //   * NewRpgStatusUpdateAction returns the bot to RPG_IDLE when the flight
+    //     lands (NewRpgAction.cpp:295), which is what lets DriveTravel's own
+    //     re-issue guard pick the walk back up on the next poll.
+    //
+    // So the module needs no flight code of its own, and deliberately has
+    // none: what it adds is the one thing upstream cannot supply, which is a
+    // DESTINATION. Upstream only ever flies somewhere random -
+    // TravelMgr::GetOptimalFlightDestinations picks a random zone in the bot's
+    // level bracket, and only when the bot is already within 500 yards of a
+    // flight master (TravelMgr.cpp:4404) - and it is only ever rolled as one
+    // of eight idle behaviours, which an aimed character never rolls. That is
+    // the whole reason `TravelFlight: 0` has been true every time it was read.
+    //
+    // WHY THE ROUTE HAS TO BE FULLY KNOWN. WorldSession::HandleActivateTaxi-
+    // ExpressOpcode checks EVERY node of a multi-hop route against the
+    // player's taximask before it will fly it (TaxiHandler.cpp:185).
+    // Player::ActivateTaxiPathTo itself checks none of them, so a bot could be
+    // flown down a route a player could not - which is exactly the kind of
+    // shortcut this module does not take. The same check is made here instead,
+    // and a route with an undiscovered hop is refused and SAID, because an
+    // unflown flight that explains itself is the only way the missing node
+    // ever gets noticed.
+    //
+    // WHAT IT CANNOT DO, STATED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT. Only
+    // the character carrying the errand flies. An errand moves the leadership
+    // (see the professions notes above), so that character is the group
+    // leader and the other four are on `follow` - they keep walking the
+    // overland route, exactly as they do today, and regroup at the far end.
+    // Flying the party as a group needs every member to hold every node on the
+    // route, which measurement says they do not, and is its own ticket.
+    //
+    // Returns true when a flight was issued, in which case the caller must NOT
+    // issue the walk this poll.
+    bool ConsiderFlight(std::string const& name, Player* bot, PlayerbotAI* botAI,
+                        WorldPosition const& dest, float walkYards,
+                        TravelAimBook::TravelState& state)
+    {
+        // The cheap refusals first, in the order that keeps the expensive ones
+        // off the common path: most errands are short, and a short errand is
+        // never worth a flight.
+        if (walkYards < TRAVEL_FLIGHT_MIN_YARDS)
+            return false;
+        if (state.flights >= TRAVEL_FLIGHT_MAX_PER_ERRAND)
+            return false;
+        // Only `new rpg` runs NewRpgTravelFlightAction, the same way only
+        // `new rpg` runs NewRpgWanderNpcAction - asked through the same shared
+        // predicate DriveTravel's own refusal above uses, so the two can never
+        // disagree about who can be sent anywhere.
+        if (!CanBeSentToNpc(botAI))
+            return false;
+        // Player::ActivateTaxiPathTo refuses a bot that is logging out, in
+        // combat, stunned or rooted (Player.cpp:10415), and refuses a MOUNTED
+        // one at a flight master (Player.cpp:10428) - which a character
+        // already on a taxi is. A dead one has no business walking to a
+        // flight master at all. Refusing to DECIDE here
+        // is better than deciding and having the activation fail at the far
+        // end, because a failed activation spends one of the errand's two
+        // flights on nothing.
+        if (!bot->IsAlive() || bot->IsInCombat() || bot->IsInFlight())
+            return false;
+
+        // ObjectMgr.h:817, the same (x, y, z, mapid, teamId) overload and the
+        // same GetTeamId(true) that DiscoverFlightPointOnArrival above uses to
+        // answer the identical "whose node is this" question.
+        uint32 const team = bot->GetTeamId(true);
+        uint32 const fromNode = sObjectMgr->GetNearestTaxiNode(
+            bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+            bot->GetMapId(), team);
+        if (!fromNode)
+            return false;
+        // DBCStores.h - the same store Player::ActivateTaxiPathTo looks the
+        // start node up in (Player.cpp:10469).
+        TaxiNodesEntry const* const departure = sTaxiNodesStore.LookupEntry(fromNode);
+        if (!departure)
+            return false;
+
+        // The creature that has to be walked to and talked to. Resolved
+        // through the keyword TravelRoles already maps onto
+        // UNIT_NPC_FLAG_FLIGHTMASTER, so "nearest flight master" means exactly
+        // what it means everywhere else in this file, and the whole errand
+        // vocabulary stays one vocabulary.
+        uint32 fmEntry = 0;
+        WorldPosition fmPos;
+        if (!ResolveTravelTarget(bot, "flight master", fmEntry, fmPos))
+            return false;
+
+        // ...and it must be the creature that answers for the departure node.
+        // See TRAVEL_FLIGHT_NODE_MATCH_YARDS: in a contested zone the nearest
+        // flight master and the nearest node of this character's own team can
+        // be two different places, and a flight issued across that gap sends a
+        // character to stand next to somebody who cannot sell it a ticket.
+        // Spelled out rather than asked of GetExactDist2d because
+        // WorldPosition declares its own overloads of that name.
+        float const nodeDx = fmPos.GetPositionX() - departure->x;
+        float const nodeDy = fmPos.GetPositionY() - departure->y;
+        if (nodeDx * nodeDx + nodeDy * nodeDy >
+            TRAVEL_FLIGHT_NODE_MATCH_YARDS * TRAVEL_FLIGHT_NODE_MATCH_YARDS)
+            return false;
+
+        // How far the flight costs before it has flown anywhere. Half of the
+        // flight-adjusted comparison below, and constant across every
+        // candidate arrival node, so it is measured once out here.
+        float const toMaster =
+            bot->GetDistance2d(fmPos.GetPositionX(), fmPos.GetPositionY());
+
+        // WHERE TO LAND, AND WHY IT IS NOT SIMPLY THE NEAREST NODE. The
+        // nearest taxi node to an errand is the obvious answer and it is
+        // regularly the wrong one, in two different ways that both end as a
+        // character walking:
+        //
+        //   * IT MAY BE ONE NOBODY HAS DISCOVERED. Landing is only possible at
+        //     a node already in the taximask, and the nearest node to a
+        //     destination is frequently in a zone the family has never walked
+        //     to. Taking it and giving up loses every flight to a node that IS
+        //     known and only slightly further out.
+        //   * IT MAY BE A NODE NOBODY CAN EVER HOLD. TaxiNodes.dbc carries
+        //     rows that pass every mechanical test and have no flight master
+        //     standing at them. Node 168, "Filming", sits in Elwynn Forest at
+        //     (-9441, 65) - nearer than Stormwind to a good deal of that zone
+        //     - carries an alliance mount id, and has a real taxi path to
+        //     Stormwind. The nearest creature with UNIT_NPC_FLAG_FLIGHTMASTER
+        //     is 740 yards away, so nothing can ever discover it, and taking
+        //     it as the arrival node throws away the flight to Stormwind that
+        //     was genuinely available.
+        //
+        // So the candidates are the character's OWN known nodes on the
+        // destination's map, nearest to the errand first. That is both the
+        // player's question - "which of my flight points is closest to where I
+        // am going" - and the only set any of these can actually land at.
+        std::vector<std::pair<float, uint32>> candidates;
+        for (uint32 id = 1; id < sTaxiNodesStore.GetNumRows(); ++id)
+        {
+            // PlayerTaxi.h:35. Asked before the store lookup because it is a
+            // bit test against an array and this loop runs over every node in
+            // the DBC.
+            if (id == fromNode || !bot->m_taxi.IsTaximaskNodeKnown(id))
+                continue;
+            TaxiNodesEntry const* const node = sTaxiNodesStore.LookupEntry(id);
+            if (!node || node->map_id != dest.GetMapId())
+                continue;
+            float const dx = node->x - dest.GetPositionX();
+            float const dy = node->y - dest.GetPositionY();
+            candidates.emplace_back(std::sqrt(dx * dx + dy * dy), id);
+        }
+        // Nearest to the errand first, so the first candidate that survives
+        // every check below is also the best one - and so the loop can stop
+        // the moment a candidate is too far to be worth flying to, because
+        // every candidate after it is further still.
+        std::sort(candidates.begin(), candidates.end());
+
+        for (auto const& candidate : candidates)
+        {
+            float const fromLanding = candidate.first;
+            uint32 const toNode = candidate.second;
+
+            // THE FLIGHT-ADJUSTED DISTANCE, which is the decision this issue
+            // actually asks for. Not "is there a flight" - there nearly always
+            // is - but "does flying put me nearer than walking would",
+            // counting both walks the flight adds: to the flight master here,
+            // and from the arrival node to the errand there. `break` and not
+            // `continue`: the candidates only get further from the errand from
+            // here on, so none of them can beat a walk either.
+            if (toMaster + fromLanding + TRAVEL_FLIGHT_SAVING_YARDS >= walkYards)
+                break;
+
+            // TravelNode.h:585, public. A precomputed BFS over the whole taxi
+            // graph, built once at startup by TravelMgr (TravelMgr.cpp:4361),
+            // so this is a map lookup rather than a search. Fewer than two
+            // nodes is no route: ActivateTaxiPathTo refuses that outright.
+            std::vector<uint32> const path = sTravelNodeMap.FindTaxiPath(fromNode, toNode);
+            if (path.size() < 2)
+                continue;
+
+            // EVERY HOP AFTER THE FIRST HAS TO BE KNOWN, and the first one
+            // deliberately does not. WorldSession::HandleActivateTaxiExpress-
+            // Opcode checks every node of a route against the taximask
+            // (TaxiHandler.cpp:185), but a real client only ever sends that
+            // packet after opening the flight master's window, which learns
+            // the node it is standing at (SendLearnNewTaxiNode). Upstream's
+            // NewRpgTravelFlightAction makes exactly that call before
+            // activating, so the departure node is learned on arrival the same
+            // way a player learns it - and requiring it in advance would be
+            // stricter than the game, not safer than it.
+            uint32 unknownHop = 0;
+            for (size_t hop = 1; hop < path.size(); ++hop)
+            {
+                if (!bot->m_taxi.IsTaximaskNodeKnown(path[hop]))
+                {
+                    unknownHop = path[hop];
+                    break;
+                }
+            }
+            if (unknownHop)
+            {
+                // SAID ONCE PER ERRAND. This is the report #68 asks for in
+                // place of a silent no-op, and it is the line that turns "they
+                // never fly" into "they never fly BECAUSE nobody has walked to
+                // node N yet" - which is a fixable sentence and the other one
+                // is not.
+                if (!state.flightSaid)
+                {
+                    state.flightSaid = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is sent to '{}' {} yards away and could fly "
+                             "node {} to node {}, but has not discovered node {} on that "
+                             "route - trying the next node out, or walking",
+                             name, state.target, static_cast<uint32>(walkYards),
+                             fromNode, toNode, unknownHop);
+                }
+                continue;
+            }
+
+            // THE FARE, CHECKED HERE RATHER THAN DISCOVERED AT THE COUNTER.
+            // Player::ActivateTaxiPathTo sums the same per-hop costs and
+            // refuses the whole flight if the character cannot pay
+            // (Player.cpp:10557) - but it refuses by sending
+            // ERR_TAXINOTENOUGHMONEY to a client that does not exist, upstream
+            // turns that into RPG_IDLE, and the visible result is a character
+            // that walked to a flight master, stood there, and then walked on.
+            // That is the silent no-op #68 asks not to have.
+            //
+            // ObjectMgr.h:819, the same GetTaxiPath the activation itself
+            // uses. Deliberately the UNDISCOUNTED total: the reputation
+            // discount Player::ActivateTaxiPathTo applies needs the flight
+            // master creature in hand, which is a walk away, and it only ever
+            // makes the fare SMALLER - so this can refuse a flight that would
+            // in fact have been affordable, and can never let one through that
+            // would not.
+            uint32 fare = 0;
+            bool flyable = true;
+            for (size_t hop = 1; hop < path.size(); ++hop)
+            {
+                uint32 hopPath = 0;
+                uint32 hopCost = 0;
+                sObjectMgr->GetTaxiPath(path[hop - 1], path[hop], hopPath, hopCost);
+                if (!hopPath)
+                {
+                    // The BFS graph and the DBC disagree about this hop. Not
+                    // this route's fault to fix; try the next candidate.
+                    flyable = false;
+                    break;
+                }
+                fare += hopCost;
+            }
+            if (!flyable)
+                continue;
+
+            if (bot->GetMoney() < fare)   // Player.h, GetMoney
+            {
+                if (!state.flightSaid)
+                {
+                    state.flightSaid = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is sent to '{}' {} yards away and could fly "
+                             "node {} to node {}, but the fare is {} copper and it holds "
+                             "{} - walking instead",
+                             name, state.target, static_cast<uint32>(walkYards),
+                             fromNode, toNode, fare, bot->GetMoney());
+                }
+                continue;
+            }
+
+            // NewRpgInfo.h:107. From here the errand belongs to upstream's
+            // flight action until it lands or the leg's own backstop takes it
+            // back.
+            botAI->rpgInfo.ChangeToTravelFlight(fmEntry, fmPos, path);
+            state.flights++;
+            state.flightSince = std::time(nullptr);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' {} yards away and flies instead - "
+                     "node {} to node {} in {} hops for {} copper, boarding at flight "
+                     "master {} {} yards off, landing {} yards from the errand",
+                     name, state.target, static_cast<uint32>(walkYards), fromNode, toNode,
+                     static_cast<uint32>(path.size() - 1), fare, fmEntry,
+                     static_cast<uint32>(toMaster), static_cast<uint32>(fromLanding));
+            return true;
+        }
+
+        // NO CANDIDATE SURVIVED, and the character walks. Said once per errand
+        // and only when a flight was genuinely in reach - a character with no
+        // known node on this map at all, or none that beats walking, is not
+        // interesting and would bury the cases that are.
+        if (!state.flightSaid && !candidates.empty() &&
+            toMaster + candidates.front().first + TRAVEL_FLIGHT_SAVING_YARDS < walkYards)
+        {
+            state.flightSaid = true;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' {} yards away and holds {} flight "
+                     "points on this map, but none of them has a route from node {} it "
+                     "can fly - walking instead",
+                     name, state.target, static_cast<uint32>(walkYards),
+                     static_cast<uint32>(candidates.size()), fromNode);
+        }
+        return false;
+    }
+
     // The unlearn drive. Its own poll, because unlearning needs no NPC and no
     // journey: it is the prerequisite that makes the journey worth taking, and
     // making it wait for one would deadlock the pair - the character cannot
@@ -5141,6 +5530,13 @@ private:
                 state.entry = 0;
                 state.pinned = false;
                 state.arrived = false;
+                // A new errand is a new flight budget too, and a new leg. The
+                // old errand's flights are spent, its leg is over the moment
+                // its aim stops being the aim, and its refusal to fly was
+                // about a route nobody is taking any more (#68).
+                state.flights = 0;
+                state.flightSince = 0;
+                state.flightSaid = false;
                 // A new errand is a new ratchet: nothing measured yet, and the
                 // clock starts now rather than carrying the last errand's over.
                 state.progress.best = 0.f;
@@ -5178,6 +5574,31 @@ private:
                              "nothing walks it anywhere. Followers travel by following the "
                              "leader; aim the leader instead", name, target);
                 }
+                continue;
+            }
+
+            // A CHARACTER IN THE AIR IS NOT DECIDED ABOUT AT ALL (#68). It
+            // cannot be walked anywhere - Player::ActivateTaxiPathTo has
+            // already taken its movement, and NewRpgTravelFlightAction returns
+            // without acting for exactly this reason (NewRpgAction.cpp:639) -
+            // so every branch below is either meaningless or harmful here.
+            // Deliberately asked of the WORLD rather than of this module's own
+            // memory of the leg, so a flight upstream started on its own is
+            // left alone too: the walk this drive would otherwise re-issue
+            // over it is the bug, whoever put the character on the taxi.
+            //
+            // THE ERRAND'S BACKSTOP CLOCK IS HELD WHILE THIS IS TRUE. Distance
+            // to the errand is not a reading about progress during a flight -
+            // half a taxi route routinely goes the wrong way round a mountain
+            // - and a leg that ends with the character much nearer would
+            // otherwise be released as unreachable somewhere over the middle
+            // of it. Same reasoning, and the same carry-the-clock shape, as
+            // the quest drive's hand-back over a travel errand.
+            if (bot->IsInFlight())
+            {
+                state.progress.since = std::time(nullptr);
+                if (state.flightSince)
+                    state.flightSince = std::time(nullptr);
                 continue;
             }
 
@@ -5324,6 +5745,78 @@ private:
                     continue;
                 }
             }
+
+            // THE FLIGHT LEG, WHICH IS A WALK IN THE WRONG DIRECTION ON PURPOSE
+            // (#68). Between issuing a flight and boarding it, the character
+            // is walking to a flight master, which is usually AWAY from the
+            // errand. The errand's own backstop reads distance-to-target and
+            // would call that a stall and release the aim, so the leg gets its
+            // own clock and holds the errand's while it runs.
+            //
+            // ONLY THIS MODULE'S OWN LEGS. `flightSince` is set nowhere but
+            // ConsiderFlight, so a RPG_TRAVEL_FLIGHT this module did not issue
+            // - upstream rolling one out of its eight idle behaviours - is not
+            // held open here and is simply re-aimed below like any other
+            // status that is not RPG_WANDER_NPC.
+            if (state.flightSince)
+            {
+                if (botAI->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT)  // NewRpgInfo.h:99
+                {
+                    state.progress.since = std::time(nullptr);
+                    if (std::time(nullptr) - state.flightSince <=
+                        TRAVEL_FLIGHT_BACKSTOP_SECONDS)
+                        continue;
+
+                    // THE LEG'S BACKSTOP, and the reason it has to exist here.
+                    // Upstream leaves RPG_TRAVEL_FLIGHT only when a flight
+                    // ENDS (NewRpgAction.cpp:295), so a character that cannot
+                    // reach the flight master never leaves it, and the errand
+                    // this drive is holding open would be held open forever
+                    // by a leg that is going nowhere.
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' set off for a flight master on its way to "
+                             "'{}' and has not left the ground in {} minutes - giving up "
+                             "on the flight and walking",
+                             name, target,
+                             static_cast<uint32>(TRAVEL_FLIGHT_BACKSTOP_SECONDS / 60));
+                    botAI->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
+                    state.flightSince = 0;
+                    // Deliberately NOT `continue`: falling through re-issues
+                    // the walk below on this same poll, so the errand loses
+                    // nothing but the time the leg cost it.
+                }
+                else
+                {
+                    // THE LEG IS OVER. Either the flight landed - upstream
+                    // returns the bot to RPG_IDLE on arrival - or the
+                    // activation was refused at the flight master and it did
+                    // the same. Both end the same way from here: the walk
+                    // below picks the errand back up from wherever the
+                    // character now stands, and `flights` is already spent so
+                    // the next poll does not simply fly again.
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is off its flight leg and carries on to '{}' "
+                             "on foot from {} yards",
+                             name, target, static_cast<uint32>(distance));
+                    state.flightSince = 0;
+                    // The errand's clock has been held for the whole leg and
+                    // the character has usually moved a long way; start it
+                    // again from here rather than from a mark measured before
+                    // the flight, which the ratchet below would otherwise
+                    // never beat if the landing left it further out.
+                    state.progress.best = 0.f;
+                    state.progress.since = std::time(nullptr);
+                }
+            }
+
+            // PREFER FLYING TO WALKING, WHERE FLYING IS SHORTER (#68). Asked
+            // BEFORE the ratchet reads, because a flight that is issued this
+            // poll makes this poll's distance reading meaningless - the
+            // character is about to walk deliberately away from the errand -
+            // and asked before the re-issue guard below, because a flight
+            // REPLACES the walk rather than competing with it.
+            if (ConsiderFlight(name, bot, botAI, pos, distance, state))
+                continue;
 
             // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63). This is the site the
             // lesson was measured on and the rule is now written down once, in
