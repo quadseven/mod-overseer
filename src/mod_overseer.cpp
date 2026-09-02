@@ -6308,6 +6308,16 @@ private:
     //      except deterministic, ground-checked rather than pathfinder-checked,
     //      and required to make progress.
     //
+    // WHAT IT COSTS TO ASK, AND WHY THE ANSWER IS NOT CACHED. One
+    // PathGenerator query per place-aimed character per poll, which is one
+    // Detour search a second at the fastest cadence this drive ever runs with a
+    // family of five - against MoveFarTo, which runs one per bot tick for the
+    // whole of every long walk (NewRpgBaseAction.cpp:136-138). The query is
+    // deliberately repeated rather than remembered: its answer depends on where
+    // the character is STANDING, which is the thing that changes between polls,
+    // and a cached "the mesh has a route" from sixty yards back is exactly the
+    // stale fact this whole section exists to stop trusting.
+    //
     // WHAT A STEPPED WALK COSTS, SO IT IS A CHOICE AND NOT A SURPRISE. Patch
     // 0012 ends an arrived place-aim in ChangeToIdle, and RPG_IDLE becomes a
     // randomly chosen status on the bot's next tick - so a character that
@@ -6750,6 +6760,17 @@ private:
             // goes over anything. Handing a follower back at the lip of a
             // gorge is handing it back to the straight step that put the
             // Duskwood three at the bottom of one. See FollowStepHolds.
+            //
+            // THIS CAN HOLD A FOLLOWER ON ITS OWN AIM INDEFINITELY, and that
+            // is the right trade rather than an oversight. For it to happen
+            // the straight line to the leader has to keep crossing a drop
+            // while the follower keeps walking toward him under a checked
+            // aim - which means the follower cannot reach the leader at all,
+            // which is precisely the case where handing it back to `follow`
+            // is handing it a fall. It stays loud: DriveTravel's own
+            // twenty-minute backstop releases the aim as unreachable and says
+            // so, and the next party poll claims it again from wherever the
+            // follower now stands.
             if (gap < 0.f ||
                 (gap <= FOLLOW_CATCH_UP_DONE_YARDS && FollowStepHolds(p, leader)))
             {
