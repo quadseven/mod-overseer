@@ -2470,53 +2470,23 @@ private:
         // promotes whoever is left, so a character taken over at the keyboard
         // and handed back comes home a member. Corrected here rather than with
         // `.group leader`, which needs GM security a bot session does not have.
-        // THE LOWEST LEVEL LEADS, AND THAT IS THE WHOLE POINT OF THE FAMILY.
         //
-        // WHAT WAS WRONG. Every character quested for itself. The quest drive
-        // picks each one's objective out of its OWN log, and `travel_npc` is a
-        // per-character column, so five characters pursued five errands in
-        // five places and the party existed on paper only. Measured over one
-        // day: the spread went from four levels to SIX, because whoever was
-        // already ahead kept earning while whoever was behind was somewhere
-        // else entirely, or parked.
+        // THE ROSTER'S `lead` IS THE ONLY THING THAT DECIDES WHO LEADS (#129).
         //
-        // WHY LEADERSHIP IS THE LEVER AND NOT A NEW DRIVE. The follower
-        // machinery already points the whole party at its leader, and the
-        // leader is the only character the travel and quest drives will
-        // actually send anywhere (`new rpg` is carried by the leader alone).
-        // So whoever leads decides where five characters go and what they
-        // fight. Handing that to the character who is BEHIND turns the party's
-        // default behaviour into "help the one who needs it" without inventing
-        // any new steering at all: the rest arrive by following, and they fight
-        // what the leader pulls because tank-assist already keys on that.
-        //
-        // Level is read off the live Player rather than the roster, because a
-        // ding between polls should move leadership on the next one rather
-        // than wait for a row to be rewritten (Unit.h:1104, public from
-        // Unit.h:666).
-        //
-        // TIES BREAK BY NAME so the choice is stable. Two characters at the
-        // same level must not hand leadership back and forth every poll - the
-        // party would spend its life turning around.
-        //
-        // `lead` REMAINS AN OVERRIDE, and deliberately so: it is how a person
-        // says "no, this one leads" for a run that needs a specific character
-        // in front. Absent that, the default is the character who is behind.
-        if (wantsToLead.empty())
-        {
-            Player const* lowest = nullptr;
-            for (Player const* p : present)
-            {
-                if (!p)
-                    continue;
-                if (!lowest || p->GetLevel() < lowest->GetLevel() ||
-                    (p->GetLevel() == lowest->GetLevel() && p->GetName() < lowest->GetName()))
-                    lowest = p;
-            }
-            if (lowest)
-                wantsToLead = lowest->GetName();
-        }
-
+        // There used to be a default below this comment: with no `lead` row,
+        // the lowest-level member led, on the theory that the leader is the
+        // only traveller and so whoever is behind should be the one choosing
+        // where five characters go. It never ran once - the bridge pins `lead`
+        // every cycle, so `wantsToLead` was never empty - and when the
+        // operator was asked, the answer was that it is the wrong design
+        // anyway. In the operator's words: the leader should follow the
+        // lowest level to help them level up, but should ALWAYS tank for
+        // them; the leader leads to do whatever the lowest-level member needs
+        // to do. Leadership by seniority is a roleplay premise, and the tank
+        // in front is a safety one. So "the leader serves the youngest" is
+        // implemented where the leader's errands are chosen - DriveQuests'
+        // own-log pick, see QuestServesTheYoungest - and not by moving the
+        // leader. With no `lead` row the group keeps whatever leader it has.
         if (!wantsToLead.empty())
         {
             if (Player* head = ObjectAccessor::FindPlayerByName(wantsToLead))
@@ -2526,9 +2496,9 @@ private:
                     group->ChangeLeader(head->GetGUID());
                     group->SendUpdate();
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' now leads the party at level {} - the family "
-                             "follows whoever is furthest behind, so its errands become "
-                             "everybody's", wantsToLead, static_cast<uint32>(head->GetLevel()));
+                             "overseer: '{}' now leads the party at level {} - the roster "
+                             "says so, and the family follows its leader",
+                             wantsToLead, static_cast<uint32>(head->GetLevel()));
                 }
             }
         }
@@ -3463,6 +3433,129 @@ private:
         } while (runs->NextRow());
     }
 
+    // ------------------------------------------- the leader serves the youngest --
+    //
+    // THE OPERATOR'S DESIGN (#129), in the operator's own words: the leader
+    // should follow the lowest level to help them level up, but should ALWAYS
+    // tank for them; the leader leads to do whatever the lowest-level member
+    // needs to do, and the lowest-level member does the quest if everyone
+    // else already did it.
+    //
+    // This is NOT "the lowest level leads". The leader stays leader and stays
+    // in front, because the leader is the tank and the party fights what the
+    // tank pulls. What changes is what the party DOES: where it goes and which
+    // quest it pursues are decided by what the youngest still needs.
+    //
+    // WHY IT DID NOT HAPPEN BEFORE, all measured. Only the group leader
+    // carries `new rpg`, and `new rpg` is the only strategy that walks a
+    // character anywhere, so the leader is the only traveller and the only
+    // earner: on three consecutive days the leader was granted `new rpg` 149,
+    // 143 and 146 times and never once stripped of it, while every other
+    // member was granted it and then stripped within the cycle. And the
+    // leader's errand, when the council had not aimed it, was picked from the
+    // leader's OWN log in slot order - so the party went wherever the
+    // character furthest ahead happened to have unfinished business, and the
+    // character furthest behind tagged along on quests it did not hold. The
+    // one piece of code written to counter that - a lowest-level-leads
+    // default in KeepRosterGrouped - was gated on a `lead` column the bridge
+    // pins every cycle, and had never executed.
+    //
+    // WHAT THIS DOES. The leader still picks from its own log, because a
+    // character can only be aimed at a quest it holds (NewRpgDoQuestAction
+    // idles on anything else). But the pick is RANKED rather than
+    // first-in-slot-order:
+    //
+    //   - a quest the youngest present member also holds unfinished (in its
+    //     log as INCOMPLETE or COMPLETE) ranks above every quest it does not,
+    //     because that is an errand the party can do together where the
+    //     youngest needs it done;
+    //   - among those, a quest more of the OTHER members have already been
+    //     rewarded for ranks higher, because that is the quest "everyone else
+    //     already did" and the one whose absence is widening the spread;
+    //   - everything else keeps its old order, so with the youngest holding
+    //     nothing in common the behaviour is byte for byte what it was.
+    //
+    // And a self-picked quest the youngest does NOT hold is given up in favour
+    // of one it does, the moment one is eligible - a lease of up to thirty
+    // minutes on an errand that helps nobody behind is exactly the "fixed
+    // order" the issue asks this to stop being. Only a quest still INCOMPLETE
+    // is pre-empted; one that is COMPLETE is being walked to its hand-in, and
+    // finishing it costs one walk and gains one turn-in.
+    //
+    // MEASURED WITH THE RIGHT FILTER. "In the log" is QUEST_STATUS_INCOMPLETE
+    // (3) or QUEST_STATUS_COMPLETE (1), read through Player::GetQuestStatus -
+    // never status 0, NONE, which the core deliberately never gives a log slot
+    // (see the issue's correction). The same `status IN (1,3)` is what this
+    // module's own DoShare uses, and what the acceptance check must use.
+    //
+    // WHAT THIS DOES NOT DO, said plainly. When the youngest holds a quest that
+    // everyone else INCLUDING the leader has already rewarded, the leader
+    // cannot be aimed at it - it is not in his log and cannot be again. That
+    // quest can only be done by the youngest, and doing it means the youngest
+    // travelling on its own errand with the tank going along. That is the
+    // second half of the operator's design and it is a change to who carries
+    // `new rpg`, which this file holds on the leader alone for a measured
+    // reason (the 937-yard scatter). It is tracked separately.
+    //
+    // Level is read off the live Player rather than the roster, so a ding
+    // between polls moves the choice on the next one. TIES BREAK BY NAME so
+    // the youngest is stable: two characters at the same level must not hand
+    // the party's errands back and forth every poll.
+    static Player* YoungestOf(std::vector<Player*> const& present)
+    {
+        Player* youngest = nullptr;
+        for (Player* p : present)
+        {
+            if (!p)
+                continue;
+            if (!youngest || p->GetLevel() < youngest->GetLevel() ||
+                (p->GetLevel() == youngest->GetLevel() && p->GetName() < youngest->GetName()))
+                youngest = p;
+        }
+        return youngest;
+    }
+
+    // Is this quest sitting unfinished in this character's log? INCOMPLETE or
+    // COMPLETE and nothing else - the same two statuses the own-log walk in
+    // DriveQuests accepts, so the two cannot disagree about what "held" means.
+    static bool HoldsUnfinished(Player const* player, uint32 questId)
+    {
+        if (!player)
+            return false;
+        QuestStatus const status = player->GetQuestStatus(questId);  // Player.h:1492
+        return status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_COMPLETE;
+    }
+
+    // How much doing this quest now serves the youngest. Score() is what the
+    // pick is ranked by; zero means nothing about this quest helps whoever is
+    // behind, and such quests keep their slot order among themselves.
+    struct YoungestNeed
+    {
+        bool youngestHolds = false;
+        uint32 othersRewarded = 0;
+        uint32 Score() const { return (youngestHolds ? 100u : 0u) + othersRewarded; }
+    };
+    static YoungestNeed QuestServesTheYoungest(uint32 questId, Player const* leader,
+                                               Player const* youngest,
+                                               std::vector<Player*> const& present)
+    {
+        YoungestNeed need;
+        // The leader IS the youngest: its own log already serves it, and the
+        // ranking would only be counting the leader's own quests against
+        // itself.
+        if (!youngest || youngest == leader)
+            return need;
+        need.youngestHolds = HoldsUnfinished(youngest, questId);
+        for (Player const* p : present)
+        {
+            if (!p || p == leader || p == youngest)
+                continue;
+            if (p->GetQuestRewardStatus(questId))  // Player.h:1491
+                ++need.othersRewarded;
+        }
+        return need;
+    }
+
     void DriveQuests()
     {
         // Read first, and each on its own, so that neither aim column can stop
@@ -3498,11 +3591,34 @@ private:
         if (!result)
             return;
 
+        // The roster is read out in full before anybody is steered, because
+        // the leader's pick below is ranked against the WHOLE family - who is
+        // youngest, who has already been rewarded for what - and that has to
+        // be known before the leader's row comes round, wherever in the
+        // result it happens to sit.
+        std::vector<std::pair<std::string, bool>> roster;
         do
         {
             Field* fields = result->Fetch();
-            std::string const name = fields[0].Get<std::string>();
-            bool const isLead = fields[1].Get<uint8>() != 0;
+            roster.emplace_back(fields[0].Get<std::string>(), fields[1].Get<uint8>() != 0);
+        } while (result->NextRow());
+
+        // Everybody present and steerable this tick. Resolved once here and
+        // never held past this call: the pointers are valid for the length of
+        // this world-thread tick and nothing below logs anybody out.
+        std::vector<Player*> present;
+        for (auto const& row : roster)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(row.first);
+            if (SteerableAI(member))
+                present.push_back(member);
+        }
+        Player* const youngest = YoungestOf(present);
+
+        for (auto const& row : roster)
+        {
+            std::string const& name = row.first;
+            bool const isLead = row.second;
 
             // THE JOB GATE (infra#2834). A character whose schedule says
             // something other than 'quest' gets no quest aim asserted and no
@@ -3796,7 +3912,51 @@ private:
             // Already on one. Re-issuing would restart the travel from here
             // every poll, which is a character that walks toward an objective
             // forever and never arrives.
-            if (onQuest)
+            //
+            // UNLESS THE LEADER IS ON AN ERRAND THAT HELPS NOBODY BEHIND
+            // (#129). A quest this drive picked for the leader out of its own
+            // log, still INCOMPLETE, that the youngest does not hold, is
+            // pre-empted the moment the leader's log offers one the youngest
+            // does hold - see QuestServesTheYoungest. Guarded three ways so it
+            // cannot become the walks-forever loop the check above prevents:
+            // only a SELF-picked quest (the council's aim is arbitrated above
+            // and never touched here), only while INCOMPLETE (a COMPLETE one is
+            // being handed in), and only when a strictly better candidate
+            // exists - after which the leader is on a youngest-held quest and
+            // this cannot fire again until the youngest changes.
+            bool preempted = false;
+            if (onQuest && isLead && youngest && youngest != bot && working &&
+                working == state.repick.lastPicked &&
+                bot->GetQuestStatus(working) == QUEST_STATUS_INCOMPLETE &&  // Player.h:1492
+                !HoldsUnfinished(youngest, working))
+            {
+                for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE && !preempted; ++slot)
+                {
+                    uint32 const questId = bot->GetQuestSlotQuestId(slot);  // Player.h:1510
+                    if (!questId || questId == working || !HoldsUnfinished(bot, questId) ||
+                        !HoldsUnfinished(youngest, questId))
+                        continue;
+                    if (botAI->lowPriorityQuest.count(questId) ||  // PlayerbotAI.h:605
+                        state.repick.givenUp.count(questId))
+                        continue;
+                    preempted = true;
+                }
+                if (preempted)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is on quest {} which '{}' (level {}, the "
+                             "youngest) does not hold - giving it up for one the youngest "
+                             "needs, because the leader serves the lowest level",
+                             name, working, youngest->GetName(),
+                             static_cast<uint32>(youngest->GetLevel()));
+                    // Not a strike: the quest was not abandoned as unreachable,
+                    // it was set aside on purpose. Forgetting it keeps the
+                    // strike walk below from judging it.
+                    state.repick.strikes = 0;
+                    state.repick.lastPicked = 0;
+                }
+            }
+            if (onQuest && !preempted)
                 continue;
 
             // AN UNAIMED FOLLOWER STAYS PUT. Everything below picks a quest out
@@ -3918,6 +4078,19 @@ private:
             bool picked = false;
             bool skipped = false;
             uint32 deferred = 0;
+
+            // THE WALK COLLECTS; IT NO LONGER PICKS (#129). Every eligible
+            // quest in the leader's log is gathered first, in slot order, and
+            // then ONE is chosen by how much it serves the youngest. With
+            // nothing in the log serving the youngest, the first eligible slot
+            // wins exactly as it always did.
+            struct Candidate
+            {
+                uint32 questId;
+                Quest const* quest;
+                YoungestNeed need;
+            };
+            std::vector<Candidate> candidates;
             for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
             {
                 uint32 const questId = bot->GetQuestSlotQuestId(slot);  // Player.h:1510
@@ -3955,18 +4128,43 @@ private:
                 // deliberately included: the objective is met and the walk back
                 // to the giver is the rest of the quest, and a family that
                 // never turns anything in is not playing either.
-                QuestStatus const status = bot->GetQuestStatus(questId);  // Player.h:1492
-                if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
+                if (!HoldsUnfinished(bot, questId))
                     continue;
 
                 Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
                 if (!quest)
                     continue;
 
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' now working quest {} ({}) - picked from its own "
-                         "log, nothing chosen", name, questId, quest->GetTitle());
-                botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
+                candidates.push_back(
+                    {questId, quest, QuestServesTheYoungest(questId, bot, youngest, present)});
+            }
+
+            // The best-scoring candidate, and on a tie the EARLIEST slot -
+            // strictly greater, never greater-or-equal, so a run of zeros
+            // resolves to the first of them, which is the old behaviour.
+            Candidate const* chosen = nullptr;
+            for (Candidate const& candidate : candidates)
+                if (!chosen || candidate.need.Score() > chosen->need.Score())
+                    chosen = &candidate;
+
+            if (chosen)
+            {
+                uint32 const questId = chosen->questId;
+                if (chosen->need.Score())
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' now working quest {} ({}) - picked from its own "
+                             "log because '{}' (level {}, the youngest) {} it and {} other "
+                             "member(s) have already finished it",
+                             name, questId, chosen->quest->GetTitle(), youngest->GetName(),
+                             static_cast<uint32>(youngest->GetLevel()),
+                             chosen->need.youngestHolds ? "also holds" : "does not hold",
+                             chosen->need.othersRewarded);
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' now working quest {} ({}) - picked from its own "
+                             "log, nothing chosen and nothing in it serves the youngest",
+                             name, questId, chosen->quest->GetTitle());
+                botAI->rpgInfo.ChangeToDoQuest(questId, chosen->quest);  // NewRpgInfo.h:106
 
                 // Strikes count consecutive failures of the SAME quest, so
                 // moving to a different one starts the count again. The
@@ -3984,7 +4182,6 @@ private:
                 repick.lastPicked = questId;
                 repick.stuckLogged = false;
                 picked = true;
-                break;
             }
 
             // NOTHING UNTRIED WAS ELIGIBLE, so the quest that just failed is
@@ -4042,7 +4239,7 @@ private:
                          name, ids.str().empty() ? std::string("none") : ids.str());
                 repick.stuckLogged = true;
             }
-        } while (result->NextRow());
+        }
     }
 
     // Give the aim back. The bridge owns this column and will aim again the
