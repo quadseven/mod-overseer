@@ -2543,10 +2543,19 @@ private:
     // returns nullptr and the `if (newMaster)` guard at PlayerbotAI.cpp:440
     // assigns nothing AND clears nothing.
     //
-    // WHY AN EXPLICIT MASTER STICKS. That same nullptr is what makes this hold:
-    // the recheck fires every tick for a bot master, calls FindNewMaster, gets
-    // nullptr, and leaves `master` exactly as it found it. The assignment below
-    // is made once per poll and is not overwritten in between.
+    // WHY AN EXPLICIT MASTER STICKS. Since #135 the leader is kept a selfbot
+    // (its master is itself - see the leader block inside the function), and
+    // the recheck at PlayerbotAI.cpp:437 fires only for a master that is a
+    // bot AND not a selfbot. A follower pointed at the leader therefore never
+    // enters the recheck at all. The one path that still can is a follower
+    // whose master is NULL - after the leader logs out and back in, before
+    // this poll - and for that follower FindNewMaster now returns the leader
+    // (PlayerbotAI.cpp:4420) and upstream assigns it itself, with
+    // ResetStrategies and `+follow` (PlayerbotAI.cpp:442-448). That is the
+    // same end state this poll produces, reached a little earlier, so the
+    // "now follows" line below appears at most once per leader change and
+    // sometimes not at all. Either way the assignment below is never
+    // overwritten between polls.
     //
     // THE OBSERVER EFFECT THAT HID ALL OF THIS. With SelfBotLevel = 3 a human
     // logging in as the leader IS a selfbot, IsSelfBot(groupLeader) goes true,
@@ -2663,21 +2672,81 @@ private:
             p->RemovePlayerFlag(PLAYER_FLAGS_AFK);
         }
 
-        // THE LEADER FOLLOWS NOBODY. RandomPlayerbotMgr::OnPlayerLogin hands a
-        // master to every bot grouped with an arriving character when its own
-        // master is null or is a bot (RandomPlayerbotMgr.cpp:2582-2586), and
-        // that includes the leader. A leader following one of his own followers
-        // is a cohesion loop with no fixed point: the party converges on
-        // nothing and drifts as a clump. A human driving this character is a
-        // selfbot, whose master is himself, so HasGameClientMaster() is true
-        // and he is left alone.
+        // THE LEADER IS ITS OWN MASTER (#135). Not "follows nobody": a leader
+        // whose master is nullptr follows nobody too, and that is what this
+        // block used to set, but it also makes the leader fail IsSelfBot -
+        // `botAI && botAI->GetMaster() == player` (PlayerbotAI.cpp:4397-4402)
+        // - and IsSelfBot is the test the dungeon module's IsAuthorized
+        // applies to the issuer of every `dc` command
+        // (DungeonClearChatActions.cpp:60-72). With the leader's master
+        // cleared and every follower's master pointed at the leader (below),
+        // NOBODY in the party passed it, and AuthorizedDcIssuer found no one
+        // for as long as anyone watched:
+        //
+        //     'Og' is inside map 36 but no groupmate may issue a
+        //     dungeon-clear command - ... so the dungeon brain stays OFF
+        //
+        // repeated every eight seconds with all five clients attached. The
+        // dungeon brain had never armed on its own.
+        //
+        // Master == self is exactly what `self` sets when a client logs in
+        // under SelfBotLevel 3: PlayerbotMgr::OnPlayerLogin runs the `self`
+        // command (PlayerbotMgr.cpp:1657-1658), which does
+        // `GET_PLAYERBOT_AI(master)->SetMaster(master)` (PlayerbotMgr.cpp:1065).
+        // So a freshly logged-in leader already IS a selfbot; what this block
+        // must do is keep it one. Two things take it away. A character that
+        // was a follower when it was promoted (leadership drifts to the
+        // roster's `lead` one poll after it changes) still carries the OLD
+        // leader as master, which this block used to null. And nothing ever
+        // restored the self-master afterwards, because upstream's own per-tick
+        // recheck assigns only what FindNewMaster hands back, which for a
+        // leader that is not a selfbot is nullptr (see the WHY block above).
+        //
+        // A SELF-MASTER STICKS ACROSS THE TICK. UpdateAIGroupMaster rechecks
+        // only when `!master || (masterBotAI && !IsSelfBot(master))`
+        // (PlayerbotAI.cpp:437); with master == bot, IsSelfBot(master) is
+        // true by definition and the recheck does not fire. The no-group
+        // branch (PlayerbotAI.cpp:417-426) and the battleground branch
+        // (:430-431) only clear a RANDOM bot's master, and roster characters
+        // are on named accounts. OverseerEventScript::OnPlayerBeforeLogout
+        // skips the departing character itself. The old worry that
+        // RandomPlayerbotMgr::OnPlayerLogin re-points the leader at an
+        // arriving groupmate (RandomPlayerbotMgr.cpp:2582-2586) no longer
+        // applies: that walk covers its own PlayerBotMap, and under #131 a
+        // roster selfbot is in no holder's map.
+        //
+        // A cohesion loop is still impossible: a leader whose master is
+        // itself walks toward nobody, same as one with no master. And a
+        // genuine person at the keyboard is still left alone twice over: no
+        // PlayerbotAI means this block is skipped, and a master that IS a
+        // person (IsRealPlayer, PlayerbotAI.cpp:4389-4394) is not
+        // overwritten, which is the same rule the follower loop below applies.
+        //
+        // Nothing here touches a character with no client attached: #131
+        // logs those out, and this drive only ever runs over `present`.
         if (PlayerbotAI* leaderAI = GET_PLAYERBOT_AI(leader))
         {
-            if (leaderAI->GetMaster() && !leaderAI->HasGameClientMaster())
+            if (leaderAI->GetMaster() != leader && !IsRealPlayer(leaderAI->GetMaster()))
             {
                 LOG_INFO("module.overseer",
-                         "overseer: '{}' leads, so he follows nobody", leader->GetName());
-                leaderAI->SetMaster(nullptr);
+                         "overseer: '{}' leads, so it is its own master - the tank must "
+                         "pass IsSelfBot to issue the dungeon-clear command",
+                         leader->GetName());
+                leaderAI->SetMaster(leader);
+
+                // READ BACK THROUGH THE EXACT PREDICATE THE DUNGEON MODULE
+                // USES, not through GetMaster(): IsSelfBot goes through
+                // GET_PLAYERBOT_AI(leader) afresh, so this also catches the
+                // AI this block holds not being the one registered for the
+                // character. If it fires, no `dc` command from the leader
+                // will ever be accepted, and the log should say so before
+                // DriveDungeonClear finds nobody.
+                if (!IsSelfBot(leader))
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' was made its own master and still does not "
+                              "pass IsSelfBot - the dungeon module will refuse every "
+                              "command it issues",
+                              leader->GetName());
             }
 
             // AND THE LEADER MUST ACTUALLY CARRY `new rpg`, BECAUSE NOTHING
@@ -2922,16 +2991,15 @@ private:
             //
             // NEITHER KNOWN GATE EXPLAINS IT. UpdateAIGroupMaster re-enters
             // every tick (PlayerbotAI.cpp:397, :439-448) but only acts when
-            // FindNewMaster() returns non-null, and for a plain-bot leader
-            // (not a selfbot) FindNewMaster() returns nullptr for every one
-            // of these five - see the WHY block above KeepRosterFollowing
-            // for the citations, confirmed again here by reading
-            // PlayerbotAI::FindNewMaster (PlayerbotAI.cpp:4410-4449): the
-            // loop over group members only returns non-null for a member
-            // with no PlayerbotAI or that IS a selfbot, and none of these
-            // five bots are either. So nothing upstream is watching a
-            // follower that stands still while a correctly-assigned master
-            // walks away.
+            // the master is missing or is a bot that is not a selfbot
+            // (PlayerbotAI.cpp:437). Since #135 the leader is kept a selfbot,
+            // so a follower whose master is the leader never enters that
+            // branch - and when it was a plain bot, FindNewMaster
+            // (PlayerbotAI.cpp:4410-4449) returned nullptr for every one of
+            // these five, because its member loop only returns a member with
+            // no PlayerbotAI or that IS a selfbot. Either way nothing
+            // upstream is watching a follower that stands still while a
+            // correctly-assigned master walks away.
             //
             // THE STUCK TRIGGER DOES NOT COVER IT EITHER, AND THE REASON
             // ASSUMED GOING IN WAS WRONG. mod-playerbots ships
@@ -6641,13 +6709,37 @@ private:
     // same as ending a run - a wipe puts the party outside at a graveyard with
     // the run still meaningfully in progress - and the module's own `dc` verbs
     // own that lifecycle. This drive only ever turns the brain ON.
+    // Would the dungeon module accept a `dc` command from this character?
+    //
+    // Two tests, and both are needed. The first is the dungeon module's own:
+    // IsAuthorized (DungeonClearChatActions.cpp:60-72) rejects an owner that
+    // has a PlayerbotAI unless it is a selfbot, so the issuer must be a
+    // person with no AI (IsRealPlayer, PlayerbotAI.cpp:4389-4394) or a
+    // selfbot (IsSelfBot, PlayerbotAI.cpp:4397-4402; both are free functions
+    // declared at PlayerbotAI.h:79-80). Client attachment ALONE is not
+    // enough, even though it is the discriminator this module trusts
+    // everywhere else since #131: a follower playing through a real client
+    // has its master pointed at the leader by KeepRosterFollowing, fails
+    // IsSelfBot, and would be refused. The second test is this module's:
+    // ClientAttached, so a character whose client has dropped is never the
+    // one whose name a command goes out under - #131 has it out of the world
+    // within a poll anyway. Group membership, IsAuthorized's third
+    // condition, is the caller's to check.
+    static bool MayIssueDcCommands(Player* member)
+    {
+        return ClientAttached(member) && (IsRealPlayer(member) || IsSelfBot(member));
+    }
+
     // A groupmate the dungeon module will accept a command FROM.
     //
-    // IsAuthorized wants an issuer that is either not a bot at all, or is a
-    // selfbot - and in both cases a member of the target's group. Every roster
-    // character is a bot, so the only candidate is whichever one is currently
-    // a selfbot, which is the character being observed. `IsSelfBot` is a free
-    // function declared at PlayerbotAI.h:80.
+    // THE LEADER FIRST (#135). KeepRosterFollowing keeps the leader its own
+    // master, which is what makes it a selfbot, precisely so that the tank
+    // is the one who issues: the dungeon module was written around a run
+    // being commanded by the character at its head. Any other qualifying
+    // member is the fallback - a person at a keyboard in the party, or a
+    // follower that is momentarily still a selfbot because it logged in
+    // after the last follow poll - so the brain is not left off for a poll
+    // when the leader is mid-relog.
     //
     // Returns null rather than falling back to the bot itself, because the bot
     // itself is precisely the issuer that is always rejected, and retrying with
@@ -6660,10 +6752,14 @@ private:
         if (!group)
             return nullptr;
 
+        Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
+        if (leader && MayIssueDcCommands(leader))
+            return leader;
+
         for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
         {
             Player* member = ref->GetSource();
-            if (member && IsSelfBot(member))
+            if (member && member != leader && MayIssueDcCommands(member))
                 return member;
         }
         return nullptr;
@@ -6769,9 +6865,10 @@ private:
             // confirmation and neither was.
             //
             // The rule accepts an issuer who is a selfbot AND a member of the
-            // target's group. The roster is one permanent party and the
-            // observed character is always in it, so there is normally exactly
-            // such an issuer available - it just was never the one used.
+            // target's group. The roster is one permanent party and its
+            // leader is kept a selfbot by KeepRosterFollowing (#135), so the
+            // tank is normally the issuer; see AuthorizedDcIssuer for the
+            // fallback and for why "has a client" is not by itself enough.
             Player* issuer = AuthorizedDcIssuer(bot);
             if (!issuer)
             {
@@ -6781,7 +6878,8 @@ private:
                 LOG_WARN("module.overseer",
                          "overseer: '{}' is inside map {} but no groupmate may issue a "
                          "dungeon-clear command - the module refuses a true bot as issuer "
-                         "and no selfbot is in the party, so the dungeon brain stays OFF",
+                         "and no client-attached member of the party is a selfbot or a "
+                         "person, so the dungeon brain stays OFF",
                          name, static_cast<uint32>(bot->GetMapId()));
                 continue;
             }
