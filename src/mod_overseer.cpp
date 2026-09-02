@@ -104,7 +104,9 @@
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "GuildMgr.h"
+#include "InstanceSaveMgr.h"
 #include "ObjectAccessor.h"
+#include "Map.h"
 #include "MapMgr.h"
 #include "ObjectMgr.h"
 #include "QuestDef.h"
@@ -863,6 +865,53 @@ constexpr time_t DUNGEON_DC_ON_RETRY_SECONDS = 60;
 // builds a long path before the first step).
 constexpr float DUNGEON_DC_ON_MOVE_YARDS = 30.f;
 constexpr time_t DUNGEON_DC_ON_MOVE_WINDOW_SECONDS = 120;
+
+// ------------------------------------------------- the run goes again (#144) --
+//
+// HOW MANY TIMES THE RESET MAY BE ASKED FOR BEFORE THE RUN IS WRITTEN OFF.
+//
+// A reset is not a request that gets queued and eventually honoured: the core
+// decides it on the spot. Group::ResetInstances (Group.cpp:2328 at the pinned
+// core) hands each bound save to InstanceMap::Reset (Map.cpp:2210), which
+// returns m_mapRefMgr.IsEmpty() (Map.cpp:2249) - so an instance with anybody
+// still standing in it refuses, once, immediately, and tells everyone inside
+// (SendResetFailedNotify, Map.cpp:2240). Retrying is therefore only worth
+// anything when the world has changed between attempts, which is why the
+// PRECONDITIONS get a generous clock of their own below and the ATTEMPTS get a
+// small count: three refusals in a row from a party this coordinator believes
+// is entirely outside means the refusal is not about the party.
+//
+// AND THREE RATHER THAN ONE, because the coordinator's census and the map's own
+// reference list can disagree for a tick. The census asks each member for
+// GetMapId(), which a character that has just been teleported out can answer
+// with its DESTINATION while it is still linked to the map it left; the map
+// answers HavePlayers() from that link. One poll of slack absorbs that; three
+// costs fifteen seconds and removes the whole class of spurious first refusal.
+constexpr uint32 DUNGEON_RESET_ATTEMPTS = 3;
+
+// How long the reset waits for its own preconditions - everybody out of the
+// instance, nobody in combat - before giving up on them.
+//
+// THE SAME FIVE MINUTES THE CROSSING BACKSTOP USES, and for the same reason
+// stated there: it is far longer than the thing can honestly take, and a
+// coordinator that waits forever for a condition that has stopped changing is
+// the failure shape this file has now paid for three times. A party that has
+// just walked out of a door and is standing on the doorstep is out of combat
+// within seconds; five minutes covers a straggler finishing a fight with
+// something that followed them out.
+constexpr time_t DUNGEON_RESET_BACKSTOP_SECONDS = 5 * 60;
+
+// How many consecutive failed runs end the campaign (#144: "the loop stops ...
+// after 3 consecutive runs that did not complete, and says which").
+//
+// WHAT THIS ACTUALLY COUNTS, WHICH IS NARROWER THAN THE ISSUE'S WORDING. "Did
+// not complete" needs a notion of completion, and this module has none: a run's
+// goal is #143 and is not built. What it can prove is a reset that will not
+// take, and that failure is genuinely terminal in a way a bad run is not - the
+// instance still has every boss dead in it, so the fourth attempt would walk
+// into the same empty mine as the first three. Counted from the run rows rather
+// than from memory so it survives a worldserver bounce.
+constexpr uint32 DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES = 3;
 
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
@@ -3899,6 +3948,304 @@ private:
                      "cold for {}s, so nobody from the roster has been inside",
                      runId, mapId, coldFor);
         } while (runs->NextRow());
+    }
+
+    // ------------------------------------------------- the run goes again (#144) --
+    //
+    // THE CAMPAIGN: how many runs are wanted, how many have happened, and how
+    // each one ended. Everything below is bookkeeping the RESET phase and the
+    // end-of-run paths in DriveDungeonRun read; the reset itself is
+    // ResetGroupInstance, further down beside the coordinator that calls it.
+    //
+    // WHY THE SCHEMA IS PROBED RATHER THAN ASSUMED. The DDL and the reader ship
+    // in DIFFERENT images and arrive in either order - the long comment above
+    // LoadQuestAims carries the full mechanism, and its consequence is that a
+    // SELECT naming a column the table does not have fails WHOLE. LoadJobs
+    // survives that by having a fallback that means the same thing as an empty
+    // result ("everybody questing"). The campaign columns have no such luck: an
+    // unreadable cap is not "run it zero times" and it is certainly not "run it
+    // forever", so absence has to be a distinguishable answer rather than a
+    // value. INFORMATION_SCHEMA answers it once per process, cheaply, and the
+    // answer cannot change under a running worldserver without a db-import that
+    // would restart it anyway.
+    enum class SchemaColumns : uint8 { Unknown, Absent, Present };
+    SchemaColumns _runCapColumns{SchemaColumns::Unknown};
+    SchemaColumns _runAccountingColumns{SchemaColumns::Unknown};
+
+    // `columns` is a SQL list literal written at this call site and never built
+    // from anything a person or a row can influence, which is why it can be
+    // interpolated at all - the same discipline every other query in this file
+    // follows, where anything from the world goes through Esc().
+    static bool SchemaHasColumns(char const* table, char const* columns, uint64 expected)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' "
+            "AND COLUMN_NAME IN ({})", table, columns);
+        return result && result->Fetch()[0].Get<uint64>() >= expected;
+    }
+
+    // Can this database hold a campaign at all? Said out loud the first time the
+    // answer is no, because "the family ran the dungeon once and stopped" with
+    // no line explaining it is exactly the kind of silence this module keeps
+    // being rebuilt to remove.
+    bool CampaignColumnsPresent()
+    {
+        if (_runCapColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_roster", "'dungeon_runs_wanted','dungeon_runs_done'", 2);
+            _runCapColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_roster has no dungeon_runs_wanted / "
+                         "dungeon_runs_done, so this worldserver is newer than its "
+                         "database (2026_09_02_01_overseer_roster_dungeon_runs.sql has "
+                         "not been applied). A dungeon run will still RESET the instance "
+                         "before it starts, but it will not repeat - a cap that cannot be "
+                         "read is not a cap, and looping without one is the worse "
+                         "direction to guess in");
+        }
+        return _runCapColumns == SchemaColumns::Present;
+    }
+
+    // Can a run be accounted for? Separate from the cap on purpose: they are two
+    // migrations against two tables, and a database that has one and not the
+    // other should lose exactly the half it is missing.
+    bool RunAccountingPresent()
+    {
+        if (_runAccountingColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_dungeon_run",
+                "'campaign_id','run_number','outcome','members'", 4);
+            _runAccountingColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_dungeon_run has no campaign_id / run_number / "
+                         "outcome / members (2026_09_02_02_overseer_dungeon_run_accounting"
+                         ".sql has not been applied), so runs cannot be numbered or given "
+                         "an outcome and the campaign loop stays off");
+        }
+        return _runAccountingColumns == SchemaColumns::Present;
+    }
+
+    struct DungeonCampaignCap
+    {
+        uint32 wanted{0};
+        uint32 done{0};
+        bool known{false};   // false = this database cannot answer, not "zero"
+    };
+
+    // The cap, read off the LEADER's roster row - the same row `job` is read
+    // from, for the reason that column's own migration gives: the leader is the
+    // only character that can be aimed, and the bridge writes the whole roster's
+    // job in one pass, so a per-character cap would be five opinions about one
+    // party.
+    DungeonCampaignCap LoadCampaignCap(std::string const& leaderName)
+    {
+        DungeonCampaignCap cap;
+        if (!CampaignColumnsPresent())
+            return cap;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT dungeon_runs_wanted, dungeon_runs_done FROM overseer_roster "
+            "WHERE name = '{}' AND enabled = 1", Esc(leaderName));
+        if (!result)
+            return cap;   // no such roster row - the caller treats that as unknown
+
+        cap.wanted = result->Fetch()[0].Get<uint32>();
+        cap.done = result->Fetch()[1].Get<uint32>();
+        cap.known = true;
+        return cap;
+    }
+
+    // One more run has ended, whatever it was. Incremented rather than written
+    // to a computed value so that a person editing the column between two runs
+    // (raising the cap mid-campaign, or resetting the count to start again)
+    // cannot be silently overwritten by this module's idea of the number.
+    void CountRunDone(std::string const& leaderName)
+    {
+        if (!CampaignColumnsPresent())
+            return;
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET dungeon_runs_done = dungeon_runs_done + 1 "
+            "WHERE name = '{}'", Esc(leaderName));
+    }
+
+    // A NEW CAMPAIGN'S ID, ALLOCATED WITHOUT A READ-BACK. MAX + 1 rather than
+    // "the first run's own id" precisely so that nothing here has to insert a
+    // row and then ask the database what id it got - see OpenOrTouchRun's own
+    // comment for why this module treats a read-back after a write as a thing to
+    // design around rather than a thing to do casually. The world thread is the
+    // only writer, so there is no second allocator to race.
+    static uint32 AllocateCampaignId()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COALESCE(MAX(campaign_id), 0) + 1 FROM overseer_dungeon_run");
+        // READ AS uint64 AND NARROWED, not read as uint32. An expression comes
+        // back from MySQL as a BIGINT whatever the column it was computed from
+        // was - the same fact OpenOrTouchRun already writes down about its own
+        // `last_progress_at = started_at` comparison, and the same reason it
+        // reads that as an int64.
+        return result ? static_cast<uint32>(result->Fetch()[0].Get<uint64>()) : 0;
+    }
+
+    // Which campaign are this leader's runs on this map currently part of? Read
+    // from the rows rather than remembered, so a worldserver bounce mid-campaign
+    // picks the campaign back up instead of starting a rival one.
+    static uint32 CampaignInProgress(std::string const& leaderName, uint32 mapId)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT campaign_id FROM overseer_dungeon_run "
+            "WHERE leader_name = '{}' AND map_id = {} AND campaign_id <> 0 "
+            "ORDER BY id DESC LIMIT 1", Esc(leaderName), mapId);
+        return result ? result->Fetch()[0].Get<uint32>() : 0;
+    }
+
+    // How many of this campaign's most recent runs failed at the reset, counting
+    // back from the newest and stopping at the first that did not.
+    static uint32 TrailingResetFailures(uint32 campaignId)
+    {
+        if (!campaignId)
+            return 0;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT outcome FROM overseer_dungeon_run WHERE campaign_id = {} "
+            "ORDER BY id DESC LIMIT {}", campaignId,
+            DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES);
+        if (!result)
+            return 0;
+
+        uint32 failures = 0;
+        do
+        {
+            if (result->Fetch()[0].Get<std::string>() != "reset_failed")
+                break;
+            ++failures;
+        } while (result->NextRow());
+        return failures;
+    }
+
+    // Put a run row into the campaign it belongs to. `AND campaign_id = 0` is
+    // what makes this safe to call on every poll and safe against an ADOPTED run
+    // that was already numbered by the process that started it: a run already in
+    // a campaign is never renumbered by a later one.
+    void StampRunIntoCampaign(uint32 runId, uint32 campaignId, uint32 runNumber,
+                              std::string const& members)
+    {
+        if (!RunAccountingPresent() || !runId || !campaignId)
+            return;
+        CharacterDatabase.Execute(
+            "UPDATE overseer_dungeon_run SET campaign_id = {}, run_number = {}, "
+            "members = '{}' WHERE id = {} AND campaign_id = 0",
+            campaignId, runNumber, Esc(members), runId);
+    }
+
+    // Read a run's campaign back, for the coordinator that adopts a run it did
+    // not start (a worldserver bounce with the party still inside). Returns
+    // false when this schema cannot answer or the row has gone.
+    bool ReadRunCampaign(uint32 runId, uint32& campaignId, uint32& runNumber)
+    {
+        if (!RunAccountingPresent() || !runId)
+            return false;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT campaign_id, run_number FROM overseer_dungeon_run WHERE id = {}",
+            runId);
+        if (!result)
+            return false;
+        campaignId = result->Fetch()[0].Get<uint32>();
+        runNumber = result->Fetch()[1].Get<uint32>();
+        return true;
+    }
+
+    // CLOSE A RUN BECAUSE IT IS OVER, rather than leaving it to the cold
+    // heartbeat.
+    //
+    // Before #144 nothing ever closed a run deliberately: CloseAbandonedRuns was
+    // the only writer of `state = 'ended'`, and it takes RUN_COLD_SECONDS to
+    // notice. That was harmless while a run was a one-off. It is not harmless in
+    // a loop, because the run row is unique per active map: the next run would
+    // either collide with a corpse of the last one or, worse, silently JOIN it -
+    // one row, two runs, and run numbers 1, 2, 3 that never happened.
+    //
+    // `AND state = 'active'` for the same reason CloseAbandonedRuns carries its
+    // predicate into its own UPDATE: closing by id alone would re-close a run
+    // something else had already finished and overwrite its reason.
+    void CloseRun(uint32 runId, char const* outcome, std::string const& reason)
+    {
+        if (!runId)
+            return;
+
+        if (RunAccountingPresent())
+            CharacterDatabase.Execute(
+                "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
+                "outcome = '{}', ended_reason = '{}' WHERE id = {} AND state = 'active'",
+                outcome, Esc(reason), runId);
+        else
+            // No outcome column to write to. The run is still closed, because
+            // leaving it open is the thing that actually breaks the next run.
+            CharacterDatabase.Execute(
+                "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
+                "ended_reason = '{}' WHERE id = {} AND state = 'active'",
+                Esc(reason), runId);
+    }
+
+    // A RUN THAT NEVER GOT INSIDE STILL HAPPENED. The arming drive is the only
+    // thing that opens a run row, and it opens one when it sees a character on
+    // the instance map - so a reset that will not take produces no row at all,
+    // and the campaign would show a gap where its failures were. #144 asks for
+    // the opposite: a failed reset "counts as a failed run". So this inserts the
+    // row itself, born ended.
+    //
+    // THAT CANNOT COLLIDE WITH THE ONE-ACTIVE-RUN-PER-MAP UNIQUE KEY, and the
+    // reason is the generated column that key is built on: `active_map` holds
+    // the map id only while the run is active and NULL once it has ended, and
+    // NULLs do not collide. A row inserted already-ended is therefore invisible
+    // to that key by construction.
+    void RecordResetFailedRun(std::string const& leaderName, uint32 mapId,
+                              uint32 campaignId, uint32 runNumber,
+                              std::string const& reason, std::string const& members)
+    {
+        if (!RunAccountingPresent())
+            return;
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_dungeon_run "
+            "(leader_name, map_id, state, ended_at, ended_reason, campaign_id, "
+            " run_number, outcome, members) "
+            "VALUES ('{}', {}, 'ended', NOW(), '{}', {}, {}, 'reset_failed', '{}')",
+            Esc(leaderName), mapId, Esc(reason), campaignId, runNumber, Esc(members));
+    }
+
+    // WAS THAT A WIPE, ASKED OF THE DEATH RECORD RATHER THAN OF A GUESS.
+    //
+    // The coordinator sees the same thing for a wipe and for a relog: the map
+    // holds nobody any more. The first draft told them apart by asking whether
+    // any member was currently a ghost, which is a reading of the moment this
+    // poll happened to land on rather than of the run - a party that has already
+    // resurrected at the graveyard looks identical to one that walked out.
+    //
+    // overseer_death carries the fact properly: one un-coalesced row per death,
+    // with the map it happened on and when. A wipe is then a statement about the
+    // run's own window - at least as many DISTINCT roster characters died on the
+    // instance map since this run started as went into it. Distinct, because a
+    // character that dies twice is not two members.
+    //
+    // A schema with no overseer_death answers nullptr, which reads as "not a
+    // wipe" - the honest answer for a database that cannot tell.
+    static bool RunEndedInAWipe(uint32 runId, uint32 mapId, uint32 wentIn)
+    {
+        if (!runId || !wentIn)
+            return false;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(DISTINCT d.character_name) FROM overseer_death d "
+            "JOIN overseer_dungeon_run r ON r.id = {} "
+            "WHERE d.map = {} AND d.created_at >= r.started_at", runId, mapId);
+        if (!result)
+            return false;
+
+        return result->Fetch()[0].Get<uint64>() >= wentIn;
     }
 
     // ------------------------------------------- the leader serves the youngest --
@@ -8293,12 +8640,42 @@ private:
     // Miner and an Evoker with no healer in range, and both died. Ugga was
     // still walking." Nobody owned the decision to wait.
     //
-    // WHAT IS BUILT: GATHERING, BARRIER, ENTER, STAGED_INSIDE, CLEARING and
-    // EXIT. LOOT and WIPE_RECOVER are not, and LOOT's absence is a measurement
-    // rather than a deferral - see the end-of-run comment in DriveDungeonRun
-    // for why "the dungeon is cleared" is not a fact available to this module
-    // for map 36 today, and why a signal that reads as success before anything
-    // has happened is worse than no signal.
+    // WHAT IS BUILT: RESET, GATHERING, BARRIER, ENTER, STAGED_INSIDE, CLEARING
+    // and EXIT. LOOT and WIPE_RECOVER are not, and LOOT's absence is a
+    // measurement rather than a deferral - see the end-of-run comment in
+    // DriveDungeonRun for why "the dungeon is cleared" is not a fact available
+    // to this module for map 36 today, and why a signal that reads as success
+    // before anything has happened is worse than no signal.
+    //
+    // AND IT IS A LOOP NOW (#144), which is one new state and one new edge:
+    //
+    //     IDLE -> RESET -> GATHERING -> ... -> CLEARING -> EXIT -> RESET -> ...
+    //                                                           \-> IDLE
+    //
+    // The measured fact that made the loop necessary is not about looping at
+    // all. On 2026-09-02 the family cleared Deadmines, was sent back in with
+    // `job = 'dungeon'`, and every part of this machine worked: staged, crossed
+    // together, `dc on` issued and verified automatically for the first time
+    // ("CLEARING verified - the tank has moved 31y"). Seconds later the dungeon
+    // brain said `advance: no next boss (all dead/skipped) -> stalling`. The
+    // `instance` row for map 36 held completedEncounters = 127 - all seven bits
+    // - and the leader still had a `character_instance` row binding him to it.
+    // He had walked into a mine where everything was already dead.
+    //
+    // So RESET is not a step BETWEEN runs, it is the first step OF one. The
+    // state a rerun inherits is exactly the state the first run of the day
+    // inherits, and a coordinator that only reset on the way round the loop
+    // would still walk the very first run into an empty dungeon.
+    //
+    // WHAT BOUNDS THE LOOP, AND WHAT DOES NOT. Two numbers on the leader's
+    // roster row - `dungeon_runs_wanted` (30 by default, the operator's own
+    // figure) and `dungeon_runs_done` - plus a stop after
+    // DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES resets that would not take. What
+    // does NOT bound it is any notion of the run's GOAL being met: a run's real
+    // goal is #143 and is not built, gear as a goal is #145, "until item X
+    // drops" is #150. #144's own wording for the stand-in is used instead - the
+    // run ended and the party is outside - and the PR that built this says so
+    // rather than implying a completion test exists.
     //
     // IT STILL NEVER WRITES `dc on`. DriveDungeonClear (above) already owns
     // arming the dungeon brain, and it is the only thing that may: `dc on` is
@@ -8659,6 +9036,17 @@ private:
     enum class DungeonRunPhase : uint8
     {
         Idle,          // nobody has asked for a run
+        // A RUN BEGINS AT THE RESET, NOT AT THE DOOR (#144). Measured
+        // 2026-09-02: the party was staged, crossed together, and `dc on` was
+        // accepted and verified - and the dungeon brain said "advance: no next
+        // boss (all dead/skipped) -> stalling" within seconds, because the
+        // `instance` row for map 36 held completedEncounters = 127 and the
+        // leader was still bound to it. Everything about the walking worked and
+        // the run was still a walk through an empty mine. So the reset comes
+        // FIRST, before anybody is aimed anywhere, and it comes first on every
+        // run of a campaign rather than only between them: the state the first
+        // run of the day inherits is exactly the state the second one would.
+        Resetting,     // nobody is inside; the leader resets the instance the party is bound to
         Gathering,     // leader aimed at the staging point, still walking
         Barrier,       // leader has arrived; waiting for the whole roster
         Enter,         // the party closes the last yards to the door and crosses together
@@ -8720,6 +9108,45 @@ private:
         bool anchorSet{false};
         float anchorX{0.f}, anchorY{0.f};
         time_t anchorAt{0};
+
+        // ---- the campaign this run belongs to (#144) ----
+        //
+        // WHY THESE FOUR ARE IN-PROCESS WHEN THE CAP ITSELF IS A COLUMN. The
+        // campaign's PROGRESS has to be durable, which is why
+        // overseer_roster.dungeon_runs_done is a column and this struct does not
+        // count runs itself. What is here is only which campaign and which run
+        // THIS process is currently driving - a cache of two numbers that are
+        // written onto the run row as soon as there is a run row to write them
+        // to, and re-read off that row when a bounced worldserver adopts a run
+        // it did not start. Losing them costs a read, not a count.
+        uint32 campaignId{0};   // 0 until the campaign is allocated or read back
+        uint32 runNumber{0};    // which run of the campaign is being staged or run
+        uint32 runId{0};        // the overseer_dungeon_run row this coordinator drives
+        uint32 wentIn{0};       // how many members crossed, for the wipe test at the end
+
+        // THE CAP AS IT READ WHEN THIS RUN STARTED, carried rather than re-read
+        // at the end of the run. `dungeon_runs_done` is incremented through
+        // CharacterDatabase.Execute, which is queued on the async worker, so a
+        // SELECT issued in the same breath as that increment could read the old
+        // value and start a thirty-first run. Deciding from the numbers this run
+        // began with needs no read at all, and the roster row catches up on its
+        // own well inside the five seconds before the next poll. `capKnown` is
+        // false when the columns do not exist, which is the one case the loop
+        // must not run at all - see CampaignColumnsPresent.
+        uint32 runsWanted{0};
+        bool capKnown{false};
+
+        // ---- RESETTING's two clocks, the same shape CLEARING's two are ----
+        //
+        // `resetSince` is when the reset started waiting for its PRECONDITIONS
+        // (everybody out, nobody in combat) and bounds only that wait;
+        // `resetAttempts` counts actual refusals from the core, which is a
+        // different failure and deserves a different, much smaller bound. See
+        // DUNGEON_RESET_BACKSTOP_SECONDS and DUNGEON_RESET_ATTEMPTS.
+        time_t resetSince{0};
+        uint32 resetAttempts{0};
+        bool loggedResetWaiting{false};
+        bool loggedCampaignOver{false};
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
@@ -9038,6 +9465,410 @@ private:
         return DungeonCrossingResult::Working;
     }
 
+    // ------------------------------------------------------ dungeon run: reset --
+    //
+    // WHAT A RESET IS PRECONDITIONED ON, ALL FOUR OF THEM READ OUT OF THE
+    // PINNED CORE RATHER THAN GUESSED. This is a list of ways the core will
+    // decline, each of which it declines SILENTLY as far as this module is
+    // concerned - Group::ResetInstances returns void and reports itself to a
+    // CLIENT, which is precisely the class of call this module has already been
+    // burned by twice (see the "`delivered` is not `done`" section in AGENTS.md,
+    // and Trainer::TeachSpell before it). Checking them here is what turns four
+    // silent no-ops into four named log lines.
+    //
+    //   1. THE GROUP, AND THE LEADER OF IT. The client's reset-all is
+    //      WorldSession::HandleResetInstancesOpcode (MiscHandler.cpp:1255),
+    //      which calls group->ResetInstances(INSTANCE_RESET_ALL, false, _player)
+    //      only `if (group->IsLeader(_player->GetGUID()))` (MiscHandler.cpp:1262).
+    //      Group::ResetInstances itself does NOT re-check that - it walks
+    //      whichever player it is handed - so issuing it from a non-leader would
+    //      not fail, it would reset the wrong character's binds. And it would
+    //      not help: the instance a GROUPED player lands in is chosen from the
+    //      GROUP LEADER's bind, not their own
+    //      (InstanceSaveMgr::PlayerGetDestinationInstanceId,
+    //      InstanceSaveMgr.cpp:957 - "2. leader temp/perm" wins over the
+    //      player's own temp bind). Resetting a follower would leave the party
+    //      walking back into the same saved instance.
+    //
+    //   2. NOT A BATTLEGROUND, BATTLEFIELD OR DUNGEON-FINDER GROUP:
+    //      Group::ResetInstances returns immediately for those
+    //      (Group.cpp:2330). The roster's group is an ordinary party, so this
+    //      can only fire if something else put them in a queue - which is worth
+    //      a line rather than a silent nothing.
+    //
+    //   3. NORMAL DUNGEON DIFFICULTY. INSTANCE_RESET_ALL breaks out at once
+    //      unless leader->GetDifficulty(false) == DUNGEON_DIFFICULTY_NORMAL
+    //      (Group.cpp:2337). Heroic lockouts are #12 and are not handled here;
+    //      what IS handled is saying so instead of resetting nothing.
+    //
+    //   4. EVERY MEMBER OUT OF THE INSTANCE. This is the one the coordinator
+    //      has to SEQUENCE rather than merely check, and it is why the reset is
+    //      a phase rather than a line inside EXIT. Group::ResetInstances hands
+    //      each bound save to InstanceMap::Reset (Map.cpp:2210), whose return
+    //      value is m_mapRefMgr.IsEmpty() (Map.cpp:2249) - so an instance with
+    //      anybody still standing in it refuses the reset and tells everyone
+    //      inside instead (SendResetFailedNotify, Map.cpp:2240). The party has
+    //      to be all the way out first, which the existing EXIT crossing is
+    //      already the thing that does.
+    //
+    // Out of combat is on this list too, and it is the one precondition the CORE
+    // does not care about: a party still fighting something that followed them
+    // out of the door is not a party that is about to walk back in, and BARRIER
+    // would refuse to open for them a moment later anyway. Waiting for it here
+    // keeps the reset and the re-entry from disagreeing about when the party is
+    // ready.
+    //
+    // Returns an empty string when the reset may be attempted, or the reason it
+    // may not - phrased so the log line reads as a sentence.
+    std::string DungeonResetBlockers(std::vector<std::string> const& members,
+                                     std::string const& leaderName,
+                                     uint32 insideMapId)
+    {
+        Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
+        if (!SteerableAI(leader))
+            return "the leader is not in the world right now";
+
+        // GetGroup  Player.h  Group* GetGroup() const
+        Group* group = leader->GetGroup();
+        if (!group)
+            return "the leader is in no group, so there is no group instance to reset";
+
+        // IsLeader  Group.h:239  bool IsLeader(ObjectGuid guid) const
+        if (!group->IsLeader(leader->GetGUID()))
+            return "'" + leaderName + "' is not the group leader, and the instance a "
+                   "grouped character lands in is chosen from the GROUP leader's bind";
+
+        // isBGGroup/isBFGroup/isLFGGroup  Group.h:222-225
+        if (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup())
+            return "this is a battleground, battlefield or dungeon-finder group, which "
+                   "Group::ResetInstances refuses outright";
+
+        // GetDifficulty  Player.h:1948  Difficulty GetDifficulty(bool isRaid) const
+        if (leader->GetDifficulty(false) != DUNGEON_DIFFICULTY_NORMAL)
+            return "the party is not on normal dungeon difficulty, and INSTANCE_RESET_ALL "
+                   "only resets normal five-mans (heroic lockouts are #12)";
+
+        std::string inside;
+        std::string fighting;
+        for (std::string const& name : members)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(member))
+                continue;   // not in the world, and therefore not on the map either
+
+            // GetMapId  Position.h:281  uint32 GetMapId() const
+            if (member->GetMapId() == insideMapId)
+            {
+                if (!inside.empty())
+                    inside += ", ";
+                inside += name;
+            }
+            // IsInCombat  Unit.h:936  bool IsInCombat() const
+            else if (member->IsInCombat())
+            {
+                if (!fighting.empty())
+                    fighting += ", ";
+                fighting += name;
+            }
+        }
+
+        if (!inside.empty())
+            return "still on map " + std::to_string(insideMapId) + ": " + inside;
+        if (!fighting.empty())
+            return "still in combat: " + fighting;
+        return "";
+    }
+
+    // DO THE RESET, AND THEN READ THE WORLD BACK.
+    //
+    // The action is exactly the one a person clicking "Reset all instances"
+    // takes - INSTANCE_RESET_ALL (Map.h:710) through
+    // Group::ResetInstances(uint8, bool, Player*) (Group.h:283, Group.cpp:2328)
+    // - and deliberately nothing more. In particular this does NOT call
+    // InstanceSaveMgr::PlayerUnbindInstance (InstanceSaveMgr.h:205) on anybody
+    // by hand. That was considered and rejected twice over: it is not a thing a
+    // player can do, so a bug it papers over is a bug nobody would ever have
+    // found from a client, and it is unnecessary anyway - the core's own reset
+    // path ends in UnbindAllFor(save) (Group.cpp:2362, InstanceSaveMgr.cpp:988),
+    // which unbinds every character on that save's player list, which is all
+    // five of them because all five entered through the leader's save.
+    // AGENTS.md's standing instruction is the general form of this: fix the
+    // code, never reach for the admin shortcut.
+    //
+    // THE VERIFICATION IS THE POINT OF THE FUNCTION. `delivered` is not `done`,
+    // and a void call that reports its failure to a client the bot does not have
+    // is the exact shape this module keeps being caught by. So the bind is read
+    // before and after: INSTANCE_RESET_ALL pushes a save onto `toUnbind` only
+    // when the map is unloaded or empty (Group.cpp:2345-2352), so a leader that
+    // is still bound afterwards is a reset that did not happen, whatever the
+    // call appeared to do.
+    //
+    // WHY THE BIND MAP AND NOT THE `character_instance` TABLE, which is how #144
+    // phrases the same check. They are the same fact with two different
+    // latencies: PlayerUnbindInstance deletes the row through
+    // CharacterDatabase.Execute (InstanceSaveMgr.cpp:871-876), which is queued
+    // on the async worker, while the in-memory bind is gone the instant the call
+    // returns. The in-memory map is also the one the SERVER consults when it
+    // decides where the party lands (PlayerGetDestinationInstanceId reads
+    // PlayerGetBoundInstance, InstanceSaveMgr.cpp:957-970), so it is the
+    // authority rather than a proxy for one. The table catches up on its own and
+    // is where an operator can confirm it afterwards.
+    bool ResetGroupInstance(std::string const& leaderName,
+                            std::vector<std::string> const& members,
+                            uint32 insideMapId, std::string& why)
+    {
+        Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
+        if (!SteerableAI(leader))
+        {
+            why = "the leader left the world between the check and the reset";
+            return false;
+        }
+
+        Group* group = leader->GetGroup();
+        if (!group)
+        {
+            why = "the leader left his group between the check and the reset";
+            return false;
+        }
+
+        // PlayerGetBoundInstance  InstanceSaveMgr.h:207
+        InstancePlayerBind* before = sInstanceSaveMgr->PlayerGetBoundInstance(
+            leader->GetGUID(), insideMapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (!before || !before->save)
+        {
+            // NOTHING BOUND IS A SUCCESS, NOT A SKIP. The party is free to walk
+            // into a fresh instance, which is the whole thing the reset is for.
+            // This is the ordinary case for the very first run of a campaign on
+            // a worldserver that has just started.
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is not bound to any instance of map {} - there is "
+                     "nothing to reset and the party will be given a new one on entry",
+                     leaderName, insideMapId);
+            return true;
+        }
+
+        // GetInstanceId / GetCompletedEncounterMask  InstanceSaveMgr.h:62,72.
+        // Both read BEFORE the reset because the save can be gone after it, and
+        // the encounter mask is the number that made #144 necessary: 127 on map
+        // 36 is all seven Deadmines encounters already dead.
+        uint32 const instanceId = before->save->GetInstanceId();
+        uint32 const encounters = before->save->GetCompletedEncounterMask();
+
+        LOG_INFO("module.overseer",
+                 "overseer: resetting map {} for '{}' - he is bound to instance {} with "
+                 "completedEncounters = {}, which is what a rerun would otherwise walk "
+                 "back into. Issuing the group reset a player's own 'reset all instances' "
+                 "would issue",
+                 insideMapId, leaderName, instanceId, encounters);
+
+        // ResetInstances  Group.h:283  void ResetInstances(uint8 method, bool isRaid, Player* leader)
+        // INSTANCE_RESET_ALL  Map.h:710
+        group->ResetInstances(INSTANCE_RESET_ALL, false, leader);
+
+        if (InstancePlayerBind* after = sInstanceSaveMgr->PlayerGetBoundInstance(
+                leader->GetGUID(), insideMapId, DUNGEON_DIFFICULTY_NORMAL))
+        {
+            why = "'" + leaderName + "' is still bound to instance " +
+                  std::to_string(after->save ? after->save->GetInstanceId() : 0) +
+                  " on map " + std::to_string(insideMapId) +
+                  " after the reset, so the instance was not empty when it was asked";
+            return false;
+        }
+
+        // AND THE OTHER FOUR, WHICH IS A WARNING RATHER THAN A FAILURE.
+        // UnbindAllFor covers everyone on the leader's save, so a member left
+        // bound here is one bound to a DIFFERENT save of the same map - entered
+        // separately at some point. That cannot send the party anywhere wrong
+        // (the group leader's bind decides, InstanceSaveMgr.cpp:957) but it does
+        // leave a character_instance row behind, and a row nobody expected is
+        // worth a line rather than a silence.
+        std::string stillBound;
+        for (std::string const& name : members)
+        {
+            if (name == leaderName)
+                continue;
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(member))
+                continue;
+            if (sInstanceSaveMgr->PlayerGetBoundInstance(
+                    member->GetGUID(), insideMapId, DUNGEON_DIFFICULTY_NORMAL))
+            {
+                if (!stillBound.empty())
+                    stillBound += ", ";
+                stillBound += name;
+            }
+        }
+
+        if (!stillBound.empty())
+            LOG_WARN("module.overseer",
+                     "overseer: map {} was reset for the group and these members are still "
+                     "bound to some other save of it: {}. They will follow the leader into "
+                     "his new instance regardless - a grouped character's destination comes "
+                     "from the GROUP leader's bind - but their character_instance rows "
+                     "outlived the reset",
+                     insideMapId, stillBound);
+
+        LOG_INFO("module.overseer",
+                 "overseer: map {} reset - instance {} (completedEncounters = {}) is no "
+                 "longer bound to '{}', verified by reading the bind back rather than by "
+                 "the call returning. The next entry gets a fresh instance",
+                 insideMapId, instanceId, encounters, leaderName);
+        return true;
+    }
+
+    // The `members` column is a list a person reads, so it is joined the way a
+    // person writes one. Roster names are ASCII and cannot contain a comma.
+    static std::string JoinNames(std::vector<std::string> const& names)
+    {
+        std::string joined;
+        for (std::string const& name : names)
+        {
+            if (!joined.empty())
+                joined += ",";
+            joined += name;
+        }
+        return joined;
+    }
+
+    // A RUN THAT NEVER STARTED IS STILL A RUN THAT HAPPENED (#144). Called only
+    // from RESETTING, on either of its two ways of giving up - preconditions
+    // that never came true, or the core refusing DUNGEON_RESET_ATTEMPTS times.
+    //
+    // It ends at IDLE rather than looping straight back into another reset, so
+    // that the next attempt goes through the campaign checks at the top of this
+    // drive like any other run. That is what makes the three-consecutive-
+    // failures stop reachable at all: the failure is written down first and read
+    // back as a row, not carried in a counter this process could lose.
+    void FailRunAtReset(DungeonRunCoordinatorState& coord,
+                        std::string const& leaderName,
+                        std::vector<std::string> const& members,
+                        DungeonPortal const& portal,
+                        std::string const& reason)
+    {
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} could not start - {}. It counts "
+                  "as a failed run: the instance still holds whatever was already dead in "
+                  "it, so walking back in would be the empty dungeon this whole loop "
+                  "exists to stop happening",
+                  coord.runNumber, coord.campaignId, reason);
+
+        RecordResetFailedRun(leaderName, portal.insideMapId, coord.campaignId,
+                             coord.runNumber, reason, JoinNames(members));
+        CountRunDone(leaderName);
+        _travelAims.Release(leaderName);
+        coord = DungeonRunCoordinatorState();
+    }
+
+    // THE END OF A RUN, AND THE DECISION TO GO AGAIN.
+    //
+    // Every path that used to say "the run is over, returning to IDLE" comes
+    // here instead. Three things happen in a fixed order, and the order is the
+    // content: the run row is CLOSED (before #144 nothing ever closed one
+    // deliberately - CloseAbandonedRuns took RUN_COLD_SECONDS to notice, which
+    // in a loop means the next run either collides with the last one's row or
+    // silently joins it), the campaign counter is INCREMENTED, and only then is
+    // the next run decided.
+    //
+    // WHAT "THE GOAL" IS TODAY, STATED PLAINLY. #144 asks the loop to go again
+    // "when a run's goal is not met", and this module has no goal to test. A
+    // run's real goal - every held quest for the instance complete - is #143 and
+    // is not built; gear as a goal is #145; "until item X drops" is #150. So the
+    // condition implemented here is the one #144 itself names as the for-now
+    // stand-in: the run ended and the party is outside. Everything that reaches
+    // this function satisfies that by construction, which is why the only
+    // question left is the COUNT.
+    void EndRunAndDecide(DungeonRunCoordinatorState& coord,
+                         std::string const& leaderName,
+                         DungeonPortal const& portal,
+                         uint32 runId, char const* outcome,
+                         std::string const& reason,
+                         bool stillWanted)
+    {
+        CloseRun(runId, outcome, reason);
+        CountRunDone(leaderName);
+        _travelAims.Release(leaderName);
+
+        uint32 const finished = coord.runNumber;
+        uint32 const wanted = coord.runsWanted;
+        bool const known = coord.capKnown;
+        uint32 const campaignId = coord.campaignId;
+        std::string const keyword = coord.portalKeyword;
+        float const stageX = coord.stageX;
+        float const stageY = coord.stageY;
+        float const stageZ = coord.stageZ;
+
+        // THE OPERATOR OUTRANKS THE COUNT. `job` leaving 'dungeon' is a person
+        // (or the bridge) saying the family has something else to do, and it is
+        // already the path by which a run inside the instance is walked back
+        // out. Without this check the run that job change ENDED would be
+        // followed by a cheerful "the run goes again", a reset, and a re-entry,
+        // all undone one poll later by the stand-down at the top of this drive.
+        // Correct either way, but a loop that has to be told twice is a loop
+        // nobody would trust.
+        if (!stillWanted)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. It does not go again: "
+                     "'{}' no longer has job = 'dungeon', and the campaign counter does "
+                     "not outrank the operator",
+                     runId, outcome, reason, leaderName);
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        if (!known)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. It does not repeat: this "
+                     "database has no dungeon_runs_wanted column, so there is no cap to "
+                     "bound a loop with and looping without one is the worse direction to "
+                     "guess in", runId, outcome, reason);
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        if (finished >= wanted)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
+                     "campaign {}, so the campaign is done and the coordinator returns to "
+                     "IDLE. The richer stopping conditions - until every held quest is "
+                     "complete (#143), until nobody has an upgrade left inside (#145), "
+                     "until a named item drops (#150) - do not exist yet; this loop stops "
+                     "on the count and on nothing else",
+                     runId, outcome, reason, finished, wanted, campaignId);
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        coord = DungeonRunCoordinatorState();
+        coord.phase = DungeonRunPhase::Resetting;
+        coord.portalKeyword = keyword;
+        // THE STAGING POINT IS CARRIED, NOT RE-RESOLVED. Its own comment gives
+        // the reason it is resolved once per run rather than once per poll: the
+        // answer depends on whether the grid was loaded when it was asked, and a
+        // barrier circle that moves under a party standing in it is a gather
+        // that gets harder the closer it gets. Between two runs of one campaign
+        // the party is standing on that exact point, so the same argument says
+        // to keep it rather than ask again.
+        coord.stageX = stageX;
+        coord.stageY = stageY;
+        coord.stageZ = stageZ;
+        coord.campaignId = campaignId;
+        coord.runNumber = finished + 1;
+        coord.runsWanted = wanted;
+        coord.capKnown = known;
+        coord.resetSince = std::time(nullptr);
+
+        LOG_INFO("module.overseer",
+                 "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
+                 "campaign {}, so the run goes again: RESET on map {} first, because the "
+                 "instance they just left still has its bosses dead in it and re-entering "
+                 "without a reset is a walk through an empty dungeon",
+                 runId, outcome, reason, finished, wanted, campaignId,
+                 portal.insideMapId);
+    }
+
     void DriveDungeonRun()
     {
         // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN (#122). Everything
@@ -9144,12 +9975,33 @@ private:
                 coord.phase = DungeonRunPhase::Clearing;
                 coord.portalKeyword = inside->keyword;
                 coord.awaitingSince = std::time(nullptr);
+
+                // AND THE CAMPAIGN THE ADOPTED RUN BELONGS TO, READ OFF ITS ROW
+                // (#144). The coordinator's campaign numbers are in-process and
+                // die with the worldserver; the run row's do not. Reading them
+                // back is what stops a bounce mid-campaign from either losing
+                // the run's number or inventing a rival campaign for it. A row
+                // with campaign_id 0 is a run this coordinator never stamped -
+                // somebody walked in by another path - and it stays 0, because
+                // putting a number on a run nobody drove would be a claim about
+                // a series that never happened.
+                coord.runId = ActiveRunIdOnMap(inside->insideMapId);
+                ReadRunCampaign(coord.runId, coord.campaignId, coord.runNumber);
+
+                // The cap is re-read rather than inherited: the operator may
+                // have changed it while the process was down, and the adopted
+                // run's own end has to know whether to go again.
+                DungeonCampaignCap const adoptedCap = LoadCampaignCap(leaderName);
+                coord.capKnown = adoptedCap.known;
+                coord.runsWanted = adoptedCap.wanted;
+
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is already inside a dungeon run on map {} - "
-                         "adopting it at CLEARING. The staging half is over and there is "
-                         "nothing to gather; what is left to own is whether the dungeon "
-                         "brain is on, and the way back out",
-                         leaderName, inside->insideMapId);
+                         "adopting it at CLEARING (run {} of campaign {}). The staging "
+                         "half is over and there is nothing to gather; what is left to own "
+                         "is whether the dungeon brain is on, and the way back out",
+                         leaderName, inside->insideMapId, coord.runNumber,
+                         coord.campaignId);
                 return;
             }
 
@@ -9174,34 +10026,106 @@ private:
                 return;
             }
 
-            std::ostringstream aim;
-            aim << "at:" << portal->outsideMapId << ':' << stageX << ','
-                << stageY << ',' << stageZ;
+            // HOW MANY RUNS ARE LEFT, ASKED BEFORE ANYBODY IS AIMED ANYWHERE
+            // (#144). The two stop conditions this module can prove are read
+            // here, at the one point where a run is about to begin, so that a
+            // campaign that is over never claims the wheel at all.
+            DungeonCampaignCap const cap = LoadCampaignCap(leaderName);
+            if (cap.known && cap.done >= cap.wanted)
+            {
+                // SAID ONCE, NOT EVERY FIVE SECONDS. `job` stays 'dungeon' after
+                // a campaign finishes - this module does not write that column
+                // and will not decide for the operator that the family has
+                // something else to do - so this branch is reached on every poll
+                // until somebody changes one of the two numbers. The flag lives
+                // on the idle coordinator, which nothing reassigns while it is
+                // idle, and is cleared the moment the campaign has room again.
+                if (!coord.loggedCampaignOver)
+                {
+                    coord.loggedCampaignOver = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: the dungeon campaign for '{}' is over - {} of {} "
+                             "runs done. Nothing further is started; raise "
+                             "overseer_roster.dungeon_runs_wanted, or set "
+                             "dungeon_runs_done back to 0, to run it again",
+                             leaderName, cap.done, cap.wanted);
+                }
+                return;
+            }
 
-            // CLAIM, not a raw UPDATE: the run supersedes whatever the leader
-            // was doing, and taking the wheel also drops any errand memory left
-            // over from the last time this exact staging point was aimed at -
-            // which is the case DriveTravel's own `target != target` reset
-            // cannot see, because the target is the same string. Without that,
-            // a re-gather after a given-up crossing inherits the failed
-            // crossing's backstop clock and is released as unreachable on its
-            // first poll, having walked nowhere. See TravelAimBook.
-            _travelAims.Claim(leaderName, aim.str());
+            // THE `loggedCampaignOver = false` THAT USED TO BE ON THIS LINE IS
+            // GONE, AND ITS ABSENCE IS THE FIX. Clearing the flag here, between
+            // the two stop conditions, re-armed the SECOND one on every poll:
+            // the campaign-over branch above did not fire (there is room in the
+            // count), the flag was cleared, and the three-consecutive-failures
+            // branch below then said its piece again five seconds later,
+            // forever. Nothing needs to clear it: the flag lives on the idle
+            // coordinator and the only thing that ever leaves idle is a run
+            // starting, which assigns a fresh DungeonRunCoordinatorState over
+            // the whole struct.
+
+            // WHICH CAMPAIGN, AND WHICH RUN OF IT. `dungeon_runs_done == 0` is
+            // the operator's gesture for "start a new campaign" (see
+            // 2026_09_02_01's own comment), so it is what decides whether this
+            // run joins the campaign the previous rows belong to or opens a new
+            // one. Everything here is skipped when the run table cannot carry a
+            // campaign, in which case the run happens exactly as it does today
+            // and simply is not numbered.
+            uint32 campaignId = 0;
+            uint32 runNumber = cap.done + 1;
+            if (RunAccountingPresent())
+            {
+                campaignId = cap.done == 0
+                                 ? 0
+                                 : CampaignInProgress(leaderName, portal->insideMapId);
+                if (!campaignId)
+                    campaignId = AllocateCampaignId();
+
+                uint32 const failures = TrailingResetFailures(campaignId);
+                if (failures >= DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES)
+                {
+                    if (!coord.loggedCampaignOver)
+                    {
+                        coord.loggedCampaignOver = true;
+                        LOG_ERROR("module.overseer",
+                                  "overseer: the dungeon campaign for '{}' is stopped - the "
+                                  "last {} runs of campaign {} all ended 'reset_failed', so "
+                                  "the instance still has every boss dead in it and a "
+                                  "further run would walk into the same empty dungeon. The "
+                                  "reasons are on those rows; set dungeon_runs_done to 0 "
+                                  "once the cause is fixed",
+                                  leaderName, failures, campaignId);
+                    }
+                    return;
+                }
+            }
 
             coord = DungeonRunCoordinatorState();
-            coord.phase = DungeonRunPhase::Gathering;
+            // THE RUN STARTS AT THE RESET, NOT AT THE STAGING POINT (#144). The
+            // staging aim is deliberately NOT claimed here any more: it is
+            // claimed by RESETTING once the instance is actually clean, so that
+            // a party which can never be given a fresh instance is never walked
+            // to a door it should not go through. See the phase's own comment.
+            coord.phase = DungeonRunPhase::Resetting;
             coord.portalKeyword = "deadmines";
             coord.stageX = stageX;
             coord.stageY = stageY;
             coord.stageZ = stageZ;
+            coord.campaignId = campaignId;
+            coord.runNumber = runNumber;
+            coord.runsWanted = cap.wanted;
+            coord.capKnown = cap.known;
+            coord.resetSince = std::time(nullptr);
 
             LOG_INFO("module.overseer",
-                     "overseer: dungeon run requested (job=dungeon on leader '{}') - "
-                     "aiming it at the Deadmines staging point ({}) outside the portal, "
-                     "{:.0f}y back down the approach corridor from areatrigger {}; "
-                     "GATHERING begins",
-                     leaderName, aim.str(), DUNGEON_STAGING_STANDOFF_YARDS,
-                     portal->entryTriggerId);
+                     "overseer: dungeon run requested (job=dungeon on leader '{}') - run {} "
+                     "of {} in campaign {}. RESET goes first: the instance the party is "
+                     "bound to is reset before anybody is aimed at the door, because a "
+                     "rerun into a saved instance is a walk through a dungeon where "
+                     "everything is already dead. The staging point ({:.1f}, {:.1f}, "
+                     "{:.1f}) is resolved and held for GATHERING",
+                     leaderName, runNumber,
+                     cap.known ? cap.wanted : 0, campaignId, stageX, stageY, stageZ);
             return;
         }
 
@@ -9226,8 +10150,17 @@ private:
         Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
         PlayerbotAI* leaderAI = SteerableAI(leader);
 
-        // THE JOB LEAVING 'dungeon' IS WHAT ENDS A RUN, and it is the only
-        // honest end-of-run signal this module has today.
+        // THE JOB LEAVING 'dungeon' IS ONE OF TWO WAYS A RUN ENDS, and it is
+        // the only one a person controls.
+        //
+        // The other is the instance map holding no roster member any more,
+        // handled further down beside the census - a wipe, a relog, a party
+        // that left by some other path. Since #144 those two ends are the same
+        // end: both go through EndRunAndDecide, which closes the run row, counts
+        // it against the campaign, and decides whether to go again. The
+        // difference is that this one says the operator no longer wants the
+        // run at all, which outranks any count (see EndRunAndDecide's
+        // `stillWanted`).
         //
         // The state machine in the epic has the run end when the dungeon is
         // CLEARED, and that fact is not available here. It was looked for
@@ -9307,7 +10240,8 @@ private:
         // ENTER it still means what it always meant: entry happened by some
         // other path (a human command, a different drive, a relog that landed
         // inside) and there is no gather left to own.
-        if ((coord.phase == DungeonRunPhase::Gathering ||
+        if ((coord.phase == DungeonRunPhase::Resetting ||
+             coord.phase == DungeonRunPhase::Gathering ||
              coord.phase == DungeonRunPhase::Barrier) && InDungeonRun(leader))
         {
             LOG_INFO("module.overseer",
@@ -9325,6 +10259,84 @@ private:
             // the reason is known. Same argument as the ENTER success path.
             _travelAims.Release(leaderName);
             coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        if (coord.phase == DungeonRunPhase::Resetting)
+        {
+            // WAITING AND FAILING ARE DIFFERENT THINGS, ON DIFFERENT CLOCKS.
+            // A party that is still filing out of the door, or still finishing
+            // a fight that followed them out, is a reset that is not READY -
+            // nothing has gone wrong and the answer is to wait. A reset the
+            // core has actually refused is a different fact and gets the much
+            // smaller DUNGEON_RESET_ATTEMPTS. Conflating them would either give
+            // up on a party that was about to be ready or hammer a refusal that
+            // was never going to change.
+            std::string const blockers =
+                DungeonResetBlockers(members, leaderName, portal->insideMapId);
+            if (!blockers.empty())
+            {
+                if (!coord.loggedResetWaiting)
+                {
+                    coord.loggedResetWaiting = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} holds at RESET - {}. The instance "
+                             "cannot be reset while anybody is standing in it "
+                             "(InstanceMap::Reset returns whether the map is empty), so "
+                             "this waits rather than asking and being refused",
+                             coord.runNumber, blockers);
+                }
+
+                if (coord.resetSince &&
+                    std::time(nullptr) - coord.resetSince > DUNGEON_RESET_BACKSTOP_SECONDS)
+                    FailRunAtReset(coord, leaderName, members, *portal,
+                                   "the reset never became possible in " +
+                                       std::to_string(DUNGEON_RESET_BACKSTOP_SECONDS / 60) +
+                                       " minutes - " + blockers);
+                return;
+            }
+
+            std::string why;
+            if (ResetGroupInstance(leaderName, members, portal->insideMapId, why))
+            {
+                std::ostringstream aim;
+                aim << "at:" << portal->outsideMapId << ':' << coord.stageX << ','
+                    << coord.stageY << ',' << coord.stageZ;
+
+                // CLAIM, not a raw UPDATE: the run supersedes whatever the
+                // leader was doing, and taking the wheel also drops any errand
+                // memory left over from the last time this exact staging point
+                // was aimed at - which is the case DriveTravel's own
+                // `target != target` reset cannot see, because the target is
+                // the same string. Without that, a re-gather after a given-up
+                // crossing inherits the failed crossing's backstop clock and is
+                // released as unreachable on its first poll, having walked
+                // nowhere. See TravelAimBook. In a LOOP that argument stops
+                // being hypothetical: every run after the first aims at the
+                // identical string the previous run just finished with.
+                _travelAims.Claim(leaderName, aim.str());
+
+                coord.phase = DungeonRunPhase::Gathering;
+                coord.loggedGathering = false;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} of {} - map {} is reset and '{}' is "
+                         "aimed at the staging point ({}); GATHERING begins {:.0f}y back "
+                         "down the approach corridor from areatrigger {}",
+                         coord.runNumber, coord.capKnown ? coord.runsWanted : 0,
+                         portal->insideMapId, leaderName, aim.str(),
+                         DUNGEON_STAGING_STANDOFF_YARDS, portal->entryTriggerId);
+                return;
+            }
+
+            ++coord.resetAttempts;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} asked for the map {} reset and it did not "
+                     "take ({} of {} attempts) - {}",
+                     coord.runNumber, portal->insideMapId, coord.resetAttempts,
+                     DUNGEON_RESET_ATTEMPTS, why);
+
+            if (coord.resetAttempts >= DUNGEON_RESET_ATTEMPTS)
+                FailRunAtReset(coord, leaderName, members, *portal, why);
             return;
         }
 
@@ -9452,12 +10464,22 @@ private:
                     case DungeonCrossingResult::Through:
                         LOG_INFO("module.overseer",
                                  "overseer: all {} roster members came back out through "
-                                 "areatrigger {} and are on map {} - the run is over and "
-                                 "the coordinator returns to IDLE",
+                                 "areatrigger {} and are on map {} - the run is over",
                                  static_cast<uint32>(members.size()), triggerId,
                                  portal->outsideMapId);
-                        _travelAims.Release(leaderName);
-                        coord = DungeonRunCoordinatorState();
+                        // THE ONE PRECONDITION A RESET CANNOT BE GIVEN BY
+                        // ANYTHING ELSE (#144): every member out of the
+                        // instance. EXIT is what establishes it, and this is
+                        // the line where it becomes true - so the decision to
+                        // go again is taken here rather than a phase later.
+                        EndRunAndDecide(coord, leaderName, *portal,
+                                        coord.runId
+                                            ? coord.runId
+                                            : ActiveRunIdOnMap(portal->insideMapId),
+                                        "left",
+                                        "the party walked back out through areatrigger " +
+                                            std::to_string(triggerId),
+                                        leaderJob == "dungeon");
                         return;
 
                     case DungeonCrossingResult::GaveUp:
@@ -9518,13 +10540,45 @@ private:
             // 'dungeon', and WIPE_RECOVER is a later slice.
             if (!inside)
             {
+                // HOWEVER IT ENDED - AND #144 MAKES THAT WORTH ASKING ABOUT.
+                // The coordinator still does not act differently on a wipe than
+                // on a relog: both end the run and both are followed by a reset
+                // and another run. What changed is that the run now gets an
+                // OUTCOME, and "the party all died" and "somebody logged out"
+                // are different enough that recording them as the same thing
+                // would make the run table useless for the question #151 will
+                // ask of it. The test is over overseer_death rather than over
+                // who happens to be a ghost this poll - see RunEndedInAWipe.
+                uint32 const runId = coord.runId
+                                         ? coord.runId
+                                         : ActiveRunIdOnMap(portal->insideMapId);
+                bool const wiped =
+                    RunEndedInAWipe(runId, portal->insideMapId, coord.wentIn);
                 LOG_INFO("module.overseer",
                          "overseer: the dungeon run holds nobody any more - not one roster "
-                         "member is on map {}, so the run is over however it ended; "
-                         "returning to IDLE", portal->insideMapId);
-                coord = DungeonRunCoordinatorState();
+                         "member is on map {}, so the run is over however it ended",
+                         portal->insideMapId);
+                EndRunAndDecide(coord, leaderName, *portal, runId,
+                                wiped ? "wipe" : "emptied",
+                                wiped
+                                    ? "every member who went in died on map " +
+                                          std::to_string(portal->insideMapId) +
+                                          " during this run"
+                                    : "the map emptied without the coordinator walking "
+                                      "them out",
+                                leaderJob == "dungeon");
                 return;
             }
+
+            // HOW MANY WENT IN, RATCHETED RATHER THAN SAMPLED. This is only ever
+            // read by the wipe test at the end of the run, and what that test
+            // needs is the size of the party that was in there - not the size of
+            // whatever is left standing when the map finally empties, which is
+            // zero by definition. A high-water mark is the honest reading, and
+            // it also covers a run ADOPTED after a bounce, which never passes
+            // through the ENTER crossing that would otherwise have counted.
+            if (inside > coord.wentIn)
+                coord.wentIn = inside;
 
             if (coord.phase == DungeonRunPhase::StagedInside)
             {
@@ -9555,6 +10609,19 @@ private:
                 coord.loggedNotAccepted = false;
                 coord.loggedMoved = false;
                 coord.loggedNotMoved = false;
+
+                // THE RUN JOINS ITS CAMPAIGN HERE, AND HERE IS THE FIRST MOMENT
+                // IT COULD (#144). The run ROW is opened by the arming drive,
+                // which is the thing that notices somebody is on the instance
+                // map - so it exists by now and not before, and this is the
+                // earliest point at which the coordinator can put its own
+                // numbers on it. `AND campaign_id = 0` inside StampRunIntoCampaign
+                // is what keeps this idempotent against a re-entry to this
+                // transition and against a run some other process already
+                // numbered.
+                coord.runId = ActiveRunIdOnMap(portal->insideMapId);
+                StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
+                                     JoinNames(members));
                 // THE LINE THIS WHOLE EPIC WAS OPENED TO MAKE POSSIBLE, so it
                 // says what is now true rather than what was attempted.
                 LOG_INFO("module.overseer",
