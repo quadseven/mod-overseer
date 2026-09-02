@@ -105,6 +105,7 @@
 #include "ItemTemplate.h"
 #include "GuildMgr.h"
 #include "ObjectAccessor.h"
+#include "MapMgr.h"
 #include "ObjectMgr.h"
 #include "QuestDef.h"
 #include "Player.h"
@@ -255,6 +256,47 @@ constexpr uint64 STUCK_REVIVAL_TRAP_DEATHS = 3;
 constexpr uint32 STUCK_REVIVAL_TRAP_MINUTES = 15;
 constexpr float STUCK_REVIVAL_TRAP_RADIUS = 100.0f;
 
+// WHEN THE NEAREST GRAVEYARD IS SOMEBODY ELSE'S CAMP.
+// GetClosestGraveyard answers a geometry question. The character needs a
+// safety question answered: where can it stand for ten seconds at half
+// health. Measured after the first full instance clear: a level 22 follower
+// died once on the road through Duskwood, was resurrected by this drive at
+// the nearest graveyard, Raven Hill cemetery, and died there twice more
+// inside a minute to level 25-30 undead, each time before it could take a
+// step. The trap check above (three deaths within 100 yards in fifteen
+// minutes) is the right backstop for a loop that has already run; this is
+// the check that stops the loop from starting, by asking about the
+// destination BEFORE the first revival there.
+//
+// A graveyard is refused when the ground it stands on is levelled above the
+// character (AreaTable's area_level, the same number the client's zone text
+// reads), or when hostile spawns above the character's level sit within
+// GRAVEYARD_THREAT_RADIUS of it. Spawn data, not the live grid: a graveyard
+// two grids away is not loaded, and an unloaded grid reads as "no creatures",
+// which is exactly the wrong answer for the question being asked.
+// The alternatives are the core's own candidate set for that corpse (the
+// graveyards graveyard_zone links to its zone, filtered by team, which is
+// what GetClosestGraveyard itself walks at GameGraveyard.cpp:145-160), nearest
+// first; when none qualifies the bind point is the destination, because it
+// is the one place that always exists and is always the character's own.
+constexpr float GRAVEYARD_THREAT_RADIUS = 60.0f;
+constexpr std::size_t GRAVEYARD_CANDIDATES = 6;
+
+// Two revivals of the same character at the same graveyard inside this
+// window, and the second goes to the bind point instead, unconditionally:
+// whatever the scoring above thought of that graveyard, the character has
+// now demonstrated it cannot live there.
+constexpr int64 GRAVEYARD_REPEAT_SECONDS = 5 * 60;
+
+// THE GRACE AFTER A REVIVAL. A character revived at half health that is
+// immediately walked off by `follow` or `new rpg` arrives at its next fight
+// at half health. So it is held (`stay`, which upstream honours over
+// `follow`) for this long before this module lets anything move it - unless
+// hostile spawns sit within REVIVAL_AGGRO_RADIUS of the spot, in which case
+// standing still is the worse option and it is left free to move away.
+constexpr int64 REVIVAL_HOLD_SECONDS = 20;
+constexpr float REVIVAL_AGGRO_RADIUS = 30.0f;
+
 // The living party member the dungeon module could send to a corpse, or null.
 //
 // Re-derived from DcRezRecovery::CanRecover (DcRezRecovery.cpp:361-377) with
@@ -274,6 +316,164 @@ constexpr float STUCK_REVIVAL_TRAP_RADIUS = 100.0f;
 //   GetMapId        Position.h:281    uint32 GetMapId() const
 //   CLASS_PALADIN 2, CLASS_PRIEST 5, CLASS_SHAMAN 7, CLASS_DRUID 11
 //                   SharedDefines.h:127,130,132,136
+// What hostile spawn data says about a spot: how many creatures hostile to
+// this character and above `aboveLevel` are placed within `radius` yards of
+// (x, y) on `mapId`, and the highest-level one, for the log line.
+//
+// Members read at the pinned core:
+//   GetAllCreatureData      ObjectMgr.h:1235   CreatureDataContainer const&
+//   GetCreatureTemplate     ObjectMgr.h:773    CreatureTemplate const* (uint32)
+//   CreatureData::id        CreatureData.h:372 entry in creature_template
+//   SpawnData mapid/posX/posY  SpawnData.h:69,71,72
+//   CreatureTemplate Name/maxlevel/faction  CreatureData.h:192,197,199
+//   GetFactionTemplateEntry Unit.h:853
+//   sFactionTemplateStore   DBCStores.h:121
+//   FactionTemplateEntry::IsHostileTo(FactionTemplateEntry const&)
+//                           DBCStructure.h:1004
+struct NearbyThreat
+{
+    uint32 count{0};
+    uint32 level{0};
+    std::string name;
+};
+
+static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float y,
+                                      float radius, uint32 aboveLevel)
+{
+    NearbyThreat threat;
+    FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
+    if (!mine)
+        return threat;
+
+    float const r2 = radius * radius;
+    for (auto const& spawn : sObjectMgr->GetAllCreatureData())
+    {
+        CreatureData const& data = spawn.second;
+        if (data.mapid != mapId)
+            continue;
+        float const dx = data.posX - x;
+        float const dy = data.posY - y;
+        if (dx * dx + dy * dy > r2)
+            continue;
+        CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
+        if (!tmpl || tmpl->maxlevel <= aboveLevel)
+            continue;
+        FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
+        if (!theirs || !theirs->IsHostileTo(*mine))
+            continue;
+        ++threat.count;
+        if (tmpl->maxlevel > threat.level)
+        {
+            threat.level = tmpl->maxlevel;
+            threat.name = tmpl->Name;
+        }
+    }
+    return threat;
+}
+
+// The level the game gives the ground at a point: the sub-area's
+// area_level, or its zone's when the sub-area carries none. 0 when unknown.
+//
+// Members read at the pinned core:
+//   Map::GetAreaId(phaseMask, x, y, z)  Map.h:253
+//   sAreaTableStore                     DBCStores.h:91
+//   AreaTableEntry zone/area_level      DBCStructure.h:522,526
+static int32 AreaLevelAt(Map* map, uint32 phaseMask, float x, float y, float z)
+{
+    if (!map)
+        return 0;
+    AreaTableEntry const* area = sAreaTableStore.LookupEntry(map->GetAreaId(phaseMask, x, y, z));
+    if (area && area->area_level <= 0 && area->zone)
+        area = sAreaTableStore.LookupEntry(area->zone);
+    return area ? area->area_level : 0;
+}
+
+// Why this character should not be revived at this graveyard, or empty
+// when there is no reason. See GRAVEYARD_THREAT_RADIUS for the two tests.
+//
+//   FindBaseMap   MapMgr.h:44   Map* FindBaseMap(uint32 mapId) const
+//   GetPhaseMask  Object.h:517  uint32 GetPhaseMask() const
+static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g)
+{
+    uint32 const level = bot->GetLevel();
+    Map* map = g.Map == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(g.Map);
+    int32 const areaLevel = AreaLevelAt(map, bot->GetPhaseMask(), g.x, g.y, g.z);
+    if (areaLevel > int32(level))
+        return "it stands on level " + std::to_string(areaLevel) + " ground and the character is level " +
+               std::to_string(level);
+
+    NearbyThreat const threat = HostileSpawnsNear(bot, g.Map, g.x, g.y, GRAVEYARD_THREAT_RADIUS, level);
+    if (threat.count)
+        return std::to_string(threat.count) + " hostile spawn(s) above level " + std::to_string(level) +
+               " within " + std::to_string(uint32(GRAVEYARD_THREAT_RADIUS)) + " yards, up to '" +
+               threat.name + "' (level " + std::to_string(threat.level) + ")";
+    return {};
+}
+
+// The nearest graveyard this character can stand at: `nearest` itself when
+// it passes, else the nearest of the core's own alternatives for this corpse
+// that does, else null (the caller goes to the bind point). `refused`
+// collects every refusal, so the log line can say why.
+//
+// Members read at the pinned core:
+//   GetGraveyardData          GameGraveyard.h:62  GraveyardContainer const&
+//   FindGraveyardData         GameGraveyard.h:61  GraveyardData const* (id, zone)
+//   IsNeutralOrFriendlyToTeam GameGraveyard.h:42
+//   GetTeamId                 Player.h:2142
+//   Map::GetZoneAndAreaId     Map.h:255
+static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct const* nearest,
+                                                uint32 corpseMap, float cx, float cy, float cz,
+                                                std::string& refused)
+{
+    refused = GraveyardRefusal(bot, *nearest);
+    if (refused.empty())
+        return nearest;
+    refused = "'" + nearest->name + "': " + refused;
+
+    // The corpse's zone and area, because that is what graveyard_zone keys
+    // its links by (GameGraveyard.cpp:145-160): a graveyard linked to the
+    // corpse's area or zone, and neutral or friendly to the team, is one the
+    // core itself would have offered; the nearest of them is the one it
+    // picked.
+    Map* map = corpseMap == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(corpseMap);
+    if (!map)
+        return nullptr;
+    uint32 zoneId = 0;
+    uint32 areaId = 0;
+    map->GetZoneAndAreaId(bot->GetPhaseMask(), zoneId, areaId, cx, cy, cz);
+
+    std::vector<std::pair<float, GraveyardStruct const*>> candidates;
+    for (auto const& entry : sGraveyard->GetGraveyardData())
+    {
+        GraveyardStruct const& g = entry.second;
+        if (g.Map != corpseMap || g.ID == nearest->ID)
+            continue;
+        GraveyardData const* link = sGraveyard->FindGraveyardData(g.ID, areaId);
+        if (!link)
+            link = sGraveyard->FindGraveyardData(g.ID, zoneId);
+        if (!link || !link->IsNeutralOrFriendlyToTeam(bot->GetTeamId()))
+            continue;
+        float const dx = g.x - cx;
+        float const dy = g.y - cy;
+        candidates.emplace_back(dx * dx + dy * dy, &g);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](auto const& a, auto const& b) { return a.first < b.first; });
+
+    std::size_t tried = 0;
+    for (auto const& candidate : candidates)
+    {
+        if (tried++ >= GRAVEYARD_CANDIDATES)
+            break;
+        GraveyardStruct const* g = candidate.second;
+        std::string const why = GraveyardRefusal(bot, *g);
+        if (why.empty())
+            return g;
+        refused += "; '" + g->name + "': " + why;
+    }
+    return nullptr;
+}
+
 static Player* LivingResurrectorFor(Player* dead)
 {
     Group* group = dead ? dead->GetGroup() : nullptr;
@@ -2948,7 +3148,10 @@ private:
             //
             // A genuine person is still left alone: no PlayerbotAI means no
             // leaderAI and this whole block is skipped.
-            if (!leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            // Unless it is held after a revival, which took `new rpg` off on
+            // purpose and gives it back itself - see HoldAfterRevival.
+            if (!leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
+                !HeldAfterRevival(leader->GetName()))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' leads but did not carry `new rpg` - granting it, "
@@ -3068,7 +3271,10 @@ private:
             // The pin is real and still worth solving - see the second gate in
             // #100, where UpdateAIGroupMaster re-adds `follow` every tick - but
             // it is not solved by removing the only cohesion this party has.
-            if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+            // A character held after a revival has `follow` off ON PURPOSE -
+            // see HoldAfterRevival - and gets it back when the hold ends.
+            if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT) &&
+                !HeldAfterRevival(p->GetName()))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' had a master but no follow strategy - granting "
@@ -6166,6 +6372,10 @@ private:
         // be standing on something, for the reason OnTheGround gives.
         if (!p->IsAlive() || p->IsInFlight() || InDungeonRun(p))
             return;
+        // And a follower held after a revival is standing still on purpose,
+        // for a few seconds - see HoldAfterRevival.
+        if (HeldAfterRevival(name))
+            return;
         if (!leader->IsAlive() || !OnTheGround(leader))
             return;
 
@@ -7424,6 +7634,7 @@ private:
             if (bot->IsAlive())
             {
                 _healerExpected.erase(name);
+                ReleaseRevivalHold(botAI, name);
                 continue;
             }
 
@@ -7511,6 +7722,7 @@ private:
             uint32 corpseMap = 0;
             float corpseX = 0.f;
             float corpseY = 0.f;
+            float corpseZ = 0.f;
 
             if (corpse)
             {
@@ -7518,9 +7730,10 @@ private:
                 corpseMap = corpse->GetMapId();
                 corpseX = corpse->GetPositionX();
                 corpseY = corpse->GetPositionY();
+                corpseZ = corpse->GetPositionZ();
             }
             else if (QueryResult row = CharacterDatabase.Query(
-                         "SELECT time, mapId, posX, posY FROM corpse WHERE guid = {}",
+                         "SELECT time, mapId, posX, posY, posZ FROM corpse WHERE guid = {}",
                          bot->GetGUID().GetCounter()))
             {
                 Field* f = row->Fetch();
@@ -7528,6 +7741,7 @@ private:
                 corpseMap = f[1].Get<uint16>();
                 corpseX = f[2].Get<float>();
                 corpseY = f[3].Get<float>();
+                corpseZ = f[4].Get<float>();
             }
 
             // NOBODY IS THERE TO CLICK RELEASE.
@@ -7654,6 +7868,9 @@ private:
                          "point instead",
                          name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
                          STUCK_REVIVAL_TRAP_MINUTES, home->GetName());
+                _lastRevival.erase(name);
+                HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                 home->m_homebindX, home->m_homebindY);
                 continue;
             }
 
@@ -7699,6 +7916,61 @@ private:
                          "for GetClosestGraveyard to return, so it was sent to its own "
                          "bind point instead of being left where it fell",
                          name, deadFor, static_cast<uint32>(bot->GetMapId()));
+                _lastRevival.erase(name);
+                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
+                                 bot->m_homebindX, bot->m_homebindY);
+                continue;
+            }
+
+            // NEAREST IS A GEOMETRY ANSWER; THE CHARACTER ASKED A SAFETY
+            // QUESTION. See GRAVEYARD_THREAT_RADIUS for the measurement and
+            // the two tests. When the nearest graveyard passes, everything
+            // below is exactly what it was before.
+            std::string refused;
+            GraveyardStruct const* safe = SafeGraveyardNear(bot, grave, corpseMap,
+                                                            corpseX, corpseY, corpseZ, refused);
+            if (!safe)
+            {
+                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
+                                bot->m_homebindY, bot->m_homebindZ, 0.f);
+                bot->ResurrectPlayer(0.5f);
+                bot->SpawnCorpseBones();
+
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' (level {}) has been dead for {}s and no graveyard "
+                         "for its corpse is safe to stand at [{}] - sent to its own bind "
+                         "point instead of the nearest graveyard",
+                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused);
+                _lastRevival.erase(name);
+                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
+                                 bot->m_homebindX, bot->m_homebindY);
+                continue;
+            }
+
+            // THE SAME GRAVEYARD TWICE IN FIVE MINUTES IS A VERDICT, NOT A
+            // COINCIDENCE. Whatever the scoring above thinks of the place it
+            // picked, a character this drive already revived there and that
+            // is dead again has shown it cannot live there. Home,
+            // unconditionally - see GRAVEYARD_REPEAT_SECONDS.
+            int64 const now = time(nullptr);
+            auto const last = _lastRevival.find(name);
+            if (last != _lastRevival.end() && last->second.first == safe->ID &&
+                now - last->second.second < GRAVEYARD_REPEAT_SECONDS)
+            {
+                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
+                                bot->m_homebindY, bot->m_homebindZ, 0.f);
+                bot->ResurrectPlayer(0.5f);
+                bot->SpawnCorpseBones();
+
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been dead for {}s and this drive already revived "
+                         "it at '{}' {}s ago - twice at one graveyard inside {}s means it "
+                         "cannot live there, so it was sent to its own bind point instead",
+                         name, deadFor, safe->name, now - last->second.second,
+                         GRAVEYARD_REPEAT_SECONDS);
+                _lastRevival.erase(last);
+                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
+                                 bot->m_homebindX, bot->m_homebindY);
                 continue;
             }
 
@@ -7707,18 +7979,96 @@ private:
             // this is not a new resurrection mechanism, it is the same one,
             // reached without depending on a path that never runs for this
             // roster at all.
-            bot->TeleportTo(grave->Map, grave->x, grave->y, grave->z, 0.f);
+            bot->TeleportTo(safe->Map, safe->x, safe->y, safe->z, 0.f);
             bot->ResurrectPlayer(0.5f);
             bot->SpawnCorpseBones();
 
-            LOG_WARN("module.overseer",
-                     "overseer: '{}' has been dead for {}s - mod-playerbots' own "
-                     "auto-relocate-after-repeated-deaths (RandomTeleport, "
-                     "RandomPlayerbotMgr.cpp) is gated behind IsRandomBot, which is false "
-                     "for this roster's named accounts, so it would never reach a graveyard "
-                     "on its own; resurrected at the nearest graveyard instead",
-                     name, deadFor);
+            if (safe == grave)
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been dead for {}s - mod-playerbots' own "
+                         "auto-relocate-after-repeated-deaths (RandomTeleport, "
+                         "RandomPlayerbotMgr.cpp) is gated behind IsRandomBot, which is false "
+                         "for this roster's named accounts, so it would never reach a graveyard "
+                         "on its own; resurrected at the nearest graveyard instead",
+                         name, deadFor);
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' (level {}) has been dead for {}s - the nearest "
+                         "graveyard was refused [{}], so it was resurrected at '{}' instead",
+                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
+                         safe->name);
+            _lastRevival[name] = std::make_pair(safe->ID, now);
+            HoldAfterRevival(bot, botAI, name, safe->Map, safe->x, safe->y);
         } while (result->NextRow());
+    }
+
+    // THE GRACE AFTER A REVIVAL - see REVIVAL_HOLD_SECONDS. `+stay` is
+    // upstream's own hold: it is a sibling of `follow` in the movement
+    // strategy context (StrategyContext.h:210-218), so adding it removes
+    // `follow` (Engine.cpp:350-363) and StayAction stops the character where
+    // it stands (StayActions.cpp:31-37). `new rpg` is not a sibling and its
+    // status trigger outranks `stay`, so the leader's is taken off for the
+    // hold as well. What this module would otherwise do to a held character
+    // (re-grant `follow` or `new rpg`, send it to catch up) asks
+    // HeldAfterRevival first.
+    //
+    // Decided from spawn data at the DESTINATION rather than the live grid
+    // around the character, because a teleport is not complete when
+    // TeleportTo returns: the relocation lands on the teleport ack, which
+    // for a bot is upstream's HandleTeleportAck on its next AI tick. So at
+    // this point the character is still standing where it died.
+    void HoldAfterRevival(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                          uint32 mapId, float x, float y)
+    {
+        NearbyThreat const threat = HostileSpawnsNear(bot, mapId, x, y, REVIVAL_AGGRO_RADIUS, 0);
+        if (threat.count)
+        {
+            _revivalHoldUntil.erase(name);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' revives with {} hostile spawn(s) within {} yards, up to "
+                     "'{}' (level {}) - not held there; it is left free to move away",
+                     name, threat.count, uint32(REVIVAL_AGGRO_RADIUS), threat.name, threat.level);
+            return;
+        }
+
+        bool const led = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+        botAI->ChangeStrategy("+stay", BOT_STATE_NON_COMBAT);
+        if (led)
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+        _revivalHoldUntil[name] = std::make_pair(time(nullptr) + REVIVAL_HOLD_SECONDS, led);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is held where it revives for {}s (`+stay`{}) before "
+                 "anything moves it again - nothing hostile spawns within {} yards",
+                 name, REVIVAL_HOLD_SECONDS, led ? ", `-new rpg`" : "",
+                 uint32(REVIVAL_AGGRO_RADIUS));
+    }
+
+    // The hold's other end: `stay` comes off, and the mover it displaced
+    // comes back - `follow` for a character with a master, `new rpg` for the
+    // one that led. Called from the alive branch of DriveStuckRevival, so a
+    // hold ends at most one poll late.
+    void ReleaseRevivalHold(PlayerbotAI* botAI, std::string const& name)
+    {
+        auto const hold = _revivalHoldUntil.find(name);
+        if (hold == _revivalHoldUntil.end() || time(nullptr) < hold->second.first)
+            return;
+        bool const led = hold->second.second;
+        _revivalHoldUntil.erase(hold);
+
+        botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
+        if (led)
+            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        else if (botAI->GetMaster())
+            botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is released from its post-revival hold ({} restored)",
+                 name, led ? "`new rpg`" : botAI->GetMaster() ? "`follow`" : "nothing to restore");
+    }
+
+    bool HeldAfterRevival(std::string const& name) const
+    {
+        auto const hold = _revivalHoldUntil.find(name);
+        return hold != _revivalHoldUntil.end() && time(nullptr) < hold->second.first;
     }
 
     // ------------------------------------------------------ dungeon run: gather --
@@ -11450,6 +11800,20 @@ private:
     // the world thread only, cleared when the character is alive again, lost
     // on restart at the cost of one repeated line.
     std::set<std::string> _healerExpected;
+
+    // WHERE THIS DRIVE LAST REVIVED EACH CHARACTER (graveyard id, when), so a
+    // second revival at the same graveyard inside GRAVEYARD_REPEAT_SECONDS
+    // goes home instead. Cleared by a revival anywhere that is not a
+    // graveyard. Same ownership and lifetime as _awaitingRelease.
+    std::map<std::string, std::pair<uint32, int64>> _lastRevival;
+
+    // UNTIL WHEN EACH REVIVED CHARACTER IS HELD, and whether it led (carried
+    // `new rpg`) when the hold began, so the right mover is restored. Read
+    // by the movers this module owns through HeldAfterRevival. Same
+    // ownership and lifetime as _awaitingRelease: lost on restart, which
+    // costs nothing, because a restart also resets every bot's strategies
+    // to upstream's defaults and there is no `stay` left to take off.
+    std::map<std::string, std::pair<int64, bool>> _revivalHoldUntil;
 
     // What KeepRosterFollowing knew about each follower's position last
     // time round, so a stall is measured against ITS OWN best position
