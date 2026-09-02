@@ -7458,7 +7458,8 @@ private:
             // again and the first is not repeated every poll.
             auto const healerExpected = [&](int64 deadSeconds) -> bool
             {
-                Player* rezzer = InDungeonRun(bot) ? LivingResurrectorFor(bot) : nullptr;
+                bool const inRun = InDungeonRun(bot);
+                Player* rezzer = inRun ? LivingResurrectorFor(bot) : nullptr;
                 if (rezzer && deadSeconds < STUCK_REVIVAL_HEALER_SECONDS)
                 {
                     if (_healerExpected.insert(name).second)
@@ -7479,7 +7480,8 @@ private:
                              "is no longer waited for; recovering as in the open world",
                              name, deadSeconds,
                              rezzer ? "the dungeon module's rez budget has passed"
-                                    : "no living resurrector is left on its map");
+                             : inRun ? "no living resurrector is left on its map"
+                                     : "no dungeon run is open for its map any more");
                 return false;
             };
 
