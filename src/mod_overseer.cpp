@@ -9922,6 +9922,18 @@ private:
     // going to be resurrected off those fields at all.
     bool AnswerResurrectOffer(Player* bot, PlayerbotAI* botAI, std::string const& name)
     {
+        // MID-TELEPORT IS MID-ANSWER, AND ANSWERING TWICE IS WORSE THAN
+        // ANSWERING LATE. An accept teleports first and finishes on the ack
+        // (Player.cpp:13122-13126), and because nothing on that path clears
+        // the request data, a character still in flight one poll later still
+        // reads as having an offer pending. Calling the accept again would
+        // restart the teleport it is already serving, which on a client that
+        // is slow to ack could hold it in flight indefinitely. True, not
+        // false: the offer HAS been answered, and this poll has nothing left
+        // to do for it.
+        if (bot->IsBeingTeleported())
+            return true;
+
         Player* offerer = ResurrectOfferedBy(bot);
 
         if (!offerer)
