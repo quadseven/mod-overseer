@@ -938,6 +938,21 @@ constexpr char const* ESCORT_DIVERT_STRATEGIES[] = {
 // is well inside how long the walk to the trainer takes anyway.
 constexpr uint32 PROFESSION_POLL_MS = 30000;
 
+// How often the gear drive sweeps (#145). Deliberately the dungeon-run
+// cadence rather than a slower one of its own, for two reasons that both come
+// off a stopwatch: a group loot roll is open for exactly sixty seconds
+// (AzerothCore Group.cpp:1356 passes 60000 to SendLootStartRollToPlayer), so a
+// drive that means to have an opinion about it has to look several times
+// inside that window; and the moment worth acting on is the one right after a
+// win, when the thing the character just fought for is sitting in its bags.
+//
+// WHAT A PASS COSTS, so the cadence is a choice and not an accident. Five
+// characters, each with somewhere under sixty carried items, each scored by a
+// pure function that does a few dozen multiplications and builds one short
+// string. No database query, no pathfinding, no packet. This is the cheapest
+// drive in the file and it runs at the same rate as the most expensive one.
+constexpr uint32 GEAR_POLL_MS = 5000;
+
 // How long a dungeon run's heartbeat may go cold before it is considered over.
 // The arming drive touches it on every pass while anyone from the roster is
 // inside, so a cold heartbeat means nobody has been seen in there.
@@ -2815,6 +2830,7 @@ public:
         _questTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
+        _gearTimer += diff;
         _eventTimer += diff;
         _engagementTimer += diff;
         _deathTimer += diff;
@@ -2939,6 +2955,17 @@ public:
         {
             _professionTimer = 0;
             DriveProfessions();
+        }
+        // AFTER the dungeon run coordinator and after the travel drive, on
+        // purpose and for a plainer reason than either of those two have: a
+        // character that has just been walked somewhere, or has just had a run
+        // phase change under it, is a character whose combat state this drive
+        // is about to ask about. Cheap either way; this order means the answer
+        // is this tick's.
+        if (_gearTimer >= GEAR_POLL_MS)
+        {
+            _gearTimer = 0;
+            DriveGear();
         }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
@@ -7082,6 +7109,661 @@ private:
             else
                 StepTowardAssignment(name, bot, plan);
         }
+    }
+
+    // ------------------------------------------------------ wear what you won --
+    //
+    // THE FAMILY WINS GEAR AND NEVER PUTS IT ON. Measured on the live world:
+    // a level 22 priest wearing item level 20 sandals and item level 22 gloves
+    // while carrying, in her bags, four spare pairs of boots, three spare
+    // pairs of gloves, three bracers and a second copy of a ring she is
+    // already wearing. A level 27 warrior tank wearing a CLOTH robe and
+    // LEATHER boots alongside four pieces of mail. The first half of the loop
+    // - decide an item is worth rolling for - exists upstream. The second half
+    // - put the thing on - is what nothing was ever driving, and its absence
+    // is why the worn item stays bad, why the next similar drop still looks
+    // like an upgrade, and why the bags are full.
+    //
+    // WHY THIS IS A MODULE JOB WHEN mod-playerbots HAS EQUIP ACTIONS. It has
+    // three, and they are all real code: EquipUpgradesPacketAction fires off
+    // the `loot roll won` packet trigger, EquipUpgradeAction is a chat command,
+    // and EquipAction::SelectInventoryItemsToEquip walks the bags exactly the
+    // way this drive does (mod-playerbots EquipAction.cpp:333-367,369-409).
+    // What they all ask is `AI_VALUE2(ItemUsage, "item upgrade", ...)`, and
+    // that judgement is the thing this issue is about: its stat calculator
+    // multiplies the whole weight of an item through by its item level
+    // (StatsWeightCalculator.cpp:120-128) and carries no armour-class term at
+    // all - the penalty for wearing the wrong armour class is written, and
+    // commented out, at :631-636, with the helper it would have called still
+    // compiled and reachable from nowhere at :724. So the actions are not the
+    // gap; the score they act on is. This drive supplies a score
+    // (OverseerDecisions::GearScore) and then does the move itself rather than
+    // trying to talk the upstream actions into using a different opinion.
+    //
+    // AND IT DOES THE MOVE THROUGH THE CORE, NOT THROUGH A PACKET. Player::
+    // SwapItem (PlayerStorage.cpp:3632) is the same call a player's own
+    // inventory drag ends in; it re-checks CanUnequipItem on the source and
+    // CanEquipItem on the destination, so nothing here can put a character in
+    // something the server would not have let it wear. Then the world is read
+    // BACK - see this repo's AGENTS.md on why `delivered` is not `done` - and
+    // a refusal is said out loud instead of assumed away.
+    //
+    // WHAT IT DELIBERATELY DOES NOT DO. It does not sell, destroy or hand over
+    // anything, so a bag full of items nobody can wear stays full: the hand-off
+    // is #14 and the vendor run is #146. What it does for the bags is the part
+    // that belongs to gear - the copy you are carrying because you never put it
+    // on stops being carried, because you are wearing it.
+    static char const* GearSlotName(uint8 slot)
+    {
+        switch (slot)
+        {
+            case EQUIPMENT_SLOT_HEAD: return "head";
+            case EQUIPMENT_SLOT_NECK: return "neck";
+            case EQUIPMENT_SLOT_SHOULDERS: return "shoulders";
+            case EQUIPMENT_SLOT_BODY: return "shirt";
+            case EQUIPMENT_SLOT_CHEST: return "chest";
+            case EQUIPMENT_SLOT_WAIST: return "waist";
+            case EQUIPMENT_SLOT_LEGS: return "legs";
+            case EQUIPMENT_SLOT_FEET: return "feet";
+            case EQUIPMENT_SLOT_WRISTS: return "wrists";
+            case EQUIPMENT_SLOT_HANDS: return "hands";
+            case EQUIPMENT_SLOT_FINGER1: return "first finger";
+            case EQUIPMENT_SLOT_FINGER2: return "second finger";
+            case EQUIPMENT_SLOT_TRINKET1: return "first trinket";
+            case EQUIPMENT_SLOT_TRINKET2: return "second trinket";
+            case EQUIPMENT_SLOT_BACK: return "back";
+            case EQUIPMENT_SLOT_MAINHAND: return "main hand";
+            case EQUIPMENT_SLOT_OFFHAND: return "off hand";
+            case EQUIPMENT_SLOT_RANGED: return "ranged";
+            case EQUIPMENT_SLOT_TABARD: return "tabard";
+            default: return "an unknown slot";
+        }
+    }
+
+    // What this character's gear is FOR, from its class and the talent tree the
+    // roster already names for it (overseer_roster.spec_tab, the same column
+    // TrainRoster spends talent points from). Two facts and no guessing: a
+    // class that has only one answer - a rogue is melee whatever it specs - is
+    // answered from the class alone, and a class whose trees really do want
+    // different gear is answered only when the roster has said which tree.
+    // Everything else is GearRole::Unknown, which the scorer treats as "no
+    // opinion" and refuses to act on rather than averaging into a guess.
+    //
+    // TAB NUMBERS ARE THE DBC's OWN tabpage order, the same ones spec_tab
+    // already carries: warrior 0/1/2 = arms/fury/protection, paladin =
+    // holy/protection/retribution, priest = discipline/holy/shadow, shaman =
+    // elemental/enhancement/restoration, druid = balance/feral/restoration,
+    // death knight = blood/frost/unholy. 255 means "leave talents alone" and
+    // therefore also means "no tree has been chosen".
+    static OverseerDecisions::GearRole GearRoleFor(uint8 cls, uint8 specTab)
+    {
+        using OverseerDecisions::GearRole;
+        switch (cls)
+        {
+            case CLASS_WARRIOR:
+                if (specTab == 2) return GearRole::Tank;
+                if (specTab == 0 || specTab == 1) return GearRole::Melee;
+                return GearRole::Unknown;
+            case CLASS_PALADIN:
+                if (specTab == 0) return GearRole::Healer;
+                if (specTab == 1) return GearRole::Tank;
+                if (specTab == 2) return GearRole::Melee;
+                return GearRole::Unknown;
+            case CLASS_HUNTER: return GearRole::Ranged;
+            case CLASS_ROGUE: return GearRole::Melee;
+            case CLASS_PRIEST:
+                if (specTab == 0 || specTab == 1) return GearRole::Healer;
+                if (specTab == 2) return GearRole::Caster;
+                return GearRole::Unknown;
+            case CLASS_DEATH_KNIGHT:
+                // All three trees can hold a boss in 3.3.5 and only one of
+                // them is ever asked to here; blood is the roster's tanking
+                // answer and the other two are treated as melee.
+                if (specTab == 0) return GearRole::Tank;
+                if (specTab == 1 || specTab == 2) return GearRole::Melee;
+                return GearRole::Unknown;
+            case CLASS_SHAMAN:
+                if (specTab == 0) return GearRole::Caster;
+                if (specTab == 1) return GearRole::Melee;
+                if (specTab == 2) return GearRole::Healer;
+                return GearRole::Unknown;
+            case CLASS_MAGE:
+            case CLASS_WARLOCK: return GearRole::Caster;
+            case CLASS_DRUID:
+                if (specTab == 0) return GearRole::Caster;
+                if (specTab == 1) return GearRole::Melee;
+                if (specTab == 2) return GearRole::Healer;
+                return GearRole::Unknown;
+            default: return GearRole::Unknown;
+        }
+    }
+
+    // The character's own armour proficiencies, off its own skills.
+    //
+    // NEVER INFERRED FROM CLASS, which is the whole of the first defect. The
+    // tank measured here is a level 27 warrior and his character_skills rows
+    // are mail, leather, cloth and shield - no plate row, because a warrior
+    // learns plate at 40. Upstream derives the answer from class and level
+    // instead (mod-playerbots RandomItemMgr.cpp:1069-1078), which happens to
+    // agree in this one case and would not for a heirloom, a class this party
+    // has not had yet, or any future roster. Player::HasSkill is the same
+    // lookup the core's own equip check makes (PlayerStorage.cpp:2344-2366).
+    static OverseerDecisions::GearWearer GearWearerFor(Player* bot, uint8 specTab)
+    {
+        OverseerDecisions::GearWearer who;
+        who.name = bot->GetName();
+        who.level = static_cast<int>(bot->GetLevel());
+        who.role = GearRoleFor(bot->getClass(), specTab);
+        who.cloth = bot->HasSkill(SKILL_CLOTH);
+        who.leather = bot->HasSkill(SKILL_LEATHER);
+        who.mail = bot->HasSkill(SKILL_MAIL);
+        who.plate = bot->HasSkill(SKILL_PLATE_MAIL);
+        who.shield = bot->HasSkill(SKILL_SHIELD);
+        return who;
+    }
+
+    // An item template flattened into the plain facts the scorer reads. The
+    // scorer includes no core header, so this is where a core type stops.
+    static OverseerDecisions::GearItem GearItemFor(ItemTemplate const* proto,
+                                                   bool unresolvedRandomProperty)
+    {
+        OverseerDecisions::GearItem item;
+        item.name = proto->Name1;
+        item.itemClass = static_cast<int>(proto->Class);
+        item.subClass = static_cast<int>(proto->SubClass);
+        item.inventoryType = static_cast<int>(proto->InventoryType);
+        item.itemLevel = static_cast<int>(proto->ItemLevel);
+        item.requiredLevel = static_cast<int>(proto->RequiredLevel);
+        item.quality = static_cast<int>(proto->Quality);
+        item.armour = static_cast<int>(proto->Armor);
+
+        for (uint32 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
+        {
+            if (!proto->ItemStat[i].ItemStatValue)
+                continue;
+            OverseerDecisions::GearStat stat;
+            stat.type = static_cast<int>(proto->ItemStat[i].ItemStatType);
+            stat.value = static_cast<int>(proto->ItemStat[i].ItemStatValue);
+            item.stats.push_back(stat);
+        }
+
+        // Damage per second, the honest way: the template's own damage lines
+        // over its own swing timer. ItemTemplate::Delay is in milliseconds.
+        if (proto->Delay)
+        {
+            float damage = 0.f;
+            for (uint32 i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
+                damage += (proto->Damage[i].DamageMin + proto->Damage[i].DamageMax) / 2.f;
+            item.dps = damage * 1000.f / static_cast<float>(proto->Delay);
+        }
+
+        for (uint32 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+            if (proto->Spells[i].SpellId > 0)
+                item.hasEffect = true;
+
+        item.unresolvedRandomProperty = unresolvedRandomProperty;
+        return item;
+    }
+
+    // One item, scored for one character.
+    //
+    // THE TWO PER-ITEM FACTS THE SCORER CANNOT WORK OUT FOR ITSELF are gathered
+    // here, from the core, and handed in: whether the character is allowed the
+    // item at all, and whether it holds the weapon skill this particular weapon
+    // needs. Player::CanUseItem(ItemTemplate const*) answers the first
+    // (PlayerStorage.cpp:2377-2421: faction, class mask, race, RequiredSkill,
+    // RequiredSpell, level) and notably does NOT answer armour proficiency -
+    // that check lives only in the Item* overload, which is exactly why a
+    // priest sails through it holding a pair of leather boots. The scorer makes
+    // that test itself, from the five booleans above.
+    static OverseerDecisions::GearVerdict GearScoreFor(Player* bot,
+                                                       OverseerDecisions::GearWearer who,
+                                                       ItemTemplate const* proto,
+                                                       bool unresolvedRandomProperty)
+    {
+        who.classAllowed = bot->CanUseItem(proto) == EQUIP_ERR_OK;
+        who.weaponProficient = proto->Class != ITEM_CLASS_WEAPON || proto->GetSkill() == 0 ||
+                               bot->HasSkill(proto->GetSkill());
+        return OverseerDecisions::GearScore(GearItemFor(proto, unresolvedRandomProperty), who);
+    }
+
+    // What is worn in one slot, scored. An empty slot is zero, which is what
+    // makes the first item into an empty slot an upgrade by construction.
+    static float GearWornScore(Player* bot, OverseerDecisions::GearWearer const& who,
+                               uint8 slot)
+    {
+        Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!item)
+            return 0.f;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return 0.f;
+        OverseerDecisions::GearVerdict const verdict =
+            GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0);
+        return verdict.score;
+    }
+
+    // Everything a character is wearing, scored, which is what decides who
+    // Needs when two of them want the same drop.
+    static float GearTotalWorn(Player* bot, OverseerDecisions::GearWearer const& who)
+    {
+        float total = 0.f;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            total += GearWornScore(bot, who, slot);
+        return total;
+    }
+
+    // Everything in the backpack and the equipped bags. Same walk ProbeBags
+    // makes, and for the same reason: a character's carried items are in two
+    // different places and only one of them is obvious.
+    static std::vector<Item*> GearCarried(Player* bot)
+    {
+        std::vector<Item*> carried;
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                carried.push_back(item);
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = bot->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    carried.push_back(item);
+        }
+        return carried;
+    }
+
+    // Say a thing about one character and one item exactly once. The sweep runs
+    // on a five-second timer, so anything it says about an item it is NOT going
+    // to move would otherwise be said seventeen thousand times a day. A swap
+    // that WORKS needs no such guard - it changes the world, so the next pass
+    // has nothing left to say about it - and is deliberately not routed through
+    // here, because a character putting something on is the one line in this
+    // drive worth having in the log every time it happens.
+    //
+    // Bounded by the number of distinct item entries the family ever carries,
+    // unguarded because DriveGear runs only from OnUpdate on the world thread,
+    // and lost on a restart, which costs one repeated line and no correctness -
+    // the same terms every other per-character memory in this file is kept on.
+    bool SayGearOnce(std::string const& name, uint32 entry)
+    {
+        return _gearSaid[name].insert(entry).second;
+    }
+    std::map<std::string, std::set<uint32>> _gearSaid;
+
+    // One character's bags, against one character's worn gear.
+    void SweepGear(Player* bot, OverseerDecisions::GearWearer const& who)
+    {
+        // A character rummaging through its bags mid-fight is not a character
+        // playing the way a person does, and Player::SwapItem would refuse a
+        // weapon swap in combat anyway (CanUnequipItem). Dead is the same
+        // answer for a plainer reason: SwapItem's first test is IsAlive.
+        if (!bot->IsAlive() || bot->IsInCombat())
+            return;
+
+        for (Item* item : GearCarried(bot))
+        {
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!proto)
+                continue;
+            if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+                continue;
+            if (proto->InventoryType == INVTYPE_NON_EQUIP)
+                continue;
+
+            // Where would it go? The core's own answer, so a shield lands in
+            // the off hand and a two-hander does not land anywhere a shield is.
+            uint8 const found = bot->FindEquipSlot(proto, NULL_SLOT, true);
+            if (found == NULL_SLOT || found >= EQUIPMENT_SLOT_END)
+                continue;
+
+            OverseerDecisions::GearVerdict const candidate =
+                GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0);
+
+            // Not wearable is not news. It is the ordinary state of most of
+            // what a party carries out of a dungeon, and saying so once per
+            // item per character would bury the lines that matter.
+            if (!candidate.wearable)
+                continue;
+
+            uint8 target = found;
+            float incumbent = GearWornScore(bot, who, found);
+
+            // A TWO-HANDER HAS TO BEAT BOTH HANDS (#14, the Severing Axe): the
+            // off hand is emptied to make room for it, so what it is really
+            // being compared against is the pair.
+            if (proto->InventoryType == INVTYPE_2HWEAPON && found == EQUIPMENT_SLOT_MAINHAND)
+            {
+                incumbent = OverseerDecisions::GearIncumbent(
+                    incumbent, GearWornScore(bot, who, EQUIPMENT_SLOT_OFFHAND), true);
+            }
+            // A RING OR A TRINKET HAS TWO HOMES, and the one worth taking is
+            // the worse of them. FindEquipSlot names the first; this picks.
+            else if (found == EQUIPMENT_SLOT_FINGER1 || found == EQUIPMENT_SLOT_TRINKET1)
+            {
+                uint8 const other = static_cast<uint8>(found + 1);
+                float const second = GearWornScore(bot, who, other);
+                if (second < incumbent)
+                {
+                    target = other;
+                    incumbent = second;
+                }
+            }
+
+            if (!OverseerDecisions::GearIsUpgrade(candidate, incumbent))
+                continue;
+
+            // IT SCORES HIGHER AND THE SCORE IS NOT THE WHOLE STORY. Said, and
+            // then left alone: the number that would justify the swap is one
+            // this file has already admitted is incomplete, and swapping on it
+            // anyway is exactly the confident-but-wrong move that put a cloth
+            // robe on the tank. Checked here rather than before the comparison
+            // so it is only ever said about an item that would OTHERWISE have
+            // been put on - the bags are full of things nobody needs told
+            // about.
+            if (!candidate.judged)
+            {
+                if (SayGearOnce(who.name, item->GetEntry()))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is carrying {}, which scores above the {} it is "
+                             "wearing - {} - and it is left in the bags because that score is "
+                             "not the whole story",
+                             who.name, proto->Name1, GearSlotName(target), candidate.why);
+                continue;
+            }
+
+            // EVERYTHING THE LOG LINE NEEDS IS READ BEFORE ANYTHING MOVES.
+            // Player::SwapItem re-homes both items, so `item` is not where it
+            // was and the displaced Item* is not where it was either - the same
+            // discipline the give command already documents at length.
+            uint32 const entry = item->GetEntry();
+            std::string const itemName = proto->Name1;
+            Item* const wornItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, target);
+            ItemTemplate const* wornProto = wornItem ? wornItem->GetTemplate() : nullptr;
+            std::string const replaced = wornProto ? wornProto->Name1 : "nothing";
+            uint16 const src = static_cast<uint16>(
+                (static_cast<uint16>(item->GetBagSlot()) << 8) | item->GetSlot());
+            uint16 const dst = static_cast<uint16>(
+                (static_cast<uint16>(INVENTORY_SLOT_BAG_0) << 8) | target);
+
+            bot->SwapItem(src, dst);
+
+            // DELIVERED IS NOT DONE. SwapItem reports a refusal to a client
+            // through SendEquipError and returns void, which for a character
+            // nobody is watching is the same as silence - so the world is asked
+            // rather than the call believed.
+            Item* const nowWorn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, target);
+            if (nowWorn && nowWorn->GetEntry() == entry)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' puts on {} in the {} slot over {} - {} against {} "
+                         "for what it was wearing",
+                         who.name, itemName, GearSlotName(target), replaced, candidate.why,
+                         static_cast<int>(incumbent));
+            }
+            else if (SayGearOnce(who.name, entry))
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' should be wearing {} in the {} slot over {} - {} "
+                         "against {} - and the server refused the swap, so it stays in the "
+                         "bags",
+                         who.name, itemName, GearSlotName(target), replaced, candidate.why,
+                         static_cast<int>(incumbent));
+            }
+        }
+    }
+
+    // Everything one member needs to be voted for.
+    struct GearMember
+    {
+        Player* bot{nullptr};
+        OverseerDecisions::GearWearer who;
+    };
+
+    // NEED ON A REAL UPGRADE, GREED ON EVERYTHING ELSE (#10, #145).
+    //
+    // WHAT THIS ADDS TO WHAT IS ALREADY DEPLOYED, AND WHAT IT LEAVES ALONE.
+    // The voting itself works: LootNeedRollLevel = 2 and LootGreedRollLevel = 1
+    // are set on this realm, so a NEED reaches the tally as a NEED and a GREED
+    // as a GREED rather than being downgraded to a pass, and patch 0008 already
+    // stopped BAD_EQUIP - the value that means "I have decided not to wear
+    // this" - from voting NEED. None of that is touched. What is added is the
+    // judgement in front of it, from the same scorer the sweep above uses, so
+    // that "upgrade" means the same thing to the roll as it does to the
+    // wardrobe.
+    //
+    // IT ONLY EVER FILLS IN A VOTE NOBODY HAS CAST. mod-playerbots'
+    // LootRollAction votes on the same rolls from the bot's own AI tick and
+    // guards itself the same way (LootRollAction.cpp:26-28), and whichever of
+    // the two reaches a still-unvoted roll first is the one that counts. This
+    // does not try to overrule a vote already cast, because it cannot:
+    // Group::CountRollVote has no idempotence at all (Group.cpp:1501-1548
+    // increments totalNeed/totalGreed/totalPass unconditionally and calls
+    // CountTheRoll the moment they add up), so voting twice for one member
+    // corrupts the tally and can end the roll early. A race that is only ever
+    // resolved in favour of "somebody has an opinion" is safe; one resolved by
+    // arithmetic on a shared counter is not.
+    //
+    // MASTER LOOT AND FREE FOR ALL ARE LEFT ENTIRELY ALONE. Under those methods
+    // the roll is not how the item is distributed and upstream votes PASS
+    // (LootRollAction.cpp:96-105); there is nothing here to improve and a Need
+    // cast into one would be noise.
+    void VoteOnOpenRolls(Group* group, std::vector<GearMember> const& members)
+    {
+        LootMethod const method = group->GetLootMethod();
+        if (method == MASTER_LOOT || method == FREE_FOR_ALL)
+            return;
+
+        // GetRolls returns a COPY of the vector, which is what makes this safe
+        // to iterate while voting: CountRollVote can finish and delete the roll
+        // it was given, and the pointers to the OTHER rolls stay good. The one
+        // rule is that nothing may read `roll` after the first vote is cast on
+        // it, so everything needed is taken off it up front.
+        std::vector<Roll*> const rolls = group->GetRolls();
+        for (Roll* roll : rolls)
+        {
+            if (!roll)
+                continue;
+
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll->itemid);
+            if (!proto)
+                continue;
+
+            // GEAR ONLY. This scorer knows what a piece of armour and a weapon
+            // are worth to a character and knows nothing whatever about a
+            // recipe it could learn, a bigger bag, a reagent a profession
+            // wants, or an armour token. Upstream's ItemUsage does know about
+            // all four (ItemUsageValue.cpp:32-95 for the skill and consumable
+            // cases, LootRollAction.cpp:51-58 for tokens and :72-79 for
+            // recipes), and every one of those is a NEED it would cast and
+            // this file would turn into a Greed. So the vote is left entirely
+            // alone for anything that is not worn.
+            if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+                continue;
+
+            ObjectGuid const rollGuid = roll->itemGUID;
+            bool const randomProperty = roll->itemRandomPropId != 0 || roll->itemRandomSuffix != 0;
+            bool const needAllowed = (roll->rollVoteMask & ROLL_FLAG_TYPE_NEED) != 0;
+
+            struct GearBallot
+            {
+                Player* bot{nullptr};
+                std::string name;
+                OverseerDecisions::GearVerdict verdict;
+                float incumbent{0.f};
+                bool wants{false};
+            };
+            std::vector<GearBallot> ballots;
+            std::vector<OverseerDecisions::GearContender> contenders;
+
+            for (GearMember const& member : members)
+            {
+                Roll::PlayerVote::const_iterator const cast =
+                    roll->playerVote.find(member.bot->GetGUID());
+                // Not in the roll at all (out of reward range), or already
+                // voted - either way this drive has nothing to add.
+                if (cast == roll->playerVote.end() || cast->second != NOT_EMITED_YET)
+                    continue;
+
+                GearBallot ballot;
+                ballot.bot = member.bot;
+                ballot.name = member.who.name;
+                ballot.verdict = GearScoreFor(member.bot, member.who, proto, randomProperty);
+
+                // AN UNJUDGED VERDICT CASTS NO VOTE AT ALL. Not a Greed: a
+                // Greed is an opinion, and the whole content of `judged ==
+                // false` is that this file does not have one - the item's
+                // worth is partly in a proc it does not read, or in a random
+                // suffix that could not be resolved, or the character's role
+                // was never named. Leaving the vote un-emitted hands the roll
+                // back to mod-playerbots' LootRollAction on the bot's next
+                // tick, which is exactly what happened before this drive
+                // existed. Silence is the only answer here that cannot be a
+                // regression.
+                if (!ballot.verdict.judged)
+                    continue;
+
+                if (ballot.verdict.wearable)
+                {
+                    uint8 const found = member.bot->FindEquipSlot(proto, NULL_SLOT, true);
+                    if (found != NULL_SLOT && found < EQUIPMENT_SLOT_END)
+                    {
+                        ballot.incumbent = GearWornScore(member.bot, member.who, found);
+                        if (proto->InventoryType == INVTYPE_2HWEAPON &&
+                            found == EQUIPMENT_SLOT_MAINHAND)
+                        {
+                            ballot.incumbent = OverseerDecisions::GearIncumbent(
+                                ballot.incumbent,
+                                GearWornScore(member.bot, member.who, EQUIPMENT_SLOT_OFFHAND),
+                                true);
+                        }
+                        else if (found == EQUIPMENT_SLOT_FINGER1 ||
+                                 found == EQUIPMENT_SLOT_TRINKET1)
+                        {
+                            float const second = GearWornScore(
+                                member.bot, member.who, static_cast<uint8>(found + 1));
+                            if (second < ballot.incumbent)
+                                ballot.incumbent = second;
+                        }
+                        ballot.wants =
+                            OverseerDecisions::GearIsUpgrade(ballot.verdict, ballot.incumbent);
+                    }
+                }
+
+                if (ballot.wants)
+                {
+                    OverseerDecisions::GearContender contender;
+                    contender.name = ballot.name;
+                    contender.gain = ballot.verdict.score - ballot.incumbent;
+                    contender.totalWorn = GearTotalWorn(member.bot, member.who);
+                    contenders.push_back(contender);
+                }
+                ballots.push_back(ballot);
+            }
+
+            if (ballots.empty())
+                continue;
+
+            // Two members wanting the same drop is settled here rather than by
+            // the dice: the one with the lower total equipped score Needs and
+            // the other Greeds, so the run raises the party's floor instead of
+            // handing the item to whoever rolled higher. See GearNeedWinner.
+            std::string const winner =
+                needAllowed ? OverseerDecisions::GearNeedWinner(contenders) : std::string();
+
+            for (GearBallot const& ballot : ballots)
+            {
+                bool const needs = !winner.empty() && ballot.name == winner;
+                if (needs)
+                {
+                    std::string const contested =
+                        contenders.size() > 1
+                            ? std::string(", and is the worst geared of those who want it")
+                            : std::string();
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' needs on {} - {} against {} for the {} it is "
+                             "wearing{}",
+                             ballot.name, proto->Name1, ballot.verdict.why,
+                             static_cast<int>(ballot.incumbent),
+                             GearSlotName(ballot.bot->FindEquipSlot(proto, NULL_SLOT, true)),
+                             contested);
+                }
+                else
+                {
+                    std::string why = ballot.verdict.why;
+                    if (ballot.verdict.wearable)
+                        why = ballot.wants ? "another member wants it more"
+                                           : "not an upgrade for it";
+                    LOG_INFO("module.overseer", "overseer: '{}' greeds on {} - {}",
+                             ballot.name, proto->Name1, why);
+                }
+                group->CountRollVote(ballot.bot->GetGUID(), rollGuid,
+                                     needs ? uint8(ROLL_NEED) : uint8(ROLL_GREED));
+            }
+        }
+    }
+
+    // Every enabled character's talent tree, which is the only thing this drive
+    // needs out of the roster table. Read on its own, on the same terms as
+    // LoadJobs and LoadProfessionPlans: a schema without the column is the same
+    // answer as a roster that has chosen no tree.
+    std::map<std::string, uint8> LoadGearSpecs()
+    {
+        std::map<std::string, uint8> specs;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, spec_tab FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return specs;
+        do
+        {
+            Field* fields = result->Fetch();
+            specs[fields[0].Get<std::string>()] = fields[1].Get<uint8>();
+        } while (result->NextRow());
+        return specs;
+    }
+
+    void DriveGear()
+    {
+        std::map<std::string, uint8> const specs = LoadGearSpecs();
+        if (specs.empty())
+            return;
+
+        std::vector<GearMember> members;
+        for (std::pair<std::string const, uint8> const& row : specs)
+        {
+            // SteerableAI, not a bare lookup, for the reason that function
+            // spells out at length: a name resolves to a Player through a
+            // window in which touching it is a segfault.
+            Player* bot = ObjectAccessor::FindPlayerByName(row.first);
+            if (!SteerableAI(bot))
+                continue;
+
+            GearMember member;
+            member.bot = bot;
+            member.who = GearWearerFor(bot, row.second);
+            members.push_back(member);
+        }
+        if (members.empty())
+            return;
+
+        // THE SWEEP FIRST, THE VOTE SECOND, on purpose: a character that puts
+        // something on this pass is voting on the next drop against what it is
+        // NOW wearing, which is the loop this issue exists to close. Doing it
+        // the other way round would have every roll judged against the gear the
+        // character had already decided to stop wearing.
+        for (GearMember& member : members)
+            SweepGear(member.bot, member.who);
+
+        // One vote per group, not one per member: the whole family shares a
+        // party, and asking each of them for its group would walk the same roll
+        // list five times.
+        std::set<Group*> groups;
+        for (GearMember const& member : members)
+            if (Group* group = member.bot->GetGroup())
+                groups.insert(group);
+        for (Group* group : groups)
+            VoteOnOpenRolls(group, members);
     }
 
     // Only `new rpg` walks a character to an NPC: it owns the `wander npc
@@ -15761,6 +16443,7 @@ private:
 
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
+    uint32 _gearTimer = 0;
     uint32 _engagementTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is
