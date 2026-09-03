@@ -7549,7 +7549,7 @@ private:
     // the roll is not how the item is distributed and upstream votes PASS
     // (LootRollAction.cpp:96-105); there is nothing here to improve and a Need
     // cast into one would be noise.
-    void VoteOnOpenRolls(Group* group, std::vector<GearMember>& members)
+    void VoteOnOpenRolls(Group* group, std::vector<GearMember> const& members)
     {
         LootMethod const method = group->GetLootMethod();
         if (method == MASTER_LOOT || method == FREE_FOR_ALL)
@@ -7597,7 +7597,7 @@ private:
             std::vector<GearBallot> ballots;
             std::vector<OverseerDecisions::GearContender> contenders;
 
-            for (GearMember& member : members)
+            for (GearMember const& member : members)
             {
                 Roll::PlayerVote::const_iterator const cast =
                     roll->playerVote.find(member.bot->GetGUID());
