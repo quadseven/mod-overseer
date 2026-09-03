@@ -70,6 +70,7 @@ struct DungeonRunMemberState
     bool seen{false};              // false = not found in the world this poll
     bool alive{false};
     bool inCombat{false};
+    float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
     // ALREADY THROUGH THE DOOR THIS BARRIER IS WAITING OUTSIDE (#165). Measured
     // live: a run sat `active` and unstaged for forty-three minutes while its
     // barrier line read "Ugga (not seen)" and, on the run before, "Ugga (wrong
@@ -85,7 +86,6 @@ struct DungeonRunMemberState
     // neither: what it buys today is a blockers line that cannot be misread,
     // and a give-up that can say what was actually wrong.
     bool inside{false};
-    float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
 };
 
 bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
