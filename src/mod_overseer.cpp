@@ -7777,6 +7777,14 @@ private:
     // the next one, which is five seconds while anyone is escorted and fifteen
     // otherwise. Five seconds of not gathering is not a cost; a release path
     // somebody forgets to hand the focus back on is.
+    //
+    // AND THAT LAG CANNOT RACE THE ONE THING IT COULD HAVE RACED. The drive that
+    // would otherwise pick a just-released character up is DriveQuests, and
+    // TravelAimBook::Release stamps a hand-back grace of
+    // TRAVEL_HANDBACK_SECONDS (45) that stands it down for exactly that window.
+    // The longest this sweep can lag is one TRAVEL_POLL_MS (15), so the
+    // strategies are always back on the engine before anything else is allowed
+    // to steer the character that lost them.
     void SweepTravelFocus(std::set<std::string> const& stillAimed)
     {
         for (auto it = _travelFocus.begin(); it != _travelFocus.end(); )
