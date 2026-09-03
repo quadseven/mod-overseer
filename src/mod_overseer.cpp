@@ -5968,6 +5968,48 @@ private:
             "UPDATE overseer_roster SET learn_skill = 0 WHERE name = '{}'", Esc(name));
     }
 
+    // THE OTHER HALF OF THE SAME COLUMN. Something has to WRITE the errand
+    // ClearLearnAim clears, and until now nothing inside the worldserver did.
+    // The roster's declared end state was read only as a PERMISSION - it could
+    // refuse a wrong trade, and it could not name a right one - so every move
+    // toward it had to be scripted from outside, one at a time. That is how
+    // four of the five ended up holding a pair nobody assigned them while the
+    // column saying what they should hold was correct the whole time.
+    void AimLearnAt(std::string const& name, uint32 skill)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET learn_skill = {} WHERE name = '{}'",
+            skill, Esc(name));
+    }
+
+    // Every primary profession this character actually holds, and what each
+    // one would cost to give up.
+    //
+    // WALKED RATHER THAN TABULATED. There is no "list my professions" on
+    // Player - the skill map is private and the only way in is by id - so the
+    // ids come from the DBC the core already loaded and
+    // IsPrimaryProfessionSkill does the filtering, which is the same test
+    // UnlearnProfession trusts three functions down. A table of the eleven
+    // primaries written out in this file would be a second spelling of
+    // something SkillLineStore already holds, and the only thing a second
+    // spelling can add is a way to disagree. It costs one DBC lookup per row
+    // per character, against a poll measured in tens of seconds.
+    std::vector<OverseerDecisions::ProfessionHolding> HeldPrimaries(Player* bot)
+    {
+        std::vector<OverseerDecisions::ProfessionHolding> held;
+        for (uint32 id = 0; id < sSkillLineStore.GetNumRows(); ++id)
+        {
+            if (!IsPrimaryProfessionSkill(id) || !bot->HasSkill(id))
+                continue;
+
+            OverseerDecisions::ProfessionHolding holding;
+            holding.skill = static_cast<unsigned>(id);
+            holding.value = static_cast<unsigned>(bot->GetPureSkillValue(id));
+            held.push_back(holding);
+        }
+        return held;
+    }
+
     // The price dies with the request, for the same reason TravelAimBook::Release
     // erases the clock: a leftover `unlearn_max` would be inherited by the NEXT
     // request against the same character, and the next one might be for a skill
@@ -6765,18 +6807,159 @@ private:
         return false;
     }
 
-    // The unlearn drive. Its own poll, because unlearning needs no NPC and no
-    // journey: it is the prerequisite that makes the journey worth taking, and
-    // making it wait for one would deadlock the pair - the character cannot
-    // learn until a slot is free, and the slot would not free until it arrived.
+    // ONE STEP FROM WHAT A CHARACTER HOLDS TOWARD WHAT THE ROSTER SAYS (#27).
+    //
+    // THE VERB THAT WAS MISSING, AND WHY ITS ABSENCE WAS INVISIBLE. The
+    // decision has been in `overseer_roster.professions` and correct. Both
+    // transactions have existed since the professions section above shipped:
+    // TrainOnArrival buys a trade from a trainer, UnlearnProfession gives one
+    // up. What was never written is the thing BETWEEN them - something that
+    // reads what a character holds, compares it with what it was assigned, and
+    // names the next move. Without that, every move had to be scripted from
+    // outside one at a time, and five characters converging on ten professions
+    // that way is a queue measured in weeks. It is not a queue that stands
+    // still while it drains, either: the herbalism nobody assigned goes on
+    // climbing the whole time, and every point it gains is a point that gets
+    // destroyed later instead of now. That is the argument #27 makes for doing
+    // this soon rather than correctly-but-later, and this is where it is acted
+    // on.
+    //
+    // THE THREE THINGS IT WILL NOT DO, WHICH ARE THE POINT OF IT.
+    //
+    //   * IT NEVER GIVES UP A SKILL THE ROSTER ASKED FOR. That is rule 5 of
+    //     NextProfessionStep, and it is also UnlearnProfession's own gate, so
+    //     it is refused twice by two pieces of code that do not know about each
+    //     other. What that protects today is the one trade anybody has actually
+    //     worked - a herbalism at 117/150, an order of magnitude more than
+    //     anything else on the roster - and it is protected without anyone
+    //     having had to remember it was there.
+    //
+    //   * IT NEVER EMPTIES A SLOT WITH NOTHING TO PUT IN IT. A GiveUp is only
+    //     ever returned when a slot is NEEDED, so the Take that follows it is
+    //     the reason it happened. Stripping the family to nothing and leaving
+    //     them that way while a queue of trainer trips drains would be a worse
+    //     world than the one being fixed, and it is the obvious way to write
+    //     this.
+    //
+    //   * IT GRANTS NOTHING. A Take writes the ERRAND, not the skill. Learning
+    //     still happens at a trainer, through Trainer::TeachSpell, in
+    //     TrainOnArrival, with the money taken and the free-slot rule enforced
+    //     by the core. A profession appearing in `character_skills` without a
+    //     trainer having been visited is the failure this epic is named after,
+    //     and it is not being reintroduced from the other end by the drive
+    //     meant to close it.
+    //
+    // AND WHEN THERE IS NOTHING TO DO IT DOES NOTHING - no write, no log line,
+    // no query beyond the ones the poll was making anyway - every poll, for the
+    // rest of the character's life. See NextProfessionStep rule 2. That is the
+    // acceptance criterion about re-running, and it is a property of the
+    // decision rather than of a guard bolted on beside it.
+    void StepTowardAssignment(std::string const& name, Player* bot,
+                              ProfessionPlan const& plan)
+    {
+        std::vector<OverseerDecisions::ProfessionHolding> const held = HeldPrimaries(bot);
+
+        // THE CEILING IS ASKED OF THE CHARACTER RATHER THAN WRITTEN DOWN HERE.
+        // Two is what upstream reads, from CONFIG_MAX_PRIMARY_TRADE_SKILL, but
+        // the number that actually binds is whatever the core is willing to
+        // hand out - and the core will say: the points still free plus the ones
+        // already spent IS the maximum, by construction. So a realm configured
+        // differently moves this rather than making it quietly wrong, and there
+        // is no second copy of a configured value here to drift from the first.
+        unsigned const maxPrimary = static_cast<unsigned>(held.size()) +
+                                    bot->GetFreePrimaryProfessionPoints();
+
+        std::vector<unsigned> const wanted(plan.wanted.begin(), plan.wanted.end());
+        OverseerDecisions::ProfessionStep const step =
+            OverseerDecisions::NextProfessionStep(wanted, held, maxPrimary);
+
+        switch (step.kind)
+        {
+            case OverseerDecisions::ProfessionStepKind::Nothing:
+                // Two different silences arrive here and only one of them is
+                // fine. The ordinary one is "already holds what it was
+                // assigned", which must stay silent or it becomes the loudest
+                // line in the log while being the least interesting. The other
+                // is an assignment asking for more primaries than a character
+                // may hold, which nothing downstream can fix and which this
+                // drive deliberately does not resolve by picking a victim - so
+                // it is said once, to whoever can edit the roster.
+                if (wanted.size() > maxPrimary && _assignmentTooBig.insert(name).second)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is assigned {} primary professions and may "
+                             "hold {}. Nothing has been given up and nothing will be - "
+                             "this is the roster being asked to choose, not a drive",
+                             name, static_cast<uint32>(wanted.size()), maxPrimary);
+                return;
+
+            case OverseerDecisions::ProfessionStepKind::Take:
+                // Idempotent against the errand already standing, which is what
+                // lets this run on every poll with no guard of its own: the
+                // column is re-read at the top of every DriveProfessions, so
+                // "is this already the errand" is answerable without asking the
+                // database a second time.
+                if (plan.learnSkill == step.skill)
+                    return;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is assigned {} ({}), does not hold it, and has a "
+                         "free slot to put it in - standing errand set. It gets bought "
+                         "from a trainer like anything else, not granted",
+                         name, SkillName(step.skill), step.skill);
+                AimLearnAt(name, step.skill);
+                return;
+
+            case OverseerDecisions::ProfessionStepKind::GiveUp:
+            {
+                ProfessionPlan derived = plan;
+                derived.unlearnSkill = step.skill;
+
+                // THE PRICE IS THE VALUE READ ONE STATEMENT AGO, AND THAT IS
+                // NOT THE PRICE CHECK GOING SOFT. `unlearn_max` exists to
+                // refuse a request whose author's picture of the world went
+                // stale while the row sat in a queue - a real hazard for an
+                // instruction written minutes or days ago by another process,
+                // and the reason that column is a compare-and-swap rather than
+                // a flag. A request derived from THIS Player on THIS line has
+                // no staleness window for the check to catch, so pricing it at
+                // anything but the live value would be inventing a
+                // disagreement in order to then resolve it. What protects the
+                // character here is what protects it from an external request
+                // too, and it is strictly stronger than a number: the roster's
+                // declared end state, which neither NextProfessionStep nor
+                // UnlearnProfession will ever unlearn out of.
+                derived.unlearnMax = static_cast<uint32>(step.cost);
+
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' holds every primary slot it has and is assigned "
+                         "one it does not hold, so {} ({}) at {} points is what goes - the "
+                         "cheapest thing the roster did not ask for. This is the family's "
+                         "own decision being carried out and the points do not come back; "
+                         "they are also the fewest points it will ever cost, which is why "
+                         "it happens now",
+                         name, SkillName(step.skill), step.skill, step.cost);
+                UnlearnProfession(name, bot, derived);
+                return;
+            }
+        }
+    }
+
+    // The profession drive. Its own poll, because giving a trade up needs no
+    // NPC and no journey: it is the prerequisite that makes the journey worth
+    // taking, and making it wait for one would deadlock the pair - the
+    // character cannot learn until a slot is free, and the slot would not free
+    // until it arrived.
+    //
+    // IT NO LONGER ONLY EXECUTES INSTRUCTIONS. It used to leave the loop
+    // immediately for any character with no `unlearn_skill` standing, which
+    // meant the whole drive was dead for four of the five at any given moment
+    // and the roster's declared end state was a permission that nothing ever
+    // acted on. Now a character with no standing instruction gets one derived
+    // from that end state instead - see StepTowardAssignment.
     void DriveProfessions()
     {
         std::map<std::string, ProfessionPlan> const plans = LoadProfessionPlans();
         for (auto const& [name, plan] : plans)
         {
-            if (!plan.unlearnSkill)
-                continue;
-
             // SteerableAI for the same reason every other drive uses it: a name
             // resolves to a Player that is mid-login or mid-teardown several
             // times an hour while POV streaming runs, and this one writes to
@@ -6798,7 +6981,18 @@ private:
                 continue;
             }
 
-            UnlearnProfession(name, bot, plan);
+            // A WRITTEN INSTRUCTION OUTRANKS A DERIVED ONE, and that ordering
+            // is the whole of how the two coexist. Anything that fills
+            // `unlearn_skill` has said something specific about this character
+            // and has priced it; the derivation has only read a column that was
+            // already true a moment ago. So the instruction is executed first,
+            // and the derivation gets the polls where there is nothing else to
+            // do - which, once the roster and the world agree, is all of them,
+            // and it does nothing on every one.
+            if (plan.unlearnSkill)
+                UnlearnProfession(name, bot, plan);
+            else
+                StepTowardAssignment(name, bot, plan);
         }
     }
 
@@ -14956,6 +15150,14 @@ private:
     // log line and no correctness, exactly like the hand-back clock inside
     // _travelAims.
     std::map<std::string, uint32> _unlearnRefused;
+    // The characters whose declared end state asks for more primary
+    // professions than the realm lets anybody hold, so that unsatisfiable
+    // roster row is said once instead of twice a minute forever. Nothing is
+    // given up for these characters and nothing ever will be - see the Nothing
+    // branch of StepTowardAssignment - so this is a log-volume matter and not
+    // a piece of state anything decides on. Lost on restart, which costs one
+    // repeated line, exactly like _unlearnRefused above.
+    std::set<std::string> _assignmentTooBig;
     // What DriveQuests knew about each traveller's aim last time round, so a
     // standing complaint is logged once instead of three times a minute, an
     // aim that never lands can be given up on, and a turn-in of the WRONG
