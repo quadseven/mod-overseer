@@ -46,10 +46,26 @@ jobs:
       # -Wall -Wextra because this is the one translation unit in the module
       # whose warnings are not drowned out by a core's own, so they are cheap
       # to keep clean here and worth having.
+      #
+      # ONE BINARY PER TEST FILE, over whatever tests/ holds. Each of these
+      # files owns a main() and they cannot be linked together, and naming them
+      # one at a time here means the next decision that gets a test is a
+      # decision whose test silently never runs until somebody remembers to
+      # edit this file. The loop changes nothing about WHAT is compiled: still
+      # src/overseer_decisions.cpp plus one test file, still no include path
+      # into a core, which is the half of this job that IS the test. An empty
+      # tests/ fails rather than passing vacuously, for the same reason.
       - name: Compile and run
         run: |
           set -euo pipefail
           g++ --version | head -1
-          g++ -std=c++17 -Wall -Wextra -Isrc \
-              src/overseer_decisions.cpp tests/test_professions.cpp -o decisions
-          ./decisions
+          shopt -s nullglob
+          found=0
+          for test in tests/test_*.cpp; do
+            found=1
+            name="$(basename "$test" .cpp)"
+            echo "== $test"
+            g++ -std=c++17 -Wall -Wextra -Isrc src/overseer_decisions.cpp "$test" -o "$name"
+            "./$name"
+          done
+          test "$found" = 1 || { echo "no tests/test_*.cpp found"; exit 1; }
