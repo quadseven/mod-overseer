@@ -54,11 +54,11 @@ name: Build against the pinned core
 # this fleet.
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/compile-check-rez-9f2a']
   workflow_dispatch: {}
 
 concurrency:
-  group: build
+  group: build-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -169,29 +169,3 @@ jobs:
         with:
           path: /tmp/buildx-cache
           key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
-
-      - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Deliberately a SECOND buildx invocation rather than adding --push to
-      # the compile-check step above: buildx cannot --load and --push in the
-      # same call, and keeping the compile-check untouched means the gate
-      # every PR here actually depends on cannot be affected by anything
-      # below this line. Warm from the cache the compile-check just
-      # populated, so this is a re-tag-and-upload, not a second cold build -
-      # the Dockerfile's layers already exist locally.
-      - name: Push to GHCR
-        working-directory: acore
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --cache-from type=local,src=/tmp/buildx-cache \
-            -f apps/docker/Dockerfile \
-            -t "${GHCR_IMAGE}:${{ github.sha }}" \
-            -t "${GHCR_IMAGE}:latest" \
-            --push \
-            .
