@@ -342,6 +342,110 @@ struct StagingStallState
 StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
                              bool measurable, time_t now,
                              RatchetLimits const& limits);
+// ------------------------------------------------------------- professions --
+//
+// THE THIRD TENANT, AND THE SAME REASON AS THE OTHER TWO. The roster declares
+// what professions a character should END UP holding
+// (overseer_roster.professions), and something has to work out what the next
+// step towards that is. That arithmetic needs no world at all: it is a declared
+// set, a held set, and the ceiling of two primaries the core enforces - so it
+// belongs here, where a test can reach it, rather than three ifs deep inside a
+// poll that needs a live Player before it will run.
+//
+// WHY THIS PARTICULAR DECISION IS WORTH PULLING OUT. Giving up a primary
+// profession is the only thing this module does that CANNOT BE UNDONE: it
+// destroys every point of the skill and every recipe hanging off it. The
+// acceptance criterion most likely to be got wrong is therefore also the one
+// that costs the most when it is - re-running the assignment must not unlearn
+// and relearn what is already correct - and "already correct" has to be
+// something a person can read and a test can pin, not a condition that is only
+// true by accident of the order two polls happened to run in.
+
+// One primary profession a character actually holds, and what giving it up
+// would cost. The value travels WITH the skill rather than being looked up
+// again later, because it is the price: it is the number of points that stop
+// existing, and a price fetched at a different moment from the decision it
+// prices is how a stale one gets paid.
+struct ProfessionHolding
+{
+    unsigned skill{0};
+    unsigned value{0};
+};
+
+enum class ProfessionStepKind
+{
+    // NOTHING TO DO, AND THIS IS THE COMMON ANSWER. A character already
+    // holding what the roster asked for gets this on every poll, forever, and
+    // is therefore never touched by any of it. That is the idempotence, and it
+    // is a property of this enum's first value rather than of a guard
+    // somewhere downstream.
+    Nothing,
+
+    // Give up `skill`, destroying `cost` points, because every slot is full
+    // and the roster wants something this character does not hold.
+    GiveUp,
+
+    // Take `skill`: a slot is free and the roster wants it.
+    Take,
+};
+
+struct ProfessionStep
+{
+    ProfessionStepKind kind{ProfessionStepKind::Nothing};
+    unsigned skill{0};
+    unsigned cost{0};  // GiveUp only: the skill value this destroys
+};
+
+// The next step from what a character HOLDS towards what the roster SAYS.
+//
+// THE RULES, IN THE ORDER THEY ARE APPLIED, AND WHY EACH IS THE WAY ROUND IT
+// IS.
+//
+//   1. AN EMPTY `wanted` IS "NO OPINION", NOT "HOLD NOTHING". A character
+//      nobody has decided about is not one that may be freely rearranged; the
+//      safe reading of an absent decision is to leave it exactly as it is. The
+//      column comment in 2026_08_26_00_overseer_roster_professions.sql says
+//      the same thing about the same value, and this is where it is enforced.
+//
+//   2. NOTHING MISSING MEANS NOTHING TO DO, AND IT IS ASKED FIRST. This is the
+//      idempotence, and it is deliberately NOT written as `held == wanted`: a
+//      character that also holds something the roster has no opinion about is
+//      left alone rather than tidied up. Only the MISSING half of the
+//      comparison can ever cause anything to happen, so the only way to make
+//      this function destroy something is to ask for something it does not
+//      have.
+//
+//   3. A FREE SLOT IS FILLED BEFORE ANYTHING IS DESTROYED. Giving something up
+//      is only ever a way of making room, so it cannot be the answer while
+//      there is room. This is what stops a character holding one profession
+//      and one empty slot losing the profession it has - and it is what makes
+//      the whole sequence just-in-time: every GiveUp this returns is followed
+//      by a Take into the slot it opened, so nobody is left standing around
+//      holding nothing at all.
+//
+//   4. GATHERING BEFORE CRAFTING while both are still missing. A craft with no
+//      supply is a skill that sits at 1/75, which is the failure the whole
+//      issue is about, so mining is taken before blacksmithing and skinning
+//      before leatherworking. It has to be said explicitly because the ids
+//      sort the wrong way round for both of those pairs (164 blacksmithing
+//      before 186 mining, 165 leatherworking before 393 skinning), so "take
+//      them in id order" would get the supply chain backwards every time.
+//
+//   5. THE CHEAPEST THING THE ROSTER DOES NOT WANT IS WHAT GOES, and something
+//      the roster DOES want is never a candidate however cheap it looks. That
+//      second half is not an optimisation. It is what makes a character
+//      already holding its assigned pair unreachable by the destructive branch
+//      at all, rather than merely unlucky enough not to be picked.
+//
+// A NOTHING WITH SOMETHING STILL MISSING IS A REAL ANSWER, and the caller can
+// tell it from rule 2's Nothing by asking `wanted` again: it means every slot
+// is full of skills the roster ALSO wants, so the declared end state does not
+// fit in `maxPrimary` and no amount of polling will change that. Nothing is
+// destroyed in that case, which is the right direction to fail in for a plan
+// nobody can satisfy.
+ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
+                                  std::vector<ProfessionHolding> const& held,
+                                  unsigned maxPrimary);
 
 }  // namespace OverseerDecisions
 

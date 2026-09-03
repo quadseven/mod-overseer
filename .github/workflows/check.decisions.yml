@@ -1,0 +1,55 @@
+# Compile the pure decisions on their own, and run what they decide.
+#
+# WHY THIS IS A SEPARATE WORKFLOW FROM build.yml. That one proves the module
+# compiles against the pinned core, which means cloning AzerothCore and
+# mod-playerbots and building the whole server - tens of minutes even warm, and
+# it runs on a push to main rather than on a pull request. This one compiles two
+# files with the runner's own g++ and finishes in seconds, so a decision that
+# has been got wrong is said before a review starts rather than after a merge.
+#
+# THE FILE LIST IS THE TEST. src/overseer_decisions.{h,cpp} include <ctime>,
+# <string> and <vector> and nothing else, on purpose: the header says a reader
+# or a test "can compile these two on their own", and until this existed nothing
+# in this repository ever did. So the compile line below names exactly those
+# files and no include path into a core - if an AzerothCore type ever gets into
+# one of these decisions, this job stops compiling, which is the property being
+# protected. It is not incidental to the test; it IS half of it.
+name: The pure decisions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Keyed on the ref rather than shared with build.yml's single `build` group: a
+# second push to the same pull request should cancel the first run of this, and
+# should not queue behind an unrelated build of main.
+concurrency:
+  group: decisions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  decisions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Least privilege, and it is genuinely the least: this job clones the
+    # repository, compiles two files and runs the binary. It writes nothing
+    # anywhere, so contents: read is the whole of what it needs. Named
+    # explicitly rather than inherited, because the repository default is a
+    # setting somebody can change without ever reading this file.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      # -Wall -Wextra because this is the one translation unit in the module
+      # whose warnings are not drowned out by a core's own, so they are cheap
+      # to keep clean here and worth having.
+      - name: Compile and run
+        run: |
+          set -euo pipefail
+          g++ --version | head -1
+          g++ -std=c++17 -Wall -Wextra -Isrc \
+              src/overseer_decisions.cpp tests/test_professions.cpp -o decisions
+          ./decisions

@@ -221,4 +221,105 @@ StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
     return StagingNudge::ClearMovement;
 }
 
+namespace
+{
+
+bool Wants(std::vector<unsigned> const& wanted, unsigned skill)
+{
+    for (unsigned const id : wanted)
+        if (id == skill)
+            return true;
+    return false;
+}
+
+bool Holds(std::vector<ProfessionHolding> const& held, unsigned skill)
+{
+    for (ProfessionHolding const& holding : held)
+        if (holding.skill == skill)
+            return true;
+    return false;
+}
+
+// The three primaries that FEED other people's crafts rather than consuming
+// their own supply. Spelled out here and nowhere else in this module, because
+// nothing in the core answers it: SkillLineEntry has a category, and every one
+// of these shares it with the eight crafting primaries, so there is no lookup
+// to defer to. Three numbers with a reason beside them is the honest form of a
+// fact the data does not carry.
+//
+// USED FOR ORDER AND NOTHING ELSE. Which professions a character ends up with
+// is the roster's decision and this has no vote in it; this only decides which
+// of two skills the roster ALREADY chose gets taken first, which is why being
+// wrong here would cost a delay and not a profession.
+bool Feeds(unsigned skill)
+{
+    return skill == 182     // herbalism
+        || skill == 186     // mining
+        || skill == 393;    // skinning
+}
+
+}  // namespace
+
+ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
+                                  std::vector<ProfessionHolding> const& held,
+                                  unsigned maxPrimary)
+{
+    ProfessionStep step;
+
+    if (wanted.empty())
+        return step;                                    // rule 1: no opinion
+
+    // Rules 2 and 4 in one pass. `take` is the skill a free slot would be
+    // filled with, and a gatherer displaces a crafter for it once - the second
+    // gatherer does not displace the first, so a `wanted` in a fixed order
+    // always produces the same answer.
+    unsigned missing = 0;
+    unsigned take = 0;
+    for (unsigned const id : wanted)
+    {
+        if (Holds(held, id))
+            continue;
+        ++missing;
+        if (!take || (Feeds(id) && !Feeds(take)))
+            take = id;
+    }
+
+    // RULE 2, AND THE WHOLE OF THE IDEMPOTENCE. Nothing the roster asked for is
+    // absent, so there is nothing to make room for, so nothing can be
+    // destroyed. A character that reaches its assigned pair leaves through here
+    // on every poll for the rest of its life.
+    if (!missing)
+        return step;
+
+    // RULE 3. Room before ruin.
+    if (held.size() < static_cast<std::vector<ProfessionHolding>::size_type>(maxPrimary))
+    {
+        step.kind = ProfessionStepKind::Take;
+        step.skill = take;
+        return step;
+    }
+
+    // RULE 5. Cheapest first, and only among the ones the roster did not ask
+    // for. The id is the tie-break purely so that two skills of equal value
+    // cannot make two polls disagree about which one dies.
+    for (ProfessionHolding const& holding : held)
+    {
+        if (Wants(wanted, holding.skill))
+            continue;
+        if (step.kind != ProfessionStepKind::Nothing &&
+            (holding.value > step.cost ||
+             (holding.value == step.cost && holding.skill > step.skill)))
+            continue;
+
+        step.kind = ProfessionStepKind::GiveUp;
+        step.skill = holding.skill;
+        step.cost = holding.value;
+    }
+
+    // Falls out as Nothing when every held skill is one the roster also wants:
+    // the end state asks for more primaries than a character may hold, and the
+    // answer to that is to do nothing loudly rather than to pick a victim.
+    return step;
+}
+
 }  // namespace OverseerDecisions
