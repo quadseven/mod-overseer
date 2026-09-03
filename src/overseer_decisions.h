@@ -71,6 +71,21 @@ struct DungeonRunMemberState
     bool alive{false};
     bool inCombat{false};
     float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
+    // ALREADY THROUGH THE DOOR THIS BARRIER IS WAITING OUTSIDE (#165). Measured
+    // live: a run sat `active` and unstaged for forty-three minutes while its
+    // barrier line read "Ugga (not seen)" and, on the run before, "Ugga (wrong
+    // map)". She was neither. She was inside the instance, having walked
+    // through early, and the barrier was waiting for her to arrive at a place
+    // she had gone past.
+    //
+    // THIS IS DELIBERATELY NOT A FOURTH WAY TO SATISFY THE BARRIER, and the
+    // predicate below ignores it on purpose. Whether a member who is already
+    // through counts as staged, or whether nobody may cross until the barrier
+    // opens, is #165's own question and a choice between two defensible
+    // answers. Naming the state correctly is a prerequisite for either and is
+    // neither: what it buys today is a blockers line that cannot be misread,
+    // and a give-up that can say what was actually wrong.
+    bool inside{false};
 };
 
 bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
@@ -255,6 +270,78 @@ bool RatchetProgressed(float reading, float best, RatchetLimits const& limits);
 // restarted the clock - so the two verdicts read as the alternatives they are.
 RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
                        RatchetLimits const& limits);
+
+// -------------------------------------------------- the staging watchdog --
+//
+// "IT IS FAR AWAY" AND "IT IS NOT COMING" ARE DIFFERENT FACTS, and the
+// dungeon-run barrier could only ever say the first one. It prints the gap for
+// every member on every poll it holds - "Grog (549y away)" - and a character
+// walking in from 549 yards away and a character standing at a herb node 549
+// yards away produce the identical line. That is narration. What the operator
+// asked for is the second fact and an action to go with it, so that a run that
+// cannot start is fixed by the module rather than by somebody watching a
+// stream.
+//
+// THE SECOND FACT IS THE RATCHET ABOVE, ASKED WITH A DISTANCE. Is the gap
+// closing? A member that keeps beating its own best distance is walking,
+// however far out it still is; one that has not beaten it for long enough is
+// stalled, whatever the gap says. That is the whole of the detection and it is
+// not a new mechanism - it is the one four other drives already share.
+//
+// THE ACTION IS A LADDER, NOT A VERDICT, because the three things that can be
+// wrong with a staged character are different and they are ordered by how much
+// putting them right disturbs it:
+//
+//   1. SOMETHING IS STEERING IT. A strategy that walks the character somewhere
+//      of its own choosing is back on its engine - which is measured, not
+//      hypothetical, and is what the escort's own strategy set exists to stop.
+//      Re-asserting that set moves nothing and costs nothing, so it is first.
+//   2. THE WALK WAS LOST. The aim is still on the roster row and the character
+//      is not acting on it. Re-issuing costs one restarted spline.
+//   3. THE MOVEMENT GENERATOR IS JITTERING WITHOUT ARRIVING. This is the case
+//      KeepRosterFollowing measured (#70) and already answers with
+//      MotionMaster::Clear(), and it is last because it throws away whatever
+//      the character was in the middle of doing.
+//
+// AND IT IS BOUNDED, because a self-correcting mechanism that never gives up is
+// a loop with a log line in it. After the last rung the character is declared
+// unstageable ONCE and this stops touching it; the run's own bounds - the
+// travel errand's twenty-minute unreachable backstop, and the operator - own it
+// from there. Any poll that shows real progress puts the whole ladder back to
+// the bottom, so a character that recovers is watched from scratch rather than
+// from the rung its last bad patch reached.
+enum class StagingNudge
+{
+    Nothing,        // walking, staged, or nothing worth reading this poll
+    Restrategy,     // re-assert the escort's own strategy set
+    Reaim,          // re-issue the aim
+    ClearMovement,  // discard the movement generator, as the follow stall does
+    GiveUp,         // say once that it cannot be staged, and stop
+};
+
+// How many rungs there are below GiveUp. Named so the bound is a number a
+// reader can see rather than a switch they have to count.
+constexpr unsigned STAGING_NUDGE_STEPS = 3;
+
+// What one member's watchdog remembers between polls. Kept inside the
+// coordinator's own run state, world-thread only and unguarded, and lost with
+// the run on a restart - which costs one restarted clock and no correctness,
+// exactly as every other per-character state in this module already documents.
+struct StagingStallState
+{
+    RatchetState progress;
+    unsigned escalated{0};  // how many rungs have been climbed
+    bool gaveUp{false};     // the give-up line has been said
+};
+
+// One member, one poll. `measurable` is false when this poll's distance is not
+// a reading ABOUT WALKING - the member is in combat, in the air, dead, or on
+// another map - and the clock is then held rather than run, for the reason the
+// travel drive already holds its own over a flight: half a taxi route goes the
+// wrong way round a mountain, and a fight is a pause rather than a stall.
+StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
+                             bool measurable, time_t now,
+                             RatchetLimits const& limits);
 
 }  // namespace OverseerDecisions
 

@@ -47,6 +47,11 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
             why = "dead";
         else if (member.inCombat)
             why = "in combat";
+        // BEFORE "wrong map", because being inside IS a wrong map and is the
+        // one wrong map that means something specific: the member is ahead of
+        // the party rather than lost behind it. See DungeonRunMemberState.
+        else if (member.inside)
+            why = "already inside";
         else if (member.distanceFromStage < 0.f)
             why = "wrong map";
         else if (member.distanceFromStage > radiusYards)
@@ -165,6 +170,55 @@ RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
     verdict.stalled = limits.patienceSeconds != 0 && state.since != 0 &&
                       now - state.since > limits.patienceSeconds;
     return verdict;
+}
+
+StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
+                             bool measurable, time_t now,
+                             RatchetLimits const& limits)
+{
+    if (!measurable)
+    {
+        // Held, not read. `best` is deliberately left alone: a member that
+        // fought its way forward and then came back out of combat nearer than
+        // it has ever been should count that as progress, and a member that was
+        // pushed backwards should not have its mark spoiled by the push.
+        state.progress.since = now;
+        return StagingNudge::Nothing;
+    }
+
+    RatchetVerdict const verdict = Ratchet(state.progress, distanceFromStage, now, limits);
+    if (verdict.progressed)
+    {
+        // IT IS COMING. The clock has already been restarted by the ratchet;
+        // what is undone here is the ladder, so a member that closes the gap
+        // after two nudges is watched from the bottom again rather than being
+        // one bad patch away from being given up on.
+        state.escalated = 0;
+        state.gaveUp = false;
+        return StagingNudge::Nothing;
+    }
+    if (!verdict.stalled)
+        return StagingNudge::Nothing;
+
+    if (state.escalated >= STAGING_NUDGE_STEPS)
+    {
+        if (state.gaveUp)
+            return StagingNudge::Nothing;
+        state.gaveUp = true;
+        return StagingNudge::GiveUp;
+    }
+
+    // THE CLOCK RESTARTS ON EVERY RUNG, so the rung just climbed is given a
+    // whole patience window to work in before the next one is tried. Without
+    // this the three of them and the give-up would all fire on consecutive
+    // polls, which is not an escalation - it is one reaction spelled four ways.
+    state.progress.since = now;
+    unsigned const rung = state.escalated++;
+    if (rung == 0)
+        return StagingNudge::Restrategy;
+    if (rung == 1)
+        return StagingNudge::Reaim;
+    return StagingNudge::ClearMovement;
 }
 
 }  // namespace OverseerDecisions
