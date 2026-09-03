@@ -1,0 +1,86 @@
+-- A realm records what it is and what it is running (mod-overseer#184).
+--
+-- WHY THIS TABLE EXISTS. Three realms run this module and they do not run the
+-- same build of it. Today one of them is on an AzerothCore twelve days older
+-- than the other two, and the only place that fact is written down is a log
+-- line inside a container. Which realm a page is showing has so far been told
+-- by the hostname it was fetched from, and that hostname is about to stop being
+-- distinct - at which point nothing on the page distinguishes the live world
+-- from a disposable one. A page that shows the live family's positions while
+-- promising it is not production is the failure this table exists to prevent.
+--
+-- WHY THE REALM REPORTS ITSELF RATHER THAN BEING LABELLED FROM OUTSIDE. The
+-- site is a passive reader: it opens a database and renders what is in it. If
+-- the label came from the site's own configuration, then pointing a site at the
+-- wrong database would produce a page that is confidently, silently wrong -
+-- live data under a development banner, which is precisely the accident being
+-- designed out. Because the label is a row in the same database as the data, a
+-- misdirected site renders the banner of the world it is actually reading. The
+-- label cannot be separated from the thing it labels.
+--
+-- WHY NAME/VALUE ROWS RATHER THAN A COLUMN PER FACT, and this is the whole
+-- reason the shape is what it is. The reader of this table has to survive
+-- meeting a realm older than itself: a site that queries a column an older
+-- worldserver never created gets MySQL 1054 and, unguarded, returns a 500 for
+-- the whole page. That has happened here before - the achievements view broke
+-- on the live realm exactly that way, because the live realm was running an
+-- older module than the one the site was written against. Facts as ROWS means
+-- a newer module adds rows, never columns, so this table can only ever fail a
+-- reader with 1146 (the table itself is absent, on a realm that has not yet
+-- taken the build that creates it) and never with 1054. One failure mode to
+-- guard instead of two, and the one that remains is the one that cannot be
+-- designed away.
+--
+-- WHAT `source` IS FOR, and why it is not decoration. The rows do not all have
+-- the same standing, and a reader that treated them alike would overstate what
+-- is known:
+--
+--   compiled - read out of this running binary. The module's own version and
+--              AzerothCore's own revision string. Cannot be wrong: if the
+--              binary is running, this is what it is.
+--   declared - handed to the process by its deployment as an environment
+--              variable and recorded VERBATIM, without interpretation. These
+--              are build-time facts about sibling modules that the module has
+--              no way to read out of itself, so they are only ever as accurate
+--              as whoever set them. A deployment that updates its image without
+--              updating these declares the old truth about a new binary.
+--   derived  - the module's own verdict, computed from the two above. Today
+--              there is one: `pins`, which says whether the declared core
+--              commit actually describes the core this binary was built from.
+--              That is the check that catches a stale declaration, and it is
+--              made here rather than in the reader because the module is the
+--              only party that holds both halves.
+--
+-- WHY `IF NOT EXISTS`, against the convention two sibling files argue for.
+-- 2026_08_24_02_overseer_event.sql deliberately drops `IF NOT EXISTS` so that a
+-- re-hashed file fails at import rather than silently skipping a change that
+-- mattered, and that is the right trade for a table holding state nothing else
+-- can reconstruct. It is the wrong trade here. This import runs in the
+-- worldserver's db-upgrade init container, so a failing statement does not fail
+-- a migration - it fails the pod, and the world does not come up. Everything in
+-- this table is rewritten from scratch on the next start of any worldserver, so
+-- there is no state here worth taking a world down to protect. Loud beats
+-- silent right up until loud means nobody can log in.
+--
+-- WHY THERE IS NO HISTORY. One row per fact, overwritten every startup. The
+-- question this answers is "what is this realm running RIGHT NOW", and a table
+-- that accumulated a row per restart would answer a different and much less
+-- useful question while growing without bound on a realm that restarts often.
+-- `reported_at` carries the one temporal fact worth having: how long ago the
+-- realm last said any of this, which is how a reader tells a live report from
+-- one left behind by a worldserver that has since been replaced.
+
+CREATE TABLE IF NOT EXISTS `overseer_build` (
+  `name`  VARCHAR(64)  NOT NULL COMMENT 'what is being reported, e.g. module, core, realm',
+  `value` VARCHAR(255) NOT NULL DEFAULT '' COMMENT 'recorded verbatim; never parsed by the writer',
+  -- DELIBERATELY NOT AN ENUM. Adding a value to an ENUM cannot be done by
+  -- re-running a CREATE TABLE - it needs its own ALTER ... MODIFY migration,
+  -- a trap four other files in this directory carry a warning about because
+  -- it has bitten this codebase twice. The set of sources is small today and
+  -- there is no reason to believe it is closed, so it costs nothing to let a
+  -- fourth kind arrive as data rather than as schema.
+  `source` VARCHAR(16) NOT NULL DEFAULT 'declared'
+      COMMENT 'compiled = read from this binary, declared = set by the deployment, derived = the module''s verdict',
+  `reported_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

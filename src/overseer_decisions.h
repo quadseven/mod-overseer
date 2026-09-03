@@ -75,6 +75,154 @@ namespace OverseerDecisions
 constexpr char VERSION[] = "0.1.0";
 
 
+// WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
+//
+// THE PROBLEM, STATED AS THE OPERATOR STATES IT. Three realms run this module:
+// a live one, a disposable one, and a small hardcore one. They do not run the
+// same build. Today one of them is on an AzerothCore twelve days older than the
+// other two, and nothing outside a container log says so. Which realm a reader
+// is looking at has, until now, been carried entirely by the hostname the page
+// came from - and that distinction is being retired. When it goes, a page with
+// no other label is a page that will eventually show the live family's
+// positions under a promise that it is not the live family.
+//
+// So the page has to become the label, and this is the part of that the module
+// owns: the realm says who it is and what it is running, into its own database,
+// and the site renders what it finds there. A passive reader and a self-
+// reporting world, rather than a reader that has to be told out of band.
+//
+// WHY THE COMPOSITION IS HERE AND NOT IN mod_overseer.cpp. Everything below is
+// a decision about strings - which facts go in the report, what a declared
+// realm kind is allowed to mean, whether a declared commit describes this
+// binary. None of it needs a world, a player or a database, and all of it is
+// the kind of thing that is wrong in a way no compile catches. Here it is
+// reachable by tests/test_build_report.cpp with no core behind it. What stays
+// in mod_overseer.cpp is the part that genuinely cannot move: reading the
+// environment, asking GitRevision, and writing the rows.
+
+// The standing of a reported fact. Not decoration: a reader that treated all
+// three alike would overstate what is actually known. See the table comment in
+// data/sql/characters/base/2026_09_03_00_overseer_build.sql.
+constexpr char SOURCE_COMPILED[] = "compiled";  // read out of this binary
+constexpr char SOURCE_DECLARED[] = "declared";  // handed in by the deployment
+constexpr char SOURCE_DERIVED[]  = "derived";   // this module's own verdict
+
+// The environment variables a deployment may set for this module, named here so
+// the writer and its tests cannot disagree about them.
+//
+// WHY `OVERSEER_` AND NOT THE `AC_` PREFIX THE PINS FILE USES. AzerothCore's
+// ConfigMgr derives an environment variable name from every one of its own
+// config keys by a camelCase-aware transform and reads whatever matches. An
+// `AC_`-prefixed name of our own is at best ignored and at worst collides with
+// a key nobody was thinking about, and the failure mode of that collision is
+// silent. Our own prefix cannot collide with theirs.
+//
+// EVERY ONE OF THESE IS OPTIONAL. A deployment that sets none of them still
+// gets a report - a thinner one, saying what the binary knows about itself and
+// admitting it was told nothing else. That is the honest answer, and it is also
+// what every realm will produce on the first start after this ships, because
+// the manifests that set these are a separate change on a separate cadence.
+constexpr char ENV_REALM[]              = "OVERSEER_REALM";
+constexpr char ENV_REALM_KIND[]         = "OVERSEER_REALM_KIND";
+constexpr char ENV_PIN_CORE[]           = "OVERSEER_PIN_CORE";
+constexpr char ENV_PIN_PLAYERBOTS[]     = "OVERSEER_PIN_PLAYERBOTS";
+constexpr char ENV_PIN_OLLAMA_CHAT[]    = "OVERSEER_PIN_OLLAMA_CHAT";
+constexpr char ENV_PIN_DUNGEON_CLEAR[]  = "OVERSEER_PIN_DUNGEON_CLEAR";
+constexpr char ENV_PIN_AH_BOT[]         = "OVERSEER_PIN_AH_BOT";
+
+// The three answers to "is this the live world". THERE ARE THREE ON PURPOSE,
+// and the third is the whole safety argument.
+//
+// A binary question would force every realm that has not said anything into one
+// of the two real answers, and both choices are wrong. Defaulting to
+// non-production is the accident this feature exists to prevent: an unlabelled
+// live realm would render as safe. Defaulting to production would put a
+// production banner over the disposable realm and the canary, so the warning
+// would be false two times out of three and would be trained away within a
+// week - which is the same failure with a longer fuse.
+//
+// So a realm that has not been told, or has been told something this module
+// does not recognise, reports UNKNOWN, and the site renders unknown as an
+// alarm rather than as either answer. A typo in a manifest becomes a visible
+// question instead of a confident lie.
+constexpr char REALM_PRODUCTION[]     = "production";
+constexpr char REALM_NON_PRODUCTION[] = "non-production";
+constexpr char REALM_UNKNOWN[]        = "unknown";
+
+// Whether the declared upstream pins actually describe this binary.
+constexpr char PINS_MATCH[]   = "match";
+constexpr char PINS_STALE[]   = "stale";
+constexpr char PINS_UNKNOWN[] = "unknown";
+
+// One line of a realm's report about itself.
+struct BuildFact
+{
+    std::string name;
+    std::string value;
+    std::string source;
+};
+
+// The declared realm kind, reduced to one of the three answers above.
+//
+// Case and surrounding whitespace are forgiven because a YAML value picks both
+// up for free. NOTHING ELSE IS. "prod", "PRODUCTION " and "Production" all
+// arrive as production; "prd", "live" and "" all arrive as unknown, which is
+// the alarm, not the safe answer. Widening this set is a deliberate act - every
+// spelling added here is a spelling that can be typed into a manifest and
+// believed.
+std::string RealmKind(std::string const& declared);
+
+// The commit AzerothCore prints for itself, pulled out of the sentence
+// GitRevision::GetFullVersion() returns:
+//
+//   "AzerothCore rev. 47960183bb03+ 2026-08-28 21:04:11 +0200 (HEAD branch)
+//    (Unix, RelWithDebInfo, Static)"   ->   "47960183bb03"
+//
+// The trailing `+` means the tree had local modifications at build time, which
+// is always true here because the build applies this repo's patches. It is not
+// part of the commit and is dropped. Empty if the string is not in that shape,
+// which is the honest answer for a core that changes its banner one day.
+std::string CoreRevision(std::string const& coreVersion);
+
+// DOES THE DEPLOYMENT'S DECLARATION DESCRIBE THIS BINARY, and this is the check
+// that makes the declared rows safe to publish at all.
+//
+// The upstream commits of mod-playerbots, mod-ollama-chat, mod-dungeon-clear
+// and mod-ah-bot-plus are compiled in and then unreachable: there is no symbol
+// to ask, so the only way they reach the page is for the deployment to say what
+// it built. A declaration can be stale - a manifest that names today's pins in
+// front of an image built weeks ago declares the wrong SHAs with total
+// confidence, and a page that printed them would be worse than a page that
+// printed nothing, because it would look authoritative.
+//
+// The core commit is the one declared fact that CAN be checked, because the
+// core also reports itself. So it is used as the witness for all of them: if
+// the declared core commit is not the core actually running, the declaration as
+// a whole was written for a different image and every SHA in it is suspect.
+//
+// Returns PINS_MATCH, PINS_STALE, or PINS_UNKNOWN when either side is missing
+// or not in a shape that can be compared. Unknown is not a failure - it is what
+// a realm that was told nothing correctly reports.
+std::string PinsVerdict(std::string const& coreVersion,
+                        std::string const& declaredCoreSha);
+
+// The whole report, in the order a reader would want it.
+//
+// `coreVersion` is GitRevision::GetFullVersion(). `env` maps the names above to
+// their values, with anything the deployment did not set simply absent - so a
+// caller reads the environment once and this stays testable.
+//
+// TWO ROWS ARE ALWAYS PRESENT AND THE REST ARE NOT, which is deliberate.
+// `realm_kind` and `pins` are always written, including when the answer is
+// "unknown", because their absence and their unknown mean different things to a
+// reader and it must be able to tell them apart: no row at all means this realm
+// has never reported, and that is a fact about the realm rather than about its
+// configuration. Everything else is omitted when it was not declared, because
+// an empty string pretending to be a commit is worse than a gap.
+std::vector<BuildFact> BuildReport(std::string const& coreVersion,
+                                   std::map<std::string, std::string> const& env);
+
+
 // THE BARRIER PREDICATE, KEPT FREE OF EVERY CORE TYPE ON PURPOSE. Nothing
 // here touches Player, Map, or PlayerbotAI - it is fed plain facts the
 // caller already gathered, so it can be exercised directly by a unit test
