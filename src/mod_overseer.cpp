@@ -510,6 +510,46 @@ static Player* LivingResurrectorFor(Player* dead)
     return nullptr;
 }
 
+// The living party member whose resurrect offer this character is sitting on,
+// or null.
+//
+// There is no public getter for a pending offer's caster - m_resurrectGUID is
+// private (Player.h:2909) and reachable only through the two predicates beside
+// it - so the caster is found the way the dungeon module finds it
+// (DcFollowerActions.cpp:1730), by asking each group member whether the offer
+// names it.
+//
+// ALIVE AND IN THE GROUP IS THE WHOLE TEST, and the "alive" half is not
+// bookkeeping. Accepting resurrects the character where the caster stood
+// (ResurectUsingRequestData, Player.cpp:13119-13120), so an offer whose caster
+// has since died would put this character down exactly where that caster went
+// down. An offer with nobody alive behind it is not one worth taking.
+//
+// Members read at the pinned core:
+//   isResurrectRequested    Player.h:1856   bool isResurrectRequested() const
+//   isResurrectRequestedBy  Player.h:1855   bool (ObjectGuid) const
+//   GetGroup                Player.h:2520   Group* GetGroup()
+//   GetFirstMember          Group.h:252     GroupReference* GetFirstMember()
+static Player* ResurrectOfferedBy(Player* dead)
+{
+    if (!dead || !dead->isResurrectRequested())
+        return nullptr;
+
+    Group* group = dead->GetGroup();
+    if (!group)
+        return nullptr;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || member == dead || !member->IsAlive())
+            continue;
+        if (dead->isResurrectRequestedBy(member->GetGUID()))
+            return member;
+    }
+    return nullptr;
+}
+
 // The level difference at which AzerothCore's own client-facing con-color
 // math would show a target as `??` - unknown, maximum danger - rather than a
 // number. This is the SAME signal the game already computes for the
@@ -9566,10 +9606,82 @@ private:
 
             if (bot->IsAlive())
             {
+                // AN OFFER NEVER OUTLIVES THE DEATH THAT CAUSED IT.
+                //
+                // Nothing upstream clears a resurrect offer when the character
+                // comes back by some OTHER route. The core clears the request
+                // data in exactly two places - an explicit decline
+                // (MiscHandler.cpp:681) and the NEXT death (setDeathState,
+                // Player.cpp:1099) - and the accept path does not clear it at
+                // all (ResurectUsingRequestData, Player.cpp:13117-13143, and
+                // its delayed half at Player.cpp:1668-1686). Worse, the
+                // response handler refuses to run at all once the character is
+                // alive:
+                //
+                //     if (GetPlayer()->IsAlive() || ...)
+                //         return;                    // MiscHandler.cpp:676
+                //
+                // That test sits ABOVE the decline branch, so from the moment
+                // the character is alive even a DECLINE is unreachable and the
+                // offer is stuck until it next dies. Upstream's accept action
+                // bails on the same condition (AcceptResurrectAction.cpp:13)
+                // and is wired only under the dead strategy
+                // (DeadStrategy.cpp:22-23), which leaves the AI tree the
+                // instant the character is alive. So at exactly the moment an
+                // offer goes stale, everything that could answer it stops being
+                // able to.
+                //
+                // Clearing it here is cheap - whatever set it has already taken
+                // what it needed - and it restores the property the branch
+                // below relies on: that a pending offer means a REAL offer,
+                // still worth standing down for.
+                //
+                // DELIBERATELY NOT CALLED "ORPHANED" IN THE LOG. A pending
+                // offer on a living character is the ordinary tail of an
+                // ACCEPTED resurrect just as often as it is a stranded one,
+                // because the accept path leaves it set either way, and this
+                // drive cannot tell the two apart from state alone. It does not
+                // need to; the action is the same.
+                if (bot->isResurrectRequested())
+                {
+                    bot->clearResurrectRequestData();
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is alive with a resurrect offer still recorded "
+                             "against it - cleared, because upstream clears one only on a "
+                             "decline or the next death, and an offer that outlives its death "
+                             "is one that nothing can ever answer",
+                             name);
+                }
+
                 _healerExpected.erase(name);
                 ReleaseRevivalHold(botAI, name);
                 continue;
             }
+
+            // AN OFFER ON THE TABLE IS ANSWERED BEFORE ANYTHING STEPS OVER IT.
+            //
+            // Every recovery below moves the character away from its corpse,
+            // and none of them asked whether a healer had already put an offer
+            // up. Watched live in Duskwood (#177): a character died to a fall,
+            // came back through upstream's own corpse path 54 seconds later,
+            // and the healer's offer - cast while it was dead, and entirely
+            // legitimate when it was cast - was still drawn across the middle
+            // of that character's picture afterwards, with nothing left on
+            // either side of the connection that could answer it.
+            //
+            // Answering is strictly better than recovering around it. It puts
+            // the character back where the PARTY is standing rather than at a
+            // graveyard, which is the same argument the healer-first stand-down
+            // above already makes, and it is the only outcome that CONSUMES the
+            // offer rather than stranding it.
+            //
+            // ANSWERED ON THE FIRST POLL THAT SEES IT, with no grace. The
+            // graces elsewhere in this drive exist to let a better recovery
+            // arrive; here the better recovery has already arrived and is
+            // waiting to be taken. Every poll it is not taken is another poll
+            // it sits on a picture somebody is watching.
+            if (bot->isResurrectRequested() && AnswerResurrectOffer(bot, botAI, name))
+                continue;
 
             // THE HEALER GETS THERE FIRST.
             //
@@ -9996,6 +10108,110 @@ private:
         LOG_INFO("module.overseer",
                  "overseer: '{}' is released from its post-revival hold ({} restored)",
                  name, led ? "`new rpg`" : botAI->GetMaster() ? "`follow`" : "nothing to restore");
+    }
+
+    // Answer a resurrect offer this character is sitting on. True when the
+    // offer was taken and the character is on its way back, false when it was
+    // declined and the recovery below should carry on as if there had never
+    // been one.
+    //
+    // ACCEPTED WHEN IT IS SAFE, DECLINED WITH A STATED REASON WHEN IT IS NOT.
+    // Answering Accept blindly is its own bug: the accept teleports the
+    // character to where the caster stood and revives it there at the health
+    // the spell specified (Player.cpp:13119-13133), so accepting into a fight
+    // puts a partial-health character straight back into the fight that killed
+    // it, and accepting an offer whose caster has since died puts it exactly
+    // where that caster went down.
+    //
+    // WHY ACCEPTING IS THE OUTCOME THAT ALSO CLEARS THE PICTURE. The prompt is
+    // a client-side widget and the operator's client is stock, so nothing here
+    // can reach in and close it; there is no "cancel resurrect" opcode in this
+    // client's protocol to send either. What the client DOES watch is the
+    // character's ghost state. Accepting runs ResurrectPlayer, which removes
+    // SPELL_AURA_GHOST (spell 8326, Player.cpp:4561); that clears
+    // PLAYER_FLAGS_GHOST, and the client hides its resurrect prompts on the
+    // ghost-to-alive transition. Clearing the request data on its own sends the
+    // client nothing at all. So a decline settles the SERVER's state and leaves
+    // the recovery below to produce that same transition a moment later, while
+    // an accept produces it immediately - which is the whole reason this
+    // prefers to accept.
+    //
+    // THE REQUEST DATA IS NOT CLEARED ON THE ACCEPT PATH, ON PURPOSE. The
+    // resurrect is usually DELAYED: TeleportTo leaves the character
+    // mid-teleport, ResurectUsingRequestData schedules DELAYED_RESURRECT_PLAYER
+    // and returns (Player.cpp:13122-13126), and the half that actually restores
+    // health and mana runs later, reading m_resurrectHealth and m_resurrectMana
+    // (Player.cpp:1668-1686). Clearing here would zero those fields before that
+    // code reads them and the character would revive at zero health. The alive
+    // branch above clears it one poll later instead, once the fields have been
+    // consumed and the character is safely back. Both DECLINE paths below clear
+    // it immediately, which is safe for exactly the opposite reason: nothing is
+    // going to be resurrected off those fields at all.
+    bool AnswerResurrectOffer(Player* bot, PlayerbotAI* botAI, std::string const& name)
+    {
+        // MID-TELEPORT IS MID-ANSWER, AND ANSWERING TWICE IS WORSE THAN
+        // ANSWERING LATE. An accept teleports first and finishes on the ack
+        // (Player.cpp:13122-13126), and because nothing on that path clears
+        // the request data, a character still in flight one poll later still
+        // reads as having an offer pending. Calling the accept again would
+        // restart the teleport it is already serving, which on a client that
+        // is slow to ack could hold it in flight indefinitely. True, not
+        // false: the offer HAS been answered, and this poll has nothing left
+        // to do for it.
+        if (bot->IsBeingTeleported())
+            return true;
+
+        Player* offerer = ResurrectOfferedBy(bot);
+
+        if (!offerer)
+        {
+            bot->clearResurrectRequestData();
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' holds a resurrect offer with nobody alive in its party "
+                     "behind it - declined, because taking it would put the character down "
+                     "where the caster went down; the recovery below carries on instead",
+                     name);
+            return false;
+        }
+
+        if (bot->IsInCombat() || offerer->IsInCombat())
+        {
+            bot->clearResurrectRequestData();
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is offered a resurrect by '{}' while {} in combat - "
+                     "declined, because it would arrive at partial health inside the fight "
+                     "that killed it; the caster is free to offer again once the fight ends",
+                     name, offerer->GetName(),
+                     bot->IsInCombat() ? "it is" : "the caster is");
+            return false;
+        }
+
+        // The caster's CURRENT position, not the offer's stored one, which is
+        // private (Player.h:2910-2912). In the ordinary case they are the same
+        // spot, the spell having landed a moment ago, and where the caster is
+        // NOW is the better question anyway: that is where the party is.
+        uint32 const mapId = offerer->GetMapId();
+        float const x = offerer->GetPositionX();
+        float const y = offerer->GetPositionY();
+        std::string const offererName = offerer->GetName();
+
+        bot->ResurectUsingRequestData();
+
+        // This drive's own per-death bookkeeping ends with the death it belongs
+        // to. The paths that normally erase these are the ones this accept just
+        // skipped, and a stale entry would time the NEXT death from this one's
+        // first sighting.
+        _awaitingRelease.erase(name);
+        _healerExpected.erase(name);
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' takes the resurrect '{}' offered it - answered here because "
+                 "a character with nobody at its keyboard never answers one itself, and an "
+                 "offer left standing outlives the death that caused it",
+                 name, offererName);
+
+        HoldAfterRevival(bot, botAI, name, mapId, x, y);
+        return true;
     }
 
     bool HeldAfterRevival(std::string const& name) const
