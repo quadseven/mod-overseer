@@ -1092,6 +1092,68 @@ constexpr time_t DUNGEON_DC_ON_RETRY_SECONDS = 60;
 constexpr float DUNGEON_DC_ON_MOVE_YARDS = 30.f;
 constexpr time_t DUNGEON_DC_ON_MOVE_WINDOW_SECONDS = 120;
 
+// A RUN THAT HAS STOPPED, INSIDE (#171).
+//
+// WHAT WAS WATCHED. All five inside a freshly reset Deadmines, healthy,
+// together, and motionless for about twenty-six minutes. The dungeon module
+// said exactly what was wrong every five seconds for the whole of it:
+//
+//     [DC:Grug] event 'Iron Clad Door (Defias Cannon)' step 1 kind 11 result 1
+//               elapsed 1587558ms timeout 30000ms
+//
+// Elapsed 1,587,558 ms against its own stated timeout of 30,000 ms: the step ran
+// FIFTY times past its own deadline and the deadline never fired. `dc skip`
+// cleared it instantly - the party moved from (-106,-665) to (-79,-726) and the
+// tank issued a 142 yard path and carried on - so the designed remedy existed
+// the whole time and nothing invoked it. Two stream frames ten seconds apart
+// were pixel identical; a person spotted it, which is the thing this module is
+// for.
+//
+// HOW FAR THE TANK HAS TO GO TO COUNT AS MOVING. DUNGEON_DC_ON_MOVE_YARDS, the
+// constant chosen one state earlier for exactly this question and measured for
+// it: "more than the party mills about at the door and less than the walk to the
+// first pull". A tank clearing a dungeon covers it many times over between
+// polls; a tank standing at a cannon never does. One number, one meaning.
+constexpr float DUNGEON_CLEAR_STALL_YARDS = DUNGEON_DC_ON_MOVE_YARDS;
+
+// HOW LONG WITHOUT MOVING IS A STALL RATHER THAN AN OBJECTIVE IN PROGRESS.
+//
+// Every legitimately slow thing is HELD OUT of the reading rather than absorbed
+// by the number - combat, looting, sitting to eat or drink, anybody dead or
+// waiting on a resurrect all hold the clock, see RunClearingWatchdog - so what
+// this bounds is the one thing left that can keep a tank inside thirty yards
+// with none of those true: a scripted objective. A healthy one on this route
+// resolves in seconds to a couple of minutes.
+//
+// FIVE MINUTES IS TEN TIMES THE OBJECTIVE'S OWN STATED DEADLINE. The dungeon
+// module prints `timeout 30000ms` beside every step, so a factor of ten is the
+// margin that says this module is not second-guessing a slow objective but
+// noticing a dead one. The observed stall ran fifty times past that deadline. It
+// is also more than twice the longest healthy objective, a fifth of the
+// twenty-six minutes the operator watched, and sixty DUNGEON_RUN_POLL_MS polls,
+// so no single slow poll can trip it.
+constexpr time_t DUNGEON_CLEAR_STALL_SECONDS = 5 * 60;
+
+// The CLEARING watchdog's ratchet. DistanceFromLastMark, which is the follow
+// stall's reading rather than the staging watchdog's: a clearing party is not
+// being sent anywhere this module knows about - where the next boss is, is the
+// dungeon module's knowledge - so the only question available is whether the
+// tank has got anywhere AT ALL since it was last seen going somewhere.
+constexpr OverseerDecisions::RatchetLimits DUNGEON_CLEAR_RATCHET{
+    OverseerDecisions::RatchetReading::DistanceFromLastMark,
+    DUNGEON_CLEAR_STALL_YARDS, DUNGEON_CLEAR_STALL_SECONDS};
+
+// HOW MANY OBJECTIVES A RUN MAY ABANDON BEFORE IT IS ITSELF ABANDONED.
+//
+// Three, and each gets a whole DUNGEON_CLEAR_STALL_SECONDS to show that it
+// worked, so a run is given fifteen minutes of the designed remedy before
+// anything heavier happens to it. Deadmines has seven encounters: a run that has
+// skipped three consecutive objectives and still moved nowhere is not a run
+// being unblocked one obstacle at a time, it is a run that skipping does not
+// reach - which is the case the operator asked to be ENDED rather than narrated,
+// so the next poll can open a fresh one.
+constexpr unsigned DUNGEON_CLEAR_SKIPS = 3;
+
 // ------------------------------------------------- the run goes again (#144) --
 //
 // HOW MANY TIMES THE RESET MAY BE ASKED FOR BEFORE THE RUN IS WRITTEN OFF.
@@ -10154,6 +10216,25 @@ private:
         // independent of WHICH path entered the phase, and zeroed with the rest
         // of this struct when a run ends. See DUNGEON_STAGING_BACKSTOP_SECONDS.
         time_t stagingSince{0};
+        // THE CLEARING WATCHDOG'S MEMORY (#171). The same shape as
+        // FollowStallState - a mark the subject is measured FROM, the shared
+        // ratchet's reading of how far it has got from that mark, and a count
+        // of what has been tried about it - with the RUN's lifetime rather than
+        // a character's, which is why it lives here and not beside
+        // _followStall. See RunClearingWatchdog.
+        bool clearMarked{false};
+        float clearX{0.f}, clearY{0.f};
+        OverseerDecisions::RatchetState clearProgress;
+        // The completed-encounter mask as this run last saw it. A boss dying is
+        // progress that no amount of standing still can fake, and it is the one
+        // progress signal that does not depend on where anybody is standing.
+        uint32 clearEncounters{0};
+        unsigned clearSkips{0};
+        // WHY THE PARTY IS BEING WALKED OUT, when it is not simply over. Set by
+        // the CLEARING watchdog and read by EXIT, so a run that died inside ends
+        // on its row as what it was rather than as an ordinary 'left'. Empty for
+        // every other way out.
+        std::string stalledReason;
         bool anchorSet{false};
         float anchorX{0.f}, anchorY{0.f};
         time_t anchorAt{0};
@@ -10214,6 +10295,209 @@ private:
     // crossing and were never testable without a world, so moving them would
     // have moved the core types into the file whose whole value is not having
     // any.
+
+    // THE RUN'S BOSS CREDIT, as the core counts it and not as any module
+    // reports it (#171). InstanceSave::GetCompletedEncounterMask
+    // (InstanceSaveMgr.h:72) is the mask the core itself sets on every kill that
+    // a DungeonEncounter.dbc row credits: KillRewarder calls
+    // Map::UpdateEncounterState (KillRewarder.cpp:313, Map.cpp:2933-2975), which
+    // ORs the bit in through InstanceScript::SetCompletedEncountersMask and
+    // writes it straight back to the save (InstanceScript.cpp:756-773). So it
+    // rises live during a run, needs no header from the dungeon module, and
+    // cannot be faked by a party standing still.
+    //
+    // ZERO ON A LEADER THIS MAP HAS NOT BOUND YET, and the caller treats a
+    // reading that does not RISE as no news rather than as a loss - so a bind
+    // that is not there yet costs nothing and cannot un-credit a boss.
+    //
+    // THIS IS NOT "IS THE DUNGEON FINISHED". That question is still not
+    // answerable here for map 36 and the CLEARING state's own comment says why
+    // at length: Deadmines' script never calls SetBossState, so its encounter
+    // COUNT is zero and "all done" would read true on entry. A mask that RISES
+    // is a different claim and a safe one.
+    static uint32 CompletedEncounters(Player* leader)
+    {
+        if (!leader)
+            return 0;
+        // PlayerGetBoundInstance  InstanceSaveMgr.h:207; InstancePlayerBind::save
+        // InstanceSaveMgr.h:39-41. Both already used by ResetGroupInstance.
+        if (InstancePlayerBind* bind = sInstanceSaveMgr->PlayerGetBoundInstance(
+                leader->GetGUID(), leader->GetMapId(), DUNGEON_DIFFICULTY_NORMAL))
+            if (bind->save)
+                return bind->save->GetCompletedEncounterMask();
+        return 0;
+    }
+
+    // ---- the CLEARING watchdog: has the run gone anywhere (#171) ----
+    //
+    // A DIFFERENT STALL FROM THE STAGING ONE, AND THE WORST OF THE THREE. The
+    // staging watchdog below bounds a member that will not reach the door and
+    // the whole-run staging clock bounds a barrier that will not open; neither
+    // of them is looking any more once the party is INSIDE. This one is, and the
+    // thing it caught was a healthy party frozen at a cannon for twenty-six
+    // minutes with a thirty-second timeout printed beside it every five seconds.
+    //
+    // THE CONDITION IS MEASURED, NOT READ OFF ANOTHER MODULE'S LOG. That is a
+    // requirement rather than a preference: a log line is a format somebody else
+    // owns and may change, and a watchdog that parses one is a watchdog that
+    // fails silently the day they do. Three facts this module can take for
+    // itself, all of them public core API:
+    //
+    //   - NO BOSS CREDIT. The completed-encounter mask has not risen. See
+    //     CompletedEncounters above.
+    //   - NO MOVEMENT. The tank has not got DUNGEON_CLEAR_STALL_YARDS from a
+    //     mark this drive moves to wherever it last saw it going somewhere -
+    //     the shared ratchet, on the reading the follower stall already uses.
+    //   - NOT BUSY. Nobody inside is fighting, looting, sitting to eat or drink,
+    //     dead, or waiting on a resurrect. Every one of those is a party doing
+    //     something legitimately slow, and every one of them HOLDS the clock
+    //     rather than being absorbed into the patience: a bound that has to be
+    //     wide enough to cover the longest boss fight is a bound that cannot
+    //     catch a stall shorter than one.
+    //
+    // THE REMEDY THE MODULE ALREADY SHIPS COMES FIRST. `dc skip` is what a
+    // person types at this exact state, and it worked instantly when one did.
+    // It goes out through the same door `dc on` does - DoSpecificAction with an
+    // authorized issuer - for all the reasons the arming drive sets out, and it
+    // goes to the LEADER because DcSkipAction returns early for anybody who is
+    // not the dungeon module's elected leader
+    // (DungeonClearChatActions.cpp:382-383).
+    //
+    // WHAT IT CANNOT SAY, HONESTLY. Which objective was abandoned. The name
+    // ('Iron Clad Door (Defias Cannon)') exists only in the dungeon module's own
+    // log and in an addon-channel packet sent to real clients; there is no table
+    // and no accessor this module can read it from, and inventing one by parsing
+    // that log is exactly the coupling the condition above avoids. So this line
+    // says what it skipped FOR, where the party was, and how long it had stood
+    // there, and points at the other module's log for the name.
+    //
+    // Returns true when it has taken the run out of CLEARING, so the caller
+    // stops rather than falling through into the arming verdict for a phase that
+    // is over.
+    using DungeonRunEntryStates = std::vector<OverseerDecisions::DungeonRunEntryState>;
+    bool RunClearingWatchdog(DungeonRunCoordinatorState& coord, Player* leader,
+                             DungeonRunEntryStates const& states, uint32 insideMapId)
+    {
+        time_t const now = std::time(nullptr);
+
+        // A BOSS DIED. Unambiguous progress, and it resets the whole ladder:
+        // three skips spent getting past one obstacle should not count against
+        // the next one. Only a RISE counts - see CompletedEncounters.
+        uint32 const encounters = CompletedEncounters(leader);
+        if (encounters > coord.clearEncounters)
+        {
+            coord.clearEncounters = encounters;
+            coord.clearProgress.best = 0.f;
+            coord.clearProgress.since = now;
+            coord.clearMarked = false;
+            coord.clearSkips = 0;
+            return false;
+        }
+
+        // BUSY IS NOT STALLED. IsInCombat Unit.h:936; IsAlive Unit.h:1793;
+        // IsSitState Unit.h:1781 (public from :666) covers eating and drinking,
+        // which is what a party does between pulls; GetLootGUID Player.h:2026
+        // and isResurrectRequested Player.h:1856 (both public from :1091) cover
+        // the two that look most like standing still and are not.
+        for (OverseerDecisions::DungeonRunEntryState const& state : states)
+        {
+            if (!state.through)
+                continue;
+            Player* member = ObjectAccessor::FindPlayerByName(state.name);
+            if (!SteerableAI(member))
+                continue;
+            if (member->IsInCombat() || !member->IsAlive() || member->IsSitState() ||
+                !member->GetLootGUID().IsEmpty() || member->isResurrectRequested())
+            {
+                coord.clearProgress.since = now;
+                return false;
+            }
+        }
+
+        // THE MARK IS A POSITION AND THE RATCHET TAKES ONE NUMBER, so the mark is
+        // dropped here exactly as KeepRosterFollowing's stall check drops its
+        // own, and for the same reason.
+        float const movedFromMark =
+            coord.clearMarked ? leader->GetExactDist2d(coord.clearX, coord.clearY) : 0.f;
+        OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
+            coord.clearProgress, movedFromMark, now, DUNGEON_CLEAR_RATCHET);
+
+        if (!coord.clearMarked || progress.progressed)
+        {
+            coord.clearMarked = true;
+            coord.clearX = leader->GetPositionX();
+            coord.clearY = leader->GetPositionY();
+            coord.clearProgress.since = now;
+            // The run is moving, so whatever it had to skip to get moving is
+            // paid for. A later obstacle gets the full three tries of its own.
+            coord.clearSkips = 0;
+            return false;
+        }
+        if (!progress.stalled)
+            return false;
+
+        // STALLED. The clock restarts on every rung, so whatever is tried here
+        // gets a whole patience window to work in before the next thing is.
+        coord.clearProgress.since = now;
+
+        if (coord.clearSkips < DUNGEON_CLEAR_SKIPS)
+        {
+            ++coord.clearSkips;
+            Player* issuer = AuthorizedDcIssuer(leader);
+            PlayerbotAI* leaderAI = SteerableAI(leader);
+            // Event(source, param, owner)  Event.h:21-24; the owner is what
+            // IsAuthorized reads (DungeonClearChatActions.cpp:62), the same way
+            // the arming drive issues `dc on`.
+            bool const skipped =
+                issuer && leaderAI &&
+                leaderAI->DoSpecificAction("dc skip", Event("dc", "", issuer), true);
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run CLEARING has not moved '{}' more than {}y on "
+                     "map {} for {} minutes, with nobody fighting, looting, resting, dead "
+                     "or being resurrected, and no boss credited - so it is stuck on an "
+                     "objective it cannot finish. Issuing 'dc skip' ({} of {}) as '{}': "
+                     "{}. Which objective is in the dungeon module's own log, which is "
+                     "the only place it exists",
+                     leader->GetName(), static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS),
+                     insideMapId,
+                     static_cast<uint32>(DUNGEON_CLEAR_STALL_SECONDS / 60),
+                     coord.clearSkips, static_cast<uint32>(DUNGEON_CLEAR_SKIPS),
+                     issuer ? issuer->GetName() : "nobody",
+                     skipped ? "accepted"
+                             : "REFUSED or unavailable - the dungeon module's log says "
+                               "why under 'DC command refused'");
+            return false;
+        }
+
+        // SKIPPING DOES NOT REACH IT. Said once, and then the run ENDS rather
+        // than being narrated for another half hour. It ends by walking the
+        // party out through EXIT like every other finished run - the coordinator
+        // has one way to leave an instance and this is not the place to grow a
+        // second - and `stalledReason` is what makes the row that EXIT closes
+        // say what actually happened instead of 'left'.
+        coord.stalledReason =
+            "the run stopped progressing inside map " + std::to_string(insideMapId) +
+            ": no boss credit and no movement for " +
+            std::to_string((DUNGEON_CLEAR_SKIPS + 1) * DUNGEON_CLEAR_STALL_SECONDS / 60) +
+            " minutes, and " + std::to_string(DUNGEON_CLEAR_SKIPS) +
+            " 'dc skip's did not restart it";
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} cannot be cleared - {} 'dc "
+                  "skip's and '{}' has still not moved {}y on map {}. Walking the party "
+                  "back out through EXIT and ending the run so the next poll can open a "
+                  "fresh one; a run left 'active' inside a dungeon it is not clearing is "
+                  "the half hour of nothing this bound exists to end",
+                  coord.runNumber, coord.campaignId,
+                  static_cast<uint32>(DUNGEON_CLEAR_SKIPS), leader->GetName(),
+                  static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId);
+
+        coord.phase = DungeonRunPhase::Exiting;
+        coord.crossing.best = 0.f;
+        coord.crossing.since = std::time(nullptr);
+        coord.loggedCrossingAim = false;
+        coord.loggedCrossingWaiting = false;
+        return true;
+    }
 
     // ---- the staging watchdog: one member, one poll (#164) ----
     //
@@ -11814,14 +12098,29 @@ private:
                         // instance. EXIT is what establishes it, and this is
                         // the line where it becomes true - so the decision to
                         // go again is taken here rather than a phase later.
-                        EndRunAndDecide(coord, leaderName, *portal,
-                                        coord.runId
-                                            ? coord.runId
-                                            : ActiveRunIdOnMap(portal->insideMapId),
-                                        "left",
-                                        "the party walked back out through areatrigger " +
-                                            std::to_string(triggerId),
-                                        leaderJob == "dungeon");
+                        {
+                            // COPIED, NOT REFERENCED. EndRunAndDecide resets
+                            // `coord` at the end of every branch, and a reason
+                            // that lived on `coord` would be destroyed under a
+                            // reference the function still holds.
+                            std::string const reason =
+                                coord.stalledReason.empty()
+                                    ? ("the party walked back out through areatrigger " +
+                                       std::to_string(triggerId))
+                                    : coord.stalledReason;
+                            // AND THE ROW SAYS WHAT ACTUALLY HAPPENED (#171).
+                            // 'stalled' was named and deliberately NOT written
+                            // by the accounting migration, because this module
+                            // could not prove it then. It can now: no boss
+                            // credit, no movement, nobody busy, and every skip
+                            // spent. The column is a VARCHAR for exactly this.
+                            EndRunAndDecide(coord, leaderName, *portal,
+                                            coord.runId
+                                                ? coord.runId
+                                                : ActiveRunIdOnMap(portal->insideMapId),
+                                            coord.stalledReason.empty() ? "left" : "stalled",
+                                            reason, leaderJob == "dungeon");
+                        }
                         return;
 
                     case DungeonCrossingResult::GaveUp:
@@ -12103,6 +12402,15 @@ private:
             Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
             if (!leader || leader->GetMapId() != portal->insideMapId)
                 return;
+
+            // HAS THE RUN ACTUALLY GONE ANYWHERE (#171)? Asked BEFORE the
+            // arming verdict below, because that verdict answers itself once
+            // ("CLEARING verified") and then returns on every later poll - so
+            // anything placed after it would never run again for the rest of
+            // the run, which is precisely the window a twenty-six minute freeze
+            // lives in.
+            if (RunClearingWatchdog(coord, leader, states, portal->insideMapId))
+                return;   // the run is on its way out; the phase has changed
 
             if (!coord.anchorSet)
             {
