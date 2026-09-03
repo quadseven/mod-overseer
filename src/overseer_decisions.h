@@ -52,6 +52,29 @@
 namespace OverseerDecisions
 {
 
+// THE MODULE'S OWN VERSION, and the reason it lives in this header rather than
+// in mod_overseer.cpp: this file is the one part of the module that compiles
+// on its own, with no AzerothCore include path (see check.decisions.yml, which
+// exists to enforce exactly that). So a test, a tool, or the module itself can
+// read the version without dragging a core in behind it.
+//
+// KEPT IN STEP WITH THE `VERSION` FILE AT THE REPOSITORY ROOT, which is the
+// human-facing source of truth and what a release is cut from. Two copies of a
+// version string is exactly the kind of thing that drifts silently, so the
+// decisions workflow compares them and fails if they disagree. Change both, or
+// change neither.
+//
+// WHY 0.x AND NOT 1.0.0. Semver's promise at 1.0 is a stable public interface.
+// This module's public interface is its database schema, which the Overseer
+// site reads, and its command surface. Both moved this week: overseer_goal and
+// overseer_dungeon_run are new, overseer_roster gained the professions columns,
+// and a site built against the newer schema returned 503 against an older
+// worldserver. Claiming 1.0.0 today would promise a stability the schema
+// demonstrably does not have yet. It goes to 1.0.0 when the schema stops
+// moving under the site, and that is a real event worth waiting for.
+constexpr char VERSION[] = "0.1.0";
+
+
 // THE BARRIER PREDICATE, KEPT FREE OF EVERY CORE TYPE ON PURPOSE. Nothing
 // here touches Player, Map, or PlayerbotAI - it is fed plain facts the
 // caller already gathered, so it can be exercised directly by a unit test
