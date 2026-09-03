@@ -61,19 +61,18 @@ jobs:
       # in behind it. Two copies of a string is exactly the thing that drifts
       # silently, and a wrong version in a build banner is worse than none
       # because it is believed. So they are compared here, where it costs a
-      # second, rather than discovered from a page saying the wrong number.
+      # second, rather than discovered from a page showing the wrong number.
       - name: The two version strings agree
         run: |
           set -euo pipefail
-          file="$(tr -d ' 
-' < VERSION)"
-          header="$(sed -nE 's/^constexpr char VERSION\[\] = "([^"]+)";//p' src/overseer_decisions.h)"
-          echo "VERSION file:      $file"
-          echo "header constant:   $header"
+          file="$(tr -d '[:space:]' < VERSION)"
+          header="$(grep -oE '^constexpr char VERSION\[\] = "[^"]+"' src/overseer_decisions.h | grep -oE '"[^"]+"' | tr -d '"')"
+          echo "VERSION file:    $file"
+          echo "header constant: $header"
           test -n "$file"   || { echo '::error::VERSION file is empty'; exit 1; }
-          test -n "$header" || { echo '::error::no VERSION constant found in src/overseer_decisions.h'; exit 1; }
+          test -n "$header" || { echo '::error::no VERSION constant in src/overseer_decisions.h'; exit 1; }
           test "$file" = "$header" || { echo "::error::version drift: VERSION=$file header=$header"; exit 1; }
-          echo "$file" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::not semver: $file"; exit 1; }
+          printf '%s\n' "$file" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::not semver: $file"; exit 1; }
       - name: Compile and run
         run: |
           set -euo pipefail
