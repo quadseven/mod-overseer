@@ -320,6 +320,7 @@ ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
     // the end state asks for more primaries than a character may hold, and the
     // answer to that is to do nothing loudly rather than to pick a victim.
     return step;
+}
 
 bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
                  time_t backoffSeconds, time_t forgetSeconds, std::string& reason)
