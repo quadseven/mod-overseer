@@ -47,6 +47,11 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
             why = "dead";
         else if (member.inCombat)
             why = "in combat";
+        // BEFORE "wrong map", because being inside IS a wrong map and is the
+        // one wrong map that means something specific: the member is ahead of
+        // the party rather than lost behind it. See DungeonRunMemberState.
+        else if (member.inside)
+            why = "already inside";
         else if (member.distanceFromStage < 0.f)
             why = "wrong map";
         else if (member.distanceFromStage > radiusYards)
