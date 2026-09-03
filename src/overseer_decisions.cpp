@@ -322,4 +322,45 @@ ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
     return step;
 }
 
+bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
+                 time_t backoffSeconds, time_t forgetSeconds, std::string& reason)
+{
+    bool held = false;
+
+    for (auto it = book.begin(); it != book.end();)
+    {
+        // Cold entries go on the way past, whether or not they are the one
+        // being asked about. This is the only walk of the book there is, so it
+        // is the only place the sweep can happen.
+        if (it->second.since == 0 || now - it->second.since >= forgetSeconds)
+        {
+            it = book.erase(it);
+            continue;
+        }
+
+        if (it->first == key && now - it->second.since < backoffSeconds)
+        {
+            reason = it->second.reason;
+            held = true;
+        }
+        ++it;
+    }
+
+    return held;
+}
+
+bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
+                     std::string const& reason, time_t now)
+{
+    GiveRefusal& memory = book[key];
+    // NEW means "not the same wall as last time": either nothing was
+    // remembered here at all, or the give is being refused for a different
+    // reason than it was, which is a change worth a line of log even though
+    // the outcome is the same refusal.
+    bool const worthSaying = memory.since == 0 || memory.reason != reason;
+    memory.reason = reason;
+    memory.since = now;
+    return worthSaying;
+}
+
 }  // namespace OverseerDecisions
