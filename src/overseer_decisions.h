@@ -577,9 +577,15 @@ bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
 
 enum class GearRole
 {
-    // No opinion. Scores everything at one and reports itself unjudged, so a
-    // character whose role this module does not know never has an automatic
-    // swap or a Need roll made on its behalf. An honest refusal, not a guess.
+    // No opinion, and the score says so rather than pretending otherwise.
+    // Every STAT counts one for one - which is the only neutral answer there
+    // is, since with no role there is nothing to prefer - while the armour,
+    // weapon-damage and item-level terms keep middle values belonging to no
+    // role in particular (0.20, 4.0 and the same 0.5 everyone gets). What
+    // comes out is a rough ordering, not a judgement, and it is marked
+    // unjudged for exactly that reason: an unjudged verdict never drives an
+    // automatic swap and never casts a vote. See GearVerdict::judged. An
+    // honest refusal, not a guess.
     Unknown,
     Tank,
     Melee,
