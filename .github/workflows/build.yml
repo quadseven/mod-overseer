@@ -54,7 +54,10 @@ name: Build against the pinned core
 # this fleet.
 on:
   push:
-    branches: [main]
+    # THROWAWAY COMPILE-CHECK BRANCH ONLY. This repo has no C++ test
+    # harness (#116), so a change is proved by building it here before
+    # the PR opens. Present on this branch and nowhere else.
+    branches: [main, 'ci/**']
   workflow_dispatch: {}
 
 concurrency:
@@ -170,7 +173,11 @@ jobs:
           path: /tmp/buildx-cache
           key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
 
+      # NOT FROM A COMPILE-CHECK BRANCH. `latest` must only ever move on a
+      # merge to main; a throwaway branch proving that it builds has no
+      # business publishing an image anybody could pull.
       - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -185,6 +192,7 @@ jobs:
       # populated, so this is a re-tag-and-upload, not a second cold build -
       # the Dockerfile's layers already exist locally.
       - name: Push to GHCR
+        if: github.ref == 'refs/heads/main'
         working-directory: acore
         run: |
           set -euo pipefail
