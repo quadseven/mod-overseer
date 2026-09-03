@@ -45,6 +45,7 @@
 #define MOD_OVERSEER_DECISIONS_H
 
 #include <ctime>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -446,6 +447,66 @@ struct ProfessionStep
 ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
                                   std::vector<ProfessionHolding> const& held,
                                   unsigned maxPrimary);
+
+// ------------------------------------------------------ the give backoff --
+//
+// "IT DID NOT WORK, AND IT WILL NOT WORK TWO SECONDS FROM NOW EITHER."
+//
+// The command queue is drained every couple of seconds and the sender is free
+// to re-insert a give it has not seen succeed, so a give that cannot succeed
+// is not attempted once - it is attempted for as long as the condition lasts.
+// Measured on the dev world for mod-overseer#169: 31 rows of one identical
+// refusal, the oldest of them hours old, four characters, three items, and
+// nothing about any of it changing between one attempt and the next.
+//
+// The cost is not the work. It is that every one of those attempts is a fresh
+// failure with a fresh answer, and everything downstream that reacts to an
+// answer reacts again - which is how one blocked hand-over became a line of
+// party chat every two seconds for an evening.
+//
+// SO: REMEMBER THE WALL, AND STOP WALKING INTO IT. A refusal buys a pause. A
+// give asked again inside that pause is answered from the memory instead of
+// being retried, and the reason is printed only when it is NEW, so the log
+// says what is wrong once rather than nine hundred times an hour. The pause is
+// short by design: this is a backoff and not a give-up, so the wall is re-
+// tested on a cadence a person would use rather than on the queue's.
+//
+// KEPT FREE OF EVERY CORE TYPE, like everything else in this pair of files, so
+// the rule can be exercised with no world, no bot, and no database - which for
+// a rule whose whole content is "what happened LAST time, and how long ago" is
+// the only way to test it at all.
+
+// One refused give, remembered.
+struct GiveRefusal
+{
+    std::string reason;  // the detail the last attempt returned
+    time_t since{0};     // when that attempt was made; 0 = no memory at all
+};
+
+// The refusals collected against ONE RECEIVER, keyed by the give that earned
+// them. Grouped by receiver rather than kept flat because that is the unit
+// that gets forgotten: what these refusals are usually about is how much room
+// the receiver has, so the moment anything DOES reach him, every one of them
+// is a stale answer to a question whose facts just changed.
+using GiveRefusalBook = std::map<std::string, GiveRefusal>;
+
+// Is this give still inside the pause its last refusal bought? Writes the
+// remembered reason into `reason` when it is, so the caller can answer the row
+// with the same detail it would have produced by trying again.
+//
+// Sweeps as it goes: any entry older than `forgetSeconds` is erased, because a
+// refusal that outlives its reason is its own bug (the lesson
+// WithinHandbackGrace in mod_overseer.cpp already carries) and because a book
+// nothing ever removes from is a leak with a slow fuse.
+bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
+                 time_t backoffSeconds, time_t forgetSeconds, std::string& reason);
+
+// Record a refusal against `key`, and answer whether it is worth SAYING: true
+// the first time a reason is seen, false for every repeat of it. The clock is
+// restarted either way - that is what makes the next few polls cheap - so
+// "say it once" and "try it rarely" stay two separate answers.
+bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
+                     std::string const& reason, time_t now);
 
 }  // namespace OverseerDecisions
 

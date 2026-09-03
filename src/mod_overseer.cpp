@@ -21,6 +21,12 @@
  *                     inside a CharacterDatabase transaction. There is no chat
  *                     command that can do this between two bots; see the
  *                     migration 2026_08_24_00_overseer_give.sql for why.
+ *                     A CONTAINER goes into a free bag slot and is worn, not
+ *                     into the inventory (mod-overseer#169), and a receiver
+ *                     with no room is offered a bag first when the giver has
+ *                     one to spare. A give that cannot succeed is left alone
+ *                     for GIVE_REFUSAL_BACKOFF_SECONDS rather than retried on
+ *                     every poll of the queue.
  *       kind='share' - put a quest target_name is carrying into target_arg's
  *                     quest log, behind the core's own eligibility checks.
  *                     mod-playerbots' two sharing paths both need a master and
@@ -1289,6 +1295,19 @@ constexpr uint32 COMMANDS_PER_POLL = 20;
 // earlier is resolved earlier - this is only the point at which "it still has
 // not changed" becomes the answer instead of the question.
 constexpr uint32 VERIFY_GRACE_MS = 6000;
+// How long a refused give is left alone before it is tried again
+// (mod-overseer#169). Thirty COMMAND_POLL_MS drains, which is the whole point:
+// the sender re-inserts a give it has not seen succeed, so without this the
+// retry cadence is the queue's rather than the world's, and nothing a
+// hand-over waits on - room in a bag, a fight ending - resolves anywhere near
+// that fast. Short enough that a give unblocked by hand is moving again within
+// a minute; see OverseerDecisions::GiveHeldOff for why this is a backoff and
+// not a give-up.
+constexpr time_t GIVE_REFUSAL_BACKOFF_SECONDS = 60;
+// ...and when the memory of a refusal is thrown away entirely, so a book of
+// gives that were asked once and never again cannot grow for the life of the
+// process. Well past the backoff: forgetting inside it would defeat it.
+constexpr time_t GIVE_REFUSAL_FORGET_SECONDS = 30 * 60;
 // WoW's own chat limit, in BYTES - which is what the client sends and what
 // std::string measures. Escaping can nearly double it (a backslash per quote),
 // and overseer_chat.text is VARCHAR(512) CHARACTERS, so the worst case still
@@ -14439,14 +14458,242 @@ private:
         return nullptr;
     }
 
+    // ------------------------------------------- a bag goes in a bag slot --
+    //
+    // A CONTAINER DOES NOT NEED INVENTORY SPACE. It needs a BAG SLOT, and a
+    // bag slot is a different place: the four at INVENTORY_SLOT_BAG_START..
+    // INVENTORY_SLOT_BAG_END (Player.h:685-688), which sit after the nineteen
+    // equipment slots and before the sixteen backpack ones (Player.h:660-694)
+    // and are the only slots FindEquipSlot will consider for an INVTYPE_BAG
+    // (PlayerStorage.cpp:216-224).
+    //
+    // Asking CanStoreItem about a bag therefore asks about the wrong place,
+    // and the answer it gives back - EQUIP_ERR_INVENTORY_FULL, "no room in the
+    // inventory" - names the one condition that a bag is the CURE for. That is
+    // mod-overseer#169 in a sentence: three characters could not loot, the
+    // family was carrying 22 unused slots' worth of bags, and every attempt to
+    // hand one over was refused on the grounds that it was needed. Measured on
+    // the dev world at the time: one receiver had a single bag equipped and
+    // three empty bag slots, and was told his bags were full.
+
+    // How many of the four bag slots are empty. Reported on every give row so
+    // the two refusals can be told apart by anybody reading the queue: four
+    // bags and a full inventory is a standing fact about the character, while
+    // "no room" alongside three empty bag slots is the bug this issue is
+    // about, and until now the row said the same thing in both cases.
+    static uint8 CountFreeBagSlots(Player* who)
+    {
+        uint8 freeSlots = 0;
+        for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+            if (!who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                ++freeSlots;
+        return freeSlots;
+    }
+
+    // Can the receiver WEAR this container, and where? The core is the
+    // authority and is asked as the core: CanEquipItem with slot = NULL_SLOT
+    // is exactly what makes FindEquipSlot search the four bag slots for a free
+    // one (PlayerStorage.cpp:257-263), and it also applies every rule this
+    // module has no business restating - quiver and ammo-pouch uniqueness
+    // (PlayerStorage.cpp:2015-2024), combat (PlayerStorage.cpp:1937-1946),
+    // binding, and the script hook.
+    //
+    // `pos` comes back as (bag << 8) | slot, which is the form Player::EquipItem
+    // takes (PlayerStorage.cpp:2838-2840).
+    static InventoryResult CanWearContainer(Player* receiver, Item* container, uint16& pos)
+    {
+        pos = 0;
+        // Item.h:254 - IsBag() is InventoryType == INVTYPE_BAG, the same fact
+        // FindEquipSlot switches on, so this and the core agree by
+        // construction rather than by coincidence.
+        if (!container->IsBag())
+            return EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT;
+
+        InventoryResult const res =
+            receiver->CanEquipItem(NULL_SLOT, pos, container, false, true);
+        if (res != EQUIP_ERR_OK)
+            return res;
+
+        // Belt and braces on a uint16 that decides where an item is PUT. If
+        // this is ever not one of the four bag slots (Player.h:594-602), the
+        // right answer is to refuse rather than to place an item somewhere
+        // nobody meant it to go.
+        if (!Player::IsBagPos(pos))
+            return EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT;
+        return EQUIP_ERR_OK;
+    }
+
+    // A SPARE BAG THE GIVER COULD HAND OVER TO UNBLOCK HIMSELF. Searched only
+    // when a give has already been refused for want of room, because that is
+    // the only time the answer is worth anything: the container removes the
+    // condition that blocked the transfer, so offering it first turns one
+    // impossible hand-over into two possible ones.
+    //
+    // Worn bags are skipped by CanBeTraded, which refuses a bag that is in a
+    // bag position or is not empty (Item.cpp:800-801), so what comes back here
+    // is a spare being carried as cargo - which is exactly what the family had
+    // four of while three of its members could not loot.
+    static Item* SpareContainerFor(Player* giver, Player* receiver, uint16& pos)
+    {
+        auto usable = [&](Item* candidate) -> bool
+        {
+            if (!candidate || !candidate->IsBag() || candidate->IsSoulBound())
+                return false;
+            if (!candidate->CanBeTraded())
+                return false;
+            // Into a local first, so `pos` is written only for the container
+            // that is actually returned and can never be read as the answer
+            // for one that was rejected.
+            uint16 where = 0;
+            if (CanWearContainer(receiver, candidate, where) != EQUIP_ERR_OK)
+                return false;
+            pos = where;
+            return true;
+        };
+
+        // The backpack first, then inside the worn bags - the same two sweeps
+        // FindCarriedItem makes, minus the equipment slots, which for a
+        // container can only mean a bag that is being worn and therefore one
+        // CanBeTraded would refuse anyway.
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* candidate = giver->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (usable(candidate))
+                    return candidate;
+
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = giver->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* candidate = bag->GetItemByPos(i))
+                    if (usable(candidate))
+                        return candidate;
+        }
+        return nullptr;
+    }
+
+    // THE MOVE ITSELF, once it is settled where the item is going. Both of
+    // DoGive's transfers go through this - the requested item, and the bag
+    // handed over first to make room for it - so the four steps below are
+    // written once and the two hand-overs cannot drift apart.
+    //
+    // Returns the slot the item landed in on the receiver, or -1 if it merged
+    // into a stack he already had (see step 4).
+    static int32 PlaceItemOn(Player* giver, Player* receiver, Item* item,
+                             ItemPosCountVec const& dest, uint16 equipPos, bool equip)
+    {
+        ObjectGuid const itemGuid = item->GetGUID();
+        uint8 const srcBag = item->GetBagSlot();
+        uint8 const srcSlot = item->GetSlot();
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+        // 1. Off the giver, in memory and in character_inventory.
+        giver->MoveItemFromInventory(srcBag, srcSlot, true);
+        item->DeleteFromInventoryDB(trans);
+
+        // 2. Re-owned in item_instance. SetState is required because
+        //    RemoveItem left the item ITEM_UNCHANGED and SaveToDB ignores
+        //    that state; the default nullptr `forplayer` means no update
+        //    queue is touched by it.
+        item->SetOwnerGUID(receiver->GetGUID());
+        item->SetState(ITEM_CHANGED);
+        item->SaveToDB(trans);
+
+        // 3. Into the receiver's bags - or ONTO him, if this is a container
+        //    going into a bag slot. EquipItem is the same call the core makes
+        //    for a player dragging a bag onto a bag slot: SwapItem checks
+        //    CanEquipItem and then equips (PlayerStorage.cpp:2833), and
+        //    IsEquipmentPos counts the four bag slots as equipment
+        //    (PlayerStorage.cpp:574-581). VisualizeItem inside it does the
+        //    SetState(ITEM_CHANGED, receiver) that MoveItemToInventory would
+        //    otherwise have done (PlayerStorage.cpp:2981-3003), so the item is
+        //    in the receiver's update queue either way.
+        //
+        //    in_characterInventoryDB = true on the store because the
+        //    character_inventory row is written just below rather than being
+        //    deferred to the receiver's next save.
+        if (equip)
+            receiver->EquipItem(equipPos, item, true);
+        else
+            receiver->MoveItemToInventory(dest, item, true, true);
+
+        // 4. The placement, durably. Re-found by guid rather than reusing
+        //    `item`: a store that merges into an existing stack consumes the
+        //    source item (PlayerStorage.cpp:2786-2800), and in that case there
+        //    is no new row to write - the surviving stack already has one.
+        //    GetItemByGuid's first sweep covers slots 0..38
+        //    (PlayerStorage.cpp:413-416), so it finds an equipped bag as
+        //    readily as a stored one.
+        int32 destSlot = -1;
+        if (Item* stored = receiver->GetItemByGuid(itemGuid))
+        {
+            destSlot = int32(stored->GetSlot());
+            Bag* container = stored->GetContainer();
+            trans->Append(
+                "REPLACE INTO character_inventory (guid, bag, slot, item) VALUES ({}, {}, {}, {})",
+                receiver->GetGUID().GetRawValue(),
+                container ? container->GetGUID().GetCounter() : 0,
+                uint32(destSlot),
+                itemGuid.GetCounter());
+        }
+
+        CharacterDatabase.CommitTransaction(trans);
+        return destSlot;
+    }
+
     // EVERY exit from here writes `out`, including every refusal. A row that
     // ends 'error' with an empty result is a row nobody can diagnose from
     // outside the worldserver, and this queue has already shipped one action
     // that reported success while doing nothing.
-    static char const* DoGive(Player* giver, std::string const& receiverName,
-                              std::string const& command, char const*& status,
-                              std::string& out)
+    //
+    // NOT static, unlike everything around it, and for one reason: the refusal
+    // memory below. A backoff is a fact about what happened on an EARLIER
+    // poll, and there is nowhere for that to live but the script object.
+    char const* DoGive(Player* giver, std::string const& receiverName,
+                       std::string const& command, char const*& status,
+                       std::string& out)
     {
+        time_t const now = std::time(nullptr);
+
+        // THE GIVE, AS THE REFUSAL BOOK KEYS IT. These three fields are what
+        // the sender re-inserts unchanged every time it re-asks for a
+        // hand-over it has not seen succeed, which is what makes them a key
+        // and not just a description.
+        std::string const giveKey = giver->GetName() + "\n" + command;
+        OverseerDecisions::GiveRefusalBook& book = _giveRefusals[receiverName];
+
+        std::string heldReason;
+        if (OverseerDecisions::GiveHeldOff(book, giveKey, now, GIVE_REFUSAL_BACKOFF_SECONDS,
+                                           GIVE_REFUSAL_FORGET_SECONDS, heldReason))
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"held\",\"reason\":" << J(heldReason)
+              << ",\"from\":" << J(giver->GetName())
+              << ",\"to\":" << J(receiverName)
+              << ",\"request\":" << J(command)
+              << ",\"backoff_seconds\":" << int64(GIVE_REFUSAL_BACKOFF_SECONDS) << "}";
+            out = o.str();
+            // Deliberately no log line. This is the poll that exists in order
+            // to be quiet: the reason was printed once when the wall was first
+            // hit, and it is in the row above for anybody who wants it again.
+            return "not retried; the same refusal is still standing";
+        }
+
+        // Every refusal below goes through this, so arming the backoff cannot
+        // be forgotten at one exit and remembered at the others. It returns
+        // the detail it was given so a refusal still reads as one line.
+        auto arm = [&](char const* detail) -> char const*
+        {
+            if (OverseerDecisions::NoteGiveRefusal(book, giveKey, detail, now))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' cannot give {} to '{}': {}; leaving it alone for {}s",
+                         giver->GetName(), command, receiverName, detail,
+                         int64(GIVE_REFUSAL_BACKOFF_SECONDS));
+            return detail;
+        };
+
         auto refuse = [&](char const* reason, char const* detail) -> char const*
         {
             std::ostringstream o;
@@ -14455,7 +14702,7 @@ private:
               << ",\"to\":" << J(receiverName)
               << ",\"request\":" << J(command) << "}";
             out = o.str();
-            return detail;
+            return arm(detail);
         };
 
         GiveSpec const spec = ParseGiveSpec(command);
@@ -14496,6 +14743,20 @@ private:
         uint8 const srcBag = item->GetBagSlot();
         uint8 const srcSlot = item->GetSlot();
         std::string const itemName = proto->Name1;
+        // Captured for the same reason as the rest: describe() runs after the
+        // move as well as before it, and on a store that merged into an
+        // existing stack the Item this was read from is already gone.
+        bool const isContainer = item->IsBag();
+
+        // WHAT MADE ROOM, if anything did. Filled by the bag hand-over below
+        // and reported on every exit after it, because a row that says "the
+        // receiver was full" while a bag quietly went the other way is a row
+        // that describes half of what happened.
+        std::string madeRoom;
+        // What the core said about wearing this item, for the rows that get
+        // written before the question is asked. Declared up here rather than
+        // where it is answered because describe() reads it.
+        InventoryResult wearResult = EQUIP_ERR_OK;
 
         auto describe = [&](char const* outcome, char const* reason, int32 storeResult,
                             int32 destSlot)
@@ -14512,7 +14773,24 @@ private:
               << ",\"src_bag\":" << uint32(srcBag)
               << ",\"src_slot\":" << uint32(srcSlot)
               << ",\"dest_slot\":" << destSlot
-              << ",\"store_result\":" << storeResult << "}";
+              << ",\"store_result\":" << storeResult
+              // The two facts that separate "he is full" from "he has nowhere
+              // to PUT A BAG", which is the distinction this whole path exists
+              // to make. Reported on refusals and on successes alike, so the
+              // row that refuses and the row that works are comparable.
+              << ",\"is_container\":" << (isContainer ? "true" : "false")
+              // Read fresh on every call rather than captured, so a row
+              // written AFTER a bag went the other way reports the receiver
+              // as he is now and not as he was when this function started.
+              << ",\"free_bag_slots\":" << uint32(CountFreeBagSlots(receiver))
+              // What the core said about WEARING it, which for a container is
+              // the answer that decided the outcome. EQUIP_ERR_OK on anything
+              // that is not a container simply means the question was never
+              // asked, which is why is_container is next to it.
+              << ",\"wear_result\":" << int32(wearResult);
+            if (!madeRoom.empty())
+                o << ",\"made_room\":" << madeRoom;
+            o << "}";
             out = o.str();
         };
 
@@ -14523,7 +14801,7 @@ private:
         if (item->IsSoulBound())
         {
             describe("refused", "item is soulbound to the giver", EQUIP_ERR_OK, -1);
-            return "item is soulbound and can never be handed over";
+            return arm("item is soulbound and can never be handed over");
         }
         // Everything else Item::CanBeTraded (Item.cpp:795-820) knows about: a
         // non-empty bag, a bag that is itself equipped, an item currently
@@ -14532,67 +14810,125 @@ private:
         {
             describe("refused", "item cannot be traded (non-empty bag, worn bag, being looted, "
                                 "or bound by enchant)", EQUIP_ERR_OK, -1);
-            return "item cannot be handed over";
+            return arm("item cannot be handed over");
         }
 
+        // ---- WHERE THE RECEIVER CAN PUT IT ---------------------------------
+        //
         // Asked BEFORE anything is removed from the giver, so a receiver with
         // no room costs nothing: the giver still has the item and the row says
         // why.
+        //
+        // TWO QUESTIONS, and which one applies depends on the ITEM. See the
+        // note above CountFreeBagSlots: a container goes in a bag slot, an
+        // ordinary item goes in the inventory, and answering the second
+        // question for both is the whole of mod-overseer#169.
         ItemPosCountVec dest;
-        InventoryResult const msg = receiver->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
-        if (msg != EQUIP_ERR_OK)
+        uint16 equipPos = 0;
+        bool equip = false;
+        InventoryResult msg = EQUIP_ERR_OK;
+
+        if (isContainer)
         {
-            describe("refused", "receiver cannot store the item", int32(msg), -1);
+            // The bag slot FIRST, and not merely as a fallback for a full
+            // inventory. A spare bag carried as cargo is eight slots doing
+            // nothing and one more slot spent holding it; the same bag worn is
+            // eight slots of room. The issue asks for it equipped, and that is
+            // also the only outcome that changes anything.
+            wearResult = CanWearContainer(receiver, item, equipPos);
+            equip = (wearResult == EQUIP_ERR_OK);
+        }
+        if (!equip)
+        {
+            // Either it is not a container, or every bag slot is worn and it
+            // has to be carried - which is how the family came to be holding
+            // four spares in the first place, and is still a real hand-over.
+            msg = receiver->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+        }
+
+        // ---- OFFER A BAG FIRST, IF ONE WOULD UNBLOCK THIS ------------------
+        //
+        // The receiver has no room and this item is not the thing that would
+        // give him any. If the giver is carrying a spare bag the receiver
+        // could wear, hand THAT over first: it is the one item on either
+        // character that changes the answer, and the family had four of them
+        // in its bags while three of its members could not loot.
+        //
+        // Only for a non-container, and not merely as an optimisation: a
+        // container that reached here has already failed CanWearContainer, so
+        // any spare would fail it for the same reason - and SpareContainerFor
+        // could otherwise hand back the very item being given.
+        if (!equip && !isContainer && msg == EQUIP_ERR_INVENTORY_FULL)
+        {
+            uint16 roomPos = 0;
+            if (Item* spare = SpareContainerFor(giver, receiver, roomPos))
+            {
+                ObjectGuid const spareGuid = spare->GetGUID();
+                uint32 const spareEntry = spare->GetEntry();
+                std::string const spareName = spare->GetTemplate()->Name1;
+                uint32 const spareSize = spare->ToBag() ? spare->ToBag()->GetBagSize() : 0;
+
+                ItemPosCountVec none;
+                int32 const spareSlot = PlaceItemOn(giver, receiver, spare, none, roomPos, true);
+
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' had no room for {}, so '{}' handed over "
+                         "'{}' (item {}, {} slots) to make some; it is now in bag slot {}",
+                         receiver->GetName(), itemName, giver->GetName(), spareName,
+                         spareGuid.GetCounter(), spareSize, spareSlot);
+
+                std::ostringstream room;
+                room << "{\"item_guid\":" << spareGuid.GetCounter()
+                     << ",\"entry\":" << spareEntry
+                     << ",\"name\":" << J(spareName)
+                     << ",\"slots\":" << spareSize
+                     << ",\"bag_slot\":" << spareSlot << "}";
+                madeRoom = room.str();
+
+                // ASK AGAIN. The receiver has just grown by a bagful, so this
+                // is a different question from the one answered a moment ago,
+                // and answering it here is what lets the hand-over that has
+                // been failing for hours finish on the poll that unblocked it
+                // instead of on some later one.
+                dest.clear();
+                msg = receiver->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+            }
+        }
+
+        if (!equip && msg != EQUIP_ERR_OK)
+        {
+            describe("refused", isContainer ? "receiver has no free bag slot and cannot store it"
+                                            : "receiver cannot store the item",
+                     int32(msg), -1);
             // No apostrophe, and that is not a style choice: `detail` is
             // embedded straight into the UPDATE below, so every literal on
             // this path must be free of quote characters.
-            return msg == EQUIP_ERR_INVENTORY_FULL ? "receiver bags are full"
-                                                   : "receiver cannot store the item";
+            //
+            // The message for a full receiver is UNCHANGED, deliberately: a
+            // character wearing four bags with nothing free in them is still
+            // refused, and refused in the same words an operator has been
+            // reading all along. What changed is who gets told it.
+            return arm(msg == EQUIP_ERR_INVENTORY_FULL ? "receiver bags are full"
+                                                       : "receiver cannot store the item");
         }
 
-        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        int32 const destSlot = PlaceItemOn(giver, receiver, item, dest, equipPos, equip);
 
-        // 1. Off the giver, in memory and in character_inventory.
-        giver->MoveItemFromInventory(srcBag, srcSlot, true);
-        item->DeleteFromInventoryDB(trans);
+        LOG_INFO("module.overseer",
+                 "overseer: gave item {} (entry {}) from '{}' to '{}'{}",
+                 itemGuid.GetCounter(), itemEntry, giver->GetName(), receiver->GetName(),
+                 equip ? ", worn in a bag slot" : "");
 
-        // 2. Re-owned in item_instance. SetState is required because
-        //    RemoveItem left the item ITEM_UNCHANGED and SaveToDB ignores
-        //    that state; the default nullptr `forplayer` means no update
-        //    queue is touched by it.
-        item->SetOwnerGUID(receiver->GetGUID());
-        item->SetState(ITEM_CHANGED);
-        item->SaveToDB(trans);
-
-        // 3. Into the receiver's bags. in_characterInventoryDB = true because
-        //    the character_inventory row is written just below rather than
-        //    being deferred to the receiver's next save.
-        receiver->MoveItemToInventory(dest, item, true, true);
-
-        // 4. The placement, durably. Re-found by guid rather than reusing
-        //    `item`: a store that merges into an existing stack consumes the
-        //    source item (PlayerStorage.cpp:2786-2800), and in that case there
-        //    is no new row to write - the surviving stack already has one.
-        int32 destSlot = -1;
-        if (Item* stored = receiver->GetItemByGuid(itemGuid))
-        {
-            destSlot = int32(stored->GetSlot());
-            Bag* container = stored->GetContainer();
-            trans->Append(
-                "REPLACE INTO character_inventory (guid, bag, slot, item) VALUES ({}, {}, {}, {})",
-                receiver->GetGUID().GetRawValue(),
-                container ? container->GetGUID().GetCounter() : 0,
-                uint32(destSlot),
-                itemGuid.GetCounter());
-        }
-
-        CharacterDatabase.CommitTransaction(trans);
-
-        LOG_INFO("module.overseer", "overseer: gave item {} (entry {}) from '{}' to '{}'",
-                 itemGuid.GetCounter(), itemEntry, giver->GetName(), receiver->GetName());
-
-        describe("moved", "", EQUIP_ERR_OK, destSlot);
+        describe("moved", equip ? "equipped in a free bag slot" : "", EQUIP_ERR_OK, destSlot);
         status = "delivered";
+
+        // SOMETHING GOT THROUGH, so every refusal remembered against this
+        // receiver is now an answer to a question whose facts have changed -
+        // most obviously if what got through was a bag. Forgetting them costs
+        // one retry each and buys the family the room immediately. `book` is a
+        // reference into the map being erased from, so nothing may touch it
+        // after this line.
+        _giveRefusals.erase(receiverName);
         return "";
     }
 
@@ -15270,6 +15606,18 @@ private:
         RepickMemory repick;
     };
     std::map<std::string, AimState> _lastAim;
+
+    // THE GIVES THIS MODULE HAS ALREADY REFUSED, so a hand-over that cannot
+    // work is not attempted thirty times a minute for as long as it cannot
+    // (mod-overseer#169). Keyed by RECEIVER, then by the give itself, because
+    // the receiver is the unit that gets forgotten: what these refusals are
+    // usually about is how much room he has, so the moment anything does reach
+    // him every one of them is stale. World thread only, like every other
+    // memory on this loop, and lost on a restart - which costs one early retry
+    // per entry and no correctness. The rule it implements is in
+    // OverseerDecisions::GiveHeldOff, where it can be tested without a world.
+    std::map<std::string, OverseerDecisions::GiveRefusalBook> _giveRefusals;
+
     uint32 _eventTimer = 0;
     uint32 _deathTimer = 0;
     bool _watchLoaded = false;
