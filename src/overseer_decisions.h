@@ -508,6 +508,199 @@ bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
 bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
                      std::string const& reason, time_t now);
 
+// ------------------------------------------------------------- gear (#145) --
+//
+// WHAT AN ITEM IS WORTH TO ONE CHARACTER, AND WHETHER IT MAY WEAR IT AT ALL.
+//
+// THE TWO DEFECTS THIS ANSWERS, BOTH MEASURED ON THE LIVE FAMILY. A level 27
+// warrior tank was wearing a CLOTH robe, LEATHER boots and a LEATHER belt
+// alongside four pieces of mail, and a mail boot of item level 19 carrying 113
+// armour was not preferred over a leather boot of item level 22 carrying 56 -
+// twice the mitigation, passed over because the comparison came down to item
+// level. Separately, a level 22 priest is carrying leather boots and leather
+// gloves she can never put on, four item levels above the cloth she wears.
+//
+// WHY IT IS HERE AND NOT IN mod_overseer.cpp. Same reason as everything else
+// in this pair of files: a decision that needs nothing from the world is a
+// decision a test can reach. This one needs it more than most - it is a
+// weighting table, and a weighting table nothing can exercise is a weighting
+// table nobody will ever dare change (#134, #116).
+//
+// ---------------------------------------------------------------------------
+// THE WEIGHTING, AND WHY IT IS THIS AND NOT SOMETHING ELSE
+// ---------------------------------------------------------------------------
+//
+// EVERY TERM IS IN ARMOUR POINTS. The score is "how many points of armour this
+// piece is worth to this character", so the armour term needs no conversion at
+// all and every other term is stated as its exchange rate against it. That is
+// what makes the numbers below arguable rather than arbitrary: a reader can
+// say "two stamina is not worth four armour to a tank" and be talking about
+// something real.
+//
+// THERE IS NO SEPARATE "WRONG ARMOUR CLASS" PENALTY, ON PURPOSE. It would be a
+// constant somebody chose. The armour VALUE already is the penalty, in the
+// units the tank actually cares about: the cloth robe measured on the tank
+// carries 38 armour where mail on the same character's legs carries 168, and
+// that gap is a fact about the two items rather than a number invented to
+// express a preference. What the score must not do - and what the upstream one
+// does - is multiply the whole weight through by item level afterwards, which
+// is how a low-armour piece of the wrong class wins on freshness alone.
+// (Upstream's calculator has an armour-type penalty written and commented out,
+// mod-playerbots StatsWeightCalculator.cpp:631-636, with the helper it would
+// have called, NotBestArmorType, still compiled at :724 and reachable from
+// nowhere; the multiply-by-item-level is at :120-128, and the armour stat's
+// own weight is 0.001 at :266.)
+//
+// ITEM LEVEL SURVIVES ONLY AS A TIEBREAK, half a point per level. It is a
+// proxy for everything not modelled here - a proc, a set bonus, a resistance -
+// and a proxy is worth having as a nudge and disastrous as the whole answer.
+// Half a point per level cannot move a decision armour or stats have already
+// made, and it does break a tie between two otherwise equal pieces in favour
+// of the newer one.
+//
+// PROFICIENCY IS READ PER CHARACTER AND NEVER INFERRED FROM CLASS. The caller
+// fills the five booleans below out of the character's own skills, because
+// "warrior" does not mean "plate": a warrior learns plate at level 40, the
+// tank measured here is 27, and his skill rows are mail, leather, cloth and
+// shield with no plate row at all. Deriving it from class and level instead -
+// which is what upstream does, mod-playerbots RandomItemMgr.cpp:1069-1078 -
+// happens to get that one case right by arithmetic and would get a future
+// party member, a heirloom, or a class change wrong. The core's own rule is a
+// skill lookup: an item's armour subclass maps to a skill (AzerothCore
+// ItemTemplate.h:782-796) and equipping it needs a nonzero value in that skill
+// (PlayerStorage.cpp:2344-2366). Worth knowing that the template-only check
+// every "can this bot use it" path starts from,
+// Player::CanUseItem(ItemTemplate const*), does NOT make that test at all
+// (PlayerStorage.cpp:2377-2421) - it checks faction, class mask, race,
+// RequiredSkill, RequiredSpell and level, and lets a priest straight through
+// on a pair of leather boots.
+
+enum class GearRole
+{
+    // No opinion. Scores everything at one and reports itself unjudged, so a
+    // character whose role this module does not know never has an automatic
+    // swap or a Need roll made on its behalf. An honest refusal, not a guess.
+    Unknown,
+    Tank,
+    Melee,
+    Ranged,
+    Healer,
+    Caster,
+};
+
+// One stat line off an item, exactly as ItemTemplate::ItemStat carries it: the
+// core's ItemModType id and the value. Plain ints, so this file still includes
+// no core header.
+struct GearStat
+{
+    int type{0};
+    int value{0};
+};
+
+// What THIS character may wear, and what it is for.
+struct GearWearer
+{
+    std::string name;
+    int level{0};
+    GearRole role{GearRole::Unknown};
+
+    // From the character's own skills. See the proficiency note above for why
+    // these are booleans the caller fills rather than a class id this file
+    // reasons about.
+    bool cloth{false};
+    bool leather{false};
+    bool mail{false};
+    bool plate{false};
+    bool shield{false};
+
+    // Does the character hold the weapon skill this particular item needs?
+    // Resolved by the caller, for the same reason: a skill lookup, not a
+    // property of the class.
+    bool weaponProficient{true};
+
+    // Does the item's AllowableClass admit this character? Resolved by the
+    // caller against the class mask.
+    bool classAllowed{true};
+};
+
+// An item, reduced to what the score actually reads.
+struct GearItem
+{
+    std::string name;
+    int itemClass{0};  // ITEM_CLASS_WEAPON 2, ITEM_CLASS_ARMOR 4
+    int subClass{0};   // armour: cloth 1, leather 2, mail 3, plate 4, shield 6
+    int inventoryType{0};
+    int itemLevel{0};
+    int requiredLevel{0};
+    int quality{0};
+    int armour{0};
+    float dps{0.f};
+    std::vector<GearStat> stats;
+
+    // Carries an on-use or proc spell this file does not model. Not a reason
+    // to refuse the item; a reason to stop claiming the score is the whole
+    // story about it. See GearVerdict::judged.
+    bool hasEffect{false};
+
+    // The caller could not resolve a random suffix or property into stats, so
+    // some of this item's worth is missing from `stats` and the score is a
+    // floor rather than a figure.
+    bool unresolvedRandomProperty{false};
+};
+
+struct GearVerdict
+{
+    // May this character put it on at all? False is final: no score, no
+    // upgrade, no Need. This is the half that stops a priest needing leather.
+    bool wearable{false};
+
+    // In armour points. Meaningless unless `wearable`.
+    float score{0.f};
+
+    // Is the score the whole story? False when the role is unknown, when the
+    // item's worth is partly in an effect this file does not read, or when a
+    // random property could not be resolved. An unjudged verdict never drives
+    // an automatic swap or a Need roll - it is said out loud instead.
+    bool judged{false};
+
+    // One clause, for the line the caller prints: "mail, 113 armour", or
+    // "no leather proficiency".
+    std::string why;
+};
+
+GearVerdict GearScore(GearItem const& item, GearWearer const& who);
+
+// What a candidate actually has to beat in the slot it would go into.
+//
+// A TWO-HANDER HAS TO BEAT BOTH HANDS, which is the whole of the Severing Axe
+// test (#14): a green two-hander is not an upgrade for a tank holding a shield
+// worth 445 armour and a block, however good the axe is on its own. An empty
+// slot scores zero, so the first item into one is an upgrade by construction.
+float GearIncumbent(float mainHandScore, float offHandScore, bool takesBothHands);
+
+// How much better a candidate has to be before it is worth a swap or a Need.
+// One percent plus half a point: the percentage keeps it proportionate at
+// every level, and the absolute floor stops two near-zero scores trading
+// places forever. Deliberately small - the failure being fixed is a family
+// that never swaps anything, not one that swaps too eagerly - and the swap is
+// one-way, so it cannot oscillate: once the better item is worn, the one now
+// in the bag is the lower score.
+bool GearIsUpgrade(GearVerdict const& candidate, float incumbent);
+
+// WHO NEEDS WHEN TWO MEMBERS BOTH WANT THE SAME DROP (#145). The one with the
+// lower total equipped score, because what a dungeon run raises is the party's
+// floor; on a tie, the larger gain, and on a tie in that, the name, so the
+// answer never depends on the order the party happens to be walked in.
+// Returns an empty string when nobody wants it.
+struct GearContender
+{
+    std::string name;
+    float gain{0.f};       // candidate score minus incumbent; must be > 0 to count
+    float totalWorn{0.f};  // everything this character is wearing, scored
+};
+
+std::string GearNeedWinner(std::vector<GearContender> const& contenders);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
