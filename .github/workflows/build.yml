@@ -61,7 +61,12 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: build
+  # PER-REF ON THIS THROWAWAY BRANCH. A single shared 'build' group means
+  # any other compile-check branch pushed while this one is queued cancels
+  # it, which is what happened three times tonight. Not on the feature
+  # branch; this exists so one compile check can answer without another
+  # one silently taking its place.
+  group: build-${{ github.ref }}
   cancel-in-progress: false
 
 env:
