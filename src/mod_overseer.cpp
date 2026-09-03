@@ -151,6 +151,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+// std::exception, for the one catch in this file. Pulled in
+// transitively by several of the headers above, but a catch that
+// compiles only by accident of somebody else's include is a catch
+// that stops compiling when they tidy up.
+#include <exception>
 #include <map>
 #include <mutex>
 #include <random>
@@ -14123,6 +14128,17 @@ private:
         std::vector<OverseerDecisions::BuildFact> const facts =
             OverseerDecisions::BuildReport(GitRevision::GetFullVersion(), env);
 
+        // INTO THE LOG FIRST, BEFORE ANY OF IT GOES NEAR THE DATABASE. The
+        // database is exactly the place this is unreadable from when something
+        // has gone wrong enough to be worth reading, and a report that is only
+        // written after a successful write is missing precisely when it would
+        // have explained the failure. This is the line an operator greps for
+        // when a realm is behaving like a build it is not supposed to be
+        // running.
+        for (OverseerDecisions::BuildFact const& fact : facts)
+            LOG_INFO("module.overseer", "overseer build: {} = {} ({})",
+                     fact.name, fact.value, fact.source);
+
         // ONE TRANSACTION, AND IT STARTS WITH A DELETE. The report is the
         // CURRENT state of this realm, not a history of it: a row for a fact an
         // older build used to report and this one does not would otherwise sit
@@ -14131,28 +14147,55 @@ private:
         // report and never a merge of two. The transaction is what stops a
         // reader polling between the delete and the writes from seeing a realm
         // that has suddenly reported nothing at all.
-        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-        trans->Append("DELETE FROM overseer_build");
-        for (OverseerDecisions::BuildFact const& fact : facts)
+        //
+        // WRAPPED, THOUGH NOTHING IN HERE IS EXPECTED TO THROW, and the reason
+        // is what this code is for rather than what it does. This runs on the
+        // world's FIRST TICK, in OnUpdate, with no handler between it and the
+        // core's update loop. Everything it writes is a banner. There is no
+        // version of "the page could not label the realm" that is worth even a
+        // small chance of "the world did not come up", so the cost of being
+        // certain is one block.
+        //
+        // WHAT COULD ACTUALLY REACH IT, since a reader deserves better than a
+        // defensive catch with no story: not a MySQL fault. CommitTransaction
+        // hands the batch to the async writer and returns, so a database that
+        // is down, read-only, or rejecting the statement fails on the worker
+        // thread long after this function has returned - see the durability
+        // note on the chat flush, which is the same arrangement. What is left
+        // is allocation, and a format failure inside Append. Neither is
+        // expected. Both are survivable, and neither is worth a realm.
+        //
+        // AND THIS IS NOT A SWALLOW. It logs at ERROR with what failed, and the
+        // consequence is visible on the page rather than hidden by it: a realm
+        // with no rows in this table renders as REALM NOT VERIFIED, which is
+        // the alarm the site already draws for a realm that has not reported.
+        // The failure surfaces in the one place somebody is looking.
+        try
         {
-            // Esc, not EscLong: `value` is VARCHAR(255) and MAX_CHAT_BYTES is
-            // 255, so the truncation is the column width and it cuts on a UTF-8
-            // boundary rather than mid-character. Nothing that belongs in this
-            // table is near that length; an environment variable that is has
-            // been set to something that is not a commit.
-            trans->Append(
-                "INSERT INTO overseer_build (name, value, source) VALUES ('{}', '{}', '{}')",
-                Esc(fact.name), Esc(fact.value), Esc(fact.source));
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            trans->Append("DELETE FROM overseer_build");
+            for (OverseerDecisions::BuildFact const& fact : facts)
+            {
+                // Esc, not EscLong: `value` is VARCHAR(255) and MAX_CHAT_BYTES
+                // is 255, so the truncation is the column width and it cuts on
+                // a UTF-8 boundary rather than mid-character. Nothing that
+                // belongs in this table is near that length; an environment
+                // variable that is has been set to something that is not a
+                // commit.
+                trans->Append(
+                    "INSERT INTO overseer_build (name, value, source) VALUES ('{}', '{}', '{}')",
+                    Esc(fact.name), Esc(fact.value), Esc(fact.source));
+            }
+            CharacterDatabase.CommitTransaction(trans);
         }
-        CharacterDatabase.CommitTransaction(trans);
-
-        // AND INTO THE LOG AS WELL, because the database is exactly the place
-        // this is unreadable from when something has gone wrong enough to be
-        // worth reading. This is the line an operator greps for when a realm is
-        // behaving like a build it is not supposed to be running.
-        for (OverseerDecisions::BuildFact const& fact : facts)
-            LOG_INFO("module.overseer", "overseer build: {} = {} ({})",
-                     fact.name, fact.value, fact.source);
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer build: could not write the report ({}) - the "
+                      "world is fine and the page will show this realm as "
+                      "unverified until the next start",
+                      e.what());
+        }
     }
 
     // Rebuilt wholesale rather than diffed: the list is a handful of rows and
