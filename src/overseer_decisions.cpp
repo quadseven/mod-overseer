@@ -433,6 +433,25 @@ constexpr float ITEM_LEVEL_TIEBREAK = 0.5f;
 constexpr float UPGRADE_MARGIN_FRACTION = 0.01f;
 constexpr float UPGRADE_MARGIN_FLOOR = 0.5f;
 
+// A SHIELD IS THE ONE PIECE OF ARMOUR YOU WEAR INSTEAD OF A WEAPON, and that
+// makes the same number on it worth something quite different from the same
+// number on a chest.
+//
+// THE NUMBERS, off this world: the tank's buckler carries 545 armour where his
+// boots carry 56 and his legs 168. A shield is an order of magnitude heavier
+// than anything else in the wardrobe, because a shield is not really an armour
+// slot - it is a decision to hold something other than a weapon. At the melee
+// weight, 545 armour would out-score every off-hand weapon and every two-hander
+// in the game, and a retribution paladin would spend the rest of his life
+// holding a shield. Only a tank is making that trade on purpose.
+//
+// So only a tank counts a shield's armour at its own rate. Everybody else
+// counts it at the caster rate, which is the rate for "something is going to
+// hit me eventually" rather than "this is what I am wearing gear for" - which
+// still leaves a holy paladin holding a shield over a plain off-hand, and still
+// lets a shield lose to a real weapon for anyone swinging one.
+float ShieldArmourWeight(GearRole role);
+
 float ArmourWeight(GearRole role)
 {
     switch (role)
@@ -452,6 +471,12 @@ float ArmourWeight(GearRole role)
         case GearRole::Unknown: return 0.20f;
     }
     return 0.20f;
+}
+
+float ShieldArmourWeight(GearRole role)
+{
+    return role == GearRole::Tank ? ArmourWeight(GearRole::Tank)
+                                  : ArmourWeight(GearRole::Caster);
 }
 
 // Exchange rate, in armour points per point of the stat.
@@ -682,7 +707,10 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
 
     verdict.wearable = true;
 
-    float score = ArmourWeight(who.role) * static_cast<float>(item.armour);
+    float const armourWeight = item.subClass == ARMOUR_SHIELD && item.itemClass == CLASS_ARMOUR
+                                   ? ShieldArmourWeight(who.role)
+                                   : ArmourWeight(who.role);
+    float score = armourWeight * static_cast<float>(item.armour);
     for (GearStat const& stat : item.stats)
     {
         if (!stat.value)
