@@ -33,6 +33,13 @@ jobs:
   decisions:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Least privilege, and it is genuinely the least: this job clones the
+    # repository, compiles two files and runs the binary. It writes nothing
+    # anywhere, so contents: read is the whole of what it needs. Named
+    # explicitly rather than inherited, because the repository default is a
+    # setting somebody can change without ever reading this file.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
