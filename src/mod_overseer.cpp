@@ -7326,6 +7326,40 @@ private:
         return true;
     }
 
+    // Is anything STANDING between where `p` is and the point it is about to be
+    // stepped to? GroundHolds answers how high the ground is along that line
+    // and never what is on it, so a wall passes every one of its samples:
+    // solid ground on both sides of it, no drop between them, approved.
+    //
+    // That is exactly how characters were stepped through Stormwind's walls
+    // and ended up under the world. Measured the night this was written: the
+    // operator watched a character standing on a featureless plane beneath the
+    // city while the server had all five on the street at z = 95.5, and three
+    // died at z = -508, -516 and -526 where the terrain sits near 30 to 50.
+    // Those were never falls off a ledge, they were characters leaving the
+    // world through geometry this check could not see (#181, #174).
+    //
+    // ASKED AT BODY HEIGHT, NOT AT THE FEET, because the question is whether a
+    // WALL is in the way and not whether a kerb is. GetCollisionHeight is the
+    // character's own height, so this scales with race and shapeshift instead
+    // of guessing a constant.
+    //
+    // LINEOFSIGHT_ALL_CHECKS with ModelIgnoreFlags::Nothing is what upstream
+    // uses when it asks this same question of this same map
+    // (FishingAction.cpp:109); the signature is Map.h:394.
+    static bool NothingInTheWay(Player* p, float toX, float toY, float toFooting)
+    {
+        Map* map = p->GetMap();
+        if (!map)
+            return false;
+        float const eye = p->GetCollisionHeight();
+        return map->isInLineOfSight(
+            p->GetPositionX(), p->GetPositionY(), p->GetPositionZ() + eye,
+            toX, toY, toFooting + eye,
+            p->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS,
+            VMAP::ModelIgnoreFlags::Nothing);
+    }
+
     // Will the mover follow the navmesh from where `bot` stands to (x, y, z),
     // or will it draw a straight line? The test is the mover's OWN
     // (PointMovementGenerator.cpp:66) rather than a judgement of this module's,
@@ -7424,6 +7458,10 @@ private:
             float footing = 0.f;
             if (!GroundHolds(bot, sx, sy, footing))
                 continue;
+            // The ground holding is not enough on its own: it says nothing
+            // about what stands on that ground. See NothingInTheWay.
+            if (!NothingInTheWay(bot, sx, sy, footing))
+                continue;
             step = WorldPosition(want.GetMapId(), sx, sy, footing);
             return true;
         }
@@ -7450,8 +7488,12 @@ private:
             return true;
         float const t = std::min(1.0f, sPlayerbotAIConfig.spellDistance / span);
         float footing = 0.f;
-        return GroundHolds(p, p->GetPositionX() + dx * t, p->GetPositionY() + dy * t,
-                           footing);
+        float const toX = p->GetPositionX() + dx * t;
+        float const toY = p->GetPositionY() + dy * t;
+        // Both halves, for the same reason the stepping fan asks both: upstream's
+        // Follow draws its short step straight, so a wall between the follower
+        // and its master is walked through exactly as one on a travel step is.
+        return GroundHolds(p, toX, toY, footing) && NothingInTheWay(p, toX, toY, footing);
     }
 
     // ------------------------------------------------------------- escort --
