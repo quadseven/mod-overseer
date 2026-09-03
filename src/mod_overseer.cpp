@@ -774,6 +774,93 @@ constexpr float FOLLOW_CATCH_UP_REAIM_YARDS = FOLLOW_CATCH_UP_DONE_YARDS / 2.0f;
 // block in DriveTravel for what is done with it.
 constexpr uint32 UPSTREAM_MOVE_FAR_STUCK_SECONDS = 90;
 
+// WHAT AN ESCORT TAKES OFF A CHARACTER WHILE IT IS TRAVELLING (#164).
+//
+// TWO MEASUREMENTS, TWELVE HOURS APART, AND THE SECOND ONE IS WHY THIS IS NOT
+// A TIDINESS LIST. On 2026-09-02 a member of a staging party stood 500 yards
+// from the instance door casting Herb Gathering, indefinitely, while BARRIER
+// held for him and the other four waited at the door; the module had just
+// handed him `new rpg` itself, exactly as the escort is designed to, and
+// `gather` and `loot` were still on the engine beside it, so the walk to the
+// dungeon became ordinary open-world time. That looked like a politeness
+// problem. The same night it killed somebody: the LEADER, under a staging aim,
+// was held on the spot by GroundedStep because every direction out of where he
+// stood was a drop - the log says so in those words - and `grind`, granted
+// seconds earlier by an upkeep cycle that had no idea a run was staging, walked
+// him off that drop anyway. He was found at z = -511, through the floor, killed
+// by himself.
+//
+// SO THIS IS A SAFETY SET. Every walk this module issues goes through
+// GroundedStep, and GroundedStep is only ever as strong as the guarantee that
+// nothing ELSE is steering the character. A second strategy with a destination
+// of its own is that guarantee failing.
+//
+// THE CRITERION, AND IT IS ABOUT THE NON-COMBAT ENGINE ONLY: a strategy is here
+// if it can send the character somewhere the escort did not choose, or start a
+// fight or a duel that stops it walking. The escort's own walk is "new rpg
+// wander npc" at relevance 3.0 (NewRpgStrategy.cpp:45-52), so anything above
+// that which fires simply wins the tick.
+//
+//   gather          "timer" -> "add gathering loot" 5.0
+//                   (LootNonCombatStrategy.cpp:19-23)
+//   loot            "loot available" -> "loot" 6.0, "far from loot target" ->
+//                   "move to loot" 7.0, "can loot" -> "open loot" 8.0
+//                   (LootNonCombatStrategy.cpp:10-17). `gather` is what puts a
+//                   herb or ore node INTO the loot stack and `loot` is what
+//                   WALKS to it, so taking one and leaving the other leaves
+//                   half of the measured behaviour in place. They are one
+//                   diverter with two names.
+//   quest           "gossip hello" / "use game object" / "complete quest" ->
+//                   "talk to quest giver", "quest share" -> "accept quest
+//                   share" (QuestStrategies.cpp:12-30) - it turns arriving
+//                   anywhere near a quest giver into an accepted objective.
+//   grind           "no target" -> "attack anything" 4.0
+//                   (GrindingStrategy.cpp:18-29). The one that killed the
+//                   leader. Note this is the NON-combat engine: the strip
+//                   DriveEngagementSafety already does for an unaccompanied
+//                   character is on the combat engine and is a different
+//                   question with a different answer.
+//   rpg             "no rpg target" -> "choose rpg target" 5.0, "far from rpg
+//                   target" -> "move to rpg target" 5.0 (RpgStrategy.cpp:34-59)
+//                   - an entire second traveller with a destination of its own.
+//   travel          "no travel target" -> "choose travel target" 6.0
+//                   (TravelStrategy.cpp:19-37) - likewise, and it picks the
+//                   destination itself.
+//   move random     "often" -> "move random" 1.5 (GrindingStrategy.cpp:31-41).
+//                   BELOW the walk's own relevance rather than above it, and
+//                   here anyway: it exists to move the character for no reason,
+//                   which is precisely what a walk to a door is not for, and
+//                   the walk is not on the table on every tick (MoveFarTo lets
+//                   a committed move run, NewRpgBaseAction.cpp:57-83).
+//   master fishing  "very often" -> "move near water" 10.0
+//                   (NonCombatStrategy.cpp:37-46).
+//   pvp             "enemy player near" -> "attack enemy player" 55.0
+//                   (AttackEnemyPlayersStrategy.cpp:10-14).
+//   duel            "duel requested" -> "accept duel", "no attackers" ->
+//                   "attack duel opponent" 70.0 (DuelStrategy.cpp:9-19).
+//
+// WHAT IS DELIBERATELY LEFT ON, because an escort is a character walking and
+// not a character switched off. `food` stops it for a few seconds and keeps it
+// alive; `mount` and `collision` help it travel rather than divert it; `flee`,
+// `cure` and the class buffs are about surviving whatever finds it on the way;
+// `emote`, `chat` and `default` move nobody; `follow` and `new rpg` are how the
+// escort works at all, and taking either is the bug this file already has three
+// comments about. `explore`, `map`, `map full` and `attack tagged` register no
+// triggers of their own at all (TravelStrategy.h:25-47,
+// NonCombatStrategy.h:43-50) - they are flags other code reads - so there is
+// nothing in them to stand down. `lfg` is the near miss: it can put a character
+// into a queue that would teleport it out of the escort entirely
+// (LfgStrategy.cpp:10-17), but it moves nobody by itself, this module walks a
+// party through the door rather than using the finder, and this family does not
+// carry it - so it is named here rather than stripped on a guess.
+//
+// EVERY NAME HERE IS PUT BACK. See TravelFocus for how, and for why the restore
+// is provable rather than merely intended.
+constexpr char const* ESCORT_DIVERT_STRATEGIES[] = {
+    "gather", "loot", "quest", "grind", "rpg",
+    "travel", "move random", "master fishing", "pvp", "duel",
+};
+
 // How often the unlearn drive looks for a profession the roster has asked a
 // character to give up (infra#2757).
 //
@@ -818,6 +905,56 @@ constexpr uint32 DUNGEON_RUN_POLL_MS = 5000;
 // constant the way INTERACTION_DISTANCE is (see TRAVEL_ARRIVED_POSITION_YARDS
 // above), so this is that consensus number, not a measurement.
 constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
+
+// THE STAGING WATCHDOG'S TWO NUMBERS (#164). Both are taken off measurements
+// this module already made rather than chosen for feel, and both are written
+// down here with what they were taken from.
+//
+// HOW MUCH CLOSER COUNTS AS CLOSING. FOLLOW_STALL_JITTER_YARDS, which is ten,
+// and it is the same constant rather than a second one that happens to have the
+// same value: it is the measured noise floor of a character that is standing
+// still, one to eight yards of jitter over eighteen minutes (#70), and a stall
+// detector that cannot clear its own noise floor reports stalls that are not
+// there. A member that is genuinely walking beats it easily - the travel
+// backstop's own measurement is 112 yards a minute (2347 yards walked before it
+// was wrongly released; see the ratchet comment in overseer_decisions.h), which
+// is about nine yards per DUNGEON_RUN_POLL_MS poll and so past ten within two
+// of them - and the ratchet only has to be beaten ONCE to restart the clock.
+constexpr float DUNGEON_STAGING_STALL_YARDS = FOLLOW_STALL_JITTER_YARDS;
+
+// HOW LONG WITHOUT CLOSING IS LONG ENOUGH. Ninety seconds, and the number is
+// borrowed rather than picked: it is UPSTREAM_MOVE_FAR_STUCK_SECONDS above,
+// which is upstream's own `stuckTime` (NewRpgBaseAction.h:76) - the interval
+// after which MoveFarTo concludes that a walk it is driving is not getting
+// anywhere. This module deliberately holds that fuse open on every travel poll
+// so upstream's recovery, a teleport onto the destination, can never fire (see
+// the stuck-teleport block in DriveTravel). Taking upstream's judgement away and
+// then never making one of its own is exactly how a character stands at a herb
+// node for a whole staging window, so the judgement is made here instead, on
+// upstream's own timescale.
+//
+// IT IS COMFORTABLY LONGER THAN EVERY LEGITIMATE PAUSE that is not already held
+// out of the reading. Combat, flight, death and a wrong map hold the clock
+// rather than run it - see RunStagingWatchdog - which leaves eating, thirty
+// seconds for a full food tick, as the longest ordinary stand-still, and that
+// fits three times inside this. It is also eighteen DUNGEON_RUN_POLL_MS polls,
+// so no single slow poll can trip it.
+//
+// AND IT IS MUCH SHORTER THAN FOLLOW_STALL_SECONDS (five minutes) ON PURPOSE.
+// That one bounds a follower nobody is waiting for. This one bounds a whole
+// party standing at a door while one member botanises, and the stall it was
+// written for lasted many minutes with the character stationary at a herb node.
+constexpr time_t DUNGEON_STAGING_STALL_SECONDS = UPSTREAM_MOVE_FAR_STUCK_SECONDS;
+
+// The staging watchdog's ratchet. DistanceToTarget and not DistanceFromLastMark,
+// which is the difference between this and the follower stall it borrows its
+// numbers from: a staged member IS being sent somewhere, and the question
+// BARRIER could never answer is whether it is getting NEARER to that somewhere.
+// "Has it moved at all" is the wrong question here - a character circling a herb
+// node moves plenty.
+constexpr OverseerDecisions::RatchetLimits DUNGEON_STAGING_RATCHET{
+    OverseerDecisions::RatchetReading::DistanceToTarget,
+    DUNGEON_STAGING_STALL_YARDS, DUNGEON_STAGING_STALL_SECONDS};
 
 // How close a character must be to the portal's own areatrigger before ENTER
 // will knock on it for the whole party (mod-overseer#88).
@@ -1888,6 +2025,16 @@ public:
         // reason: a refusal is about the journey being taken, not about the
         // character taking it.
         bool groundSaid{false};
+        // "RE-ISSUE THIS WALK EVEN THOUGH IT LOOKS LIKE THE ONE ALREADY IN
+        // FLIGHT" (#164). Set by the staging watchdog's second rung and spent
+        // by DriveTravel's re-issue guard, which otherwise does exactly the
+        // right thing and is the reason a lost walk cannot recover on its own:
+        // a character whose `rpgInfo` still names the destination it is not
+        // walking to is, to that guard, already walking to it. The flag is the
+        // one caller that knows better, and it is a single poll's exception
+        // rather than a mode - cleared at the instant the walk is issued, and
+        // dying with the errand like everything else in this record.
+        bool reissue{false};
         // The backstop's memory of whether the walk is going anywhere: the
         // nearest this character has ever been to this errand's target, 0 while
         // that has not been measured yet, and when it last got nearer. Kept in
@@ -7295,6 +7442,327 @@ private:
         }
     }
 
+    // ------------------------------------------------------- escort focus --
+    //
+    // AN ESCORT TRAVELS AND NOTHING ELSE (#164).
+    //
+    // WHAT WAS WATCHED, TWICE, TWELVE HOURS APART. A staging party of five: four
+    // at or inside the instance door and the fifth 500 yards back in Westfall
+    // with a Herb Gathering cast bar, indefinitely, so the run could not start
+    // because BARRIER holds for everybody to reach the staging point. The module
+    // had just handed him `new rpg` itself, which is the escort working as
+    // designed - a character 500 yards back cannot be moved by `follow`, so it
+    // is given the one strategy that travels under its own aim - and `gather`,
+    // `loot` and `quest` were still on the engine beside it, so the walk to the
+    // dungeon became ordinary open-world time.
+    //
+    // The same night the same shape killed the LEADER. Under a staging aim, he
+    // was held on the spot by GroundedStep, which had found that every direction
+    // out of where he stood was a drop and said so; `grind`, granted seconds
+    // earlier by an upkeep cycle with no idea a run was staging, then walked him
+    // off that drop. He was found at z = -511 - through the floor, not off a
+    // ledge - killed by himself.
+    //
+    // SO THE RULE IS NOT ABOUT POLITENESS. Every walk this module issues goes
+    // through GroundedStep, and GroundedStep is only ever as strong as the
+    // guarantee that nothing else is steering the character. While a character
+    // is travelling, everything that could steer it stands down; see
+    // ESCORT_DIVERT_STRATEGIES for what that set is and how each name in it was
+    // arrived at.
+    //
+    // WHAT COUNTS AS TRAVELLING HERE. Any character with a live errand in
+    // `travel_npc` that it can actually act on. The dungeon run's BARRIER
+    // escort, DriveCatchUp's catch-up walk and an operator's own travel aim are
+    // three names for one row in one column, and from this angle they are the
+    // same thing. THE LEADER IS COVERED BY THE SAME RULE AS A FOLLOWER, which
+    // the death above makes non-negotiable: an implementation that stripped
+    // diverters only from escorted followers would leave that death reachable,
+    // unchanged.
+    //
+    // IT IS ASSERTED EVERY POLL, NOT ONCE. The grants that killed the leader
+    // arrived mid-escort from an upkeep cycle that does not know a run exists,
+    // and the window between the grant and the death was seconds. A set taken
+    // down once at the start of the walk would have been taken down before the
+    // grant that mattered. Re-asserting is cheap - it reads the live list and
+    // writes nothing when there is nothing to write - and every re-take is
+    // logged, so the second-order bug (something granting `+grind` to a
+    // character mid-escort) is visible in the log every time it happens rather
+    // than only when it kills somebody.
+    //
+    // AND IT IS SYMMETRIC, WHICH IS THE PART THAT HAD TO BE PROVABLE. Only
+    // strategies that were PRESENT are taken; only strategies OBSERVED TO HAVE
+    // COME OFF are recorded, because `delivered` is not `done` anywhere in this
+    // module and a restore list containing something that never came off would
+    // ADD a strategy the character did not have; and only what was recorded is
+    // put back. A character that had `gather` before its escort has it after,
+    // and one that did not, does not.
+    struct TravelFocus
+    {
+        // Exactly what this module took off this character's non-combat engine,
+        // and nothing else. This list IS the restore, so anything that is not in
+        // it is never given back and anything in it always is.
+        std::vector<std::string> stoodDown;
+        // Which refusals have already been reported. A strategy that will not
+        // come off is retried on every poll, on purpose - it may come off on the
+        // next one - and an ERROR repeated every five seconds for a whole
+        // staging window is exactly the noise that buries the one line worth
+        // reading, which this file complains about in four other places. Said
+        // once per strategy per errand instead.
+        std::vector<std::string> refusedSaid;
+        // What the errand was, for the log lines that name it. Kept here
+        // rather than read back out of TravelAimBook so that a caller holding
+        // only a name can still say where the character was going.
+        std::string aim;
+    };
+    // World-thread-only and unguarded, like the escort book above it and for the
+    // same reason: DriveTravel and DriveDungeonRun both run from OnUpdate. A
+    // restart loses it, and a restart also rebuilds every bot's engine from the
+    // config it was going to be restored to, so the two are lost consistently.
+    std::map<std::string, TravelFocus> _travelFocus;
+
+    // Take down every diverter that is on this character's non-combat engine and
+    // is not already recorded as taken, and record what actually came off.
+    // Returns what it took THIS call, which is empty on every poll after the
+    // first unless something put a strategy back.
+    std::string TakeDownDiverters(std::string const& name, PlayerbotAI* botAI)
+    {
+        TravelFocus& focus = _travelFocus[name];
+
+        std::string change;
+        std::vector<std::string> taking;
+        for (char const* strategy : ESCORT_DIVERT_STRATEGIES)
+        {
+            // Already ours. Asked before the engine is, because a strategy this
+            // module took is one the engine will say is absent, and re-taking it
+            // would be a second entry in the restore list.
+            if (std::find(focus.stoodDown.begin(), focus.stoodDown.end(), strategy) !=
+                focus.stoodDown.end())
+                continue;
+            // StrategyPresent, the same predicate the command surface reads its
+            // verdicts with, so "is it on" can never mean two different things
+            // in one file. `false` is the non-combat engine.
+            if (!StrategyPresent(botAI, StrategyItem{strategy, false}))
+                continue;
+            if (!change.empty())
+                change += ',';
+            change += '-';
+            change += strategy;
+            taking.push_back(strategy);
+        }
+
+        if (change.empty())
+            return std::string();
+
+        // .c_str() for the reason DriveEngagementSafety's own built strip gives:
+        // every other ChangeStrategy in this file passes a literal, so a built
+        // string is the one call that has to work whichever parameter type
+        // upstream picked.
+        botAI->ChangeStrategy(change.c_str(), BOT_STATE_NON_COMBAT);
+
+        std::string took;
+        std::string refused;
+        for (std::string const& strategy : taking)
+        {
+            if (StrategyPresent(botAI, StrategyItem{strategy, false}))
+            {
+                if (std::find(focus.refusedSaid.begin(), focus.refusedSaid.end(),
+                              strategy) != focus.refusedSaid.end())
+                    continue;
+                focus.refusedSaid.push_back(strategy);
+                if (!refused.empty())
+                    refused += ", ";
+                refused += strategy;
+                continue;
+            }
+            focus.stoodDown.push_back(strategy);
+            if (!took.empty())
+                took += ", ";
+            took += strategy;
+        }
+
+        if (!refused.empty())
+            // ERROR, because this is the failure that looks like success from
+            // the outside: the module decided to take the wheel, the log says it
+            // did, and the character can still be steered off ground the
+            // grounded step refused. Said once per strategy per errand - see
+            // TravelFocus::refusedSaid.
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' is travelling and {} would not come off its "
+                      "non-combat engine - it can still be steered away from the walk, "
+                      "including off ground this module has already refused to walk it "
+                      "off", name, refused);
+        return took;
+    }
+
+    // ONE TRAVELLING CHARACTER, ONE POLL. Idempotent and cheap: it reads the
+    // live strategy list and writes only when something is actually there to
+    // take. Returns what it took, for a caller that wants to say so in its own
+    // words.
+    std::string AssertTravelFocus(std::string const& name, PlayerbotAI* botAI,
+                                  std::string const& aim)
+    {
+        // ASKED BEFORE THE TAKE, because TakeDownDiverters creates the record.
+        // "Is this the first poll of this focus" is the whole difference between
+        // the two lines below: anything taken on the first poll is what the
+        // character was carrying when it set off, and anything taken after that
+        // is something that arrived while it was already walking.
+        bool const fresh = _travelFocus.find(name) == _travelFocus.end();
+
+        std::string const took = TakeDownDiverters(name, botAI);
+        TravelFocus& focus = _travelFocus[name];
+        focus.aim = aim;
+        if (took.empty())
+            return took;
+
+        if (fresh)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is travelling to '{}' and stands down {} for the "
+                     "trip - an escort travels and nothing else, and every one of them "
+                     "goes back exactly as it was when the errand ends",
+                     name, aim, took);
+            return took;
+        }
+
+        // A DIVERTER THAT CAME BACK MID-ESCORT, which is the second-order bug
+        // this line exists to make visible: something granted it to a character
+        // that was already being walked somewhere, knowing nothing about the
+        // walk. WARN rather than INFO because the last time it happened
+        // unobserved it ended in a death.
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' had {} put back on its non-combat engine while it was "
+                 "travelling to '{}' - taken off again. Something is granting "
+                 "strategies to a character that is mid-escort",
+                 name, took, aim);
+        return took;
+    }
+
+    // The same, for a caller that has only a name - the dungeon run coordinator,
+    // which re-asserts on its own five-second clock rather than waiting for the
+    // travel poll. DELIBERATELY DOES NOT CREATE A FOCUS: the errand loop is the
+    // one place that knows a character has an aim it can act on, and a focus
+    // created here for a row that loop has not seen yet would be swept back off
+    // on its next poll and taken again on the one after.
+    std::string AssertTravelFocus(std::string const& name)
+    {
+        auto const it = _travelFocus.find(name);
+        if (it == _travelFocus.end())
+            return std::string();
+        std::string const aim = it->second.aim;
+
+        Player* bot = ObjectAccessor::FindPlayerByName(name);
+        PlayerbotAI* botAI = SteerableAI(bot);
+        if (!botAI)
+            return std::string();
+        return AssertTravelFocus(name, botAI, aim);
+    }
+
+    // GIVE BACK EXACTLY WHAT WAS TAKEN, and nothing else. The one terminal path,
+    // the same way TravelAimBook::Release is the one terminal path for an
+    // errand: the record is erased here whatever happens next, so a character
+    // whose engine has gone cannot leave a restore list behind to be applied to
+    // some later engine.
+    void RestoreTravelFocus(std::string const& name)
+    {
+        auto it = _travelFocus.find(name);
+        if (it == _travelFocus.end())
+            return;
+        std::vector<std::string> const stoodDown = it->second.stoodDown;
+        std::string const aim = it->second.aim;
+        _travelFocus.erase(it);
+        if (stoodDown.empty())
+            return;
+
+        Player* bot = ObjectAccessor::FindPlayerByName(name);
+        PlayerbotAI* botAI = SteerableAI(bot);
+        if (!botAI)
+            // Logged out, mid-teardown, or the worldserver bounced - the engine
+            // that held these is gone with it, and AiFactory builds a fresh one
+            // from the config when the character comes back. Nothing to give
+            // back and nothing wrong; the same argument EndOneEscort makes about
+            // the strategy it hands back.
+            return;
+
+        std::string change;
+        for (std::string const& strategy : stoodDown)
+        {
+            if (!change.empty())
+                change += ',';
+            change += '+';
+            change += strategy;
+        }
+        botAI->ChangeStrategy(change.c_str(), BOT_STATE_NON_COMBAT);
+
+        // READ BACK, because `delivered` is not `done` anywhere in this module
+        // and because the whole claim this section makes is that the character is
+        // the character it was before the trip. A claim nobody checked is a
+        // comment.
+        std::string back;
+        std::string missing;
+        for (std::string const& strategy : stoodDown)
+        {
+            std::string& into =
+                StrategyPresent(botAI, StrategyItem{strategy, false}) ? back : missing;
+            if (!into.empty())
+                into += ", ";
+            into += strategy;
+        }
+
+        if (!missing.empty())
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' did not get {} back after its errand to '{}' ended "
+                      "- it is not the character it was before the trip, and nothing else "
+                      "will notice", name, missing, aim);
+        if (!back.empty())
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' has {} back after its errand to '{}' - restored "
+                     "exactly as they were before it started travelling",
+                     name, back, aim);
+    }
+
+    // END EVERY FOCUS WHOSE ERRAND IS GONE. The same shape, and for the same
+    // reason, as TravelAimBook::PruneVanished which it runs beside: an errand can
+    // end without this loop seeing it end - the bridge owns the column too, and
+    // a `return` cannot be made to run an epilogue - so the only complete answer
+    // is to compare what is remembered against the rows that actually came back.
+    //
+    // ONE POLL OF LAG ON THE PATHS THAT DO RELEASE INSIDE THE LOOP, and it is
+    // the same trade the escort sweep above already makes for the same reason.
+    // A character that arrives and is released this poll keeps its focus until
+    // the next one, which is five seconds while anyone is escorted and fifteen
+    // otherwise. Five seconds of not gathering is not a cost; a release path
+    // somebody forgets to hand the focus back on is.
+    void SweepTravelFocus(std::set<std::string> const& stillAimed)
+    {
+        for (auto it = _travelFocus.begin(); it != _travelFocus.end(); )
+        {
+            if (stillAimed.count(it->first))
+            {
+                ++it;
+                continue;
+            }
+            // Advanced BEFORE the restore, which erases the entry this iterator
+            // is on. Erasing one element of a std::map invalidates only the
+            // iterator to that element, so the advanced one stays good.
+            std::string const name = it->first;
+            ++it;
+            RestoreTravelFocus(name);
+        }
+    }
+
+    // THE END OF A TRAVEL POLL, BOTH HALVES OF IT. The errand memory and the
+    // focus begin together and they end together: an aim that stopped coming
+    // back from the roster has to take the errand record AND the stood-down
+    // strategies with it, and a caller that does one of the two has done half
+    // the job. That is the same argument TravelAimBook::Release makes about its
+    // own three side effects, and the reason this is one verb: DriveTravel has
+    // two ways out and both of them go through here.
+    void EndTravelPoll(std::set<std::string> const& stillAimed)
+    {
+        _travelAims.PruneVanished(stillAimed);
+        SweepTravelFocus(stillAimed);
+    }
+
     // THE ARBITRATION between this drive and DriveQuests, in full. DriveQuests
     // is the only caller and carries the argument for the direction; what is
     // here is the two ways travel holds the wheel.
@@ -7417,7 +7885,7 @@ private:
             // true. A schema with no `travel_npc` lands here too, which is the
             // correct degrade for this drive and always was: no column, no
             // errands, nobody sent anywhere.
-            _travelAims.PruneVanished(std::set<std::string>());
+            EndTravelPoll(std::set<std::string>());
             return;
         }
 
@@ -7499,6 +7967,23 @@ private:
                 }
                 continue;
             }
+
+            // THE ESCORT'S FOCUS, TAKEN BEFORE ANYTHING BELOW CAN RETURN (#164).
+            // This is the last point at which the answer is unconditionally
+            // "this character is travelling": a character in the air, one held
+            // on a cliff top by GroundedStep, one already standing at its
+            // escort point and one whose walk simply is not re-issued this poll
+            // are all still travelling, and every one of them reaches a
+            // `continue` further down. It is also the point at which the LEADER
+            // is covered on exactly the same terms as an escorted follower,
+            // which is what the death in ESCORT_DIVERT_STRATEGIES' comment made
+            // non-negotiable: he was on a staging aim, and a rule that only
+            // covered followers would have left him on the cliff with `grind`.
+            //
+            // ASSERTED EVERY POLL, not taken once. See the escort focus section
+            // for why: the grants that killed him arrived mid-walk, seconds
+            // before it, from something that does not know a run exists.
+            AssertTravelFocus(name, botAI, target);
 
             // A CHARACTER IN THE AIR IS NOT DECIDED ABOUT AT ALL (#68). It
             // cannot be walked anywhere - Player::ActivateTaxiPathTo has
@@ -7904,7 +8389,13 @@ private:
                 continue;
             }
 
-            if (botAI->rpgInfo.GetStatus() == RPG_WANDER_NPC)  // NewRpgInfo.h:99
+            // `!state.reissue` FIRST, because the staging watchdog's second
+            // rung is precisely the case this guard is wrong about (#164): a
+            // character whose `rpgInfo` still names a destination it has stopped
+            // walking to reads here as already walking to it, and the guard
+            // then refuses to hand it the walk again forever. The flag is spent
+            // below, at the instant the walk is issued.
+            if (!state.reissue && botAI->rpgInfo.GetStatus() == RPG_WANDER_NPC)  // NewRpgInfo.h:99
             {
                 if (NewRpgInfo::WanderNpc const* wander =
                         std::get_if<NewRpgInfo::WanderNpc>(&botAI->rpgInfo.data))
@@ -7968,6 +8459,8 @@ private:
             // overload. The no-argument ChangeToWanderNpc() upstream ships takes
             // no target, which is the entire reason this feature did not exist.
             botAI->rpgInfo.ChangeToWanderNpc(entry, aimAt);
+            // Spent. One poll's exception, not a mode - see TravelState.
+            state.reissue = false;
 
             // Pinned to what it was actually SENT to, not to what was
             // resolved: a resolve that never reached ChangeToWanderNpc is not
@@ -8004,7 +8497,7 @@ private:
             }
         }
 
-        _travelAims.PruneVanished(stillAimed);
+        EndTravelPoll(stillAimed);
     }
 
     // ---------------------------------------------------------- engagement --
@@ -9582,6 +10075,14 @@ private:
         // the same way and now through the same function. Shared by ENTER and
         // EXIT because only one crossing is ever in progress.
         OverseerDecisions::RatchetState crossing;
+        // THE STAGING WATCHDOG'S PER-MEMBER MEMORY (#164): whether each member
+        // is actually closing on the staging point, and how far up the
+        // correction ladder it has been taken. It lives on the RUN rather than
+        // beside _followStall because that is its lifetime - it is meaningless
+        // outside BARRIER, it is cleared on the way into that phase and on the
+        // way out of it, and a run that ends takes it with the rest of this
+        // struct. See RunStagingWatchdog and OverseerDecisions::StagingWatchdog.
+        std::map<std::string, OverseerDecisions::StagingStallState> staging;
         // CLEARING'S TWO CLOCKS (#140). `awaitingSince` is when this state
         // last started waiting for `dc on` to be accepted on everyone inside -
         // set on entry, and again whenever that stops being true, so the
@@ -9652,6 +10153,169 @@ private:
     // crossing and were never testable without a world, so moving them would
     // have moved the core types into the file whose whole value is not having
     // any.
+
+    // ---- the staging watchdog: one member, one poll (#164) ----
+    //
+    // BARRIER ALREADY KNEW. It prints the gap for every member holding it up -
+    // "BARRIER holds - Bork (18y away), Grog (549y away), Grug (in combat), Og
+    // (22y away), Ugga (wrong map)" - and what it could never say is whether
+    // Grog was walking in from 549 yards or standing at a herb node 549 yards
+    // out. Those are the same line. The operator asked for that difference to
+    // be detected and corrected by the module rather than by somebody watching
+    // a stream, so the reading BARRIER already takes is put through the
+    // ratchet's question - is the gap CLOSING - and the answer through an
+    // escalating, bounded ladder of corrections.
+    //
+    // THE LADDER AND ITS BOUND LIVE IN OverseerDecisions::StagingWatchdog, where
+    // a test can exercise them with no world, no bot and no database, and where
+    // the argument for the shape is written down. What is here is the two halves
+    // that need a world: whether this poll's distance is a reading about walking
+    // at all, and what each rung actually does to the character.
+    //
+    // IT IS NOT A SECOND STALL MECHANISM. The comparison, the mark, the clock
+    // and the verdict are OverseerDecisions::Ratchet - the same four that
+    // KeepRosterFollowing's stall check, the travel backstop, the crossing
+    // backstop and the quest re-pick all already share. What differs is the
+    // reading (DistanceToTarget, because a staged member IS being sent
+    // somewhere) and the reaction, which is the only part any of those five
+    // sites ever had of its own.
+    void RunStagingWatchdog(DungeonRunCoordinatorState& coord, std::string const& name,
+                            Player* member,
+                            OverseerDecisions::DungeonRunMemberState const& state)
+    {
+        // A STAGED MEMBER IS NOT WATCHED, AND ITS LADDER GOES WITH IT. Inside
+        // the barrier radius there is nothing left to close. The leader in
+        // particular is HELD there on purpose - BARRIER escorts him at any
+        // distance, including none, so that his own `new rpg` cannot go idle
+        // and wander off while the stragglers arrive - and a watchdog that
+        // measured him would find a character that never gets nearer, because
+        // it is already there, and start correcting the one member doing
+        // exactly what was asked. Erased rather than merely skipped, so a
+        // member that arrives, drifts back out and returns is watched from the
+        // bottom of the ladder rather than from the rung its last bad patch
+        // reached.
+        if (state.distanceFromStage >= 0.f &&
+            state.distanceFromStage <= DUNGEON_BARRIER_RADIUS_YARDS)
+        {
+            coord.staging.erase(name);
+            return;
+        }
+
+        // WHEN THIS POLL'S DISTANCE IS NOT A READING ABOUT WALKING. A fight is
+        // a pause and not a stall. A taxi leg routinely goes the wrong way
+        // round a mountain, which is exactly why DriveTravel holds its own
+        // errand clock over one. A dead member is a ghost walking to a corpse,
+        // which is DriveStuckRevival's business and not a distance from
+        // anybody. And a member on another map has no distance to this staging
+        // point at all - the blockers line already names it, and an `at:` aim
+        // cannot cross a map anyway. All four hold the clock rather than run
+        // it, so none of them can spend a rung of the ladder.
+        //
+        // IsInFlight  Unit.h:1709  bool IsInFlight() const
+        bool const measurable = state.seen && state.alive && !state.inCombat &&
+                                state.distanceFromStage >= 0.f && !member->IsInFlight();
+
+        OverseerDecisions::StagingStallState& stall = coord.staging[name];
+        OverseerDecisions::StagingNudge const nudge = OverseerDecisions::StagingWatchdog(
+            stall, state.distanceFromStage, measurable, std::time(nullptr),
+            DUNGEON_STAGING_RATCHET);
+
+        switch (nudge)
+        {
+            case OverseerDecisions::StagingNudge::Nothing:
+                return;
+
+            case OverseerDecisions::StagingNudge::Restrategy:
+            {
+                // RUNG ONE, AND IT IS FIRST BECAUSE IT MOVES NOTHING. If
+                // something has put a diverter back on this character's engine
+                // then it is being steered somewhere else, which is a complete
+                // explanation for a gap that will not close and is the measured
+                // cause of both halves of #164. Re-asserting costs a read of
+                // the live list and, usually, no write at all.
+                std::string const took = AssertTravelFocus(name);
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run BARRIER - '{}' has got no nearer than {} "
+                         "yards to the staging point for {} seconds and is {} yards out. "
+                         "Correction 1 of {}: re-asserting the escort's own strategy set "
+                         "- {}",
+                         name, static_cast<uint32>(stall.progress.best),
+                         static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS),
+                         static_cast<uint32>(state.distanceFromStage),
+                         static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS),
+                         took.empty() ? std::string("nothing had come back on, so this "
+                                                    "is not what is holding it")
+                                      : ("took " + took + " back off it"));
+                return;
+            }
+
+            case OverseerDecisions::StagingNudge::Reaim:
+            {
+                // RUNG TWO. The aim is still on the roster row - EscortToward
+                // re-claims it every poll - so what can be missing is the walk
+                // itself, and DriveTravel will not hand it over again while the
+                // character's own `rpgInfo` still names the destination. This
+                // is the one caller that knows better; see TravelState::reissue.
+                _travelAims.StateFor(name).reissue = true;
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run BARRIER - '{}' is still {} yards out and "
+                         "no nearer. Correction 2 of {}: the walk is handed to it again "
+                         "on the next travel poll, over the guard that would otherwise "
+                         "read its own stale state as proof it is already walking",
+                         name, static_cast<uint32>(state.distanceFromStage),
+                         static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS));
+                return;
+            }
+
+            case OverseerDecisions::StagingNudge::ClearMovement:
+            {
+                // RUNG THREE, AND IT IS LAST BECAUSE IT THROWS AWAY WHATEVER
+                // THE CHARACTER WAS IN THE MIDDLE OF. Exactly the recovery
+                // KeepRosterFollowing already applies to a follower jittering
+                // in place, for exactly the reason set out there: a generator
+                // that keeps producing small motion without ever arriving is
+                // what MotionMaster::Clear() (MotionMaster.h:193, public from
+                // :160) exists to discard, so the next tick starts a fresh move
+                // instead of repeating a stale one. GetMotionMaster is public
+                // (Unit.h:1758, public from Unit.h:666).
+                member->GetMotionMaster()->Clear();
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run BARRIER - '{}' is still {} yards out and "
+                         "no nearer. Correction 3 of {}: clearing its movement so the "
+                         "next tick starts fresh, the same recovery the follow drive uses "
+                         "for a follower jittering in place",
+                         name, static_cast<uint32>(state.distanceFromStage),
+                         static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS));
+                return;
+            }
+
+            case OverseerDecisions::StagingNudge::GiveUp:
+                // SAID PLAINLY, ONCE, AND THEN NOTHING. A self-correcting
+                // mechanism that never gives up is a loop with a log line in
+                // it. The three corrections have each had a full
+                // DUNGEON_STAGING_STALL_SECONDS to work and none of them did,
+                // so this member is not going to be staged by anything this
+                // watchdog can do, and saying so is more use than a fourth
+                // attempt. What owns it from here is the errand's own
+                // twenty-minute unreachable backstop in DriveTravel, and the
+                // operator, who now has one line naming the character, the gap
+                // and everything that was tried.
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run BARRIER cannot stage '{}' - {} yards from "
+                          "the staging point, no nearer for {} minutes, and all {} "
+                          "corrections have been tried and made no difference. Nothing "
+                          "further will be attempted for it; the errand's own {}-minute "
+                          "unreachable backstop bounds the aim and the run's own timeout "
+                          "owns the run",
+                          name, static_cast<uint32>(state.distanceFromStage),
+                          static_cast<uint32>(
+                              (OverseerDecisions::STAGING_NUDGE_STEPS + 1) *
+                              DUNGEON_STAGING_STALL_SECONDS / 60),
+                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS),
+                          static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
+                return;
+        }
+    }
 
     // ---- the mechanical half of a crossing, shared by ENTER and EXIT ----
     //
@@ -10871,6 +11535,16 @@ private:
                          "reach it by following, not by their own aim", leaderName);
             }
 
+            // THE LEADER'S OWN FOCUS, ON THE RUN'S CLOCK (#164). GATHERING
+            // escorts nobody and does not start to here - but the leader IS
+            // travelling, under the staging aim this coordinator wrote, and the
+            // death that made this rule was a leader on exactly that aim. While
+            // nobody is escorted the travel poll is TRAVEL_POLL_MS (15 s); the
+            // grant that killed him and the death were seconds apart. This
+            // closes that window to DUNGEON_RUN_POLL_MS for the one character
+            // the run is walking.
+            AssertTravelFocus(leaderName);
+
             // GetMapId  Position.h:281  uint32 GetMapId() const
             // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
             if (leader->GetMapId() != portal->outsideMapId)
@@ -10882,6 +11556,9 @@ private:
 
             coord.phase = DungeonRunPhase::Barrier;
             coord.loggedBarrierWaiting = false;
+            // A fresh watchdog for a fresh barrier (#164): nothing measured
+            // yet, nobody on the ladder.
+            coord.staging.clear();
             LOG_INFO("module.overseer",
                      "overseer: '{}' reached the staging point ({:.0f}y out) - GATHERING "
                      "done, BARRIER holds until the whole roster is alive, out of combat "
@@ -11416,6 +12093,20 @@ private:
                 (isLeader || state.distanceFromStage > DUNGEON_BARRIER_RADIUS_YARDS))
                 EscortToward(name, stageTarget, "BARRIER");
 
+            // AND THE ESCORT RE-ASSERTS ITSELF ON THE RUN'S OWN CLOCK (#164).
+            // DriveTravel asserts the focus on every travel poll already; this
+            // is the same call on DUNGEON_RUN_POLL_MS instead, because a
+            // staging window is exactly when something else granting a
+            // movement strategy is most expensive and the measured window
+            // between such a grant and a death was seconds. A no-op for a
+            // member the travel drive has not focused yet.
+            AssertTravelFocus(name);
+
+            // IS IT ACTUALLY COMING? The reading above is a distance, and a
+            // distance alone cannot tell a member walking in from a member
+            // standing still. This can, and corrects what it finds.
+            RunStagingWatchdog(coord, name, member, state);
+
             states.push_back(state);
         }
 
@@ -11428,6 +12119,10 @@ private:
             // staging point" is false BY SUCCEEDING. A barrier re-checked after
             // it is met is a barrier that can never be passed.
             coord.phase = DungeonRunPhase::Enter;
+            // BARRIER is over, so its watchdog is too - the staging point
+            // stops being the thing anybody is measured against the moment
+            // the party starts walking through the door (#164).
+            coord.staging.clear();
             coord.crossing.best = 0.f;
             coord.crossing.since = std::time(nullptr);
             coord.loggedCrossingAim = false;
