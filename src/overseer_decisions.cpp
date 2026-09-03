@@ -14,6 +14,179 @@
 namespace OverseerDecisions
 {
 
+namespace
+{
+
+// THESE THREE ARE HAND-ROLLED RATHER THAN <cctype>'s, and that is not
+// squeamishness about one more include. This translation unit includes its own
+// header and nothing else on purpose - that is the property the header says it
+// is protecting - and the moment a second include is normal here, the argument
+// for refusing the third one is weaker. Character classification over ASCII is
+// four comparisons; it is not worth spending the rule on.
+//
+// `std::tolower` would also have been the wrong tool anyway: it takes an int
+// and is undefined for a negative char, which is exactly what a UTF-8 byte in a
+// mangled environment variable arrives as.
+char LowerAscii(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? char(c + ('a' - 'A')) : c;
+}
+
+bool IsHexDigit(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// Trimmed of surrounding whitespace and lowered. A YAML scalar picks up a
+// trailing space for free and nobody ever sees it.
+std::string Normalized(std::string const& raw)
+{
+    size_t begin = 0;
+    size_t end = raw.size();
+    auto isSpace = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+    };
+    while (begin < end && isSpace(raw[begin]))
+        ++begin;
+    while (end > begin && isSpace(raw[end - 1]))
+        --end;
+
+    std::string out;
+    out.reserve(end - begin);
+    for (size_t i = begin; i < end; ++i)
+        out.push_back(LowerAscii(raw[i]));
+    return out;
+}
+
+// The value of `name` in `env`, or an empty string when the deployment did not
+// set it. A lookup rather than `env.at`, because "not set" is the ordinary case
+// here and not an error.
+std::string Declared(std::map<std::string, std::string> const& env, char const* name)
+{
+    auto const found = env.find(name);
+    return found == env.end() ? std::string() : found->second;
+}
+
+// Add a declared row, or add nothing. See BuildReport's header comment for why
+// an undeclared fact is a gap rather than an empty string.
+void AppendDeclared(std::vector<BuildFact>& facts, std::string const& name,
+                    std::string const& value)
+{
+    std::string const trimmed = Normalized(value);
+    if (trimmed.empty())
+        return;
+    // The VALUE is recorded as it was given, not as it was normalized: the
+    // normalization exists to decide whether there is anything here at all, and
+    // a reader deserves to see what the deployment actually wrote. The one
+    // exception is the surrounding whitespace, which is invisible and would
+    // only ever make two identical SHAs look different on the page.
+    std::string kept = value;
+    size_t const begin = kept.find_first_not_of(" \t\r\n\v\f");
+    size_t const end = kept.find_last_not_of(" \t\r\n\v\f");
+    kept = (begin == std::string::npos) ? std::string() : kept.substr(begin, end - begin + 1);
+    facts.push_back(BuildFact{name, kept, SOURCE_DECLARED});
+}
+
+}  // namespace
+
+std::string RealmKind(std::string const& declared)
+{
+    std::string const value = Normalized(declared);
+    if (value == REALM_PRODUCTION)
+        return REALM_PRODUCTION;
+    if (value == REALM_NON_PRODUCTION)
+        return REALM_NON_PRODUCTION;
+    return REALM_UNKNOWN;
+}
+
+std::string CoreRevision(std::string const& coreVersion)
+{
+    // The marker rather than a fixed offset, because the text in front of it is
+    // AC_COMPANYNAME_STR and a fork is free to change it. Everything this needs
+    // is between " rev. " and the first character that cannot be part of a
+    // commit.
+    static char const MARKER[] = " rev. ";
+    size_t const at = coreVersion.find(MARKER);
+    if (at == std::string::npos)
+        return std::string();
+
+    size_t i = at + (sizeof(MARKER) - 1);
+    std::string revision;
+    while (i < coreVersion.size() && IsHexDigit(coreVersion[i]))
+    {
+        revision.push_back(LowerAscii(coreVersion[i]));
+        ++i;
+    }
+    // A revision has to be long enough to mean something. Anything shorter than
+    // this is not an abbreviated commit, it is a coincidence - "AzerothCore
+    // rev. de" would otherwise compare equal to every SHA starting `de`, and a
+    // false match here reads as "your pins are correct".
+    if (revision.size() < 7)
+        return std::string();
+    return revision;
+}
+
+std::string PinsVerdict(std::string const& coreVersion,
+                        std::string const& declaredCoreSha)
+{
+    std::string const running = CoreRevision(coreVersion);
+    std::string const declared = Normalized(declaredCoreSha);
+    if (running.empty() || declared.empty())
+        return PINS_UNKNOWN;
+
+    // A declaration that is not a commit cannot be compared with one. Saying so
+    // is right; guessing STALE would raise an alarm about the pins when the
+    // actual fault is that somebody put a branch name in the field.
+    for (char const c : declared)
+        if (!IsHexDigit(c))
+            return PINS_UNKNOWN;
+    if (declared.size() < 7)
+        return PINS_UNKNOWN;
+
+    // The core abbreviates, the pins file does not, so the shorter of the two
+    // has to be a prefix of the longer. Both directions are allowed because
+    // which one is shorter is not this function's business.
+    std::string const& shorter = declared.size() < running.size() ? declared : running;
+    std::string const& longer = declared.size() < running.size() ? running : declared;
+    return longer.compare(0, shorter.size(), shorter) == 0 ? PINS_MATCH : PINS_STALE;
+}
+
+std::vector<BuildFact> BuildReport(std::string const& coreVersion,
+                                   std::map<std::string, std::string> const& env)
+{
+    std::vector<BuildFact> facts;
+
+    // The two the binary knows about itself, first, because they are the two
+    // that cannot be wrong.
+    facts.push_back(BuildFact{"module", VERSION, SOURCE_COMPILED});
+    // The core's whole sentence, not just the commit: the build date and the
+    // build type in it are what tell a reader whether two realms on the same
+    // commit are actually running the same binary.
+    facts.push_back(BuildFact{"core", coreVersion, SOURCE_COMPILED});
+
+    // WHO THIS REALM IS. `realm` is a name for a reader; `realm_kind` is the
+    // one the page changes colour on, and it is always present.
+    AppendDeclared(facts, "realm", Declared(env, ENV_REALM));
+    facts.push_back(BuildFact{"realm_kind",
+                              RealmKind(Declared(env, ENV_REALM_KIND)),
+                              SOURCE_DERIVED});
+
+    // WHAT IT WAS BUILT AGAINST, as declared. The core pin is kept even though
+    // the running core is already recorded above, because the two disagreeing
+    // is the entire point of the verdict below and a reader that can see only
+    // the verdict cannot check the work.
+    AppendDeclared(facts, "core_pin", Declared(env, ENV_PIN_CORE));
+    AppendDeclared(facts, "mod-playerbots", Declared(env, ENV_PIN_PLAYERBOTS));
+    AppendDeclared(facts, "mod-ollama-chat", Declared(env, ENV_PIN_OLLAMA_CHAT));
+    AppendDeclared(facts, "mod-dungeon-clear", Declared(env, ENV_PIN_DUNGEON_CLEAR));
+    AppendDeclared(facts, "mod-ah-bot-plus", Declared(env, ENV_PIN_AH_BOT));
+
+    facts.push_back(BuildFact{"pins",
+                              PinsVerdict(coreVersion, Declared(env, ENV_PIN_CORE)),
+                              SOURCE_DERIVED});
+    return facts;
+}
+
 bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
                           float radiusYards)
 {

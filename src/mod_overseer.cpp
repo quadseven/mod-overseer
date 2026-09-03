@@ -104,6 +104,10 @@
 #include "Log.h"
 #include "DatabaseEnv.h"
 #include "GameGraveyard.h"
+// The core reporting its own commit, the same call Banner.cpp makes for the
+// startup line. It is what lets a realm say which AzerothCore it is running
+// without anybody having to declare it (mod-overseer#184).
+#include "GitRevision.h"
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Guild.h"
@@ -147,6 +151,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+// std::exception, for the one catch in this file. Pulled in
+// transitively by several of the headers above, but a catch that
+// compiles only by accident of somebody else's include is a catch
+// that stops compiling when they tidy up.
+#include <exception>
 #include <map>
 #include <mutex>
 #include <random>
@@ -2847,6 +2856,11 @@ public:
             // restart - which is precisely when a character is most likely to
             // do something worth having a record of.
             ReloadRosterNames();
+            // And what this realm is, for the same reason and one more: until
+            // this row exists the site cannot say which world it is showing,
+            // and "which world is this" is the question it must never answer
+            // late (mod-overseer#184).
+            WriteBuildReport();
         }
         if (_commandTimer >= COMMAND_POLL_MS)
         {
@@ -14055,6 +14069,132 @@ private:
 
                 bot->LearnTalent(talent->TalentID, maxRank);
             }
+        }
+    }
+
+    // THIS REALM SAYS WHAT IT IS AND WHAT IT IS RUNNING (mod-overseer#184).
+    //
+    // WHY THE REALM WRITES THIS RATHER THAN ANYTHING ELSE READING IT. Three
+    // realms run this module and they do not run the same build of it - as this
+    // is written, the live one is on an AzerothCore twelve days older than the
+    // other two, and the only place that is recorded is a line in a container
+    // log. Which realm a reader is looking at has so far been carried by the
+    // hostname the page came from, and that distinction is being retired. Once
+    // it is gone, an unlabelled page is one accident away from showing the live
+    // family's positions under a promise that it is not the live family.
+    //
+    // The site is a passive reader: it opens a database and renders what it
+    // finds. So the label has to be IN the database, next to the data it
+    // labels. A site pointed at the wrong world then renders the banner of the
+    // world it is actually reading, which is the only arrangement where the
+    // label cannot come apart from the thing it describes.
+    //
+    // WHY IT IS WRITTEN FROM THE FIRST TICK RATHER THAN ON A TIMER. Nothing
+    // here changes while the process lives: the module's version and the core's
+    // are compiled in, and the environment is fixed at exec. Re-writing it every
+    // thirty seconds would be a database round trip to reach the same answer.
+    // Writing it once, at the same moment the watch list and the roster are
+    // loaded, means the page can label the world from the first snapshot rather
+    // than from whenever the second timer happens to fire.
+    //
+    // WHAT HAPPENS IF THE DEPLOYMENT SETS NONE OF THE VARIABLES, which is what
+    // every realm will do on the first start after this ships: the report still
+    // gets written, and it says what this binary knows about itself and admits
+    // it was told nothing else. The one thing it never does is guess.
+    void WriteBuildReport()
+    {
+        // The environment, read once here so that everything downstream of it
+        // is a decision about strings that a test can reach with no world
+        // behind it. std::getenv returns nullptr for a variable that was not
+        // set, and an absent key is exactly how BuildReport wants to be told.
+        std::map<std::string, std::string> env;
+        for (char const* name : {OverseerDecisions::ENV_REALM,
+                                 OverseerDecisions::ENV_REALM_KIND,
+                                 OverseerDecisions::ENV_PIN_CORE,
+                                 OverseerDecisions::ENV_PIN_PLAYERBOTS,
+                                 OverseerDecisions::ENV_PIN_OLLAMA_CHAT,
+                                 OverseerDecisions::ENV_PIN_DUNGEON_CLEAR,
+                                 OverseerDecisions::ENV_PIN_AH_BOT})
+        {
+            if (char const* value = std::getenv(name))
+                env[name] = value;
+        }
+
+        // GitRevision is the core reporting itself, the same call Banner.cpp
+        // makes for the line that goes into the log at startup. It is the one
+        // upstream version that does not have to be declared, because the core
+        // is the only upstream here that is linked rather than merely compiled
+        // alongside - which is why it is also the witness the pin verdict uses.
+        std::vector<OverseerDecisions::BuildFact> const facts =
+            OverseerDecisions::BuildReport(GitRevision::GetFullVersion(), env);
+
+        // INTO THE LOG FIRST, BEFORE ANY OF IT GOES NEAR THE DATABASE. The
+        // database is exactly the place this is unreadable from when something
+        // has gone wrong enough to be worth reading, and a report that is only
+        // written after a successful write is missing precisely when it would
+        // have explained the failure. This is the line an operator greps for
+        // when a realm is behaving like a build it is not supposed to be
+        // running.
+        for (OverseerDecisions::BuildFact const& fact : facts)
+            LOG_INFO("module.overseer", "overseer build: {} = {} ({})",
+                     fact.name, fact.value, fact.source);
+
+        // ONE TRANSACTION, AND IT STARTS WITH A DELETE. The report is the
+        // CURRENT state of this realm, not a history of it: a row for a fact an
+        // older build used to report and this one does not would otherwise sit
+        // there forever, indistinguishable from a fresh one, and the page would
+        // render it. Clearing first means the table always holds exactly one
+        // report and never a merge of two. The transaction is what stops a
+        // reader polling between the delete and the writes from seeing a realm
+        // that has suddenly reported nothing at all.
+        //
+        // WRAPPED, THOUGH NOTHING IN HERE IS EXPECTED TO THROW, and the reason
+        // is what this code is for rather than what it does. This runs on the
+        // world's FIRST TICK, in OnUpdate, with no handler between it and the
+        // core's update loop. Everything it writes is a banner. There is no
+        // version of "the page could not label the realm" that is worth even a
+        // small chance of "the world did not come up", so the cost of being
+        // certain is one block.
+        //
+        // WHAT COULD ACTUALLY REACH IT, since a reader deserves better than a
+        // defensive catch with no story: not a MySQL fault. CommitTransaction
+        // hands the batch to the async writer and returns, so a database that
+        // is down, read-only, or rejecting the statement fails on the worker
+        // thread long after this function has returned - see the durability
+        // note on the chat flush, which is the same arrangement. What is left
+        // is allocation, and a format failure inside Append. Neither is
+        // expected. Both are survivable, and neither is worth a realm.
+        //
+        // AND THIS IS NOT A SWALLOW. It logs at ERROR with what failed, and the
+        // consequence is visible on the page rather than hidden by it: a realm
+        // with no rows in this table renders as REALM NOT VERIFIED, which is
+        // the alarm the site already draws for a realm that has not reported.
+        // The failure surfaces in the one place somebody is looking.
+        try
+        {
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            trans->Append("DELETE FROM overseer_build");
+            for (OverseerDecisions::BuildFact const& fact : facts)
+            {
+                // Esc, not EscLong: `value` is VARCHAR(255) and MAX_CHAT_BYTES
+                // is 255, so the truncation is the column width and it cuts on
+                // a UTF-8 boundary rather than mid-character. Nothing that
+                // belongs in this table is near that length; an environment
+                // variable that is has been set to something that is not a
+                // commit.
+                trans->Append(
+                    "INSERT INTO overseer_build (name, value, source) VALUES ('{}', '{}', '{}')",
+                    Esc(fact.name), Esc(fact.value), Esc(fact.source));
+            }
+            CharacterDatabase.CommitTransaction(trans);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer build: could not write the report ({}) - the "
+                      "world is fine and the page will show this realm as "
+                      "unverified until the next start",
+                      e.what());
         }
     }
 
