@@ -14462,10 +14462,10 @@ private:
     //
     // A CONTAINER DOES NOT NEED INVENTORY SPACE. It needs a BAG SLOT, and a
     // bag slot is a different place: the four at INVENTORY_SLOT_BAG_START..
-    // INVENTORY_SLOT_BAG_END (Player.h:685-688), which sit after the nineteen
-    // equipment slots and before the sixteen backpack ones (Player.h:660-694)
+    // INVENTORY_SLOT_BAG_END (Player.h:684-688), which sit after the nineteen
+    // equipment slots and before the sixteen backpack ones (Player.h:659-694)
     // and are the only slots FindEquipSlot will consider for an INVTYPE_BAG
-    // (PlayerStorage.cpp:216-224).
+    // (PlayerStorage.cpp:214-219).
     //
     // Asking CanStoreItem about a bag therefore asks about the wrong place,
     // and the answer it gives back - EQUIP_ERR_INVENTORY_FULL, "no room in the
@@ -14493,13 +14493,13 @@ private:
     // Can the receiver WEAR this container, and where? The core is the
     // authority and is asked as the core: CanEquipItem with slot = NULL_SLOT
     // is exactly what makes FindEquipSlot search the four bag slots for a free
-    // one (PlayerStorage.cpp:257-263), and it also applies every rule this
+    // one (PlayerStorage.cpp:260-265), and it also applies every rule this
     // module has no business restating - quiver and ammo-pouch uniqueness
-    // (PlayerStorage.cpp:2015-2024), combat (PlayerStorage.cpp:1937-1946),
+    // (PlayerStorage.cpp:2015-2023), combat (PlayerStorage.cpp:1938-1941),
     // binding, and the script hook.
     //
     // `pos` comes back as (bag << 8) | slot, which is the form Player::EquipItem
-    // takes (PlayerStorage.cpp:2838-2840).
+    // takes (PlayerStorage.cpp:2838-2839).
     static InventoryResult CanWearContainer(Player* receiver, Item* container, uint16& pos)
     {
         pos = 0;
@@ -14515,7 +14515,7 @@ private:
             return res;
 
         // Belt and braces on a uint16 that decides where an item is PUT. If
-        // this is ever not one of the four bag slots (Player.h:594-602), the
+        // this is ever not one of the four bag slots (PlayerStorage.cpp:594-602), the
         // right answer is to refuse rather than to place an item somewhere
         // nobody meant it to go.
         if (!Player::IsBagPos(pos))
@@ -14604,7 +14604,7 @@ private:
         // 3. Into the receiver's bags - or ONTO him, if this is a container
         //    going into a bag slot. EquipItem is the same call the core makes
         //    for a player dragging a bag onto a bag slot: SwapItem checks
-        //    CanEquipItem and then equips (PlayerStorage.cpp:2833), and
+        //    CanEquipItem and then equips (PlayerStorage.cpp:3764-3772), and
         //    IsEquipmentPos counts the four bag slots as equipment
         //    (PlayerStorage.cpp:574-581). VisualizeItem inside it does the
         //    SetState(ITEM_CHANGED, receiver) that MoveItemToInventory would
