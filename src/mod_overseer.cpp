@@ -10399,10 +10399,14 @@ private:
         // which is what a party does between pulls; GetLootGUID Player.h:2026
         // and isResurrectRequested Player.h:1856 (both public from :1091) cover
         // the two that look most like standing still and are not.
+        //
+        // ASKED OF EVERY MEMBER, NOT ONLY THE ONES INSIDE. A member who died and
+        // released to the graveyard outside is a party legitimately waiting for
+        // somebody to run back, and it is the case most likely to look like a
+        // freeze from in here. The whole party leaving is a different fact and
+        // is already answered above, where a run that holds nobody ends.
         for (OverseerDecisions::DungeonRunEntryState const& state : states)
         {
-            if (!state.through)
-                continue;
             Player* member = ObjectAccessor::FindPlayerByName(state.name);
             if (!SteerableAI(member))
                 continue;
