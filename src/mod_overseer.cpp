@@ -956,6 +956,51 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_STAGING_RATCHET{
     OverseerDecisions::RatchetReading::DistanceToTarget,
     DUNGEON_STAGING_STALL_YARDS, DUNGEON_STAGING_STALL_SECONDS};
 
+// HOW LONG A WHOLE RUN MAY SPEND GETTING STAGED (#165). A SECOND CLOCK, AND A
+// DIFFERENT QUESTION FROM THE ONE ABOVE.
+//
+// The per-character ratchet asks "is THIS member coming", and it is answered
+// wrongly, with perfect confidence, by a member that is not coming and never
+// will: measured live, a run opened at 23:15:58 after a clean reset was still
+// `active` and unstarted forty-three minutes later, because one member had
+// walked through the door early and the barrier requires everybody within ten
+// yards of the point OUTSIDE it. She was not far away, not in combat and not
+// dead. She was past the finish line, and nothing about her distance was ever
+// going to change. The same shape had appeared on the run before. Both were
+// broken by an operator, which is the thing this module is supposed to make
+// unnecessary.
+//
+// So the run gets a clock of its own, over RESETTING, GATHERING and BARRIER
+// together - the three phases in which a party is being assembled. ENTER is
+// left out because it has its own, tighter bound already
+// (DUNGEON_CROSSING_BACKSTOP_SECONDS), and everything past it is a run that has
+// started.
+//
+// TWELVE MINUTES, AND THE NUMBER IS DERIVED RATHER THAN CHOSEN. It is TWICE the
+// per-character ladder's whole length: three corrections and a give-up, each
+// given a full DUNGEON_STAGING_STALL_SECONDS, is six minutes, so a member that
+// is corrected, starts moving, and then stalls again gets a SECOND complete
+// ladder before the run it is holding up is written off. Doubling it rather
+// than adding a margin is what makes that guarantee exact rather than
+// approximate.
+//
+// AND IT SITS WHERE THE MEASUREMENTS SAY IT SHOULD: several times a healthy
+// staging on this route, which takes a few minutes; comfortably under the
+// twenty-minute travel backstop, so a run is not held hostage to one member's
+// errand being declared unreachable; and a quarter of the forty-three minutes
+// the two observed deadlocks actually ran.
+//
+// ERRING SHORT IS THE SAFE DIRECTION, which is the other half of why it is
+// twelve and not twenty. The two mistakes are not symmetric. A run written off
+// too early is closed with a reason on its row, counted against the campaign,
+// and re-staged by the very next poll - from where the party now stands, which
+// is nearer the door than where it started, so the retry is shorter than the
+// attempt it replaces. A run written off too late is forty-three minutes of
+// five characters standing still while a line that already knows what is wrong
+// is printed at them. The number leans at the cheap mistake on purpose.
+constexpr time_t DUNGEON_STAGING_BACKSTOP_SECONDS =
+    2 * (OverseerDecisions::STAGING_NUDGE_STEPS + 1) * DUNGEON_STAGING_STALL_SECONDS;
+
 // How close a character must be to the portal's own areatrigger before ENTER
 // will knock on it for the whole party (mod-overseer#88).
 //
@@ -10093,6 +10138,14 @@ private:
         // in-process on purpose: a bounce wipes them along with the flag they
         // were verifying, and the adopted run starts both clocks again.
         time_t awaitingSince{0};
+        // WHEN THIS RUN STARTED BEING ASSEMBLED (#165), across RESETTING,
+        // GATHERING and BARRIER together rather than per phase - a run that
+        // spends four minutes in each of three phases has spent twelve minutes
+        // not starting, and three separate clocks would each say everything was
+        // fine. Stamped lazily on the first staging poll, which makes it
+        // independent of WHICH path entered the phase, and zeroed with the rest
+        // of this struct when a run ends. See DUNGEON_STAGING_BACKSTOP_SECONDS.
+        time_t stagingSince{0};
         bool anchorSet{false};
         float anchorX{0.f}, anchorY{0.f};
         time_t anchorAt{0};
@@ -10922,6 +10975,50 @@ private:
         coord = DungeonRunCoordinatorState();
     }
 
+    // A STAGING THAT WILL NOT FINISH IS CLOSED, NOT NARRATED (#165).
+    //
+    // WHAT WAS WATCHED. A run `active` and unstarted for forty-three minutes,
+    // printing "BARRIER holds - ..." on every poll and doing nothing about it,
+    // twice, both times ended by an operator. Narration is not a bound.
+    //
+    // WHY CLOSING IS THE RIGHT REACTION AND STANDING DOWN IS NOT. A closed run
+    // is recoverable: the accounting has a row with a reason on it, the campaign
+    // has counted an attempt, and the coordinator's own next poll opens a fresh
+    // run and resets the instance before it aims anybody. A run left `active`
+    // is not recoverable by anything - it holds the one-active-run-per-map key
+    // that the next run needs, so nothing else can even begin.
+    //
+    // IT ENDS THROUGH EndRunAndDecide LIKE EVERY OTHER RUN, rather than through
+    // a private teardown of its own, so the campaign counter, the aim release
+    // and the go-again decision all happen exactly once and in the order that
+    // function fixes. The outcome vocabulary gains 'staging_failed', which the
+    // accounting column takes without a migration because it is a VARCHAR and
+    // was made one for this reason. It is deliberately NOT 'reset_failed': the
+    // reset worked, and the consecutive-failure stop that reads that value is
+    // about an instance that will not clear, which this is not. A repeat is
+    // still bounded, by the campaign's own cap, because a closed run counts.
+    void FailStaging(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                     DungeonPortal const& portal, char const* phase,
+                     std::string const& blockers, bool stillWanted)
+    {
+        std::string const minutes =
+            std::to_string(DUNGEON_STAGING_BACKSTOP_SECONDS / 60);
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} cannot be staged - {} has held "
+                  "for over {} minutes. Unsatisfied: {}. The run is CLOSED rather than "
+                  "left 'active', because a closed run is recoverable - the next poll "
+                  "opens a fresh one and resets the instance before it aims anybody - and "
+                  "a run that sits 'active' forever holds the one-active-run-per-map key "
+                  "the next one needs",
+                  coord.runNumber, coord.campaignId, phase, minutes, blockers);
+        EndRunAndDecide(coord, leaderName, portal,
+                        coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
+                        "staging_failed",
+                        std::string(phase) + " held for more than " + minutes +
+                            " minutes and never opened - " + blockers,
+                        stillWanted);
+    }
+
     // THE END OF A RUN, AND THE DECISION TO GO AGAIN.
     //
     // Every path that used to say "the run is over, returning to IDLE" comes
@@ -11442,6 +11539,20 @@ private:
             return;
         }
 
+        // THE WHOLE-RUN STAGING CLOCK STARTS HERE (#165), on the first poll of
+        // whichever of the three assembling phases this run reaches first.
+        // Stamped lazily rather than at each phase transition because there are
+        // six ways into them - a fresh campaign, a run that goes again, a
+        // bounced worldserver adopting a run, a job change, a failed crossing,
+        // an operator - and a clock that has to be started in six places is a
+        // clock that is not started in one of them. Zero means "not staging",
+        // and a run that leaves these phases zeroes it below.
+        bool const assembling = coord.phase == DungeonRunPhase::Resetting ||
+                                coord.phase == DungeonRunPhase::Gathering ||
+                                coord.phase == DungeonRunPhase::Barrier;
+        if (assembling && !coord.stagingSince)
+            coord.stagingSince = std::time(nullptr);
+
         if (coord.phase == DungeonRunPhase::Resetting)
         {
             // WAITING AND FAILING ARE DIFFERENT THINGS, ON DIFFERENT CLOCKS.
@@ -11544,6 +11655,27 @@ private:
             // closes that window to DUNGEON_RUN_POLL_MS for the one character
             // the run is walking.
             AssertTravelFocus(leaderName);
+
+            // AND GATHERING IS BOUNDED (#165). It had no bound of its own at
+            // all: it returns and waits until the leader arrives, and if his
+            // errand is released as unreachable by the travel backstop he never
+            // will, so the run waits for an arrival nothing is any longer
+            // working toward. Only the leader can hold this phase, so he is the
+            // whole of the reason it gives.
+            if (coord.stagingSince && std::time(nullptr) - coord.stagingSince >
+                                          DUNGEON_STAGING_BACKSTOP_SECONDS)
+            {
+                std::string const where =
+                    leader->GetMapId() != portal->outsideMapId
+                        ? "on map " + std::to_string(uint32(leader->GetMapId())) +
+                              " rather than map " + std::to_string(portal->outsideMapId)
+                        : std::to_string(static_cast<uint32>(leader->GetDistance2d(
+                              coord.stageX, coord.stageY))) +
+                              "y from the staging point";
+                FailStaging(coord, leaderName, *portal, "GATHERING",
+                            leaderName + " (" + where + ")", leaderJob == "dungeon");
+                return;
+            }
 
             // GetMapId  Position.h:281  uint32 GetMapId() const
             // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
@@ -12061,6 +12193,14 @@ private:
             state.alive = member->IsAlive();
             // IsInCombat  Unit.h:936  bool IsInCombat() const
             state.inCombat = member->IsInCombat();
+            // ALREADY THROUGH THE DOOR (#165). Recorded for the blockers line
+            // and for the give-up below, and for nothing else: the predicate
+            // still counts this member as not staged, because whether being
+            // ahead should satisfy a barrier is that issue's own question. What
+            // this fixes today is a run that spent forty-three minutes saying
+            // "not seen" about somebody standing thirty yards away through a
+            // wall.
+            state.inside = member->GetMapId() == portal->insideMapId;
             // GetMapId  Position.h:281  uint32 GetMapId() const
             if (member->GetMapId() == portal->outsideMapId)
                 // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
@@ -12119,6 +12259,10 @@ private:
             // staging point" is false BY SUCCEEDING. A barrier re-checked after
             // it is met is a barrier that can never be passed.
             coord.phase = DungeonRunPhase::Enter;
+            // ...and the whole-run staging clock stops with it (#165). ENTER has
+            // a bound of its own, DUNGEON_CROSSING_BACKSTOP_SECONDS, and two
+            // clocks on one phase is two answers to the same question.
+            coord.stagingSince = 0;
             // BARRIER is over, so its watchdog is too - the staging point
             // stops being the thing anybody is measured against the moment
             // the party starts walking through the door (#164).
@@ -12135,6 +12279,27 @@ private:
                      static_cast<uint32>(states.size()), DUNGEON_BARRIER_RADIUS_YARDS,
                      static_cast<uint32>(DUNGEON_STAGING_STANDOFF_YARDS),
                      portal->entryTriggerId);
+            return;
+        }
+
+        // THE WHOLE-RUN STAGING BACKSTOP (#165), asked AFTER the barrier has
+        // had this poll's chance to open, so a party that assembles on the very
+        // poll the clock runs out is let through rather than written off.
+        //
+        // THIS IS THE SECOND HALF OF THE ESCALATION AND NOT A RIVAL TO IT. The
+        // per-character ladder above has, by the time this can fire, tried every
+        // correction on every member that is merely slow, twice over, and said
+        // so each time. What is left when it has not worked is a member nothing
+        // this module can do reaches - one that is already through the door
+        // being the measured case - and the honest answer to that is to say who
+        // and why and close the run, not to keep printing the same line.
+        if (coord.stagingSince &&
+            std::time(nullptr) - coord.stagingSince > DUNGEON_STAGING_BACKSTOP_SECONDS)
+        {
+            FailStaging(coord, leaderName, *portal, "BARRIER",
+                        OverseerDecisions::DungeonRunBarrierBlockers(
+                            states, DUNGEON_BARRIER_RADIUS_YARDS),
+                        leaderJob == "dungeon");
             return;
         }
 

@@ -70,6 +70,21 @@ struct DungeonRunMemberState
     bool seen{false};              // false = not found in the world this poll
     bool alive{false};
     bool inCombat{false};
+    // ALREADY THROUGH THE DOOR THIS BARRIER IS WAITING OUTSIDE (#165). Measured
+    // live: a run sat `active` and unstaged for forty-three minutes while its
+    // barrier line read "Ugga (not seen)" and, on the run before, "Ugga (wrong
+    // map)". She was neither. She was inside the instance, having walked
+    // through early, and the barrier was waiting for her to arrive at a place
+    // she had gone past.
+    //
+    // THIS IS DELIBERATELY NOT A FOURTH WAY TO SATISFY THE BARRIER, and the
+    // predicate below ignores it on purpose. Whether a member who is already
+    // through counts as staged, or whether nobody may cross until the barrier
+    // opens, is #165's own question and a choice between two defensible
+    // answers. Naming the state correctly is a prerequisite for either and is
+    // neither: what it buys today is a blockers line that cannot be misread,
+    // and a give-up that can say what was actually wrong.
+    bool inside{false};
     float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
 };
 
