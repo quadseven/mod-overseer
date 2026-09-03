@@ -11003,8 +11003,17 @@ private:
     // accounting column takes without a migration because it is a VARCHAR and
     // was made one for this reason. It is deliberately NOT 'reset_failed': the
     // reset worked, and the consecutive-failure stop that reads that value is
-    // about an instance that will not clear, which this is not. A repeat is
-    // still bounded, by the campaign's own cap, because a closed run counts.
+    // about an instance that will not clear, which this is not.
+    //
+    // AND A REPEAT TERMINATES RATHER THAN LOOPING, which is the question a
+    // close-and-go-again always has to answer. Each closed run counts against
+    // the campaign's own cap, so a staging that fails for a reason that keeps
+    // being true cannot run forever. In the measured case it terminates much
+    // sooner than that: the member who deadlocks the barrier by being inside
+    // the instance is also the member who blocks the RESET the next run opens
+    // with (DungeonResetBlockers refuses while anybody is standing in there),
+    // so the next run fails at its reset, and three of those stop the campaign
+    // outright with the ERROR that already exists for it.
     void FailStaging(DungeonRunCoordinatorState& coord, std::string const& leaderName,
                      DungeonPortal const& portal, char const* phase,
                      std::string const& blockers, bool stillWanted)
