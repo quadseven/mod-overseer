@@ -83,4 +83,25 @@ CREATE TABLE IF NOT EXISTS `overseer_build` (
       COMMENT 'compiled = read from this binary, declared = set by the deployment, derived = the module''s verdict',
   `reported_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+)
+-- THE COLLATION IS NAMED RATHER THAN INHERITED, and the reason is measured
+-- rather than theoretical. The tables in this directory are split across two
+-- collations, and a join across that split raises 1267 and fails the WHOLE
+-- statement rather than returning nothing - which has already taken out a poll
+-- cycle on a live realm.
+--
+-- The split is caused by these very lines. Read from information_schema on a
+-- running realm: every table here declared `DEFAULT CHARSET=utf8mb4` with no
+-- COLLATE came out utf8mb4_0900_ai_ci, and every table that named
+-- utf8mb4_unicode_ci got it. Naming the charset explicitly makes MySQL 8 take
+-- THAT charset's default collation and ignore the database's, which is
+-- utf8mb4_unicode_ci here. So "inherit the default" does not mean what it
+-- looks like it means, and the only way to know what a table got is to go and
+-- look at one that already exists.
+--
+-- Nothing joins to this table today: it holds facts about a deployment, not
+-- character names. So the value matters less than the fact that it is written
+-- down, and it is set to the database's own default so that this table does
+-- not add another member to the side of a split that has already cost an
+-- outage.
+ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
