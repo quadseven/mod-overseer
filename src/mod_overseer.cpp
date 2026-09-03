@@ -6893,12 +6893,26 @@ private:
                 return;
 
             case OverseerDecisions::ProfessionStepKind::Take:
-                // Idempotent against the errand already standing, which is what
-                // lets this run on every poll with no guard of its own: the
-                // column is re-read at the top of every DriveProfessions, so
-                // "is this already the errand" is answerable without asking the
-                // database a second time.
-                if (plan.learnSkill == step.skill)
+                // A STANDING ERRAND IS LEFT ALONE, whatever it names. Partly
+                // for the reason a written unlearn outranks a derived one
+                // below, and partly for one that belongs to this column
+                // alone: an errand is identified in flight by the skill it is
+                // for as well as by the target keyword, so changing
+                // learn_skill under a character that is already walking drops
+                // the pinned spawn and re-resolves the trainer mid-trip. Two
+                // writers that agree about the SET but not about the ORDER
+                // would do that to each other on every poll, and the
+                // character would oscillate between two trainers and reach
+                // neither. Writing only into an empty column removes the
+                // possibility rather than relying on the two orders happening
+                // to match.
+                //
+                // AN ERRAND NAMING SOMETHING THE ROSTER DOES NOT WANT IS NOT
+                // CORRECTED HERE EITHER, and does not need to be:
+                // TrainOnArrival already refuses one and clears the column, at
+                // which point the next poll of this finds it empty and fills
+                // it with something the roster actually asked for.
+                if (plan.learnSkill)
                     return;
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is assigned {} ({}), does not hold it, and has a "
