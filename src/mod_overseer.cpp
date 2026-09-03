@@ -676,6 +676,21 @@ constexpr float TRAVEL_GROUND_DROP_YARDS = 10.0f;
 // walked onto while a correction of twenty would put it under the floor.
 constexpr float TRAVEL_GROUND_SNAP_YARDS = 5.0f;
 
+// How high over the last footing the ground is looked for a SECOND time, when
+// looking from TRAVEL_GROUND_DROP_YARDS up found nothing. Fifty because that is
+// the reach SurfaceAt already describes as the point where a drop stops being
+// legible, so this asks the same primitive over its whole useful range rather
+// than inventing a second, shorter one. See GroundHolds for why not finding
+// ground and standing over a cliff are different answers.
+constexpr float TRAVEL_GROUND_UPHILL_YARDS = 50.0f;
+
+// How much of the remaining distance an ANGLED probe walks. Six tenths because
+// the widest bearing kept (sixty degrees) then lands
+// sqrt(1 + 0.36 - 0.6) = 0.87 of the way, comfortably inside the
+// forward-progress rule, while a probe at the full remaining distance lands
+// exactly ON it and is rejected. See the fan in GroundedStep.
+constexpr float TRAVEL_STEP_SIDE_FRACTION = 0.6f;
+
 // A follower that has stopped, and never closes the gap (#70).
 //
 // Two followers stopped at a zone border on the dev world 2026-08-30 and
@@ -7005,13 +7020,38 @@ private:
         {
             float const t = static_cast<float>(i) / static_cast<float>(samples);
             float next = 0.f;
+            float const sampleX = fromX + dx * t;
+            float const sampleY = fromY + dy * t;
             // Looked for from TRAVEL_GROUND_DROP_YARDS ABOVE the last footing
             // rather than from the footing itself, so a step UPHILL finds the
             // slope it is climbing rather than the valley floor beyond it. The
             // asymmetry is the point: this check is about falling.
-            if (!SurfaceAt(bot, fromX + dx * t, fromY + dy * t,
+            if (!SurfaceAt(bot, sampleX, sampleY,
                            footing + TRAVEL_GROUND_DROP_YARDS, next))
-                return false;
+            {
+                // NOT FINDING THE GROUND IS NOT THE SAME AS STANDING OVER A
+                // CLIFF, and answering both with `false` is what held
+                // characters still on open hillside. The search above starts
+                // TRAVEL_GROUND_DROP_YARDS over the last footing and looks
+                // DOWN, so a slope gaining more than that within one sample
+                // puts its own surface ABOVE the origin: the search passes
+                // under the hill and reports nothing. Read literally that says
+                // "no ground here", when what happened is "the ground went up",
+                // and nothing falls up. Ask again from over any single-sample
+                // rise before believing the first answer.
+                //
+                // Measured: 'Bork' refused an aim SEVEN yards away in open
+                // Duskwood, and two others were held on Westfall hillside in
+                // the same minute, every one of them on ground a character can
+                // simply walk up.
+                if (!SurfaceAt(bot, sampleX, sampleY,
+                               footing + TRAVEL_GROUND_UPHILL_YARDS, next))
+                    return false;
+                // Nothing is forgiven on the way down. Any surface BELOW the
+                // first origin was already within that search's reach, so a
+                // second answer lower than the footing is not a hill, and the
+                // drop test immediately below still has to pass on it.
+            }
             if (footing - next > TRAVEL_GROUND_DROP_YARDS)
                 return false;
             footing = next;
@@ -7077,16 +7117,34 @@ private:
         }
 
         // 2. AND OTHERWISE A SHORT STEP, OVER GROUND THAT HOLDS.
-        float const reach = std::min(span, TRAVEL_STEP_YARDS);
         float const bearing = bot->GetAngle(wx, wy);   // Position.h:190
         // The direct line, then either side of it, nearest bearing first.
-        // Seven and no more: this runs once per stepping character per poll and
-        // each candidate is a walk over the terrain. Thirty, sixty and ninety
-        // degrees, written in radians because that is what GetAngle returns.
+        // Five and no more: this runs once per stepping character per poll and
+        // each candidate is a walk over the terrain. Thirty and sixty degrees,
+        // written in radians because that is what GetAngle returns.
+        //
+        // NINETY DEGREES IS GONE, AND ITS ABSENCE IS PART OF THE FIX. A step at
+        // a right angle to the aim lands sqrt(span^2 + reach^2) from it, which
+        // is longer than span for every span and every reach there is, so the
+        // forward-progress rule below rejected that bearing on arithmetic every
+        // time it was offered. The fan read as seven candidates and was five.
         static constexpr float FAN[] = {
-            0.f, 0.5236f, -0.5236f, 1.0472f, -1.0472f, 1.5708f, -1.5708f };
+            0.f, 0.5236f, -0.5236f, 1.0472f, -1.0472f };
         for (float delta : FAN)
         {
+            // AN ANGLED PROBE WALKS LESS THAN THE WAY HOME, or it cannot be a
+            // step forward either. Stepping the whole remaining distance at an
+            // angle lands 2*span*sin(delta/2) from the aim, which reaches span
+            // exactly at sixty degrees, so while reach was span the wide
+            // bearings failed the progress test on geometry alone. reach IS
+            // span for every aim inside TRAVEL_STEP_YARDS, which is most of
+            // them, so a character close to its errand was really being offered
+            // three bearings rather than five. Shortening only the angled
+            // probes restores them; the straight one still steps as far as it
+            // may, so nothing about the ordinary case changes.
+            float const reach = delta == 0.f
+                ? std::min(span, TRAVEL_STEP_YARDS)
+                : std::min(span * TRAVEL_STEP_SIDE_FRACTION, TRAVEL_STEP_YARDS);
             float const angle = bearing + delta;
             float const sx = bot->GetPositionX() + std::cos(angle) * reach;
             float const sy = bot->GetPositionY() + std::sin(angle) * reach;
