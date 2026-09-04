@@ -109,6 +109,7 @@
 // without anybody having to declare it (mod-overseer#184).
 #include "GitRevision.h"
 #include "Group.h"
+#include "LootRollAction.h"
 #include "GroupMgr.h"
 #include "Guild.h"
 #include "Item.h"
@@ -7570,6 +7571,26 @@ private:
         OverseerDecisions::GearWearer who;
     };
 
+    // ANSWER THE WHOLE ROLL, NOT JUST THE GEAR HALF (#120). The normal
+    // LootRollAction is selected by mod-playerbots' non-combat engine. A
+    // selfbot in combat never reaches that engine, which is why the tank can
+    // leave a roll window open until it expires. Calling the same action here
+    // preserves its item-usage policy and config gates, while this module
+    // supplies the missing roster cadence. The action checks NOT_EMITED_YET
+    // itself, so the later gear arbitration only sees unanswered rolls.
+    void AnswerOpenRolls(std::vector<GearMember> const& members)
+    {
+        for (GearMember const& member : members)
+        {
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(member.bot);
+            if (!botAI)
+                continue;
+
+            LootRollAction action(botAI);
+            action.Execute(Event("overseer loot roll", "", member.bot));
+        }
+    }
+
     // NEED ON A REAL UPGRADE, GREED ON EVERYTHING ELSE (#10, #145).
     //
     // WHAT THIS ADDS TO WHAT IS ALREADY DEPLOYED, AND WHAT IT LEAVES ALONE.
@@ -7803,6 +7824,8 @@ private:
         // character had already decided to stop wearing.
         for (GearMember& member : members)
             SweepGear(member.bot, member.who);
+
+        AnswerOpenRolls(members);
 
         // One vote per group, not one per member: the whole family shares a
         // party, and asking each of them for its group would walk the same roll
