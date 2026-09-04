@@ -1968,6 +1968,8 @@ struct AimSnapshot
     std::string job;            // overseer_roster.job as DriveQuests last saw it
     uint32 questAim = 0;        // overseer_roster.drive_quest, 0 = none
     std::string travelTarget;   // overseer_roster.travel_npc, '' = none
+    uint16 mapId = 0;           // position observed while this aim was current
+    float x = 0.f, y = 0.f, z = 0.f;
 };
 std::mutex g_aimMutex;
 std::map<std::string, AimSnapshot> g_aimSnapshot;  // key: lowercased character name
@@ -1995,13 +1997,20 @@ void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
 
 // Called from DriveQuests, world thread only - see that function.
 void RememberAim(std::string const& name, std::string const& job, uint32 questAim,
-                 std::string const& travelTarget)
+                 std::string const& travelTarget, Player* bot)
 {
     std::lock_guard<std::mutex> guard(g_aimMutex);
     AimSnapshot& a = g_aimSnapshot[LowerName(name)];
     a.job = job;
     a.questAim = questAim;
     a.travelTarget = travelTarget;
+    if (bot)
+    {
+        a.mapId = static_cast<uint16>(bot->GetMapId());
+        a.x = bot->GetPositionX();
+        a.y = bot->GetPositionY();
+        a.z = bot->GetPositionZ();
+    }
 }
 
 // Called from the two kill hooks below, whatever thread Unit::Kill happens to
@@ -4922,8 +4931,9 @@ private:
             // for EVERY roster row this loop sees, including one the job gate
             // is about to stand down, because a death while farming still
             // deserves its job recorded accurately.
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
             RememberAim(name, jobIt == jobs.end() ? "quest" : jobIt->second, aim,
-                       travelTarget);
+                       travelTarget, bot);
 
             // THE JOB GATE (infra#2834). A character whose schedule says
             // something other than 'quest' gets no quest aim asserted and no
@@ -4944,7 +4954,6 @@ private:
             // SteerableAI, not a bare lookup: a name can resolve to a
             // Player that is mid-login or mid-teardown, and its AI pointer is
             // non-null right up until it is freed. See SteerableAI above.
-            Player* bot = ObjectAccessor::FindPlayerByName(name);
             PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
                 continue;
@@ -10462,14 +10471,39 @@ private:
                 if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
                     home = leader;
 
+            uint16 const fromMap = static_cast<uint16>(bot->GetMapId());
+            float const fromX = bot->GetPositionX();
+            float const fromY = bot->GetPositionY();
             float const fromZ = bot->GetPositionZ();
+            std::string travelTarget;
+            std::string job;
+            uint32 questAim = 0;
+            uint16 aimedMap = 0;
+            float aimedX = 0.f, aimedY = 0.f, aimedZ = 0.f;
+            {
+                std::lock_guard<std::mutex> guard(g_aimMutex);
+                auto const it = g_aimSnapshot.find(LowerName(name));
+                if (it != g_aimSnapshot.end())
+                {
+                    travelTarget = it->second.travelTarget;
+                    job = it->second.job;
+                    questAim = it->second.questAim;
+                    aimedMap = it->second.mapId;
+                    aimedX = it->second.x;
+                    aimedY = it->second.y;
+                    aimedZ = it->second.z;
+                }
+            }
             bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
                             home->m_homebindY, home->m_homebindZ, 0.f);
             LOG_WARN("module.overseer",
-                     "overseer: '{}' is alive at z {:.1f} with a surface at z {:.1f} "
-                     "above it and no local navmesh - sent to '{}'s bind point before "
-                     "movement under the world could continue; it was not resurrected",
-                     name, fromZ, surface, home->GetName());
+                     "overseer: '{}' recovered at map {} position ({:.1f}, {:.1f}, {:.1f}), "
+                     "surface z {:.1f}, no local navmesh; aim job='{}' quest={} travel='{}' "
+                     "last aimed position map {} ({:.1f}, {:.1f}, {:.1f}); sent to '{}'s "
+                     "bind point; it was not resurrected",
+                     name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                     surface, job, questAim, travelTarget, static_cast<uint32>(aimedMap),
+                     aimedX, aimedY, aimedZ, home->GetName());
         } while (result->NextRow());
     }
 
