@@ -219,6 +219,32 @@ constexpr uint32 TRAVEL_POLL_MS = 15000;
 // segfaulted twice today.
 constexpr uint32 ENGAGEMENT_POLL_MS = 8000;
 
+// HOW QUICKLY A LIVING CHARACTER BELOW THE WALKABLE WORLD IS BROUGHT BACK.
+// The Deadmines exit dropped two characters more than five hundred yards in
+// six seconds (#174), so the eight-second revival cadence is too slow for this
+// different failure. One check a second over a five-character roster is early
+// enough to act while the bad position is still a position, not a death.
+constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
+
+// HOW FAR ABOVE A CHARACTER ANOTHER SURFACE MUST BE before it can mean the
+// character is underneath the world rather than walking an ordinary slope.
+// The first live Stormwind reading was a 34-36 yard gap, but the trapped party
+// later climbed hidden terrain until only part of that gap remained while its
+// point of view still showed it inside city geometry. Ten is the same maximum
+// single-sample drop GroundHolds permits. The navmesh check, not a larger gap,
+// is what distinguishes a real lower interior from terrain below a WMO.
+constexpr float TERRAIN_RECOVERY_GAP_YARDS = 10.0f;
+
+// The surface lookup starts this far above the character and searches the
+// same distance down. It reaches the measured city floor without asking from
+// MAX_HEIGHT, which can answer with an unrelated roof or terrain layer.
+constexpr float TERRAIN_RECOVERY_PROBE_YARDS = 60.0f;
+
+// Four short probes answer whether the character's current height belongs to
+// the local walkable mesh. Two yards fits inside an ordinary room while still
+// requiring the navmesh to find a real polygon rather than a point in place.
+constexpr float TERRAIN_RECOVERY_PATH_YARDS = 2.0f;
+
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
 // "died too many times, get yourself unstuck" escape hatch
@@ -2842,6 +2868,7 @@ public:
         _gearTimer += diff;
         _eventTimer += diff;
         _engagementTimer += diff;
+        _terrainRecoveryTimer += diff;
         _deathTimer += diff;
         _dungeonRunTimer += diff;
 
@@ -3016,6 +3043,14 @@ public:
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_death WHERE created_at < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
+        }
+        // LAST, so a recovery is the final movement decision in this world
+        // tick. A quest, travel or follow drive cannot overwrite the teleport
+        // before the next update sees that the character is already in flight.
+        if (_terrainRecoveryTimer >= TERRAIN_RECOVERY_POLL_MS)
+        {
+            _terrainRecoveryTimer = 0;
+            DriveBelowTerrainRecovery();
         }
     }
 
@@ -7962,6 +7997,52 @@ private:
         return true;
     }
 
+    // The highest relevant surface above the character, looked for from one
+    // bounded probe rather than from MAX_HEIGHT. Map::GetHeight considers both
+    // map terrain and VMAP geometry, which is the distinction the incident
+    // needs: the raw terrain held the party at z 60 while the city WMO floor
+    // above it was around z 95.
+    static bool SurfaceAbove(Player* bot, float& out)
+    {
+        Map* map = bot->GetMap();
+        if (!map)
+            return false;
+        float const z = bot->GetPositionZ() + TERRAIN_RECOVERY_PROBE_YARDS;
+        float const surface = map->GetHeight(
+            bot->GetPhaseMask(), bot->GetPositionX(), bot->GetPositionY(), z,
+            true, TERRAIN_RECOVERY_PROBE_YARDS);
+        if (surface <= INVALID_HEIGHT)
+            return false;
+        out = surface;
+        return true;
+    }
+
+    // Does this height belong to a real local navmesh polygon? A cave, cellar
+    // or building can have another surface far above it and must be left
+    // alone. The raw terrain hidden under a city WMO does not have a polygon
+    // at the character's height. PATHFIND_NOT_USING_PATH is explicitly not an
+    // answer: for a Player, PathGenerator uses that two-point shortcut when it
+    // cannot find a polygon, which is the wall-hacking fallback this recovery
+    // is meant to detect.
+    static bool HasLocalNavmesh(Player* bot)
+    {
+        static constexpr float DIRECTIONS[] = {0.f, 1.5708f, 3.1416f, 4.7124f};
+        for (float delta : DIRECTIONS)
+        {
+            float const angle = bot->GetOrientation() + delta;
+            float const x = bot->GetPositionX() + std::cos(angle) * TERRAIN_RECOVERY_PATH_YARDS;
+            float const y = bot->GetPositionY() + std::sin(angle) * TERRAIN_RECOVERY_PATH_YARDS;
+            PathGenerator path(bot);
+            if (!path.CalculatePath(x, y, bot->GetPositionZ()))
+                continue;
+            PathType const type = path.GetPathType();
+            if (!(type & PATHFIND_NOPATH) && !(type & PATHFIND_NOT_USING_PATH) &&
+                !(type & PATHFIND_SHORTCUT) && !(type & PATHFIND_FARFROMPOLY))
+                return true;
+        }
+        return false;
+    }
+
     // Does the ground hold, walking in a straight line from where `bot` stands
     // to (toX, toY)? `footing` comes back as the surface at the far end, which
     // is the Z the step should be aimed at: an aim's own Z is what put a
@@ -10319,6 +10400,63 @@ private:
                          issuer->GetName(), name,
                          static_cast<uint32>(DUNGEON_DC_ON_RETRY_SECONDS));
             }
+        } while (result->NextRow());
+    }
+
+    void DriveBelowTerrainRecovery()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot)
+                continue;
+            // A taxi, flying mount, boat, vehicle or swimmer is deliberately
+            // away from a land navmesh. Elevated geometry above one of those
+            // states is not proof that it fell through the world.
+            if (!OverseerDecisions::TerrainRecoveryMayInspect(
+                    bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
+                    bot->IsFlying(), bot->IsInWater(), bot->GetTransport() != nullptr,
+                    bot->GetVehicle() != nullptr))
+                continue;
+
+            float surface = 0.f;
+            bool const surfaceValid = SurfaceAbove(bot, surface);
+            // Most characters see their own footing again and stop here. Ask
+            // the pure rule first with the conservative no-navmesh answer so
+            // four Detour probes are paid only where the vertical gap itself
+            // could possibly require recovery.
+            if (!OverseerDecisions::BelowTerrainNeedsRecovery(
+                    bot->GetPositionZ(), surface, surfaceValid, false,
+                    TERRAIN_RECOVERY_GAP_YARDS))
+                continue;
+            bool const hasLocalNavmesh = HasLocalNavmesh(bot);
+            if (!OverseerDecisions::BelowTerrainNeedsRecovery(
+                    bot->GetPositionZ(), surface, surfaceValid, hasLocalNavmesh,
+                    TERRAIN_RECOVERY_GAP_YARDS))
+                continue;
+
+            // The leader's bind point keeps a grouped family together. This is
+            // the same destination DriveStuckRevival uses for a repeated death
+            // trap, but this character is alive and must not be resurrected.
+            Player* home = bot;
+            if (Group* group = bot->GetGroup())
+                if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+                    home = leader;
+
+            float const fromZ = bot->GetPositionZ();
+            bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                            home->m_homebindY, home->m_homebindZ, 0.f);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' is alive at z {:.1f} with a surface at z {:.1f} "
+                     "above it and no local navmesh - sent to '{}'s bind point before "
+                     "movement under the world could continue; it was not resurrected",
+                     name, fromZ, surface, home->GetName());
         } while (result->NextRow());
     }
 
@@ -16585,6 +16723,7 @@ private:
     uint32 _professionTimer = 0;
     uint32 _gearTimer = 0;
     uint32 _engagementTimer = 0;
+    uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is
     // safety-critical for the same reason DriveEngagementSafety is - see
