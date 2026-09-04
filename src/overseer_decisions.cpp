@@ -372,6 +372,26 @@ RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
     return verdict;
 }
 
+DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
+                                                  bool partyBusy,
+                                                  bool movementProgress,
+                                                  bool stalled,
+                                                  unsigned skips,
+                                                  unsigned maximumSkips)
+{
+    // A run is only stalled when every legitimate source of progress is quiet.
+    // In particular, being inside a dungeon or merely waiting between pulls is
+    // not enough to extract it.
+    if (bossProgress || partyBusy || movementProgress || !stalled)
+        return DungeonClearStallAction::Nothing;
+
+    // A zero bound is useful to callers that want extraction immediately, and
+    // makes the policy explicit rather than relying on an underflow or a magic
+    // special case at the call site.
+    return skips < maximumSkips ? DungeonClearStallAction::Skip
+                                : DungeonClearStallAction::Extract;
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
                              bool measurable, time_t now,
                              RatchetLimits const& limits)
