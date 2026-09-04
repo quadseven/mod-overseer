@@ -97,8 +97,8 @@ bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
 
 // `surfaceValid` is separate from the number because the core has two invalid
 // height sentinels. Invalid data grants no permission to move a character.
-// The boundary is inclusive so a declared thirty-yard gap means exactly that,
-// rather than thirty yards plus one floating-point step.
+// The boundary is inclusive so a declared ten-yard gap means exactly that,
+// rather than ten yards plus one floating-point step.
 bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap);

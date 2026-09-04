@@ -36,7 +36,7 @@ void Check(char const* what, bool got, bool want)
 void TheMeasuredGapIsRecovered()
 {
     Check("35 yards below the surface without a navmesh",
-          BelowTerrainNeedsRecovery(60.f, 95.f, true, false, 30.f), true);
+          BelowTerrainNeedsRecovery(60.f, 95.f, true, false, 10.f), true);
 }
 
 void DeliberatelyAirborneStatesAreLeftAlone()
@@ -63,27 +63,27 @@ void DeliberatelyAirborneStatesAreLeftAlone()
 void TheBoundaryIsARecovery()
 {
     Check("exactly the declared gap",
-          BelowTerrainNeedsRecovery(60.f, 90.f, true, false, 30.f), true);
+          BelowTerrainNeedsRecovery(60.f, 70.f, true, false, 10.f), true);
 }
 
 void AnUnknownSurfaceSaysNothing()
 {
     Check("invalid surface reading",
-          BelowTerrainNeedsRecovery(60.f, 95.f, false, false, 30.f), false);
+          BelowTerrainNeedsRecovery(60.f, 95.f, false, false, 10.f), false);
 }
 
 void AnOrdinaryHeightDifferenceIsLeftAlone()
 {
-    Check("small gap",
-          BelowTerrainNeedsRecovery(60.f, 79.f, true, false, 30.f), false);
+    Check("sub-threshold gap",
+          BelowTerrainNeedsRecovery(60.f, 69.f, true, false, 10.f), false);
     Check("surface below the character",
-          BelowTerrainNeedsRecovery(60.f, 40.f, true, false, 30.f), false);
+          BelowTerrainNeedsRecovery(60.f, 40.f, true, false, 10.f), false);
 }
 
 void ARealInteriorHasAPathAndIsLeftAlone()
 {
     Check("cave or building with a local navmesh",
-          BelowTerrainNeedsRecovery(60.f, 95.f, true, true, 30.f), false);
+          BelowTerrainNeedsRecovery(60.f, 95.f, true, true, 10.f), false);
 }
 
 }  // namespace

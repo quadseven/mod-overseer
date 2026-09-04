@@ -228,9 +228,12 @@ constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
 
 // HOW FAR ABOVE A CHARACTER ANOTHER SURFACE MUST BE before it can mean the
 // character is underneath the world rather than walking an ordinary slope.
-// The live Stormwind failure was a 34-36 yard gap. Thirty catches it while
-// remaining three times the largest single-sample drop GroundHolds permits.
-constexpr float TERRAIN_RECOVERY_GAP_YARDS = 30.0f;
+// The first live Stormwind reading was a 34-36 yard gap, but the trapped party
+// later climbed hidden terrain until only part of that gap remained while its
+// point of view still showed it inside city geometry. Ten is the same maximum
+// single-sample drop GroundHolds permits. The navmesh check, not a larger gap,
+// is what distinguishes a real lower interior from terrain below a WMO.
+constexpr float TERRAIN_RECOVERY_GAP_YARDS = 10.0f;
 
 // The surface lookup starts this far above the character and searches the
 // same distance down. It reaches the measured city floor without asking from
