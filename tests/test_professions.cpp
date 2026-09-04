@@ -30,6 +30,8 @@
 
 using OverseerDecisions::NextProfessionStep;
 using OverseerDecisions::ProfessionHolding;
+using OverseerDecisions::ProfessionCap;
+using OverseerDecisions::ProfessionCapStatus;
 using OverseerDecisions::ProfessionStep;
 using OverseerDecisions::ProfessionStepKind;
 
@@ -48,6 +50,30 @@ unsigned const ENCHANTING = 333;
 unsigned const SKINNING = 393;
 
 int failures = 0;
+
+void ExpectCap(char const* what, ProfessionCapStatus got, ProfessionCapStatus expected)
+{
+    if (got == expected)
+        return;
+    ++failures;
+    std::printf("FAIL %s: profession cap status mismatch\n", what);
+}
+
+void CapIsReadAsAState()
+{
+    ExpectCap("unknown maximum", ProfessionCap(75, 0, false, true),
+              ProfessionCapStatus::Unknown);
+    ExpectCap("still progressing", ProfessionCap(62, 75, true, true),
+              ProfessionCapStatus::Progressing);
+    ExpectCap("ceiling without trainer", ProfessionCap(75, 75, true, false),
+              ProfessionCapStatus::CappedWithoutTrainer);
+    ExpectCap("ceiling needs trainer", ProfessionCap(75, 75, true, true),
+              ProfessionCapStatus::CappedNeedsTraining);
+    // A stale read must never turn into a training order, even if the caller
+    // happened to find a trainer while the character was being rebuilt.
+    ExpectCap("value above cap", ProfessionCap(76, 75, true, true),
+              ProfessionCapStatus::CappedNeedsTraining);
+}
 
 char const* KindName(ProfessionStepKind kind)
 {
@@ -289,6 +315,7 @@ void SomethingExtraIsNotTidiedAway()
 
 int main()
 {
+    CapIsReadAsAState();
     AlreadyCorrectIsNeverTouched();
     AnImpossibleAssignmentDestroysNothing();
     NoOpinionMeansNoChange();

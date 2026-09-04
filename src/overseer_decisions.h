@@ -597,6 +597,21 @@ struct ProfessionStep
     unsigned cost{0};  // GiveUp only: the skill value this destroys
 };
 
+// The cap is a fact read from the character, not a profession-level constant.
+// A value below the cap is still gathering progress; a value at the cap is a
+// blocked character, and only a trainer that can raise this skill turns that
+// blocked state into a travel errand. Unknown or malformed reads fail closed.
+enum class ProfessionCapStatus
+{
+    Unknown,
+    Progressing,
+    CappedWithoutTrainer,
+    CappedNeedsTraining,
+};
+
+ProfessionCapStatus ProfessionCap(unsigned value, unsigned maximum,
+                                  bool maximumKnown, bool trainerAvailable);
+
 // The next step from what a character HOLDS towards what the roster SAYS.
 //
 // THE RULES, IN THE ORDER THEY ARE APPLIED, AND WHY EACH IS THE WAY ROUND IT
