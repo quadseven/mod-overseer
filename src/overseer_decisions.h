@@ -236,6 +236,10 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
 bool QuestIsStale(int playerLevel, int questLevel, bool objectiveProgress,
                   bool activeAim, int minimumLevelGap);
 
+bool WhisperWatcherIsGenuineListener(std::uint64_t senderGuid,
+                                     std::uint64_t receiverGuid,
+                                     std::uint64_t watcherGuid);
+
 // A large measured separation over a reported local polygon. THIS IS A
 // DETECTOR AND NOT A LICENCE TO MOVE ANYBODY: what its caller does about a
 // true answer depends entirely on whether that polygon is there, and

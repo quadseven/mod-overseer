@@ -151,6 +151,13 @@ bool QuestIsStale(int playerLevel, int questLevel, bool objectiveProgress,
     return playerLevel - questLevel >= minimumLevelGap;
 }
 
+bool WhisperWatcherIsGenuineListener(std::uint64_t senderGuid,
+                                     std::uint64_t receiverGuid,
+                                     std::uint64_t watcherGuid)
+{
+    return receiverGuid != 0 && watcherGuid == receiverGuid && watcherGuid != senderGuid;
+}
+
 bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
                                        bool surfaceValid, bool hasLocalNavmesh,
                                        float overrideGap)
