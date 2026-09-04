@@ -11369,9 +11369,6 @@ private:
         // the world the way a fourth and fifth hand-written float did.
     };
 
-    static bool IsDungeonJob(std::string const& job);
-    static std::string DungeonKeywordForJob(std::string const& job);
-
     // Standoff from the portal trigger's own coordinates, chosen so the whole
     // gather circle (DUNGEON_BARRIER_RADIUS_YARDS, 10) sits outside the
     // trigger's own radius (7 for Deadmines) with room to spare: 20 > 10 + 7.
