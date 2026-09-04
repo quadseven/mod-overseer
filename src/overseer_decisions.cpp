@@ -398,6 +398,53 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                 : DungeonClearStallAction::Extract;
 }
 
+DungeonTraversalAction DungeonTraversalStep(DungeonTraversalKind kind,
+                                             DungeonTraversalFacts const& facts,
+                                             DungeonTraversalState const& state)
+{
+    if (state.phase == DungeonTraversalPhase::Complete)
+        return DungeonTraversalAction::Complete;
+    if (state.phase == DungeonTraversalPhase::Aborted)
+        return DungeonTraversalAction::Abort;
+
+    // A failed probe is not permission to aim at the nearest polygon. The
+    // caller must measure both sides of the transition before this state can
+    // advance, which is especially important for a non-walking jump or drop.
+    if (!facts.approachMeasured || !facts.destinationMeasured)
+        return DungeonTraversalAction::WaitForMeasurement;
+    if (!facts.destinationNavmesh || !facts.destinationSafe)
+        return DungeonTraversalAction::Abort;
+    if ((kind == DungeonTraversalKind::Jump || kind == DungeonTraversalKind::Drop) &&
+        !facts.actionReady)
+        return DungeonTraversalAction::Abort;
+
+    switch (kind)
+    {
+        case DungeonTraversalKind::Walk:
+            return DungeonTraversalAction::Walk;
+        case DungeonTraversalKind::Jump:
+            return DungeonTraversalAction::Jump;
+        case DungeonTraversalKind::Drop:
+            return DungeonTraversalAction::Drop;
+    }
+    return DungeonTraversalAction::Abort;
+}
+
+DungeonTraversalAction WailingTraversalStepDecision(WailingTraversalStep step,
+                                                     DungeonTraversalFacts const& facts,
+                                                     DungeonTraversalState const& state)
+{
+    // Both route transitions are jumps. There is intentionally no fallback
+    // to the walking pathfinder or a teleport when geometry is unavailable.
+    switch (step)
+    {
+        case WailingTraversalStep::FirstJump:
+        case WailingTraversalStep::SecondJump:
+            return DungeonTraversalStep(DungeonTraversalKind::Jump, facts, state);
+    }
+    return DungeonTraversalAction::Abort;
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
                              bool measurable, time_t now,
                              RatchetLimits const& limits)
