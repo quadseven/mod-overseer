@@ -10503,6 +10503,10 @@ private:
                     aimedZ = it->second.z;
                 }
             }
+            // Recovery is terminal for the unsafe travel aim. Clear it before
+            // teleporting, otherwise the next travel poll re-issues the same
+            // coordinate and sends the character back onto the bad plane.
+            _travelAims.Release(name);
             bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
                             home->m_homebindY, home->m_homebindZ, 0.f);
             LOG_WARN("module.overseer",
