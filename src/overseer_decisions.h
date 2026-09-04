@@ -1968,6 +1968,19 @@ struct DoorAimHeight
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
                                 float arrivalYards, float triggerRadiusYards);
 
+// Wailing Caverns has two physical jumps on the route to the final boss.
+// Keep them as named route steps so a caller cannot accidentally collapse the
+// route into a walk or a teleport. The adapter still supplies measured facts.
+enum class WailingTraversalStep : std::uint8_t
+{
+    FirstJump = 0,
+    SecondJump = 1,
+};
+
+DungeonTraversalAction WailingTraversalStepDecision(WailingTraversalStep step,
+                                                     DungeonTraversalFacts const& facts,
+                                                     DungeonTraversalState const& state);
+
 // ------------------------------------------------------------- the ratchet --
 //
 // "HAS IT GOT ANYWHERE, AND IF NOT, FOR HOW LONG?" - a question this module
