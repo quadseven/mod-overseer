@@ -11342,9 +11342,9 @@ private:
     // so keeps the check where the argument for it is.
     static constexpr float DUNGEON_STAGING_Z_SANITY_YARDS = 15.0f;
 
-    // Each supported dungeon is one row. Shadowfang Keep is the first
-    // same-continent expansion; cross-continent travel remains a separate
-    // problem and is intentionally not represented here.
+    // Each supported dungeon is one row. Stockades is a same-continent
+    // instance in Stormwind and is reachable without the cross-continent
+    // travel that Wailing Caverns still requires.
     static DungeonPortal const* FindDungeonPortal(std::string const& keyword)
     {
         for (DungeonPortal const& portal : DungeonPortals())
@@ -11362,6 +11362,11 @@ private:
             // areatrigger.sql: (194,33,-230.953,2105.06,79.7533,5,0,0,0,0)
             // areatrigger_teleport.sql: (194,'Shadowfang keep - Entrance',0,-232.796,1568.28,76.8909,4.398)
             {"shadowfang", 0, 145, 33, 194},
+            // areatrigger.sql: (101,0,-8761.85,848.557,87.8052,0,4.972,9.694,7.444,0.6632)
+            // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
+            // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
+            // areatrigger_teleport.sql: (503,'Stockades Instance',0,-8764.83,846.075,87.4842,3.77934)
+            {"stockades", 0, 101, 34, 503},
         };
         return portals;
     }
