@@ -98,6 +98,8 @@
  * race.
  */
 
+// Spark-authored: deepseek-v4-flash-0731 on an on-prem DGX Spark, 2026-09-04; review pending
+
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "Corpse.h"
@@ -2526,9 +2528,12 @@ public:
 
         ForEachWatcher(KIND_WHISPER, [&](ObjectGuid guid, std::string const& name)
         {
-            // Pure identity, so no lookup of any kind is needed: a watcher who
-            // is one of the two ends of this whisper is online by definition.
-            if (guid == player->GetGUID() || (receiver && guid == receiver->GetGUID()))
+            // Pure identity, so no lookup of any kind is needed: only the
+            // receiver is a genuine listener. A whisper is not audible to its
+            // sender, even though the core supplies both ends to this hook.
+            if (receiver && OverseerDecisions::WhisperWatcherIsGenuineListener(
+                    player->GetGUID().GetCounter(), receiver->GetGUID().GetCounter(),
+                    guid.GetCounter()))
                 RecordHeard(player, name, KIND_WHISPER, msg, "");
         });
         return true;

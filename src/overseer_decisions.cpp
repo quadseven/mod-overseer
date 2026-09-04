@@ -9,10 +9,19 @@
  * next to the declaration a caller reads.
  */
 
+// Spark-authored: deepseek-v4-flash-0731 on an on-prem DGX Spark, 2026-09-04; review pending
+
 #include "overseer_decisions.h"
 
 namespace OverseerDecisions
 {
+
+bool WhisperWatcherIsGenuineListener(std::uint64_t senderGuid,
+                                     std::uint64_t receiverGuid,
+                                     std::uint64_t watcherGuid)
+{
+    return receiverGuid != 0 && watcherGuid == receiverGuid && watcherGuid != senderGuid;
+}
 
 namespace
 {

@@ -41,16 +41,27 @@
  * one.
  */
 
+// Spark-authored: deepseek-v4-flash-0731 on an on-prem DGX Spark, 2026-09-04; review pending
+
 #ifndef MOD_OVERSEER_DECISIONS_H
 #define MOD_OVERSEER_DECISIONS_H
 
 #include <ctime>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
 
 namespace OverseerDecisions
 {
+
+// A whisper has exactly one genuine listener: its receiver. The sender is
+// never a listener, even when the core invokes the chat gate with both ends
+// available. Keeping this identity rule pure makes the capture adapter unable
+// to accidentally reintroduce the sender self-echo (#22).
+bool WhisperWatcherIsGenuineListener(std::uint64_t senderGuid,
+                                     std::uint64_t receiverGuid,
+                                     std::uint64_t watcherGuid);
 
 // THE MODULE'S OWN VERSION, and the reason it lives in this header rather than
 // in mod_overseer.cpp: this file is the one part of the module that compiles
