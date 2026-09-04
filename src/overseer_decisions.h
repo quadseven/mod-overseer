@@ -1979,6 +1979,30 @@ struct DoorAimHeight
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
                                 float arrivalYards, float triggerRadiusYards);
 
+enum class DungeonTraversalKind : std::uint8_t { Walk, Jump, Drop };
+enum class DungeonTraversalPhase : std::uint8_t { Planned, Executing, Complete, Aborted };
+enum class DungeonTraversalAction : std::uint8_t {
+    WaitForMeasurement, Walk, Jump, Drop, Complete, Abort
+};
+
+struct DungeonTraversalFacts
+{
+    bool approachMeasured{false};
+    bool destinationMeasured{false};
+    bool destinationNavmesh{false};
+    bool destinationSafe{false};
+    bool actionReady{false};
+};
+
+struct DungeonTraversalState
+{
+    DungeonTraversalPhase phase{DungeonTraversalPhase::Planned};
+};
+
+DungeonTraversalAction DungeonTraversalStep(DungeonTraversalKind kind,
+                                             DungeonTraversalFacts const& facts,
+                                             DungeonTraversalState const& state);
+
 // ------------------------------------------------------------- the ratchet --
 //
 // "HAS IT GOT ANYWHERE, AND IF NOT, FOR HOW LONG?" - a question this module
