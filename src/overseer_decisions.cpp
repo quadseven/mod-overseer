@@ -430,6 +430,21 @@ DungeonTraversalAction DungeonTraversalStep(DungeonTraversalKind kind,
     return DungeonTraversalAction::Abort;
 }
 
+DungeonTraversalAction WailingTraversalStepDecision(WailingTraversalStep step,
+                                                     DungeonTraversalFacts const& facts,
+                                                     DungeonTraversalState const& state)
+{
+    // Both route transitions are jumps. There is intentionally no fallback
+    // to the walking pathfinder or a teleport when geometry is unavailable.
+    switch (step)
+    {
+        case WailingTraversalStep::FirstJump:
+        case WailingTraversalStep::SecondJump:
+            return DungeonTraversalStep(DungeonTraversalKind::Jump, facts, state);
+    }
+    return DungeonTraversalAction::Abort;
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
                              bool measurable, time_t now,
                              RatchetLimits const& limits)
