@@ -319,15 +319,17 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
     return blockers;
 }
 
-bool RatchetProgressed(float reading, float best, RatchetLimits const& limits)
+bool RatchetProgressed(float reading, float best, RatchetLimits const& limits,
+                       bool seen)
 {
     switch (limits.reading)
     {
         case RatchetReading::DistanceToTarget:
-            // `!best` is "no reading yet" here and not "arrived" - see the
-            // enum. It is also exactly the test the travel backstop this came
-            // from was already making against its own `closest`.
-            return !best || reading < best - limits.margin;
+            // `seen` is separate from the mark because zero is a real reading:
+            // WorldObject::GetDistance2d clamps arrival-range distances to
+            // zero, so a traveller standing on its target must not restart the
+            // clock forever by looking "unmeasured" on every poll.
+            return !seen || reading < best - limits.margin;
         case RatchetReading::CountAchieved:
         case RatchetReading::DistanceFromLastMark:
             // The same comparison for both, which is not a coincidence worth
@@ -343,7 +345,8 @@ RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
                        RatchetLimits const& limits)
 {
     RatchetVerdict verdict;
-    verdict.progressed = RatchetProgressed(reading, state.best, limits);
+    verdict.progressed = RatchetProgressed(reading, state.best, limits, state.seen);
+    state.seen = true;
 
     if (verdict.progressed)
     {

@@ -407,11 +407,10 @@ enum class RatchetReading
 {
     // A DISTANCE TO SOMETHING THE SUBJECT IS TRYING TO REACH. Progress is
     // getting NEARER than it has ever been, by more than `margin`, so the mark
-    // only ever falls. A mark of ZERO means no reading has been taken yet and
-    // never "already arrived": the caller measures with
-    // WorldObject::GetDistance2d, which clamps at zero once the subject is
-    // within its own size of the target, and it settles arrival before it asks
-    // this.
+    // only ever falls. `RatchetState::seen` says whether a reading exists;
+    // ZERO is a real reading, including when WorldObject::GetDistance2d
+    // clamps an arrived subject's distance to zero. The caller settles arrival
+    // before it asks this, so a zero distance still needs to be ratcheted.
     DistanceToTarget,
 
     // A COUNT OF THINGS THAT HAVE ALREADY HAPPENED. Progress is a bigger count
@@ -452,6 +451,7 @@ struct RatchetState
 {
     float best{0.f};  // the best reading so far, in the sense named above
     time_t since{0};  // when `best` was last beaten
+    bool seen{false}; // whether any reading has been taken yet
 };
 
 struct RatchetVerdict
@@ -464,7 +464,8 @@ struct RatchetVerdict
 // own, for the site whose patience is counted in tries rather than in seconds
 // and which therefore has no clock to keep. Pure in the strongest sense: it
 // changes nothing and reads nothing but its arguments.
-bool RatchetProgressed(float reading, float best, RatchetLimits const& limits);
+bool RatchetProgressed(float reading, float best, RatchetLimits const& limits,
+                       bool seen = true);
 
 // The whole thing: compare, then either restart the clock or say how long it
 // has been running. A poll that progressed is never also stalled - it has just
