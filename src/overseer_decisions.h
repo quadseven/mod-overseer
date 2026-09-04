@@ -268,12 +268,13 @@ std::vector<BuildFact> BuildReport(std::string const& coreVersion,
 // are gathered can never also silently change what BARRIER requires.
 //
 // ALL THREE CONDITIONS ARE FROM THE EPIC, VERBATIM: "hold until ALL are
-// within ~10y, alive, and out of combat." Fails closed: an empty roster or
-// any member this poll could not even find (a name that resolved to
-// nobody, or a distance never measured because the character is on a
-// different map) reads as barrier-not-met, never as vacuously met -
-// exactly the "geography is necessary but not sufficient" lesson
-// InDungeonRun above already had to learn once.
+// within ~10y, alive, and out of combat." A member already inside is also
+// ready: it is ahead of the staging point, not absent from the party. Fails
+// closed: an empty roster or any member this poll could not even find (a name
+// that resolved to nobody, or a distance never measured because the character
+// is on a different map) reads as barrier-not-met, never as vacuously met -
+// exactly the "geography is necessary but not sufficient" lesson InDungeonRun
+// above already had to learn once.
 struct DungeonRunMemberState
 {
     std::string name;
@@ -288,13 +289,10 @@ struct DungeonRunMemberState
     // through early, and the barrier was waiting for her to arrive at a place
     // she had gone past.
     //
-    // THIS IS DELIBERATELY NOT A FOURTH WAY TO SATISFY THE BARRIER, and the
-    // predicate below ignores it on purpose. Whether a member who is already
-    // through counts as staged, or whether nobody may cross until the barrier
-    // opens, is #165's own question and a choice between two defensible
-    // answers. Naming the state correctly is a prerequisite for either and is
-    // neither: what it buys today is a blockers line that cannot be misread,
-    // and a give-up that can say what was actually wrong.
+    // An inside member satisfies the barrier because the party is already
+    // together at the only boundary that matters. The entry predicate still
+    // requires every member to be through before the run can be CLEARING, so
+    // accepting this state cannot recreate #126's leader-only transition.
     bool inside{false};
 };
 

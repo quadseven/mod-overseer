@@ -219,6 +219,12 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
 
     for (DungeonRunMemberState const& member : members)
     {
+        if (member.inside)
+        {
+            if (!member.seen || !member.alive || member.inCombat)
+                return false;
+            continue;
+        }
         if (!member.seen)
             return false;
         if (!member.alive)

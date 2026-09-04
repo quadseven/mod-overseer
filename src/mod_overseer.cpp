@@ -12964,10 +12964,30 @@ private:
                     return;
                 }
 
+                AreaTrigger const* entryDoor =
+                    sObjectMgr->GetAreaTrigger(inside->entryTriggerId);
+                if (!entryDoor)
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' is inside dungeon map {} but the entry "
+                              "areatrigger {} is missing, so the coordinator cannot "
+                              "census the adopted party",
+                              leaderName, inside->insideMapId, inside->entryTriggerId);
+                    return;
+                }
+
+                uint32 adoptedInside = 0;
+                std::vector<OverseerDecisions::DungeonRunEntryState> const adoptedStates =
+                    DungeonRunCensus(members, entryDoor, inside->insideMapId, adoptedInside);
+
                 coord = DungeonRunCoordinatorState();
-                coord.phase = DungeonRunPhase::Clearing;
+                coord.phase = OverseerDecisions::DungeonRunAllThrough(adoptedStates)
+                                  ? DungeonRunPhase::Clearing
+                                  : DungeonRunPhase::StagedInside;
+                coord.wentIn = adoptedInside;
                 coord.portalKeyword = inside->keyword;
-                coord.awaitingSince = std::time(nullptr);
+                if (coord.phase == DungeonRunPhase::Clearing)
+                    coord.awaitingSince = std::time(nullptr);
 
                 // AND THE CAMPAIGN THE ADOPTED RUN BELONGS TO, READ OFF ITS ROW
                 // (#144). The coordinator's campaign numbers are in-process and
@@ -13001,11 +13021,14 @@ private:
 
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is already inside a dungeon run on map {} - "
-                         "adopting it at CLEARING (run {} of campaign {}). The staging "
-                         "half is over and there is nothing to gather; what is left to own "
-                         "is whether the dungeon brain is on, and the way back out",
-                         leaderName, inside->insideMapId, coord.runNumber,
-                         coord.campaignId);
+                         "adopting it at {} ({} of {} roster members inside, run {} of "
+                         "campaign {}). The coordinator will not call the run CLEARING "
+                         "until the census says every member is through",
+                         leaderName, inside->insideMapId,
+                         coord.phase == DungeonRunPhase::Clearing ? "CLEARING"
+                                                                  : "STAGED_INSIDE",
+                         adoptedInside, static_cast<uint32>(members.size()),
+                         coord.runNumber, coord.campaignId);
                 return;
             }
 
