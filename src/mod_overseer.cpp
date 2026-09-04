@@ -8165,7 +8165,19 @@ private:
         PathGenerator path(bot);   // PathGenerator.h:61
         if (!path.CalculatePath(x, y, z))
             return false;
-        return !(path.GetPathType() & PATHFIND_NOPATH) && path.GetPath().size() > 2;
+        if ((path.GetPathType() & PATHFIND_NOPATH) || path.GetPath().size() <= 2)
+            return false;
+
+        // PathGenerator can return the nearest polygon for an unreachable
+        // point. Treating that as a route made the family walk toward a
+        // mountain or cliff until the mover fell away from the world. A real
+        // route must finish near the requested ground height. Explicit jump
+        // and drop steps do not use this helper, so this guard cannot remove a
+        // deliberate dungeon traversal step.
+        G3D::Vector3 const& end = path.GetPath().back();
+        if (std::fabs(end.z - z) > TRAVEL_GROUND_DROP_YARDS * 2.0f)
+            return false;
+        return true;
     }
 
     // The point to hand the mover THIS POLL for a character wanted at `want`.
@@ -10503,6 +10515,10 @@ private:
                     aimedZ = it->second.z;
                 }
             }
+            // Recovery is terminal for the unsafe travel aim. Clear it before
+            // teleporting, otherwise the next travel poll re-issues the same
+            // coordinate and sends the character back onto the bad plane.
+            _travelAims.Release(name);
             bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
                             home->m_homebindY, home->m_homebindZ, 0.f);
             LOG_WARN("module.overseer",
@@ -11368,9 +11384,6 @@ private:
         // it from these two triggers instead, so the table cannot drift from
         // the world the way a fourth and fifth hand-written float did.
     };
-
-    static bool IsDungeonJob(std::string const& job);
-    static std::string DungeonKeywordForJob(std::string const& job);
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
     // gather circle (DUNGEON_BARRIER_RADIUS_YARDS, 10) sits outside the
