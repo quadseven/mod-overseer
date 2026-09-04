@@ -11653,6 +11653,7 @@ private:
         time_t resetSince{0};
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
+        bool loggedTravelConflict{false};
         bool loggedCampaignOver{false};
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
@@ -12231,8 +12232,9 @@ private:
         // that errand's twenty-minute backstop fired. A crossing that cannot be
         // started because the walk to its own doorstep is still finishing is the
         // party standing still, which is the state this epic exists to stop
-        // mistaking for a working one. A run supersedes an errand; Claim takes
-        // the wheel and says so in its name.
+        // mistaking for a working one. Resetting arbitrates the leader's
+        // outstanding errand before it claims the wheel; a run only
+        // supersedes a walk it owns itself.
         //
         // EVERY MEMBER WALKS THE LAST YARDS ITSELF, NOT JUST THE LEADER (#122).
         //
@@ -13269,6 +13271,36 @@ private:
                 return;
             }
 
+            // A PROFESSION OR TRADE ERRAND OWNS THE LEADER UNTIL IT ENDS
+            // (#168). The old coordinator claimed the staging aim
+            // unconditionally, so the bridge's hourly trainer trip was
+            // overwritten again on every campaign run. Keep RESETTING as the
+            // bounded waiting state: DriveTravel completes the errand and
+            // clears `travel_npc`, then this same run may claim the staging
+            // point on a later poll. The target is included in the one log
+            // line so a supersession cannot become silent again.
+            std::map<std::string, std::string> const travelAims = _travelAims.Load();
+            auto const leaderAim = travelAims.find(leaderName);
+            if (!OverseerDecisions::DungeonRunMayClaimTravel(leaderAim != travelAims.end()))
+            {
+                // The errand has its own bounded backstop. Do not spend the
+                // dungeon's reset or whole-staging budgets while waiting on
+                // that legitimate piece of work, or a five-minute reset
+                // timeout would turn arbitration into a failed run.
+                coord.resetSince = std::time(nullptr);
+                coord.stagingSince = coord.resetSince;
+                if (!coord.loggedTravelConflict)
+                {
+                    coord.loggedTravelConflict = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} defers staging because leader '{}' "
+                             "has outstanding travel errand '{}' - the errand owns the "
+                             "travel wheel and the run will start after it clears",
+                             coord.runNumber, leaderName, leaderAim->second);
+                }
+                return;
+            }
+
             std::string why;
             if (ResetGroupInstance(leaderName, members, portal->insideMapId, why))
             {
@@ -13276,8 +13308,8 @@ private:
                 aim << "at:" << portal->outsideMapId << ':' << coord.stageX << ','
                     << coord.stageY << ',' << coord.stageZ;
 
-                // CLAIM, not a raw UPDATE: the run supersedes whatever the
-                // leader was doing, and taking the wheel also drops any errand
+                // CLAIM, not a raw UPDATE: the arbitration above has confirmed
+                // that no leader errand is outstanding. Taking the wheel also drops any errand
                 // memory left over from the last time this exact staging point
                 // was aimed at - which is the case DriveTravel's own
                 // `target != target` reset cannot see, because the target is

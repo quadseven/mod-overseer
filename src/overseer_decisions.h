@@ -103,6 +103,13 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap);
 
+// MAY A NEW DUNGEON RUN TAKE THE LEADER'S TRAVEL WHEEL? An errand already
+// outstanding on that character is a real piece of work, not a stale hint:
+// leave it in place so the errand can reach its trainer or trade partner.
+// The caller logs the target when this refuses, keeping the policy free of
+// database and formatting concerns.
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand);
+
 
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
 //
