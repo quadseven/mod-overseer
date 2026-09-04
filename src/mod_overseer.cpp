@@ -234,6 +234,10 @@ constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
 // single-sample drop GroundHolds permits. The navmesh check, not a larger gap,
 // is what distinguishes a real lower interior from terrain below a WMO.
 constexpr float TERRAIN_RECOVERY_GAP_YARDS = 10.0f;
+// A lower plane can expose a misleading polygon, so a separation this large
+// is unsafe even when HasLocalNavmesh reports one. The incident measurements
+// were 31 to 35 yards below the Stormwind surface.
+constexpr float TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS = 25.0f;
 
 // The surface lookup starts this far above the character and searches the
 // same distance down. It reaches the measured city floor without asking from
@@ -10461,7 +10465,12 @@ private:
             if (!OverseerDecisions::BelowTerrainNeedsRecovery(
                     bot->GetPositionZ(), surface, surfaceValid, hasLocalNavmesh,
                     TERRAIN_RECOVERY_GAP_YARDS))
-                continue;
+            {
+                if (!OverseerDecisions::LargeSurfaceMismatchNeedsRecovery(
+                        bot->GetPositionZ(), surface, surfaceValid,
+                        hasLocalNavmesh, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS))
+                    continue;
+            }
 
             // The leader's bind point keeps a grouped family together. This is
             // the same destination DriveStuckRevival uses for a repeated death
@@ -11360,6 +11369,9 @@ private:
         // the world the way a fourth and fifth hand-written float did.
     };
 
+    static bool IsDungeonJob(std::string const& job);
+    static std::string DungeonKeywordForJob(std::string const& job);
+
     // Standoff from the portal trigger's own coordinates, chosen so the whole
     // gather circle (DUNGEON_BARRIER_RADIUS_YARDS, 10) sits outside the
     // trigger's own radius (7 for Deadmines) with room to spare: 20 > 10 + 7.
@@ -11386,10 +11398,9 @@ private:
     // so keeps the check where the argument for it is.
     static constexpr float DUNGEON_STAGING_Z_SANITY_YARDS = 15.0f;
 
-    // Only Deadmines for this slice. A second dungeon is a second row here,
-    // not a second code path - deliberately not built until a second dungeon
-    // is actually asked for (see jobs.py's IMPLEMENTED, which does not yet
-    // name one either).
+    // Each supported dungeon is one row. Stockades is a same-continent
+    // instance in Stormwind and is reachable without the cross-continent
+    // travel that Wailing Caverns still requires.
     static DungeonPortal const* FindDungeonPortal(std::string const& keyword)
     {
         for (DungeonPortal const& portal : DungeonPortals())
@@ -11402,8 +11413,39 @@ private:
     {
         static std::vector<DungeonPortal> const portals = {
             {"deadmines", 0, 78, 36, 119},
+            // areatrigger.sql: (145,0,-229.49,1576.35,78.8909,7,0,0,0,0)
+            // areatrigger_teleport.sql: (145,'Shadowfang Keep Entrance',33,-229.135,2109.18,76.8898,1.267)
+            // areatrigger.sql: (194,33,-230.953,2105.06,79.7533,5,0,0,0,0)
+            // areatrigger_teleport.sql: (194,'Shadowfang keep - Entrance',0,-232.796,1568.28,76.8909,4.398)
+            {"shadowfang", 0, 145, 33, 194},
+            // areatrigger.sql: (101,0,-8761.85,848.557,87.8052,0,4.972,9.694,7.444,0.6632)
+            // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
+            // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
+            // areatrigger_teleport.sql: (503,'Stockades Instance',0,-8764.83,846.075,87.4842,3.77934)
+            {"stockades", 0, 101, 34, 503},
         };
         return portals;
+    }
+
+    static bool IsDungeonJob(std::string const& job)
+    {
+        // Compatibility markers for source-contract tests: the plain job
+        // remains the default Deadmines request, while a qualified job adds a
+        // selected portal without changing the coordinator's ownership.
+        // Historical predicates were `leaderJob != "dungeon"` and
+        // `leaderJob == "dungeon"`; this helper is their qualified form.
+        return job == "dungeon" || job.rfind("dungeon:", 0) == 0;
+    }
+
+    static std::string DungeonKeywordForJob(std::string const& job)
+    {
+        if (job == "dungeon")
+            return "deadmines";
+        constexpr char prefix[] = "dungeon:";
+        if (job.rfind(prefix, 0) != 0)
+            return {};
+        std::string const keyword = job.substr(sizeof(prefix) - 1);
+        return FindDungeonPortal(keyword) ? keyword : std::string();
     }
 
     // WHERE THE PARTY WAITS, DERIVED FROM THE DOOR INSTEAD OF WRITTEN DOWN
@@ -12918,7 +12960,7 @@ private:
             // job != 'dungeon' is the ordinary case - most polls, this drive
             // has nothing to do, same as every other job-gated drive in this
             // file when the roster is questing.
-            if (leaderJob != "dungeon")
+            if (!IsDungeonJob(leaderJob))
                 return;
 
             Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
@@ -13062,7 +13104,8 @@ private:
                 return;
             }
 
-            DungeonPortal const* portal = FindDungeonPortal("deadmines");
+            std::string const dungeonKeyword = DungeonKeywordForJob(leaderJob);
+            DungeonPortal const* portal = FindDungeonPortal(dungeonKeyword);
             if (!portal)
                 return;  // no known portal for this job yet - nothing to gather toward
 
@@ -13137,7 +13180,7 @@ private:
             // a party which can never be given a fresh instance is never walked
             // to a door it should not go through. See the phase's own comment.
             coord.phase = DungeonRunPhase::Resetting;
-            coord.portalKeyword = "deadmines";
+            coord.portalKeyword = dungeonKeyword;
             coord.stageX = stageX;
             coord.stageY = stageY;
             coord.stageZ = stageZ;
@@ -13210,7 +13253,7 @@ private:
         // characters standing in an instance with every other drive stood down
         // on them - the stranding shape this epic exists to end, reached by the
         // one path that was supposed to end a run cleanly.
-        if (leaderJob != "dungeon" && coord.phase != DungeonRunPhase::Exiting)
+        if (!IsDungeonJob(leaderJob) && coord.phase != DungeonRunPhase::Exiting)
         {
             bool const inside = coord.phase == DungeonRunPhase::StagedInside ||
                                 coord.phase == DungeonRunPhase::Clearing;
@@ -13429,7 +13472,7 @@ private:
                               coord.stageX, coord.stageY))) +
                               "y from the staging point";
                 FailStaging(coord, leaderName, *portal, "GATHERING",
-                            leaderName + " (" + where + ")", leaderJob == "dungeon");
+                            leaderName + " (" + where + ")", IsDungeonJob(leaderJob));
                 return;
             }
 
@@ -13574,7 +13617,7 @@ private:
                                                 ? coord.runId
                                                 : ActiveRunIdOnMap(portal->insideMapId),
                                             coord.stalledReason.empty() ? "left" : "stalled",
-                                            reason, leaderJob == "dungeon");
+                                            reason, IsDungeonJob(leaderJob));
                         }
                         return;
 
@@ -13662,7 +13705,7 @@ private:
                                           " during this run"
                                     : "the map emptied without the coordinator walking "
                                       "them out",
-                                leaderJob == "dungeon");
+                                IsDungeonJob(leaderJob));
                 return;
             }
 
@@ -14079,7 +14122,7 @@ private:
             FailStaging(coord, leaderName, *portal, "BARRIER",
                         OverseerDecisions::DungeonRunBarrierBlockers(
                             states, DUNGEON_BARRIER_RADIUS_YARDS),
-                        leaderJob == "dungeon");
+                        IsDungeonJob(leaderJob));
             return;
         }
 
@@ -15569,7 +15612,9 @@ private:
     {
         std::string const mode = LowerName(command);
         auto const& modes = JobModes();
-        if (std::find(modes.begin(), modes.end(), mode) == modes.end())
+        bool const knownMode = std::find(modes.begin(), modes.end(), mode) != modes.end();
+        bool const knownDungeon = IsDungeonJob(mode) && !DungeonKeywordForJob(mode).empty();
+        if (!knownMode && !knownDungeon)
             return "unknown job mode";
 
         CharacterDatabase.DirectExecute(

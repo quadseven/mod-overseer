@@ -113,6 +113,17 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= minimumGap;
 }
 
+bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
+                                       bool surfaceValid, bool hasLocalNavmesh,
+                                       float overrideGap)
+{
+    if (!surfaceValid || overrideGap <= 0.f)
+        return false;
+    if (hasLocalNavmesh && surfaceAboveZ - currentZ < overrideGap)
+        return false;
+    return surfaceAboveZ - currentZ >= overrideGap;
+}
+
 std::string RealmKind(std::string const& declared)
 {
     std::string const value = Normalized(declared);

@@ -112,6 +112,13 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap);
 
+// A large measured separation is unsafe even when a misleading lower plane
+// reports a local polygon. This is the fail-closed backstop for geometry that
+// is technically navigable but clearly below the world surface.
+bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
+                                       bool surfaceValid, bool hasLocalNavmesh,
+                                       float overrideGap);
+
 
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
 //
