@@ -472,6 +472,26 @@ bool RatchetProgressed(float reading, float best, RatchetLimits const& limits);
 RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
                        RatchetLimits const& limits);
 
+// The clearing watchdog has two remedies for a run that stopped: skip the
+// objective a bounded number of times, then leave the instance. Keep this
+// policy free of core types so the dangerous boundary is testable without a
+// worldserver. Busy runs, boss progress, and movement are explicit inputs;
+// the adapter owns measuring those facts and this function owns only what
+// they mean.
+enum class DungeonClearStallAction
+{
+    Nothing,
+    Skip,
+    Extract,
+};
+
+DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
+                                                  bool partyBusy,
+                                                  bool movementProgress,
+                                                  bool stalled,
+                                                  unsigned skips,
+                                                  unsigned maximumSkips);
+
 // -------------------------------------------------- the staging watchdog --
 //
 // "IT IS FAR AWAY" AND "IT IS NOT COMING" ARE DIFFERENT FACTS, and the

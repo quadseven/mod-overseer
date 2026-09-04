@@ -11814,14 +11814,18 @@ private:
             coord.clearSkips = 0;
             return false;
         }
-        if (!progress.stalled)
+        OverseerDecisions::DungeonClearStallAction const action =
+            OverseerDecisions::DungeonClearStallDecision(
+                false, false, false, progress.stalled, coord.clearSkips,
+                DUNGEON_CLEAR_SKIPS);
+        if (action == OverseerDecisions::DungeonClearStallAction::Nothing)
             return false;
 
         // STALLED. The clock restarts on every rung, so whatever is tried here
         // gets a whole patience window to work in before the next thing is.
         coord.clearProgress.since = now;
 
-        if (coord.clearSkips < DUNGEON_CLEAR_SKIPS)
+        if (action == OverseerDecisions::DungeonClearStallAction::Skip)
         {
             ++coord.clearSkips;
             Player* issuer = AuthorizedDcIssuer(leader);
