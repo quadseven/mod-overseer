@@ -12,6 +12,8 @@ using OverseerDecisions::DungeonTraversalKind;
 using OverseerDecisions::DungeonTraversalPhase;
 using OverseerDecisions::DungeonTraversalState;
 using OverseerDecisions::DungeonTraversalStep;
+using OverseerDecisions::WailingTraversalStep;
+using OverseerDecisions::WailingTraversalStepDecision;
 
 namespace
 {
@@ -92,6 +94,22 @@ void TerminalStatesStayTerminal()
     Check("aborted stays aborted", DungeonTraversalStep(DungeonTraversalKind::Drop, facts, state),
           DungeonTraversalAction::Abort);
 }
+
+void WailingRequiresBothExplicitJumps()
+{
+    DungeonTraversalFacts facts = Measured();
+    Check("wailing first jump", WailingTraversalStepDecision(
+                                     WailingTraversalStep::FirstJump, facts, {}),
+          DungeonTraversalAction::Jump);
+    Check("wailing second jump", WailingTraversalStepDecision(
+                                      WailingTraversalStep::SecondJump, facts, {}),
+          DungeonTraversalAction::Jump);
+    facts.destinationMeasured = false;
+    Check("first jump waits for measurement", WailingTraversalStepDecision(
+                                                   WailingTraversalStep::FirstJump,
+                                                   facts, {}),
+          DungeonTraversalAction::WaitForMeasurement);
+}
 }  // namespace
 
 int main()
@@ -100,5 +118,6 @@ int main()
     UnsafeGeometryAborts();
     NonWalkingActionsNeverDegradeToWalking();
     TerminalStatesStayTerminal();
+    WailingRequiresBothExplicitJumps();
     return failures ? 1 : 0;
 }

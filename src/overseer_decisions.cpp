@@ -1586,6 +1586,19 @@ DungeonTraversalAction DungeonTraversalStep(DungeonTraversalKind kind,
     return DungeonTraversalAction::Abort;
 }
 
+DungeonTraversalAction WailingTraversalStepDecision(WailingTraversalStep step,
+                                                     DungeonTraversalFacts const& facts,
+                                                     DungeonTraversalState const& state)
+{
+    switch (step)
+    {
+        case WailingTraversalStep::FirstJump:
+        case WailingTraversalStep::SecondJump:
+            return DungeonTraversalStep(DungeonTraversalKind::Jump, facts, state);
+    }
+    return DungeonTraversalAction::Abort;
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
                              RatchetLimits const& limits,
