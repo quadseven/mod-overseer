@@ -17,6 +17,7 @@
 #include <cstdlib>
 
 using OverseerDecisions::BelowTerrainNeedsRecovery;
+using OverseerDecisions::LargeSurfaceMismatchNeedsRecovery;
 using OverseerDecisions::TerrainRecoveryMayInspect;
 
 namespace
@@ -86,6 +87,16 @@ void ARealInteriorHasAPathAndIsLeftAlone()
           BelowTerrainNeedsRecovery(60.f, 95.f, true, true, 10.f), false);
 }
 
+void ALargeMismatchOverridesMisleadingPolygon()
+{
+    Check("large gap with misleading lower polygon",
+          LargeSurfaceMismatchNeedsRecovery(60.f, 95.f, true, true, 25.f), true);
+    Check("ordinary interior gap keeps its polygon",
+          LargeSurfaceMismatchNeedsRecovery(80.f, 95.f, true, true, 25.f), false);
+    Check("unknown surface never authorizes recovery",
+          LargeSurfaceMismatchNeedsRecovery(60.f, 95.f, false, true, 25.f), false);
+}
+
 }  // namespace
 
 int main()
@@ -96,6 +107,7 @@ int main()
     AnUnknownSurfaceSaysNothing();
     AnOrdinaryHeightDifferenceIsLeftAlone();
     ARealInteriorHasAPathAndIsLeftAlone();
+    ALargeMismatchOverridesMisleadingPolygon();
 
     if (failures)
     {

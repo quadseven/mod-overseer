@@ -234,6 +234,10 @@ constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
 // single-sample drop GroundHolds permits. The navmesh check, not a larger gap,
 // is what distinguishes a real lower interior from terrain below a WMO.
 constexpr float TERRAIN_RECOVERY_GAP_YARDS = 10.0f;
+// A lower plane can expose a misleading polygon, so a separation this large
+// is unsafe even when HasLocalNavmesh reports one. The incident measurements
+// were 31 to 35 yards below the Stormwind surface.
+constexpr float TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS = 25.0f;
 
 // The surface lookup starts this far above the character and searches the
 // same distance down. It reaches the measured city floor without asking from
@@ -10439,7 +10443,12 @@ private:
             if (!OverseerDecisions::BelowTerrainNeedsRecovery(
                     bot->GetPositionZ(), surface, surfaceValid, hasLocalNavmesh,
                     TERRAIN_RECOVERY_GAP_YARDS))
-                continue;
+            {
+                if (!OverseerDecisions::LargeSurfaceMismatchNeedsRecovery(
+                        bot->GetPositionZ(), surface, surfaceValid,
+                        hasLocalNavmesh, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS))
+                    continue;
+            }
 
             // The leader's bind point keeps a grouped family together. This is
             // the same destination DriveStuckRevival uses for a repeated death
