@@ -2469,6 +2469,15 @@ bool GearIsUpgrade(GearVerdict const& candidate, float incumbent)
            incumbent * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR;
 }
 
+bool SiblingUpgradeDecision(SiblingUpgradeRequest const& request)
+{
+    if (request.questItem || request.equipped || request.soulbound)
+        return false;
+    if (!request.candidate.wearable || !request.candidate.judged)
+        return false;
+    return GearIsUpgrade(request.candidate, request.incumbent);
+}
+
 GearIncumbentScore GearWorn(GearVerdict const& worn)
 {
     // NOTHING WORN AND NOTHING WEARABLE ARE THE SAME NUMBER, and it is an exact
