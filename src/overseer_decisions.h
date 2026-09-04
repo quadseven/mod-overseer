@@ -356,6 +356,56 @@ bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members);
 std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
                                     float doorstepYards);
 
+// A traversal target that cannot be reached by walking must never be handed
+// to the walking pathfinder. The world adapter supplies measured facts from
+// the live map; this seam deliberately has no coordinates or geometry of its
+// own, so an unmeasured Wailing Caverns jump cannot become a guessed wallhack.
+enum class DungeonTraversalKind : std::uint8_t
+{
+    Walk,
+    Jump,
+    Drop,
+};
+
+enum class DungeonTraversalPhase : std::uint8_t
+{
+    Planned,
+    Executing,
+    Complete,
+    Aborted,
+};
+
+enum class DungeonTraversalAction : std::uint8_t
+{
+    WaitForMeasurement,
+    Walk,
+    Jump,
+    Drop,
+    Complete,
+    Abort,
+};
+
+struct DungeonTraversalFacts
+{
+    bool approachMeasured{false};
+    bool destinationMeasured{false};
+    bool destinationNavmesh{false};
+    bool destinationSafe{false};
+    bool actionReady{false};
+};
+
+struct DungeonTraversalState
+{
+    DungeonTraversalPhase phase{DungeonTraversalPhase::Planned};
+};
+
+// Select the only movement action justified by the measured facts. Missing
+// geometry, an unwalkable destination, or an unavailable jump/drop executor
+// all fail closed. In particular, Jump and Drop never degrade to Walk.
+DungeonTraversalAction DungeonTraversalStep(DungeonTraversalKind kind,
+                                             DungeonTraversalFacts const& facts,
+                                             DungeonTraversalState const& state);
+
 // ------------------------------------------------------------- the ratchet --
 //
 // "HAS IT GOT ANYWHERE, AND IF NOT, FOR HOW LONG?" - a question this module
