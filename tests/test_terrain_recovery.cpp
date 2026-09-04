@@ -17,6 +17,7 @@
 #include <cstdlib>
 
 using OverseerDecisions::BelowTerrainNeedsRecovery;
+using OverseerDecisions::TerrainRecoveryMayInspect;
 
 namespace
 {
@@ -36,6 +37,27 @@ void TheMeasuredGapIsRecovered()
 {
     Check("35 yards below the surface without a navmesh",
           BelowTerrainNeedsRecovery(60.f, 95.f, true, false, 30.f), true);
+}
+
+void DeliberatelyAirborneStatesAreLeftAlone()
+{
+    Check("ordinary living character is inspectable",
+          TerrainRecoveryMayInspect(true, false, false, false, false, false, false),
+          true);
+    Check("dead character", TerrainRecoveryMayInspect(
+              false, false, false, false, false, false, false), false);
+    Check("teleport in progress", TerrainRecoveryMayInspect(
+              true, true, false, false, false, false, false), false);
+    Check("taxi flight", TerrainRecoveryMayInspect(
+              true, false, true, false, false, false, false), false);
+    Check("free flight", TerrainRecoveryMayInspect(
+              true, false, false, true, false, false, false), false);
+    Check("swimming", TerrainRecoveryMayInspect(
+              true, false, false, false, true, false, false), false);
+    Check("transport", TerrainRecoveryMayInspect(
+              true, false, false, false, false, true, false), false);
+    Check("vehicle", TerrainRecoveryMayInspect(
+              true, false, false, false, false, false, true), false);
 }
 
 void TheBoundaryIsARecovery()
@@ -69,6 +91,7 @@ void ARealInteriorHasAPathAndIsLeftAlone()
 int main()
 {
     TheMeasuredGapIsRecovered();
+    DeliberatelyAirborneStatesAreLeftAlone();
     TheBoundaryIsARecovery();
     AnUnknownSurfaceSaysNothing();
     AnOrdinaryHeightDifferenceIsLeftAlone();

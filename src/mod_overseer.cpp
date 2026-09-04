@@ -10411,7 +10411,15 @@ private:
         {
             std::string const name = result->Fetch()[0].Get<std::string>();
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot || !bot->IsAlive() || bot->IsBeingTeleported())
+            if (!bot)
+                continue;
+            // A taxi, flying mount, boat, vehicle or swimmer is deliberately
+            // away from a land navmesh. Elevated geometry above one of those
+            // states is not proof that it fell through the world.
+            if (!OverseerDecisions::TerrainRecoveryMayInspect(
+                    bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
+                    bot->IsFlying(), bot->IsInWater(), bot->GetTransport() != nullptr,
+                    bot->GetVehicle() != nullptr))
                 continue;
 
             float surface = 0.f;

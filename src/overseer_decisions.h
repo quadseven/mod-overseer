@@ -89,6 +89,12 @@ constexpr char VERSION[] = "0.1.0";
 // recovery candidate. Conversely, the raw terrain hidden beneath a city WMO
 // has no walkable polygon at the character's height.
 //
+// Airborne travel is deliberately off the land navmesh, so the adapter passes
+// those current player states here before any geometry is interpreted.
+bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
+                               bool flying, bool inWater, bool onTransport,
+                               bool onVehicle);
+
 // `surfaceValid` is separate from the number because the core has two invalid
 // height sentinels. Invalid data grants no permission to move a character.
 // The boundary is inclusive so a declared thirty-yard gap means exactly that,
