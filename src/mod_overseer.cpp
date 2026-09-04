@@ -4068,15 +4068,13 @@ private:
     // the right answer ONLY when the column in question is the entire reason
     // the query is being run.
     //
-    // SO EACH LATE-ADDED COLUMN IS READ ON ITS OWN. LoadQuestAims and
-    // TravelAimBook::Load each select one column and each return an EMPTY map
-    // when the read comes back null. Every caller already handles an empty map,
-    // because that is also what "nobody is aimed" looks like - which is why
-    // there is no 1054 test anywhere here and does not need to be: the error
-    // case and the empty case want the same answer. A missing `travel_npc`
-    // costs the errands. A missing `drive_quest` costs the council's aim and
-    // leaves the leader's own-log fallback and the repick memory running. What
-    // neither can do any more is take the whole drive off the air.
+    // SO EACH LATE-ADDED COLUMN IS READ ON ITS OWN. TravelAimBook::Load still
+    // returns an EMPTY map when its read comes back null. Quest aims need one
+    // extra distinction: a query that returns no rows can be a transient
+    // failure, while a successful query of enabled roster rows with every aim
+    // set to zero is a deliberate clear. LoadQuestAims therefore reads every
+    // enabled row and reports whether the result itself was readable, allowing
+    // its caller to retain the last good map on failure.
     //
     // The roster query itself is left holding `name`/`enabled` (the CREATE
     // TABLE, 2026_08_23_00) and `lead` (2026_08_23_01) - all older than this
@@ -4084,23 +4082,26 @@ private:
     // are missing there is no roster feature at all, and no behaviour to
     // degrade to.
 
-    // Every enabled character with a standing council aim, name -> quest id.
-    // Absent means 0, "no opinion", the sentinel the column itself defines
-    // (2026_08_24_00_overseer_roster_drive_quest.sql) - so a row filtered out
-    // here, a row that was never written, and a column that does not exist are
-    // all the same thing to the caller, deliberately.
-    std::map<std::string, uint32> LoadQuestAims()
+    // Every enabled character is read so that an empty result is distinguishable
+    // from a successful all-zero read. Only non-zero values become map entries;
+    // absent still means 0, "no opinion", the sentinel the column itself
+    // defines (2026_08_24_00_overseer_roster_drive_quest.sql).
+    std::map<std::string, uint32> LoadQuestAims(bool& readSucceeded)
     {
         std::map<std::string, uint32> aims;
+        readSucceeded = false;
         QueryResult result = CharacterDatabase.Query(
             "SELECT name, drive_quest FROM overseer_roster "
-            "WHERE enabled = 1 AND drive_quest <> 0");
+            "WHERE enabled = 1");
         if (!result)
-            return aims;  // nobody aimed, or no such column - same answer
+            return aims;  // no such column, or a transient read failure
+        readSucceeded = true;
         do
         {
             Field* fields = result->Fetch();
-            aims[fields[0].Get<std::string>()] = fields[1].Get<uint32>();
+            uint32 const questId = fields[1].Get<uint32>();
+            if (questId)
+                aims[fields[0].Get<std::string>()] = questId;
         } while (result->NextRow());
         return aims;
     }
@@ -4830,7 +4831,12 @@ private:
     {
         // Read first, and each on its own, so that neither aim column can stop
         // this drive from running - see above.
-        std::map<std::string, uint32> const aims = LoadQuestAims();
+        bool aimsRead = false;
+        std::map<std::string, uint32> const loadedAims = LoadQuestAims(aimsRead);
+        std::map<std::string, uint32> const aims =
+            OverseerDecisions::QuestAimsAfterRead(_questAims, loadedAims, aimsRead);
+        if (aimsRead)
+            _questAims = aims;
         std::map<std::string, std::string> const travelAims = _travelAims.Load();
         // infra#2834: everybody NOT holding job 'quest'. Checked first in the
         // loop below, before any quest aim or travel arbitration - a
@@ -9840,7 +9846,14 @@ private:
         // of these columns: one guarded loader per column, so a schema older
         // than either degrades this drive exactly like it degrades theirs -
         // to "nobody has an opinion", never to "nothing runs".
-        std::map<std::string, uint32> const questAims = LoadQuestAims();
+        bool questAimsRead = false;
+        std::map<std::string, uint32> const loadedQuestAims =
+            LoadQuestAims(questAimsRead);
+        std::map<std::string, uint32> const questAims =
+            OverseerDecisions::QuestAimsAfterRead(_questAims, loadedQuestAims,
+                                                  questAimsRead);
+        if (questAimsRead)
+            _questAims = questAims;
         std::map<std::string, std::string> const travelAims = _travelAims.Load();
 
         QueryResult result = CharacterDatabase.Query(
@@ -16826,6 +16839,9 @@ private:
         RepickMemory repick;
     };
     std::map<std::string, AimState> _lastAim;
+    // Last successful council aim read. A failed SELECT must not look like a
+    // deliberate clear and restart every active quest on the next good poll.
+    std::map<std::string, uint32> _questAims;
 
     // THE GIVES THIS MODULE HAS ALREADY REFUSED, so a hand-over that cannot
     // work is not attempted thirty times a minute for as long as it cannot
