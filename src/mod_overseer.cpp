@@ -1321,6 +1321,11 @@ constexpr uint32 DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES = 3;
 // nothing.
 constexpr uint8 QUEST_REPICK_STRIKES = 3;
 
+// A full log needs one safe vacancy before the next batch can be accepted
+// (#73). Ten levels is intentionally conservative: the rule only considers
+// incomplete quests with zero objective counters, and never the active aim.
+constexpr int QUEST_STALE_LEVEL_GAP = 10;
+
 // How long a given-up quest stays given up. A quest unreachable from Elwynn is
 // reachable from Goldshire: the bot moves, the world moves, and a refusal that
 // outlives its reason is its own bug. Fifteen minutes is long enough that a
@@ -4826,6 +4831,61 @@ private:
         return need;
     }
 
+    // Free at most one slot per quest poll. This is deliberately not a bulk
+    // purge: the read-back after each abandon is the boundary that makes a
+    // destructive action observable, and one vacancy is enough for the next
+    // quest batch to make progress.
+    bool PruneStaleQuest(Player* bot, uint32 activeAim)
+    {
+        if (!bot || bot->SatisfyQuestLog(false))
+            return false;
+
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const questId = bot->GetQuestSlotQuestId(slot);
+            if (!questId || questId == activeAim ||
+                bot->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
+                continue;
+
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+
+            bool objectiveProgress = false;
+            for (uint8 counter = 0; counter < QUEST_OBJECTIVES_COUNT; ++counter)
+                objectiveProgress = objectiveProgress ||
+                                    bot->GetQuestSlotCounter(slot, counter) != 0;
+            objectiveProgress = objectiveProgress ||
+                                bot->GetQuestSlotCounter(slot, QUEST_PVP_KILL_SLOT) != 0;
+
+            if (!OverseerDecisions::QuestIsStale(
+                    static_cast<int>(bot->GetLevel()), quest->GetQuestLevel(),
+                    objectiveProgress, questId == activeAim, QUEST_STALE_LEVEL_GAP))
+                continue;
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' abandoning stale quest {} ({}) - level gap {}, "
+                     "no objective progress, and not the active aim",
+                     bot->GetName(), questId, quest->GetTitle(),
+                     static_cast<int>(bot->GetLevel()) - quest->GetQuestLevel());
+            bot->AbandonQuest(questId);
+            bot->RemoveActiveQuest(questId);
+            bot->SetQuestSlot(slot, 0);
+
+            // Do not trust AbandonQuest's return path. The slot and status both
+            // have to say gone before this counts as a freed vacancy.
+            if (bot->GetQuestSlotQuestId(slot) == 0 &&
+                bot->GetQuestStatus(questId) == QUEST_STATUS_NONE)
+                return true;
+
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' abandon of quest {} did not read back as removed",
+                      bot->GetName(), questId);
+            return false;
+        }
+        return false;
+    }
+
     void DriveQuests()
     {
         // Read first, and each on its own, so that neither aim column can stop
@@ -4942,6 +5002,11 @@ private:
             PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
                 continue;
+
+            // Make room before choosing another quest. Completed quests are
+            // intentionally preserved for their hand-in, and the active aim
+            // is never treated as stale.
+            PruneStaleQuest(bot, aim);
 
             // THE DUNGEON GATE. Same shape as the job gate above and the
             // travel hand-off below: something else is steering, so this drive
