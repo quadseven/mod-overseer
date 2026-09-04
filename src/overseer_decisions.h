@@ -231,6 +231,11 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap);
 
+// A quest is stale only when it has no progress, is not the active aim, and
+// is at least the configured level gap below the character.
+bool QuestIsStale(int playerLevel, int questLevel, bool objectiveProgress,
+                  bool activeAim, int minimumLevelGap);
+
 // A large measured separation over a reported local polygon. THIS IS A
 // DETECTOR AND NOT A LICENCE TO MOVE ANYBODY: what its caller does about a
 // true answer depends entirely on whether that polygon is there, and

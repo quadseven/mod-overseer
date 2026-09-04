@@ -143,6 +143,14 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= minimumGap;
 }
 
+bool QuestIsStale(int playerLevel, int questLevel, bool objectiveProgress,
+                 bool activeAim, int minimumLevelGap)
+{
+    if (minimumLevelGap <= 0 || objectiveProgress || activeAim)
+        return false;
+    return playerLevel - questLevel >= minimumLevelGap;
+}
+
 bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
                                        bool surfaceValid, bool hasLocalNavmesh,
                                        float overrideGap)
