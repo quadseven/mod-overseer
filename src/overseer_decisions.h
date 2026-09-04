@@ -893,6 +893,22 @@ float GearIncumbent(float mainHandScore, float offHandScore, bool takesBothHands
 // in the bag is the lower score.
 bool GearIsUpgrade(GearVerdict const& candidate, float incumbent);
 
+// The pure gate for a possible sibling hand-off. The adapter supplies the
+// candidate verdict after scoring it for the RECEIVER'S role and supplies the
+// score of the receiver's current slot (both hands for a two-hander). The
+// ownership facts remain explicit because a quest, equipped, or soulbound item
+// is not a transfer candidate even when its score would be an upgrade.
+struct SiblingUpgradeRequest
+{
+    GearVerdict candidate;
+    float incumbent{0.f};
+    bool questItem{false};
+    bool equipped{false};
+    bool soulbound{false};
+};
+
+bool SiblingUpgradeDecision(SiblingUpgradeRequest const& request);
+
 // WHO NEEDS WHEN TWO MEMBERS BOTH WANT THE SAME DROP (#145). The one with the
 // lower total equipped score, because what a dungeon run raises is the party's
 // floor; on a tie, the larger gain, and on a tie in that, the name, so the
