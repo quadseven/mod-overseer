@@ -106,6 +106,17 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= minimumGap;
 }
 
+ProfessionCapStatus ProfessionCap(unsigned value, unsigned maximum,
+                                  bool maximumKnown, bool trainerAvailable)
+{
+    if (!maximumKnown || !maximum)
+        return ProfessionCapStatus::Unknown;
+    if (value < maximum)
+        return ProfessionCapStatus::Progressing;
+    return trainerAvailable ? ProfessionCapStatus::CappedNeedsTraining
+                            : ProfessionCapStatus::CappedWithoutTrainer;
+}
+
 std::string RealmKind(std::string const& declared)
 {
     std::string const value = Normalized(declared);

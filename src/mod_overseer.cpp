@@ -5750,6 +5750,13 @@ private:
     // this character in that primary profession (infra#2757). 0 means "no
     // opinion", which is every errand that is not a profession errand and is
     // byte for byte the behaviour this function has always had.
+    // Declared here because target resolution must also recognise a trainer
+    // that sells the next tier of a skill already held (#74). The older index
+    // only indexed first-rank profession spells, which made capped gatherers
+    // walk to an arbitrary trainer or report that none existed.
+    static uint32 TrainerSpellForSkill(Trainer::Trainer* trainer, Player* bot,
+                                       uint32 skill);
+
     bool ResolveTravelTarget(Player* bot, std::string const& target,
                              uint32& outEntry, WorldPosition& outPos,
                              uint32 wantSkill = 0)
@@ -5879,8 +5886,17 @@ private:
                 continue;
             if (wantedEntry ? spawn.entry != wantedEntry : !(spawn.npcFlags & wantedFlag))
                 continue;
-            if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
-                continue;
+            if (narrowToSkill)
+            {
+                Trainer::Trainer* trainer = sObjectMgr->GetTrainer(spawn.entry);
+                bool teaches = false;
+                if (trainer)
+                    teaches = bot->HasSkill(wantSkill)
+                        ? TrainerSpellForSkill(trainer, bot, wantSkill) != 0
+                        : TrainerStartedSkills(spawn.entry).count(wantSkill) != 0;
+                if (!teaches)
+                    continue;
+            }
 
             float const dist = bot->GetDistance2d(spawn.x, spawn.y);
             if (!found || dist < bestDist)
@@ -6129,6 +6145,20 @@ private:
     {
         CharacterDatabase.Execute(
             "UPDATE overseer_roster SET learn_skill = {} WHERE name = '{}'",
+            skill, Esc(name));
+    }
+
+    // A capped skill is not a failed gathering attempt. If the world can
+    // currently resolve a trainer that sells its next tier, make that fact an
+    // ordinary, durable travel errand. The target is deliberately the role,
+    // not a guessed creature entry: ResolveTravelTarget performs the live
+    // same-map and spell-availability check for this character.
+    void AimTrainingAt(std::string const& name, uint32 skill)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET learn_skill = {}, travel_npc = "
+            "'profession trainer' WHERE name = '{}' AND learn_skill = 0 "
+            "AND travel_npc = ''",
             skill, Esc(name));
     }
 
@@ -7026,6 +7056,40 @@ private:
         switch (step.kind)
         {
             case OverseerDecisions::ProfessionStepKind::Nothing:
+                if (!plan.learnSkill)
+                {
+                    for (OverseerDecisions::ProfessionHolding const& holding : held)
+                    {
+                        if (!plan.wanted.count(holding.skill))
+                            continue;
+
+                        unsigned const maximum =
+                            static_cast<unsigned>(bot->GetPureMaxSkillValue(holding.skill));
+                        OverseerDecisions::ProfessionCapStatus const cap =
+                            OverseerDecisions::ProfessionCap(holding.value, maximum, true, false);
+                        if (cap != OverseerDecisions::ProfessionCapStatus::CappedWithoutTrainer)
+                            continue;
+
+                        uint32 trainerEntry = 0;
+                        WorldPosition trainerPosition;
+                        bool const trainerAvailable = ResolveTravelTarget(
+                            bot, "profession trainer", trainerEntry, trainerPosition,
+                            holding.skill);
+                        if (OverseerDecisions::ProfessionCap(holding.value, maximum, true,
+                                                              trainerAvailable) !=
+                            OverseerDecisions::ProfessionCapStatus::CappedNeedsTraining)
+                            continue;
+
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' holds assigned skill {} at its {} point "
+                                 "ceiling and a trainer is available - standing training "
+                                 "errand",
+                                 name, holding.skill,
+                                 maximum);
+                        AimTrainingAt(name, holding.skill);
+                        return;
+                    }
+                }
                 // Two different silences arrive here and only one of them is
                 // fine. The ordinary one is "already holds what it was
                 // assigned", which must stay silent or it becomes the loudest
