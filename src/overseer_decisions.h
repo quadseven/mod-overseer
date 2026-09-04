@@ -75,6 +75,29 @@ namespace OverseerDecisions
 constexpr char VERSION[] = "0.1.0";
 
 
+// IS A LIVING CHARACTER UNDER A FLOOR IT CANNOT WALK ONTO? (#174)
+//
+// A wall check can refuse the step that leaves the walkable world, but it says
+// nothing about a character already below geometry. The measured failure was
+// an entire party alive and moving at z 59-61 while the city surface above it
+// was around z 95. Horizontal movement remained possible on the raw terrain
+// beneath the city, so neither a death recovery nor a stall could notice.
+//
+// THE NAVMESH IS THE FALSE-POSITIVE GUARD. A cave, cellar or building may
+// legitimately have another surface well above the character. If its current
+// position still belongs to the local walkable mesh, it is an interior, not a
+// recovery candidate. Conversely, the raw terrain hidden beneath a city WMO
+// has no walkable polygon at the character's height.
+//
+// `surfaceValid` is separate from the number because the core has two invalid
+// height sentinels. Invalid data grants no permission to move a character.
+// The boundary is inclusive so a declared thirty-yard gap means exactly that,
+// rather than thirty yards plus one floating-point step.
+bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
+                               bool surfaceValid, bool hasLocalNavmesh,
+                               float minimumGap);
+
+
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
 //
 // THE PROBLEM, STATED AS THE OPERATOR STATES IT. Three realms run this module:

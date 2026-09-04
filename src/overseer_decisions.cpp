@@ -89,6 +89,15 @@ void AppendDeclared(std::vector<BuildFact>& facts, std::string const& name,
 
 }  // namespace
 
+bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
+                               bool surfaceValid, bool hasLocalNavmesh,
+                               float minimumGap)
+{
+    if (!surfaceValid || hasLocalNavmesh || minimumGap <= 0.f)
+        return false;
+    return surfaceAboveZ - currentZ >= minimumGap;
+}
+
 std::string RealmKind(std::string const& declared)
 {
     std::string const value = Normalized(declared);
