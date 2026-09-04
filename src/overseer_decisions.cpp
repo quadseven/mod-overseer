@@ -14,6 +14,11 @@
 namespace OverseerDecisions
 {
 
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand)
+{
+    return !leaderHasOutstandingErrand;
+}
+
 namespace
 {
 
