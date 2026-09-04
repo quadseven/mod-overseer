@@ -14,6 +14,13 @@
 namespace OverseerDecisions
 {
 
+std::map<std::string, uint32_t> QuestAimsAfterRead(
+    std::map<std::string, uint32_t> const& previous,
+    std::map<std::string, uint32_t> const& loaded, bool readSucceeded)
+{
+    return readSucceeded ? loaded : previous;
+}
+
 namespace
 {
 

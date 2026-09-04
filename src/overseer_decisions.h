@@ -44,6 +44,7 @@
 #ifndef MOD_OVERSEER_DECISIONS_H
 #define MOD_OVERSEER_DECISIONS_H
 
+#include <cstdint>
 #include <ctime>
 #include <map>
 #include <string>
@@ -51,6 +52,14 @@
 
 namespace OverseerDecisions
 {
+
+// A failed aim read is not the same thing as a successful read of an empty
+// column. Keep the last known council decision through a transient database
+// failure; otherwise one failed poll turns a steady aim into 0 and the next
+// successful poll looks like a new errand.
+std::map<std::string, uint32_t> QuestAimsAfterRead(
+    std::map<std::string, uint32_t> const& previous,
+    std::map<std::string, uint32_t> const& loaded, bool readSucceeded);
 
 // THE MODULE'S OWN VERSION, and the reason it lives in this header rather than
 // in mod_overseer.cpp: this file is the one part of the module that compiles
