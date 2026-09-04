@@ -106,6 +106,14 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= minimumGap;
 }
 
+bool QuestIsStale(int playerLevel, int questLevel, bool objectiveProgress,
+                  bool activeAim, int minimumLevelGap)
+{
+    if (minimumLevelGap <= 0 || objectiveProgress || activeAim)
+        return false;
+    return playerLevel - questLevel >= minimumLevelGap;
+}
+
 std::string RealmKind(std::string const& declared)
 {
     std::string const value = Normalized(declared);

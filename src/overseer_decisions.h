@@ -103,6 +103,15 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap);
 
+// IS AN INCOMPLETE QUEST DEAD WEIGHT? (#73)
+//
+// The level gap alone is not enough: a low-level quest may still be an active
+// chain, and a quest with recent objective progress is still being worked.
+// The caller supplies those observations, while this pure rule keeps the
+// destructive decision reviewable and testable without a Player.
+bool QuestIsStale(int playerLevel, int questLevel, bool objectiveProgress,
+                  bool activeAim, int minimumLevelGap);
+
 
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
 //
