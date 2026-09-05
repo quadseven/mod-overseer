@@ -754,9 +754,11 @@ ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& rout
         return ApproachLeg::Direct;
 
     // ALREADY PAST IT. Nearer the door than the corridor's start is, AND on
-    // ground a walk can cover - the second half is what keeps the rim out. See
-    // the header: on the rim those two distances differ by one yard the wrong
-    // way, and only the shape tells them apart.
+    // ground a walk can cover - the second half is what keeps the rim out, and
+    // it is doing real work rather than belt and braces. The walkable surface
+    // directly over the Wailing Caverns door is 145 yards from the staging
+    // point and the corridor's start is 179, so the rim is THIRTY-FOUR YARDS
+    // NEARER and passes the distance test outright. Only the shape says no.
     float const toStaging = ApproachDistance(route.leaderToStagingPoint);
     if (toStaging >= 0.f && toStaging <= route.waypointToStagingYards &&
         ApproachShapeOf(route.leaderToStagingPoint, limits) != ApproachShape::Overhead)
