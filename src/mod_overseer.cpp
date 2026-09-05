@@ -10545,6 +10545,11 @@ private:
             // teleporting, otherwise the next travel poll re-issues the same
             // coordinate and sends the character back onto the bad plane.
             _travelAims.Release(name);
+            // A terrain recovery is also terminal for the quest aim that
+            // led the character onto the invalid surface. Leaving it in
+            // overseer_roster would make DriveQuests select the same bad
+            // target again immediately after the bind-point teleport.
+            ClearAim(name);
             bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
                             home->m_homebindY, home->m_homebindZ, 0.f);
             LOG_WARN("module.overseer",
