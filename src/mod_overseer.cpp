@@ -14717,6 +14717,26 @@ private:
             {
                 _travelAims.Claim(leaderName, legAim.aim);
                 coord.legAim = legAim.aim;
+
+                // AND A FRESH LEG GETS A FRESH RATCHET, which is not tidying:
+                // without it the second leg is given up on at ninety seconds
+                // every single time. DUNGEON_STAGING_RATCHET tracks the BEST
+                // distance to the point being walked at, and the point changes
+                // here. The leader reaches the corridor at about four yards,
+                // so `best` is four; the very next reading is his distance to
+                // the staging point, which for the Wailing Caverns corridor is
+                // 179 yards and falling. A ratchet that kept the four would
+                // read every yard of a 465 yard descent as no progress, start
+                // the stall clock at the top of it, and climb the correction
+                // ladder to GiveUp while the leader was walking correctly.
+                //
+                // This is the same clearing, for the same reason, that BARRIER
+                // already does on entry: a new thing to measure against is a
+                // new measurement. The whole-run clock `stagingSince` is
+                // deliberately NOT reset - it bounds the assembly end to end,
+                // and a leg change is not a new assembly.
+                coord.staging.clear();
+
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is now walking at {} ({}) - {}",
                          leaderName,
