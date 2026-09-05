@@ -1,0 +1,85 @@
+-- Sell ONE named stack to the vendor a family member is standing next to,
+-- through the core's own sale, the way a player does it (part of #18).
+--
+-- WHY THIS EXISTS. #18 measured the family as five hoarders: bags full, no
+-- gold, and no way to turn one into the other. mod-playerbots' SellAction
+-- finds nobody in range and returns true anyway, and its `sell` chat command
+-- needs a master to have been told what "junk" means. Travel to a vendor is
+-- already solved (the `vendor` travel role); what was missing was the
+-- transaction on arrival. This is that transaction, and only that.
+--
+-- WHY THE EXECUTOR NEVER CHOOSES WHAT TO SELL, WHICH IS THE LOAD-BEARING
+-- DESIGN DECISION. The obvious executor is "sell the junk", and it is the
+-- wrong one. What counts as junk depends on the whole family at once: the
+-- green one member cannot wear is an upgrade for a sibling (kind='give' and
+-- kind='trade' exist to move it), the stack of cloth is a profession's input,
+-- the grey with a sell price is a quest's turn-in. That rule needs all five
+-- bag lists, professions, quest logs and wants side by side, which is what the
+-- bridge outside the worldserver holds and what a compiled module standing in
+-- one character's boots does not. A second copy of that rule inside the world
+-- would disagree with the first one silently, from a place nobody can watch.
+-- So the row names an item_instance guid and the executor sells THAT or
+-- refuses. Deciding is upstream of the row; the module is the hands.
+--
+-- WHY THE CORE'S SALE AND NOT ModifyMoney PLUS DestroyItem. A sale a player
+-- makes is not "money up, item gone". WorldSession::HandleSellItemOpcode
+-- (ItemHandler.cpp:578-746) deducts the durability refund from the price with
+-- a one-copper floor for starter gear (:666-703), clones a partial stack
+-- (:705-726), parks the sold item in a buyback slot rather than deleting it
+-- (AddItemToBuyBackSlot, PlayerStorage.cpp:4038), fires the OnPlayerCanSellItem
+-- script hook (:604) and counts the vendor-gold achievement (:737). A hand-
+-- rolled version gets the price wrong for anything damaged and loses the
+-- buyback, which is the one undo a sale has. The handler is public on
+-- WorldSession (WorldSession.h:936) and takes a typed packet of exactly three
+-- fields - vendor guid, item guid, count (ItemPackets.h:115-125) - so the
+-- module builds that packet and calls the handler, and the sale is the core's
+-- own in every detail. There is no Player-level API beneath it to call
+-- instead: the sale IS the handler body.
+--
+-- WHAT THE CORE REFUSES, AND WHY THE MODULE TESTS IT FIRST ANYWAY. Every
+-- refusal in that handler is a SendSellError to a session. A bot has no client
+-- to show it to, and the handler returns void, so a refused sale and a
+-- completed one look identical from the call. Each condition is therefore
+-- tested BEFORE the call, purely so `detail` can name the wall that was hit,
+-- and the world is READ BACK afterwards - purse, stack, buyback slots - so
+-- `result` reports what happened rather than what was asked. The one gate that
+-- matters most is Player::GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_VENDOR)
+-- (Player.cpp:2115), which is also the handler's own first test (:583): the
+-- vendor has to be alive, friendly, uncharmed and within INTERACTION_DISTANCE
+-- (5.5 yards, ObjectDefines.h:24). The module sweeps for vendors and keeps the
+-- ones that call accepts; "vendor not in range" is the answer when it accepts
+-- none, with the nearest vendor's distance beside it so an aim can be
+-- corrected.
+--
+-- ONE REFUSAL THE CORE DOES NOT MAKE, made here anyway: a quest item
+-- (ITEM_CLASS_QUEST) is never sold, even when it carries a price. The
+-- disposition rule upstream cannot see which quest a sale was about to break,
+-- and a quest item is the one thing gold cannot buy back once the twelve
+-- buyback slots have rolled over.
+--
+-- Column re-use, no new columns, same shape as kind='give' and kind='trade':
+--   target_name  the SELLER, who must already be standing at the vendor
+--   command      `guid:<item_instance.guid>` optionally ` count:<n>`
+--                (no `entry:` form: an entry names a type, and a family
+--                holding two stacks of it would have the executor choosing)
+--   target_arg   unused
+--   detail       short refusal literal, or empty on success
+--   result       JSON: outcome (sold|refused), reason, retry
+--                (never|elsewhere|later - see SellRefusalRetry in
+--                overseer_decisions.h), item {guid, entry, name, count,
+--                stack}, remaining, money_before, money_after, gained,
+--                buyback, buyback_guid, vendor {entry, name, yards}
+--
+-- THE ENUM LISTS THE FULL UNION. Three kinds ('sell', 'bank', 'auction') are
+-- being added by three parallel branches, and 'job' has been dispatched in
+-- C++ since 2026_08_26 without ever being added here (a latent bug: a 'job'
+-- row could not be inserted at all). Each branch's ALTER names every value so
+-- the migrations apply in any order and the last one to run does not silently
+-- drop the others' values. ENUM values cannot be added by re-running the
+-- CREATE TABLE: the base file is `CREATE TABLE IF NOT EXISTS`, a no-op against
+-- an existing table, so the column keeps whatever value set it already has.
+-- (The same trap is documented on the 'give', 'share' and 'trade' migrations;
+-- it has bitten this codebase more than once.)
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction')
+        NOT NULL DEFAULT 'bot';

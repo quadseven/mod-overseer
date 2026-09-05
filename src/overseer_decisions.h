@@ -112,6 +112,13 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap);
 
+// A large measured separation is unsafe even when a misleading lower plane
+// reports a local polygon. This is the fail-closed backstop for geometry that
+// is technically navigable but clearly below the world surface.
+bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
+                                       bool surfaceValid, bool hasLocalNavmesh,
+                                       float overrideGap);
+
 
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
 //
@@ -934,6 +941,88 @@ struct GearContender
 };
 
 std::string GearNeedWinner(std::vector<GearContender> const& contenders);
+
+// -------------------------------------------------------------- sell (#18) --
+//
+// WHAT THE VENDOR SALE DECIDES WITHOUT A WORLD, and why so little of it.
+//
+// kind='sell' is deliberately the dumbest executor in the queue: it is handed
+// ONE item_instance guid and sells that or refuses. It never decides WHAT to
+// sell. Whether a green is vendor trash or a listing, whether a stack of herbs
+// feeds a profession or a purse, whether the family's twelfth Linen Cloth is
+// surplus - every one of those is a disposition rule, and a disposition rule
+// has to see the whole family's bags, professions, quests and wants at once,
+// which is what the bridge outside the worldserver holds and what this module
+// does not. An executor that "helpfully" chose would be a second, blinder copy
+// of that rule, disagreeing with the first one from inside a compiled module
+// nobody can watch. So the three things below are the whole of what the sale
+// decides on its own, and each is a pure function so it can be tested here:
+//
+//   1. what the command text says (ParseSellSpec)
+//   2. which vendor, when more than one is in reach (ChooseSellVendor)
+//   3. whether a refusal is worth retrying, and where (SellRefusalRetry)
+
+// `guid:<item_instance.guid>` optionally followed by ` count:<n>`. The guid
+// names exactly one stack, the way kind='give' and kind='trade' address one
+// (an entry would name a TYPE, and a family that carries two stacks of the
+// same thing would have the executor choosing, which is the thing it must
+// not do). `count` sells part of the stack; absent, the whole stack goes.
+// Anything else - a bare number, `entry:`, a count of 0, a third token - is
+// rejected rather than guessed at.
+struct SellSpec
+{
+    bool valid{false};
+    uint32_t guid{0};
+    uint32_t count{0};  // 0 = the whole stack; never 0 when a count was given
+};
+
+SellSpec ParseSellSpec(std::string const& command);
+
+// One vendor the seller can interact with, as the world reports it.
+struct SellVendorCandidate
+{
+    float distance{0.f};       // yards from the seller
+    bool refusesSales{false};  // CREATURE_FLAG_EXTRA_NO_SELL_VENDOR
+};
+
+// The index of the vendor to sell to, or -1 when none will do. The nearest
+// vendor that BUYS wins; one flagged as refusing sales is chosen only when it
+// is the only kind in reach, and then only so the refusal can be named as the
+// vendor's rather than as "no vendor". Ties go to the lower index, so the
+// answer never depends on the order a cell sweep happened to produce.
+int ChooseSellVendor(std::vector<SellVendorCandidate> const& candidates);
+
+// WHETHER A REFUSAL IS WORTH ASKING AGAIN, AND WHERE. Three answers, because
+// the walls a sale can hit are of three different kinds and a sender treating
+// them alike either retries a quest item for ever or gives up on a vendor
+// that was merely three yards too far:
+//
+//   Never      the item itself, or the command, is the problem; the same row
+//              gets the same answer from every vendor in the world.
+//   Elsewhere  this spot is the problem; the same row may succeed once the
+//              seller has walked to a (different) vendor.
+//   Later      the seller's state is the problem (dead, in flight, a bag not
+//              yet emptied, a loot window open); the same row may succeed
+//              here in a moment.
+//
+// Keyed on the `detail` literal the executor returns, which is the one string
+// a row carries that both sides read; an unknown literal is `Later`, because
+// a refusal this table has never heard of is more likely a new transient than
+// a new permanent, and retrying a permanent costs a row while giving up on a
+// transient costs the sale.
+enum class SellRetry
+{
+    Never,
+    Elsewhere,
+    Later,
+};
+
+SellRetry SellRefusalRetry(std::string const& detail);
+
+// The word the result JSON carries for each answer: "never", "elsewhere",
+// "later". Here rather than in the executor so the string a test pins is the
+// string a row carries.
+char const* SellRetryWord(SellRetry retry);
 
 // ---------------------------------------------------------- the bank row --
 //
