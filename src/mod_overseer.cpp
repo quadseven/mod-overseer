@@ -15305,6 +15305,16 @@ private:
             else
                 detail = "target has no bot AI (selfbot not enabled?)";
 
+            // A vendor row is claimed before execution, but reaching the NPC
+            // is asynchronous: the travel errand may still be walking the
+            // seller when this poll handles the row. Keep transient proximity
+            // and death failures pending so the next poll can retry after the
+            // holder arrives, rather than losing the sale permanently.
+            if (kind == "sell" &&
+                (std::string(detail) == "vendor not in range" ||
+                 std::string(detail) == "seller is dead"))
+                status = "pending";
+
             // Conditional on the row still being OURS. If the bridge gave up
             // waiting and already ended this row, writing over it would
             // resurrect a command the sender has been told nothing came of,
