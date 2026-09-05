@@ -2384,4 +2384,68 @@ float YardsFallen(bool sampled, float lastZ, float deathZ)
     return dropped > 0.f ? dropped : 0.f;
 }
 
+float FallDamageShare(float yardsDropped, float safeFallYards, float rate)
+{
+    // The core's gate is on the distance itself, before any rate is applied,
+    // so no Rate.Damage.Fall makes a short drop hurt. Written as a negated
+    // >= so a NaN drop falls out here rather than propagating a NaN share.
+    if (!(yardsDropped >= FALL_DAMAGE_MIN_YARDS) || rate <= 0.f)
+        return 0.f;
+
+    float const share =
+        (FALL_DAMAGE_SLOPE * (yardsDropped - safeFallYards) +
+         FALL_DAMAGE_INTERCEPT) * rate;
+
+    if (share <= 0.f)
+        return 0.f;
+    // The core clamps the damage at max health, so the share clamps at one.
+    return share > 1.f ? 1.f : share;
+}
+
+float LethalFallYards(float safeFallYards, float rate)
+{
+    // Solve SLOPE * (yards - safeFall) + INTERCEPT >= 1 / rate. A rate of
+    // zero disables fall damage outright, and nothing is lethal then.
+    if (rate <= 0.f)
+        return -1.f;
+
+    float const yards =
+        (1.f / rate - FALL_DAMAGE_INTERCEPT) / FALL_DAMAGE_SLOPE + safeFallYards;
+
+    // The distance gate still applies underneath the arithmetic: a rate high
+    // enough to make a one-yard drop lethal still never gets to charge for it.
+    return yards < FALL_DAMAGE_MIN_YARDS ? FALL_DAMAGE_MIN_YARDS : yards;
+}
+
+FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards,
+                           float rate)
+{
+    // Negative is YardsFallen's unsampled marker, and it is not zero: see the
+    // header. Saying "it did not fall" about a row nobody sampled is exactly
+    // the mistake this whole function exists to stop.
+    if (recordedYardsFallen < 0.f)
+        return FallAccount::Unsampled;
+    if (recordedYardsFallen == 0.f)
+        return FallAccount::NoDrop;
+    if (recordedYardsFallen < FALL_DAMAGE_MIN_YARDS)
+        return FallAccount::TooShortToHurt;
+
+    return FallDamageShare(recordedYardsFallen, safeFallYards, rate) >= 1.f
+               ? FallAccount::EnoughToKill
+               : FallAccount::Survivable;
+}
+
+char const* FallAccountName(FallAccount account)
+{
+    switch (account)
+    {
+        case FallAccount::Unsampled:      return "unsampled";
+        case FallAccount::NoDrop:         return "no drop";
+        case FallAccount::TooShortToHurt: return "too short to hurt it";
+        case FallAccount::Survivable:     return "could not have killed it";
+        case FallAccount::EnoughToKill:   return "enough to kill it";
+    }
+    return "unsampled";
+}
+
 }  // namespace OverseerDecisions
