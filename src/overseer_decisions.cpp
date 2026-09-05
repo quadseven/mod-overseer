@@ -1029,4 +1029,141 @@ std::string GearNeedWinner(std::vector<GearContender> const& contenders)
     return winner;
 }
 
+// -------------------------------------------------------------- sell (#18) --
+
+namespace
+{
+
+// `<key>:<digits>` -> the digits, or false. Strict on purpose: a value with
+// anything but digits, or nothing at all, is a malformed command and not a
+// zero, because a zero guid would be "no item" and a zero count would be the
+// core's "sell all" special case (ItemHandler.cpp:638), which a sender should
+// ask for by leaving count out rather than by writing 0.
+bool KeyedNumber(std::string const& token, char const* key, uint32_t& value)
+{
+    std::string::size_type const colon = token.find(':');
+    if (colon == std::string::npos || token.substr(0, colon) != key)
+        return false;
+    std::string const digits = token.substr(colon + 1);
+    if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    // Ten digits can overflow uint32; refuse rather than wrap, since a wrapped
+    // guid would name a different item.
+    if (digits.size() > 10)
+        return false;
+    unsigned long long parsed = 0;
+    for (char c : digits)
+        parsed = parsed * 10 + static_cast<unsigned>(c - '0');
+    if (parsed > 0xFFFFFFFFull)
+        return false;
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+}  // namespace
+
+SellSpec ParseSellSpec(std::string const& command)
+{
+    SellSpec spec;
+
+    std::vector<std::string> tokens;
+    std::string::size_type start = 0;
+    while (start <= command.size())
+    {
+        std::string::size_type const space = command.find(' ', start);
+        std::string const token =
+            command.substr(start, space == std::string::npos ? std::string::npos : space - start);
+        if (!token.empty())
+            tokens.push_back(token);
+        if (space == std::string::npos)
+            break;
+        start = space + 1;
+    }
+
+    if (tokens.empty() || tokens.size() > 2)
+        return spec;
+
+    uint32_t guid = 0;
+    if (!KeyedNumber(tokens[0], "guid", guid) || guid == 0)
+        return spec;
+
+    uint32_t count = 0;
+    if (tokens.size() == 2)
+    {
+        if (!KeyedNumber(tokens[1], "count", count) || count == 0)
+            return spec;
+    }
+
+    spec.valid = true;
+    spec.guid = guid;
+    spec.count = count;
+    return spec;
+}
+
+int ChooseSellVendor(std::vector<SellVendorCandidate> const& candidates)
+{
+    int best = -1;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        SellVendorCandidate const& candidate = candidates[i];
+        if (best < 0)
+        {
+            best = static_cast<int>(i);
+            continue;
+        }
+        SellVendorCandidate const& incumbent = candidates[static_cast<size_t>(best)];
+        // A buyer always beats a refuser, whatever the distances.
+        if (incumbent.refusesSales && !candidate.refusesSales)
+        {
+            best = static_cast<int>(i);
+            continue;
+        }
+        if (!incumbent.refusesSales && candidate.refusesSales)
+            continue;
+        if (candidate.distance < incumbent.distance)
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+SellRetry SellRefusalRetry(std::string const& detail)
+{
+    // The literals mod_overseer.cpp's DoSell returns, grouped by what would
+    // have to change for the same row to succeed. A literal that is not here
+    // is answered `Later` (see the header for why that is the safe default).
+    static char const* const NEVER[] = {
+        "malformed sell: want guid:<item_instance.guid>[ count:<n>]",
+        "item not carried",
+        "item is a quest item",
+        "item cannot be sold",
+        "count exceeds stack",
+    };
+    static char const* const ELSEWHERE[] = {
+        "vendor not in range",
+        "vendor refuses item",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return SellRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return SellRetry::Elsewhere;
+    return SellRetry::Later;
+}
+
+char const* SellRetryWord(SellRetry retry)
+{
+    switch (retry)
+    {
+        case SellRetry::Never:
+            return "never";
+        case SellRetry::Elsewhere:
+            return "elsewhere";
+        case SellRetry::Later:
+            break;
+    }
+    return "later";
+}
+
 }  // namespace OverseerDecisions

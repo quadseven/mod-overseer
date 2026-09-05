@@ -34,6 +34,14 @@
  *                     unconditional null-master dereference reachable
  *                     (AcceptQuestAction.cpp:139). Neither divider nor packet
  *                     is touched here; see 2026_08_24_03_overseer_share.sql.
+ *       kind='sell' - sell ONE named stack (or part of it) to the vendor
+ *                     target_name is standing next to, through the core's own
+ *                     WorldSession::HandleSellItemOpcode, so the price, the
+ *                     durability refund and the buyback slot are the core's.
+ *                     The executor never chooses WHAT to sell: that is a
+ *                     disposition rule that needs the whole family's bags at
+ *                     once, and it lives in the bridge outside the world. See
+ *                     2026_09_04_01_overseer_sell.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -139,6 +147,14 @@
 #include "TradeData.h"
 #include "Opcodes.h"
 #include "WorldPacket.h"
+// kind='sell' (#18): the typed packet WorldSession::HandleSellItemOpcode takes
+// (ItemPackets.h:115-125), and the cell sweep that finds which vendor is in
+// reach of the seller - the same three headers mod-playerbots' own
+// TravelAction.cpp:8-10 uses for its sweep.
+#include "ItemPackets.h"
+#include "CellImpl.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 
 // The decisions this module makes that need nothing from the world. Its own
 // header so that something other than this translation unit can reach them -
@@ -156,6 +172,7 @@
 // compiles only by accident of somebody else's include is a catch
 // that stops compiling when they tidy up.
 #include <exception>
+#include <list>
 #include <map>
 #include <mutex>
 #include <random>
@@ -15120,12 +15137,12 @@ private:
             char const* detail = "";
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share' and 'job' do not go through PlayerbotAI::HandleCommand
-            // and share no
+            // 'share', 'job' and 'sell' do not go through
+            // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
-                && kind != "trade" && kind != "share" && kind != "job")
+                && kind != "trade" && kind != "share" && kind != "job" && kind != "sell")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -15188,9 +15205,9 @@ private:
             // echoed back into SQL.
             // Cleared per row: a probe that fails must not inherit the answer
             // the previous row produced, which would be a wrong reading served
-            // with every appearance of a fresh one. kind='give' and
-            // kind='share' fill the same column, for the same reason: the row
-            // must carry ITS OWN outcome.
+            // with every appearance of a fresh one. kind='give',
+            // kind='share' and kind='sell' fill the same column, for the same
+            // reason: the row must carry ITS OWN outcome.
             std::string rowResult;
 
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
@@ -15210,6 +15227,8 @@ private:
                 detail = DoShare(player, targetArg, command, status, rowResult);
             else if (kind == "job")
                 detail = DoJob(player, command, status);
+            else if (kind == "sell")
+                detail = DoSell(player, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -16503,6 +16522,343 @@ private:
                  itemGuid.GetCounter(), itemEntry, giver->GetName(), receiver->GetName());
 
         describe("moved", "");
+        status = "delivered";
+        return "";
+    }
+
+    // ---------------------------------------------------------------- sell --
+    //
+    // Sell ONE named stack (or part of it) to the vendor the character is
+    // standing next to, through the core's own sale, so the gold, the buyback
+    // slot and the price rounding are all the core's.
+    //
+    // WHY THE EXECUTOR NEVER CHOOSES THE ITEM. #18 measured the family as five
+    // hoarders: bags full, no gold, no vendor path (mod-playerbots' SellAction
+    // finds nobody in range and returns true anyway). The obvious fix is an
+    // executor that "sells the junk", and it is the wrong one, because what
+    // is junk depends on the whole family at once - which greens are upgrades
+    // for a sibling, which stack of cloth feeds a profession, which trash is
+    // a quest's turn-in. That rule lives in the bridge outside the worldserver,
+    // where all five bag lists, professions and quest logs are in one place.
+    // A second copy of it in a compiled module nobody can watch would
+    // disagree with the first, from inside the world, silently. So this takes
+    // an item_instance guid and sells that or refuses; the deciding is
+    // upstream of the row. See 2026_09_04_01_overseer_sell.sql.
+    //
+    // WHY THE CORE'S HANDLER AND NOT ModifyMoney+DestroyItem. The sale a
+    // player makes does four things this module would otherwise have to
+    // re-implement and get subtly wrong: it deducts the durability refund
+    // from the price (ItemHandler.cpp:666-703, with the floor at 1 copper for
+    // starter gear), it splits a partial stack into a clone (ItemHandler.cpp:
+    // 705-726), it parks the sold item in a buyback slot instead of deleting
+    // it (AddItemToBuyBackSlot, PlayerStorage.cpp:4038), and it fires the
+    // OnPlayerCanSellItem script hook and the vendor-gold achievement. The
+    // handler is public on WorldSession (WorldSession.h:936,
+    // `void HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)`) and
+    // takes a typed packet whose only fields are the vendor guid, the item
+    // guid and a count (ItemPackets.h:115-125, read at ItemPackets.cpp:71-76).
+    // There is no Player-level API underneath it: the sale IS the handler
+    // body, so the handler is what is called.
+    //
+    // WHAT THE CORE REFUSES, AND WHY EACH IS TESTED HERE FIRST. Every refusal
+    // in HandleSellItemOpcode (ItemHandler.cpp:578-746) is a SendSellError
+    // to a session, which a bot has no client to show and a module cannot
+    // read back. So each condition is tested before the call, purely so the
+    // row can NAME it in `detail` and classify it in `result.retry`:
+    //
+    //   GetNPCIfCanInteractWith(vendor, UNIT_NPC_FLAG_VENDOR) == nullptr
+    //     (Player.cpp:2115-2165: not in world, in flight, seller dead, vendor
+    //     dead, wrong npcflag, charmed, unfriendly, or farther than
+    //     INTERACTION_DISTANCE = 5.5f, ObjectDefines.h:24)
+    //                                          -> "vendor not in range" (or
+    //                                             "seller is dead" / "seller
+    //                                             is in flight" when it is
+    //                                             the seller, not the spot)
+    //   CREATURE_FLAG_EXTRA_NO_SELL_VENDOR      -> "vendor refuses item"
+    //     (ItemHandler.cpp:591; CreatureData.h:58). This is the ONLY
+    //     vendor-side refusal the sell path has. VendorItemData - what the
+    //     vendor SELLS - is never consulted when a player sells TO it, so a
+    //     vendor with an empty or restricted stock still buys.
+    //   GetItemByGuid == nullptr                -> "item not carried"
+    //     (ItemHandler.cpp:601/744). Narrowed here to FindCarriedItem, which
+    //     omits the bank the core's lookup would search (PlayerStorage.cpp:
+    //     423-426): a character in a field cannot reach its bank, and a sale
+    //     out of it would be a state change no player could make.
+    //   IsNotEmptyBag                           -> "item is a non-empty bag"
+    //   GetLootGUID() == item guid              -> "item is being looted"
+    //   IsRefundable                            -> "item is still refundable"
+    //     (ItemHandler.cpp:634: the core returns with NO error packet at all
+    //     here, so without this pre-check the row would read as a sale that
+    //     silently did nothing.)
+    //   Count > GetCount                        -> "count exceeds stack"
+    //   SellPrice == 0                          -> "item cannot be sold"
+    //     (ItemHandler.cpp:653/740. There is no NO_SELL item flag in this
+    //     core - ItemTemplate.h:145-175 has none - the price is the gate.)
+    //   GetMoney() >= MAX_MONEY_AMOUNT - price  -> "too much gold"
+    //
+    // One refusal the core does NOT make, made here anyway: ITEM_CLASS_QUEST
+    // (ItemTemplate.h:303). The core sells a quest item that carries a price.
+    // This module does not, because the disposition rule upstream cannot see
+    // which quest a sold item was about to complete, and a quest item is the
+    // one thing a sale can destroy that gold cannot buy back once the buyback
+    // slot has rolled over. Named "item is a quest item", never retried.
+    //
+    // What the core also does NOT refuse, and so neither does this: combat
+    // and an open trade window. A player at a vendor mid-fight can sell; the
+    // sell path has no IsInCombat test and no GetTradeData test. Adding either
+    // here would make the bot stricter than the player it is imitating.
+    //
+    // THE READ-BACK IS THE RESULT. The handler returns void. Success is
+    // proven by three readings taken before and after: the purse, the stack
+    // (gone, or reduced by exactly the count), and the buyback slots (a guid
+    // that was not there before - the item's own for a whole-stack sale, the
+    // clone's for a split). Any other combination is reported as what it is
+    // rather than as a sale.
+
+    // The predicate the vendor sweep in DoSell runs over each creature in the
+    // visited cells: alive, flagged as a vendor, and within `range` of `from`.
+    // The shape Acore::CreatureListSearcher wants (GridNotifiers.h:494-508: a
+    // `Check&` whose operator() takes a Creature*), and the same three tests
+    // Acore::AnyUnitInObjectRangeCheck makes (GridNotifiers.h:1061-1075) plus
+    // the npcflag, so the list is vendors and not every guard in town.
+    struct VendorNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR)
+                && from->IsWithinDistInMap(creature, range);
+        }
+    };
+
+    static char const* DoSell(Player* seller, std::string const& command,
+                              char const*& status, std::string& out)
+    {
+        using OverseerDecisions::ChooseSellVendor;
+        using OverseerDecisions::ParseSellSpec;
+        using OverseerDecisions::SellRefusalRetry;
+        using OverseerDecisions::SellRetryWord;
+        using OverseerDecisions::SellSpec;
+        using OverseerDecisions::SellVendorCandidate;
+
+        // Every exit writes `out`. `detail` is the literal the retry table in
+        // overseer_decisions keys on, so the JSON carries the classification
+        // alongside it rather than making the bridge repeat the lookup.
+        auto refuse = [&](char const* detail, std::string const& extra = std::string()) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(detail)
+              << ",\"retry\":" << J(SellRetryWord(SellRefusalRetry(detail)))
+              << ",\"seller\":" << J(seller->GetName())
+              << ",\"request\":" << J(command)
+              << extra << "}";
+            out = o.str();
+            return detail;
+        };
+
+        SellSpec const spec = ParseSellSpec(command);
+        if (!spec.valid)
+            return refuse("malformed sell: want guid:<item_instance.guid>[ count:<n>]");
+
+        WorldSession* session = seller->GetSession();
+        if (!session)
+            return refuse("seller has no session");
+
+        // The two seller-side reasons GetNPCIfCanInteractWith would return
+        // nullptr for, named separately so a dead character is not reported
+        // as a missing vendor (Player.cpp:2121-2134).
+        if (!seller->IsInWorld())
+            return refuse("seller is not in the world");
+        if (!seller->IsAlive())
+            return refuse("seller is dead");
+        if (seller->IsInFlight())
+            return refuse("seller is in flight");
+
+        Item* item = FindCarriedItem(seller, true, spec.guid);
+        if (!item)
+            return refuse("item not carried");
+
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return refuse("item has no template");
+
+        ObjectGuid const itemGuid = item->GetGUID();
+        uint32 const itemEntry = item->GetEntry();
+        uint32 const countBefore = item->GetCount();
+        uint32 const sellCount = spec.count ? spec.count : countBefore;
+        std::string const itemName = proto->Name1;
+
+        std::ostringstream itemJson;
+        itemJson << ",\"item\":{\"guid\":" << itemGuid.GetCounter()
+                 << ",\"entry\":" << itemEntry
+                 << ",\"name\":" << J(itemName)
+                 << ",\"count\":" << sellCount
+                 << ",\"stack\":" << countBefore << "}";
+
+        if (proto->Class == ITEM_CLASS_QUEST)
+            return refuse("item is a quest item", itemJson.str());
+        if (proto->SellPrice == 0)
+            return refuse("item cannot be sold", itemJson.str());
+        if (sellCount > countBefore)
+            return refuse("count exceeds stack", itemJson.str());
+        if (item->IsNotEmptyBag())
+            return refuse("item is a non-empty bag", itemJson.str());
+        if (seller->GetLootGUID() == itemGuid)
+            return refuse("item is being looted", itemJson.str());
+        if (item->IsRefundable())
+            return refuse("item is still refundable", itemJson.str());
+        // The same overflow guard as ItemHandler.cpp:655-661, on the
+        // undiscounted price; the core's is the same test on the same number.
+        if (seller->GetMoney() >= MAX_MONEY_AMOUNT - proto->SellPrice * sellCount)
+            return refuse("too much gold", itemJson.str());
+
+        // ---- who is in reach ------------------------------------------------
+        //
+        // A cell sweep for living creatures flagged as vendors, wider than the
+        // interaction distance on purpose: the interact gate is the core's own
+        // GetNPCIfCanInteractWith and decides who counts, and the wider sweep
+        // exists only so a refusal can say how far the nearest vendor WAS -
+        // "vendor not in range" with "8.4 yards" beside it is an aim error
+        // the bridge can correct; without the number it is a mystery.
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        VendorNearbyCheck check{seller, SWEEP_YARDS};
+        Acore::CreatureListSearcher<VendorNearbyCheck> searcher(seller, nearby, check);
+        Cell::VisitObjects(seller, searcher, SWEEP_YARDS);
+
+        std::vector<SellVendorCandidate> candidates;
+        std::vector<Creature*> reachable;
+        float nearestYards = -1.f;
+        for (Creature* creature : nearby)
+        {
+            float const yards = seller->GetDistance(creature);
+            if (nearestYards < 0.f || yards < nearestYards)
+                nearestYards = yards;
+
+            // THE GATE. Player.h:1146; the same call ItemHandler.cpp:583
+            // makes with the same flag, so a creature this accepts is one
+            // the handler will accept.
+            if (!seller->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_VENDOR))
+                continue;
+
+            SellVendorCandidate candidate;
+            candidate.distance = yards;
+            candidate.refusesSales = creature->HasFlagsExtra(CREATURE_FLAG_EXTRA_NO_SELL_VENDOR);
+            candidates.push_back(candidate);
+            reachable.push_back(creature);
+        }
+
+        if (reachable.empty())
+        {
+            std::ostringstream extra;
+            extra << itemJson.str();
+            if (nearestYards >= 0.f)
+                extra << ",\"nearest_vendor_yards\":" << nearestYards;
+            return refuse("vendor not in range", extra.str());
+        }
+
+        int const choice = ChooseSellVendor(candidates);
+        Creature* vendor = reachable[static_cast<size_t>(choice)];
+        uint32 const vendorEntry = vendor->GetEntry();
+        std::string const vendorName = vendor->GetName();
+
+        std::ostringstream vendorJson;
+        vendorJson << ",\"vendor\":{\"entry\":" << vendorEntry
+                   << ",\"name\":" << J(vendorName)
+                   << ",\"yards\":" << candidates[static_cast<size_t>(choice)].distance << "}";
+
+        if (candidates[static_cast<size_t>(choice)].refusesSales)
+            return refuse("vendor refuses item", itemJson.str() + vendorJson.str());
+
+        // ---- readings before ------------------------------------------------
+
+        uint32 const moneyBefore = seller->GetMoney();
+        std::set<ObjectGuid> buybackBefore;
+        for (uint32 slot = BUYBACK_SLOT_START; slot < BUYBACK_SLOT_END; ++slot)
+            if (Item* parked = seller->GetItemFromBuyBackSlot(slot))
+                buybackBefore.insert(parked->GetGUID());
+
+        // ---- the core's own sale ---------------------------------------------
+        //
+        // The packet is built the way the client builds it - vendor guid,
+        // item guid, count, in that order (ItemPackets.cpp:71-76) - wrapped in
+        // the typed packet the handler takes (ItemPackets.h:118 asserts the
+        // opcode), and read back out of the bytes by the packet's own Read().
+        // The count is sent explicitly rather than as the core's 0-means-all
+        // (ItemHandler.cpp:638) so the row and the packet say the same number.
+        WorldPacket raw(CMSG_SELL_ITEM, 8 + 8 + 4);
+        raw << vendor->GetGUID();
+        raw << itemGuid;
+        raw << uint32(sellCount);
+        WorldPackets::Item::SellItem packet(std::move(raw));
+        packet.Read();
+        session->HandleSellItemOpcode(packet);
+
+        // ---- believe nothing; read the world back ----------------------------
+
+        uint32 const moneyAfter = seller->GetMoney();
+        Item* remaining = FindCarriedItem(seller, true, spec.guid);
+        uint32 const countAfter = remaining ? remaining->GetCount() : 0;
+
+        bool buyback = false;
+        uint32 buybackGuid = 0;
+        for (uint32 slot = BUYBACK_SLOT_START; slot < BUYBACK_SLOT_END; ++slot)
+        {
+            Item* parked = seller->GetItemFromBuyBackSlot(slot);
+            if (!parked || buybackBefore.count(parked->GetGUID()))
+                continue;
+            if (parked->GetEntry() != itemEntry)
+                continue;
+            buyback = true;
+            buybackGuid = parked->GetGUID().GetCounter();
+            break;
+        }
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"retry\":" << J(*reason ? SellRetryWord(SellRefusalRetry(reason)) : "")
+              << ",\"seller\":" << J(seller->GetName())
+              << ",\"request\":" << J(command)
+              << itemJson.str()
+              << ",\"remaining\":" << countAfter
+              << ",\"money_before\":" << moneyBefore
+              << ",\"money_after\":" << moneyAfter
+              << ",\"gained\":" << (moneyAfter >= moneyBefore ? moneyAfter - moneyBefore : 0)
+              << ",\"buyback\":" << (buyback ? "true" : "false")
+              << ",\"buyback_guid\":" << buybackGuid
+              << vendorJson.str() << "}";
+            out = o.str();
+        };
+
+        // Untouched: the stack is what it was and the purse is what it was.
+        // Everything this function tests was tested, so this is a wall it does
+        // not know about - the OnPlayerCanSellItem script hook, or a
+        // durability table lookup failing (ItemHandler.cpp:604, :674-689).
+        if (countAfter == countBefore && moneyAfter == moneyBefore)
+        {
+            describe("refused", "the core refused the sale");
+            return "the core refused the sale";
+        }
+
+        // Something moved but not what was asked for. Reported as such and
+        // NOT as a sale, because a row that says "sold 20" when 5 went is the
+        // wrong count in a ledger somebody will balance against.
+        if (countAfter != countBefore - sellCount)
+        {
+            describe("refused", "the sale did not read back as requested");
+            return "the sale did not read back as requested";
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' sold {} x item {} (entry {}) to vendor {} (entry {}) for {} copper{}",
+                 seller->GetName(), sellCount, itemGuid.GetCounter(), itemEntry, vendorName,
+                 vendorEntry, moneyAfter - moneyBefore, buyback ? ", parked in buyback" : "");
+
+        describe("sold", "");
         status = "delivered";
         return "";
     }
