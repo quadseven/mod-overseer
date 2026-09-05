@@ -1,0 +1,109 @@
+-- Buy a named item from the vendor a family member is standing next to,
+-- through the core's own purchase, the way a player does it (part of #18).
+--
+-- WHY THIS EXISTS. Measured across the whole roster: four of the five carry no
+-- food and no drink at all, and the fifth carries one bowl of soup. The healer
+-- and the mage - the two whose mana is what makes a dungeon finishable - carry
+-- nothing to drink whatsoever. Out of combat a character in the middle twenties
+-- regenerates mana slowly enough that a party with no water spends most of a
+-- dungeon sitting on the floor, and a party being asked to clear the same
+-- instance a hundred times spends most of a week there. #18 gave the family a
+-- way to turn stuff into gold; this is the other half, the only way anything in
+-- this module has ever put an item INTO a bag from outside it.
+--
+-- WHY THE CORE'S PURCHASE AND NOT ModifyMoney PLUS StoreNewItem.
+-- WorldSession::HandleBuyItemOpcode (ItemHandler.cpp) decrements the vendor
+-- slot - the client numbers slots from 1 and the handler expects that, treating
+-- a 0 as a cheat - and calls Player::BuyItemFromVendorSlot (Player.cpp), which
+-- is where all of it happens: the interaction gate, the allowable-class gate
+-- for bind-on-pickup items, the faction-flag gate, the vendor condition list,
+-- the slot-matches-item check, the limited-stock check against the vendor's own
+-- restock counter, the reputation discount, the overflow guard, the money, the
+-- storage, and the decrement of that stock counter afterwards. Re-implementing
+-- any of it would be a second and worse copy, and would let a bot buy things
+-- from a shop that has none left.
+--
+-- WHY THE VENDOR LIST IS OPENED FIRST. BuyItemFromVendorSlot reads
+-- `GetSession()->GetCurrentVendor()` and, when it is non-zero, looks the stock
+-- up by THAT entry rather than by the creature standing in front of the
+-- character. Only SendListInventory sets it, and only HandleListInventoryOpcode
+-- calls that. So the module sends CMSG_LIST_INVENTORY first, exactly as a
+-- client does when the vendor window opens - not for the packet, which nobody
+-- will read, but because without it a stale current-vendor left behind by some
+-- other system would silently price this purchase against a different shop.
+--
+-- WHY THE ROW IS BELIEVED ONLY AFTER THE WORLD IS READ BACK. The handler
+-- returns void, and the bool underneath it is not a success flag: on a
+-- COMPLETED purchase BuyItemFromVendorSlot returns `crItem->maxcount != 0`, so
+-- buying something the vendor has an unlimited supply of - which is every food
+-- and drink in the town this roster can reach - returns FALSE from a purchase
+-- that worked perfectly. Every refusal inside it is a SendBuyError or
+-- SendEquipError to a session a bot does not have. So the proof is two
+-- readings taken on both sides of the call: how many of the entry the
+-- character carries, and the purse. `result` reports those, not the call.
+--
+-- ONE REFUSAL THE CORE DOES NOT MAKE, made here anyway: `max:<copper>`. The
+-- core buys at whatever the vendor charges. A SALE can be undone - the item
+-- sits in a buyback slot for a while - but a PURCHASE cannot: the gold is
+-- simply gone. A count typed with one extra zero, or a price that is not what
+-- the planner read, is exactly the kind of mistake a bot cannot notice and
+-- cannot walk back. `max` is the sender saying what it expected to pay,
+-- checked before the packet rather than discovered after it. Absent, there is
+-- no ceiling. `max:0` is a real request - "only if it is free" - and is
+-- distinguishable from absent.
+--
+-- AND ONE THE CORE MAKES BADLY, made properly here: the packet's count field is
+-- four bytes, but HandleBuyItemOpcode passes it into BuyItemFromVendorSlot's
+-- `uint8 count`. A count of 256 therefore arrives as 0, is rewritten to 1 by
+-- that function's own cheat guard, and produces a row claiming a purchase of
+-- 256 that bought one. Counts above 255 are refused rather than truncated.
+--
+-- `count` IS PURCHASES AND NOT ITEMS, because that is what the packet's count
+-- means: the core stores `ItemTemplate::BuyCount * count`. For everything this
+-- roster restocks that factor is 1 and the two numbers are the same, but the
+-- read-back multiplies rather than assuming, so a vendor that sells arrows two
+-- hundred at a time is counted correctly instead of read as a hundred and
+-- ninety-nine items missing.
+--
+-- `entry:` AND NOT `guid:`, which is the opposite of every other item verb in
+-- this module, and it has to be: the item does not exist until the purchase
+-- creates it, so there is no item_instance row to name. What a vendor sells is
+-- a TYPE, the packet carries a type, and so does the row.
+--
+-- WHAT THE EXECUTOR NEVER DECIDES: what to buy, how much of it, or for whom.
+-- How much water a healer needs for a dungeon, whether a mage who can conjure
+-- his own should be buying any, and what the party can afford after repairing -
+-- every one of those needs all five characters' bags, classes, spellbooks and
+-- purses side by side, which is what the side outside the worldserver holds.
+-- This executor buys the entry it is told to buy where the character already
+-- stands, or names why it cannot.
+--
+-- Column re-use, no new columns:
+--   target_name  the BUYER, who must already be standing at the vendor
+--   command      `entry:<item_template.entry> [count:<n>] [max:<copper>]`
+--                (count and max may come in either order, each at most once)
+--   target_arg   unused
+--   detail       short refusal literal, or empty on success
+--   result       JSON: outcome (bought|refused|error), reason, retry
+--                (never|elsewhere|later - see BuyRefusalRetry in
+--                overseer_decisions.h), buyer, item {entry, name, purchases,
+--                items_wanted}, carried_before, carried_after, price, cap,
+--                money_before, money_after, spent, price_matches_spend,
+--                vendor {entry, name, yards, discount, slot, stock_left} or
+--                null, nearest_vendor_yards, inventory_result and
+--                inventory_result_name when the bags were asked
+--
+-- THE REFUSAL THAT IS `later` AND LOOKS LIKE `never`: "vendor is out of stock".
+-- A limited-stock line restocks on the vendor's own timer, and the nearest
+-- weapon dealer to this roster really does sell healing potions three at a time
+-- on a 9000-second refresh. Giving up on it permanently would be wrong; so
+-- would retrying "item is not for this class" for ever. That is what the retry
+-- table in overseer_decisions.h is for, and tests/test_buy.cpp pins it.
+--
+-- THE ENUM LISTS THE FULL UNION, for the reason spelled out on the repair
+-- migration alongside this one: parallel branches are adding 'auction' and
+-- 'mail', each ALTER names every value, and the base CREATE TABLE is
+-- `IF NOT EXISTS` so it can never add one.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy')
+        NOT NULL DEFAULT 'bot';

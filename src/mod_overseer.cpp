@@ -16046,6 +16046,10 @@ private:
                 detail = DoSell(player, command, status, rowResult);
             else if (kind == "bank")
                 detail = DoBank(player, command, status, rowResult);
+            else if (kind == "repair")
+                detail = DoRepair(player, command, status, rowResult);
+            else if (kind == "buy")
+                detail = DoBuy(player, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -16098,6 +16102,37 @@ private:
                 (std::string(detail) == "vendor not in range" ||
                  std::string(detail) == "seller is dead"))
                 status = "pending";
+
+            // AND THE TOWN TRIP'S TWO NEW ROWS DELIBERATELY DO NOT DO THIS.
+            //
+            // The obvious thing was to copy the four lines above for
+            // kind='repair' and kind='buy': both race travel exactly the way a
+            // sale does, and a row that arrives before its character reaches
+            // the counter is refused for a reason that will stop being true in
+            // a moment. That copy was written, and then removed, because the
+            // pattern it copies is #230.
+            //
+            // Measured on the dev realm while this was being written: twenty
+            // sell rows refused with "vendor not in range", each pushed back to
+            // `pending` with its low id intact, re-selected by the very next
+            // poll because the drain takes work `ORDER BY id ASC LIMIT 20`, and
+            // re-attempted for half an hour. Twenty is COMMANDS_PER_POLL, so
+            // they filled the window completely and the 322 rows behind them
+            // were never read at all. Not a stall - a livelock, with the drain
+            // running perfectly on the same twenty rows.
+            //
+            // A retry that keeps its place at the head of a FIFO is not a
+            // retry, it is a lock. So these two verbs carry their retry class
+            // OUT instead: `detail` names the wall, `result` carries
+            // "retry":"elsewhere" or "later" (RepairRefusalRetry /
+            // BuyRefusalRetry), and the side that decides re-queues a FRESH row
+            // - which lands at the TAIL, behind everything already waiting,
+            // and cannot hold the head against anybody.
+            //
+            // The sell path above is left exactly as it is. Changing it is
+            // #230's job and belongs in #230's diff, where the bounded retry,
+            // the claim lease and the logging can be designed together instead
+            // of being half-done here.
 
             // Conditional on the row still being OURS. If the bridge gave up
             // waiting and already ended this row, writing over it would
@@ -18234,6 +18269,867 @@ private:
         status = "delivered";
         return "";
     }
+
+    // -------------------------------------------------------------- repair --
+    //
+    // Pay a repairer to put the durability back, the way a player at the
+    // repair window does it.
+    //
+    // WHY THIS EXISTS. The family is being asked to clear the same instance a
+    // hundred times. Nothing in this module has ever spent a copper, and
+    // nothing has ever restored a point of durability. Gear does not wear out
+    // quickly - measured after a clear, the five characters were between 99.0%
+    // and 100%, ten missing points across nine items - but it wears out
+    // MONOTONICALLY, and the loss is dominated by deaths (10% of maximum, each
+    // time) rather than by hits taken. Over a hundred runs that is the
+    // difference between a tank who is wearing armour and a tank who is not:
+    // at 0% durability an item stops contributing its stats entirely. The
+    // ninety-ninth run fails because of what nobody did after the first one.
+    //
+    // THE CORE'S OWN PATH. WorldSession::HandleRepairItemOpcode
+    // (NPCHandler.cpp) reads a repairer guid, an item guid and a guild-bank
+    // byte, puts the repairer through Player::GetNPCIfCanInteractWith with
+    // UNIT_NPC_FLAG_REPAIR, takes the reputation discount from
+    // Player::GetReputationPriceDiscount, and then calls either
+    // Player::DurabilityRepair for the named item or Player::DurabilityRepairAll
+    // for everything. Those two are public on Player (Player.h:2083-2084) and
+    // calling them directly would work - but the handler is what applies the
+    // interaction gate and the discount, and a module that skipped it would be
+    // repairing at a price no player pays, from a distance no player can.
+    //
+    // WHY THE READ-BACK IS THE ONLY EVIDENCE, and this is the strongest case
+    // for it anywhere in this file. Player::DurabilityRepair returns a
+    // `uint32 TotalCost` that is ONLY EVER ASSIGNED ON THE GUILD-BANK BRANCH.
+    // Repairing out of the character's own purse - the only kind this module
+    // does - returns 0 whether it repaired a full set of plate or refused for
+    // want of a copper. So does the "not enough money" path. So does a missing
+    // DurabilityCosts.dbc row. And HandleRepairItemOpcode returns void on top
+    // of that. There is no value anywhere in the call chain that distinguishes
+    // a repair from a no-op. The durability fields and the purse do, and they
+    // are read before and after.
+    //
+    // NO GUILD FUNDS. The byte is always sent as 0. The family has no guild,
+    // and Player::DurabilityRepair's guild branch returns immediately when
+    // GetGuildId() == 0 - having repaired nothing, charged nothing, and told
+    // nobody. A grammar that could ask for it would be a grammar whose most
+    // likely outcome is a row that looks like a success and changed nothing.
+    //
+    // WHAT THIS DOES NOT DECIDE. Whether the family can afford to repair now,
+    // whether it should sell first, and which item matters most when it
+    // cannot afford all of them - every one of those needs the whole family's
+    // bags, purses and plans side by side, which is what the side outside the
+    // worldserver holds. This executor repairs what it is told to repair
+    // where the character already stands, or names why it cannot.
+    //
+    // Column re-use, no new columns, same shape as kind='sell' and kind='bank':
+    //   target_name  the CHARACTER, already standing at a repairer
+    //   command      `all`, or `item guid:<item_instance.guid>`
+    //   target_arg   unused
+    //   detail       short refusal literal, or empty on success
+    //   result       JSON, described on the migration
+
+    // The predicate the repairer sweep runs over each creature in the visited
+    // cells. The same three tests Acore::AnyUnitInObjectRangeCheck makes, plus
+    // the npcflag, so the list is repairers and not every guard in town.
+    //
+    // Deliberately WITHOUT the bad-spawn exclusions VendorNearbyCheck carries:
+    // those exist so the TRAVEL aim does not walk a character to a synthetic
+    // pedestal on the far side of a city, and this sweep never aims anything.
+    // It runs where the character already is, and every creature it finds is
+    // then put to the core's own interaction gate anyway.
+    struct RepairerNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_REPAIR)
+                && from->IsWithinDistInMap(creature, range);
+        }
+    };
+
+    // One carried item's durability, as it stood at a moment.
+    struct DurabilityReading
+    {
+        uint32 guid = 0;
+        uint32 entry = 0;
+        std::string name;
+        uint32 current = 0;
+        uint32 maximum = 0;
+    };
+
+    // Every carried item that CAN wear out, over exactly the slots
+    // Player::DurabilityRepairAll walks: equipment, the bag slots, the
+    // backpack, and then the contents of every worn bag. The bank is not
+    // included, because DurabilityRepairAll does not repair it either
+    // ("bank, buyback and keys not repaired", Player.cpp) - so a read-back
+    // that counted it would be measuring something the call never touched.
+    //
+    // The instance fields are read rather than ItemTemplate::MaxDurability,
+    // because the instance is what the core reads and what a repair writes.
+    static std::vector<DurabilityReading> ReadCarriedDurability(Player* who)
+    {
+        std::vector<DurabilityReading> readings;
+
+        auto take = [&](Item* item)
+        {
+            if (!item)
+                return;
+            uint32 const maximum = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
+            if (!maximum)
+                return;
+            DurabilityReading reading;
+            reading.guid = item->GetGUID().GetCounter();
+            reading.entry = item->GetEntry();
+            if (ItemTemplate const* proto = item->GetTemplate())
+                reading.name = proto->Name1;
+            reading.current = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
+            reading.maximum = maximum;
+            readings.push_back(reading);
+        };
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            take(who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                take(bag->GetItemByPos(uint8(i)));
+        }
+        return readings;
+    }
+
+    // The core's own repair arithmetic (Player::DurabilityRepair), run without
+    // paying, purely so that a row can say what it expected the bill to be.
+    //
+    // THIS IS A WITNESS, NOT AN AUTHORITY, and the distinction is the whole
+    // reason it is safe to have a second copy of a formula in this file. It
+    // never refuses a repair: the core is asked either way, and if this number
+    // is wrong the repair still happens at the core's price. It is written
+    // into the JSON beside what was actually spent, so a disagreement between
+    // them is a visible signal that this copy has drifted from the core's -
+    // rather than a repair silently refused for a price nobody charged.
+    //
+    // `priceable` comes back false when a DBC row is missing, which is the one
+    // case where the core also gives up and repairs nothing.
+    static uint32 RepairQuote(Item const* item, float discountMod, bool& priceable)
+    {
+        priceable = false;
+        if (!item)
+            return 0;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return 0;
+
+        uint32 const maximum = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
+        uint32 const current = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
+        if (!maximum || current >= maximum)
+        {
+            priceable = true;
+            return 0;
+        }
+
+        DurabilityCostsEntry const* cost = sDurabilityCostsStore.LookupEntry(proto->ItemLevel);
+        if (!cost)
+            return 0;
+        DurabilityQualityEntry const* quality =
+            sDurabilityQualityStore.LookupEntry((proto->Quality + 1) * 2);
+        if (!quality)
+            return 0;
+
+        uint32 const multiplier =
+            cost->multiplier[ItemSubClassToDurabilityMultiplierId(proto->Class, proto->SubClass)];
+        uint32 copper = uint32((maximum - current) * multiplier * double(quality->quality_mod));
+        copper = uint32(copper * discountMod * sWorld->getRate(RATE_REPAIRCOST));
+        if (copper == 0)
+            copper = 1;  // the core's own floor, for items a rounding would make free
+
+        priceable = true;
+        return copper;
+    }
+
+    static char const* DoRepair(Player* who, std::string const& command, char const*& status,
+                                std::string& out)
+    {
+        using OverseerDecisions::ChooseRepairer;
+        using OverseerDecisions::ParseRepairRequest;
+        using OverseerDecisions::RepairerCandidate;
+        using OverseerDecisions::RepairRefusalRetry;
+        using OverseerDecisions::RepairRequest;
+        using OverseerDecisions::RepairVerb;
+        using OverseerDecisions::TownRetryWord;
+
+        RepairRequest const request = ParseRepairRequest(command);
+
+        // Everything a row can be answered with, gathered as it becomes known
+        // and written by EVERY exit, refusals included. Unknowns stay -1
+        // because 0 is a real amount of money and a real number of items.
+        struct Evidence
+        {
+            char const* verb = "";
+            bool haveRepairer = false;
+            uint32 repairerEntry = 0;
+            std::string repairerName;
+            float repairerYards = 0.f;
+            float discount = 1.f;
+            float nearestYards = -1.f;
+            int32 damagedBefore = -1;
+            int32 repaired = -1;
+            int32 leftDamaged = -1;
+            int32 pointsRestored = -1;
+            int64 moneyBefore = -1;
+            int64 moneyAfter = -1;
+            int64 quoted = -1;  // -1 when no DBC row priced it
+            bool haveItem = false;
+            uint32 itemGuid = 0;
+            uint32 itemEntry = 0;
+            std::string itemName;
+            uint32 itemDurabilityBefore = 0;
+            uint32 itemDurabilityMax = 0;
+        } ev;
+
+        switch (request.verb)
+        {
+            case RepairVerb::All:  ev.verb = "all";  break;
+            case RepairVerb::One:  ev.verb = "item"; break;
+            case RepairVerb::None: ev.verb = "";     break;
+        }
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            int64 const spent = (ev.moneyBefore >= 0 && ev.moneyAfter >= 0 &&
+                                 ev.moneyBefore >= ev.moneyAfter)
+                                    ? ev.moneyBefore - ev.moneyAfter
+                                    : -1;
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"retry\":" << J(*reason ? TownRetryWord(RepairRefusalRetry(reason)) : "")
+              << ",\"verb\":" << J(ev.verb)
+              << ",\"character\":" << J(who->GetName());
+            if (ev.haveItem)
+                o << ",\"item\":{\"guid\":" << ev.itemGuid
+                  << ",\"entry\":" << ev.itemEntry
+                  << ",\"name\":" << J(ev.itemName)
+                  << ",\"durability\":" << ev.itemDurabilityBefore
+                  << ",\"max_durability\":" << ev.itemDurabilityMax << "}";
+            else
+                o << ",\"item\":null";
+            if (ev.haveRepairer)
+                o << ",\"repairer\":{\"entry\":" << ev.repairerEntry
+                  << ",\"name\":" << J(ev.repairerName)
+                  << ",\"yards\":" << ev.repairerYards
+                  << ",\"discount\":" << ev.discount << "}";
+            else
+                o << ",\"repairer\":null";
+            if (ev.nearestYards >= 0.f)
+                o << ",\"nearest_repairer_yards\":" << ev.nearestYards;
+            o << ",\"damaged_before\":" << ev.damagedBefore
+              << ",\"repaired\":" << ev.repaired
+              << ",\"left_damaged\":" << ev.leftDamaged
+              << ",\"points_restored\":" << ev.pointsRestored
+              << ",\"money_before\":" << ev.moneyBefore
+              << ",\"money_after\":" << ev.moneyAfter
+              << ",\"spent\":" << spent
+              << ",\"quoted\":" << ev.quoted
+              << ",\"quote_matches_spend\":"
+              << ((ev.quoted >= 0 && spent >= 0 && ev.quoted == spent) ? "true" : "false")
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        // The refusal literals go straight into the UPDATE, so none may carry
+        // a quote character - the same rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (request.verb == RepairVerb::None)
+        {
+            // The parser's exact words are pinned in tests/test_repair.cpp and
+            // go into the JSON. `detail` has to outlive this call, so the
+            // column gets the literal the table keys on.
+            describe("refused", request.error.c_str());
+            return "malformed repair request";
+        }
+
+        ev.moneyBefore = who->GetMoney();
+        ev.moneyAfter = ev.moneyBefore;
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("character has no session");
+        if (!who->IsInWorld())
+            return refuse("character is not in the world");
+        if (!who->IsAlive())
+            return refuse("character is dead");
+        if (who->IsInFlight())
+            return refuse("character is in flight");
+
+        // COMBAT IS NOT REFUSED, unlike in DoBank. The bank frame does not
+        // open in combat for a player, so a bot that banked mid-fight would be
+        // doing something no player can. The repair window is the vendor
+        // window and it does not close, and neither HandleRepairItemOpcode nor
+        // GetNPCIfCanInteractWith asks. Refusing here would make the bot
+        // stricter than the player it is imitating, which is the same call
+        // DoSell already made about selling in combat.
+
+        // ---- who is in reach ------------------------------------------------
+        //
+        // A sweep wider than the interaction distance on purpose: the gate is
+        // the core's own GetNPCIfCanInteractWith and it decides who counts;
+        // the wider sweep exists only so a refusal can say how far the nearest
+        // repairer WAS. "repairer not in range" with "8.4 yards" beside it is
+        // an aim error the sender can correct, and without the number it is a
+        // mystery. It is also how the one refusal this town cannot avoid gets
+        // named: the repairers nearest the family's dungeon belong to the
+        // other faction, and GetNPCIfCanInteractWith turns those down for
+        // being unfriendly no matter how close the character stands.
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        RepairerNearbyCheck check{who, SWEEP_YARDS};
+        Acore::CreatureListSearcher<RepairerNearbyCheck> searcher(who, nearby, check);
+        Cell::VisitObjects(who, searcher, SWEEP_YARDS);
+
+        std::vector<RepairerCandidate> candidates;
+        std::vector<Creature*> reachable;
+        for (Creature* creature : nearby)
+        {
+            float const yards = who->GetDistance(creature);
+            if (ev.nearestYards < 0.f || yards < ev.nearestYards)
+                ev.nearestYards = yards;
+
+            // THE GATE. The same call HandleRepairItemOpcode makes with the
+            // same flag, so a creature this accepts is one the handler will.
+            if (!who->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_REPAIR))
+                continue;
+
+            RepairerCandidate candidate;
+            candidate.distance = yards;
+            candidate.discount = who->GetReputationPriceDiscount(creature);
+            candidates.push_back(candidate);
+            reachable.push_back(creature);
+        }
+
+        if (reachable.empty())
+            return refuse("repairer not in range");
+
+        int const choice = ChooseRepairer(candidates);
+        Creature* repairer = reachable[static_cast<size_t>(choice)];
+        ev.haveRepairer = true;
+        ev.repairerEntry = repairer->GetEntry();
+        ev.repairerName = repairer->GetName();
+        ev.repairerYards = candidates[static_cast<size_t>(choice)].distance;
+        ev.discount = candidates[static_cast<size_t>(choice)].discount;
+
+        // ---- what is damaged, before ----------------------------------------
+        ObjectGuid namedItem = ObjectGuid::Empty;
+        std::vector<DurabilityReading> before;
+
+        if (request.verb == RepairVerb::One)
+        {
+            Item* item = FindCarriedItem(who, true, request.itemGuid);
+            if (!item)
+                return refuse("item not carried");
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!proto)
+                return refuse("item has no template");
+
+            uint32 const maximum = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
+            uint32 const current = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
+            ev.haveItem = true;
+            ev.itemGuid = item->GetGUID().GetCounter();
+            ev.itemEntry = item->GetEntry();
+            ev.itemName = proto->Name1;
+            ev.itemDurabilityBefore = current;
+            ev.itemDurabilityMax = maximum;
+
+            if (!maximum)
+                return refuse("item cannot be damaged");
+            if (current >= maximum)
+                return refuse("item is not damaged");
+
+            namedItem = item->GetGUID();
+            bool priceable = false;
+            uint32 const quote = RepairQuote(item, ev.discount, priceable);
+            if (priceable)
+                ev.quoted = int64(quote);
+
+            DurabilityReading reading;
+            reading.guid = ev.itemGuid;
+            reading.entry = ev.itemEntry;
+            reading.name = ev.itemName;
+            reading.current = current;
+            reading.maximum = maximum;
+            before.push_back(reading);
+        }
+        else
+        {
+            before = ReadCarriedDurability(who);
+            uint32 quote = 0;
+            bool allPriceable = true;
+            for (DurabilityReading const& reading : before)
+            {
+                if (reading.current >= reading.maximum)
+                    continue;
+                Item* item = FindCarriedItem(who, true, reading.guid);
+                bool priceable = false;
+                quote += RepairQuote(item, ev.discount, priceable);
+                if (!priceable)
+                    allPriceable = false;
+            }
+            if (allPriceable)
+                ev.quoted = int64(quote);
+        }
+
+        ev.damagedBefore = 0;
+        for (DurabilityReading const& reading : before)
+            if (reading.current < reading.maximum)
+                ++ev.damagedBefore;
+
+        if (ev.damagedBefore == 0)
+        {
+            // A repair that pays nothing and restores nothing is
+            // indistinguishable from a repairer that refused, so it is named
+            // here rather than reported as a success with a zero in it.
+            return refuse(request.verb == RepairVerb::One ? "item is not damaged"
+                                                          : "nothing is damaged");
+        }
+
+        // ---- drive the core's own handler ------------------------------------
+        //
+        // CMSG_REPAIR_ITEM is repairer guid, item guid, guild-bank byte, in
+        // that order (NPCHandler.cpp). An EMPTY item guid is the core's own
+        // "repair everything" and is what `all` sends; the byte is always 0.
+        // This handler takes a raw WorldPacket rather than a typed one, unlike
+        // the sell and bank handlers, so there is no Read() to call.
+        {
+            WorldPacket raw(CMSG_REPAIR_ITEM, 8 + 8 + 1);
+            raw << repairer->GetGUID();
+            raw << namedItem;
+            raw << uint8(0);
+            session->HandleRepairItemOpcode(raw);
+        }
+
+        // ---- believe nothing; read the durability back -----------------------
+        ev.moneyAfter = who->GetMoney();
+
+        ev.repaired = 0;
+        ev.leftDamaged = 0;
+        ev.pointsRestored = 0;
+        for (DurabilityReading const& was : before)
+        {
+            Item* item = FindCarriedItem(who, true, was.guid);
+            uint32 const now = item ? item->GetUInt32Value(ITEM_FIELD_DURABILITY) : was.current;
+            if (was.current >= was.maximum)
+                continue;
+            if (now > was.current)
+            {
+                ++ev.repaired;
+                ev.pointsRestored += int32(now - was.current);
+            }
+            if (now < was.maximum)
+                ++ev.leftDamaged;
+        }
+
+        if (ev.repaired == 0)
+        {
+            // Nothing moved. Every other wall this function knows about was
+            // tested before the call, so what is left is the purse (which the
+            // core refuses silently, by returning) or a wall this module has
+            // not heard of - a missing DurabilityCosts row, or the
+            // OnPlayerBeforeDurabilityRepair script hook.
+            if (ev.quoted >= 0 && ev.moneyBefore < ev.quoted)
+                return refuse("cannot afford the repair");
+            return refuse("the core repaired nothing");
+        }
+
+        if (ev.moneyAfter >= ev.moneyBefore)
+        {
+            // Durability came back and no money left. The core's own floor
+            // makes every priced repair cost at least one copper, so this is
+            // half the evidence being wrong, and it is reported as that rather
+            // than as a repair.
+            describe("error", "durability was restored but nothing was paid");
+            return "durability was restored but nothing was paid";
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' repaired {} item(s) for {} copper at {} ({}), {} still damaged",
+                 who->GetName(), ev.repaired, ev.moneyBefore - ev.moneyAfter, ev.repairerName,
+                 ev.repairerEntry, ev.leftDamaged);
+
+        describe("repaired", ev.leftDamaged > 0 ? "some items were left damaged" : "");
+        status = "delivered";
+        return "";
+    }
+
+    // ----------------------------------------------------------------- buy --
+    //
+    // Restock from a vendor: food, drink, and whatever else the next run needs.
+    //
+    // WHY THIS EXISTS. Measured across the whole family: four of the five
+    // carry NO food and NO drink at all, and the fifth carries one bowl of
+    // soup. The healer and the mage - the two whose mana is what makes a
+    // dungeon finishable - carry nothing to drink. Out of combat a level 26
+    // character regenerates mana slowly enough that a party with no water
+    // spends most of a dungeon sitting down. Nothing in this module could buy
+    // anything; kind='sell' takes money in and kind='bank' moves things
+    // sideways, and neither has ever put an item into a bag from outside.
+    //
+    // THE CORE'S OWN PURCHASE. WorldSession::HandleBuyItemOpcode
+    // (ItemHandler.cpp) decrements the vendor slot - the client numbers from 1
+    // and the handler expects that - and calls
+    // Player::BuyItemFromVendorSlot (Player.cpp), which is where all of it
+    // happens: the interaction gate, the class and faction gates, the vendor
+    // condition list, the slot-matches-item check, the limited-stock check,
+    // the reputation discount, the money, the storage, and the vendor's stock
+    // counter. Reimplementing any of that would be a second, worse copy.
+    //
+    // AND WHY THE VENDOR LIST IS OPENED FIRST. BuyItemFromVendorSlot reads
+    // `GetSession()->GetCurrentVendor()` and, when it is non-zero, looks the
+    // stock up by THAT entry instead of by the creature in front of the
+    // character. Only SendListInventory sets it, and that is what
+    // HandleListInventoryOpcode calls. So this executor sends
+    // CMSG_LIST_INVENTORY first, exactly as a client does when the vendor
+    // window opens: not for the packet, which nobody will read, but because
+    // without it a stale current-vendor left behind by some other system would
+    // silently price this purchase against a different shop's list.
+    //
+    // WHY THE READ-BACK IS THE ONLY EVIDENCE. HandleBuyItemOpcode returns
+    // void, and the bool underneath it is not a success flag: on a completed
+    // purchase BuyItemFromVendorSlot returns `crItem->maxcount != 0`, so
+    // buying something a vendor has an unlimited supply of - which is every
+    // food and drink in this town - returns FALSE from a purchase that worked
+    // perfectly. Every refusal inside it is a SendBuyError or SendEquipError
+    // to a session a bot does not have. So the proof is two readings taken on
+    // both sides: how many of the entry the character carries, and the purse.
+    //
+    // ONE REFUSAL THE CORE DOES NOT MAKE, made here anyway: `max:<copper>`.
+    // The core buys at whatever the vendor charges, and a sale can be undone
+    // because the item sits in a buyback slot for a while. A PURCHASE CANNOT.
+    // The gold is gone, and a count with one extra zero on it is exactly the
+    // kind of mistake a bot cannot notice. `max` is the sender saying what it
+    // expected to pay, checked before the packet rather than discovered after.
+    //
+    // Column re-use, no new columns:
+    //   target_name  the BUYER, already standing at the vendor
+    //   command      `entry:<item_template.entry> [count:<n>] [max:<copper>]`
+    //   target_arg   unused
+    //   detail       short refusal literal, or empty on success
+    //   result       JSON, described on the migration
+
+    static char const* DoBuy(Player* buyer, std::string const& command, char const*& status,
+                             std::string& out)
+    {
+        using OverseerDecisions::BuyRefusalRetry;
+        using OverseerDecisions::BuyRequest;
+        using OverseerDecisions::BuyVendorCandidate;
+        using OverseerDecisions::ChooseBuyVendor;
+        using OverseerDecisions::ParseBuyRequest;
+        using OverseerDecisions::TownRetryWord;
+
+        BuyRequest const request = ParseBuyRequest(command);
+
+        struct Evidence
+        {
+            uint32 entry = 0;
+            std::string itemName;
+            uint32 purchases = 0;
+            int32 itemsWanted = -1;  // purchases * ItemTemplate::BuyCount
+            int32 carriedBefore = -1;
+            int32 carriedAfter = -1;
+            int64 price = -1;
+            int64 cap = -1;  // -1 when the row set none
+            int64 moneyBefore = -1;
+            int64 moneyAfter = -1;
+            bool haveVendor = false;
+            uint32 vendorEntry = 0;
+            std::string vendorName;
+            float vendorYards = 0.f;
+            float discount = 1.f;
+            int32 vendorSlot = -1;
+            int32 stockLeft = -1;  // -1 for an unlimited vendor
+            float nearestYards = -1.f;
+            bool haveInventoryResult = false;
+            InventoryResult inventoryResult = EQUIP_ERR_OK;
+        } ev;
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            int64 const spent = (ev.moneyBefore >= 0 && ev.moneyAfter >= 0 &&
+                                 ev.moneyBefore >= ev.moneyAfter)
+                                    ? ev.moneyBefore - ev.moneyAfter
+                                    : -1;
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"retry\":" << J(*reason ? TownRetryWord(BuyRefusalRetry(reason)) : "")
+              << ",\"buyer\":" << J(buyer->GetName())
+              << ",\"item\":{\"entry\":" << ev.entry
+              << ",\"name\":" << J(ev.itemName)
+              << ",\"purchases\":" << ev.purchases
+              << ",\"items_wanted\":" << ev.itemsWanted << "}"
+              << ",\"carried_before\":" << ev.carriedBefore
+              << ",\"carried_after\":" << ev.carriedAfter
+              << ",\"price\":" << ev.price
+              << ",\"cap\":" << ev.cap
+              << ",\"money_before\":" << ev.moneyBefore
+              << ",\"money_after\":" << ev.moneyAfter
+              << ",\"spent\":" << spent
+              << ",\"price_matches_spend\":"
+              << ((ev.price >= 0 && spent >= 0 && ev.price == spent) ? "true" : "false");
+            if (ev.haveVendor)
+                o << ",\"vendor\":{\"entry\":" << ev.vendorEntry
+                  << ",\"name\":" << J(ev.vendorName)
+                  << ",\"yards\":" << ev.vendorYards
+                  << ",\"discount\":" << ev.discount
+                  << ",\"slot\":" << ev.vendorSlot
+                  << ",\"stock_left\":" << ev.stockLeft << "}";
+            else
+                o << ",\"vendor\":null";
+            if (ev.nearestYards >= 0.f)
+                o << ",\"nearest_vendor_yards\":" << ev.nearestYards;
+            if (ev.haveInventoryResult)
+                o << ",\"inventory_result\":" << int32(ev.inventoryResult)
+                  << ",\"inventory_result_name\":" << J(InventoryResultName(ev.inventoryResult));
+            o << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (!request.valid)
+        {
+            describe("refused", request.error.c_str());
+            return "malformed buy request";
+        }
+
+        ev.entry = request.entry;
+        ev.purchases = request.count;
+        if (request.capped)
+            ev.cap = int64(request.maxCopper);
+        ev.moneyBefore = buyer->GetMoney();
+        ev.moneyAfter = ev.moneyBefore;
+
+        WorldSession* session = buyer->GetSession();
+        if (!session)
+            return refuse("buyer has no session");
+        if (!buyer->IsInWorld())
+            return refuse("buyer is not in the world");
+        // BuyItemFromVendorSlot's own IsAlive test, and HandleListInventory's,
+        // named here so a dead buyer is not reported as a missing vendor.
+        if (!buyer->IsAlive())
+            return refuse("buyer is dead");
+        if (buyer->IsInFlight())
+            return refuse("buyer is in flight");
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(request.entry);
+        if (!proto)
+            return refuse("no such item");
+        ev.itemName = proto->Name1;
+
+        // The core's own class gate: an item bound on pickup that this class
+        // cannot use is refused outright, because buying it would spend gold on
+        // something that can then never be sold, given away or traded.
+        if (!(proto->AllowableClass & buyer->getClassMask()) && proto->Bonding == BIND_WHEN_PICKED_UP)
+            return refuse("item is not for this class");
+        if ((proto->HasFlag2(ITEM_FLAG2_FACTION_HORDE) && buyer->GetTeamId(true) == TeamId::TEAM_ALLIANCE) ||
+            (proto->HasFlag2(ITEM_FLAG2_FACTION_ALLIANCE) && buyer->GetTeamId(true) == TeamId::TEAM_HORDE))
+            return refuse("item is for the other faction");
+
+        // THE COUNT IS A BYTE BY THE TIME THE CORE SEES IT. The packet field is
+        // four bytes but HandleBuyItemOpcode passes it into
+        // BuyItemFromVendorSlot's `uint8 count`, so 256 arrives as 0, is
+        // rewritten to 1 by that function's own cheat guard, and the row would
+        // report a purchase of 256 that bought one. Refused rather than
+        // truncated.
+        if (request.count > 255)
+            return refuse("count exceeds what the packet carries");
+        if (proto->BuyPrice > 0 && request.count > MAX_MONEY_AMOUNT / uint32(proto->BuyPrice))
+            return refuse("count would overflow the purse");
+
+        // The core stores `ItemTemplate::BuyCount * count`, so that is what the
+        // read-back expects. Not defended against a BuyCount of 0: the core would
+        // then store nothing, and a read-back expecting 1 would report a purchase
+        // that never happened as a mismatch instead of as the refusal it is.
+        ev.itemsWanted = int32(uint32(proto->BuyCount) * request.count);
+
+        // ---- who is in reach -------------------------------------------------
+        //
+        // The same sweep and the same gate the sale uses, so a vendor this
+        // accepts is one BuyItemFromVendorSlot will accept.
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        VendorNearbyCheck check{buyer, SWEEP_YARDS};
+        Acore::CreatureListSearcher<VendorNearbyCheck> searcher(buyer, nearby, check);
+        Cell::VisitObjects(buyer, searcher, SWEEP_YARDS);
+
+        std::vector<BuyVendorCandidate> candidates;
+        std::vector<Creature*> reachable;
+        std::vector<int32> slots;
+        std::vector<VendorItem const*> lines;
+        for (Creature* creature : nearby)
+        {
+            float const yards = buyer->GetDistance(creature);
+            if (ev.nearestYards < 0.f || yards < ev.nearestYards)
+                ev.nearestYards = yards;
+
+            if (!buyer->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_VENDOR))
+                continue;
+
+            // WHICH SLOT THE ITEM SITS IN, which is what the packet carries.
+            // BuyItemFromVendorSlot refuses a slot whose item is not the one
+            // asked for, so the index has to be found rather than guessed.
+            int32 slot = -1;
+            VendorItem const* line = nullptr;
+            if (VendorItemData const* items = creature->GetVendorItems())
+            {
+                uint32 const lineCount = items->GetItemCount();
+                for (uint32 i = 0; i < lineCount; ++i)
+                {
+                    VendorItem const* candidateLine = items->GetItem(i);
+                    if (candidateLine && candidateLine->item == request.entry)
+                    {
+                        slot = int32(i);
+                        line = candidateLine;
+                        break;
+                    }
+                }
+            }
+
+            BuyVendorCandidate candidate;
+            candidate.distance = yards;
+            candidate.discount = buyer->GetReputationPriceDiscount(creature);
+            candidate.stocksItem = line != nullptr;
+            candidate.inStock =
+                line && (line->maxcount == 0 ||
+                         creature->GetVendorItemCurrentCount(line) >= uint32(ev.itemsWanted));
+            candidates.push_back(candidate);
+            reachable.push_back(creature);
+            slots.push_back(slot);
+            lines.push_back(line);
+        }
+
+        if (reachable.empty())
+            return refuse("vendor not in range");
+
+        size_t const choice = static_cast<size_t>(ChooseBuyVendor(candidates));
+        Creature* vendor = reachable[choice];
+        VendorItem const* line = lines[choice];
+        ev.haveVendor = true;
+        ev.vendorEntry = vendor->GetEntry();
+        ev.vendorName = vendor->GetName();
+        ev.vendorYards = candidates[choice].distance;
+        ev.discount = candidates[choice].discount;
+        ev.vendorSlot = slots[choice];
+        if (line && line->maxcount != 0)
+            ev.stockLeft = int32(vendor->GetVendorItemCurrentCount(line));
+
+        if (!line)
+            return refuse("vendor does not stock the item");
+        if (!candidates[choice].inStock)
+            return refuse("vendor is out of stock");
+        if (line->ExtendedCost && !line->IsGoldRequired(proto))
+            return refuse("item is not bought with gold");
+
+        // The core's own price, computed the same way and in the same order:
+        // the whole stack first, then floor() of the reputation discount.
+        uint32 price = 0;
+        if (line->IsGoldRequired(proto) && proto->BuyPrice > 0)
+            price = uint32(std::floor(uint32(proto->BuyPrice) * request.count * ev.discount));
+        ev.price = int64(price);
+
+        if (request.capped && price > request.maxCopper)
+            return refuse("price exceeds the cap the row set");
+        if (!buyer->HasEnoughMoney(price))
+            return refuse("cannot afford the purchase");
+
+        // Where it will go, asked with the same call and the same count the
+        // core will use, so this answer and the core's are the same answer.
+        {
+            ItemPosCountVec dest;
+            InventoryResult const msg = buyer->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
+                                                              request.entry, uint32(ev.itemsWanted));
+            ev.haveInventoryResult = true;
+            ev.inventoryResult = msg;
+            if (msg != EQUIP_ERR_OK)
+                return refuse("bags cannot take the item");
+        }
+
+        ev.carriedBefore = int32(buyer->GetItemCount(request.entry, false));
+
+        // ---- open the vendor list, the way the client does --------------------
+        {
+            WorldPacket raw(CMSG_LIST_INVENTORY, 8);
+            raw << vendor->GetGUID();
+            WorldPackets::Item::ListInventory listing(std::move(raw));
+            listing.Read();
+            session->HandleListInventoryOpcode(listing);
+        }
+
+        // ---- drive the core's own purchase ------------------------------------
+        //
+        // Vendor guid, item entry, slot, count, and a byte the handler never
+        // reads (ItemPackets.cpp). THE SLOT IS SENT PLUS ONE: the client
+        // numbers vendor slots from 1 and HandleBuyItemOpcode decrements before
+        // it does anything, treating a 0 as a cheat and returning.
+        {
+            WorldPacket raw(CMSG_BUY_ITEM, 8 + 4 + 4 + 4 + 1);
+            raw << vendor->GetGUID();
+            raw << uint32(request.entry);
+            raw << uint32(uint32(ev.vendorSlot) + 1);
+            raw << uint32(request.count);
+            raw << uint8(0);
+            WorldPackets::Item::BuyItem packet(std::move(raw));
+            packet.Read();
+            session->HandleBuyItemOpcode(packet);
+        }
+
+        // ---- believe nothing; read the bags and the purse back ----------------
+        ev.moneyAfter = buyer->GetMoney();
+        ev.carriedAfter = int32(buyer->GetItemCount(request.entry, false));
+        if (line->maxcount != 0)
+            ev.stockLeft = int32(vendor->GetVendorItemCurrentCount(line));
+
+        if (ev.carriedAfter == ev.carriedBefore && ev.moneyAfter == ev.moneyBefore)
+        {
+            describe("refused", "the core refused the purchase");
+            return "the core refused the purchase";
+        }
+        if (ev.carriedAfter != ev.carriedBefore + ev.itemsWanted)
+        {
+            // Something arrived but not what was asked for. Reported as such
+            // and NOT as a purchase, because a row that says twenty when five
+            // came is the wrong number in a ledger somebody will balance.
+            describe("refused", "the purchase did not read back as requested");
+            return "the purchase did not read back as requested";
+        }
+        if (ev.moneyAfter != ev.moneyBefore - int64(price))
+        {
+            describe("error", "the item arrived but the price paid does not match");
+            return "the item arrived but the price paid does not match";
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' bought {} x {} (entry {}) from {} ({}) for {} copper",
+                 buyer->GetName(), ev.itemsWanted, ev.itemName, request.entry, ev.vendorName,
+                 ev.vendorEntry, price);
+
+        describe("bought", "");
+        status = "delivered";
+        return "";
+    }
+
 
     // --------------------------------------------------------------- share --
     //
