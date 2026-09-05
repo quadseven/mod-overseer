@@ -717,6 +717,54 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                 : DungeonClearStallAction::Extract;
 }
 
+bool DungeonRunEnteredTheInstance(std::string const& outcome)
+{
+    // THE CLOSED PAIR, NAMED RATHER THAN DERIVED. These are the only two
+    // outcomes this module writes at a point in the state machine that comes
+    // before anybody has crossed the door: the instance would not reset, and
+    // the party would not assemble. Everything else it writes - 'left',
+    // 'stalled', 'wipe', 'emptied' - is written about a party that was on the
+    // instance map, and so is an empty outcome, which is what the
+    // cold-heartbeat close leaves behind on a row that only exists because
+    // somebody was seen in there.
+    return outcome != "reset_failed" && outcome != "staging_failed";
+}
+
+unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst)
+{
+    unsigned failures = 0;
+    for (std::string const& outcome : outcomesNewestFirst)
+    {
+        if (DungeonRunEnteredTheInstance(outcome))
+            break;
+        ++failures;
+    }
+    return failures;
+}
+
+DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
+                                                uint32_t attemptedRunNumber,
+                                                uint32_t runsWanted,
+                                                bool capKnown)
+{
+    DungeonCampaignProgress progress;
+    progress.counted = DungeonRunEnteredTheInstance(outcome);
+
+    // THE SLOT IS ONLY FILLED BY AN ATTEMPT THAT ENTERED. `attemptedRunNumber`
+    // is which slot was being aimed at, not which slot is now full, and those
+    // are the same number only when the attempt got inside. Guarded against 0
+    // because an adopted run that was never stamped can reach here with no
+    // number of its own, and an unsigned 0 - 1 is the whole campaign.
+    if (progress.counted)
+        progress.runsDone = attemptedRunNumber;
+    else
+        progress.runsDone = attemptedRunNumber ? attemptedRunNumber - 1 : 0;
+
+    progress.campaignOver = capKnown && progress.runsDone >= runsWanted;
+    progress.nextRunNumber = progress.campaignOver ? 0 : progress.runsDone + 1;
+    return progress;
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
                              bool measurable, time_t now,
                              RatchetLimits const& limits)

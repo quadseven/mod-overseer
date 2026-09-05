@@ -4523,12 +4523,31 @@ private:
             // Carrying the predicate into the write makes the close atomic with
             // the decision to close. A run refreshed in that window simply is
             // not matched, and the next pass will judge it fresh.
-            CharacterDatabase.Execute(
-                "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
-                "ended_reason = 'heartbeat cold - nobody from the roster seen on the map' "
-                "WHERE id = {} AND state = 'active' "
-                "AND last_progress_at < NOW() - INTERVAL {} SECOND",
-                runId, RUN_COLD_SECONDS);
+            //
+            // AND IT WRITES AN OUTCOME NOW (#225). This was the last writer of
+            // `state = 'ended'` that left the outcome column at its empty
+            // default, so a table an operator reads for "how did each run end"
+            // had a class of row that answered nothing. 'emptied' is the word
+            // the vocabulary already has for it: the map holds nobody, the
+            // coordinator did not walk them out, and no wipe was proved. The
+            // reason column keeps saying which flavour of emptied it was.
+            if (RunAccountingPresent())
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
+                    "outcome = 'emptied', "
+                    "ended_reason = 'heartbeat cold - nobody from the roster seen on the "
+                    "map' "
+                    "WHERE id = {} AND state = 'active' "
+                    "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+                    runId, RUN_COLD_SECONDS);
+            else
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
+                    "ended_reason = 'heartbeat cold - nobody from the roster seen on the "
+                    "map' "
+                    "WHERE id = {} AND state = 'active' "
+                    "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+                    runId, RUN_COLD_SECONDS);
 
             LOG_INFO("module.overseer",
                      "overseer: closed dungeon run {} on map {} - its heartbeat had been "
@@ -4647,10 +4666,20 @@ private:
         return cap;
     }
 
-    // One more run has ended, whatever it was. Incremented rather than written
-    // to a computed value so that a person editing the column between two runs
-    // (raising the cap mid-campaign, or resetting the count to start again)
-    // cannot be silently overwritten by this module's idea of the number.
+    // One more run has HAPPENED. Incremented rather than written to a computed
+    // value so that a person editing the column between two runs (raising the
+    // cap mid-campaign, or resetting the count to start again) cannot be
+    // silently overwritten by this module's idea of the number.
+    //
+    // "WHATEVER IT WAS" IS WHAT THIS USED TO SAY, AND IT WAS THE DEFECT (#225).
+    // Every caller reached here unconditionally, so a reset that would not take
+    // and a barrier that never opened each filled a slot in a campaign of a
+    // hundred without anybody ever standing on the instance map. Measured
+    // 2026-09-05: two rows in overseer_dungeon_run, dungeon_runs_done reading
+    // three, and a campaign that would have finished in nineteen hours having
+    // cleared nothing. The callers now ask
+    // OverseerDecisions::DungeonRunEnteredTheInstance first, and that predicate
+    // carries the argument for where the bar is.
     void CountRunDone(std::string const& leaderName)
     {
         if (!CampaignColumnsPresent())
@@ -4690,9 +4719,22 @@ private:
         return result ? result->Fetch()[0].Get<uint32>() : 0;
     }
 
-    // How many of this campaign's most recent runs failed at the reset, counting
-    // back from the newest and stopping at the first that did not.
-    static uint32 TrailingResetFailures(uint32 campaignId)
+    // How many of this campaign's most recent runs never got inside at all,
+    // counting back from the newest and stopping at the first that did.
+    //
+    // IT USED TO ASK ONLY ABOUT 'reset_failed', AND WIDENING IT IS NOT OPTIONAL
+    // (#225). A staging failure had a bound of its own for as long as it
+    // consumed a campaign slot, and FailStaging's own comment leaned on exactly
+    // that: "Each closed run counts against the campaign's own cap, so a staging
+    // that fails for a reason that keeps being true cannot run forever." Taking
+    // the slot away takes that bound with it, so this stop has to cover both
+    // ways of failing before entry or the count is fixed at the price of a loop
+    // with nothing at the end of it. Twelve minutes an attempt, forever.
+    //
+    // The rows come back newest first and the counting itself is
+    // OverseerDecisions::DungeonRunTrailingFailures, which is where the
+    // vocabulary lives and where it is tested.
+    static uint32 TrailingUnenteredRuns(uint32 campaignId)
     {
         if (!campaignId)
             return 0;
@@ -4704,14 +4746,46 @@ private:
         if (!result)
             return 0;
 
-        uint32 failures = 0;
+        std::vector<std::string> outcomes;
         do
         {
-            if (result->Fetch()[0].Get<std::string>() != "reset_failed")
-                break;
-            ++failures;
+            outcomes.push_back(result->Fetch()[0].Get<std::string>());
         } while (result->NextRow());
-        return failures;
+        return OverseerDecisions::DungeonRunTrailingFailures(outcomes);
+    }
+
+    // IS THE NEWEST ATTEMPT ON THIS MAP ONE THAT NEVER GOT INSIDE? Asked only
+    // when the roster counter reads zero, and asked because that counter can no
+    // longer tell two different situations apart (#225).
+    //
+    // `dungeon_runs_done == 0` is the operator's gesture for "start a new
+    // campaign", and while pre-entry failures still incremented the counter it
+    // was also a reliable sign that no attempt had been made yet. It is not any
+    // more: a campaign whose first four attempts all died at the barrier still
+    // reads zero. Allocating a fresh campaign id on each of those would give
+    // every failure a campaign of its own, and TrailingUnenteredRuns would then
+    // never see two rows together and never stop anything.
+    //
+    // So the rows are asked instead. If the last thing that happened on this
+    // map was an attempt that never reached it, this campaign is still trying to
+    // start and the next attempt belongs to it. If the last thing that happened
+    // was a real run, the zero is the operator's gesture and a new campaign is
+    // allocated. A row with campaign_id 0 is not a campaign to rejoin, so it
+    // answers 0 and a new one is allocated as before.
+    static uint32 UnstartedCampaignOnMap(std::string const& leaderName, uint32 mapId)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT campaign_id, outcome FROM overseer_dungeon_run "
+            "WHERE leader_name = '{}' AND map_id = {} "
+            "ORDER BY id DESC LIMIT 1", Esc(leaderName), mapId);
+        if (!result)
+            return 0;
+
+        uint32 const campaignId = result->Fetch()[0].Get<uint32>();
+        std::string const outcome = result->Fetch()[1].Get<std::string>();
+        if (OverseerDecisions::DungeonRunEnteredTheInstance(outcome))
+            return 0;
+        return campaignId;
     }
 
     // Put a run row into the campaign it belongs to. `AND campaign_id = 0` is
@@ -4778,21 +4852,32 @@ private:
                 Esc(reason), runId);
     }
 
-    // A RUN THAT NEVER GOT INSIDE STILL HAPPENED. The arming drive is the only
+    // A RUN THAT NEVER GOT INSIDE IS STILL AN ATTEMPT, AND AN ATTEMPT NOBODY
+    // WROTE DOWN IS AN ATTEMPT NOBODY CAN SEE. The arming drive is the only
     // thing that opens a run row, and it opens one when it sees a character on
-    // the instance map - so a reset that will not take produces no row at all,
-    // and the campaign would show a gap where its failures were. #144 asks for
-    // the opposite: a failed reset "counts as a failed run". So this inserts the
-    // row itself, born ended.
+    // the instance map - so an attempt that never reaches the map produces no
+    // row at all, and the table shows a gap where its failures were. So this
+    // inserts the row itself, born ended.
+    //
+    // IT TAKES THE OUTCOME AS AN ARGUMENT NOW (#225). It was written for #144's
+    // reset failure and hard-coded 'reset_failed', and the other way an attempt
+    // can die before entry - a barrier that never opens - was routed through
+    // CloseRun instead, which is a no-op when there is no row to close. Measured
+    // 2026-09-05: every staging failure of the day is absent from the table, and
+    // the log line saying so reads "dungeon run 0 ended 'staging_failed'",
+    // where the 0 is the row that was never written. One insert, both
+    // pre-entry failures, and nothing that ends a run may leave the table
+    // silent.
     //
     // THAT CANNOT COLLIDE WITH THE ONE-ACTIVE-RUN-PER-MAP UNIQUE KEY, and the
     // reason is the generated column that key is built on: `active_map` holds
     // the map id only while the run is active and NULL once it has ended, and
     // NULLs do not collide. A row inserted already-ended is therefore invisible
     // to that key by construction.
-    void RecordResetFailedRun(std::string const& leaderName, uint32 mapId,
-                              uint32 campaignId, uint32 runNumber,
-                              std::string const& reason, std::string const& members)
+    void RecordUnenteredRun(std::string const& leaderName, uint32 mapId,
+                            uint32 campaignId, uint32 runNumber,
+                            char const* outcome, std::string const& reason,
+                            std::string const& members)
     {
         if (!RunAccountingPresent())
             return;
@@ -4800,8 +4885,9 @@ private:
             "INSERT INTO overseer_dungeon_run "
             "(leader_name, map_id, state, ended_at, ended_reason, campaign_id, "
             " run_number, outcome, members) "
-            "VALUES ('{}', {}, 'ended', NOW(), '{}', {}, {}, 'reset_failed', '{}')",
-            Esc(leaderName), mapId, Esc(reason), campaignId, runNumber, Esc(members));
+            "VALUES ('{}', {}, 'ended', NOW(), '{}', {}, {}, '{}', '{}')",
+            Esc(leaderName), mapId, Esc(reason), campaignId, runNumber, outcome,
+            Esc(members));
     }
 
     // WAS THAT A WIPE, ASKED OF THE DEATH RECORD RATHER THAN OF A GUESS.
@@ -13167,7 +13253,7 @@ private:
         return joined;
     }
 
-    // A RUN THAT NEVER STARTED IS STILL A RUN THAT HAPPENED (#144). Called only
+    // A RUN THAT NEVER STARTED IS STILL AN ATTEMPT (#144, #225). Called only
     // from RESETTING, on either of its two ways of giving up - preconditions
     // that never came true, or the core refusing DUNGEON_RESET_ATTEMPTS times.
     //
@@ -13176,6 +13262,16 @@ private:
     // drive like any other run. That is what makes the three-consecutive-
     // failures stop reachable at all: the failure is written down first and read
     // back as a row, not carried in a counter this process could lose.
+    //
+    // WHAT CHANGED IN #225: IT NO LONGER SPENDS A CAMPAIGN SLOT. #144 asked for
+    // a failed reset to "count as a failed run" and this counted it twice over -
+    // once as a row, once against dungeon_runs_done - and the second one is the
+    // one that hurts, because a campaign of 100 is 100 DUNGEONS to the person
+    // who asked for it and not 100 attempts at getting into one. The row and the
+    // consecutive-failure stop are what make a failed reset count; the slot
+    // stays open for the run that will eventually fill it. The next poll
+    // recomputes the same run number off the same unchanged counter, so the
+    // attempt is retried against the slot it failed at.
     void FailRunAtReset(DungeonRunCoordinatorState& coord,
                         std::string const& leaderName,
                         std::vector<std::string> const& members,
@@ -13183,15 +13279,15 @@ private:
                         std::string const& reason)
     {
         LOG_ERROR("module.overseer",
-                  "overseer: dungeon run {} of campaign {} could not start - {}. It counts "
-                  "as a failed run: the instance still holds whatever was already dead in "
-                  "it, so walking back in would be the empty dungeon this whole loop "
-                  "exists to stop happening",
-                  coord.runNumber, coord.campaignId, reason);
+                  "overseer: dungeon run {} of campaign {} could not start - {}. It is "
+                  "written down as a failed attempt but it does not spend run {} of the "
+                  "campaign, because nobody reached the instance: the instance still holds "
+                  "whatever was already dead in it, so walking back in would be the empty "
+                  "dungeon this whole loop exists to stop happening",
+                  coord.runNumber, coord.campaignId, reason, coord.runNumber);
 
-        RecordResetFailedRun(leaderName, portal.insideMapId, coord.campaignId,
-                             coord.runNumber, reason, JoinNames(members));
-        CountRunDone(leaderName);
+        RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
+                           coord.runNumber, "reset_failed", reason, JoinNames(members));
         _travelAims.Release(leaderName);
         coord = DungeonRunCoordinatorState();
     }
@@ -13219,33 +13315,59 @@ private:
     // about an instance that will not clear, which this is not.
     //
     // AND A REPEAT TERMINATES RATHER THAN LOOPING, which is the question a
-    // close-and-go-again always has to answer. Each closed run counts against
-    // the campaign's own cap, so a staging that fails for a reason that keeps
-    // being true cannot run forever. In the measured case it terminates much
-    // sooner than that: the member who deadlocks the barrier by being inside
-    // the instance is also the member who blocks the RESET the next run opens
-    // with (DungeonResetBlockers refuses while anybody is standing in there),
-    // so the next run fails at its reset, and three of those stop the campaign
-    // outright with the ERROR that already exists for it.
+    // close-and-go-again always has to answer. This used to be answered by the
+    // campaign cap - each closed run counted against it, so a staging that
+    // failed for a reason that kept being true ran out of campaign - and #225
+    // takes that answer away, deliberately, because spending a dungeon's worth
+    // of campaign on twelve minutes of a barrier that never opened is the defect
+    // it exists to fix. What answers it now is TrailingUnenteredRuns, widened in
+    // the same change to count 'staging_failed' beside 'reset_failed': three
+    // attempts in a row that never got inside stop the campaign with the ERROR
+    // that already exists for it, whichever of the two ways they failed.
+    //
+    // WHY THAT IS A BETTER BOUND AND NOT JUST A DIFFERENT ONE. It stops after
+    // three attempts rather than after a hundred, it says what is wrong instead
+    // of reporting a finished campaign, and it survives a worldserver bounce,
+    // because it is read back off rows rather than carried in this process.
+    //
+    // AND IT WRITES ITS OWN ROW WHEN THERE IS NONE TO CLOSE. The run row is
+    // opened by the arming drive when it first sees somebody on the instance
+    // map, so a staging that never gets anybody there has no row, CloseRun is a
+    // no-op on 0, and the whole failure used to vanish. Measured 2026-09-05:
+    // "dungeon run 0 ended 'staging_failed'" in the log and nothing in the
+    // table. When the row DOES exist - a member who walked in early is #165's
+    // own measured deadlock - it is closed rather than duplicated, and the
+    // attempt still does not count: one stray character on the map is not the
+    // party having started a run.
     void FailStaging(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                     std::vector<std::string> const& members,
                      DungeonPortal const& portal, char const* phase,
                      std::string const& blockers, bool stillWanted)
     {
         std::string const minutes =
             std::to_string(DUNGEON_STAGING_BACKSTOP_SECONDS / 60);
+        std::string const reason = std::string(phase) + " held for more than " + minutes +
+                                   " minutes and never opened - " + blockers;
+        uint32 const runId =
+            coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+
         LOG_ERROR("module.overseer",
                   "overseer: dungeon run {} of campaign {} cannot be staged - {} has held "
-                  "for over {} minutes. Unsatisfied: {}. The run is CLOSED rather than "
+                  "for over {} minutes. Unsatisfied: {}. The attempt is CLOSED rather than "
                   "left 'active', because a closed run is recoverable - the next poll "
                   "opens a fresh one and resets the instance before it aims anybody - and "
                   "a run that sits 'active' forever holds the one-active-run-per-map key "
-                  "the next one needs",
-                  coord.runNumber, coord.campaignId, phase, minutes, blockers);
-        EndRunAndDecide(coord, leaderName, portal,
-                        coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
-                        "staging_failed",
-                        std::string(phase) + " held for more than " + minutes +
-                            " minutes and never opened - " + blockers,
+                  "the next one needs. It does not spend run {} of the campaign: nobody "
+                  "reached the instance",
+                  coord.runNumber, coord.campaignId, phase, minutes, blockers,
+                  coord.runNumber);
+
+        if (!runId)
+            RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
+                               coord.runNumber, "staging_failed", reason,
+                               JoinNames(members));
+
+        EndRunAndDecide(coord, leaderName, portal, runId, "staging_failed", reason,
                         stillWanted);
     }
 
@@ -13275,10 +13397,23 @@ private:
                          bool stillWanted)
     {
         CloseRun(runId, outcome, reason);
-        CountRunDone(leaderName);
+
+        // WHERE THE CAMPAIGN STANDS NOW, AND WHETHER THIS RUN MOVED IT (#225).
+        // The arithmetic is in the pure decisions because it is the part that
+        // was got wrong: `coord.runNumber` is the slot this attempt was AIMED
+        // at, not the slot it filled, and the two are the same number only when
+        // the party actually got onto the instance map. Reading them as the same
+        // number is what let a barrier that never opened both spend a run and,
+        // at the last slot, declare a campaign of a hundred finished on
+        // ninety-nine dungeons. See DungeonCampaignAfterRun, and its test.
+        OverseerDecisions::DungeonCampaignProgress const progress =
+            OverseerDecisions::DungeonCampaignAfterRun(outcome, coord.runNumber,
+                                                       coord.runsWanted, coord.capKnown);
+        if (progress.counted)
+            CountRunDone(leaderName);
         _travelAims.Release(leaderName);
 
-        uint32 const finished = coord.runNumber;
+        uint32 const finished = progress.runsDone;
         uint32 const wanted = coord.runsWanted;
         bool const known = coord.capKnown;
         uint32 const campaignId = coord.campaignId;
@@ -13317,7 +13452,12 @@ private:
             return;
         }
 
-        if (finished >= wanted)
+        // THE CAP IS TESTED AGAINST RUNS THAT HAPPENED, NOT AGAINST ATTEMPTS
+        // (#225). `progress.campaignOver` is `runsDone >= wanted` and runsDone
+        // only moves for a run that reached the instance, so the last slot can
+        // be attempted and missed as many times as the failure stop allows
+        // without the campaign reporting itself finished a dungeon short.
+        if (progress.campaignOver)
         {
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
@@ -13355,18 +13495,34 @@ private:
         coord.stageY = stageY;
         coord.stageZ = stageZ;
         coord.campaignId = campaignId;
-        coord.runNumber = finished + 1;
+        // THE NEXT SLOT, WHICH IS THE SAME SLOT AGAIN AFTER AN ATTEMPT THAT
+        // NEVER GOT INSIDE (#225). A run number is which of the wanted runs is
+        // being made, and an attempt that failed at the door did not make one -
+        // so the next attempt is aimed at the number the last one missed, and
+        // the rows of a campaign can carry the same run_number more than once
+        // with different outcomes. That is the honest reading: the failures are
+        // attempts at a slot, and exactly one row per slot ever counts.
+        coord.runNumber = progress.nextRunNumber;
         coord.runsWanted = wanted;
         coord.capKnown = known;
         coord.resetSince = std::time(nullptr);
 
-        LOG_INFO("module.overseer",
-                 "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
-                 "campaign {}, so the run goes again: RESET on map {} first, because the "
-                 "instance they just left still has its bosses dead in it and re-entering "
-                 "without a reset is a walk through an empty dungeon",
-                 runId, outcome, reason, finished, wanted, campaignId,
-                 portal.insideMapId);
+        if (progress.counted)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
+                     "campaign {}, so the run goes again: RESET on map {} first, because "
+                     "the instance they just left still has its bosses dead in it and "
+                     "re-entering without a reset is a walk through an empty dungeon",
+                     runId, outcome, reason, finished, wanted, campaignId,
+                     portal.insideMapId);
+        else
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon attempt ended '{}' - {}. Nobody reached the "
+                     "instance, so it is written down as a failed attempt and run {} of {} "
+                     "in campaign {} is still to be made: RESET on map {} first, and the "
+                     "campaign stops if {} attempts in a row fail this way",
+                     outcome, reason, coord.runNumber, wanted, campaignId,
+                     portal.insideMapId, DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES);
     }
 
     void DriveDungeonRun()
@@ -13549,6 +13705,30 @@ private:
                 if (!coord.runNumber)
                     coord.runNumber = adoptedCap.done + 1;
 
+                // AND THE CAMPAIGN IS RESOLVED THE SAME WAY THE NUMBER IS
+                // (#225). This used to stop at the read-back and leave an
+                // unstamped run at campaign 0 for good, on the reasoning that
+                // "putting a number on a run nobody drove would be a claim about
+                // a series that never happened". That reasoning stopped holding
+                // the moment this coordinator adopted the run: it IS driving it,
+                // its ending will move this campaign's counter, and a row that
+                // moves a campaign's count while claiming to belong to no
+                // campaign is the harder thing to explain. Measured 2026-09-05:
+                // both of the day's runs, one of them a full clear, carry
+                // campaign_id 0 and run_number 0, so nothing can tell which
+                // campaign they were part of or in what order they came.
+                //
+                // The campaign in progress is preferred to a fresh id for the
+                // same reason the run number is taken from the counter: this run
+                // is the next one of whatever series is already under way on
+                // this map, not the start of a rival one.
+                if (!coord.campaignId)
+                    coord.campaignId = CampaignInProgress(leaderName, inside->insideMapId);
+                if (!coord.campaignId)
+                    coord.campaignId = AllocateCampaignId();
+                StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
+                                     JoinNames(members));
+
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is already inside a dungeon run on map {} - "
                          "adopting it at {} ({} of {} roster members inside, run {} of "
@@ -13682,30 +13862,53 @@ private:
             // one. Everything here is skipped when the run table cannot carry a
             // campaign, in which case the run happens exactly as it does today
             // and simply is not numbered.
+            //
+            // AND `done == 0` NO LONGER MEANS "NOTHING HAS BEEN TRIED" (#225).
+            // It did while an attempt that failed before entry still moved the
+            // counter. Now that it does not, a campaign whose first four
+            // attempts all died at the barrier still reads zero, and taking that
+            // zero as the operator's gesture would hand every one of those
+            // failures a brand new campaign id - which is to say it would hide
+            // them from the consecutive-failure stop that is now the only thing
+            // bounding them. UnstartedCampaignOnMap asks the rows instead: if
+            // the last thing that happened on this map never got inside, this
+            // campaign is still trying to start and the attempt belongs to it.
             uint32 campaignId = 0;
             uint32 runNumber = cap.done + 1;
             if (RunAccountingPresent())
             {
-                campaignId = cap.done == 0
-                                 ? 0
-                                 : CampaignInProgress(leaderName, portal->insideMapId);
+                campaignId =
+                    cap.done == 0
+                        ? UnstartedCampaignOnMap(leaderName, portal->insideMapId)
+                        : CampaignInProgress(leaderName, portal->insideMapId);
                 if (!campaignId)
                     campaignId = AllocateCampaignId();
 
-                uint32 const failures = TrailingResetFailures(campaignId);
+                uint32 const failures = TrailingUnenteredRuns(campaignId);
                 if (failures >= DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES)
                 {
                     if (!coord.loggedCampaignOver)
                     {
                         coord.loggedCampaignOver = true;
+                        // THE ESCAPE HAD TO CHANGE WITH THE RULE ABOVE (#225).
+                        // "Set dungeon_runs_done to 0" used to clear this stop
+                        // as a side effect: it made the next run allocate a
+                        // fresh campaign, which orphaned the failing rows. That
+                        // is exactly the behaviour just removed, so the gesture
+                        // is named directly instead. Taking the attempts out of
+                        // the campaign is what the module reads, and
+                        // campaign_id 0 already means "a run this coordinator
+                        // did not drive".
                         LOG_ERROR("module.overseer",
                                   "overseer: the dungeon campaign for '{}' is stopped - the "
-                                  "last {} runs of campaign {} all ended 'reset_failed', so "
-                                  "the instance still has every boss dead in it and a "
-                                  "further run would walk into the same empty dungeon. The "
-                                  "reasons are on those rows; set dungeon_runs_done to 0 "
-                                  "once the cause is fixed",
-                                  leaderName, failures, campaignId);
+                                  "last {} attempts of campaign {} all ended without the "
+                                  "party ever reaching the instance, so a further one would "
+                                  "fail the same way. The reasons are on those rows. Once "
+                                  "the cause is fixed, take them out of the campaign to "
+                                  "start again: UPDATE overseer_dungeon_run SET campaign_id "
+                                  "= 0 WHERE campaign_id = {} AND outcome IN "
+                                  "('reset_failed','staging_failed')",
+                                  leaderName, failures, campaignId, campaignId);
                     }
                     return;
                 }
@@ -14077,7 +14280,7 @@ private:
                         : std::to_string(static_cast<uint32>(leader->GetDistance2d(
                               coord.stageX, coord.stageY))) +
                               "y from the staging point";
-                FailStaging(coord, leaderName, *portal, "GATHERING",
+                FailStaging(coord, leaderName, members, *portal, "GATHERING",
                             leaderName + " (" + where + ")", IsDungeonJob(leaderJob));
                 return;
             }
@@ -14277,6 +14480,31 @@ private:
             std::vector<OverseerDecisions::DungeonRunEntryState> const states =
                 DungeonRunCensus(members, door, portal->insideMapId, inside);
 
+            // THE RUN JOINS ITS CAMPAIGN AS SOON AS THERE IS A ROW TO STAMP,
+            // WHICH IS NOT WHERE THIS USED TO HAPPEN (#225). It was done at the
+            // STAGED_INSIDE -> CLEARING transition, on the reasoning that the
+            // row cannot exist before somebody is inside and that transition is
+            // the first moment the coordinator knows it does. The first half is
+            // right and the second is a poll too late: every way a run can end
+            // from STAGED_INSIDE - the party splits after entry, the map empties
+            // before the census sees the last one through, a worldserver bounce
+            // between the two polls - closes a row still reading campaign_id 0,
+            // run_number 0. Measured 2026-09-05: both of the day's rows,
+            // including a full clear, carry those two zeros.
+            //
+            // Once per run rather than once per poll: coord.runId is 0 only
+            // until the row is found, and StampRunIntoCampaign is a no-op on a
+            // row already in a campaign anyway (`AND campaign_id = 0`), so this
+            // stays idempotent against a re-entry and against a run some other
+            // process numbered first.
+            if (!coord.runId)
+            {
+                coord.runId = ActiveRunIdOnMap(portal->insideMapId);
+                if (coord.runId)
+                    StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
+                                         JoinNames(members));
+            }
+
             // NOBODY LEFT INSIDE MEANS THE RUN IS OVER, however it ended - a
             // wipe that released everyone to a graveyard, a party that walked
             // back out, a worldserver bounce. The coordinator does not try to
@@ -14355,18 +14583,12 @@ private:
                 coord.loggedMoved = false;
                 coord.loggedNotMoved = false;
 
-                // THE RUN JOINS ITS CAMPAIGN HERE, AND HERE IS THE FIRST MOMENT
-                // IT COULD (#144). The run ROW is opened by the arming drive,
-                // which is the thing that notices somebody is on the instance
-                // map - so it exists by now and not before, and this is the
-                // earliest point at which the coordinator can put its own
-                // numbers on it. `AND campaign_id = 0` inside StampRunIntoCampaign
-                // is what keeps this idempotent against a re-entry to this
-                // transition and against a run some other process already
-                // numbered.
-                coord.runId = ActiveRunIdOnMap(portal->insideMapId);
-                StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
-                                     JoinNames(members));
+                // THE RUN HAS ALREADY JOINED ITS CAMPAIGN BY NOW (#225). That
+                // used to happen on this line, and it happened a poll too late
+                // for every run that ended from STAGED_INSIDE without ever
+                // reaching CLEARING; it is done above instead, on the first poll
+                // that finds a row at all. See the comment beside the census.
+
                 // THE LINE THIS WHOLE EPIC WAS OPENED TO MAKE POSSIBLE, so it
                 // says what is now true rather than what was attempted.
                 LOG_INFO("module.overseer",
@@ -14606,7 +14828,7 @@ private:
         std::string stageWhy;
         if (!DungeonStagingAim(*portal, coord, stageTarget, stageWhy))
         {
-            FailStaging(coord, leaderName, *portal, "BARRIER", stageWhy,
+            FailStaging(coord, leaderName, members, *portal, "BARRIER", stageWhy,
                         IsDungeonJob(leaderJob));
             return;
         }
@@ -14737,7 +14959,7 @@ private:
         if (coord.stagingSince &&
             std::time(nullptr) - coord.stagingSince > DUNGEON_STAGING_BACKSTOP_SECONDS)
         {
-            FailStaging(coord, leaderName, *portal, "BARRIER",
+            FailStaging(coord, leaderName, members, *portal, "BARRIER",
                         OverseerDecisions::DungeonRunBarrierBlockers(
                             states, DUNGEON_BARRIER_RADIUS_YARDS),
                         IsDungeonJob(leaderJob));

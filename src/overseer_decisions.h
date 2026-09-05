@@ -999,6 +999,83 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   unsigned skips,
                                                   unsigned maximumSkips);
 
+// ------------------------------------------- what counts as a run (#225) --
+//
+// DID THE PARTY ACTUALLY GET INTO THE DUNGEON? Measured 2026-09-05: a campaign
+// of 100 runs on map 43 had two rows in overseer_dungeon_run and
+// dungeon_runs_done reading 3. The third was a staging failure, twelve minutes
+// of a barrier that never opened, and it had consumed a slot in the campaign
+// without anybody ever standing on the instance map. At about twelve minutes an
+// attempt a campaign of 100 finishes in nineteen hours having cleared nothing,
+// and reports success.
+//
+// THE BAR IS THE INSTANCE MAP, and the run table already agrees with it: a run
+// ROW exists at all only because the arming drive saw a roster character
+// standing on that map. A run that never reached it is not a run, so it does
+// not fill a slot in a campaign of a hundred.
+//
+// THE DEFAULT FOR A WORD THIS FUNCTION HAS NEVER HEARD IS "IT ENTERED", and
+// that direction is chosen rather than fallen into. The vocabulary grows toward
+// endings of real runs - the accounting migration already names 'complete' as
+// the value #143 will add the moment a run has a goal to complete - while the
+// two outcomes that mean nobody got inside are a closed pair, both written by
+// this module at the two points in the state machine that come before anyone
+// crosses the door. An unknown word is far likelier to be a new way for a real
+// run to end than a third way to fail before one starts, and counting a real
+// run as no run is the failure that loses a campaign's progress silently. An
+// empty outcome is also "it entered": that is what the cold-heartbeat close
+// leaves on a row, and that row exists because somebody was on the map.
+bool DungeonRunEnteredTheInstance(std::string const& outcome);
+
+// HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
+// the newest and stopping at the first that did.
+//
+// WHY THIS HAD TO WIDEN WHEN THE COUNTER NARROWED. The consecutive-failure stop
+// used to ask only about 'reset_failed', and a staging failure was bounded by
+// something else: it consumed a campaign slot, so a staging that failed for a
+// reason that kept being true ran out of campaign eventually. Taking that slot
+// away (which is the fix #225 asks for) takes the bound away with it, so the
+// stop has to cover both ways of failing before entry or the fix trades a wrong
+// count for a loop with nothing at the end of it.
+//
+// `outcomesNewestFirst` is exactly what the caller's `ORDER BY id DESC LIMIT n`
+// returns, and the count stops at the first outcome that entered - so a
+// campaign that has had one good run since its last failure starts its streak
+// again from zero.
+unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst);
+
+// WHERE A CAMPAIGN STANDS ONCE A RUN HAS ENDED.
+//
+// This is arithmetic and it is the part that was got wrong, so it is here where
+// a test can pin it rather than inline at the one call site that does it. The
+// trap is the last slot: run 100 of 100 fails to stage, `runNumber` reads 100,
+// and a straight `finished >= wanted` declares the campaign done with
+// ninety-nine dungeons actually cleared. The slot the attempt was aimed at is
+// only filled by an attempt that entered.
+struct DungeonCampaignProgress
+{
+    // Did this run fill the slot it was attempting? The one input that decides
+    // everything else here, and the only one the caller may act on when it
+    // writes dungeon_runs_done.
+    bool counted{false};
+    // How many runs of this campaign have now happened, which is what the
+    // roster counter should read after this run.
+    uint32_t runsDone{0};
+    // Which slot the next attempt is for. Equal to `attemptedRunNumber` again
+    // when this attempt did not count, because a slot nobody filled is still
+    // the next slot to fill. 0 when the campaign is over.
+    uint32_t nextRunNumber{0};
+    // Has the campaign reached its cap? Always false when the cap is unknown:
+    // "this database cannot answer" is not "the campaign is finished", and the
+    // caller has its own branch for a cap it cannot read.
+    bool campaignOver{false};
+};
+
+DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
+                                                uint32_t attemptedRunNumber,
+                                                uint32_t runsWanted,
+                                                bool capKnown);
+
 // -------------------------------------------------- the staging watchdog --
 //
 // "IT IS FAR AWAY" AND "IT IS NOT COMING" ARE DIFFERENT FACTS, and the
