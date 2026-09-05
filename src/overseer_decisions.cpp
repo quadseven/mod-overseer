@@ -133,6 +133,28 @@ bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
     return gap <= maxGap;
 }
 
+bool TravelEndpointWithinTolerance(float routedEndZ, float requestedZ,
+                                   float toleranceYards)
+{
+    // A negative tolerance is refused rather than folded to its magnitude:
+    // see the header for why reading it charitably would loosen the rule.
+    if (toleranceYards < 0.f)
+        return false;
+    float const gap = routedEndZ - requestedZ;
+    return (gap < 0.f ? -gap : gap) <= toleranceYards;
+}
+
+bool RoutedPathGoesWhereAsked(bool noRouteAtAll, bool endIsOffTheMesh,
+                              bool tooFewPoints, float actualEndZ,
+                              float requestedZ, float toleranceYards)
+{
+    // Completeness is deliberately not among these: see the header for why the
+    // core's own actual end position answers the question the flag does not.
+    if (noRouteAtAll || endIsOffTheMesh || tooFewPoints)
+        return false;
+    return TravelEndpointWithinTolerance(actualEndZ, requestedZ, toleranceYards);
+}
+
 std::string RealmKind(std::string const& declared)
 {
     std::string const value = Normalized(declared);

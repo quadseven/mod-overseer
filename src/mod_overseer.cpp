@@ -810,6 +810,44 @@ constexpr float TRAVEL_STEP_SIDE_FRACTION = 0.6f;
 // StepMayBridgeGap for why a far aim's height is not this step's business.
 constexpr float TRAVEL_STEP_VERTICAL_YARDS = 20.0f;
 
+// HOW FAR A ROUTED PATH'S LAST POINT MAY SIT FROM THE HEIGHT THAT WAS ASKED
+// FOR, before the route is read as the nearest polygon to somewhere
+// unreachable rather than as a way to the place requested. Five, and the five
+// is arrived at twice over.
+//
+// IT IS THE CORE'S OWN ANSWER TO THIS EXACT QUESTION. PathGenerator has a
+// predicate for "the destination this route reached is at the wrong height",
+// and it is five yards measured against GetActualEndPosition:
+//
+//     bool PathGenerator::IsInvalidDestinationZ(Unit const* target) const
+//     { return (target->GetPositionZ() - GetActualEndPosition().z) > 5.0f; }
+//                                                (PathGenerator.cpp:1230-1233)
+//
+// The same quantity, the same bound. This guard asks it symmetrically, in both
+// directions rather than only downward, because a route that ends five yards
+// too HIGH is the mountain case and is the one that killed somebody.
+//
+// It is also the reach of the navmesh's own first look: GetPolyByLocation
+// searches five yards above and below a point before widening to fifty
+// (PathGenerator.cpp:233, :247), which is the same five GroundedStep already
+// cites for why it snaps a near aim's z. So an end within five is one the mesh
+// placed on the polygon actually asked about.
+//
+// It is also the same five yards TRAVEL_GROUND_SNAP_YARDS already calls the
+// largest height correction that grounds an aim rather than relocating it.
+// Equal by derivation and not by coincidence: both are the distance past which
+// this module stops believing a point and a surface are the same place. Named
+// separately because one bounds a correction this module makes and the other
+// bounds an answer the core gives back, and a future reason to move one is not
+// a reason to move the other.
+//
+// IT WAS TWENTY, as TRAVEL_GROUND_DROP_YARDS doubled, and that doubling never
+// meant anything here: the drop constant is how far the SURFACE may fall
+// between two footing samples, which is a fact about falling and not about how
+// far a route may miss. Under twenty, aims at z 242, 262 and 303 were accepted
+// from Redridge roads near z 100 on 2026-09-05, walked, and fallen off.
+constexpr float TRAVEL_ROUTE_ENDPOINT_YARDS = 5.0f;
+
 // A follower that has stopped, and never closes the gap (#70).
 //
 // Two followers stopped at a zone border on the dev world 2026-08-30 and
@@ -8222,9 +8260,6 @@ private:
         if (!path.CalculatePath(x, y, z))
             return false;
         PathType const type = path.GetPathType();
-        if ((type & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE |
-                     PATHFIND_FARFROMPOLY_END)) || path.GetPath().size() <= 2)
-            return false;
 
         // PathGenerator can return the nearest polygon for an unreachable
         // point. Treating that as a route made the family walk toward a
@@ -8232,10 +8267,27 @@ private:
         // route must finish near the requested ground height. Explicit jump
         // and drop steps do not use this helper, so this guard cannot remove a
         // deliberate dungeon traversal step.
-        G3D::Vector3 const& end = path.GetPath().back();
-        if (std::fabs(end.z - z) > TRAVEL_GROUND_DROP_YARDS * 2.0f)
-            return false;
-        return true;
+        //
+        // The tolerance was twenty yards and is now five: see
+        // TRAVEL_ROUTE_ENDPOINT_YARDS, and PathGenerator::IsInvalidDestinationZ
+        // (PathGenerator.cpp:1230-1233) where the core asks this same question
+        // of this same quantity with the same five.
+        //
+        // ASKED OF GetActualEndPosition AND NOT OF THE LAST PATH POINT. They
+        // are the same thing for a route that arrived, and they are not the
+        // same thing for a route that was cut short: the last point of a
+        // corridor truncated at MAX_PATH_LENGTH is a waypoint hundreds of yards
+        // from the aim, whose height says nothing about the aim's. The actual
+        // end position is what the core sets when it MOVED the destination on
+        // us, and leaves alone when it merely ran out of buffer. See
+        // RoutedPathGoesWhereAsked, which is also why PATHFIND_INCOMPLETE is no
+        // longer in the rejection mask and PATHFIND_FARFROMPOLY_END still is.
+        G3D::Vector3 const& actualEnd = path.GetActualEndPosition();
+        return OverseerDecisions::RoutedPathGoesWhereAsked(
+            (type & PATHFIND_NOPATH) != 0,
+            (type & PATHFIND_FARFROMPOLY_END) != 0,
+            path.GetPath().size() <= 2,
+            actualEnd.z, z, TRAVEL_ROUTE_ENDPOINT_YARDS);
     }
 
     // The point to hand the mover THIS POLL for a character wanted at `want`.
