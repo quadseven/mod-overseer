@@ -8165,7 +8165,9 @@ private:
         PathGenerator path(bot);   // PathGenerator.h:61
         if (!path.CalculatePath(x, y, z))
             return false;
-        if ((path.GetPathType() & PATHFIND_NOPATH) || path.GetPath().size() <= 2)
+        PathType const type = path.GetPathType();
+        if ((type & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE |
+                     PATHFIND_FARFROMPOLY_END)) || path.GetPath().size() <= 2)
             return false;
 
         // PathGenerator can return the nearest polygon for an unreachable
@@ -8190,6 +8192,13 @@ private:
         float wy = want.GetPositionY();
         float wz = want.GetPositionZ();
         float const span = bot->GetExactDist2d(wx, wy);   // Position.h:170
+
+        // A normal walking step cannot bridge a large vertical gap. Without
+        // this check, follower catch-up can keep handing a mountain-top
+        // endpoint to the short-step fallback after the navmesh refused it.
+        // Explicit dungeon jump and drop steps do not use GroundedStep.
+        if (std::fabs(wz - bot->GetPositionZ()) > 20.0f)
+            return false;
 
         // THE AIM'S OWN Z IS CORRECTED ONTO THE SURFACE UNDER IT, and only
         // when the character is near enough for that to be cheap: sampling the
