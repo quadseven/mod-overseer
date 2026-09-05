@@ -42,6 +42,11 @@
  *                     disposition rule that needs the whole family's bags at
  *                     once, and it lives in the bridge outside the world. See
  *                     2026_09_04_01_overseer_sell.sql.
+ *       kind='bank' - deposit one named item into the character's bank,
+ *                     withdraw one from it, or buy the next bank bag slot,
+ *                     through the core's own bank packet handlers with a
+ *                     banker in interaction range. The executor never
+ *                     chooses the item; see 2026_09_04_02_overseer_bank.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -131,6 +136,7 @@
 #include "QuestDef.h"
 #include "Player.h"
 #include "Bag.h"
+#include "BankPackets.h"
 #include "DBCStores.h"
 #include "DBCStructure.h"
 #include "PlayerbotFactory.h"
@@ -15181,12 +15187,13 @@ private:
             char const* detail = "";
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share', 'job' and 'sell' do not go through
+            // 'share', 'job', 'sell' and 'bank' do not go through
             // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
-                && kind != "trade" && kind != "share" && kind != "job" && kind != "sell")
+                && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
+                && kind != "bank")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -15273,6 +15280,8 @@ private:
                 detail = DoJob(player, command, status);
             else if (kind == "sell")
                 detail = DoSell(player, command, status, rowResult);
+            else if (kind == "bank")
+                detail = DoBank(player, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -16923,6 +16932,544 @@ private:
         return "";
     }
 
+
+    // ---------------------------------------------------------------- bank --
+    //
+    // Move ONE named item across a banker's counter, or buy the next bank bag
+    // slot, exactly as a player standing at the banker does it.
+    //
+    // WHY THE BANK. Every member of the family has been playing with an
+    // "elsewhere" item count of 0 - nothing in the bank, ever - while wedged
+    // on full bags. What fills those bags is profession material nobody can
+    // use yet: cloth for a tailor still at skill 1, ore with no smith to take
+    // it. Each such stack costs a bag slot the character then cannot loot
+    // into. The bank is the game's own answer to that, and it is the one place
+    // the family has never once put anything. 2026_09_04_02_overseer_bank.sql
+    // carries the full argument.
+    //
+    // WHAT THIS DOES NOT DECIDE. Which item goes to the bank is a question
+    // about the whole family - who will be able to use it, and when - and it
+    // is answered by the side that reads every member's bags and skills. This
+    // executor moves the item it is told to, where the character already
+    // stands, or names why it cannot. Travel to the banker is the existing
+    // errand (the `banker` travel role above) and is sequenced by the same
+    // side; a row that arrives with no banker in reach is refused, not walked.
+    //
+    // THE CORE'S OWN PATH, AND WHY THE PACKET HANDLERS RATHER THAN THE PLAYER
+    // API UNDERNEATH THEM. Player::CanBankItem / BankItem / CanStoreItem /
+    // StoreItem (Player.h:1324, :1359, :1309, :1334) are the primitives, and
+    // calling them directly would work. But a player at a bank window does
+    // not call them; the client sends CMSG_AUTOBANK_ITEM (right-click an item
+    // with the bank open) or CMSG_AUTOSTORE_BANK_ITEM (right-click one in the
+    // bank), and the handler for each does five things in an order this
+    // module would otherwise have to copy and keep in step:
+    //
+    //     CanUseBank                 BankHandler.cpp:26   the banker is still in reach
+    //     CanBankItem / CanStoreItem BankHandler.cpp:79   where it will go
+    //     RemoveItem                 BankHandler.cpp:92   out of the source slot
+    //     ItemRemovedQuestCheck      BankHandler.cpp:93   a quest counting it notices
+    //     BankItem / StoreItem       BankHandler.cpp:94   into the destination
+    //
+    // (deposit: HandleAutoBankItemOpcode, BankHandler.cpp:64-96; withdraw:
+    // the bank-position branch of HandleAutoStoreBankItemOpcode,
+    // BankHandler.cpp:112-125; the slot purchase: HandleBuyBankSlotOpcode,
+    // BankHandler.cpp:143-184.) All three are public on WorldSession
+    // (WorldSession.h:684 opens the handlers section, the bank ones sit at
+    // :914-917). Unlike the trade handlers DoTrade drives, these take TYPED
+    // packets - WorldPackets::Bank::AutoBankItem and friends, BankPackets.h:
+    // 28-58 - built from a raw WorldPacket by the constructor at
+    // BankPackets.h:31 and read with Read() (BankPackets.cpp:20-35). That is
+    // the same shape mod-playerbots itself uses for the equip handler
+    // (EquipAction.cpp:206-211), and it is what the "packet" in the class
+    // name means here: a struct with two bytes in it, not a network.
+    //
+    // THE BANKER HAS TO BE "OPEN". CanUseBank (BankHandler.cpp:26-42) reads
+    // m_currentBankerGUID, which only SendShowBank sets (BankHandler.cpp:188),
+    // which HandleBankerActivateOpcode calls (BankHandler.cpp:44-62) after
+    // its own GetNPCIfCanInteractWith. So the sequence is the client's
+    // sequence: activate the banker, then move the item. Both are gated by
+    // Player::GetNPCIfCanInteractWith(ObjectGuid const&, uint32 npcflagmask)
+    // (Player.h:1146; Player.cpp:2115-2165), which refuses a character not in
+    // world, in flight, dead (unless the creature is visible to ghosts), a
+    // creature that is dead, charmed, unfriendly, not flagged
+    // UNIT_NPC_FLAG_BANKER, or farther than INTERACTION_DISTANCE - 5.5 yards
+    // in this core (ObjectDefines.h:24).
+    //
+    // WHY EVERY CONDITION IS TESTED HERE AS WELL AS BY THE CORE. Every one of
+    // those refusals is a void return or a packet to a session, and a bot has
+    // no client to show a packet to. Testing them first is what lets `detail`
+    // NAME the wall; the core then tests them again and is the authority.
+    //
+    // NO DATABASE WRITE, NO GM SHORTCUT. Nothing here touches item_instance
+    // or character_inventory; the item's new position reaches the database
+    // on the character's next save, the way it does for a player. A row that
+    // claims a deposit is checked by reading the item's position back - and
+    // for a stack that merged into one already in the bank, by the item
+    // having left the bags and the bank's count of that entry having grown by
+    // the stack - not by the handler having returned.
+
+    // Where an item is, as the pair the core uses. INVENTORY_SLOT_BAG_0 (255,
+    // Player.h:657) means "on the character directly": equipment, the
+    // backpack, the bank's own 28 slots, or a worn bag; anything else is the
+    // slot of the bag the item is inside (Item::GetBagSlot, Item.cpp:785-788).
+    // -1 is "not known", because 0 is a real slot.
+    struct ItemPlace
+    {
+        int32 bag = -1;
+        int32 slot = -1;
+    };
+
+    static ItemPlace PlaceOf(Item const* item)
+    {
+        ItemPlace place;
+        if (item)
+        {
+            place.bag = item->GetBagSlot();
+            place.slot = item->GetSlot();
+        }
+        return place;
+    }
+
+    static ItemPlace PlaceOf(uint16 pos)
+    {
+        ItemPlace place;
+        place.bag = pos >> 8;
+        place.slot = pos & 255;
+        return place;
+    }
+
+    // The bank's own 28 slots (BANK_SLOT_ITEM_START..END, Player.h:698-699)
+    // and every bag worn in a bought bank bag slot (BANK_SLOT_BAG_START..END,
+    // Player.h:704-705; Bag::GetBagSize / GetItemByPos, Bag.h:48 / :41). The
+    // mirror of FindCarriedItem, which deliberately does NOT search here; this
+    // deliberately searches nowhere else, so a withdraw of something already
+    // in the bags is "item not in bank" rather than a move from a bag to the
+    // same bag.
+    static Item* FindBankedItem(Player* who, uint32 guidCounter)
+    {
+        auto matches = [&](Item* item) { return item->GetGUID().GetCounter() == guidCounter; };
+
+        for (uint8 slot = BANK_SLOT_ITEM_START; slot < BANK_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (matches(item))
+                    return item;
+
+        for (uint8 bagSlot = BANK_SLOT_BAG_START; bagSlot < BANK_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint8 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (matches(item))
+                        return item;
+        }
+        return nullptr;
+    }
+
+    // How many of an entry sit on the bank side of the counter. GetItemCount
+    // (Player.h:1262) counts the carried side alone with inBankAlso=false and
+    // both with true (PlayerStorage.cpp:331-374), so the bank's share is the
+    // difference.
+    static uint32 BankedCount(Player* who, uint32 entry)
+    {
+        return who->GetItemCount(entry, true) - who->GetItemCount(entry, false);
+    }
+
+    // The InventoryResult codes a bank move can produce, named (Item.h:45-140)
+    // so a row says EQUIP_ERR_BANK_FULL rather than 51. Anything else is
+    // reported by number alone; the enum is the client's and has sixty-odd
+    // members, most of them about equipping, and a table of all of them here
+    // would be a copy that drifts.
+    static char const* InventoryResultName(InventoryResult msg)
+    {
+        switch (msg)
+        {
+            case EQUIP_ERR_OK:                          return "EQUIP_ERR_OK";
+            case EQUIP_ERR_BANK_FULL:                   return "EQUIP_ERR_BANK_FULL";
+            case EQUIP_ERR_INVENTORY_FULL:              return "EQUIP_ERR_INVENTORY_FULL";
+            case EQUIP_ERR_BAG_FULL:                    return "EQUIP_ERR_BAG_FULL";
+            case EQUIP_ERR_ITEM_NOT_FOUND:              return "EQUIP_ERR_ITEM_NOT_FOUND";
+            case EQUIP_ERR_ALREADY_LOOTED:              return "EQUIP_ERR_ALREADY_LOOTED";
+            case EQUIP_ERR_DONT_OWN_THAT_ITEM:          return "EQUIP_ERR_DONT_OWN_THAT_ITEM";
+            case EQUIP_ERR_NONEMPTY_BAG_OVER_OTHER_BAG: return "EQUIP_ERR_NONEMPTY_BAG_OVER_OTHER_BAG";
+            case EQUIP_ERR_CANT_CARRY_MORE_OF_THIS:     return "EQUIP_ERR_CANT_CARRY_MORE_OF_THIS";
+            case EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT:      return "EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT";
+            case EQUIP_ERR_MUST_PURCHASE_THAT_BAG_SLOT: return "EQUIP_ERR_MUST_PURCHASE_THAT_BAG_SLOT";
+            default:                                    return "";
+        }
+    }
+
+    // The banker this character can talk to from where it stands, or null.
+    //
+    // Every living unit within INTERACTION_DISTANCE is collected with the
+    // core's own range searcher (Acore::AnyUnitInObjectRangeCheck,
+    // GridNotifiers.h:1061-1074, through UnitListSearcher, :445-453, driven
+    // by Cell::VisitObjects, CellImpl.h:165-168 - the same three lines
+    // mod-playerbots' "nearest npcs" value is built from,
+    // NearestNpcsValue.cpp). The bankers among them (Unit::IsBanker,
+    // Unit.h:811) are then each put to GetNPCIfCanInteractWith, which is the
+    // gate the handler itself will apply, and the choice between several is
+    // the pure rule in OverseerDecisions::NearestBanker. `anyInRange` reports
+    // whether ANY banker was within range at all, so a refusal can tell "no
+    // banker here" from "a banker here that will not deal with you".
+    static Creature* BankerInReach(Player* who, bool& anyInRange)
+    {
+        anyInRange = false;
+
+        std::list<Unit*> units;
+        Acore::AnyUnitInObjectRangeCheck check(who, INTERACTION_DISTANCE);
+        Acore::UnitListSearcher<Acore::AnyUnitInObjectRangeCheck> searcher(who, units, check);
+        Cell::VisitObjects(who, searcher, INTERACTION_DISTANCE);
+
+        std::vector<OverseerDecisions::BankerCandidate> candidates;
+        std::map<uint32, Creature*> byId;
+        for (Unit* unit : units)
+        {
+            Creature* creature = unit->ToCreature();
+            if (!creature || !creature->IsBanker())
+                continue;
+            anyInRange = true;
+
+            OverseerDecisions::BankerCandidate candidate;
+            candidate.id = creature->GetGUID().GetCounter();
+            candidate.distance = who->GetDistance(creature);
+            candidate.interactable =
+                who->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_BANKER) != nullptr;
+            candidates.push_back(candidate);
+            byId[candidate.id] = creature;
+        }
+
+        uint32 const pick = OverseerDecisions::NearestBanker(candidates);
+        if (!pick)
+            return nullptr;
+        return byId[pick];
+    }
+
+    static char const* DoBank(Player* who, std::string const& command, char const*& status,
+                              std::string& out)
+    {
+        OverseerDecisions::BankRequest const request = OverseerDecisions::ParseBankRequest(command);
+
+        char const* verb = "";
+        switch (request.verb)
+        {
+            case OverseerDecisions::BankVerb::Deposit:  verb = "deposit"; break;
+            case OverseerDecisions::BankVerb::Withdraw: verb = "withdraw"; break;
+            case OverseerDecisions::BankVerb::BuySlot:  verb = "buy slot"; break;
+            case OverseerDecisions::BankVerb::None:     verb = ""; break;
+        }
+
+        // Everything a row can be answered with, gathered as it becomes known
+        // and written out by EVERY exit, refusals included. Unknowns are -1 or
+        // null rather than 0, because 0 is a real slot, a real bag count and
+        // a real amount of money.
+        struct Evidence
+        {
+            bool haveItem = false;
+            uint32 itemGuid = 0;
+            uint32 itemEntry = 0;
+            std::string itemName;
+            uint32 itemCount = 0;
+            ItemPlace from;
+            ItemPlace to;
+            int32 bankSlots = -1;
+            int64 moneyBefore = -1;
+            int64 moneyAfter = -1;
+            bool haveBanker = false;
+            uint32 bankerEntry = 0;
+            std::string bankerName;
+            bool haveInventoryResult = false;
+            InventoryResult inventoryResult = EQUIP_ERR_OK;
+        } ev;
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"verb\":" << J(verb)
+              << ",\"character\":" << J(who->GetName());
+            if (ev.haveItem)
+                o << ",\"item\":{\"guid\":" << ev.itemGuid
+                  << ",\"entry\":" << ev.itemEntry
+                  << ",\"name\":" << J(ev.itemName)
+                  << ",\"count\":" << ev.itemCount << "}";
+            else
+                o << ",\"item\":null";
+            o << ",\"from\":{\"bag\":" << ev.from.bag << ",\"slot\":" << ev.from.slot << "}"
+              << ",\"to\":{\"bag\":" << ev.to.bag << ",\"slot\":" << ev.to.slot << "}"
+              << ",\"bank_slots\":" << ev.bankSlots
+              << ",\"money_before\":" << ev.moneyBefore
+              << ",\"money_after\":" << ev.moneyAfter;
+            if (ev.haveBanker)
+                o << ",\"banker\":{\"entry\":" << ev.bankerEntry
+                  << ",\"name\":" << J(ev.bankerName) << "}";
+            else
+                o << ",\"banker\":null";
+            if (ev.haveInventoryResult)
+                o << ",\"inventory_result\":" << int32(ev.inventoryResult)
+                  << ",\"inventory_result_name\":" << J(InventoryResultName(ev.inventoryResult));
+            o << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        // The refusal literals below go straight into the UPDATE, so none of
+        // them may carry a quote character - the same rule every executor in
+        // this file keeps.
+        auto refuse = [&](char const* reason, char const* detail) -> char const*
+        {
+            describe("refused", reason);
+            return detail;
+        };
+
+        if (request.verb == OverseerDecisions::BankVerb::None)
+        {
+            // The parser's exact words are tested in tests/test_bank.cpp and
+            // go into the JSON, where a string that lives in a local is fine.
+            // `detail` has to outlive this call, so the column gets the
+            // literal they all begin with.
+            describe("refused", request.error.c_str());
+            return "malformed bank request";
+        }
+
+        // Read before anything else, so a refusal still reports the state of
+        // the world the row was judged against (GetBankBagSlotCount,
+        // Player.h:1291; GetMoney, :1632).
+        ev.bankSlots = who->GetBankBagSlotCount();
+        ev.moneyBefore = who->GetMoney();
+        ev.moneyAfter = ev.moneyBefore;
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("no session", "character has no session");
+
+        // The conditions GetNPCIfCanInteractWith (Player.cpp:2115-2165) tests
+        // about the CHARACTER, named here so the row says which one. Dead is a
+        // refusal there unless the creature is flagged visible to ghosts, which
+        // no banker is.
+        if (!who->IsInWorld())
+            return refuse("not in world", "character is not in the world");
+        if (!who->IsAlive())
+            return refuse("dead", "character is dead");
+        if (who->IsInFlight())
+            return refuse("in flight", "character is on a flight path");
+        if (session->isLogingOut())
+            return refuse("logging out", "character is logging out");
+
+        // Not the server's rule but the client's: the bank frame does not open
+        // in combat, so a bot that banked mid-fight would be doing something no
+        // player at a keyboard can. Nothing in BankHandler.cpp asks, which is
+        // exactly why it has to be asked here.
+        if (who->IsInCombat())
+            return refuse("in combat", "character is in combat");
+
+        // A trade window and a bank window are not open at once for a player,
+        // and an item sitting in a trade slot that then moves to the bank is a
+        // trade the other side did not agree to. Refused rather than cancelled:
+        // this executor does not undo what another one is in the middle of.
+        if (who->GetTradeData())
+            return refuse("trading", "character is in a trade");
+
+        bool anyBankerInRange = false;
+        Creature* banker = BankerInReach(who, anyBankerInRange);
+        if (!banker)
+            return refuse(anyBankerInRange ? "banker in range but not interactable"
+                                           : "no banker in range",
+                          anyBankerInRange ? "banker in range but will not deal with the character"
+                                           : "banker not in range");
+        ev.haveBanker = true;
+        ev.bankerEntry = banker->GetEntry();
+        ev.bankerName = banker->GetCreatureTemplate()->Name;
+
+        // ---- open the bank, the way the client does ------------------------
+        //
+        // CMSG_BANKER_ACTIVATE carries the banker's guid and nothing else
+        // (BankHandler.cpp:44-48). The handler re-runs GetNPCIfCanInteractWith
+        // and then SendShowBank sets m_currentBankerGUID (BankHandler.cpp:
+        // 186-192), which is what every later CanUseBank() reads. Without this
+        // call the move handlers return before they look at the item.
+        {
+            WorldPacket activate(CMSG_BANKER_ACTIVATE, 8);
+            activate << banker->GetGUID();
+            session->HandleBankerActivateOpcode(activate);
+        }
+
+        // ---- buy slot ------------------------------------------------------
+        if (request.verb == OverseerDecisions::BankVerb::BuySlot)
+        {
+            // The handler's own arithmetic (BankHandler.cpp:154-175), run
+            // first so the refusal has a name: the next slot is one past the
+            // count, its price is a DBC row (sBankBagSlotPricesStore,
+            // DBCStores.h:95; BankBagSlotPricesEntry is {ID, price},
+            // DBCStructure.h:583-587), no row means the last one is already
+            // bought, and the price is checked against HasEnoughMoney
+            // (Player.h:1634).
+            uint32 const nextSlot = uint32(ev.bankSlots) + 1;
+            BankBagSlotPricesEntry const* slotEntry = sBankBagSlotPricesStore.LookupEntry(nextSlot);
+            if (!slotEntry)
+                return refuse("no more slots", "no more slots");
+            if (!who->HasEnoughMoney(slotEntry->price))
+                return refuse("cannot afford slot", "cannot afford slot");
+
+            WorldPacket raw(CMSG_BUY_BANK_SLOT, 8);
+            raw << banker->GetGUID();
+            WorldPackets::Bank::BuyBankSlot packet(std::move(raw));
+            packet.Read();
+            session->HandleBuyBankSlotOpcode(packet);
+
+            // READ IT BACK. The handler reports its result in a packet the
+            // bot cannot see; the slot count and the purse can be read.
+            int32 const slotsAfter = who->GetBankBagSlotCount();
+            ev.moneyAfter = who->GetMoney();
+            if (slotsAfter != int32(nextSlot))
+            {
+                describe("refused", "the core did not sell the slot");
+                return "the core refused to sell the bank slot";
+            }
+            ev.bankSlots = slotsAfter;
+            if (ev.moneyAfter != ev.moneyBefore - int64(slotEntry->price))
+            {
+                // The slot count moved and the purse does not match: reported
+                // as an error rather than a success, because the pair is the
+                // evidence and half of it is wrong.
+                describe("error", "slot count moved but the price paid does not match");
+                return "bank slot bought but the price paid does not match";
+            }
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' bought bank bag slot {} for {} copper at {} ({})",
+                     who->GetName(), nextSlot, slotEntry->price, ev.bankerName, ev.bankerEntry);
+
+            describe("bought_slot", "");
+            status = "delivered";
+            return "";
+        }
+
+        // ---- deposit / withdraw: the item must be on the side it leaves ----
+        bool const deposit = request.verb == OverseerDecisions::BankVerb::Deposit;
+        Item* item = deposit ? FindCarriedItem(who, true, request.itemGuid)
+                             : FindBankedItem(who, request.itemGuid);
+        if (!item)
+            return refuse(deposit ? "item not carried" : "item not in bank",
+                          deposit ? "item not carried" : "item not in bank");
+
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return refuse("no item template", "item has no template");
+
+        ev.haveItem = true;
+        ObjectGuid const itemGuid = item->GetGUID();
+        ev.itemGuid = itemGuid.GetCounter();
+        ev.itemEntry = item->GetEntry();
+        ev.itemName = proto->Name1;
+        ev.itemCount = item->GetCount();
+        ev.from = PlaceOf(item);
+
+        // A bag with things in it cannot be moved anywhere; the core says so
+        // as EQUIP_ERR_NONEMPTY_BAG_OVER_OTHER_BAG from deep inside
+        // CanBankItem, and it is worth its own words here because the fix
+        // (empty it first) is nothing like the fix for a full bank
+        // (Item::ToBag, Item.h:250; Bag::IsEmpty, Bag.h:46). Soulbound is
+        // deliberately NOT refused, unlike in DoTrade: a soulbound item can be
+        // banked, only not handed over.
+        if (item->IsBag() && !item->ToBag()->IsEmpty())
+            return refuse("bag not empty", "a bag with items in it cannot be moved");
+
+        // Where it will go, asked with the same call and the same arguments
+        // the handler uses (BankHandler.cpp:79 for a deposit, :115 for a
+        // withdraw), so this answer and the handler's are the same answer.
+        ItemPosCountVec dest;
+        InventoryResult const msg = deposit ? who->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false)
+                                            : who->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false);
+        ev.haveInventoryResult = true;
+        ev.inventoryResult = msg;
+        if (msg != EQUIP_ERR_OK)
+        {
+            if (deposit)
+                return refuse("bank cannot take the item",
+                              msg == EQUIP_ERR_BANK_FULL ? "bank is full" : "bank cannot take the item");
+            return refuse("bags cannot take the item",
+                          msg == EQUIP_ERR_INVENTORY_FULL ? "bags are full" : "bags cannot take the item");
+        }
+        if (dest.empty())
+            return refuse("no destination", "the core found nowhere to put the item");
+        ev.to = PlaceOf(dest[0].pos);
+
+        // The evidence a merge leaves: the stack it joined grows by the count,
+        // and the item itself is gone from its side of the counter.
+        uint32 const bankedBefore = BankedCount(who, ev.itemEntry);
+        uint32 const carriedBefore = who->GetItemCount(ev.itemEntry, false);
+
+        // ---- drive the core's own handler ----------------------------------
+        //
+        // Both packets are two bytes, bag then slot (BankPackets.cpp:20-35),
+        // read from the item's current position - the same pair
+        // FindCarriedItem / FindBankedItem just found it at.
+        if (deposit)
+        {
+            WorldPacket raw(CMSG_AUTOBANK_ITEM, 2);
+            raw << uint8(ev.from.bag) << uint8(ev.from.slot);
+            WorldPackets::Bank::AutoBankItem packet(std::move(raw));
+            packet.Read();
+            session->HandleAutoBankItemOpcode(packet);
+        }
+        else
+        {
+            WorldPacket raw(CMSG_AUTOSTORE_BANK_ITEM, 2);
+            raw << uint8(ev.from.bag) << uint8(ev.from.slot);
+            WorldPackets::Bank::AutoStoreBankItem packet(std::move(raw));
+            packet.Read();
+            session->HandleAutoStoreBankItemOpcode(packet);
+        }
+
+        // ---- believe nothing; read the item back ---------------------------
+        //
+        // `item` is not touched again: a stack that merged into one already on
+        // the far side is put into ITEM_REMOVED state and sits in no slot
+        // (PlayerStorage.cpp:2773-2802), so it is found again by guid
+        // (GetItemByGuid, Player.h:1264, which searches both sides) or not at
+        // all, never through the old pointer. IsBankPos is Player.h:1287.
+        Item* moved = who->GetItemByGuid(itemGuid);
+        bool landed = false;
+        if (moved)
+        {
+            ev.to = PlaceOf(moved);
+            bool const inBank = Player::IsBankPos(moved->GetPos());
+            landed = deposit ? inBank : !inBank;
+        }
+        else
+        {
+            // Merged. The far side must have grown by exactly the stack and
+            // the near side shrunk by it; anything else is an item that is
+            // simply gone, which is an error and not a deposit.
+            uint32 const bankedAfter = BankedCount(who, ev.itemEntry);
+            uint32 const carriedAfter = who->GetItemCount(ev.itemEntry, false);
+            landed = deposit ? (bankedAfter == bankedBefore + ev.itemCount &&
+                                carriedAfter + ev.itemCount == carriedBefore)
+                             : (carriedAfter == carriedBefore + ev.itemCount &&
+                                bankedAfter + ev.itemCount == bankedBefore);
+        }
+
+        ev.moneyAfter = who->GetMoney();
+        if (!landed)
+        {
+            describe("refused", deposit ? "the item did not land in the bank"
+                                        : "the item did not land in the bags");
+            return deposit ? "the core did not move the item into the bank"
+                           : "the core did not move the item into the bags";
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' {} item {} (entry {}, {}x {}) from bag {} slot {} to bag {} slot {}{} at {} ({})",
+                 who->GetName(), deposit ? "deposited" : "withdrew", ev.itemGuid, ev.itemEntry,
+                 ev.itemCount, ev.itemName, ev.from.bag, ev.from.slot, ev.to.bag, ev.to.slot,
+                 moved ? "" : " (merged into an existing stack)", ev.bankerName, ev.bankerEntry);
+
+        describe(deposit ? "deposited" : "withdrawn", moved ? "" : "merged into an existing stack");
+        status = "delivered";
+        return "";
+    }
 
     // --------------------------------------------------------------- share --
     //

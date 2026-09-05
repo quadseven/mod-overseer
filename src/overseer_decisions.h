@@ -1024,6 +1024,70 @@ SellRetry SellRefusalRetry(std::string const& detail);
 // string a row carries.
 char const* SellRetryWord(SellRetry retry);
 
+// ---------------------------------------------------------- the bank row --
+//
+// WHAT A kind='bank' ROW MAY SAY, decided here so the executor in
+// mod_overseer.cpp starts from a parsed request rather than from text.
+//
+// The grammar is three verbs and deliberately no more:
+//
+//     deposit guid:<item_instance.guid>    bags -> bank
+//     withdraw guid:<item_instance.guid>   bank -> bags
+//     buy slot                             the next bank bag slot, if affordable
+//
+// GUID ONLY, NO `entry:` FORM, unlike give and trade. Those keep `entry` for
+// "the only one they have"; a bank move is exactly where that convenience
+// goes wrong, because the same entry can sit in the bags AND in the bank at
+// once (that is what a deposit produces), and a withdraw by entry would then
+// have two right answers on opposite sides of the counter. item_instance.guid
+// names one row, and it is what the side that decides what to move already
+// reads out of the database. The executor never chooses an item; it moves the
+// one it is told to, or says why it cannot.
+//
+// WHY THE PARSE IS A PURE FUNCTION. Every refusal a bank row can produce is
+// either "the text was wrong" or "the world said no", and only the second
+// needs a world. Keeping the first here means a malformed row is refused with
+// the same words on every realm, and that the words are tested rather than
+// discovered.
+enum class BankVerb
+{
+    None,      // not a bank request at all; `error` says why
+    Deposit,
+    Withdraw,
+    BuySlot
+};
+
+struct BankRequest
+{
+    BankVerb verb{BankVerb::None};
+    uint32_t itemGuid{0};   // for Deposit and Withdraw; 0 for BuySlot
+    std::string error;      // the refusal literal when verb is None, else empty
+};
+
+// Whitespace-tolerant (leading, trailing, and runs between words), otherwise
+// literal: lower-case verbs, `guid:` with digits after it, nothing else on the
+// line. A guid of 0 is refused rather than passed on, because 0 is the value
+// every "not found" path in the core returns and a row asking for it would
+// be answered by whichever item that path found first.
+BankRequest ParseBankRequest(std::string const& command);
+
+// WHICH BANKER, when a city square has several in reach.
+//
+// The candidates are every creature flagged as a banker within interaction
+// distance, each already asked whether the character may interact with it
+// (alive, friendly, not charmed - the core's own gate). The choice is: any
+// interactable one before any that is not, the nearest of those, and on a
+// tie the lowest id so the answer does not depend on the order the grid was
+// walked in. Returns 0 when nothing qualifies.
+struct BankerCandidate
+{
+    uint32_t id{0};           // the creature's guid counter; never 0 for a real one
+    float distance{0.f};
+    bool interactable{false};
+};
+
+uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

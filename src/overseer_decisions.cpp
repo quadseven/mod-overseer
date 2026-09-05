@@ -1166,4 +1166,137 @@ char const* SellRetryWord(SellRetry retry)
     return "later";
 }
 
+// ---------------------------------------------------------- the bank row --
+
+namespace
+{
+
+// The words of the line, split on runs of blanks. Tabs count as blanks
+// because a row typed by hand into a SQL client can carry them.
+std::vector<std::string> Words(std::string const& text)
+{
+    std::vector<std::string> words;
+    std::string word;
+    for (char const c : text)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            if (!word.empty())
+                words.push_back(word);
+            word.clear();
+        }
+        else
+            word += c;
+    }
+    if (!word.empty())
+        words.push_back(word);
+    return words;
+}
+
+// `guid:<digits>` -> the number, or 0 for anything else, including a number
+// that overflows uint32 (a guid counter is 32 bits in the core), a bare
+// `guid:`, and the `entry:` form the other item verbs accept.
+uint32_t GuidOf(std::string const& word)
+{
+    std::string const prefix = "guid:";
+    if (word.compare(0, prefix.size(), prefix) != 0)
+        return 0;
+    std::string const digits = word.substr(prefix.size());
+    if (digits.empty() || digits.size() > 10)
+        return 0;
+    uint64_t value = 0;
+    for (char const c : digits)
+    {
+        if (c < '0' || c > '9')
+            return 0;
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (value > 0xFFFFFFFFull)
+        return 0;
+    return static_cast<uint32_t>(value);
+}
+
+}  // namespace
+
+BankRequest ParseBankRequest(std::string const& command)
+{
+    BankRequest request;
+    std::vector<std::string> const words = Words(command);
+
+    if (words.empty())
+    {
+        request.error = "malformed bank: want deposit guid:<n>, withdraw guid:<n>, or buy slot";
+        return request;
+    }
+
+    if (words[0] == "buy")
+    {
+        if (words.size() == 2 && words[1] == "slot")
+        {
+            request.verb = BankVerb::BuySlot;
+            return request;
+        }
+        request.error = "malformed bank: buy takes exactly `slot`";
+        return request;
+    }
+
+    if (words[0] == "deposit" || words[0] == "withdraw")
+    {
+        if (words.size() != 2)
+        {
+            request.error = words[0] == "deposit"
+                                ? "malformed bank: want deposit guid:<item_instance.guid>"
+                                : "malformed bank: want withdraw guid:<item_instance.guid>";
+            return request;
+        }
+        uint32_t const guid = GuidOf(words[1]);
+        if (!guid)
+        {
+            request.error = "malformed bank: item must be guid:<item_instance.guid>, not 0";
+            return request;
+        }
+        request.verb = words[0] == "deposit" ? BankVerb::Deposit : BankVerb::Withdraw;
+        request.itemGuid = guid;
+        return request;
+    }
+
+    request.error = "malformed bank: unknown verb (want deposit, withdraw, or buy slot)";
+    return request;
+}
+
+uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates)
+{
+    uint32_t pick = 0;
+    float pickDistance = 0.f;
+    bool pickInteractable = false;
+
+    for (BankerCandidate const& candidate : candidates)
+    {
+        if (!candidate.id)
+            continue;
+
+        bool better;
+        if (!pick)
+            better = true;
+        else if (candidate.interactable != pickInteractable)
+            better = candidate.interactable;
+        else if (candidate.distance != pickDistance)
+            better = candidate.distance < pickDistance;
+        else
+            better = candidate.id < pick;
+
+        if (better)
+        {
+            pick = candidate.id;
+            pickDistance = candidate.distance;
+            pickInteractable = candidate.interactable;
+        }
+    }
+
+    // A banker nobody may talk to is not an answer. The caller wants the one
+    // to hand to the core, and the core would refuse this one anyway; better
+    // it is named "no banker in reach" here than "the core refused" there.
+    return pickInteractable ? pick : 0;
+}
+
 }  // namespace OverseerDecisions
