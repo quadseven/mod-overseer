@@ -393,6 +393,152 @@ DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
                                              : DungeonApproach::OffOutsideMap;
 }
 
+namespace
+{
+
+// HAND-ROLLED FOR THE REASON THE THREE ASCII HELPERS AT THE TOP OF THIS FILE
+// ARE. `<cmath>` would give both of these, and taking it would be the second
+// include in a translation unit whose whole stated property is that it has
+// none. The rule is worth more than the two functions: it is what makes "a core
+// type cannot get in here" a build failure rather than a promise, and an
+// exception granted for a square root is an exception granted.
+float Magnitude(float value)
+{
+    return value < 0.f ? -value : value;
+}
+
+// Newton-Raphson on f(g) = g*g - value, in double so the iteration has room the
+// float inputs do not. It converges quadratically from any positive start, and
+// the loop is bounded by a COUNT rather than by a tolerance: the last step of a
+// converged Newton iteration can oscillate between two adjacent doubles forever,
+// and a fixed bound cannot spin on one. Sixty-four is far past what any distance
+// on a 34,000-yard map needs - the spans this is asked about are single-digit to
+// low-double-digit yards, which settle in about ten.
+//
+// Zero, a negative and a NaN all return zero, and the caller reads that as "no
+// distance between these two points" - which for the one caller here is exactly
+// the NoApproachAxis refusal it already has to make.
+double SquareRoot(double value)
+{
+    if (!(value > 0.0))
+        return 0.0;
+
+    double guess = value > 1.0 ? value : 1.0;
+    for (int i = 0; i < 64; ++i)
+    {
+        double const next = 0.5 * (guess + value / guess);
+        if (next == guess)
+            break;
+        guess = next;
+    }
+    return guess;
+}
+
+// Inside the world grid, and a number at all. Written as a positive test rather
+// than as `!(out of range)` on purpose: every comparison against a NaN is false,
+// so a NaN fails this and is refused, where the negated form would have let it
+// through.
+bool WithinTheWorld(float value)
+{
+    return value > -MAP_EDGE_YARDS && value < MAP_EDGE_YARDS;
+}
+
+}  // namespace
+
+StagingPointVerdict StagingPointCheck(float x, float y, float z)
+{
+    // ORDER MATTERS, AND THE ORIGIN COMES FIRST. (0, 0, 0) is inside the world
+    // grid, so it passes every bounds test there is; it has to be named as its
+    // own answer or it is silently the most plausible-looking wrong point this
+    // module can produce. It is also the one that was actually measured.
+    if (x == 0.f && y == 0.f)
+        return StagingPointVerdict::Unresolved;
+
+    if (!WithinTheWorld(x) || !WithinTheWorld(y) || !WithinTheWorld(z))
+        return StagingPointVerdict::OffTheMap;
+
+    return StagingPointVerdict::Usable;
+}
+
+bool StagingPointUsable(float x, float y, float z)
+{
+    return StagingPointCheck(x, y, z) == StagingPointVerdict::Usable;
+}
+
+std::string StagingPointRefusal(StagingPointVerdict verdict)
+{
+    switch (verdict)
+    {
+        case StagingPointVerdict::Usable:
+            return "the staging point is usable";
+        case StagingPointVerdict::Unresolved:
+            return "the staging point is the origin of the map, which is what three "
+                   "floats hold when nothing has resolved them - so this run never "
+                   "worked out where to wait";
+        case StagingPointVerdict::OffTheMap:
+            return "the staging point is outside the world grid, so it is an "
+                   "arithmetic accident rather than a place";
+        case StagingPointVerdict::NoApproachAxis:
+            return "the way back out lands on the door itself, so it names no "
+                   "approach axis to stand off along";
+    }
+    // Unreachable while the enum and this switch agree, and a plain sentence
+    // rather than an assertion because the caller's job with any of these is to
+    // print it and refuse.
+    return "the staging point cannot be used, for a reason this module has no "
+           "words for yet";
+}
+
+StagingPoint DungeonStagingPoint(float doorX, float doorY,
+                                 float backX, float backY, float backZ,
+                                 float standoffYards)
+{
+    StagingPoint point;
+
+    double const dx = double(backX) - double(doorX);
+    double const dy = double(backY) - double(doorY);
+    double const span = SquareRoot(dx * dx + dy * dy);
+
+    // ONE YARD, and the number is not the interesting part - the refusal is. A
+    // landing point on top of the door names no direction at all, and
+    // normalising it would be a divide by something near zero dressed up as a
+    // bearing. Inventing an axis instead is how a party got walked into rock
+    // the first time this was written.
+    if (!(span > 1.0))
+    {
+        point.verdict = StagingPointVerdict::NoApproachAxis;
+        return point;
+    }
+
+    double const scale = double(standoffYards) / span;
+    float const x = float(double(doorX) + dx * scale);
+    float const y = float(double(doorY) + dy * scale);
+
+    // THE ARITHMETIC IS CHECKED BY THE SAME VERDICT THE CALLER WILL CHECK, and
+    // that is the point of it being one function. A derivation that produced an
+    // unusable point used to be able to return it as a success; now the only
+    // way to leave here with three floats set is to have passed the test the
+    // consumer applies. See StagingPointVerdict for the run this rule is named
+    // after.
+    StagingPointVerdict const verdict = StagingPointCheck(x, y, backZ);
+    if (verdict != StagingPointVerdict::Usable)
+    {
+        point.verdict = verdict;
+        return point;
+    }
+
+    point.verdict = StagingPointVerdict::Usable;
+    point.x = x;
+    point.y = y;
+    point.z = backZ;
+    return point;
+}
+
+bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards)
+{
+    return Magnitude(ground - doorZ) <= toleranceYards;
+}
+
 bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
                           float doorstepYards)
 {
