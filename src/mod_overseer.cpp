@@ -12623,10 +12623,31 @@ private:
             out.gap = route.leaderToStagingPoint;
         }
 
-        // THE SAME REFUSAL EITHER WAY (#220). A corridor is a place like any
-        // other, so a corridor that is not a place is refused by the same check
-        // that refuses a staging point that is not one, and the run is closed
-        // with a sentence rather than walked at the middle of the map.
+        // THE DESTINATION IS CHECKED EVEN WHEN IT IS NOT THIS LEG'S TARGET,
+        // and that is #220's lesson applied to a new use site rather than
+        // belt and braces. A run whose STAGING POINT is not a place must not
+        // set off at all, and with a corridor in the picture it could: the
+        // corridor is a perfectly good place, so a leg of ToWaypoint would
+        // format a usable aim and walk the leader 1,161 yards toward a run
+        // whose destination is three zeros. Both callers happen to validate
+        // the staging point before they reach here - IDLE refuses when
+        // ResolveDungeonStagingPoint fails, and RESETTING derives it or fails -
+        // which is exactly the reasoning #220 was written to distrust. "A
+        // contract enforced only where a value is DERIVED protects exactly the
+        // paths that derive it", and this function is a new path.
+        OverseerDecisions::StagingPointVerdict const destination =
+            OverseerDecisions::StagingPointCheck(stageX, stageY, stageZ);
+        if (destination != OverseerDecisions::StagingPointVerdict::Usable)
+        {
+            out.why = OverseerDecisions::StagingPointRefusal(destination);
+            return out;
+        }
+
+        // AND THEN THIS LEG'S OWN TARGET, BY THE SAME REFUSAL. A corridor is a
+        // place like any other, so a corridor that is not a place is refused by
+        // the same check that refuses a staging point that is not one, and the
+        // run is closed with a sentence rather than walked at the middle of the
+        // map.
         OverseerDecisions::StagingPointVerdict const verdict =
             OverseerDecisions::StagingPointCheck(out.x, out.y, out.z);
         if (verdict != OverseerDecisions::StagingPointVerdict::Usable)
