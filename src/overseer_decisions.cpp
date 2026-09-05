@@ -373,8 +373,24 @@ std::vector<BuildFact> BuildReport(std::string const& coreVersion,
     return facts;
 }
 
+namespace
+{
+
+// The one place a member's two readings are turned into a gap, so the predicate
+// and the line it prints can never disagree about where somebody is standing.
+ApproachGap GapOf(DungeonRunMemberState const& member)
+{
+    ApproachGap gap;
+    gap.horizontalYards = member.distanceFromStage;
+    gap.verticalYards = member.verticalFromStage;
+    gap.measured = member.distanceFromStage >= 0.f;
+    return gap;
+}
+
+}  // namespace
+
 bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
-                          float radiusYards)
+                          ApproachLimits const& limits)
 {
     if (members.empty())
         return false;
@@ -393,14 +409,19 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
             return false;
         if (member.inCombat)
             return false;
-        if (member.distanceFromStage < 0.f || member.distanceFromStage > radiusYards)
+        // ARRIVED, NOT "INSIDE THE CIRCLE" (#217). Unmeasured and Overhead both
+        // fail here, and Overhead is the one that is new: a member ten yards
+        // out and a hundred and fifty yards up passed the circle test with room
+        // to spare, so a party could be declared assembled on a clifftop and
+        // then walked at a door it could not reach.
+        if (ApproachShapeOf(GapOf(member), limits) != ApproachShape::Arrived)
             return false;
     }
     return true;
 }
 
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
-                                      float radiusYards)
+                                      ApproachLimits const& limits)
 {
     std::string blockers;
     for (DungeonRunMemberState const& member : members)
@@ -419,10 +440,27 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
             why = "already inside";
         else if (member.distanceFromStage < 0.f)
             why = "wrong map";
-        else if (member.distanceFromStage > radiusYards)
-            why = std::to_string(static_cast<int>(member.distanceFromStage)) + "y away";
         else
-            continue;
+        {
+            ApproachGap const gap = GapOf(member);
+            switch (ApproachShapeOf(gap, limits))
+            {
+                case ApproachShape::Arrived:
+                    continue;
+                // THE TWO REMAINING SHAPES GET THE SAME SENTENCE, and that is
+                // the fix rather than a shortcut: ApproachWhere already carries
+                // the height, so "80y out and 184y above it" and "80y out" are
+                // told apart by the numbers in them rather than by a word this
+                // would have to choose. A reader who sees the second half knows
+                // the member is over the door; one who does not, knows it is
+                // simply short of it.
+                case ApproachShape::Overhead:
+                case ApproachShape::Closing:
+                case ApproachShape::Unmeasured:
+                    why = ApproachWhere(gap);
+                    break;
+            }
+        }
 
         if (!blockers.empty())
             blockers += ", ";
@@ -490,6 +528,29 @@ double SquareRoot(double value)
 bool WithinTheWorld(float value)
 {
     return value > -MAP_EDGE_YARDS && value < MAP_EDGE_YARDS;
+}
+
+// IS THIS READING A NUMBER AT ALL? Written as the positive test for the reason
+// WithinTheWorld above is: every comparison against a NaN is false, so a NaN
+// fails this and is refused, where the negated form would have let it through.
+//
+// `value != value` alone catches the NaN; `value * 0` is a NaN for an infinity
+// and zero for everything else, so the second half catches both infinities
+// without naming a bound a distance might one day legitimately exceed. A gap is
+// a DIFFERENCE rather than a coordinate, so WithinTheWorld is the wrong test for
+// it - two legal points on one map are further apart than MAP_EDGE_YARDS.
+// `<cmath>` would give std::isfinite; see the note at the top of this file for
+// why the include is not taken for two comparisons.
+//
+// UNREACHABLE THROUGH THE ADAPTER TODAY, and guarded anyway. A staging point is
+// put through StagingPointUsable before anything is measured against it and a
+// position in the world is a real number, so neither half of a gap can be one
+// of these. The guard costs one comparison; not having it costs an ARRIVAL
+// declared on a reading nobody can interpret, which is the exact failure this
+// whole section exists to stop.
+bool FiniteReading(float value)
+{
+    return value == value && value * 0.f == 0.f;
 }
 
 }  // namespace
@@ -586,6 +647,74 @@ StagingPoint DungeonStagingPoint(float doorX, float doorY,
 bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards)
 {
     return Magnitude(ground - doorZ) <= toleranceYards;
+}
+
+ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits)
+{
+    // NOT MEASURED, OR NOT A NUMBER, ARE THE SAME ANSWER. Both mean this poll
+    // has nothing to say about where the subject is, and both must fail to the
+    // verdict that leaves a caller waiting rather than to the one that advances
+    // a phase. See FiniteReading.
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
+        return ApproachShape::Unmeasured;
+
+    float const horizontal = Magnitude(gap.horizontalYards);
+    float const vertical = Magnitude(gap.verticalYards);
+
+    // THE FLOOR IS ASKED FIRST, and it is the step bound's own statement read
+    // backwards: a gap one step may bridge is a gap walking crosses, so it is
+    // never a cliff however little ground is left. Both step numbers have to be
+    // real for the rule to mean anything - a caller that supplied neither is
+    // one this cannot answer for, and it gets the flat test it used to have.
+    if (limits.stepYards > 0.f && limits.stepVerticalYards > 0.f &&
+        vertical > limits.stepVerticalYards)
+    {
+        // MULTIPLIED OUT RATHER THAN DIVIDED, so a character standing directly
+        // over the point is an ordinary comparison rather than a division by
+        // zero. It also reads as what it is: the height left, against the
+        // height the ground still to be walked could absorb at the one gradient
+        // this module has measured.
+        if (vertical * limits.stepYards > horizontal * limits.stepVerticalYards)
+            return ApproachShape::Overhead;
+    }
+
+    // A NaN in either half fails this comparison and lands on Closing, which is
+    // the answer that keeps a caller waiting rather than either acting on an
+    // arrival or writing off an approach. Written as the positive test for that
+    // reason; the negated form would have called it an arrival.
+    return horizontal <= limits.arrivalYards ? ApproachShape::Arrived
+                                             : ApproachShape::Closing;
+}
+
+float ApproachDistance(ApproachGap const& gap)
+{
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
+        return -1.f;
+
+    double const horizontal = double(gap.horizontalYards);
+    double const vertical = double(gap.verticalYards);
+    return float(SquareRoot(horizontal * horizontal + vertical * vertical));
+}
+
+std::string ApproachWhere(ApproachGap const& gap)
+{
+    // The same three conditions as the verdict, and deliberately not "whatever
+    // the verdict said": a caller may ask for the words without asking for the
+    // shape, and the cast below is undefined on a NaN.
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
+        return "no reading";
+
+    std::string where =
+        std::to_string(static_cast<int>(gap.horizontalYards)) + "y out";
+    int const vertical = static_cast<int>(gap.verticalYards);
+    if (vertical > 0)
+        where += " and " + std::to_string(vertical) + "y above it";
+    else if (vertical < 0)
+        where += " and " + std::to_string(-vertical) + "y below it";
+    return where;
 }
 
 bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
@@ -717,10 +846,31 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                 : DungeonClearStallAction::Extract;
 }
 
-StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
+StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
-                             RatchetLimits const& limits)
+                             RatchetLimits const& limits,
+                             ApproachLimits const& approach)
 {
+    ApproachShape const shape = ApproachShapeOf(gap, approach);
+
+    // STAGED, SO NOT WATCHED, AND THE LADDER GOES WITH IT. Inside the barrier
+    // and on the same surface there is nothing left to close, and the leader in
+    // particular is HELD there on purpose - a watchdog measuring him would find
+    // a character that never gets nearer, because it is already there, and
+    // start correcting the one member doing exactly what was asked.
+    //
+    // THE STATE IS RESET RATHER THAN LEFT, so a member that arrives, drifts
+    // back out and returns is watched from the bottom of the ladder rather than
+    // from the rung its last bad patch reached. This used to be the caller's
+    // job and used to be asked with a flat radius, which is how a character on
+    // the rim - ten yards out, a hundred and fifty yards up - was exempted from
+    // being watched at all.
+    if (shape == ApproachShape::Arrived)
+    {
+        state = StagingStallState();
+        return StagingNudge::Nothing;
+    }
+
     if (!measurable)
     {
         // Held, not read. `best` is deliberately left alone: a member that
@@ -731,19 +881,51 @@ StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
         return StagingNudge::Nothing;
     }
 
-    RatchetVerdict const verdict = Ratchet(state.progress, distanceFromStage, now, limits);
+    // THE READING IS THE WHOLE GAP AND NOT ITS HORIZONTAL HALF (#217). A
+    // descent counts as progress on this reading, which is what keeps a party
+    // walking down a real ramp from being written off; a climb counts as going
+    // backwards, which is what the horizontal span could never say.
+    RatchetVerdict const verdict =
+        Ratchet(state.progress, ApproachDistance(gap), now, limits);
     if (verdict.progressed)
     {
         // IT IS COMING. The clock has already been restarted by the ratchet;
         // what is undone here is the ladder, so a member that closes the gap
         // after two nudges is watched from the bottom again rather than being
-        // one bad patch away from being given up on.
+        // one bad patch away from being given up on. `stranded` is undone with
+        // it: a member that was over the door and has since found a way down is
+        // not the case that diagnosis was about.
         state.escalated = 0;
         state.gaveUp = false;
+        state.stranded = false;
         return StagingNudge::Nothing;
     }
     if (!verdict.stalled)
         return StagingNudge::Nothing;
+
+    // ABOVE IT AND NO LONGER CLOSING, WHICH IS A DIFFERENT FACT FROM BEING
+    // STUCK AND TAKES THE LADDER OUT OF USE RATHER THAN CLIMBING IT (#217).
+    //
+    // BOTH HALVES ARE NEEDED AND NEITHER IS ENOUGH. Overhead on its own is a
+    // descent in progress: the Deadmines approach read 99/+88, 52/+83 and
+    // 29/+43 on its way down to twelve yards out, and every one of those is
+    // Overhead. Stalled on its own is the ordinary stuck-on-scenery case the
+    // three rungs below exist for and fix. It is the conjunction - a large gap
+    // straight up that has not shrunk for a whole patience window - that means
+    // the route is wrong rather than the walking, and no rung reaches that.
+    //
+    // AND SPENDING THE RUNGS ON IT IS WORSE THAN USELESS. Two of the three
+    // restart movement, and what they restart it into is a cliff edge: six of
+    // the six deaths on the Wailing Caverns approach were falls, and the last
+    // step's own footing refusal was firing throughout. Said once, and then
+    // this stops touching the character at all.
+    if (shape == ApproachShape::Overhead)
+    {
+        if (state.stranded)
+            return StagingNudge::Nothing;
+        state.stranded = true;
+        return StagingNudge::Stranded;
+    }
 
     if (state.escalated >= STAGING_NUDGE_STEPS)
     {

@@ -381,6 +381,146 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap);
 
+// A VERTICAL GAP AT SHORT RANGE MEANS "ABOVE IT", NOT "NEAR IT" (#217).
+//
+// WHAT WAS MEASURED. Every distance this module has ever taken against a PLACE
+// - the barrier circle, the arrival check, the staging watchdog's ratchet - is
+// a two-dimensional one, so nothing in it could tell "fifty yards away" from
+// "fifty yards away and eighty yards up". A dungeon door at the bottom of a
+// ravine is therefore approached by converging on the point nearest in TWO
+// dimensions, which is the ridge directly above it, and the party stops there.
+// Two doors, two nights, and the numbers are horizontal distance from the
+// staging point paired with height above it:
+//
+//   Deadmines, staging point (-11208.2, 1665.34, 24.66). One leader's approach
+//   sampled as it happened: 1029/+22.0, 534/+10.2, 205/+30.9, 99/+88.3,
+//   52/+83.2, 29/+43.1. He descends to the valley, climbs the hill over the
+//   entrance, and stops on top of it.
+//
+//   Wailing Caverns, staging point (-733.71, -2214.91, 16.8). Four of the
+//   family at one moment: 10/+150, 80/+184, 99/+80, 210/+71. And mid-approach
+//   on the night the campaign was stood down: 22/+151, 32/+114, 74/+194,
+//   282/+117.
+//
+// THE 10/+150 READING IS WHAT THE TWO-DIMENSIONAL MEASUREMENT IS WORTH. The
+// barrier radius is ten yards, so that character counted as standing AT the
+// staging point while he was a hundred and fifty yards above it, on the wrong
+// side of a cliff with no walkable way down. The phase can advance from a
+// ledge, and a party can be declared assembled somewhere it cannot leave.
+//
+// AND IT IS NOT A REPORTING PROBLEM. Six deaths in six minutes on that
+// approach, every one of them a fall, covering all five characters, one of them
+// twice fifty-seven seconds apart. Standing a party on a rim is not a neutral
+// outcome that wastes a backstop; it is where they die.
+//
+// THE REFUSAL AT THE LIP IS RIGHT AND THE APPROACH IS WRONG. StepMayBridgeGap
+// above already stops a character stepping off the rim toward an aim below it,
+// and it should - that step is the fall. But it is asked AT THE LIP, where
+// there is nowhere left to go and holding position is the only answer left.
+// This is the same question asked EARLY, while there is still route left to go
+// around, and while the answer can still be "do not send anybody here".
+//
+// IT IS LITERALLY THE SAME RULE, WIDENED FROM ONE STRIDE TO THE WHOLE APPROACH.
+// StepMayBridgeGap says a step of `stepYards` may bridge `maxGap` of height -
+// sixty yards along for twenty yards up, as this module has it - and that is
+// the only measured statement anything here owns about how much height walking
+// absorbs per yard of ground. So the approach rule is that same gradient
+// applied over the distance that REMAINS: a walk with `horizontal` yards left
+// to run may absorb `horizontal * stepVerticalYards / stepYards` of height, and
+// a gap larger than that is a wall rather than a hillside. At exactly one
+// step's reach the two rules return the identical answer, which is what makes
+// this an extension of the step bound rather than a second opinion about it.
+//
+// A GAP NO LARGER THAN ONE STEP'S IS NEVER OVERHEAD, WHATEVER THE RANGE, and
+// that floor is the same constant read the other way rather than a fudge. A gap
+// StepMayBridgeGap would let a character step across is, by that function's own
+// statement, a gap walking crosses; calling it a cliff here would contradict
+// the rule this is derived from. Without the floor the gradient degenerates at
+// the door, where it should not be asked at all: a character standing two yards
+// from the point would be "above" it for being two thirds of a yard off in z.
+//
+// WHERE THE BOUNDARY ACTUALLY FALLS, on the samples above. Everything walking
+// is on one side of it and everything stranded on the other, the nearest pair
+// being 205/+30.9 (walkable, and he was still on the valley floor) and
+// 210/+71.2 (overhead, and she was up on the high ground with the rest of
+// them). No measured sample sits in between.
+
+// The two halves of a gap, kept apart because the whole defect is that they
+// were only ever added up into one number that held the first.
+struct ApproachGap
+{
+    // The two-dimensional span - what every check in this module used to be.
+    float horizontalYards{0.f};
+    // SIGNED, SUBJECT MINUS POINT: positive is above it, negative below. The
+    // sign is carried for the sentence an operator reads; every test below is
+    // on the magnitude, because a door under a ledge and a door over one are
+    // the same defect upside down and a rule that knew only one of them would
+    // be half a rule.
+    float verticalYards{0.f};
+    // False when this poll took no reading at all - the character is on another
+    // map, or was not found. Distinguished from a gap of zero for the reason
+    // DungeonRunMemberState's negative distance already is: an unmeasured gap
+    // must never read as an arrival.
+    bool measured{false};
+};
+
+enum class ApproachShape : std::uint8_t
+{
+    // No reading this poll. Never Arrived and never Overhead: it fails to the
+    // answer that leaves a caller waiting rather than to either of the two that
+    // make it act.
+    Unmeasured,
+    // Near in all three dimensions, and the only shape that may satisfy a
+    // barrier or advance a phase.
+    Arrived,
+    // Short of the point, and what remains is ground a walk can cover. This is
+    // the ordinary answer for almost every yard of almost every approach.
+    Closing,
+    // Above the point, or below it, by more height than the walking that is
+    // left can absorb. Not a distance to close but a route to find, and no
+    // amount of stepping toward it will help.
+    Overhead,
+};
+
+// The three numbers the rule is read against. Two of them are deliberately the
+// step bound's own: an approach rule that disagreed with the step it ends in
+// would be two rules, and the one that fired last would win by accident.
+//
+// A CALLER THAT LEAVES THE TWO STEP NUMBERS AT ZERO GETS THE OLD BEHAVIOUR -
+// nothing is ever Overhead, and arrival is the flat two-dimensional test. That
+// is a deliberate degradation rather than an assertion: a zero here means the
+// caller has no step bound to extend, and inventing one on its behalf would be
+// this function deciding something it was never told.
+struct ApproachLimits
+{
+    float arrivalYards{0.f};       // near enough, horizontally, to count as there
+    float stepYards{0.f};          // one step's reach
+    float stepVerticalYards{0.f};  // the height one step may bridge
+};
+
+ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits);
+
+// HOW FAR AWAY IT REALLY IS - the three-dimensional distance, for the ratchet
+// that asks whether an approach is closing and for the line an operator reads.
+//
+// THIS IS THE OTHER HALF OF THE SAME DEFECT. A ratchet fed the horizontal span
+// sees a character who climbs a hundred and fifty yards straight up while
+// staying ten yards out as having arrived and stopped, which is exactly what it
+// looks like from directly overhead. Fed this, the same reading is a hundred
+// and fifty yards out and not improving, which is what it is.
+//
+// Negative when the gap was not measured, which is the same "no reading"
+// convention DungeonRunMemberState::distanceFromStage already carries, and a
+// value no ratchet can mistake for progress toward anything.
+float ApproachDistance(ApproachGap const& gap);
+
+// The gap in words, for the line that says why a run is being closed. Kept
+// apart from the verdict for the reason DungeonRunBarrierBlockers already
+// gives: a pure function that also builds strings is a pure function that is
+// harder to test twice. "52y out and 83y above it" rather than "52y away",
+// because every failure line this replaces named the symptom and not the cause.
+std::string ApproachWhere(ApproachGap const& gap);
+
 // A ROUTE MUST END WHERE IT WAS ASKED TO END.
 //
 // PathGenerator answers an unreachable point with the NEAREST POLYGON it could
@@ -632,6 +772,17 @@ struct DungeonRunMemberState
     bool alive{false};
     bool inCombat{false};
     float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
+    // AND HOW FAR ABOVE OR BELOW IT (#217). Signed, member minus point, and
+    // meaningless unless `distanceFromStage` is a real reading - which is why
+    // it is a plain float with no sentinel of its own: the distance beside it
+    // already says whether this poll measured anything, and a second way of
+    // saying the same thing is a second thing to keep in step.
+    //
+    // A BARRIER THAT ONLY EVER READ THE LINE ABOVE COULD BE SATISFIED FROM A
+    // CLIFFTOP. Measured on Wailing Caverns: ten yards out and a hundred and
+    // fifty yards up, which the radius test read as "at the staging point".
+    // See ApproachShapeOf, which is what the two fields are now read through.
+    float verticalFromStage{0.f};
     // ALREADY THROUGH THE DOOR THIS BARRIER IS WAITING OUTSIDE (#165). Measured
     // live: a run sat `active` and unstaged for forty-three minutes while its
     // barrier line read "Ugga (not seen)" and, on the run before, "Ugga (wrong
@@ -646,15 +797,25 @@ struct DungeonRunMemberState
     bool inside{false};
 };
 
+// A RADIUS BECAME LIMITS (#217), and the extra numbers are not a tuning knob:
+// `arrivalYards` IS the radius this used to take, and the two step numbers
+// beside it are what turns "within ten yards" into "within ten yards and on
+// the same surface". A caller that leaves them at zero gets the flat radius
+// test this always was. See ApproachLimits.
 bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
-                          float radiusYards);
+                          ApproachLimits const& limits);
 
 // Why a member is failing BARRIER, for the one log line BARRIER prints
 // while it waits. Kept separate from the predicate above so the predicate
 // itself stays a plain bool with nothing to format - a pure function that
 // also builds strings is a pure function that is harder to test twice.
+//
+// AND IT NAMES THE CAUSE RATHER THAN THE SYMPTOM. "Grug (80y out and 184y
+// above it)" is a sentence an operator can act on; "Grug (80y away)", which is
+// what this said for the whole of #217, is one that reads as "nearly there"
+// about a character standing on a cliff.
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
-                                      float radiusYards);
+                                      ApproachLimits const& limits);
 
 // CAN THIS PORTAL BE APPROACHED AT ALL, ASKED BEFORE A RUN IS OPENED.
 //
@@ -1038,6 +1199,15 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
 // from there. Any poll that shows real progress puts the whole ladder back to
 // the bottom, so a character that recovers is watched from scratch rather than
 // from the rung its last bad patch reached.
+// AND ONE OF THE FIVE ANSWERS IS NOT ON THE LADDER AT ALL (#217). Every rung
+// below is a remedy for a character that has STOPPED WALKING, and all three of
+// them assume that making it walk again is the fix. A character standing on the
+// rim above the point it was sent to has not stopped walking - it has arrived
+// at the only place the route it was given goes, and nothing on the ladder
+// changes that. Worse, two of the rungs restart movement, and the ledge is
+// still there: six of the six deaths on the Wailing Caverns approach were
+// falls, one character twice inside a minute. So that case is recognised BEFORE
+// the ladder and takes it out of use rather than climbing it.
 enum class StagingNudge
 {
     Nothing,        // walking, staged, or nothing worth reading this poll
@@ -1045,6 +1215,12 @@ enum class StagingNudge
     Reaim,          // re-issue the aim
     ClearMovement,  // discard the movement generator, as the follow stall does
     GiveUp,         // say once that it cannot be staged, and stop
+    // ABOVE THE POINT AND NO LONGER CLOSING. Said once, and it is a diagnosis
+    // rather than a correction: this member is not short of the staging point,
+    // it is over it, and the way in is a route nothing here can supply. The
+    // caller's business is to stop pulling it toward the edge - which means
+    // ending the errand, not nudging it - and to say the cause out loud.
+    Stranded,
 };
 
 // How many rungs there are below GiveUp. Named so the bound is a number a
@@ -1060,6 +1236,7 @@ struct StagingStallState
     RatchetState progress;
     unsigned escalated{0};  // how many rungs have been climbed
     bool gaveUp{false};     // the give-up line has been said
+    bool stranded{false};   // the above-it-not-near-it line has been said
 };
 
 // One member, one poll. `measurable` is false when this poll's distance is not
@@ -1067,9 +1244,24 @@ struct StagingStallState
 // another map - and the clock is then held rather than run, for the reason the
 // travel drive already holds its own over a flight: half a taxi route goes the
 // wrong way round a mountain, and a fight is a pause rather than a stall.
-StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
+//
+// IT TAKES A GAP RATHER THAN A DISTANCE (#217), AND RATCHETS THE WHOLE OF IT.
+// The reading is ApproachDistance, not the horizontal span: a member who climbs
+// a hundred and fifty yards while staying ten yards out has not arrived and has
+// not stalled, he has gone up, and only the three-dimensional reading says so.
+// `approach` is what tells this the difference between a member short of the
+// point and a member above it; leave its step numbers at zero and this behaves
+// exactly as it did when it took a flat distance.
+//
+// ARRIVAL IS DECIDED HERE TOO, and that is a move rather than an addition: the
+// caller used to make it, with a flat radius, and drop the state of anyone
+// inside it. A member on the rim satisfied that test and so was never watched
+// at all - the one member most in need of watching was the one exempted. The
+// state is reset in place instead, so an arrival is still a fresh ladder.
+StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
-                             RatchetLimits const& limits);
+                             RatchetLimits const& limits,
+                             ApproachLimits const& approach);
 // ------------------------------------------------------------- professions --
 //
 // THE THIRD TENANT, AND THE SAME REASON AS THE OTHER TWO. The roster declares
