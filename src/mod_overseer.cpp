@@ -987,6 +987,12 @@ constexpr float FOLLOW_CATCH_UP_YARDS = 500.0f;
 // the two drives every poll.
 constexpr float FOLLOW_CATCH_UP_DONE_YARDS = FOLLOW_STALL_GAP_YARDS;
 
+// The two lines above, handed to the one rule that reads them, so the two
+// places that ask how far back a follower is provably ask the same question
+// (#241). No new number: both of these already existed and neither moves.
+constexpr OverseerDecisions::FollowGapLimits FOLLOW_GAP_LIMITS{
+    FOLLOW_STALL_GAP_YARDS, FOLLOW_CATCH_UP_YARDS};
+
 // How far the leader may walk from the point a catching-up follower was aimed
 // at before the aim is refreshed. Half of FOLLOW_CATCH_UP_DONE_YARDS, and the
 // arithmetic is the reason: a follower that ARRIVES at its aim holds there
@@ -4301,6 +4307,12 @@ private:
                 OverseerDecisions::Ratchet(stall.progress, movedFromLast,
                                            std::time(nullptr), FOLLOW_STALL_RATCHET);
 
+            // The same reading DriveCatchUp takes below, from the same pair of
+            // players, so the two can never disagree about them again (#241).
+            float yardsBehind = 0.f;
+            OverseerDecisions::FollowGap const behind =
+                ReadGap(p, leader, yardsBehind);
+
             // THE MARK IS DROPPED HERE, not inside the ratchet, because it is
             // a position and the ratchet is fed one number. `progress.since`
             // is assigned with it for the one case the ratchet cannot see -
@@ -4321,7 +4333,18 @@ private:
             // follower has no errand, so the reaction is to clear a stale
             // movement generator and let it be tried again later, which is
             // what the cooldown below is for.
-            else if (p->GetDistance2d(leader) > FOLLOW_STALL_GAP_YARDS &&
+            //
+            // AND NOT ACROSS A MAP BOUNDARY (#241). This used to ask
+            // GetDistance2d with no map guard, which for a party split between
+            // Duskwood and the Barrens returned 10,560 yards - two coordinate
+            // systems subtracted from each other - reported it as a distance,
+            // and cleared a movement generator on the strength of it, every
+            // five minutes, at three followers whose problem was not a stall. A
+            // nudge is a remedy for a character that has stopped walking, and a
+            // character on another continent has not stopped walking, it has
+            // nowhere to walk. FollowGapIsBehind answers false there, and
+            // DriveCatchUp below says what is actually wrong instead.
+            else if (OverseerDecisions::FollowGapIsBehind(behind) &&
                      progress.stalled &&
                      std::time(nullptr) - stall.nudged > FOLLOW_STALL_SECONDS)
             {
@@ -4331,7 +4354,7 @@ private:
                          "so the next follow tick starts fresh",
                          p->GetName(), static_cast<uint32>(FOLLOW_STALL_JITTER_YARDS),
                          static_cast<uint32>(FOLLOW_STALL_SECONDS / 60),
-                         static_cast<uint32>(p->GetDistance2d(leader)), leader->GetName());
+                         static_cast<uint32>(yardsBehind), leader->GetName());
                 p->GetMotionMaster()->Clear();
                 stall.nudged = std::time(nullptr);
             }
@@ -8967,6 +8990,45 @@ private:
         return p && p->IsInWorld() && !p->IsInFlight() && !p->IsFalling();
     }
 
+    // THE ONE READING, TAKEN THE SAME WAY AT BOTH CALL SITES (#241). Two
+    // expressions over the same pair of players used to disagree: the stall
+    // check subtracted two coordinate systems and reported the result as a
+    // distance, and this drive folded the same pair to a sentinel. `yards` is
+    // only written when it means something; on a cross-map pair it is left at
+    // zero and the verdict is the thing to read.
+    static OverseerDecisions::FollowGap ReadGap(Player* p, Player* leader,
+                                                float& yards)
+    {
+        bool const sameMap = p->GetMapId() == leader->GetMapId();
+        yards = sameMap ? p->GetDistance2d(leader) : 0.f;
+        return OverseerDecisions::ReadFollowGap(sameMap, yards, FOLLOW_GAP_LIMITS);
+    }
+
+    // SAID ONCE PER SPLIT, NOT ONCE PER POLL, and re-said if the leader turns
+    // up on a third map. The party poll runs every few seconds and this
+    // condition can last for an hour, so a line per poll would bury itself;
+    // one line per follower per split is four lines for this roster and is
+    // what an operator needs, because it names WHICH characters are stranded.
+    // Cleared the moment the maps agree again, by DriveCatchUp.
+    void SayPartySplit(std::string const& name, Player* p, Player* leader)
+    {
+        uint32 const here = p->GetMapId();
+        uint32 const there = leader->GetMapId();
+        auto const said = _partySplitSaid.find(name);
+        if (said != _partySplitSaid.end() && said->second == there)
+            return;
+        _partySplitSaid[name] = there;
+        LOG_ERROR("module.overseer",
+                  "overseer: '{}' is on map {} and its leader '{}' is on map {} - THE "
+                  "PARTY IS SPLIT ACROSS TWO MAPS AND NOTHING IN THIS MODULE CAN REJOIN "
+                  "IT. `follow` cannot cross a map, this catch-up walk has nowhere on "
+                  "this map to aim at, and an `at:` aim cannot name a coordinate on "
+                  "another one, so this follower stands still until somebody moves it. "
+                  "Every errand that needs the family in one place is blocked for it "
+                  "until then (#241)",
+                  name, here, leader->GetName(), there);
+    }
+
     // ONE FOLLOWER, ONE POLL: should it be walking to the leader on its own,
     // and if it already is, should it still be (#138). Called from
     // KeepRosterFollowing for every follower in the group, after the master
@@ -8976,6 +9038,22 @@ private:
     void DriveCatchUp(Player* p, Player* leader)
     {
         std::string const name = p->GetName();
+
+        // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Read
+        // BEFORE the escorted early-return below, so that a split is forgotten
+        // as soon as the maps agree again, whatever else this poll decides to
+        // do. `gap` used to carry a -1 sentinel for "not on the leader's map",
+        // which an `at:` aim cannot cross (ResolveTravelTarget refuses a spawn
+        // on another map) and which following cannot cross either
+        // (FollowActions.cpp:285). The sentinel is a named verdict now, because
+        // -1 took the same exit as "in formation" one branch further down, and
+        // that exit is silent (#241).
+        float gap = 0.f;
+        OverseerDecisions::FollowGap const reading = ReadGap(p, leader, gap);
+        bool const split = reading == OverseerDecisions::FollowGap::SplitAcrossMaps;
+        if (!split)
+            _partySplitSaid.erase(name);
+
         auto const it = _dungeonEscorts.find(name);
         bool const escorted = it != _dungeonEscorts.end();
         // A run holds this member. Its staging point is where the leader is
@@ -8983,13 +9061,6 @@ private:
         // authority on when it stops.
         if (escorted && !it->second.catchUp)
             return;
-
-        // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Negative
-        // means "not on the leader's map", which an `at:` aim cannot cross -
-        // ResolveTravelTarget refuses a spawn on another map - and which
-        // following cannot cross either (FollowActions.cpp:285).
-        float const gap =
-            p->GetMapId() == leader->GetMapId() ? p->GetDistance2d(leader) : -1.f;
 
         if (escorted)
         {
@@ -9017,14 +9088,21 @@ private:
             // twenty-minute backstop releases the aim as unreachable and says
             // so, and the next party poll claims it again from wherever the
             // follower now stands.
-            if (gap < 0.f ||
+            if (split ||
                 (gap <= FOLLOW_CATCH_UP_DONE_YARDS && FollowStepHolds(p, leader)))
             {
-                if (gap < 0.f)
+                if (split)
+                {
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is no longer on the map '{}' is on - its "
                              "catch-up walk ends, there is nowhere on this map to walk to",
                              name, leader->GetName());
+                    // ...AND THAT ENDING IS NOT THE END OF THE PROBLEM (#241).
+                    // The line above says a walk stopped. It does not say that
+                    // nothing will ever start another one, which is the fact an
+                    // operator needs and the one that used to go unsaid.
+                    SayPartySplit(name, p, leader);
+                }
                 else
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is back within {} yards of '{}' on ground it "
@@ -9081,10 +9159,23 @@ private:
         // line it is already depending on one discrete straight step per
         // attempt landing (MovementActions.cpp:1224), and this check has just
         // found that the step does not land - so there is nothing to preserve.
-        // A follower in formation - or on another map, which is what a
-        // negative gap means - is nothing this drive has an opinion about, and
-        // answering that first keeps every reading below off the common path.
-        if (gap <= FOLLOW_STALL_GAP_YARDS)
+        // A follower in formation is nothing this drive has an opinion about,
+        // and answering that first keeps every reading below off the common
+        // path.
+        //
+        // A FOLLOWER ON ANOTHER MAP USED TO TAKE THE SAME EXIT, and that is
+        // #241. A gap of -1 is `<= FOLLOW_STALL_GAP_YARDS`, so the two cases
+        // were indistinguishable here and the second one produced no line at
+        // all: measured 17:36:00 to 17:47 on 2026-09-05, eleven minutes, four
+        // followers, not one "is N yards behind" line and not one "re-aimed
+        // at" line for any of them. This drive still cannot walk anybody across
+        // an ocean and does not pretend to. It says so instead.
+        if (split)
+        {
+            SayPartySplit(name, p, leader);
+            return;
+        }
+        if (reading == OverseerDecisions::FollowGap::InFormation)
             return;
         // A dead follower is a ghost walking to its corpse, which is
         // DriveStuckRevival's business and not a distance from anybody; a
@@ -9103,7 +9194,7 @@ private:
         // Asked LAST, because it is the only reading here that walks terrain,
         // and by this point every cheaper reason to do nothing has been ruled
         // out.
-        bool const stranded = gap > FOLLOW_CATCH_UP_YARDS;
+        bool const stranded = reading == OverseerDecisions::FollowGap::Stranded;
         if (!stranded && FollowStepHolds(p, leader))
             return;
 
@@ -19962,6 +20053,13 @@ private:
                                 // not clobbered again every poll
     };
     std::map<std::string, FollowStallState> _followStall;
+
+    // Which map this follower's leader was on when the split was last said
+    // (#241). World thread only and unguarded, like _followStall beside it:
+    // losing it on a restart costs one repeated log line and no correctness.
+    // Erased by DriveCatchUp the moment the two are on one map again, so a
+    // family that splits, reunites and splits again is announced twice.
+    std::map<std::string, uint32> _partySplitSaid;
 
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
