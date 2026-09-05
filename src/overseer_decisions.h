@@ -100,9 +100,38 @@ constexpr char VERSION[] = "0.1.0";
 //
 // Airborne travel is deliberately off the land navmesh, so the adapter passes
 // those current player states here before any geometry is interpreted.
+//
+// AND A SCRIPTED FALL IS ONE OF THEM, which cost a dungeon run to learn.
+// mod-dungeon-clear drops the party down a shaft as a measured traversal step,
+// and one second into that fall a character is in open air: no polygon under
+// it by definition, and a surface reading from the lip it just left or the
+// cavern roof above. Live on 2026-09-05 in Wailing Caverns, at 14:25:27
+// "DropInHole: MoveFall from (-49.5,47.6,-29.0)" and at 14:25:28 this module
+// answered (-49.5, 47.6, -39.8) with a surface at 6.6, moved the tank, and at
+// 14:25:29 the other four logged "follow-tank: released (DC tank gone)". The
+// run lost its tank at the second of its two traversal moments and the
+// operator put him back by hand.
+//
+// The travel half of this module already knew: GroundedStep's comment says
+// "Explicit dungeon jump and drop steps do not use GroundedStep." The recovery
+// half was never told, and that is the whole of this defect.
+//
+// A FALLING CHARACTER SHOULD NEVER BE RECOVERED, scripted or not, and that is
+// the more general reason to put it here rather than special-casing dungeons.
+// Mid-air there is nothing to be right about: the position is changing every
+// tick, no polygon under a falling body means nothing, and a genuine fall out
+// of the world resolves itself within seconds when the character lands or
+// dies - at which point this rule gets a stable reading to judge, and the
+// death drive gets the other case. Recovering mid-fall is guesswork against a
+// number that will be stale before the teleport lands.
+//
+// The adapter reads it from Unit::IsFalling (Unit.h:1718), which is true both
+// for the client's own MOVEMENTFLAG_FALLING/FALLING_FAR and for a server-side
+// fall spline (Unit.cpp:15934-15938) - and the second of those is exactly what
+// MoveFall issues, so the scripted drop is covered by the same question.
 bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
-                               bool flying, bool inWater, bool onTransport,
-                               bool onVehicle);
+                               bool flying, bool falling, bool inWater,
+                               bool onTransport, bool onVehicle);
 
 // `surfaceValid` is separate from the number because the core has two invalid
 // height sentinels. Invalid data grants no permission to move a character.
@@ -207,6 +236,23 @@ enum class TerrainRemedy
     GiveUp,
 };
 
+// ONE POLL'S WORTH OF WORLD, as the adapter measured it. Grouped rather than
+// passed as eight positional arguments because the anchor below made this the
+// eighth, and a call site where two floats can be swapped without a compiler
+// noticing is a bad place to keep a character's map coordinates.
+struct TerrainReading
+{
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+    float surfaceAboveZ{0.f};
+    // `surfaceValid` is separate from the number because the core has two
+    // invalid height sentinels. Invalid data grants no permission to move.
+    bool surfaceValid{false};
+    bool hasLocalNavmesh{false};
+};
+
 struct TerrainRecoveryVerdict
 {
     TerrainRemedy remedy{TerrainRemedy::Nothing};
@@ -235,12 +281,33 @@ struct TerrainRecoveryLimits
     // the old unbounded behaviour and is offered only so a caller can say so
     // deliberately rather than by passing a number that looks like a bound.
     time_t forgetSeconds{0};
+    // HOW FAR A CHARACTER MAY MOVE AND STILL BE IN THE SAME INCIDENT. It has
+    // to be comfortably more than the walk back from wherever a remedy puts
+    // it, or every repetition would look like a fresh first occurrence and the
+    // ladder would never bound anything: the measured walk back from the
+    // leader's bind point was 140 yards. It also has to be far less than the
+    // 1,900-yard displacements the fallback produces, so that being thrown
+    // across a continent does end the episode. A map change ends it outright
+    // and needs no distance. ZERO DISABLES THE DISTANCE TEST and leaves only
+    // the map check, which is a defensible choice and has to be written.
+    float episodeRadius{0.f};
 };
 
 // What one character's terrain recovery remembers between polls. Kept inside
 // the adapter's own per-character state, world-thread only and unguarded, like
 // RatchetState and the give refusals: losing it on a restart costs one extra
 // lift and no correctness.
+//
+// AN EPISODE IS A PLACE, NOT JUST A STRETCH OF TIME, and that was learned the
+// expensive way. The first version of this remembered only how many remedies
+// had been applied and when, so "the same condition again" meant nothing more
+// than "again". Live on 2026-09-05 a lift on map 1 at 13:48 left a rung
+// standing, and at 14:25 on map 43 - a different map, a different incident, 37
+// minutes later - that leftover rung chose the fallback instead of the lift.
+// The fallback is a bind-point teleport, so it ejected the tank from the
+// instance and the run lost it. A ladder is only a fair bound on repetition if
+// the thing it is counting really is a repetition, so the episode is anchored
+// where it started and abandoned when the character is somewhere else.
 struct TerrainRecoveryState
 {
     // Remedies applied in the current unbroken episode. This is the bound.
@@ -252,8 +319,28 @@ struct TerrainRecoveryState
     // minute later still gets the lift first, rather than being handed the
     // fallback because a warning had used the lift's turn.
     bool saidOnGround{false};
-    // When this episode was last touched by either of those; 0 = no memory.
+    // WHEN THIS MODULE LAST ACTUALLY DID SOMETHING, and deliberately not when
+    // it last saw the condition. A poll that issues nothing must not extend
+    // the episode, or the episode never ends anywhere the overhead geometry is
+    // permanent. Live on 2026-09-05: inside Wailing Caverns every poll reads a
+    // large gap over a live polygon, so refreshing the clock on those quiet
+    // polls kept one character's episode alive for 37 minutes across two maps,
+    // and a ladder rung left over from a lift on map 1 at 13:48 decided what
+    // happened to a fall on map 43 at 14:25. It was the bind point, and it
+    // ejected him from the instance. 0 = no memory.
     time_t lastAttempt{0};
+    // WHEN THE CONDITION WAS LAST TRUE, which is what the forget window is
+    // measured from. Deliberately not `lastAttempt`: the window asks "has this
+    // character been FINE for a while", and a module that is out of remedies
+    // and has gone quiet is not evidence that anything got better.
+    time_t lastHeld{0};
+    // WHERE THIS EPISODE STARTED. Anchored on the first poll that holds, and
+    // the episode is abandoned when the character turns up on another map or
+    // more than `episodeRadius` away.
+    bool anchored{false};
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
 };
 
 // One poll, for one character. Reads the two predicates above for the
@@ -269,9 +356,7 @@ struct TerrainRecoveryState
 // way round that fact allows: true is trusted and never overruled, false only
 // opens the bounded ladder rather than authorizing a displacement outright.
 TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
-                                           float currentZ, float surfaceAboveZ,
-                                           bool surfaceValid,
-                                           bool hasLocalNavmesh,
+                                           TerrainReading const& reading,
                                            TerrainRecoveryLimits const& limits,
                                            time_t now);
 

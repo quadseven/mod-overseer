@@ -19,6 +19,7 @@
 using OverseerDecisions::BelowTerrainNeedsRecovery;
 using OverseerDecisions::LargeSurfaceMismatchNeedsRecovery;
 using OverseerDecisions::TerrainRecoveryMayInspect;
+using OverseerDecisions::TerrainReading;
 using OverseerDecisions::TerrainRecoveryState;
 using OverseerDecisions::TerrainRecoveryStep;
 using OverseerDecisions::TerrainRecoveryVerdict;
@@ -47,22 +48,24 @@ void TheMeasuredGapIsRecovered()
 void DeliberatelyAirborneStatesAreLeftAlone()
 {
     Check("ordinary living character is inspectable",
-          TerrainRecoveryMayInspect(true, false, false, false, false, false, false),
-          true);
+          TerrainRecoveryMayInspect(true, false, false, false, false, false, false,
+                                    false), true);
     Check("dead character", TerrainRecoveryMayInspect(
-              false, false, false, false, false, false, false), false);
+              false, false, false, false, false, false, false, false), false);
     Check("teleport in progress", TerrainRecoveryMayInspect(
-              true, true, false, false, false, false, false), false);
+              true, true, false, false, false, false, false, false), false);
     Check("taxi flight", TerrainRecoveryMayInspect(
-              true, false, true, false, false, false, false), false);
+              true, false, true, false, false, false, false, false), false);
     Check("free flight", TerrainRecoveryMayInspect(
-              true, false, false, true, false, false, false), false);
+              true, false, false, true, false, false, false, false), false);
+    Check("falling", TerrainRecoveryMayInspect(
+              true, false, false, false, true, false, false, false), false);
     Check("swimming", TerrainRecoveryMayInspect(
-              true, false, false, false, true, false, false), false);
+              true, false, false, false, false, true, false, false), false);
     Check("transport", TerrainRecoveryMayInspect(
-              true, false, false, false, false, true, false), false);
+              true, false, false, false, false, false, true, false), false);
     Check("vehicle", TerrainRecoveryMayInspect(
-              true, false, false, false, false, false, true), false);
+              true, false, false, false, false, false, false, true), false);
 }
 
 void TheBoundaryIsARecovery()
@@ -113,8 +116,27 @@ OverseerDecisions::TerrainRecoveryLimits const LIVE_LIMITS{
     10.f,   // minimumGap, as the adapter passes
     25.f,   // overrideGap, as the adapter passes
     0.5f,   // liftClearance
-    600     // forgetSeconds
+    600,    // forgetSeconds
+    250.f   // episodeRadius
 };
+
+// The live incidents all happened at real coordinates, and the episode rules
+// now read them, so the tests name a place. `Here` is one arbitrary spot that
+// several cases share when the place is not the point; the cases about place
+// name their own.
+TerrainReading Here(float z, float surfaceAboveZ, bool hasLocalNavmesh,
+                    uint32_t mapId = 0, float x = -9058.3f, float y = -45.4f)
+{
+    TerrainReading r;
+    r.mapId = mapId;
+    r.x = x;
+    r.y = y;
+    r.z = z;
+    r.surfaceAboveZ = surfaceAboveZ;
+    r.surfaceValid = true;
+    r.hasLocalNavmesh = hasLocalNavmesh;
+    return r;
+}
 
 char const* Name(TerrainRemedy r)
 {
@@ -153,16 +175,14 @@ void TheArchOnTheNorthshireRoadIsNotAFallThroughTheWorld()
     // Detour found ground at the character's own feet. It is walking under an
     // arch, and the only correct thing to do with it is nothing.
     TerrainRecoveryState state;
-    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
-        state, 88.6f, 116.8f, true, true, LIVE_LIMITS, 1000);
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(state, Here(88.6f, 116.8f, true), LIVE_LIMITS, 1000);
     CheckRemedy("z 88.6, surface 116.8, WITH a local polygon", v.remedy,
                 TerrainRemedy::GiveUp);
 
     // And it is said exactly once. The old rule moved this character 79 times.
     for (time_t t = 1001; t < 1100; ++t)
     {
-        TerrainRecoveryVerdict const again = TerrainRecoveryStep(
-            state, 88.6f, 116.8f, true, true, LIVE_LIMITS, t);
+        TerrainRecoveryVerdict const again = TerrainRecoveryStep(state, Here(88.6f, 116.8f, true), LIVE_LIMITS, t);
         CheckRemedy("the same arch, one poll later", again.remedy,
                     TerrainRemedy::Nothing);
     }
@@ -174,8 +194,7 @@ void TheArchOnTheNorthshireRoadIsNotAFallThroughTheWorld()
 void NoPolygonIsLiftedToTheSurfaceAboveIt()
 {
     TerrainRecoveryState state;
-    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
-        state, 88.6f, 116.8f, true, false, LIVE_LIMITS, 1000);
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 1000);
     CheckRemedy("z 88.6, surface 116.8, no local navmesh", v.remedy,
                 TerrainRemedy::LiftToSurface);
     CheckNear("the lift lands just above the surface it read", v.liftZ, 117.3f);
@@ -188,8 +207,7 @@ void NoPolygonIsLiftedToTheSurfaceAboveIt()
 void TheVendorUnderTheTowerIsNeverDisplaced()
 {
     TerrainRecoveryState state;
-    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
-        state, 60.5f, 97.9f, true, true, LIVE_LIMITS, 1000);
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(state, Here(60.5f, 97.9f, true), LIVE_LIMITS, 1000);
     CheckRemedy("standing at a vendor under a 37-yard tower", v.remedy,
                 TerrainRemedy::GiveUp);
     Check("a live polygon is never displaced",
@@ -208,8 +226,7 @@ void ARepeatedConditionIsABoundedSeriesAndThenSilence()
     // 396 minutes the live worldserver ran.
     for (time_t t = 0; t < 396 * 60; t += 14)
     {
-        TerrainRecoveryVerdict const v = TerrainRecoveryStep(
-            state, 88.6f, 116.8f, true, false, LIVE_LIMITS, t);
+        TerrainRecoveryVerdict const v = TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, t);
         switch (v.remedy)
         {
             case TerrainRemedy::LiftToSurface: ++lifts; break;
@@ -231,27 +248,22 @@ void ARemedyThatDidNotStickClimbsRatherThanRepeating()
 {
     TerrainRecoveryState state;
     CheckRemedy("first occurrence",
-                TerrainRecoveryStep(state, 88.6f, 116.8f, true, false,
-                                    LIVE_LIMITS, 100).remedy,
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 100).remedy,
                 TerrainRemedy::LiftToSurface);
     // The lift moved it, so the very next poll is clean. That is not the end
     // of the episode.
     CheckRemedy("the poll right after the lift",
-                TerrainRecoveryStep(state, 117.3f, 117.3f, true, true,
-                                    LIVE_LIMITS, 101).remedy,
+                TerrainRecoveryStep(state, Here(117.3f, 117.3f, true), LIVE_LIMITS, 101).remedy,
                 TerrainRemedy::Nothing);
     // Fourteen seconds later it is back under the arch.
     CheckRemedy("back in the same condition fourteen seconds later",
-                TerrainRecoveryStep(state, 88.6f, 116.8f, true, false,
-                                    LIVE_LIMITS, 115).remedy,
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 115).remedy,
                 TerrainRemedy::SendToBind);
     CheckRemedy("and again after that",
-                TerrainRecoveryStep(state, 88.6f, 116.8f, true, false,
-                                    LIVE_LIMITS, 129).remedy,
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 129).remedy,
                 TerrainRemedy::GiveUp);
     CheckRemedy("and then it stops",
-                TerrainRecoveryStep(state, 88.6f, 116.8f, true, false,
-                                    LIVE_LIMITS, 143).remedy,
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 143).remedy,
                 TerrainRemedy::Nothing);
 }
 
@@ -261,15 +273,13 @@ void AQuietSpellEndsTheEpisode()
 {
     TerrainRecoveryState state;
     CheckRemedy("first occurrence",
-                TerrainRecoveryStep(state, 88.6f, 116.8f, true, false,
-                                    LIVE_LIMITS, 100).remedy,
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 100).remedy,
                 TerrainRemedy::LiftToSurface);
     // Ten minutes of nothing wrong.
     for (time_t t = 101; t <= 100 + 600; ++t)
-        TerrainRecoveryStep(state, 117.3f, 117.3f, true, true, LIVE_LIMITS, t);
+        TerrainRecoveryStep(state, Here(117.3f, 117.3f, true), LIVE_LIMITS, t);
     CheckRemedy("a genuinely new episode starts at the first rung",
-                TerrainRecoveryStep(state, 88.6f, 116.8f, true, false,
-                                    LIVE_LIMITS, 100 + 601).remedy,
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 100 + 601).remedy,
                 TerrainRemedy::LiftToSurface);
 }
 
@@ -281,8 +291,10 @@ void AQuietSpellEndsTheEpisode()
 void AnUnknownSurfaceNeverProducesALift()
 {
     TerrainRecoveryState state;
-    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
-        state, 88.6f, -200000.f, false, false, LIVE_LIMITS, 1000);
+    TerrainReading unknown = Here(88.6f, -200000.f, false);
+    unknown.surfaceValid = false;
+    TerrainRecoveryVerdict const v =
+        TerrainRecoveryStep(state, unknown, LIVE_LIMITS, 1000);
     CheckRemedy("invalid surface reading", v.remedy, TerrainRemedy::Nothing);
     CheckNear("and no height is offered with it", v.liftZ, 0.f);
 }
@@ -292,8 +304,7 @@ void AnOrdinaryCharacterIsLeftAloneAndForgotten()
 {
     TerrainRecoveryState state;
     CheckRemedy("surface two yards above the character",
-                TerrainRecoveryStep(state, 60.f, 62.f, true, true, LIVE_LIMITS,
-                                    1000).remedy,
+                TerrainRecoveryStep(state, Here(60.f, 62.f, true), LIVE_LIMITS, 1000).remedy,
                 TerrainRemedy::Nothing);
     Check("nothing is remembered about it", state.attempts == 0u, true);
 }
@@ -305,8 +316,7 @@ void AnOrdinaryCharacterIsLeftAloneAndForgotten()
 void TheOriginalCityIncidentStillRecovers()
 {
     TerrainRecoveryState state;
-    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
-        state, 60.f, 95.f, true, false, LIVE_LIMITS, 1000);
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(state, Here(60.f, 95.f, false), LIVE_LIMITS, 1000);
     CheckRemedy("35 yards below a city floor with no polygon", v.remedy,
                 TerrainRemedy::LiftToSurface);
     CheckNear("lifted onto that floor", v.liftZ, 95.5f);
@@ -323,11 +333,11 @@ void AZeroForgetWindowIsTheOldUnboundedBehaviourAndSaysSo()
     int lifts = 0;
     for (time_t t = 0; t < 100; t += 2)
     {
-        if (TerrainRecoveryStep(state, 88.6f, 116.8f, true, false, noMemory, t)
+        if (TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), noMemory, t)
                 .remedy == TerrainRemedy::LiftToSurface)
             ++lifts;
         // The remedy works for exactly one poll, as every remedy does.
-        TerrainRecoveryStep(state, 117.3f, 117.3f, true, true, noMemory, t + 1);
+        TerrainRecoveryStep(state, Here(117.3f, 117.3f, true), noMemory, t + 1);
     }
     Check("a zero forget window forgets every episode immediately",
           lifts == 50, true);
@@ -339,17 +349,151 @@ void AWarningDoesNotSpendTheLiftARealFallWouldNeed()
 {
     TerrainRecoveryState state;
     CheckRemedy("walking under the arch",
-                TerrainRecoveryStep(state, 88.6f, 116.8f, true, true,
-                                    LIVE_LIMITS, 100).remedy,
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, true), LIVE_LIMITS, 100).remedy,
                 TerrainRemedy::GiveUp);
     // Sixty seconds later, at the same place, with no polygon under it.
-    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
-        state, 88.6f, 116.8f, true, false, LIVE_LIMITS, 160);
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 160);
     CheckRemedy("and then it really does go under the world", v.remedy,
                 TerrainRemedy::LiftToSurface);
     CheckNear("still lifted to the surface, not sent anywhere", v.liftZ, 117.3f);
 }
 
+
+// ---------------------------------------------------------------------------
+// THE SCRIPTED FALL, Wailing Caverns, 2026-09-05. mod-dungeon-clear drops the
+// party down a shaft as a measured traversal step. One second into the drop
+// this module moved the tank, and one second after that the other four logged
+// "follow-tank: released (DC tank gone)".
+//
+//   14:25:27  [dungeon-clear] Grug DropInHole: MoveFall from (-49.5,47.6,-29.0)
+//   14:25:28  overseer: 'Grug' ... map 43 position (-49.5, 47.6, -39.8),
+//             surface z 6.6, no local navmesh
+//
+// Same x and y, 10.8 yards below the lip it left, one second in.
+// ---------------------------------------------------------------------------
+
+// The adapter's own composition, in the order mod_overseer.cpp asks it: may
+// this module have an opinion at all, and only then what the readings mean.
+// Written out here so the live shape can be asked as ONE question - what does
+// this module DO about a character in this state - which is the question that
+// was got wrong.
+TerrainRecoveryVerdict Poll(TerrainRecoveryState& state, bool falling,
+                            TerrainReading const& reading, time_t now)
+{
+    if (!TerrainRecoveryMayInspect(/*alive*/ true, /*teleporting*/ false,
+                                   /*inFlight*/ false, /*flying*/ false,
+                                   falling, /*inWater*/ false,
+                                   /*onTransport*/ false, /*onVehicle*/ false))
+        return TerrainRecoveryVerdict{};
+    return TerrainRecoveryStep(state, reading, LIVE_LIMITS, now);
+}
+
+// The shaft in Wailing Caverns: map 43, the lip at (-49.5, 47.6, -29.0) and
+// the floor at -105.83, with the surface probe answering 6.6 from far above.
+TerrainReading Shaft(float z, bool hasLocalNavmesh = false)
+{
+    return Here(z, 6.6f, hasLocalNavmesh, 43, -49.5f, 47.6f);
+}
+
+void AScriptedFallIsNeverRecovered()
+{
+    // The live readings, one second into DropInHole.
+    TerrainRecoveryState falling;
+    CheckRemedy("mid-fall down the Wailing Caverns shaft",
+                Poll(falling, true, Shaft(-39.8f), 1000).remedy,
+                TerrainRemedy::Nothing);
+    Check("and nothing is remembered about a state we may not judge",
+          falling.attempts == 0u && !falling.saidOnGround, true);
+
+    // The whole fall, at the poll cadence, all the way down to the floor at
+    // -105.83. Not one of them may produce a remedy.
+    TerrainRecoveryState whole;
+    for (float z = -29.0f; z > -105.83f; z -= 10.8f)
+        CheckRemedy("every second of the drop",
+                    Poll(whole, true, Shaft(z), 1000).remedy,
+                    TerrainRemedy::Nothing);
+
+    // AND THE GUARD IS THE ONLY THING STANDING THERE. The same readings from a
+    // character that is NOT falling still get the lift, so this is a stand-down
+    // on the character's state and not a quiet weakening of the rule.
+    TerrainRecoveryState standing;
+    TerrainRecoveryVerdict const v = Poll(standing, false, Shaft(-39.8f), 1000);
+    CheckRemedy("the same readings, not falling", v.remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckNear("lifted to the surface as before", v.liftZ, 7.1f);
+}
+
+void EveryDeliberatelyAirborneStateStandsDown()
+{
+    Check("ordinary living character is inspectable",
+          TerrainRecoveryMayInspect(true, false, false, false, false, false, false, false),
+          true);
+    Check("falling", TerrainRecoveryMayInspect(
+              true, false, false, false, true, false, false, false), false);
+}
+
+// THE OTHER HALF OF THE SAME INCIDENT, and the reason the tank got the bind
+// point rather than a lift. The ladder had a rung left over from a lift on map
+// 1 at 13:48:14 (-594.3, -2014.6, 61.0), and 37 minutes later at 14:25:28 on
+// map 43 that rung chose SendToBind for a completely unrelated incident. The
+// bind teleport is what ejected him from the instance.
+void ARungDoesNotFollowACharacterToAnotherIncident()
+{
+    // The lift that set the rung: map 1, 13:48:14.
+    TerrainRecoveryState state;
+    CheckRemedy("the lift that sets the rung",
+                TerrainRecoveryStep(state, Here(61.0f, 80.5f, false, 1, -594.3f,
+                                                -2014.6f),
+                                    LIVE_LIMITS, 0).remedy,
+                TerrainRemedy::LiftToSurface);
+
+    // The condition holds continuously from then on, so nothing this rule can
+    // measure about TIME will end the episode. That is the trap: an episode
+    // that only ends on a clean poll cannot end where there are none, and a
+    // cave is such a place.
+    for (time_t t = 1; t < 2220; ++t)
+        TerrainRecoveryStep(state, Here(15.4f, 45.9f, true, 1, -594.3f, -2014.6f),
+                            LIVE_LIMITS, t);
+
+    // 14:25:28, map 43. A different map is a different incident, so this gets
+    // the first rung - a LIFT - and never the bind point that ejected the tank.
+    TerrainRecoveryVerdict const v =
+        TerrainRecoveryStep(state, Shaft(-39.8f), LIVE_LIMITS, 2220);
+    CheckRemedy("a new map is a new incident", v.remedy,
+                TerrainRemedy::LiftToSurface);
+    Check("and above all it is not the bind point",
+          v.remedy != TerrainRemedy::SendToBind, true);
+}
+
+// Distance ends an episode too, so a character thrown 1,900 yards by the
+// fallback is not still inside the incident it was thrown out of. The radius
+// has to stay larger than the 140-yard walk back from the bind point, or every
+// repetition would look like a first occurrence and nothing would be bounded.
+void DistanceEndsAnEpisodeButAWalkBackDoesNot()
+{
+    TerrainRecoveryState nearby;
+    CheckRemedy("the first occurrence",
+                TerrainRecoveryStep(nearby, Here(88.6f, 116.8f, false),
+                                    LIVE_LIMITS, 0).remedy,
+                TerrainRemedy::LiftToSurface);
+    // The measured walk back from the leader's bind point was 140 yards.
+    CheckRemedy("a 140-yard walk back is the SAME incident",
+                TerrainRecoveryStep(nearby, Here(88.6f, 116.8f, false, 0, -9058.3f,
+                                                 -185.4f),
+                                    LIVE_LIMITS, 14).remedy,
+                TerrainRemedy::SendToBind);
+
+    TerrainRecoveryState distant;
+    CheckRemedy("the first occurrence",
+                TerrainRecoveryStep(distant, Here(88.6f, 116.8f, false),
+                                    LIVE_LIMITS, 0).remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckRemedy("but a thousand yards away is a different one",
+                TerrainRecoveryStep(distant, Here(88.6f, 116.8f, false, 0, -8058.3f,
+                                                  -45.4f),
+                                    LIVE_LIMITS, 14).remedy,
+                TerrainRemedy::LiftToSurface);
+}
 }  // namespace
 
 int main()
@@ -373,6 +517,11 @@ int main()
     TheOriginalCityIncidentStillRecovers();
     AWarningDoesNotSpendTheLiftARealFallWouldNeed();
     AZeroForgetWindowIsTheOldUnboundedBehaviourAndSaysSo();
+
+    AScriptedFallIsNeverRecovered();
+    EveryDeliberatelyAirborneStateStandsDown();
+    ARungDoesNotFollowACharacterToAnotherIncident();
+    DistanceEndsAnEpisodeButAWalkBackDoesNot();
 
     if (failures)
     {

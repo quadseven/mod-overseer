@@ -97,11 +97,11 @@ void AppendDeclared(std::vector<BuildFact>& facts, std::string const& name,
 }  // namespace
 
 bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
-                               bool flying, bool inWater, bool onTransport,
-                               bool onVehicle)
+                               bool flying, bool falling, bool inWater,
+                               bool onTransport, bool onVehicle)
 {
-    return alive && !teleporting && !inFlight && !flying && !inWater &&
-           !onTransport && !onVehicle;
+    return alive && !teleporting && !inFlight && !flying && !falling &&
+           !inWater && !onTransport && !onVehicle;
 }
 
 bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
@@ -124,38 +124,84 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= overrideGap;
 }
 
+namespace
+{
+
+// Squared comparison so this file keeps needing nothing but its own header:
+// <cmath> for a square root would end the "includes its own header and nothing
+// else" property that the header exists to protect, the same reason
+// StepMayBridgeGap folds its sign by hand.
+bool WithinRadius(float ax, float ay, float bx, float by, float radius)
+{
+    float const dx = bx - ax;
+    float const dy = by - ay;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+}  // namespace
+
 TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
-                                           float currentZ, float surfaceAboveZ,
-                                           bool surfaceValid,
-                                           bool hasLocalNavmesh,
+                                           TerrainReading const& reading,
                                            TerrainRecoveryLimits const& limits,
                                            time_t now)
 {
+    // THE EPISODE IS ABANDONED FIRST, BEFORE ANYTHING IS DECIDED, and on every
+    // poll rather than only on a clean one. An episode that can only end when
+    // the condition goes false cannot end at all where the condition never
+    // does, and a cave is exactly such a place: on 2026-09-05 a rung survived
+    // 37 minutes and two maps that way and spent itself on an unrelated
+    // incident. Three separate things end it, and each catches a case the
+    // others do not.
+    if (limits.forgetSeconds <= 0)
+    {
+        // No memory was asked for. Every poll is a first occurrence.
+        state = TerrainRecoveryState{};
+    }
+    else if (state.lastHeld && now - state.lastHeld >= limits.forgetSeconds)
+    {
+        // The character has been fine for long enough that the next thing to
+        // go wrong is a new thing.
+        state = TerrainRecoveryState{};
+    }
+    else if (state.anchored &&
+             (state.mapId != reading.mapId ||
+              (limits.episodeRadius > 0.f &&
+               !WithinRadius(state.x, state.y, reading.x, reading.y,
+                             limits.episodeRadius))))
+    {
+        // Somewhere else entirely. Whatever is wrong here, the ladder climbed
+        // over there has nothing to say about it.
+        state = TerrainRecoveryState{};
+    }
+
     // The condition is exactly what the adapter asked before: the two
     // predicates above, unchanged, in the same order. Only what happens next
     // is new.
     bool const holds =
-        BelowTerrainNeedsRecovery(currentZ, surfaceAboveZ, surfaceValid,
-                                  hasLocalNavmesh, limits.minimumGap) ||
-        LargeSurfaceMismatchNeedsRecovery(currentZ, surfaceAboveZ, surfaceValid,
-                                          hasLocalNavmesh, limits.overrideGap);
-
+        BelowTerrainNeedsRecovery(reading.z, reading.surfaceAboveZ,
+                                  reading.surfaceValid, reading.hasLocalNavmesh,
+                                  limits.minimumGap) ||
+        LargeSurfaceMismatchNeedsRecovery(reading.z, reading.surfaceAboveZ,
+                                          reading.surfaceValid,
+                                          reading.hasLocalNavmesh,
+                                          limits.overrideGap);
     if (!holds)
-    {
-        // A CLEAN POLL IS NOT THE END OF AN EPISODE. Every remedy makes the
-        // condition false for at least one poll - that is what a remedy is -
-        // so forgetting here would forget the attempt that just happened and
-        // hand the next occurrence a fresh first rung, forever. The episode
-        // ends when the character has been fine for `forgetSeconds`, and a
-        // zero forget means the caller asked for no memory at all.
-        if ((state.attempts || state.saidOnGround) && limits.forgetSeconds > 0 &&
-            now - state.lastAttempt < limits.forgetSeconds)
-            return TerrainRecoveryVerdict{};
-        state = TerrainRecoveryState{};
         return TerrainRecoveryVerdict{};
+
+    // The condition is live, so the forget window starts again from here and
+    // the episode learns where it is. Both happen even on a poll that goes on
+    // to issue nothing, because both are statements about the WORLD rather
+    // than about what this module did.
+    state.lastHeld = now;
+    if (!state.anchored)
+    {
+        state.anchored = true;
+        state.mapId = reading.mapId;
+        state.x = reading.x;
+        state.y = reading.y;
     }
 
-    if (hasLocalNavmesh)
+    if (reading.hasLocalNavmesh)
     {
         // DETOUR FOUND WALKABLE GROUND AT THIS CHARACTER'S OWN FEET, so it is
         // standing on walkable ground and the gap above it is a roof. Nothing
@@ -164,10 +210,10 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         // should stop asking about that place) or a misleading lower plane
         // (and a person needs to go and look). Silence would be the answer to
         // neither.
-        state.lastAttempt = now;
         if (state.saidOnGround)
             return TerrainRecoveryVerdict{};
         state.saidOnGround = true;
+        state.lastAttempt = now;
         return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
     }
 
@@ -176,18 +222,21 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
     // tuning knob. `surfaceValid` is already true here - neither predicate
     // above returns true without it - so the lift height is a real reading
     // and never a sentinel.
-    state.lastAttempt = now;
     switch (state.attempts)
     {
         case 0:
             state.attempts = 1;
-            return TerrainRecoveryVerdict{TerrainRemedy::LiftToSurface,
-                                          surfaceAboveZ + limits.liftClearance};
+            state.lastAttempt = now;
+            return TerrainRecoveryVerdict{
+                TerrainRemedy::LiftToSurface,
+                reading.surfaceAboveZ + limits.liftClearance};
         case 1:
             state.attempts = 2;
+            state.lastAttempt = now;
             return TerrainRecoveryVerdict{TerrainRemedy::SendToBind, 0.f};
         case 2:
             state.attempts = 3;
+            state.lastAttempt = now;
             return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
         default:
             // Said and done. Staying quiet is the point of this rung.

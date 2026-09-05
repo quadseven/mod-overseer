@@ -299,12 +299,24 @@ constexpr float TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS = 0.5f;
 // then falls through the world gets the whole ladder again, which is right.
 constexpr time_t TERRAIN_RECOVERY_FORGET_SECONDS = 600;
 
+// HOW FAR A CHARACTER MAY MOVE AND STILL BE INSIDE THE SAME INCIDENT. Bounded
+// from both directions by measurements, which is why it is not a round guess.
+// It must be well ABOVE the 140-yard walk back from the leader's bind point,
+// or every repetition would present as a fresh first occurrence and the ladder
+// would bound nothing. It must be well BELOW the 1,900-yard displacements the
+// fallback itself produces, so that being thrown across a continent really
+// does end the episode. A map change ends it outright and needs no distance:
+// on 2026-09-05 a rung set on map 1 was still standing 37 minutes later on map
+// 43, where it chose the bind point for a scripted fall and ejected the tank.
+constexpr float TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS = 250.0f;
+
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
 constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_GAP_YARDS, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS,
-    TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS};
+    TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS,
+    TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -10615,36 +10627,50 @@ private:
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot)
                 continue;
-            // A taxi, flying mount, boat, vehicle or swimmer is deliberately
-            // away from a land navmesh. Elevated geometry above one of those
-            // states is not proof that it fell through the world.
+            // A taxi, flying mount, boat, vehicle, swimmer or FALLING BODY is
+            // deliberately away from a land navmesh. Elevated geometry above
+            // one of those states is not proof that it fell through the world.
+            //
+            // IsFalling covers the scripted drop, which is the point of it
+            // being here: it is true for a server-side fall spline as well as
+            // for the client's own falling flags (Unit.cpp:15934-15938), and
+            // mod-dungeon-clear's DropInHole issues exactly such a spline. A
+            // stand-down deliberately leaves this character's memory alone -
+            // "I am not entitled to an opinion right now" is not evidence that
+            // anything is either wrong or fine.
             if (!OverseerDecisions::TerrainRecoveryMayInspect(
                     bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
-                    bot->IsFlying(), bot->IsInWater(), bot->GetTransport() != nullptr,
-                    bot->GetVehicle() != nullptr))
+                    bot->IsFlying(), bot->IsFalling(), bot->IsInWater(),
+                    bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr))
                 continue;
 
-            float surface = 0.f;
-            bool const surfaceValid = SurfaceAbove(bot, surface);
+            OverseerDecisions::TerrainReading reading;
+            reading.mapId = bot->GetMapId();
+            reading.x = bot->GetPositionX();
+            reading.y = bot->GetPositionY();
+            reading.z = bot->GetPositionZ();
+            reading.surfaceValid = SurfaceAbove(bot, reading.surfaceAboveZ);
             // Most characters see their own footing again and stop here. Ask
             // the pure rule first with the conservative no-navmesh answer so
             // four Detour probes are paid only where the vertical gap itself
             // could possibly require recovery. A miss still goes through the
-            // remedy below, because a clean poll is what expires this
-            // character's memory of the last one - see TerrainRecoveryStep.
+            // remedy below, because the episode bookkeeping is in there and a
+            // poll that skipped it would be a poll the memory never saw.
             bool const gapCouldMatter = OverseerDecisions::BelowTerrainNeedsRecovery(
-                bot->GetPositionZ(), surface, surfaceValid, false,
+                reading.z, reading.surfaceAboveZ, reading.surfaceValid, false,
                 TERRAIN_RECOVERY_GAP_YARDS);
-            bool const hasLocalNavmesh = gapCouldMatter && HasLocalNavmesh(bot);
+            reading.hasLocalNavmesh = gapCouldMatter && HasLocalNavmesh(bot);
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
             OverseerDecisions::TerrainRecoveryVerdict const verdict =
                 OverseerDecisions::TerrainRecoveryStep(
-                    memory, bot->GetPositionZ(), surface, surfaceValid,
-                    hasLocalNavmesh, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
+                    memory, reading, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::Nothing)
                 continue;
+
+            float const surface = reading.surfaceAboveZ;
+            bool const hasLocalNavmesh = reading.hasLocalNavmesh;
 
             uint16 const fromMap = static_cast<uint16>(bot->GetMapId());
             float const fromX = bot->GetPositionX();
@@ -10750,14 +10776,22 @@ private:
             ClearAim(name);
             bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
                             home->m_homebindY, home->m_homebindZ, 0.f);
+            // SAYS WHAT IS ACTUALLY KNOWN, which is that a lift was this
+            // character's previous rung - not that one was tried at these
+            // coordinates. The first version of this line asserted the
+            // stronger thing and was false the one time it mattered: on
+            // 2026-09-05 the rung was left over from a lift on another map 37
+            // minutes earlier, and the line claimed a lift had been tried at a
+            // spot nothing had ever been tried at.
             LOG_WARN("module.overseer",
                      "overseer: '{}' recovered at map {} position ({:.1f}, {:.1f}, {:.1f}), "
-                     "surface z {:.1f}, no local navmesh; A LIFT TO z {:.1f} WAS TRIED "
-                     "FIRST AND DID NOT STICK, so this is the fallback: aim job='{}' "
-                     "quest={} travel='{}' last aimed position map {} ({:.1f}, {:.1f}, "
-                     "{:.1f}); sent to '{}'s bind point; it was not resurrected",
+                     "surface z {:.1f} ({:.1f} yards up), no local navmesh; a lift was this "
+                     "character's previous rung and the condition is back, so this is the "
+                     "fallback: aim job='{}' quest={} travel='{}' last aimed position map "
+                     "{} ({:.1f}, {:.1f}, {:.1f}); sent to '{}'s bind point; it was not "
+                     "resurrected",
                      name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                     surface, surface + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, job,
+                     surface, surface - fromZ, job,
                      questAim, travelTarget, static_cast<uint32>(aimedMap),
                      aimedX, aimedY, aimedZ, home->GetName());
         } while (result->NextRow());
