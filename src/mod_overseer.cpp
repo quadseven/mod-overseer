@@ -5774,6 +5774,13 @@ private:
                 std::string(creatureTemplate->Name).rfind("[DND] TAR Pedestal", 0) == 0)
                 continue;
 
+            // Morley Eberlein's only map-0 spawn is stored at z=90.5 while
+            // the local surface is about z=109.6. It is a real vendor, but
+            // routing a travel errand to that row drops the family into the
+            // Stormwind/Elwynn hole before the sale can happen.
+            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) && data.id == 959)
+                continue;
+
             TravelSpawn spawn;
             spawn.entry = data.id;
             spawn.mapId = data.mapid;
@@ -16672,6 +16679,7 @@ private:
         {
             return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR)
                 && std::string(creature->GetName()).rfind("[DND] TAR Pedestal", 0) != 0
+                && creature->GetEntry() != 959
                 && from->IsWithinDistInMap(creature, range);
         }
     };
