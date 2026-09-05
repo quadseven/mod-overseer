@@ -2307,4 +2307,81 @@ TownRetry BuyRefusalRetry(std::string const& detail)
     return TownRetry::Later;
 }
 
+char const* DeathDriverName(DeathDriver driver)
+{
+    switch (driver)
+    {
+        case DeathDriver::Unknown:      return "unknown";
+        case DeathDriver::Recovery:     return "recovery";
+        case DeathDriver::Errand:       return "errand";
+        case DeathDriver::Following:    return "following";
+        case DeathDriver::Fighting:     return "fighting";
+        case DeathDriver::Thrown:       return "thrown";
+        case DeathDriver::Idle:         return "idle";
+        case DeathDriver::Unattributed: return "unattributed";
+    }
+    return "unknown";
+}
+
+char const* MoveGeneratorName(MoveGenerator generator)
+{
+    switch (generator)
+    {
+        case MoveGenerator::Unsampled: return "";
+        case MoveGenerator::Idle:      return "idle";
+        case MoveGenerator::Follow:    return "follow";
+        case MoveGenerator::Point:     return "point";
+        case MoveGenerator::Chase:     return "chase";
+        case MoveGenerator::Flee:      return "flee";
+        case MoveGenerator::Thrown:    return "effect";
+        case MoveGenerator::Other:     return "other";
+    }
+    return "";
+}
+
+DeathDriver NameTheDriver(DeathAttribution const& a)
+{
+    if (!a.sampled || a.movement == MoveGenerator::Unsampled)
+        return DeathDriver::Unknown;
+
+    // This module's own remedy, and it outranks the generator on purpose - see
+    // the header. A window of zero is a caller saying "never attribute a death
+    // to a recovery", and a negative age is "there has never been one".
+    if (a.recoveryWindow > 0 && a.recoverySeconds >= 0 &&
+        a.recoverySeconds <= a.recoveryWindow)
+        return DeathDriver::Recovery;
+
+    switch (a.movement)
+    {
+        case MoveGenerator::Thrown:
+            return DeathDriver::Thrown;
+        case MoveGenerator::Chase:
+        case MoveGenerator::Flee:
+            return DeathDriver::Fighting;
+        case MoveGenerator::Follow:
+            return DeathDriver::Following;
+        case MoveGenerator::Idle:
+            // Nothing had hold of it. An aim it was not executing is worth
+            // seeing, and the aim columns are on the same row, so this does
+            // not overwrite the fact with the intention.
+            return DeathDriver::Idle;
+        case MoveGenerator::Point:
+        case MoveGenerator::Other:
+            break;
+        case MoveGenerator::Unsampled:
+            return DeathDriver::Unknown;
+    }
+
+    return (a.hasTravelTarget || a.hasQuestAim) ? DeathDriver::Errand
+                                                : DeathDriver::Unattributed;
+}
+
+float YardsFallen(bool sampled, float lastZ, float deathZ)
+{
+    if (!sampled)
+        return -1.f;
+    float const dropped = lastZ - deathZ;
+    return dropped > 0.f ? dropped : 0.f;
+}
+
 }  // namespace OverseerDecisions
