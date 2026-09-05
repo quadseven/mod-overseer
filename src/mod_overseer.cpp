@@ -8193,6 +8193,13 @@ private:
         float wz = want.GetPositionZ();
         float const span = bot->GetExactDist2d(wx, wy);   // Position.h:170
 
+        // A normal walking step cannot bridge a large vertical gap. Without
+        // this check, follower catch-up can keep handing a mountain-top
+        // endpoint to the short-step fallback after the navmesh refused it.
+        // Explicit dungeon jump and drop steps do not use GroundedStep.
+        if (std::fabs(wz - bot->GetPositionZ()) > 20.0f)
+            return false;
+
         // THE AIM'S OWN Z IS CORRECTED ONTO THE SURFACE UNDER IT, and only
         // when the character is near enough for that to be cheap: sampling the
         // ground four thousand yards away would CREATE the map grid there
