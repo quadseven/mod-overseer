@@ -1346,6 +1346,219 @@ struct BankerCandidate
 
 uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates);
 
+// -------------------------------------------------------------------- mail --
+//
+// THE PARTS OF kind='mail' THAT NEED NO WORLD: reading the command text, the
+// postage arithmetic the core does before it will take a letter, the
+// cross-account delivery delay rule, and whether a refusal is worth trying
+// again unchanged.
+//
+// WHY THESE ARE HERE AND NOT NEXT TO DoMail. The executor in mod_overseer.cpp
+// drives WorldSession::HandleSendMail, HandleMailTakeItem, HandleMailTakeMoney,
+// HandleMailReturnToSender and HandleMailDelete. Every one of them answers the
+// CLIENT - SMSG_SEND_MAIL_RESULT on the session, a void return, or, for the
+// structural refusals (no mailbox in reach, an empty recipient name), nothing
+// at all. A bot has no client, so the module has to say BEFORE the call which
+// wall a row is about to hit. Most of those tests are questions about the world
+// (is there a mailbox in reach, is the item soulbound, does that mail id
+// exist). The ones below are not: they are text and arithmetic, and a rule like
+// "an item mailed to another account waits an hour and one mailed inside the
+// account does not" is exactly the kind of rule nobody checks if checking it
+// needs a running worldserver.
+//
+// THE GRAMMAR, one verb per row. `target_name` is the character acting;
+// `target_arg` carries the RECIPIENT for `send`, the same way kind='give',
+// kind='trade' and kind='share' name the other character, and is unused by the
+// other four verbs.
+//
+//   send [item:<item_instance.guid>] [money:<copper>] subject:<text> [body:<text>]
+//   take-item mail:<mail.id> item:<item_instance.guid>
+//   take-money mail:<mail.id>
+//   return mail:<mail.id>
+//   delete mail:<mail.id>
+//
+// The `key:value` pairs come first, in any order, each at most once, and every
+// value is a decimal id or a copper amount - there is no gold/silver notation
+// because the Python side already speaks copper everywhere else.
+//
+// THE TEXT TAIL is what makes this grammar different from the auction one, and
+// it is why the split is done here rather than with a regex on the Python side:
+// a mail has two free-text fields and the row has one column. `subject:` opens
+// the tail and runs to the first ` body:` after it, or to the end of the line;
+// `body:` runs to the end of the line. Both are trimmed. A subject is required
+// even for a letter that carries an item, because a subject is the only part a
+// character sees in the mailbox list without opening anything, and a blank one
+// is how mail becomes invisible clutter. There is deliberately no escape for a
+// literal " body:" inside a subject: the first one splits, which is stated here
+// and pinned by a test rather than left for somebody to discover.
+//
+// ONE ITEM PER LETTER. The packet carries up to MAX_MAIL_ITEMS (12) and the
+// handler will take them all, but every other executor in this module moves ONE
+// named item (kind='give', kind='sell', kind='bank') and the read-back is exact
+// because of it. Postage is 30 copper per item either way
+// (MailHandler.cpp:163), so twelve letters cost what one twelve-attachment
+// letter costs, and twelve rows say twelve separate true things instead of one
+// row that has to explain a partial failure.
+//
+// WHAT IS NOT HERE AND WHY. Reading the mailbox is not an executor: the `mail`
+// and `mail_items` tables already hold every message, its sender, its money and
+// its attachments, and reading them changes nothing in the world. Whatever
+// drives the queue reads them and then queues a `take-item` by id. Marking a
+// mail read is not an executor either - it moves one flag no other decision in
+// this module reads. Creating a text item out of a letter (the "make a copy"
+// button, HandleMailCreateTextItem) is not wanted by anything.
+
+enum class MailVerb
+{
+    None,       // did not parse; `error` says why
+    Send,
+    TakeItem,
+    TakeMoney,
+    Return,
+    Delete,
+};
+
+struct MailRequest
+{
+    MailVerb verb{MailVerb::None};
+    uint32_t mailId{0};      // take-item, take-money, return, delete
+    uint32_t itemGuid{0};    // send: the carried item to attach
+                             // take-item: the attachment to take
+    uint32_t money{0};       // send: copper to enclose, 0 for none
+    bool hasItem{false};     // send: an item: key was given
+    bool hasMoney{false};    // send: a money: key was given
+    std::string subject;     // send: required, already trimmed
+    std::string body;        // send: may be empty
+    // Empty when it parsed; otherwise one of the MailRefusal literals below,
+    // which have static storage so the executor can hand it on as `detail`
+    // without copying.
+    char const* error{""};
+};
+
+MailRequest ParseMailRequest(std::string const& command);
+
+// The lengths the 3.3.5a client itself enforces in its own mail window before
+// the packet is ever built: 64 characters of subject and 500 of body. The core
+// enforces neither, and a longer one would be written to a `mail` row nothing
+// could ever display. Named constants rather than literals in the parser
+// because the test asserts on the boundary and a boundary in two places drifts.
+constexpr std::size_t MAIL_SUBJECT_MAX = 64;
+constexpr std::size_t MAIL_BODY_MAX = 500;
+
+// WHAT A LETTER COSTS TO POST, as HandleSendMail works it out
+// (MailHandler.cpp:163-175): 30 copper per attached item, 30 copper flat for a
+// letter with none, plus whatever money is being enclosed. The handler then
+// checks the sum for overflow (`reqmoney < money`, :168-172) and refuses
+// silently, so the sum is computed here in 64 bits and the overflow is reported
+// as a `false` the executor can name.
+//
+// It matters that this is the SUM and not the postage: a character with exactly
+// the enclosed money and nothing over cannot post the letter, and "cannot
+// afford the postage" is the only honest thing to say about that.
+bool MailTotalCost(uint32_t money, bool hasItem, uint32_t& cost);
+
+// WHEN A LETTER WAITS, which is the one piece of mail behaviour an operator has
+// to plan around. HandleSendMail sets a delivery delay only when the letter
+// CARRIES AN ITEM and the recipient is on a DIFFERENT ACCOUNT
+// (MailHandler.cpp:350, :362); everything else - money, text, anything at all
+// between two characters of one account - is delivered the instant it is sent.
+// The delay itself is the realm's CONFIG_MAIL_DELIVERY_DELAY, an hour by
+// default, and it is passed in rather than assumed so this file carries no copy
+// of a number the realm owns.
+//
+// The family plays on named accounts, one per character, so mailing the greens
+// to the tailor IS the cross-account case and the hour IS what happens. That is
+// reported on the row (deliver_time, delivery_delay_seconds) rather than
+// refused, because an hour late is what the game does and a refusal would be
+// this module inventing a rule the world does not have. `take-item` on a letter
+// that has not landed yet is what gets refused, by name, and retryably.
+uint32_t MailDeliveryDelaySeconds(bool hasItem, bool sameAccount, uint32_t configuredDelay);
+
+// THE REFUSAL LITERALS, in one place. Each is written into `detail` and into
+// result.reason by DoMail, and MailRefusalRetryable below is keyed on them, so
+// a literal that drifted between the two sides would silently turn a permanent
+// refusal into one retried for ever. Keeping them here is what keeps the
+// classification honest, and it is why the test exercises them by these names
+// rather than by retyped strings.
+namespace MailRefusal
+{
+// The grammar, decided without a world.
+constexpr char const* Malformed         = "malformed mail command";
+constexpr char const* NoSubject         = "mail has no subject";
+constexpr char const* SubjectTooLong    = "subject longer than the client allows";
+constexpr char const* BodyTooLong       = "body longer than the client allows";
+constexpr char const* TextNotRenderable = "text carries a sequence the client cannot render";
+constexpr char const* ZeroMoney         = "money is zero";
+constexpr char const* MoneyTooHigh      = "money above the money cap";
+constexpr char const* CodNotSupported   = "cash on delivery is not supported";
+
+// The character doing the sending or the taking.
+constexpr char const* NoSession         = "character has no session";
+constexpr char const* NotInWorld        = "character is not in the world";
+constexpr char const* Dead              = "character is dead";
+constexpr char const* InFlight          = "character is on a flight path";
+constexpr char const* Stunned           = "character is stunned";
+constexpr char const* LoggingOut        = "character is logging out";
+constexpr char const* InCombat          = "character is in combat";
+constexpr char const* Trading           = "character is in a trade";
+constexpr char const* BelowLevel        = "below the mail level requirement";
+constexpr char const* NoMailbox         = "mailbox not in range";
+
+// The other end of a `send`.
+constexpr char const* NoRecipient       = "no recipient (put the receiving character in target_arg)";
+constexpr char const* RecipientOffline  = "recipient is not online";
+constexpr char const* RecipientIsSelf   = "recipient is the sender";
+constexpr char const* RecipientFull     = "recipient mailbox is full";
+constexpr char const* WrongTeam         = "recipient is on the other faction";
+
+// The attachment.
+constexpr char const* ItemNotCarried    = "item not carried";
+constexpr char const* ItemNoTemplate    = "item has no template";
+constexpr char const* ItemNotEmptyBag   = "item is a non-empty bag";
+constexpr char const* ItemSoulbound     = "item is soulbound";
+constexpr char const* ItemNotTradable   = "item cannot be mailed";
+constexpr char const* ItemConjured      = "item is conjured or has a duration";
+constexpr char const* ItemQuest         = "item is a quest item";
+constexpr char const* ItemBeingLooted   = "item is being looted";
+constexpr char const* ItemRefundable    = "item is still refundable";
+constexpr char const* CannotAffordPost  = "cannot afford the postage";
+
+// The mailbox side: a letter already received.
+constexpr char const* MailNotFound      = "no mail with that id";
+constexpr char const* MailNotDelivered  = "mail has not been delivered yet";
+constexpr char const* MailDeleted       = "mail is already deleted";
+constexpr char const* MailIsCod         = "mail is cash on delivery";
+constexpr char const* MailFromSystem    = "mail was not sent by a character";
+constexpr char const* MailAlreadyReturned = "mail was already returned";
+// Deleting a letter DESTROYS what is on it: Player::_SaveMail issues
+// CHAR_DEL_ITEM_INSTANCE for every attachment of a mail left in
+// MAIL_STATE_DELETED. The client greys the button out for the same reason,
+// and the core does not check, so these two are this module's own and the
+// row that clears them is a take-item or a take-money, not a retry.
+constexpr char const* MailStillHasItems = "mail still carries an attachment";
+constexpr char const* MailStillHasMoney = "mail still carries money";
+constexpr char const* AttachmentNotInMail = "mail does not carry that item";
+constexpr char const* AttachmentMissing = "attachment missing from the mailbox";
+constexpr char const* NoRoom            = "no room in the bags";
+constexpr char const* NoMoneyInMail     = "mail carries no money";
+constexpr char const* TooMuchGold       = "too much gold";
+
+// After the handler ran and the world did not say what it should have.
+constexpr char const* CoreRefused       = "the core refused the mail";
+constexpr char const* NotReadBack       = "the mail did not read back";
+}  // namespace MailRefusal
+
+// IS THIS REFUSAL WORTH ASKING AGAIN WITHOUT CHANGING THE ROW. True for the
+// walls that move on their own - the character is fighting, dead, stunned,
+// mid-flight, mid-trade, broke, out of bag space, not yet standing at a
+// mailbox, or waiting on a letter that has not landed. False for everything the
+// same row will hit again for ever: a malformed command, a soulbound item, a
+// mail id that is gone, a letter that is cash on delivery. Written into
+// result.retryable so the sender can tell a "wait" from a "stop" without
+// keeping its own copy of this module's strings; the give backoff
+// (mod-overseer#169) is what happens when a sender cannot tell the two apart.
+bool MailRefusalRetryable(std::string const& reason);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

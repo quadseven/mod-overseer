@@ -1401,4 +1401,340 @@ uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates)
     return pickInteractable ? pick : 0;
 }
 
+// -------------------------------------------------------------------- mail --
+
+namespace
+{
+
+// A decimal field that fits a uint32, or false. Leading zeros are allowed;
+// signs, spaces and anything past 4294967295 are not, because every number in
+// this grammar is an id or a copper amount the core reads as uint32, and a
+// value that wraps would be a different sum of money from the one the operator
+// wrote down.
+//
+// Named for mail rather than shared: this file is appended to by one executor
+// at a time in parallel branches, and two anonymous-namespace helpers with the
+// same name in the same translation unit is a merge that does not compile.
+bool MailParseDecimal(std::string const& text, uint32_t& value)
+{
+    if (text.empty() || text.size() > 10 ||
+        text.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    unsigned long long parsed = 0;
+    for (char c : text)
+        parsed = parsed * 10 + static_cast<unsigned long long>(c - '0');
+    if (parsed > 4294967295ULL)
+        return false;
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+std::vector<std::string> MailSplitWords(std::string const& text)
+{
+    std::vector<std::string> words;
+    std::string::size_type pos = 0;
+    while (pos < text.size())
+    {
+        std::string::size_type const start = text.find_first_not_of(" \t", pos);
+        if (start == std::string::npos)
+            break;
+        std::string::size_type const end = text.find_first_of(" \t", start);
+        words.push_back(text.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (end == std::string::npos)
+            break;
+        pos = end;
+    }
+    return words;
+}
+
+std::string MailTrim(std::string const& text)
+{
+    std::string::size_type const start = text.find_first_not_of(" \t");
+    if (start == std::string::npos)
+        return std::string();
+    std::string::size_type const end = text.find_last_not_of(" \t");
+    return text.substr(start, end - start + 1);
+}
+
+// The one sequence HandleSendMail turns a letter away for without a word
+// (MailHandler.cpp:76-80): "| |" makes the 3.3.5a client crash when it renders
+// the mailbox list, so the core drops the packet on the floor rather than store
+// it. Checked on both fields here. The core's own check reads `body` before
+// `body` has been read off the wire, so upstream it only ever catches the
+// subject; a body carrying it would be stored and would then be the thing that
+// crashes a client. Both are checked here on purpose, and that is a deliberate
+// difference from the handler rather than a copy of it.
+bool MailTextIsRenderable(std::string const& text)
+{
+    return text.find("| |") == std::string::npos;
+}
+
+}  // namespace
+
+MailRequest ParseMailRequest(std::string const& command)
+{
+    MailRequest request;
+
+    // THE TEXT TAIL IS CUT OFF FIRST, before anything is split on spaces,
+    // because a subject has spaces in it and a subject is allowed to contain
+    // the word "money:" or a colon of its own. Everything from `subject:` on is
+    // text; everything before it is the structured head.
+    std::string head = command;
+    std::string tail;
+    bool haveSubject = false;
+
+    // The first `subject:` that starts a word. Not just find("subject:"), so a
+    // subject reading "resubject: no" cannot be split at its own middle.
+    for (std::string::size_type at = command.find("subject:");
+         at != std::string::npos; at = command.find("subject:", at + 1))
+    {
+        if (at != 0 && command[at - 1] != ' ' && command[at - 1] != '\t')
+            continue;
+        head = command.substr(0, at);
+        tail = command.substr(at + 8);
+        haveSubject = true;
+        break;
+    }
+
+    std::vector<std::string> const words = MailSplitWords(head);
+    if (words.empty())
+    {
+        request.error = MailRefusal::Malformed;
+        return request;
+    }
+
+    MailVerb verb = MailVerb::None;
+    if (words[0] == "send")
+        verb = MailVerb::Send;
+    else if (words[0] == "take-item")
+        verb = MailVerb::TakeItem;
+    else if (words[0] == "take-money")
+        verb = MailVerb::TakeMoney;
+    else if (words[0] == "return")
+        verb = MailVerb::Return;
+    else if (words[0] == "delete")
+        verb = MailVerb::Delete;
+    else
+    {
+        request.error = MailRefusal::Malformed;
+        return request;
+    }
+
+    // Which keys each verb takes. None may repeat and none may belong to
+    // another verb: a `delete` carrying an item, or a `take-item` short of its
+    // item, is a row whose author meant something this executor cannot guess
+    // at, so it is refused rather than filled in.
+    bool sawMail = false, sawItem = false, sawMoney = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        std::string const& word = words[i];
+        std::string::size_type const colon = word.find(':');
+        if (colon == std::string::npos)
+        {
+            request.error = MailRefusal::Malformed;
+            return request;
+        }
+        std::string const key = word.substr(0, colon);
+
+        // Named before the number is parsed, so `cod:500` is answered with the
+        // reason it is refused and not with "malformed". This executor does not
+        // send cash on delivery and says so; see the migration for why.
+        if (key == "cod")
+        {
+            request.error = MailRefusal::CodNotSupported;
+            return request;
+        }
+
+        uint32_t value = 0;
+        if (!MailParseDecimal(word.substr(colon + 1), value))
+        {
+            request.error = MailRefusal::Malformed;
+            return request;
+        }
+
+        bool* seen = nullptr;
+        uint32_t* into = nullptr;
+        if (key == "mail" && verb != MailVerb::Send)
+        {
+            seen = &sawMail;
+            into = &request.mailId;
+        }
+        else if (key == "item" && (verb == MailVerb::Send || verb == MailVerb::TakeItem))
+        {
+            seen = &sawItem;
+            into = &request.itemGuid;
+        }
+        else if (key == "money" && verb == MailVerb::Send)
+        {
+            seen = &sawMoney;
+            into = &request.money;
+        }
+        else
+        {
+            request.error = MailRefusal::Malformed;
+            return request;
+        }
+
+        if (*seen)
+        {
+            request.error = MailRefusal::Malformed;
+            return request;
+        }
+        *seen = true;
+        *into = value;
+    }
+
+    bool complete = false;
+    switch (verb)
+    {
+        case MailVerb::Send:
+            // item and money are both optional; a letter with neither is a
+            // letter, which is one of the things the operator asked for.
+            complete = haveSubject;
+            break;
+        case MailVerb::TakeItem:
+            complete = sawMail && sawItem;
+            break;
+        case MailVerb::TakeMoney:
+        case MailVerb::Return:
+        case MailVerb::Delete:
+            complete = sawMail;
+            break;
+        case MailVerb::None:
+            break;
+    }
+    if (!complete)
+    {
+        request.error = MailRefusal::Malformed;
+        return request;
+    }
+
+    // Ids are never zero. The core reads a zero item guid as an invalid
+    // attachment (MailHandler.cpp:233-238) and a mail id that matches nothing
+    // as an internal error, both of which it answers only with a packet the bot
+    // will never see, so they are refused by name here instead.
+    if (verb != MailVerb::Send && request.mailId == 0)
+    {
+        request.error = MailRefusal::Malformed;
+        return request;
+    }
+    if (sawItem && request.itemGuid == 0)
+    {
+        request.error = MailRefusal::Malformed;
+        return request;
+    }
+
+    request.hasItem = sawItem;
+    request.hasMoney = sawMoney;
+
+    if (verb == MailVerb::Send)
+    {
+        // `money:0` is not "no money", it is a row that meant to enclose
+        // something and did not. Omitting the key is how a letter carries no
+        // money, and the two are told apart rather than treated alike.
+        if (sawMoney && request.money == 0)
+        {
+            request.error = MailRefusal::ZeroMoney;
+            return request;
+        }
+
+        // Split the tail: subject runs to the first " body:" after it, body
+        // runs to the end. Stated in the header and pinned by a test, because
+        // there is deliberately no way to escape a literal " body:" inside a
+        // subject.
+        std::string subject = tail;
+        std::string body;
+        std::string::size_type const bodyAt = tail.find(" body:");
+        if (bodyAt != std::string::npos)
+        {
+            subject = tail.substr(0, bodyAt);
+            body = tail.substr(bodyAt + 6);
+        }
+        request.subject = MailTrim(subject);
+        request.body = MailTrim(body);
+
+        if (request.subject.empty())
+        {
+            request.error = MailRefusal::NoSubject;
+            return request;
+        }
+        if (request.subject.size() > MAIL_SUBJECT_MAX)
+        {
+            request.error = MailRefusal::SubjectTooLong;
+            return request;
+        }
+        if (request.body.size() > MAIL_BODY_MAX)
+        {
+            request.error = MailRefusal::BodyTooLong;
+            return request;
+        }
+        if (!MailTextIsRenderable(request.subject) || !MailTextIsRenderable(request.body))
+        {
+            request.error = MailRefusal::TextNotRenderable;
+            return request;
+        }
+    }
+    else if (haveSubject)
+    {
+        // Text on a verb that posts nothing. Refused rather than dropped: a row
+        // that carried a message nobody will ever read is a row whose author
+        // was writing a different command.
+        request.error = MailRefusal::Malformed;
+        return request;
+    }
+
+    request.verb = verb;
+    return request;
+}
+
+bool MailTotalCost(uint32_t money, bool hasItem, uint32_t& cost)
+{
+    // MailHandler.cpp:163. The `items_count ? 30 * items_count : 30` is 30
+    // either way at one item per letter, and it is written out rather than
+    // folded to a constant so the line still reads as the core's line.
+    uint64_t const postage = hasItem ? 30ULL * 1ULL : 30ULL;
+    uint64_t const total = postage + static_cast<uint64_t>(money);
+
+    // :168-172, the handler's own overflow guard, done in 64 bits so the test
+    // is on the real sum rather than on the wrapped one.
+    if (total > 4294967295ULL)
+        return false;
+    cost = static_cast<uint32_t>(total);
+    return true;
+}
+
+uint32_t MailDeliveryDelaySeconds(bool hasItem, bool sameAccount, uint32_t configuredDelay)
+{
+    // MailHandler.cpp:350 sets needItemDelay only inside the `items_count > 0`
+    // branch, and :362 turns it into the configured delay. Money and text never
+    // wait, and nothing waits inside one account.
+    if (!hasItem || sameAccount)
+        return 0;
+    return configuredDelay;
+}
+
+bool MailRefusalRetryable(std::string const& reason)
+{
+    static char const* const retryable[] = {
+        MailRefusal::NotInWorld,
+        MailRefusal::Dead,
+        MailRefusal::InFlight,
+        MailRefusal::Stunned,
+        MailRefusal::LoggingOut,
+        MailRefusal::InCombat,
+        MailRefusal::Trading,
+        MailRefusal::NoMailbox,
+        MailRefusal::RecipientOffline,
+        MailRefusal::RecipientFull,
+        MailRefusal::CannotAffordPost,
+        MailRefusal::MailNotDelivered,
+        MailRefusal::NoRoom,
+        MailRefusal::TooMuchGold,
+    };
+    for (char const* candidate : retryable)
+        if (reason == candidate)
+            return true;
+    return false;
+}
+
 }  // namespace OverseerDecisions

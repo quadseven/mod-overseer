@@ -47,6 +47,20 @@
  *                     through the core's own bank packet handlers with a
  *                     banker in interaction range. The executor never
  *                     chooses the item; see 2026_09_04_02_overseer_bank.sql.
+ *       kind='mail' - post a letter from target_name to target_arg carrying an
+ *                     item, money, a message, or all three, and deal with what
+ *                     arrives: take an attachment, take the money, return a
+ *                     letter, delete an empty one. Driven through the core's
+ *                     own WorldSession mail handlers with a mailbox in reach,
+ *                     so the postage, the expiry and the cross-account
+ *                     delivery delay are the core's. Mail is the only way one
+ *                     character hands another something without the two of
+ *                     them standing together, which is what kind='give' and
+ *                     kind='trade' both need and what walking keeps failing to
+ *                     arrange. The executor never chooses what to send. Cash
+ *                     on delivery is refused, and so is deleting a letter that
+ *                     still carries something, because that destroys it. See
+ *                     2026_09_05_00_overseer_mail.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -161,6 +175,14 @@
 #include "CellImpl.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+// kind='mail' (#18): the Mail/MailItemInfo/MailState definitions the read-back
+// reads off a letter, the clock HandleMailTakeItem compares deliver_time
+// against, and the permission that lifts the cross-faction mail refusal - all
+// three named by MailHandler.cpp itself.
+#include "GameObject.h"
+#include "GameTime.h"
+#include "Mail.h"
+#include "RBAC.h"
 
 // The decisions this module makes that need nothing from the world. Its own
 // header so that something other than this translation unit can reach them -
@@ -15348,7 +15370,7 @@ private:
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
                 && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
-                && kind != "bank")
+                && kind != "bank" && kind != "mail")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -15437,6 +15459,8 @@ private:
                 detail = DoSell(player, command, status, rowResult);
             else if (kind == "bank")
                 detail = DoBank(player, command, status, rowResult);
+            else if (kind == "mail")
+                detail = DoMail(player, targetArg, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -17625,6 +17649,805 @@ private:
         status = "delivered";
         return "";
     }
+
+    // ---------------------------------------------------------------- mail --
+    //
+    // Post a letter from one family member to another - an item, some money, a
+    // message, or all three - and deal with what arrives: take an attachment,
+    // take the money, send a letter back, throw one away.
+    //
+    // WHY MAIL AT ALL. Mail is the only way one character hands another
+    // something without the two of them being in the same place. Everything
+    // else this module can do with an item across characters (kind='give',
+    // kind='trade') needs the pair standing together, and walking is the thing
+    // that has been failing: a character wedged in combat, a route that ends
+    // somewhere else, a step off a cliff. A letter crosses a continent while
+    // both ends stand still. The family is holding 161 green items nobody can
+    // dispose of and the one character who can use them is a tailor and
+    // enchanter standing somewhere else; that is a mail problem wearing a
+    // travel problem's clothes.
+    //
+    // The other half is that mail is how five characters who share a stream get
+    // to have a relationship on camera. A letter is a thing one of them decided
+    // to write. This executor does not decide what to write - it does not
+    // choose an item, a recipient or a word - it only carries out a row that
+    // already says.
+    //
+    // WHY THE CORE'S PATH AND NOT A MODULE COPY. A letter lives in five places
+    // at once: the `mail` row, the `mail_items` rows, the `item_instance` row
+    // whose owner_guid changes hands, the sender's purse, and - when the
+    // recipient is online - a Mail* in that character's own m_mail list with
+    // the Item* parked in m_mailedItems beside it. WorldSession::HandleSendMail
+    // (MailHandler.cpp:65-380) keeps all five in step inside one transaction,
+    // through MailDraft::SendMailTo (Mail.cpp), and HandleMailTakeItem
+    // (:517-628), HandleMailTakeMoney (:631-673), HandleMailReturnToSender
+    // (:436-514) and HandleMailDelete (:406-433) unwind them the same way.
+    // Writing to the `mail` tables from here would drift from the core's
+    // postage, its expiry, its delivery delay and its in-memory copy, and an
+    // online character would never see the letter at all. So the module builds
+    // the packet a client would send and calls the handler, exactly as
+    // kind='sell' drives HandleSellItemOpcode and kind='trade' drives the trade
+    // handlers. The handlers are public: WorldSession.h:919-925.
+    //
+    // WHY THE PRE-CHECKS EXIST WHEN THE HANDLERS CHECK THE SAME THINGS. Every
+    // one of these handlers answers a CLIENT: SMSG_SEND_MAIL_RESULT on the
+    // session, or - for the structural refusals (no mailbox in reach, an empty
+    // recipient name, text carrying the sequence that crashes the client) -
+    // nothing at all, just a `return`. A bot has no client, so left to the
+    // handler a refused row would finish saying 'delivered' with nothing
+    // changed. Each condition the handler tests is therefore tested here first
+    // and named in `detail`, and the outcome is READ BACK from the world after
+    // the call rather than assumed from the call having returned. The handler
+    // remains the authority; the pre-checks exist so an operator reading the
+    // row learns which wall was hit.
+    //
+    // WHAT THIS EXECUTOR REFUSES THAT THE CORE WOULD ALLOW, and why each one is
+    // a deliberate difference rather than an oversight:
+    //
+    //   * CASH ON DELIVERY IS NOT SENT. `cod:` is refused by name in the
+    //     parser. A COD letter charges its RECIPIENT on the way in, so sending
+    //     one commits another character's gold to a price this row never named
+    //     and the recipient never agreed to. Taking an attachment out of a COD
+    //     letter that arrived from elsewhere is refused for the same reason
+    //     ("mail is cash on delivery"), and the core refuses to delete one at
+    //     all (:423-427), so `return` is the disposal path and is why that verb
+    //     is here.
+    //
+    //   * A LETTER WITH ANYTHING STILL IN IT IS NOT DELETED. Player::_SaveMail
+    //     issues CHAR_DEL_ITEM_INSTANCE for every attachment of a mail in
+    //     MAIL_STATE_DELETED (PlayerStorage.cpp): deleting a letter destroys
+    //     what is in it. The client greys the button out for the same reason.
+    //     So `delete` refuses "mail still carries an attachment" and "mail
+    //     still carries money", and the row that empties it is a `take-item` or
+    //     a `take-money` first.
+    //
+    //   * A QUEST ITEM IS NOT POSTED, the same call kind='sell' makes for the
+    //     same reason: it is the one thing a letter can carry away that gold
+    //     cannot buy back, and 3.3.5a mail has no buyback slot at all.
+    //
+    //   * THE RECIPIENT MUST BE ONLINE. Not the core's rule - the handler will
+    //     happily post to an offline character - but this module's, and it is
+    //     about proof rather than about mail. When the recipient is online,
+    //     MailDraft::SendMailTo puts the Mail* straight into that character's
+    //     own list before it returns (Mail.cpp), so the read-back can find the
+    //     letter in memory and say its id. When the recipient is offline the
+    //     letter exists only inside a CharacterDatabaseTransaction that has not
+    //     been executed yet, and a SELECT racing it would report "no mail"
+    //     for a letter that was sent perfectly. A row that cannot prove what it
+    //     claims does not get to claim it, so it is refused instead, retryably.
+    //     All five of the family are online whenever any of this runs.
+    //
+    // WHAT THIS EXECUTOR ACCEPTS THAT AN OPERATOR MIGHT NOT EXPECT. An item
+    // posted to a character on ANOTHER ACCOUNT waits an hour before it can be
+    // taken (MailHandler.cpp:350, :362, CONFIG_MAIL_DELIVERY_DELAY). The family
+    // plays on one named account per character, so mailing the greens to the
+    // tailor IS the cross-account case and the hour IS what happens. It is not
+    // refused - an hour late is what the game does, and a refusal would be this
+    // module inventing a rule the world does not have - it is REPORTED, on
+    // every row, twice: `delivery_delay_seconds` from the pure rule before the
+    // call, and `deliver_time` read back off the letter afterwards. Money and
+    // text never wait, and nothing waits inside one account.
+    //
+    // GRAMMAR (parsed by OverseerDecisions::ParseMailRequest, pure and tested).
+    // `target_name` is the character acting; `target_arg` carries the RECIPIENT
+    // for `send`, the way kind='give' and kind='trade' name the other
+    // character, and is unused by the other four verbs:
+    //
+    //     send [item:<item_instance.guid>] [money:<copper>] subject:<text> [body:<text>]
+    //     take-item mail:<mail.id> item:<item_instance.guid>
+    //     take-money mail:<mail.id>
+    //     return mail:<mail.id>
+    //     delete mail:<mail.id>
+    //
+    // Reading the mailbox is NOT an executor: `mail` and `mail_items` already
+    // hold every message, its sender, its money and its attachments, and
+    // reading them changes nothing in the world. Whatever drives the queue
+    // reads those tables and then queues a `take-item` by id.
+
+    // The predicate the mailbox sweep runs over each gameobject in the visited
+    // cells. The shape Acore::GameObjectListSearcher wants (GridNotifiers.h: a
+    // `Check&` whose operator() takes a GameObject*), narrowed to spawned
+    // mailboxes within `range` of `from`. The RANGE HERE IS NOT THE GATE: the
+    // gate is WorldSession::CanOpenMailBox below, which is the core's own and
+    // which asks GameObject::IsWithinDistInMap - a box test against the
+    // object's model, not a radius (GameObject.cpp). This sweep is wider on
+    // purpose, so a refusal can say how far the nearest mailbox WAS. "mailbox
+    // not in range" with "14.2 yards" beside it is an aim error the bridge can
+    // correct; without the number it is a mystery.
+    struct MailboxNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(GameObject* go) const
+        {
+            return go->GetGoType() == GAMEOBJECT_TYPE_MAILBOX
+                && go->isSpawned()
+                && from->IsWithinDistInMap(go, range);
+        }
+    };
+
+    // Some mailboxes are creatures rather than gameobjects (innkeepers and the
+    // like carry UNIT_NPC_FLAG_MAILBOX, UnitDefines.h:348), and CanOpenMailBox
+    // takes either (MailHandler.cpp:39-62). Both are swept so a character
+    // standing at one is not told there is no mailbox.
+    struct MailboxCreatureCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive()
+                && creature->HasNpcFlag(UNIT_NPC_FLAG_MAILBOX)
+                && from->IsWithinDistInMap(creature, range);
+        }
+    };
+
+    // The mailbox this character could open from where it stands, or an empty
+    // guid. `nearestYards` is left at -1 when nothing mailbox-shaped was found
+    // at all, and otherwise carries the distance to the closest one even when
+    // none of them passed the gate - which is the difference between "walk
+    // somewhere with a mailbox" and "walk four more yards".
+    static ObjectGuid FindMailboxInReach(Player* who, float& nearestYards, float& chosenYards,
+                                         std::string& nameOut)
+    {
+        float const SWEEP_YARDS = 30.f;
+        nearestYards = -1.f;
+        chosenYards = -1.f;
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return ObjectGuid::Empty;
+
+        std::list<GameObject*> boxes;
+        MailboxNearbyCheck goCheck{who, SWEEP_YARDS};
+        Acore::GameObjectListSearcher<MailboxNearbyCheck> goSearcher(who, boxes, goCheck);
+        Cell::VisitObjects(who, goSearcher, SWEEP_YARDS);
+
+        ObjectGuid found;
+        for (GameObject* go : boxes)
+        {
+            float const yards = who->GetDistance(go);
+            if (nearestYards < 0.f || yards < nearestYards)
+                nearestYards = yards;
+
+            // THE GATE, and it is the core's own: the same call the handler
+            // makes on the guid the client sends (MailHandler.cpp:113 and the
+            // four other handlers), so a mailbox this accepts is one the
+            // handler will accept.
+            if (found || !session->CanOpenMailBox(go->GetGUID()))
+                continue;
+            found = go->GetGUID();
+            chosenYards = yards;
+            nameOut = go->GetGOInfo()->name;
+        }
+
+        std::list<Creature*> keepers;
+        MailboxCreatureCheck npcCheck{who, SWEEP_YARDS};
+        Acore::CreatureListSearcher<MailboxCreatureCheck> npcSearcher(who, keepers, npcCheck);
+        Cell::VisitObjects(who, npcSearcher, SWEEP_YARDS);
+
+        for (Creature* creature : keepers)
+        {
+            float const yards = who->GetDistance(creature);
+            if (nearestYards < 0.f || yards < nearestYards)
+                nearestYards = yards;
+            if (found || !session->CanOpenMailBox(creature->GetGUID()))
+                continue;
+            found = creature->GetGUID();
+            chosenYards = yards;
+            nameOut = creature->GetName();
+        }
+
+        return found;
+    }
+
+    // Returns the detail literal ("" on success) and fills `out` with the
+    // result JSON. `status` becomes "delivered" only when the read-back
+    // confirmed the change.
+    static char const* DoMail(Player* who, std::string const& recipientName,
+                              std::string const& command, char const*& status,
+                              std::string& out)
+    {
+        namespace D = OverseerDecisions;
+        namespace R = OverseerDecisions::MailRefusal;
+
+        D::MailRequest const req = D::ParseMailRequest(command);
+
+        char const* verb = "";
+        switch (req.verb)
+        {
+            case D::MailVerb::Send:      verb = "send"; break;
+            case D::MailVerb::TakeItem:  verb = "take-item"; break;
+            case D::MailVerb::TakeMoney: verb = "take-money"; break;
+            case D::MailVerb::Return:    verb = "return"; break;
+            case D::MailVerb::Delete:    verb = "delete"; break;
+            case D::MailVerb::None:      verb = ""; break;
+        }
+
+        // The purse as it stood when the row was picked up. Every exit reports
+        // it next to the purse as it stands, so the delta is on the row whether
+        // the row succeeded or was refused halfway.
+        uint32 const moneyBefore = who->GetMoney();
+
+        // Facts filled in as they are learned, so a refusal carries whatever
+        // was known at the point the row stopped. Unknowns are absent from the
+        // JSON rather than zero, because 0 is a real mail id and a real amount
+        // of money.
+        struct
+        {
+            bool haveItem = false;
+            uint32 itemGuid = 0, itemEntry = 0, itemCount = 0;
+            std::string itemName;
+            bool haveMail = false;
+            uint32 mailId = 0, mailMoney = 0, mailCod = 0, mailSender = 0;
+            int64 deliverTime = 0;
+            std::string mailSubject;
+            bool haveMailbox = false;
+            std::string mailboxName;
+            float mailboxYards = -1.f;
+            float nearestMailboxYards = -1.f;
+            uint32 cost = 0;
+            uint32 expectedDelay = 0;
+            bool haveInventoryResult = false;
+            InventoryResult inventoryResult = EQUIP_ERR_OK;
+        } facts;
+
+        auto describe = [&](char const* outcome, char const* reason, char const* note)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason);
+            if (*reason)
+                o << ",\"retryable\":" << (D::MailRefusalRetryable(reason) ? "true" : "false");
+            o << ",\"verb\":" << J(verb)
+              << ",\"who\":" << J(who->GetName())
+              << ",\"to\":" << J(recipientName)
+              << ",\"request\":" << J(command);
+            if (facts.haveItem)
+                o << ",\"item\":{\"guid\":" << facts.itemGuid
+                  << ",\"entry\":" << facts.itemEntry
+                  << ",\"name\":" << J(facts.itemName)
+                  << ",\"count\":" << facts.itemCount << "}";
+            else
+                o << ",\"item\":null";
+            if (facts.haveMail)
+                o << ",\"mail\":{\"id\":" << facts.mailId
+                  << ",\"sender\":" << facts.mailSender
+                  << ",\"subject\":" << J(facts.mailSubject)
+                  << ",\"money\":" << facts.mailMoney
+                  << ",\"cod\":" << facts.mailCod
+                  << ",\"deliver_time\":" << facts.deliverTime << "}";
+            else
+                o << ",\"mail\":null";
+            if (facts.haveMailbox)
+                o << ",\"mailbox\":{\"name\":" << J(facts.mailboxName)
+                  << ",\"yards\":" << facts.mailboxYards << "}";
+            else
+                o << ",\"mailbox\":null";
+            if (facts.nearestMailboxYards >= 0.f)
+                o << ",\"nearest_mailbox_yards\":" << facts.nearestMailboxYards;
+            o << ",\"cost\":" << facts.cost
+              << ",\"delivery_delay_seconds\":" << facts.expectedDelay
+              << ",\"money_before\":" << moneyBefore
+              << ",\"money_after\":" << who->GetMoney();
+            if (facts.haveInventoryResult)
+                o << ",\"inventory_result\":" << int32(facts.inventoryResult)
+                  << ",\"inventory_result_name\":" << J(InventoryResultName(facts.inventoryResult));
+            if (*note)
+                o << ",\"note\":" << J(note);
+            o << "}";
+            out = o.str();
+        };
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason, "");
+            return reason;
+        };
+
+        if (req.verb == D::MailVerb::None)
+            return refuse(req.error);
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse(R::NoSession);
+
+        // The states in which a client could not have the mailbox frame open.
+        // The handlers test none of these - a client simply could not have sent
+        // the packet - so they are the module's to hold, the same set
+        // kind='bank' and kind='auction' hold for the same reason.
+        if (!who->IsInWorld())
+            return refuse(R::NotInWorld);
+        if (!who->IsAlive())
+            return refuse(R::Dead);
+        if (who->IsInFlight())
+            return refuse(R::InFlight);
+        if (who->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse(R::Stunned);
+        if (session->isLogingOut())
+            return refuse(R::LoggingOut);
+        if (who->IsInCombat())
+            return refuse(R::InCombat);
+        if (who->GetTradeData())
+            return refuse(R::Trading);
+
+        // A MAILBOX IS REQUIRED FOR EVERY VERB, not only for sending: all five
+        // handlers open with CanOpenMailBox and return silently without one
+        // (MailHandler.cpp:113, :414, :444, :526, :638). This is the mail
+        // equivalent of the vendor kind='sell' needs and the banker kind='bank'
+        // needs, and it is the one thing about mail that is not "at any
+        // distance": the sender has to be standing at a box, even though the
+        // recipient does not.
+        std::string mailboxName;
+        ObjectGuid const mailbox = FindMailboxInReach(who, facts.nearestMailboxYards,
+                                                     facts.mailboxYards, mailboxName);
+        if (!mailbox)
+            return refuse(R::NoMailbox);
+        facts.haveMailbox = true;
+        facts.mailboxName = mailboxName;
+
+        // ---- send ----------------------------------------------------------
+        if (req.verb == D::MailVerb::Send)
+        {
+            // MailHandler.cpp:127-131, and it is a SEND-only rule: nothing
+            // stops a character below the level requirement taking what has
+            // already arrived. The handler answers this one with a chat
+            // notification, which is as invisible to a bot as a status packet.
+            if (who->GetLevel() < sWorld->getIntConfig(CONFIG_MAIL_LEVEL_REQ))
+                return refuse(R::BelowLevel);
+
+            if (recipientName.empty())
+                return refuse(R::NoRecipient);
+
+            Player* receiver = ObjectAccessor::FindPlayerByName(recipientName);
+            if (!receiver)
+                return refuse(R::RecipientOffline);
+            // :148-153. The handler refuses it too, silently.
+            if (receiver == who)
+                return refuse(R::RecipientIsSelf);
+
+            WorldSession* receiverSession = receiver->GetSession();
+            if (!receiverSession)
+                return refuse(R::RecipientOffline);
+
+            // :196-204. The cap is on the recipient's mailbox, not the
+            // sender's, and it is 100.
+            if (receiver->GetMailSize() > 100)
+                return refuse(R::RecipientFull);
+
+            bool const sameAccount = session->GetAccountId() == receiverSession->GetAccountId();
+
+            // :222-228, including the permission that lifts it, so this refuses
+            // exactly what the handler would refuse on a realm with two-side
+            // mail turned on and nothing more.
+            if (!sameAccount && who->GetTeamId() != receiver->GetTeamId()
+                && !session->HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_MAIL))
+                return refuse(R::WrongTeam);
+
+            if (req.money > MAX_MONEY_AMOUNT)
+                return refuse(R::MoneyTooHigh);
+
+            // :163-175, worked out by the pure rule so the arithmetic and its
+            // overflow are pinned by a test rather than by a live realm.
+            if (!D::MailTotalCost(req.money, req.hasItem, facts.cost))
+                return refuse(R::MoneyTooHigh);
+
+            facts.expectedDelay = D::MailDeliveryDelaySeconds(
+                req.hasItem, sameAccount, sWorld->getIntConfig(CONFIG_MAIL_DELIVERY_DELAY));
+
+            ObjectGuid itemGuid;
+            if (req.hasItem)
+            {
+                // The bags and not the bank, on purpose: the handler takes any
+                // owned item (:241, Player::GetItemByGuid includes the bank)
+                // but a player could not drag a banked item into the mail
+                // frame, and every other executor here addresses a bag.
+                Item* item = FindCarriedItem(who, true, req.itemGuid);
+                if (!item)
+                    return refuse(R::ItemNotCarried);
+
+                ItemTemplate const* proto = item->GetTemplate();
+                if (!proto)
+                    return refuse(R::ItemNoTemplate);
+
+                facts.haveItem = true;
+                facts.itemGuid = item->GetGUID().GetCounter();
+                facts.itemEntry = item->GetEntry();
+                facts.itemCount = item->GetCount();
+                facts.itemName = proto->Name1;
+
+                // Named refusals first, then the handler's own catch-all for
+                // whatever is left, so the operator hears the specific reason
+                // when there is one. The order matters: CanBeTraded(true)
+                // (:256) answers "soulbound", "still has a duration" and half a
+                // dozen other things with the same silence.
+                if (item->IsNotEmptyBag())          // :250-254
+                    return refuse(R::ItemNotEmptyBag);
+                if (item->IsSoulBound())            // :256, :262
+                    return refuse(R::ItemSoulbound);
+                if (proto->Class == ITEM_CLASS_QUEST)
+                    return refuse(R::ItemQuest);
+                if (who->GetLootGUID() == item->GetGUID())
+                    return refuse(R::ItemBeingLooted);
+                // The handler clears the refund itself (:337,
+                // Item::SetNotRefundable) without saying so. Posting a
+                // refundable item silently throws the refund away, so it is
+                // refused here the way kind='sell' refuses it.
+                if (item->IsRefundable())
+                    return refuse(R::ItemRefundable);
+                if (proto->HasFlag(ITEM_FLAG_CONJURED)
+                    || item->GetUInt32Value(ITEM_FIELD_DURATION))   // :268-272
+                    return refuse(R::ItemConjured);
+                if (!item->CanBeTraded(true))       // :256-260
+                    return refuse(R::ItemNotTradable);
+
+                itemGuid = item->GetGUID();
+            }
+
+            if (!who->HasEnoughMoney(facts.cost))   // :174-178
+                return refuse(R::CannotAffordPost);
+
+            // What the recipient's mailbox held before the letter. The id that
+            // is in it afterwards and was not in it before, and whose sender is
+            // this character, is the letter this row posted - which is how a
+            // row proves the mail it claims even when the same two characters
+            // have written to each other all day.
+            std::set<uint32> before;
+            for (Mail const* existing : receiver->GetMails())
+                before.insert(existing->messageID);
+
+            // CMSG_SEND_MAIL as HandleSendMail reads it (:65-110): mailbox
+            // guid, receiver name, subject, body, two unused uint32s, the
+            // attachment count, then per attachment a slot byte and the item
+            // guid, then money, COD, and two trailing constants. COD is a
+            // literal 0: this executor does not send cash on delivery, and the
+            // parser has already turned away any row that asked for it.
+            WorldPacket packet(CMSG_SEND_MAIL, 8 + 64 + 512 + 4 + 4 + 1 + 9 + 4 + 4 + 8 + 1);
+            packet << mailbox;
+            packet << recipientName;
+            packet << req.subject;
+            packet << req.body;
+            packet << uint32(0);
+            packet << uint32(0);
+            packet << uint8(req.hasItem ? 1 : 0);
+            if (req.hasItem)
+            {
+                packet << uint8(0);
+                packet << itemGuid;
+            }
+            packet << uint32(req.money);
+            packet << uint32(0);
+            packet << uint64(0);
+            packet << uint8(0);
+            session->HandleSendMail(packet);
+
+            // ---- believe nothing; read the world back --------------------
+            //
+            // Three readings, and all three have to agree. The letter is in the
+            // recipient's mailbox with this character's name on it (:368-372
+            // through MailDraft::SendMailTo, which adds the Mail* to an online
+            // receiver before it returns). The item has left the sender's bags
+            // (:344-348 moves it out and hands its ownership over). The purse
+            // is down by exactly the postage plus the money enclosed (:315).
+            Mail const* posted = nullptr;
+            for (Mail const* candidate : receiver->GetMails())
+            {
+                if (before.count(candidate->messageID))
+                    continue;
+                if (candidate->messageType != MAIL_NORMAL)
+                    continue;
+                if (candidate->sender != who->GetGUID().GetCounter())
+                    continue;
+                posted = candidate;
+                break;
+            }
+
+            bool const stillCarried = req.hasItem && who->GetItemByGuid(itemGuid) != nullptr;
+            uint32 const moneyAfter = who->GetMoney();
+
+            if (!posted)
+            {
+                // Nothing moved at all: a wall this function does not know
+                // about, which on this path means the OnPlayerCanSendMail
+                // script hook (:280-292) or a mailbox that stopped being one
+                // between the sweep and the call.
+                if (stillCarried && moneyAfter == moneyBefore)
+                    return refuse(R::CoreRefused);
+                return refuse(R::NotReadBack);
+            }
+            if (stillCarried)
+                return refuse(R::NotReadBack);
+            if (moneyAfter != moneyBefore - facts.cost)
+                return refuse(R::NotReadBack);
+
+            facts.haveMail = true;
+            facts.mailId = posted->messageID;
+            facts.mailSender = posted->sender;
+            facts.mailSubject = posted->subject;
+            facts.mailMoney = posted->money;
+            facts.mailCod = posted->COD;
+            facts.deliverTime = int64(posted->deliver_time);
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' posted mail {} to '{}' ('{}') with item {} (entry {}) x{}, "
+                     "{} copper enclosed, {} copper charged; delivery delay {}s",
+                     who->GetName(), facts.mailId, recipientName, facts.mailSubject,
+                     facts.itemGuid, facts.itemEntry, facts.itemCount,
+                     req.money, facts.cost, facts.expectedDelay);
+
+            describe("sent", "",
+                     facts.expectedDelay
+                         ? "the attachment cannot be taken until deliver_time; the recipient is on "
+                           "another account and MailHandler.cpp:362 applies the realm's delay"
+                         : "");
+            status = "delivered";
+            return "";
+        }
+
+        // ---- the four verbs that act on a letter already received -----------
+        //
+        // Found once, checked once. `m` is only safe to read until a handler
+        // runs: HandleMailReturnToSender deletes the Mail outright (:511) and
+        // HandleMailDelete leaves it allocated but in MAIL_STATE_DELETED, so
+        // everything the read-back needs is snapshotted below and nothing
+        // dereferences `m` after the call.
+        Mail* m = who->GetMail(req.mailId);
+        if (!m)
+            return refuse(R::MailNotFound);
+
+        facts.haveMail = true;
+        facts.mailId = m->messageID;
+        facts.mailSender = m->sender;
+        facts.mailSubject = m->subject;
+        facts.mailMoney = m->money;
+        facts.mailCod = m->COD;
+        facts.deliverTime = int64(m->deliver_time);
+
+        if (m->state == MAIL_STATE_DELETED)
+            return refuse(R::MailDeleted);
+
+        // :532, :644, :449 - the same test in three handlers, and all three
+        // answer it with a packet. A letter in transit is the ordinary
+        // cross-account case, so this refusal is retryable and the row carries
+        // deliver_time for whoever decides when to ask again.
+        bool const delivered = m->deliver_time <= GameTime::GetGameTime().count();
+
+        uint32 const mailId = m->messageID;
+        uint32 const mailMoney = m->money;
+        uint32 const mailCod = m->COD;
+        bool const fromCharacter = m->messageType == MAIL_NORMAL && m->sender != 0;
+        bool const alreadyReturned = (m->checked & MAIL_CHECK_MASK_RETURNED) != 0;
+        bool const hasItems = m->HasItems();
+
+        // ---- take-item ------------------------------------------------------
+        if (req.verb == D::MailVerb::TakeItem)
+        {
+            if (!delivered)
+                return refuse(R::MailNotDelivered);
+            // :553-557 would charge the COD out of this character's purse. See
+            // the header above for why that is not this executor's to spend.
+            if (mailCod)
+                return refuse(R::MailIsCod);
+
+            // :539-551. The handler checks the same list for the same reason.
+            bool attached = false;
+            for (MailItemInfo const& info : m->items)
+                if (info.item_guid == req.itemGuid)
+                {
+                    attached = true;
+                    break;
+                }
+            if (!attached)
+                return refuse(R::AttachmentNotInMail);
+
+            Item* parked = who->GetMItem(req.itemGuid);
+            if (!parked)
+                return refuse(R::AttachmentMissing);
+
+            facts.haveItem = true;
+            facts.itemGuid = req.itemGuid;
+            facts.itemEntry = parked->GetEntry();
+            facts.itemCount = parked->GetCount();
+            if (ItemTemplate const* proto = parked->GetTemplate())
+                facts.itemName = proto->Name1;
+
+            // :562, the handler's own test, run first so "no room in the bags"
+            // is a named refusal rather than a silent nothing.
+            ItemPosCountVec dest;
+            InventoryResult const canStore =
+                who->CanStoreItem(NULL_BAG, NULL_SLOT, dest, parked, false);
+            if (canStore != EQUIP_ERR_OK)
+            {
+                facts.haveInventoryResult = true;
+                facts.inventoryResult = canStore;
+                return refuse(R::NoRoom);
+            }
+
+            // COUNTED BY ENTRY AND NOT BY GUID, which is the whole reason this
+            // read-back looks different from kind='sell''s. :613 calls
+            // MoveItemToInventory, which MERGES the attachment into a stack the
+            // character already carries and DESTROYS the Item that arrived when
+            // it does. Asking for the guid afterwards would then find nothing
+            // and report a perfectly good delivery as a failure. The count of
+            // the entry cannot lie either way.
+            uint32 const entry = facts.itemEntry;
+            uint32 const attachedCount = facts.itemCount;
+            uint32 const carriedBefore = who->GetItemCount(entry, false);
+
+            // CMSG_MAIL_TAKE_ITEM: mailbox guid, mail id, item guid low
+            // (:519-525).
+            WorldPacket packet(CMSG_MAIL_TAKE_ITEM, 8 + 4 + 4);
+            packet << mailbox;
+            packet << uint32(mailId);
+            packet << uint32(req.itemGuid);
+            session->HandleMailTakeItem(packet);
+
+            // Read back: the attachment has left the letter (:550) and the
+            // bags hold exactly that many more of it (:613).
+            uint32 const carriedAfter = who->GetItemCount(entry, false);
+            bool stillAttached = false;
+            if (Mail const* after = who->GetMail(mailId))
+                for (MailItemInfo const& info : after->items)
+                    if (info.item_guid == req.itemGuid)
+                    {
+                        stillAttached = true;
+                        break;
+                    }
+
+            if (stillAttached && carriedAfter == carriedBefore)
+                return refuse(R::CoreRefused);
+            if (stillAttached || carriedAfter != carriedBefore + attachedCount)
+                return refuse(R::NotReadBack);
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' took item {} (entry {}) x{} out of mail {}; carried {} -> {}",
+                     who->GetName(), req.itemGuid, entry, attachedCount, mailId,
+                     carriedBefore, carriedAfter);
+
+            describe("taken", "", "");
+            status = "delivered";
+            return "";
+        }
+
+        // ---- take-money -----------------------------------------------------
+        if (req.verb == D::MailVerb::TakeMoney)
+        {
+            if (!delivered)
+                return refuse(R::MailNotDelivered);
+            if (!mailMoney)
+                return refuse(R::NoMoneyInMail);
+            // :650 asks ModifyMoney(m->money, false), which refuses rather than
+            // clamping when the purse would go over the cap, and answers with a
+            // packet.
+            if (who->GetMoney() > MAX_MONEY_AMOUNT - mailMoney)
+                return refuse(R::TooMuchGold);
+
+            // CMSG_MAIL_TAKE_MONEY: mailbox guid, mail id (:633-637).
+            WorldPacket packet(CMSG_MAIL_TAKE_MONEY, 8 + 4);
+            packet << mailbox;
+            packet << uint32(mailId);
+            session->HandleMailTakeMoney(packet);
+
+            // Read back: the letter has no money left on it (:661) and the
+            // purse is up by exactly what it had.
+            Mail const* after = who->GetMail(mailId);
+            uint32 const moneyAfter = who->GetMoney();
+            if (after && after->money == mailMoney && moneyAfter == moneyBefore)
+                return refuse(R::CoreRefused);
+            if (!after || after->money != 0 || moneyAfter != moneyBefore + mailMoney)
+                return refuse(R::NotReadBack);
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' took {} copper out of mail {}; purse {} -> {}",
+                     who->GetName(), mailMoney, mailId, moneyBefore, moneyAfter);
+
+            describe("taken", "", "");
+            status = "delivered";
+            return "";
+        }
+
+        // ---- return ---------------------------------------------------------
+        if (req.verb == D::MailVerb::Return)
+        {
+            if (!delivered)                     // :449-453
+                return refuse(R::MailNotDelivered);
+            // :521-526: a letter that was not written by a character is
+            // DELETED rather than returned - there is nobody to return it to -
+            // and its attachments go with it. An auction's winnings, a quest
+            // reward or a GM letter would be destroyed by this verb, so it
+            // refuses them by name and leaves them for `take-item`.
+            if (!fromCharacter)
+                return refuse(R::MailFromSystem);
+            // The client will not let a returned letter be returned again
+            // (MAIL_CHECK_MASK_RETURNED, Mail.h:48). The core does not check,
+            // and the result would be a letter bouncing between two mailboxes.
+            if (alreadyReturned)
+                return refuse(R::MailAlreadyReturned);
+
+            // CMSG_MAIL_RETURN_TO_SENDER: mailbox guid, mail id, then the
+            // original sender guid the handler reads and discards (:438-442).
+            WorldPacket packet(CMSG_MAIL_RETURN_TO_SENDER, 8 + 4 + 8);
+            packet << mailbox;
+            packet << uint32(mailId);
+            packet << uint64(0);
+            session->HandleMailReturnToSender(packet);
+
+            // Read back: gone from this character's mailbox entirely, which is
+            // what RemoveMail plus the delete at :511 leaves behind. Anything
+            // still there means the handler bailed out.
+            if (who->GetMail(mailId))
+                return refuse(R::CoreRefused);
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' returned mail {} to character {}{}",
+                     who->GetName(), mailId, facts.mailSender,
+                     hasItems ? " with its attachments" : "");
+
+            describe("returned", "",
+                     "the letter and anything on it go back to the sender by mail; "
+                     "the sender's mailbox is not read here");
+            status = "delivered";
+            return "";
+        }
+
+        // ---- delete ---------------------------------------------------------
+        //
+        // :420-432. The handler refuses a COD letter and says so with a packet;
+        // everything else it marks MAIL_STATE_DELETED, and Player::_SaveMail
+        // then issues CHAR_DEL_ITEM_INSTANCE for every attachment still on it.
+        // That is why the two "still carries something" refusals are here and
+        // not in the core: deleting a letter destroys what is in it, and the
+        // client greys the button out for exactly that reason.
+        if (mailCod)
+            return refuse(R::MailIsCod);
+        if (hasItems)
+            return refuse(R::MailStillHasItems);
+        if (mailMoney)
+            return refuse(R::MailStillHasMoney);
+
+        // CMSG_MAIL_DELETE: mailbox guid, mail id, then a mail template id the
+        // handler reads and discards (:408-412).
+        WorldPacket packet(CMSG_MAIL_DELETE, 8 + 4 + 4);
+        packet << mailbox;
+        packet << uint32(mailId);
+        packet << uint32(0);
+        session->HandleMailDelete(packet);
+
+        // Read back. The handler does NOT remove the letter from the list - it
+        // sets MAIL_STATE_DELETED and leaves the removal to the next
+        // Player::_SaveMail - so "gone" and "marked deleted" are both the right
+        // answer here and "still MAIL_STATE_UNCHANGED" is the wrong one.
+        Mail const* after = who->GetMail(mailId);
+        if (after && after->state != MAIL_STATE_DELETED)
+            return refuse(R::CoreRefused);
+
+        LOG_INFO("module.overseer", "overseer: '{}' deleted mail {} ('{}')",
+                 who->GetName(), mailId, facts.mailSubject);
+
+        describe("deleted", "", "");
+        status = "delivered";
+        return "";
+    }
+
 
     // --------------------------------------------------------------- share --
     //
