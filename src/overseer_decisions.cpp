@@ -1090,6 +1090,74 @@ bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
     return worthSaying;
 }
 
+// --------------------------------------------- the command queue drain (#230) --
+//
+// The argument for both rules is in the header, next to the declarations. What
+// is here is the arithmetic.
+
+bool ClaimIsAbandoned(std::string const& claimedBy, std::string const& runToken,
+                      time_t heldForSeconds, time_t leaseSeconds)
+{
+    // OURS IS NEVER ABANDONED. A row this run holds is being worked on inside
+    // the very poll that would be asking, so the only thing ending it could
+    // achieve is to cancel work that is about to report its own answer. Tested
+    // first, and against a non-empty token, so that a run token that has not
+    // been made yet cannot read as "everything unheld is mine" and disable the
+    // lease for every row at once.
+    if (!runToken.empty() && claimedBy == runToken)
+        return false;
+
+    // A row younger than the lease is somebody's in-flight work until proven
+    // otherwise, including a `verifying` row deliberately sitting out its
+    // read-back window.
+    if (heldForSeconds < leaseSeconds)
+        return false;
+
+    return true;
+}
+
+CommandQueueVoice CommandQueueSay(CommandQueueVoiceState& state,
+                                  CommandQueueSnapshot const& snapshot, time_t now,
+                                  CommandQueueVoiceLimits const& limits)
+{
+    // THE LIVELOCK SIGNATURE, and it does not wait for an age to accumulate: a
+    // poll that had rows in its hands and ran none of them is already the thing
+    // that went unnoticed for twenty five minutes.
+    bool const ranNothing = snapshot.held > 0 && snapshot.executed == 0;
+    bool const notReached = snapshot.pending > 0 && limits.stuckSeconds != 0 &&
+                            snapshot.oldestPendingAge >= limits.stuckSeconds;
+    bool const stuck = ranNothing || notReached;
+    bool const deep = limits.deepRows != 0 && snapshot.pending >= limits.deepRows;
+
+    if (stuck || deep)
+    {
+        // Rate limited only while a complaint is ALREADY standing. The first
+        // poll that goes wrong always speaks, whenever the last unrelated line
+        // happened to be, because the beginning of an outage is the one moment
+        // worth being loud at.
+        if (state.complaining && limits.repeatSeconds != 0 &&
+            now - state.lastSaid < limits.repeatSeconds)
+            return CommandQueueVoice::Silent;
+
+        state.complaining = true;
+        state.lastSaid = now;
+        // STUCK OUTRANKS DEEP. A queue that is both is stuck; saying it is
+        // merely busy would be the reassuring half of a true statement.
+        return stuck ? CommandQueueVoice::Stuck : CommandQueueVoice::Deep;
+    }
+
+    // Healthy. Said once, so the log has an end as well as a beginning, and
+    // then nothing until something goes wrong again.
+    if (state.complaining)
+    {
+        state.complaining = false;
+        state.lastSaid = now;
+        return CommandQueueVoice::Recovered;
+    }
+
+    return CommandQueueVoice::Silent;
+}
+
 // ------------------------------------------------------------- gear (#145) --
 //
 // The argument for every number below is in the header, next to the

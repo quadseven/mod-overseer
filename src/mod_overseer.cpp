@@ -1515,6 +1515,26 @@ constexpr uint8 MAX_TALENT_TAB = 2;
 constexpr uint32 CHAT_FLUSH_MS = 1000;
 // One world tick must never stall on a burst of queued commands.
 constexpr uint32 COMMANDS_PER_POLL = 20;
+// How long a row may sit in `claimed` or `verifying` under a run token that is
+// not this one before the drain ends it (mod-overseer#230). A claim is taken and
+// executed inside a single poll and a `verifying` row resolves within
+// VERIFY_GRACE_MS, so two minutes is far past anything legitimate. What is left
+// after that is a row held by a worldserver that went away, which
+// `WHERE status = 'pending'` can never select again and nothing else will end.
+constexpr time_t COMMAND_CLAIM_LEASE_SECONDS = 120;
+// A waiting row untouched for longer than this is not being REACHED, as opposed
+// to merely queued behind honest work: at COMMANDS_PER_POLL rows every
+// COMMAND_POLL_MS the queue would have to be over a thousand rows deep for a two
+// minute old row to be anything else.
+constexpr time_t COMMAND_QUEUE_STUCK_SECONDS = 120;
+// More than five polls' worth waiting is worth one line even while it moves,
+// because "deep and draining" and "wedged" look identical from outside and a
+// reader should not have to guess which they are looking at.
+constexpr unsigned COMMAND_QUEUE_DEEP_ROWS = COMMANDS_PER_POLL * 5;
+// ...and the queue does not say either of those again inside this. The poll is
+// every two seconds; the give backoff below already records what happens to a
+// log when a per-poll condition is given a per-poll line.
+constexpr time_t COMMAND_QUEUE_SAY_EVERY_SECONDS = 60;
 // How long a strategy command may go unobserved before the queue says so
 // (infra#2819). The bot's AI ticks far faster than this; the window is three
 // command polls rather than one so that a bot which happens to be mid-anything
@@ -15688,6 +15708,129 @@ private:
     // resolved within VERIFY_GRACE_MS.
     std::vector<StrategyCheck> _pendingChecks;
 
+    // What the drain has already said about its own health (mod-overseer#230).
+    // World thread only, like _pendingChecks beside it and for the same reason.
+    OverseerDecisions::CommandQueueVoiceState _queueVoice;
+
+    // END ROWS A RUN THAT IS GONE IS STILL HOLDING.
+    //
+    // A row is moved to `claimed` before it is executed, which is what makes
+    // this queue at-most-once for commands that create items and move
+    // characters (see DeliverPendingCommands). The cost of that is a row left in
+    // `claimed` by a worldserver that died between the claim and the result:
+    // `WHERE status = 'pending'` can never select it again, this module has no
+    // memory of it after a restart, and nothing in the world will ever end it. A
+    // `verifying` row is the same leak one step later, its check having died
+    // with the _pendingChecks that held it.
+    //
+    // ENDED AS `error`, NOT RETURNED TO `pending`. Handing one back would undo
+    // the whole point of claiming first: a dot-command that creates items or
+    // moves a character would run a second time, which is the at-least-once
+    // behaviour the claim exists to remove. The sender gets a bad answer, which
+    // is what it is owed and is strictly better than none.
+    //
+    // THE AGE COMES FROM THE DATABASE, so a worldserver whose host clock has
+    // drifted from the database's cannot expire a live claim or keep a dead one.
+    // The rule is pure and tested (OverseerDecisions::ClaimIsAbandoned); what is
+    // here is the reading and the writing.
+    //
+    // The bridge sweeps these too, and this write is guarded on the status and
+    // the token it is collecting, so whichever gets there second changes
+    // nothing.
+    void ExpireAbandonedClaims()
+    {
+        QueryResult holders = CharacterDatabase.Query(
+            "SELECT id, claimed_by, TIMESTAMPDIFF(SECOND, updated_at, NOW()) "
+            "FROM overseer_command WHERE status IN ('claimed', 'verifying') "
+            "ORDER BY updated_at ASC LIMIT {}",
+            COMMANDS_PER_POLL);
+        if (!holders)
+            return;
+
+        do
+        {
+            Field* fields = holders->Fetch();
+            uint32 const id = fields[0].Get<uint32>();
+            std::string const claimedBy = fields[1].Get<std::string>();
+            int64 const heldFor = fields[2].Get<int64>();
+
+            if (!OverseerDecisions::ClaimIsAbandoned(claimedBy, g_runToken,
+                                                     static_cast<time_t>(heldFor),
+                                                     COMMAND_CLAIM_LEASE_SECONDS))
+                continue;
+
+            // SAID, EVERY TIME. These are rare by construction - one burst per
+            // worldserver that died holding rows - and each one is a command
+            // somebody is still waiting on, so there is nothing here to spare
+            // the log from.
+            LOG_WARN("module.overseer",
+                     "overseer: command {} has been held for {}s by a run that is not this "
+                     "one, where nothing can select it again; ending it. It is NOT re-queued, "
+                     "because a claimed command may already have half run",
+                     id, static_cast<long long>(heldFor));
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = 'error', "
+                "detail = 'claim expired: the run holding it is gone', claimed_by = '' "
+                "WHERE id = {} AND status IN ('claimed', 'verifying') AND claimed_by = '{}'",
+                id, Esc(claimedBy));
+        } while (holders->NextRow());
+    }
+
+    // THE QUEUE SAYS WHEN IT IS NOT DRAINING (mod-overseer#230).
+    //
+    // The defect this exists for was invisible in the log and obvious in one
+    // database query, which is the wrong way round for something an operator is
+    // meant to notice: the queue delivered nothing for twenty five minutes while
+    // the module logged two hundred perfectly healthy lines beside it. A poll
+    // that had rows in its hands and executed none of them, or a backlog whose
+    // oldest row is not being reached, now says so at the moment it starts.
+    //
+    // The judgement is pure and tested (OverseerDecisions::CommandQueueSay),
+    // including the rate limit and the line that ends a complaint; what is here
+    // is the wording and the level.
+    void SayHowTheQueueIsDoing(unsigned pending, unsigned executed, unsigned held,
+                               time_t oldestPendingAge)
+    {
+        OverseerDecisions::CommandQueueSnapshot snapshot;
+        snapshot.pending = pending;
+        snapshot.executed = executed;
+        snapshot.held = held;
+        snapshot.oldestPendingAge = oldestPendingAge;
+
+        OverseerDecisions::CommandQueueVoiceLimits limits;
+        limits.stuckSeconds = COMMAND_QUEUE_STUCK_SECONDS;
+        limits.deepRows = COMMAND_QUEUE_DEEP_ROWS;
+        limits.repeatSeconds = COMMAND_QUEUE_SAY_EVERY_SECONDS;
+
+        switch (OverseerDecisions::CommandQueueSay(_queueVoice, snapshot, time(nullptr),
+                                                   limits))
+        {
+            case OverseerDecisions::CommandQueueVoice::Stuck:
+                LOG_WARN("module.overseer",
+                         "overseer: the command queue is NOT draining - {} row(s) waiting, {} "
+                         "run this poll, {} selected and not run, oldest waiting row untouched "
+                         "for {}s. Something at the head is refusing every poll and everything "
+                         "behind it is waiting on it",
+                         pending, executed, held, static_cast<long long>(oldestPendingAge));
+                break;
+            case OverseerDecisions::CommandQueueVoice::Deep:
+                LOG_INFO("module.overseer",
+                         "overseer: the command queue is {} row(s) deep and moving - {} run "
+                         "this poll, oldest waiting row is {}s old",
+                         pending, executed, static_cast<long long>(oldestPendingAge));
+                break;
+            case OverseerDecisions::CommandQueueVoice::Recovered:
+                LOG_INFO("module.overseer",
+                         "overseer: the command queue is draining normally again - {} row(s) "
+                         "waiting, {} run this poll",
+                         pending, executed);
+                break;
+            case OverseerDecisions::CommandQueueVoice::Silent:
+                break;
+        }
+    }
+
     // `nc -new rpg`, `co +grind,-loot`. Returns false for everything with no
     // post-condition to read: a different verb, `~` (toggle) or `?` (query),
     // an empty or malformed list. False is not a failure - it is this module
@@ -15925,12 +16068,55 @@ private:
         // answer by a whole poll.
         ResolveStrategyChecks(sincePollMs);
 
+        // Then collect any row a run that is no longer here is still holding,
+        // because nothing below this line can ever see one.
+        ExpireAbandonedClaims();
+
+        // ORDERED BY WHEN THE ROW WAS LAST TOUCHED, NOT BY ITS ID
+        // (mod-overseer#230).
+        //
+        // In id order the head of this queue is FIXED, and any path that leaves
+        // a selected row pending keeps that head against everything behind it.
+        // That is what wedged this queue for twenty five minutes on 2026-09-05,
+        // and the retry that did it is deleted below - but the ordering is what
+        // makes the property structural rather than a promise that no future
+        // executor reaches for `status = "pending"` again. One did, an hour
+        // before this was written (see the town trip's comment below), which is
+        // the argument for closing the hole rather than only the instance.
+        //
+        // `updated_at` moves when a row is deferred and does not otherwise, so
+        // this costs nothing for a row nothing has held: for those it is still
+        // creation order, which for an auto-increment queue is id order. Every
+        // pending row is then reached within ceil(rows / COMMANDS_PER_POLL)
+        // polls whatever any one of them keeps doing. `id ASC` remains the
+        // tie-break so two commands inserted in the same second still go out in
+        // the order they were asked for, which the trigger-collision rule above
+        // depends on.
+        //
+        // The age comes back with the row for the health line at the bottom of
+        // this function, from the database's clock rather than this host's.
         QueryResult result = CharacterDatabase.Query(
-            "SELECT id, target_name, command, kind, channel, target_arg FROM overseer_command "
-            "WHERE status = 'pending' ORDER BY id ASC LIMIT {}",
+            "SELECT id, target_name, command, kind, channel, target_arg, "
+            "TIMESTAMPDIFF(SECOND, updated_at, NOW()) FROM overseer_command "
+            "WHERE status = 'pending' ORDER BY updated_at ASC, id ASC LIMIT {}",
             COMMANDS_PER_POLL);
         if (!result)
+        {
+            // Judged even so. A queue that has just drained to nothing is how a
+            // complaint ENDS, and returning early without a word here is how the
+            // log would carry the beginning of one and never the end.
+            SayHowTheQueueIsDoing(0, 0, 0, 0);
             return;
+        }
+
+        // WHAT THIS POLL WAS LIKE, gathered as it goes. `selected` counts rows
+        // taken out of the queue, `executed` the ones actually attempted, and
+        // `held` the ones handed back untried - and it is the gap between those
+        // last two that names a wedge.
+        unsigned selected = 0;
+        unsigned executed = 0;
+        unsigned held = 0;
+        time_t oldestPendingAge = 0;
 
         // "<character>\n<verb>" already handed to a bot in THIS poll. Local to
         // the poll on purpose: the trigger slot is only contended between
@@ -15946,6 +16132,17 @@ private:
             std::string kind = fields[3].Get<std::string>();
             std::string channel = fields[4].Get<std::string>();
             std::string targetArg = fields[5].Get<std::string>();
+
+            // The SELECT is ordered oldest first, so the FIRST row carries the
+            // age the health line below judges. Clamped at zero because a
+            // TIMESTAMPDIFF against a row written in the same second, or by a
+            // host running slightly ahead, can come back negative.
+            ++selected;
+            if (selected == 1)
+            {
+                int64 const waiting = fields[6].Get<int64>();
+                oldestPendingAge = waiting > 0 ? static_cast<time_t>(waiting) : 0;
+            }
 
             char const* status = "error";
             char const* detail = "";
@@ -15972,6 +16169,20 @@ private:
                               "overseer: holding command {} ('{}' for '{}') until next poll; "
                               "'{}' already sent this poll and they share a trigger",
                               id, command, targetName, verb);
+                    // ...AND IT GIVES UP ITS PLACE IN THE QUEUE
+                    // (mod-overseer#230). The SELECT above is ordered by
+                    // `updated_at`, so a row held here without a touch keeps the
+                    // head it is holding and is selected and held again on every
+                    // poll for as long as its character has other rows sharing
+                    // that verb - the same head-of-line block that wedged this
+                    // queue, merely bounded. One small write sends it behind
+                    // whatever can actually run now, and it is still pending,
+                    // still unclaimed and still unanswered, exactly as before.
+                    CharacterDatabase.Execute(
+                        "UPDATE overseer_command SET updated_at = NOW() "
+                        "WHERE id = {} AND status = 'pending'",
+                        id);
+                    ++held;
                     continue;
                 }
             }
@@ -16011,6 +16222,11 @@ private:
                 {
                     LOG_WARN("module.overseer",
                              "overseer: did not win the claim on command {}; not running it", id);
+                    // Counted as held rather than run, so a poll that loses
+                    // every claim it tries for reads as the wedge it is
+                    // (mod-overseer#230). No touch: the row is not pending any
+                    // more, so it cannot be holding the head of anything.
+                    ++held;
                     continue;
                 }
             }
@@ -16024,6 +16240,10 @@ private:
             // kind='share' and kind='sell' fill the same column, for the same
             // reason: the row must carry ITS OWN outcome.
             std::string rowResult;
+
+            // Claimed and about to run: this row is work done, whatever it
+            // answers (mod-overseer#230).
+            ++executed;
 
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
             if (!player)
@@ -16093,46 +16313,41 @@ private:
             else
                 detail = "target has no bot AI (selfbot not enabled?)";
 
-            // A vendor row is claimed before execution, but reaching the NPC
-            // is asynchronous: the travel errand may still be walking the
-            // seller when this poll handles the row. Keep transient proximity
-            // and death failures pending so the next poll can retry after the
-            // holder arrives, rather than losing the sale permanently.
-            if (kind == "sell" &&
-                (std::string(detail) == "vendor not in range" ||
-                 std::string(detail) == "seller is dead"))
-                status = "pending";
-
-            // AND THE TOWN TRIP'S TWO NEW ROWS DELIBERATELY DO NOT DO THIS.
+            // NO ROW GOES BACK ON THE QUEUE IN PLACE. NOT `sell` EITHER, NOW.
             //
-            // The obvious thing was to copy the four lines above for
-            // kind='repair' and kind='buy': both race travel exactly the way a
-            // sale does, and a row that arrives before its character reaches
-            // the counter is refused for a reason that will stop being true in
-            // a moment. That copy was written, and then removed, because the
-            // pattern it copies is #230.
+            // A vendor row is claimed before execution and reaching the NPC is
+            // asynchronous, so a sale can arrive while the travel errand is
+            // still walking its seller. That used to be answered here by setting
+            // `status = "pending"` and letting the next poll try again.
+            // mod-overseer#227 declined to copy those four lines for `repair`
+            // and `buy` because the pattern they copy is #230; this is #230's
+            // own diff, so they are gone from `sell` as well and no verb has
+            // them any more.
             //
-            // Measured on the dev realm while this was being written: twenty
-            // sell rows refused with "vendor not in range", each pushed back to
-            // `pending` with its low id intact, re-selected by the very next
-            // poll because the drain takes work `ORDER BY id ASC LIMIT 20`, and
-            // re-attempted for half an hour. Twenty is COMMANDS_PER_POLL, so
-            // they filled the window completely and the 322 rows behind them
-            // were never read at all. Not a stall - a livelock, with the drain
-            // running perfectly on the same twenty rows.
+            // Measured on the dev realm, 2026-09-05: twenty sell rows refused
+            // with "vendor not in range", each pushed back to `pending` with its
+            // low id intact, re-selected by the very next poll because the drain
+            // took its work `ORDER BY id ASC LIMIT 20`, and re-attempted for
+            // half an hour. Twenty is COMMANDS_PER_POLL, so they filled the
+            // window completely and the 322 rows behind them were never read at
+            // all. Not a stall - a livelock, with the drain running perfectly on
+            // the same twenty rows.
             //
-            // A retry that keeps its place at the head of a FIFO is not a
-            // retry, it is a lock. So these two verbs carry their retry class
-            // OUT instead: `detail` names the wall, `result` carries
-            // "retry":"elsewhere" or "later" (RepairRefusalRetry /
-            // BuyRefusalRetry), and the side that decides re-queues a FRESH row
-            // - which lands at the TAIL, behind everything already waiting,
-            // and cannot hold the head against anybody.
+            // A retry that keeps its place at the head of a FIFO is not a retry,
+            // it is a lock. So every one of these verbs carries its retry class
+            // OUT instead: `detail` names the wall and `result` carries
+            // "retry":"elsewhere" or "later" (SellRefusalRetry,
+            // RepairRefusalRetry, BuyRefusalRetry), and the side that decides
+            // re-queues a FRESH row - which lands at the TAIL, behind everything
+            // already waiting, and cannot hold the head against anybody.
             //
-            // The sell path above is left exactly as it is. Changing it is
-            // #230's job and belongs in #230's diff, where the bounded retry,
-            // the claim lease and the logging can be designed together instead
-            // of being half-done here.
+            // AND IT ALREADY DOES, WHICH IS THE OTHER HALF OF THE ARGUMENT. In
+            // the same measurement the 178 pending sales were only 21 distinct
+            // asks: the sender had re-queued the same item as many as ten times
+            // over forty five minutes while the original row sat at the head
+            // being refused. Recycling in place was never what kept a sale from
+            // being lost. It was holding the queue shut beside a sender that was
+            // already asking again.
 
             // Conditional on the row still being OURS. If the bridge gave up
             // waiting and already ended this row, writing over it would
@@ -16153,6 +16368,23 @@ private:
                     "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
                     status, detail, EscLong(rowResult), id, g_runToken);
         } while (result->NextRow());
+
+        // AND SAY HOW THAT WENT, IF IT IS WORTH SAYING (mod-overseer#230).
+        //
+        // `selected` is the whole answer whenever the window came back short,
+        // because a short window means the queue held nothing else. The COUNT is
+        // paid only when the window came back FULL, which is the one case where
+        // `selected` is a floor rather than the depth, and is also the only case
+        // where the depth could be worth complaining about.
+        unsigned pending = selected;
+        if (selected >= COMMANDS_PER_POLL)
+        {
+            if (QueryResult depth = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM overseer_command WHERE status = 'pending'"))
+                pending = static_cast<unsigned>(depth->Fetch()[0].Get<uint64>());
+        }
+
+        SayHowTheQueueIsDoing(pending, executed, held, oldestPendingAge);
     }
 
     // Speak as the character would. Language matches mod-playerbots' own
