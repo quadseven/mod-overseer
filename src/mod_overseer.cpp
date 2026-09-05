@@ -5778,7 +5778,11 @@ private:
             // the local surface is about z=109.6. It is a real vendor, but
             // routing a travel errand to that row drops the family into the
             // Stormwind/Elwynn hole before the sale can happen.
-            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) && (data.id == 958 || data.id == 959))
+            bool const badCanalCluster = data.mapid == 0 &&
+                data.posX > -9050.f && data.posX < -8750.f &&
+                data.posY > -200.f && data.posY < 0.f;
+            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) &&
+                ((data.id == 958 || data.id == 959) || badCanalCluster))
                 continue;
 
             TravelSpawn spawn;
@@ -16681,6 +16685,9 @@ private:
                 && std::string(creature->GetName()).rfind("[DND] TAR Pedestal", 0) != 0
                 && creature->GetEntry() != 958
                 && creature->GetEntry() != 959
+                && !(creature->GetMapId() == 0 && creature->GetPositionX() > -9050.f &&
+                     creature->GetPositionX() < -8750.f && creature->GetPositionY() > -200.f &&
+                     creature->GetPositionY() < 0.f)
                 && from->IsWithinDistInMap(creature, range);
         }
     };
