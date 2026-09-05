@@ -5770,6 +5770,26 @@ private:
             if (!(npcFlags & wanted))
                 continue;
 
+            // The world database marks the Dungeon Finder TAR pedestals as
+            // vendors so the client can open their synthetic menus. They are
+            // not physical shops and have no sale interaction. Indexing one
+            // sends a travel errand onto the broken pedestal geometry instead
+            // of to a real town vendor.
+            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) &&
+                std::string(creatureTemplate->Name).rfind("[DND] TAR Pedestal", 0) == 0)
+                continue;
+
+            // Morley Eberlein's only map-0 spawn is stored at z=90.5 while
+            // the local surface is about z=109.6. It is a real vendor, but
+            // routing a travel errand to that row drops the family into the
+            // Stormwind/Elwynn hole before the sale can happen.
+            bool const badCanalCluster = data.mapid == 0 &&
+                data.posX > -9050.f && data.posX < -8750.f &&
+                data.posY > -200.f && data.posY < 0.f;
+            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) &&
+                ((data.id == 958 || data.id == 959) || badCanalCluster))
+                continue;
+
             TravelSpawn spawn;
             spawn.entry = data.id;
             spawn.mapId = data.mapid;
@@ -16677,6 +16697,12 @@ private:
         bool operator()(Creature* creature) const
         {
             return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR)
+                && std::string(creature->GetName()).rfind("[DND] TAR Pedestal", 0) != 0
+                && creature->GetEntry() != 958
+                && creature->GetEntry() != 959
+                && !(creature->GetMapId() == 0 && creature->GetPositionX() > -9050.f &&
+                     creature->GetPositionX() < -8750.f && creature->GetPositionY() > -200.f &&
+                     creature->GetPositionY() < 0.f)
                 && from->IsWithinDistInMap(creature, range);
         }
     };
