@@ -7521,20 +7521,29 @@ private:
         return OverseerDecisions::GearScore(GearItemFor(proto, unresolvedRandomProperty), who);
     }
 
-    // What is worn in one slot, scored. An empty slot is zero, which is what
-    // makes the first item into an empty slot an upgrade by construction.
-    static float GearWornScore(Player* bot, OverseerDecisions::GearWearer const& who,
-                               uint8 slot)
+    // What is worn in one slot, scored, AND how much of that score the file can
+    // vouch for (#221). An empty slot is an exact zero, which is what makes the
+    // first item into an empty slot an upgrade by construction.
+    static OverseerDecisions::GearIncumbentScore GearWornIncumbent(
+        Player* bot, OverseerDecisions::GearWearer const& who, uint8 slot)
     {
         Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
         if (!item)
-            return 0.f;
+            return OverseerDecisions::GearWorn(OverseerDecisions::GearVerdict{});
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto)
-            return 0.f;
-        OverseerDecisions::GearVerdict const verdict =
-            GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0);
-        return verdict.score;
+            return OverseerDecisions::GearWorn(OverseerDecisions::GearVerdict{});
+        return OverseerDecisions::GearWorn(
+            GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0));
+    }
+
+    // The same thing as a bare number, which is all the Need vote wants: what
+    // it is comparing is one member's total against another's, and a total is
+    // never exact anyway.
+    static float GearWornScore(Player* bot, OverseerDecisions::GearWearer const& who,
+                               uint8 slot)
+    {
+        return GearWornIncumbent(bot, who, slot).score;
     }
 
     // Everything a character is wearing, scored, which is what decides who
@@ -7586,6 +7595,22 @@ private:
     }
     std::map<std::string, std::set<uint32>> _gearSaid;
 
+    // WHAT THIS DRIVE PUT WHERE (#221), keyed by character and equipment slot.
+    // The same terms as `_gearSaid` above and every other per-character memory
+    // in this file: bounded by the roster times the equipment slots, unguarded
+    // because DriveGear runs only from OnUpdate on the world thread, and lost
+    // on a restart. Losing it costs at most three more swaps on a slot
+    // somebody else is fighting over, and no correctness.
+    std::map<std::string, OverseerDecisions::GearSlotMemory> _gearSlotMemory;
+
+    // The entry worn in one slot, or zero for an empty one. Zero is meaningful
+    // to GearIntend: an empty slot is never something to give up on.
+    static unsigned GearWornEntry(Player* bot, uint8 slot)
+    {
+        Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        return item ? static_cast<unsigned>(item->GetEntry()) : 0u;
+    }
+
     // One character's bags, against one character's worn gear.
     void SweepGear(Player* bot, OverseerDecisions::GearWearer const& who)
     {
@@ -7622,50 +7647,81 @@ private:
                 continue;
 
             uint8 target = found;
-            float incumbent = GearWornScore(bot, who, found);
+            OverseerDecisions::GearIncumbentScore incumbent =
+                GearWornIncumbent(bot, who, found);
 
             // A TWO-HANDER HAS TO BEAT BOTH HANDS (#14, the Severing Axe): the
             // off hand is emptied to make room for it, so what it is really
             // being compared against is the pair.
             if (proto->InventoryType == INVTYPE_2HWEAPON && found == EQUIPMENT_SLOT_MAINHAND)
             {
-                incumbent = OverseerDecisions::GearIncumbent(
-                    incumbent, GearWornScore(bot, who, EQUIPMENT_SLOT_OFFHAND), true);
+                incumbent = OverseerDecisions::GearIncumbentPair(
+                    incumbent, GearWornIncumbent(bot, who, EQUIPMENT_SLOT_OFFHAND));
             }
             // A RING OR A TRINKET HAS TWO HOMES, and the one worth taking is
             // the worse of them. FindEquipSlot names the first; this picks.
             else if (found == EQUIPMENT_SLOT_FINGER1 || found == EQUIPMENT_SLOT_TRINKET1)
             {
                 uint8 const other = static_cast<uint8>(found + 1);
-                float const second = GearWornScore(bot, who, other);
-                if (second < incumbent)
+                OverseerDecisions::GearIncumbentScore const second =
+                    GearWornIncumbent(bot, who, other);
+                if (second.score < incumbent.score)
                 {
                     target = other;
                     incumbent = second;
                 }
             }
 
-            if (!OverseerDecisions::GearIsUpgrade(candidate, incumbent))
+            // THE THREE-WAY ANSWER (#221). NotBetter is the ordinary state of
+            // most of what a party carries and is said about nothing.
+            OverseerDecisions::GearComparison const verdict =
+                OverseerDecisions::GearCompare(candidate, incumbent);
+            if (verdict == OverseerDecisions::GearComparison::NotBetter)
                 continue;
 
-            // IT SCORES HIGHER AND THE SCORE IS NOT THE WHOLE STORY. Said, and
-            // then left alone: the number that would justify the swap is one
-            // this file has already admitted is incomplete, and swapping on it
-            // anyway is exactly the confident-but-wrong move that put a cloth
-            // robe on the tank. Checked here rather than before the comparison
-            // so it is only ever said about an item that would OTHERWISE have
-            // been put on - the bags are full of things nobody needs told
-            // about.
-            if (!candidate.judged)
+            // UNDECIDED IS NOT A REFUSAL AND IS NOT A SWAP. Either the
+            // candidate's score is only a floor and the floor does not clear
+            // the margin, or what is being worn is itself only a floor and
+            // nothing above it can be proved. Both are worth saying once,
+            // because an item nobody can decide about is exactly the thing a
+            // person should look at - and worth saying ONCE, because the sweep
+            // runs on a five second timer.
+            if (verdict == OverseerDecisions::GearComparison::Undecided)
             {
                 if (SayGearOnce(who.name, item->GetEntry()))
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' is carrying {}, which scores above the {} it is "
-                             "wearing - {} - and it is left in the bags because that score is "
-                             "not the whole story",
+                             "overseer: '{}' is carrying {}, and whether it beats the {} it "
+                             "is wearing cannot be settled from the numbers - {} - so it "
+                             "stays in the bags",
                              who.name, proto->Name1, GearSlotName(target), candidate.why);
                 continue;
             }
+
+            // AM I BEING OVERRULED? (#221) The drive remembers what it put into
+            // this slot and what it took off to do it. Finding that pair the
+            // other way round means somebody else moved it back, because this
+            // drive's own swap is one-way and cannot produce it. Three attempts
+            // and then it stands down and says so, rather than the 124 equips
+            // in eleven hours that one pair of gloves actually cost.
+            std::string const slotKey = who.name + "/" + std::to_string(target);
+            OverseerDecisions::GearSwapIntent const intent = OverseerDecisions::GearIntend(
+                _gearSlotMemory[slotKey], item->GetEntry(), GearWornEntry(bot, target), true);
+            _gearSlotMemory[slotKey] = intent.memory;
+            if (intent.standDown)
+            {
+                Item* const held = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, target);
+                ItemTemplate const* heldProto = held ? held->GetTemplate() : nullptr;
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' has had {} put back on over {} in the {} slot {} "
+                          "times, so something else is equipping this character and the "
+                          "overseer is standing down on that slot - {}",
+                          who.name, heldProto ? heldProto->Name1 : "something",
+                          proto->Name1, GearSlotName(target),
+                          OverseerDecisions::GEAR_REVERSALS_ALLOWED, candidate.why);
+                continue;
+            }
+            if (!intent.swap)
+                continue;
 
             // EVERYTHING THE LOG LINE NEEDS IS READ BEFORE ANYTHING MOVES.
             // Player::SwapItem re-homes both items, so `item` is not where it
@@ -7694,7 +7750,7 @@ private:
                          "overseer: '{}' puts on {} in the {} slot over {} - {} against {} "
                          "for what it was wearing",
                          who.name, itemName, GearSlotName(target), replaced, candidate.why,
-                         static_cast<int>(incumbent));
+                         static_cast<int>(incumbent.score));
             }
             else if (SayGearOnce(who.name, entry))
             {
@@ -7703,7 +7759,7 @@ private:
                          "against {} - and the server refused the swap, so it stays in the "
                          "bags",
                          who.name, itemName, GearSlotName(target), replaced, candidate.why,
-                         static_cast<int>(incumbent));
+                         static_cast<int>(incumbent.score));
             }
         }
     }

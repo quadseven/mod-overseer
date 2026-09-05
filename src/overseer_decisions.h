@@ -1187,6 +1187,42 @@ struct GearItem
     bool unresolvedRandomProperty{false};
 };
 
+// HOW MUCH OF THE ITEM THE NUMBER COVERS (#221).
+//
+// `judged` below is a boolean, and a boolean threw away the one distinction
+// that decides most of the family's bags: the difference between a number that
+// might be too HIGH and a number that can only be too LOW.
+//
+// An on-equip effect this file does not price, and a random property whose
+// stats the caller could not resolve, can only ever ADD to what an item is
+// worth. So the score of such an item is not an unknown - it is a FLOOR, and a
+// floor that already beats what the character is wearing settles the question
+// without the missing part being read at all. Refusing to act on it, which is
+// what the boolean did, is how a level 26 mage ended up carrying a blue robe
+// scoring 25.8 while wearing a green one scoring 21.8: the robe's worth is
+// partly in an on-equip spell, so the score was declared incomplete and the
+// robe stayed in the bag forever.
+//
+// An unknown ROLE is a different thing altogether and must not be confused
+// with it. There the weights are all 1.0 and the ordering is a rough opinion
+// rather than a bound in either direction, so nothing may be concluded from it
+// in either direction. That is the case the boolean was right about.
+//
+// Three answers, then, and not two.
+enum class GearConfidence
+{
+    // The score is the whole of what this file can see, and nothing it could
+    // not see is missing. A refusal is Exact too: "she cannot wear leather" is
+    // certain, and so is the zero an empty slot is worth.
+    Exact,
+    // The score is a LOWER BOUND. Something unread - an effect, an unresolved
+    // random property - can only add to it.
+    Floor,
+    // Not even a bound. The role is unknown, or the thing is not worn gear at
+    // all, so the number orders items roughly and proves nothing.
+    Opinion,
+};
+
 struct GearVerdict
 {
     // May this character put it on at all? False is final: no score, no
@@ -1200,7 +1236,14 @@ struct GearVerdict
     // item's worth is partly in an effect this file does not read, or when a
     // random property could not be resolved. An unjudged verdict never drives
     // an automatic swap or a Need roll - it is said out loud instead.
+    //
+    // KEPT AS IT WAS, and it is exactly `confidence == GearConfidence::Exact`.
+    // The Need vote and the sibling hand-off both read it and both want the
+    // strict answer; only the swap needed the finer one.
     bool judged{false};
+
+    // The same answer, told apart. See GearConfidence above.
+    GearConfidence confidence{GearConfidence::Opinion};
 
     // One clause, for the line the caller prints: "mail, 113 armour", or
     // "no leather proficiency".
@@ -1225,6 +1268,134 @@ float GearIncumbent(float mainHandScore, float offHandScore, bool takesBothHands
 // one-way, so it cannot oscillate: once the better item is worn, the one now
 // in the bag is the lower score.
 bool GearIsUpgrade(GearVerdict const& candidate, float incumbent);
+
+// ------------------------------------------- a swap that settles (#221) --
+//
+// WHAT WENT WRONG, MEASURED. On the dev realm, one character's hands slot
+// filed 124 equip events across eleven hours between the same two pairs of
+// gloves - a level 23 rare and a level 29 common, both 122 armour - and twelve
+// slots across four of the five characters behaved the same way, 923 equips in
+// the hours a flip happened. Nothing was broken in either half. Each half was
+// individually correct and individually convergent, and they pointed opposite
+// ways:
+//
+//   - This file scores the rare higher for a tank, because 8 strength and 3
+//     stamina beat 6 stamina and 5 spirit at equal armour, and GearIsUpgrade's
+//     one-way margin means it will only ever move the character TOWARDS it.
+//   - Upstream's own auto-equip multiplies an item's whole stat weight through
+//     by its item level and then wants a 1.1x margin, which makes the common
+//     item win by 29/23, and it will only ever move the character towards THAT.
+//
+// Two monotone rules, opposite directions, each on its own timer. Neither can
+// oscillate alone; together they cannot do anything else. Both of the swaps
+// were "correct" every single time, which is why nothing in either half's logs
+// looked wrong, and why it ran for days.
+//
+// So the settlement is not a better margin. A margin cannot help: whatever it
+// is, the other writer has its own. The settlement is that ONE of them decides,
+// and that this one NOTICES when something disagrees with it instead of
+// arm-wrestling in silence. The first half is a deployment setting. This is the
+// second half, and it is here rather than in the adapter because "have I been
+// overruled?" is a judgement and belongs where it can be tested.
+
+// Is the candidate better than what is worn, given how much of each score the
+// file can actually vouch for? Three answers, because "I cannot tell" is a real
+// and common one and reporting it as "no" is what buried the bags.
+enum class GearComparison
+{
+    // Certainly better. Put it on.
+    Better,
+    // Certainly not better. Leave it, and say nothing - most of what a party
+    // carries out of a dungeon is this.
+    NotBetter,
+    // The numbers do not settle it. Leave it and SAY SO: either the candidate's
+    // score is a floor that does not clear the margin, or what is worn is
+    // itself only a floor and nothing above it can be proved.
+    Undecided,
+};
+
+// What a candidate is measured against: a number, and how much of what is worn
+// that number covers.
+struct GearIncumbentScore
+{
+    float score{0.f};
+    GearConfidence confidence{GearConfidence::Exact};
+};
+
+// What is worn in one slot, as something to be measured against. An empty slot
+// and an item the character can no longer wear are both worth EXACTLY zero -
+// certain, not a guess - which is what makes the first item into an empty slot
+// an upgrade by construction.
+GearIncumbentScore GearWorn(GearVerdict const& worn);
+
+// A TWO-HANDER HAS TO BEAT BOTH HANDS (#14, the Severing Axe). The scores add,
+// and the certainty is the WEAKER of the two: a pair is only exactly known when
+// both halves are.
+GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
+                                     GearIncumbentScore const& offHand);
+
+// The rule itself. `GearIsUpgrade` is the margin it uses and is unchanged, so
+// the two never disagree about where the line is - only about what to say when
+// the line cannot be located.
+GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore const& worn);
+
+// ---------------------------------------------- and the drive stands down --
+//
+// The comparison above converges on its own: it is antisymmetric, so under
+// unchanged inputs no pair of items can each be Better than the other, and a
+// sweep that swaps reaches a fixed point. `tests/test_gear_converges.cpp`
+// asserts both properties rather than asserting the arithmetic that happens to
+// give them.
+//
+// THAT IS NOT ENOUGH ON ITS OWN, because it only proves this file cannot fight
+// ITSELF. What actually happened was another writer, and no rule of ours can
+// stop one existing - a stray admin `autogear`, a deployment setting that comes
+// back on an upstream bump, an upstream path that has not been written yet. So
+// the drive also remembers what it put where, and gives up on a slot somebody
+// keeps undoing.
+//
+// The budget is deliberately small. Three attempts is enough to ride out a
+// transient - an item briefly unequipped by a durability break, a swap the
+// server refused once - and small enough that the 124-equip day becomes three
+// equips and one line in the log naming both items. Being WRONG and quiet is
+// the failure being fixed; being right and quiet was never the requirement.
+constexpr int GEAR_REVERSALS_ALLOWED = 3;
+
+// What the drive remembers about ONE character's ONE slot. Entries, not names:
+// a slot is disputed over particular items, and any other candidate is a fresh
+// question.
+struct GearSlotMemory
+{
+    // The item entry this drive last put into the slot, and what it took off to
+    // do it. Zero for a slot it has never touched.
+    unsigned chosen{0};
+    unsigned displaced{0};
+
+    // How many times it has since found `displaced` back on and `chosen` in the
+    // bags again. Nobody but another writer can do that.
+    int reversals{0};
+};
+
+// Should the swap happen, and what should be remembered afterwards?
+struct GearSwapIntent
+{
+    // Do it.
+    bool swap{false};
+
+    // Do not do it, and say out loud that this slot is being fought over. Set
+    // once, on the attempt that exhausts the budget, so the line is said once
+    // rather than every five seconds forever.
+    bool standDown{false};
+
+    // What to store against this character and slot, whatever the answer.
+    GearSlotMemory memory;
+};
+
+// `wanted` is the caller's GearCompare answer reduced to a yes: only a
+// GearComparison::Better reaches here as true. Everything else is the caller's
+// to report and is not this function's business.
+GearSwapIntent GearIntend(GearSlotMemory const& memory, unsigned candidateEntry,
+                          unsigned wornEntry, bool wanted);
 
 // WHO NEEDS WHEN TWO MEMBERS BOTH WANT THE SAME DROP (#145). The one with the
 // lower total equipped score, because what a dungeon run raises is the party's

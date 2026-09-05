@@ -1034,8 +1034,10 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
     // is the answer being certain rather than the answer being good, and the
     // difference matters to the caller: an unjudged verdict is one this file
     // declines to have an opinion on and hands back for somebody else to
-    // decide, whereas "she cannot wear leather" is decided.
+    // decide, whereas "she cannot wear leather" is decided. Exact, too: there
+    // is no unread part of a refusal that might yet change the answer.
     verdict.judged = true;
+    verdict.confidence = GearConfidence::Exact;
 
     if (!who.classAllowed)
     {
@@ -1083,6 +1085,20 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
                      !item.unresolvedRandomProperty &&
                      (item.itemClass == CLASS_ARMOUR || item.itemClass == CLASS_WEAPON);
 
+    // THE SAME FACT, TOLD APART (#221). An unknown role, or a thing that is not
+    // worn gear at all, leaves a number that is not a bound in either
+    // direction - every stat weighted 1.0 orders items roughly and proves
+    // nothing. An unread effect or an unresolved random property is the other
+    // case entirely: both can only ADD, so what is left is a FLOOR, and a floor
+    // is something a comparison can still use.
+    if (who.role == GearRole::Unknown ||
+        (item.itemClass != CLASS_ARMOUR && item.itemClass != CLASS_WEAPON))
+        verdict.confidence = GearConfidence::Opinion;
+    else if (item.hasEffect || item.unresolvedRandomProperty)
+        verdict.confidence = GearConfidence::Floor;
+    else
+        verdict.confidence = GearConfidence::Exact;
+
     std::string const armourClass = ArmourClassName(item);
     verdict.why = armourClass.empty() ? std::string() : armourClass + ", ";
     if (item.armour)
@@ -1116,6 +1132,128 @@ bool GearIsUpgrade(GearVerdict const& candidate, float incumbent)
         return false;
     return candidate.score >
            incumbent * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR;
+}
+
+GearIncumbentScore GearWorn(GearVerdict const& worn)
+{
+    // NOTHING WORN AND NOTHING WEARABLE ARE THE SAME NUMBER, and it is an exact
+    // one. An empty slot is worth zero; a piece the character has lost the
+    // proficiency for is worth zero to it as well, and both of those are
+    // certain rather than a floor under something unknown.
+    if (!worn.wearable)
+        return GearIncumbentScore{0.f, GearConfidence::Exact};
+    return GearIncumbentScore{worn.score, worn.confidence};
+}
+
+GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
+                                     GearIncumbentScore const& offHand)
+{
+    GearIncumbentScore pair;
+    pair.score = mainHand.score + offHand.score;
+
+    // THE WEAKER HALF DECIDES WHAT THE PAIR IS WORTH KNOWING. A sum is only
+    // exactly known when both terms are; a sum with one floor in it is a floor;
+    // and an opinion anywhere makes the whole thing an opinion, because
+    // "roughly ordered" plus "exact" is still only roughly ordered.
+    if (mainHand.confidence == GearConfidence::Opinion ||
+        offHand.confidence == GearConfidence::Opinion)
+        pair.confidence = GearConfidence::Opinion;
+    else if (mainHand.confidence == GearConfidence::Floor ||
+             offHand.confidence == GearConfidence::Floor)
+        pair.confidence = GearConfidence::Floor;
+    else
+        pair.confidence = GearConfidence::Exact;
+    return pair;
+}
+
+GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore const& worn)
+{
+    // A refusal is final and has no number, exactly as it always was.
+    if (!candidate.wearable)
+        return GearComparison::NotBetter;
+
+    // An opinion on either side settles nothing. The role is unknown, or the
+    // thing is not worn gear, so the number does not bound anything and acting
+    // on it is the confident-but-wrong move that put a cloth robe on the tank.
+    if (candidate.confidence == GearConfidence::Opinion ||
+        worn.confidence == GearConfidence::Opinion)
+        return GearComparison::Undecided;
+
+    // What is worn is itself only a floor, so its true worth is somewhere above
+    // the number and nothing can be proved to beat it.
+    if (worn.confidence == GearConfidence::Floor)
+        return GearComparison::Undecided;
+
+    // From here what is worn is exactly known, and the margin is the same one
+    // GearIsUpgrade uses - the two must never disagree about where the line is.
+    bool const clears = candidate.score >
+                        worn.score * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR;
+
+    if (candidate.confidence == GearConfidence::Exact)
+        return clears ? GearComparison::Better : GearComparison::NotBetter;
+
+    // The candidate's score is a FLOOR (#221). A floor that already clears the
+    // margin settles it - the unread part can only widen the gap, never close
+    // it - which is the whole of why a rare with an on-equip effect now gets
+    // worn instead of carried. A floor that does NOT clear proves nothing
+    // either way, so it is said out loud rather than reported as a refusal.
+    return clears ? GearComparison::Better : GearComparison::Undecided;
+}
+
+GearSwapIntent GearIntend(GearSlotMemory const& memory, unsigned candidateEntry,
+                          unsigned wornEntry, bool wanted)
+{
+    GearSwapIntent intent;
+    intent.memory = memory;
+
+    if (!wanted)
+        return intent;
+
+    // IS THIS THE SAME SWAP, UNDONE? The drive put `chosen` on over `displaced`
+    // and is now looking at `chosen` in the bags with `displaced` worn again.
+    // Nothing this module does can produce that: its own swap is one-way, and
+    // after it the candidate IS what is worn. So somebody else moved it.
+    //
+    // AN EMPTY SLOT IS NOT A DISPUTE, and `wornEntry == 0` is what an empty one
+    // looks like. There is no rival item to be arm-wrestling over, an empty
+    // slot is worth exactly zero so filling it is unambiguously an improvement,
+    // and a slot that keeps ending up bare - a piece destroyed, a swap the
+    // server refused - wants filling again rather than giving up on. Standing
+    // down there would leave a character permanently missing a slot, which is
+    // strictly worse than the churn this guard exists to stop.
+    bool const reverted = candidateEntry != 0 && wornEntry != 0 &&
+                          memory.chosen == candidateEntry && memory.displaced == wornEntry;
+    if (!reverted)
+    {
+        // A different pair is a fresh question and gets a fresh budget.
+        intent.swap = true;
+        intent.memory.chosen = candidateEntry;
+        intent.memory.displaced = wornEntry;
+        intent.memory.reversals = 0;
+        return intent;
+    }
+
+    if (memory.reversals >= GEAR_REVERSALS_ALLOWED)
+    {
+        // Already given up on this pair, and already said so. Silence from here.
+        return intent;
+    }
+
+    intent.memory.reversals = memory.reversals + 1;
+    if (intent.memory.reversals >= GEAR_REVERSALS_ALLOWED)
+    {
+        // THE ATTEMPT THAT EXHAUSTS THE BUDGET DOES NOT HAPPEN, and is the one
+        // that speaks. Swapping and then giving up would leave the slot in this
+        // module's preferred state by luck of ordering and say nothing useful;
+        // standing down leaves it where the other writer put it and names both
+        // items, which is what a reader needs in order to go and find the other
+        // writer.
+        intent.standDown = true;
+        return intent;
+    }
+
+    intent.swap = true;
+    return intent;
 }
 
 std::string GearNeedWinner(std::vector<GearContender> const& contenders)
