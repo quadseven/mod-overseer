@@ -142,6 +142,7 @@
 #include "DBCStructure.h"
 #include "PlayerbotFactory.h"
 #include "Playerbots.h"
+#include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "Creature.h"
@@ -499,6 +500,114 @@ static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float 
         }
     }
     return threat;
+}
+
+// ---------------------------------------------------------------------------
+// WHETHER THIS CHARACTER COULD ACTUALLY DEAL WITH THAT NPC (#234).
+//
+// A travel errand used to choose its NPC by distance alone, and the nearest
+// vendor to a family parked beside a hostile town is a vendor that will never
+// serve it. `Player::GetNPCIfCanInteractWith` ends with
+//
+//     if (creature->GetReactionTo(this) <= REP_UNFRIENDLY)
+//         return nullptr;                        Player.cpp:2147
+//
+// so the walk cannot end in a sale however well it goes, and the route to it
+// runs through whatever stands between. The decision itself is pure and lives
+// in overseer_decisions; the two functions below are the adapter that reads
+// the DBC rows it needs.
+//
+// Members read at the pinned core:
+//   FactionTemplateEntry fields          DBCStructure.h:976-983
+//   MAX_FACTION_RELATIONS                DBCStructure.h:972
+//   GetFactionTemplateEntry              Unit.h:853
+//   sFactionTemplateStore, sFactionStore DBCStores.h:120-121
+//   FactionEntry::CanHaveReputation      DBCStructure.h:961
+//   Player::GetReputationMgr             Player.h:2159
+//   ReputationMgr::GetForcedRankIfAny    ReputationMgr.h:106
+//   ReputationMgr::GetRank               ReputationMgr.h:99
+//   ReputationMgr::IsAtWar               ReputationMgr.h:93
+//   HasPlayerFlag                        Player.h:1125
+//   HasUnitFlag2                         Unit.h:754
+static OverseerDecisions::FactionStance StanceOf(FactionTemplateEntry const* entry)
+{
+    OverseerDecisions::FactionStance stance;
+    if (!entry)
+        return stance;
+    stance.faction = entry->faction;
+    stance.flags = entry->factionFlags;
+    stance.ourMask = entry->ourMask;
+    stance.friendlyMask = entry->friendlyMask;
+    stance.hostileMask = entry->hostileMask;
+    for (uint32 i = 0; i < MAX_FACTION_RELATIONS; ++i)
+    {
+        stance.enemyFactions.push_back(entry->enemyFaction[i]);
+        stance.friendFactions.push_back(entry->friendFaction[i]);
+    }
+    return stance;
+}
+
+// How a creature of this `creature_template.faction` would react to this
+// character, asked the way the core asks it and in the core's own order.
+//
+// THIS IS SPAWN DATA, NOT A LIVE CREATURE, which is the whole reason it is
+// re-derived rather than delegated. A travel errand chooses a destination
+// hundreds or thousands of yards away, on a grid that is not loaded, so there
+// is no Creature object to put to `GetReactionTo` and there will not be one
+// until the character has already walked there. The four steps below are
+// Unit::GetReactionTo and Unit::GetFactionReactionTo for the one case that
+// matters here - a creature toward a player - with the branches that need a
+// live unit (self-ownership, duels, FFA-PvP, group membership) dropped
+// because a creature template is on neither side of any of them.
+//
+//   1. a forced reaction, from SPELL_AURA_FORCE_REACTION       Unit.cpp:7148
+//   2. the contested-guard flag against a PvP-active player    Unit.cpp:7263
+//   3. the character's REPUTATION with the creature's faction, when that
+//      faction carries one                                     Unit.cpp:7275
+//   4. and only then the faction template masks                Unit.cpp:7287
+//
+// STEP 3 IS NOT OPTIONAL AND IS NOT THE SAME AS STEP 4. Both the vendor that
+// killed this family and the one that will serve it are decided there: the
+// near town's faction is one an Alliance character starts at -42000 with, and
+// the goblin town's is one everybody starts at +500 with. The masks agree in
+// both cases, which is exactly why reading only the masks would look correct
+// while being wrong for any character who has since earned, or declared war
+// on, a reputation of its own.
+static OverseerDecisions::Reaction ReactionTowardCharacter(Player* who, uint32 creatureFaction)
+{
+    // A missing template is the core's own "neutral": GetFactionReactionTo
+    // returns REP_NEUTRAL when either side has none (Unit.cpp:7247-7254), and
+    // refusing here instead would strand an errand on a data gap.
+    if (!who)
+        return OverseerDecisions::Reaction::Neutral;
+    FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(creatureFaction);
+    FactionTemplateEntry const* mine = who->GetFactionTemplateEntry();
+    if (!theirs || !mine)
+        return OverseerDecisions::Reaction::Neutral;
+
+    if (ReputationRank const* forced = who->GetReputationMgr().GetForcedRankIfAny(theirs))
+        return static_cast<OverseerDecisions::Reaction>(*forced);
+
+    if ((theirs->factionFlags & FACTION_TEMPLATE_FLAG_ATTACK_PVP_ACTIVE_PLAYERS) &&
+        who->HasPlayerFlag(PLAYER_FLAGS_CONTESTED_PVP))
+        return OverseerDecisions::Reaction::Hostile;
+
+    if (!who->HasUnitFlag2(UNIT_FLAG2_IGNORE_REPUTATION))
+        if (FactionEntry const* faction = sFactionStore.LookupEntry(theirs->faction))
+            if (faction->CanHaveReputation())
+            {
+                ReputationRank rank = who->GetReputationMgr().GetRank(faction);
+                // At war caps the reaction at neutral rather than raising it,
+                // which is the core's own line and the reason a character who
+                // has declared war on a friendly town stops being able to shop
+                // there. Kept because losing it would send somebody to a
+                // counter that has just stopped serving them.
+                if (who->GetReputationMgr().IsAtWar(faction))
+                    rank = std::min(REP_NEUTRAL, rank);
+                return static_cast<OverseerDecisions::Reaction>(rank);
+            }
+
+    return OverseerDecisions::FactionStanceReaction(StanceOf(theirs), StanceOf(mine));
 }
 
 // The level the game gives the ground at a point: the sub-area's
@@ -6115,6 +6224,7 @@ private:
             spawn.y = data.posY;
             spawn.z = data.posZ;
             spawn.npcFlags = npcFlags;
+            spawn.faction = creatureTemplate->faction;
             _travelSpawns.push_back(spawn);
         }
 
@@ -6135,9 +6245,24 @@ private:
     // this character in that primary profession (infra#2757). 0 means "no
     // opinion", which is every errand that is not a profession errand and is
     // byte for byte the behaviour this function has always had.
+    //
+    // AND THE SPAWN HAS TO BE ONE THIS CHARACTER CAN ACTUALLY DEAL WITH
+    // (#234). Every keyword in TravelRoles names an npcflag, and every one of
+    // those is an INTERACTION the core gates on faction: an errand aimed at a
+    // vendor, a repairer, a banker, a trainer or a flight master this
+    // character is unfriendly to cannot end in the thing it was sent to do,
+    // however perfectly the walk goes. So a spawn that fails the gate is not
+    // ranked below the others, it is not a candidate. `at:` and `trigger:`
+    // aims are untouched above, which is what an operator who wants GROUND
+    // rather than an NPC should be using anyway.
+    //
+    // `outSaid` takes a sentence for the log when there is one worth saying -
+    // which nearer spawns were passed over, or why nothing was chosen. It is
+    // an out-parameter rather than a return value so the two existing call
+    // sites that do not want it are unchanged.
     bool ResolveTravelTarget(Player* bot, std::string const& target,
                              uint32& outEntry, WorldPosition& outPos,
-                             uint32 wantSkill = 0)
+                             uint32 wantSkill = 0, std::string* outSaid = nullptr)
     {
         // A PLACE, NOT A CREATURE: `at:<map>:<x>,<y>,<z>`. Answered before the
         // NPC index is even built, because no spawn is involved - the aim names
@@ -6256,8 +6381,17 @@ private:
             (wantedFlag & (UNIT_NPC_FLAG_TRAINER | UNIT_NPC_FLAG_TRAINER_PROFESSION));
 
         uint32 const mapId = bot->GetMapId();
-        float bestDist = 0.f;
-        bool found = false;
+
+        // ONE ANSWER PER FACTION, NOT PER SPAWN. A town's shops share a
+        // faction and a continent's vendor spawns run to hundreds - 823 of
+        // them on the map this was measured on - so the reaction is worked
+        // out once for each distinct `creature_template.faction` and read back
+        // for every spawn that carries it. Scoped to this resolve because the
+        // answer depends on the character asking, and it is asked about one
+        // character.
+        std::map<uint32, bool> mayDealWith;
+        std::vector<OverseerDecisions::TravelTargetCandidate> candidates;
+        std::vector<TravelSpawn const*> spawns;
         for (TravelSpawn const& spawn : _travelSpawns)
         {
             if (spawn.mapId != mapId)
@@ -6267,16 +6401,33 @@ private:
             if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
                 continue;
 
-            float const dist = bot->GetDistance2d(spawn.x, spawn.y);
-            if (!found || dist < bestDist)
-            {
-                found = true;
-                bestDist = dist;
-                outEntry = spawn.entry;
-                outPos = WorldPosition(spawn.mapId, spawn.x, spawn.y, spawn.z);
-            }
+            auto known = mayDealWith.find(spawn.faction);
+            if (known == mayDealWith.end())
+                known = mayDealWith
+                            .emplace(spawn.faction,
+                                     OverseerDecisions::MayInteractAt(
+                                         ReactionTowardCharacter(bot, spawn.faction)))
+                            .first;
+
+            OverseerDecisions::TravelTargetCandidate candidate;
+            candidate.entry = spawn.entry;
+            candidate.distance = bot->GetDistance2d(spawn.x, spawn.y);
+            candidate.mayInteract = known->second;
+            candidates.push_back(candidate);
+            spawns.push_back(&spawn);
         }
-        return found;
+
+        OverseerDecisions::TravelTargetChoice const choice =
+            OverseerDecisions::ChooseTravelTarget(candidates);
+        if (outSaid)
+            *outSaid = OverseerDecisions::TravelTargetExplanation(choice, candidates);
+        if (choice.verdict != OverseerDecisions::TravelTargetVerdict::Chosen)
+            return false;
+
+        TravelSpawn const& chosen = *spawns[static_cast<std::size_t>(choice.index)];
+        outEntry = chosen.entry;
+        outPos = WorldPosition(chosen.mapId, chosen.x, chosen.y, chosen.z);
+        return true;
     }
 
     // ----------------------------------------------------------- professions --
@@ -9824,19 +9975,33 @@ private:
             // and ResolveTravelTarget would refuse it anyway.
             uint32 entry = 0;
             WorldPosition pos;
+            // What the resolve wants said about its choice, when there is
+            // anything: which nearer spawns this character may not deal with
+            // were passed over, or why none of them would do (#234). Empty for
+            // a pinned errand, which is not re-resolving anything, and empty
+            // for an ordinary choice the faction gate did not change.
+            std::string said;
             if (state.pinned && state.mapId == bot->GetMapId())
             {
                 entry = state.entry;
                 pos = WorldPosition(state.mapId, state.x, state.y, state.z);
             }
-            else if (!ResolveTravelTarget(bot, target, entry, pos, wantSkill))
+            else if (!ResolveTravelTarget(bot, target, entry, pos, wantSkill, &said))
             {
                 // Said unconditionally: the errand is released on this line and
                 // its state erased with it, so there is no second poll of this
                 // errand to repeat it.
+                //
+                // A REFUSAL THAT NAMES ITS CAUSE IS WORTH MORE THAN A HOPEFUL
+                // JOURNEY (#234). "There is no such spawn" and "there are five
+                // and this character may deal with none of them" are different
+                // facts with different fixes, and reading the second as the
+                // first is what made the vendor errand look like a missing
+                // town rather than a wrong one.
                 LOG_INFO("module.overseer",
-                         "overseer: '{}' was sent to '{}' and there is no such spawn on "
-                         "map {} - releasing the errand", name, target,
+                         "overseer: '{}' was sent to '{}' and {} on map {} - releasing "
+                         "the errand", name, target,
+                         said.empty() ? std::string("there is no such spawn") : said,
                          static_cast<uint32>(bot->GetMapId()));
                 _travelAims.Release(name);
                 continue;
@@ -10237,10 +10402,19 @@ private:
                               name, target,
                               bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
                 else
+                {
                     LOG_INFO("module.overseer",
                              "overseer: '{}' sent to '{}' - creature {} at {:.0f} yards",
                              name, target, entry,
                              bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
+                    // THE FIX HAS TO BE VISIBLE WHEN IT WORKS, not only when
+                    // it refuses (#234). This is the line that says the errand
+                    // walked past a shop it could see, and why - without it a
+                    // 1,470 yard walk to a vendor with a 15 yard one in sight
+                    // reads as a routing fault rather than as the answer.
+                    if (!said.empty())
+                        LOG_INFO("module.overseer", "overseer: '{}' {}", name, said);
+                }
             }
         }
 
@@ -19990,6 +20164,15 @@ private:
         float y{0.f};
         float z{0.f};
         uint32 npcFlags{0};
+        // `creature_template.faction`, cached here for the same reason the
+        // rest of the row is: whether a character may deal with this spawn is
+        // asked once per errand and the answer never changes, and looking the
+        // template up again at resolve time would be a map lookup per spawn
+        // per errand for a number this loop already had in its hand. There is
+        // no per-spawn override of it the way there is for npcflag - the
+        // `creature` table carries no faction column - so the template is the
+        // whole of the answer (#234).
+        uint32 faction{0};
     };
     std::vector<TravelSpawn> _travelSpawns;
     bool _travelIndexBuilt = false;
