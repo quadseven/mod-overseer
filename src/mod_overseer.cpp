@@ -10789,6 +10789,10 @@ private:
 
             // A LIFT IS NOT A DISPLACEMENT, so it takes nothing away. Same map,
             // same x and y, on top of the surface the probe just read - and the
+            // ONLY remedy in this drive that moves anything at all, since #188
+            // removed the bind-point escalation that followed it. The map id
+            // passed here is the character's own by construction, so a recovery
+            // cannot change continents even if the surface reading is nonsense.
             // travel aim, the quest aim and the party the character had a
             // moment ago are all still exactly right for where it now stands.
             // The old bind-point teleport cleared both aims every time; over
@@ -10816,75 +10820,64 @@ private:
             // character's own feet, or a lift that did not stick, means either
             // this rule is wrong about this place or the world is. Both are
             // worth one loud line and neither is worth a two-minute loop.
+            //
+            // AND NEITHER IS WORTH A TELEPORT (#188). This used to escalate to
+            // the leader's bind point. On 2026-09-05 that carried 'Grog' from
+            // map 1 (1204.1, -708.5) to map 0 (-8902.6, -162.6) in eleven
+            // seconds, where he STILL read as below the world - so it moved the
+            // failure rather than fixing it - and it left two of the five in
+            // Elwynn, two in the Barrens and one offline in Stonetalon, which
+            // cannot run a dungeon on either continent and does not walk back
+            // without a boat. The remedy set is now closed under "same map,
+            // same x and y" in TerrainRemedy itself, so there is no branch here
+            // to reintroduce by accident. This is the end of the ladder, and it
+            // is deliberately loud: giving up in a log line a person can find
+            // beats a remedy that relocates the problem out of sight.
+            //
+            // THE TWO GIVE-UPS ARE NOT THE SAME THING, and one log line for
+            // both is how #188 got its title. With a polygon under its feet the
+            // character is standing on the ground and the DETECTOR is wrong,
+            // which is a note about this rule. Without one, a real remedy was
+            // tried and did not hold, which is a note about the world. They
+            // send a reader to different places, so they say different things.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::GiveUp)
             {
+                if (hasLocalNavmesh)
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
+                              "reads {:.1f} yards under a surface at z {:.1f}, but Detour "
+                              "finds walkable ground at its own feet (local navmesh "
+                              "PRESENT), so it is STANDING ON THE GROUND and what the "
+                              "probe found overhead is a roof, a bridge or a tower floor. "
+                              "NOTHING IS BEING MOVED: this is the detector being wrong "
+                              "about this place, not a character below the world (#188). "
+                              "Aim job='{}' quest={} travel='{}'. Staying quiet about this "
+                              "character for {}s",
+                              name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                              surface - fromZ, surface, job, questAim, travelTarget,
+                              static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS));
+                    continue;
+                }
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' STILL reads as below the world at map {} "
                           "position ({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} "
-                          "yards up), local navmesh {} - and this module has run out of "
-                          "remedies for it. GIVING UP on this character until it has "
-                          "been clear for {}s; it is NOT being moved and NOT being "
-                          "resurrected. Aim job='{}' quest={} travel='{}' last aimed "
-                          "position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody needs to "
-                          "look at what is overhead at these coordinates",
+                          "yards up), local navmesh absent, and a lift at these "
+                          "coordinates did not stick. This module is OUT OF REMEDIES for "
+                          "it and is GIVING UP until it has been clear for {}s. It is NOT "
+                          "being moved, NOT being sent to a bind point and NOT being "
+                          "resurrected: the cross-map escalation that used to be here "
+                          "split the family across an ocean without fixing the reading "
+                          "(#188), so a character this module cannot recover WHERE IT "
+                          "STANDS is reported and left. Aim job='{}' quest={} travel='{}' "
+                          "last aimed position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody "
+                          "needs to look at what is under these coordinates",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                          surface, surface - fromZ, hasLocalNavmesh ? "PRESENT" : "absent",
+                          surface, surface - fromZ,
                           static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS), job,
                           questAim, travelTarget, static_cast<uint32>(aimedMap),
                           aimedX, aimedY, aimedZ);
-                continue;
             }
-
-            // SendToBind, and only for a character with no polygon under it
-            // whose lift did not stick. The leader's bind point keeps a grouped
-            // family together. This is the same destination DriveStuckRevival
-            // uses for a repeated death trap, but this character is alive and
-            // must not be resurrected.
-            Player* home = bot;
-            if (Group* group = bot->GetGroup())
-                if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
-                    home = leader;
-
-            // Recovery is terminal for the unsafe travel aim. Clear it before
-            // teleporting, otherwise the next travel poll re-issues the same
-            // coordinate and sends the character back onto the bad plane.
-            _travelAims.Release(name);
-            // A terrain recovery is also terminal for the quest aim that
-            // led the character onto the invalid surface. Leaving it in
-            // overseer_roster would make DriveQuests select the same bad
-            // target again immediately after the bind-point teleport.
-            // Keep the quest picker from selecting that same objective again
-            // in this process as well. Clearing the aim alone only removes
-            // the current coordinate; the quest remains in the log and was
-            // otherwise eligible on the very next poll.
-            if (questAim)
-            {
-                AimState& aimState = _lastAim[LowerName(name)];
-                aimState.repick.givenUp[questAim] = std::time(nullptr);
-                aimState.repick.lastPicked = 0;
-                aimState.repick.strikes = 0;
-            }
-            ClearAim(name);
-            bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                            home->m_homebindY, home->m_homebindZ, 0.f);
-            // SAYS WHAT IS ACTUALLY KNOWN, which is that a lift was this
-            // character's previous rung - not that one was tried at these
-            // coordinates. The first version of this line asserted the
-            // stronger thing and was false the one time it mattered: on
-            // 2026-09-05 the rung was left over from a lift on another map 37
-            // minutes earlier, and the line claimed a lift had been tried at a
-            // spot nothing had ever been tried at.
-            LOG_WARN("module.overseer",
-                     "overseer: '{}' recovered at map {} position ({:.1f}, {:.1f}, {:.1f}), "
-                     "surface z {:.1f} ({:.1f} yards up), no local navmesh; a lift was this "
-                     "character's previous rung and the condition is back, so this is the "
-                     "fallback: aim job='{}' quest={} travel='{}' last aimed position map "
-                     "{} ({:.1f}, {:.1f}, {:.1f}); sent to '{}'s bind point; it was not "
-                     "resurrected",
-                     name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                     surface, surface - fromZ, job,
-                     questAim, travelTarget, static_cast<uint32>(aimedMap),
-                     aimedX, aimedY, aimedZ, home->GetName());
         } while (result->NextRow());
     }
 

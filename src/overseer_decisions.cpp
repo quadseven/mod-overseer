@@ -222,6 +222,17 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
     // tuning knob. `surfaceValid` is already true here - neither predicate
     // above returns true without it - so the lift height is a real reading
     // and never a sentinel.
+    //
+    // TWO RUNGS, AND THE SECOND ONE MOVES NOBODY (#188). There used to be a
+    // bind-point teleport between them. On 2026-09-05 it took a character from
+    // map 1 (1204.1, -708.5) to map 0 (-8902.6, -162.6) in eleven seconds and
+    // he STILL read as below the world when he got there, so it relocated the
+    // failure rather than resolving it, and it left the roster split across an
+    // ocean with a dungeon to run on one side of it. A lift that did not stick
+    // means this module cannot fix this character WHERE IT STANDS, and the
+    // honest answer to that is to say so loudly. Escalating past a remedy that
+    // failed in place, to a remedy that cannot address the condition at all,
+    // is not an escalation.
     switch (state.attempts)
     {
         case 0:
@@ -232,10 +243,6 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
                 reading.surfaceAboveZ + limits.liftClearance};
         case 1:
             state.attempts = 2;
-            state.lastAttempt = now;
-            return TerrainRecoveryVerdict{TerrainRemedy::SendToBind, 0.f};
-        case 2:
-            state.attempts = 3;
             state.lastAttempt = now;
             return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
         default:

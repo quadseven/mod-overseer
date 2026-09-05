@@ -214,8 +214,43 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
 // condition is false on the next poll. If it does not, the condition is true
 // again immediately and this says so, rather than a slow walk back disguising
 // a failed remedy as a fresh incident. That is what the attempt count below
-// is for: one lift, then the bind as the fallback of last resort, then a loud
-// give-up. Three actions, then silence, per episode. Never 204.
+// is for: one lift, then a loud give-up. Two actions, then silence, per
+// episode. Never 204.
+//
+// AND NO REMEDY MAY CHANGE THE MAP, which is #188 and is why the fallback that
+// used to sit between those two is GONE rather than merely unreachable. The
+// whole ladder was caught in one trace on the dev realm 2026-09-05:
+//
+//   16:46:58  'Grog' below the world at map 1 (1202.6, -707.3, 72.3),
+//             surface z 97.7, no local navmesh; LIFTED to z 98.2
+//   16:47:03  'Grog' the condition is back, so this is the fallback:
+//             sent to the leader's bind point
+//   16:47:14  'Grog' STILL below the world at MAP 0 (-8902.6, -162.6, 81.9),
+//             surface z 128.0, local navmesh PRESENT
+//
+// Eleven seconds, one ocean, and the same unresolved reading at the far end.
+// Every roster member's bind row is map 0 (-8950, -132), the abbey grounds in
+// Elwynn, so a fallback taken on Kalimdor lands the character on the other
+// continent: the party ended that minute two in Elwynn, two in the Barrens and
+// one offline in Stonetalon, which is not a party and cannot run a dungeon on
+// either side of the ocean. The fallback also did not fix the condition it
+// escalated for, and could not have, because it moved a bad READING rather
+// than a bad position. There is no measured success to weigh against that.
+//
+// AND IT FED ITSELF. The bind point sits under the abbey, whose roof is the
+// highest geometry within the probe's sixty yards, so the destination is one
+// of the places most reliably guaranteed to read as "below the world" - which
+// is exactly the last line above, with `local navmesh PRESENT` naming it a
+// false positive out loud. A remedy whose destination re-triggers the detector
+// that chose it is a loop, and the "something keeps putting the family under
+// Stormwind" in #188's title was this ladder putting them there.
+//
+// SO THE REMEDY SET IS CLOSED UNDER "SAME MAP, SAME X, SAME Y". The only
+// remedy that moves anything is the lift, and a lift is a change of z alone.
+// There is no verdict this can return that a caller could turn into a
+// cross-map teleport, which is a stronger guarantee than a rung that merely
+// never gets chosen: the type says it, so the next change cannot bring it back
+// by accident.
 enum class TerrainRemedy
 {
     // Leave it where it is. Either nothing is wrong, or nothing this module
@@ -223,16 +258,19 @@ enum class TerrainRemedy
     Nothing,
 
     // Straight up to `liftZ`, at the character's own x and y. Its errand,
-    // its aims and its party keep going.
+    // its aims and its party keep going. THE ONLY REMEDY THAT MOVES ANYTHING,
+    // and it moves it in z alone (#188).
     LiftToSurface,
-
-    // The fallback of last resort, and the only remedy that displaces. For a
-    // lift that has already been tried and did not stick.
-    SendToBind,
 
     // Say it once, loudly, and stop trying. A repeated identical condition is
     // a bug in this rule or in the world, and either way silence is worse
     // than one warning a person can go and look at.
+    //
+    // This is now the END OF THE LADDER as well as the answer to a live
+    // polygon. When a lift has not stuck, this module cannot fix the character
+    // where it stands, and saying so is the whole remedy: the escalation that
+    // used to be here relocated the failure to another continent instead, and
+    // the character was still below the world when it arrived (#188).
     GiveUp,
 };
 
@@ -282,14 +320,16 @@ struct TerrainRecoveryLimits
     // deliberately rather than by passing a number that looks like a bound.
     time_t forgetSeconds{0};
     // HOW FAR A CHARACTER MAY MOVE AND STILL BE IN THE SAME INCIDENT. It has
-    // to be comfortably more than the walk back from wherever a remedy puts
-    // it, or every repetition would look like a fresh first occurrence and the
-    // ladder would never bound anything: the measured walk back from the
-    // leader's bind point was 140 yards. It also has to be far less than the
-    // 1,900-yard displacements the fallback produces, so that being thrown
-    // across a continent does end the episode. A map change ends it outright
-    // and needs no distance. ZERO DISABLES THE DISTANCE TEST and leaves only
-    // the map check, which is a defensible choice and has to be written.
+    // to be comfortably more than the distance a character covers between one
+    // occurrence and the next, or every repetition would look like a fresh
+    // first occurrence and the ladder would never bound anything: the measured
+    // walk back from the leader's bind point was 140 yards. Since #188 nothing
+    // this module does moves a character at all in x or y, so what this reads
+    // now is the character's own wandering, and 250 still separates "back in
+    // the same hole" from "somewhere else entirely". A map change ends the
+    // episode outright and needs no distance. ZERO DISABLES THE DISTANCE TEST
+    // and leaves only the map check, which is a defensible choice and has to
+    // be written.
     float episodeRadius{0.f};
 };
 
@@ -305,9 +345,11 @@ struct TerrainRecoveryLimits
 // standing, and at 14:25 on map 43 - a different map, a different incident, 37
 // minutes later - that leftover rung chose the fallback instead of the lift.
 // The fallback is a bind-point teleport, so it ejected the tank from the
-// instance and the run lost it. A ladder is only a fair bound on repetition if
-// the thing it is counting really is a repetition, so the episode is anchored
-// where it started and abandoned when the character is somewhere else.
+// instance and the run lost it. That fallback is gone (#188), but the anchor
+// still earns its place: a ladder is only a fair bound on repetition if the
+// thing it is counting really is a repetition, so the episode is anchored
+// where it started and abandoned when the character is somewhere else, and
+// what it protects now is the LIFT'S turn rather than a teleport's.
 struct TerrainRecoveryState
 {
     // Remedies applied in the current unbroken episode. This is the bound.
@@ -317,7 +359,7 @@ struct TerrainRecoveryState
     // tried, so nothing should be crossed off. A character warned about
     // walking under an arch that then really does fall through the world a
     // minute later still gets the lift first, rather than being handed the
-    // fallback because a warning had used the lift's turn.
+    // give-up because a warning had used the lift's turn.
     bool saidOnGround{false};
     // WHEN THIS MODULE LAST ACTUALLY DID SOMETHING, and deliberately not when
     // it last saw the condition. A poll that issues nothing must not extend
