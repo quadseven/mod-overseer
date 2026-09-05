@@ -1745,4 +1745,309 @@ uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates)
     return pickInteractable ? pick : 0;
 }
 
+
+// ------------------------------------------- the town trip: repair and buy --
+
+char const* TownRetryWord(TownRetry retry)
+{
+    switch (retry)
+    {
+        case TownRetry::Never:
+            return "never";
+        case TownRetry::Elsewhere:
+            return "elsewhere";
+        case TownRetry::Later:
+            break;
+    }
+    return "later";
+}
+
+namespace
+{
+
+// The words of the line, split on runs of blanks. The bank parser's own
+// splitter, duplicated here rather than shared because both live in anonymous
+// namespaces inside this one translation unit and a shared one would have to
+// become part of the header's public surface for no caller outside it.
+std::vector<std::string> TownWords(std::string const& text)
+{
+    std::vector<std::string> words;
+    std::string word;
+    for (char const c : text)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            if (!word.empty())
+                words.push_back(word);
+            word.clear();
+        }
+        else
+            word += c;
+    }
+    if (!word.empty())
+        words.push_back(word);
+    return words;
+}
+
+// `<key>:<digits>` -> true and the number, or false. Anything that is not
+// digits, an empty value, or a value that would not fit in uint32 is a
+// malformed word and not a zero: a wrapped number names a different item and a
+// silent zero is the core's own "all" special case in both of these grammars.
+bool TownKeyed(std::string const& word, char const* key, uint32_t& value)
+{
+    std::string const prefix = std::string(key) + ":";
+    if (word.size() <= prefix.size() || word.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    std::string const digits = word.substr(prefix.size());
+    if (digits.size() > 10)
+        return false;
+    uint64_t parsed = 0;
+    for (char const c : digits)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (parsed > 0xFFFFFFFFull)
+        return false;
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+}  // namespace
+
+RepairRequest ParseRepairRequest(std::string const& command)
+{
+    RepairRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    if (words.empty())
+    {
+        request.error = "malformed repair: want all, or item guid:<item_instance.guid>";
+        return request;
+    }
+
+    if (words[0] == "all")
+    {
+        if (words.size() == 1)
+        {
+            request.verb = RepairVerb::All;
+            return request;
+        }
+        request.error = "malformed repair: all takes no arguments";
+        return request;
+    }
+
+    if (words[0] == "item")
+    {
+        if (words.size() != 2)
+        {
+            request.error = "malformed repair: want item guid:<item_instance.guid>";
+            return request;
+        }
+        uint32_t guid = 0;
+        if (!TownKeyed(words[1], "guid", guid) || guid == 0)
+        {
+            request.error = "malformed repair: item must be guid:<item_instance.guid>, not 0";
+            return request;
+        }
+        request.verb = RepairVerb::One;
+        request.itemGuid = guid;
+        return request;
+    }
+
+    request.error = "malformed repair: unknown verb (want all, or item guid:<n>)";
+    return request;
+}
+
+int ChooseRepairer(std::vector<RepairerCandidate> const& candidates)
+{
+    int best = -1;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        if (best < 0)
+        {
+            best = static_cast<int>(i);
+            continue;
+        }
+        RepairerCandidate const& incumbent = candidates[static_cast<size_t>(best)];
+        RepairerCandidate const& candidate = candidates[i];
+
+        // Cheaper first. Every candidate is already inside interaction
+        // distance, so the yards cost nothing and the discount costs gold.
+        if (candidate.discount != incumbent.discount)
+        {
+            if (candidate.discount < incumbent.discount)
+                best = static_cast<int>(i);
+            continue;
+        }
+        if (candidate.distance < incumbent.distance)
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+TownRetry RepairRefusalRetry(std::string const& detail)
+{
+    // The literals mod_overseer.cpp's DoRepair returns, grouped by what would
+    // have to change for the same row to succeed.
+    static char const* const NEVER[] = {
+        "malformed repair: want all, or item guid:<item_instance.guid>",
+        "malformed repair: all takes no arguments",
+        "malformed repair: want item guid:<item_instance.guid>",
+        "malformed repair: item must be guid:<item_instance.guid>, not 0",
+        "malformed repair: unknown verb (want all, or item guid:<n>)",
+        "malformed repair request",
+        "item not carried",
+        "item has no template",
+        "item cannot be damaged",
+        "item is not damaged",
+        "nothing is damaged",
+    };
+    static char const* const ELSEWHERE[] = {
+        "repairer not in range",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return TownRetry::Elsewhere;
+    return TownRetry::Later;
+}
+
+BuyRequest ParseBuyRequest(std::string const& command)
+{
+    BuyRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    if (words.empty())
+    {
+        request.error = "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]";
+        return request;
+    }
+
+    uint32_t entry = 0;
+    if (!TownKeyed(words[0], "entry", entry) || entry == 0)
+    {
+        request.error = "malformed buy: first word must be entry:<item_template.entry>, not 0";
+        return request;
+    }
+
+    bool haveCount = false;
+    bool haveMax = false;
+    uint32_t count = 1;
+    uint32_t maxCopper = 0;
+
+    for (size_t i = 1; i < words.size(); ++i)
+    {
+        uint32_t value = 0;
+        if (TownKeyed(words[i], "count", value))
+        {
+            if (haveCount || value == 0)
+            {
+                request.error = haveCount ? "malformed buy: count given twice"
+                                          : "malformed buy: count must be 1 or more";
+                return request;
+            }
+            haveCount = true;
+            count = value;
+            continue;
+        }
+        if (TownKeyed(words[i], "max", value))
+        {
+            if (haveMax)
+            {
+                request.error = "malformed buy: max given twice";
+                return request;
+            }
+            haveMax = true;
+            maxCopper = value;
+            continue;
+        }
+        request.error = "malformed buy: unknown word (want count:<n> or max:<copper>)";
+        return request;
+    }
+
+    request.valid = true;
+    request.entry = entry;
+    request.count = count;
+    request.capped = haveMax;
+    request.maxCopper = maxCopper;
+    return request;
+}
+
+int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates)
+{
+    // A vendor's rank, high is better: it has the thing (2), it sells the
+    // thing but is out of it (1), it does not sell the thing (0). Named rather
+    // than written as two nested conditionals so the tie-breaking below reads
+    // as one comparison and not three.
+    auto rank = [](BuyVendorCandidate const& c) -> int
+    { return c.stocksItem ? (c.inStock ? 2 : 1) : 0; };
+
+    int best = -1;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        if (best < 0)
+        {
+            best = static_cast<int>(i);
+            continue;
+        }
+        BuyVendorCandidate const& incumbent = candidates[static_cast<size_t>(best)];
+        BuyVendorCandidate const& candidate = candidates[i];
+
+        int const incumbentRank = rank(incumbent);
+        int const candidateRank = rank(candidate);
+        if (candidateRank != incumbentRank)
+        {
+            if (candidateRank > incumbentRank)
+                best = static_cast<int>(i);
+            continue;
+        }
+        if (candidate.discount != incumbent.discount)
+        {
+            if (candidate.discount < incumbent.discount)
+                best = static_cast<int>(i);
+            continue;
+        }
+        if (candidate.distance < incumbent.distance)
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+TownRetry BuyRefusalRetry(std::string const& detail)
+{
+    static char const* const NEVER[] = {
+        "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]",
+        "malformed buy: first word must be entry:<item_template.entry>, not 0",
+        "malformed buy: count must be 1 or more",
+        "malformed buy: count given twice",
+        "malformed buy: max given twice",
+        "malformed buy: unknown word (want count:<n> or max:<copper>)",
+        "malformed buy request",
+        "no such item",
+        "item is not for this class",
+        "item is for the other faction",
+        "item is not bought with gold",
+        "price exceeds the cap the row set",
+        "count exceeds what the packet carries",
+        "count would overflow the purse",
+    };
+    static char const* const ELSEWHERE[] = {
+        "vendor not in range",
+        "vendor does not stock the item",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return TownRetry::Elsewhere;
+    return TownRetry::Later;
+}
+
 }  // namespace OverseerDecisions

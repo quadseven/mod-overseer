@@ -1751,6 +1751,179 @@ struct BankerCandidate
 
 uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates);
 
+
+// ------------------------------------------- the town trip: repair and buy --
+//
+// TWO MORE EXECUTORS AT THE SAME COUNTER, and the reason they are one section.
+//
+// A family that clears a dungeon a hundred times has to come back to town in
+// between, and the trip has four errands: sell what it does not want (done -
+// kind='sell'), put away what it cannot use yet (done - kind='bank'), REPAIR
+// what the run wore out, and BUY the food, drink and reagents the next run
+// needs. The last two did not exist. Nothing else in this module spends money
+// at all; sell and bank only move things.
+//
+// The retry classes below are the sell path's three, and they are a SECOND
+// enum rather than a rename of SellRetry because renaming that one would edit
+// a literal tests/test_sell.cpp pins and a column live rows already carry.
+// Two enums with the same three members is a smaller cost than a rename that
+// reaches an executor already merged and running.
+enum class TownRetry
+{
+    Never,      // the item, the character's class, or the command is the wall
+    Elsewhere,  // this spot is the wall; another NPC may answer differently
+    Later,      // the character's own state is the wall; here, in a moment
+};
+
+// "never", "elsewhere", "later". Here rather than in the executor so the
+// string a test pins is the string a row carries.
+char const* TownRetryWord(TownRetry retry);
+
+// ------------------------------------------------------------ repair (#18) --
+//
+// WHAT A kind='repair' ROW MAY SAY.
+//
+//     all                                  everything worn and carried
+//     item guid:<item_instance.guid>       exactly that one item
+//
+// BOTH FORMS, and the argument for each. `all` is what a player actually does:
+// the repair window has one button for it, and it is one packet where the
+// per-item form is eighteen, each with its own chance of arriving after the
+// character has wandered out of range. It is also the only form whose whole
+// cost is one money delta, which makes the read-back a single subtraction
+// rather than a reconciliation.
+//
+// `item guid:` exists because `all` cannot say WHICH item it failed to pay
+// for. Player::DurabilityRepair charges per item and simply returns when the
+// purse is short, so a repair-all with 40 silver in hand and 60 silver of
+// damage on the gear restores some items and leaves others, silently. When the
+// purse is thin the sender wants the tank's weapon repaired and not the
+// rogue's spare shirt, and that is a choice about ONE item, addressed by the
+// guid the way every other item verb in this module addresses one.
+//
+// NO GUILD-FUNDS FORM, deliberately. CMSG_REPAIR_ITEM carries a third byte
+// meaning "take it out of the guild bank", and Player::DurabilityRepair
+// honours it - by returning immediately, having repaired nothing and charged
+// nothing, when GetGuildId() == 0. The family has no guild (that is its own
+// open issue), so the only thing a guild-funds repair could produce here is a
+// row that looks exactly like a successful repair and changed nothing, which
+// is the failure mode this whole module exists to stop reporting. The grammar
+// therefore has no way to ask for it and the executor always sends 0.
+enum class RepairVerb
+{
+    None,  // not a repair request; `error` says why
+    All,
+    One,
+};
+
+struct RepairRequest
+{
+    RepairVerb verb{RepairVerb::None};
+    uint32_t itemGuid{0};  // for One; 0 for All
+    std::string error;     // the refusal literal when verb is None, else empty
+};
+
+// Whitespace-tolerant, otherwise literal: lower-case words, `guid:` with
+// digits after it, nothing else on the line. A guid of 0 is refused rather
+// than passed on, because 0 is exactly what the core's repair path reads as
+// "no item named, repair everything" - so a row that meant one item and
+// carried a 0 would silently become a repair-all and spend the whole purse.
+RepairRequest ParseRepairRequest(std::string const& command);
+
+// WHICH REPAIRER, when a town square has several in reach. The nearest town to
+// the family's dungeon has four repair-flagged NPCs within a hundred yards of
+// each other, two of them standing about five yards apart.
+//
+// The candidates are the repair-flagged creatures the character may ALREADY
+// interact with, so every one of them is inside INTERACTION_DISTANCE and
+// walking to the nearer one saves nothing. What is not the same between them
+// is the price: Player::GetReputationPriceDiscount returns a per-creature
+// multiplier and the repair cost is multiplied by it. So the rule is CHEAPEST
+// FIRST, not nearest first - distance breaks a tie in the discount, and the
+// index breaks a tie in both so the answer never depends on the order a cell
+// sweep happened to produce. Returns -1 for an empty list.
+struct RepairerCandidate
+{
+    float distance{0.f};  // yards from the character
+    float discount{1.f};  // GetReputationPriceDiscount; lower is cheaper
+};
+
+int ChooseRepairer(std::vector<RepairerCandidate> const& candidates);
+
+// Keyed on the `detail` literal the executor returns. An unknown literal is
+// `Later`, for the same reason the sell table gives: a refusal this table has
+// never heard of is more likely a new transient than a new permanent, and
+// retrying a permanent costs a row while giving up on a transient costs the
+// errand.
+TownRetry RepairRefusalRetry(std::string const& detail);
+
+// --------------------------------------------------------------- buy (#18) --
+//
+// WHAT A kind='buy' ROW MAY SAY.
+//
+//     entry:<item_template.entry> [count:<n>] [max:<copper>]
+//
+// `entry:` AND NOT `guid:`, which is the opposite of every other item verb
+// here, and the reason is that the item does not exist yet. There is no
+// item_instance row to name until the purchase creates one. What a vendor
+// sells is a TYPE, the packet carries a type, and so does the row.
+//
+// `count` is the number of PURCHASES, not the number of items, because that is
+// what the packet's count means: Player::BuyItemFromVendorSlot stores
+// `pProto->BuyCount * count`. For everything a level-20s party restocks that
+// factor is 1 and the two numbers are the same, but the read-back multiplies
+// rather than assuming, so a vendor selling arrows two hundred at a time is
+// counted correctly instead of read as a hundred and ninety-nine missing.
+//
+// `max` is a copper ceiling on the WHOLE purchase, and it is the one part of
+// this grammar the core's packet has no field for. It is here because the
+// read-back proves the purse fell by the right amount only AFTER the money is
+// gone, and a mispriced row - a count typed with an extra zero, a vendor whose
+// price is not what the planner read - is exactly the thing a bot cannot
+// notice and cannot undo. A sale can be undone: the item sits in a buyback
+// slot. A purchase cannot; the gold is simply spent. `max` lets the sender say
+// what it expected to pay and the executor refuse rather than discover.
+// Absent, there is no ceiling.
+struct BuyRequest
+{
+    bool valid{false};
+    uint32_t entry{0};
+    uint32_t count{1};      // purchases, not items; never 0
+    bool capped{false};     // whether `max:` was given
+    uint32_t maxCopper{0};  // meaningful only when capped
+    std::string error;      // the refusal literal when invalid, else empty
+};
+
+// The first word must be `entry:`; `count:` and `max:` may follow in either
+// order, each at most once. A count of 0 is refused rather than read as 1,
+// because the core silently rewrites a count below 1 to 1 and a row asking for
+// nothing should be a malformed row rather than a purchase nobody asked for. A
+// `max:` of 0 is allowed and means "only if it is free", which is a real thing
+// to ask and is distinguishable from absent by `capped`.
+BuyRequest ParseBuyRequest(std::string const& command);
+
+// WHICH VENDOR, when several are in reach and only some of them sell the
+// thing. The family's town has eleven vendors inside a hundred and fifty
+// yards, and the one that sells water is not the one that sells arrows.
+//
+// The order is: a vendor that stocks the item and has it in stock beats one
+// that stocks it and is sold out, which beats one that does not stock it at
+// all. Then the cheaper reputation discount, then the nearer, then the lower
+// index. A vendor that does not stock the item is still CHOSEN when no better
+// one is in reach, and only so that the refusal can name it - "this vendor
+// does not stock 4594" is an aim a sender can correct; "no vendor" is not.
+struct BuyVendorCandidate
+{
+    float distance{0.f};
+    float discount{1.f};
+    bool stocksItem{false};  // the entry is in this vendor's list at all
+    bool inStock{false};     // and there are enough of them right now
+};
+
+int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates);
+
+TownRetry BuyRefusalRetry(std::string const& detail);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

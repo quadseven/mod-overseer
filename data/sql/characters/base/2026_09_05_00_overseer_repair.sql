@@ -1,0 +1,100 @@
+-- Pay a repairer to put the durability back, through the core's own repair
+-- path, the way a player at the repair window does it (part of #18).
+--
+-- WHY THIS EXISTS. The family is being asked to clear the same instance a
+-- hundred times over. Nothing in this module has ever spent a copper and
+-- nothing has ever restored a point of durability, so run 100 is run 1 with a
+-- hundred runs of wear on it. Measured on the roster right after a full clear:
+-- the five characters sat between 99.0% and 100% durability, ten missing
+-- points across nine items - which sounds like nothing until you notice that
+-- the loss is MONOTONIC and dominated by deaths (10% of maximum, every time)
+-- rather than by hits taken, and that the death table for this roster holds
+-- over three thousand rows in eight days. An item at 0% durability contributes
+-- no stats at all. The hundredth run fails because of what nobody did after
+-- the first one.
+--
+-- WHY THE CORE'S REPAIR AND NOT A DURABILITY WRITE. A repair is not "set the
+-- field to maximum". WorldSession::HandleRepairItemOpcode (NPCHandler.cpp) runs
+-- the repairer through Player::GetNPCIfCanInteractWith with
+-- UNIT_NPC_FLAG_REPAIR, takes the per-creature reputation discount from
+-- Player::GetReputationPriceDiscount, and hands off to Player::DurabilityRepair
+-- or Player::DurabilityRepairAll, which price each item from DurabilityCosts
+-- and DurabilityQuality, apply the server's repair-cost rate, floor the result
+-- at one copper, take the money, and re-apply the item's mods when a fully
+-- broken item comes back. Writing the field directly would be free, would be
+-- reachable from any distance, and would be exactly the admin shortcut this
+-- module's own notes forbid.
+--
+-- WHY THE ROW IS BELIEVED ONLY AFTER THE WORLD IS READ BACK. This is the
+-- clearest case in the whole module. Player::DurabilityRepair returns a
+-- `uint32 TotalCost` that IS ONLY EVER ASSIGNED ON THE GUILD-BANK BRANCH: a
+-- repair paid for out of the character's own purse returns 0 whether it
+-- restored a full set of plate or refused for want of one copper. The
+-- not-enough-money path returns the same 0. A missing DurabilityCosts row
+-- returns the same 0. And the handler above it returns void. There is no value
+-- anywhere in that call chain that tells a repair from a no-op. So the module
+-- reads every carried item's durability and the purse BEFORE the call and
+-- again after, and `result` reports what changed rather than what was asked.
+--
+-- BOTH FORMS, AND THE ARGUMENT FOR EACH:
+--   `all` is what a player actually does - the window has one button for it -
+--   and it is one packet where the per-item form is eighteen, each with its
+--   own chance of arriving after the character has wandered out of range.
+--   `item guid:<n>` exists because `all` cannot say WHICH item it failed to
+--   pay for: DurabilityRepair charges per item and simply returns when the
+--   purse runs short, so a repair-all with less money than damage restores
+--   some items and leaves others, silently. When the purse is thin the sender
+--   wants the tank's weapon repaired and not the rogue's spare shirt.
+--
+-- NO GUILD-FUNDS FORM. CMSG_REPAIR_ITEM carries a third byte meaning "take it
+-- out of the guild bank" and the module always sends 0. This family has no
+-- guild, and DurabilityRepair's guild branch returns immediately when
+-- GetGuildId() == 0 - having repaired nothing, charged nothing and told
+-- nobody. The only thing a guild-funds form could produce here is a row that
+-- looks exactly like a success and changed nothing, which is the single
+-- failure mode this module exists to stop reporting.
+--
+-- WHAT THE EXECUTOR NEVER DECIDES: whether the family can afford to repair
+-- now, whether it should sell first, and which item matters most when it
+-- cannot afford all of them. Every one of those needs all five characters'
+-- bags, purses and plans side by side, which is what the side outside the
+-- worldserver holds. Travel to the repairer is the existing errand and is
+-- sequenced by that same side; a row that arrives with no repairer in reach is
+-- refused, not walked.
+--
+-- Column re-use, no new columns, same shape as kind='sell' and kind='bank':
+--   target_name  the CHARACTER, who must already be standing at a repairer
+--   command      `all`, or `item guid:<item_instance.guid>`
+--                (a guid of 0 is refused rather than passed on: 0 is exactly
+--                what the core reads as "no item named, repair everything",
+--                so a row that meant one bracer would quietly become a
+--                repair-all and spend the whole purse)
+--   target_arg   unused
+--   detail       short refusal literal, or empty on success
+--   result       JSON: outcome (repaired|refused|error), reason, retry
+--                (never|elsewhere|later - see RepairRefusalRetry in
+--                overseer_decisions.h), verb, character, item {guid, entry,
+--                name, durability, max_durability} or null, repairer {entry,
+--                name, yards, discount} or null, nearest_repairer_yards,
+--                damaged_before, repaired, left_damaged, points_restored,
+--                money_before, money_after, spent, quoted,
+--                quote_matches_spend
+--
+-- `quoted` is the module's own copy of the core's cost arithmetic, run without
+-- paying. It is a WITNESS AND NOT AN AUTHORITY: it never refuses a repair, the
+-- core is asked either way, and `quote_matches_spend` is there so that a
+-- disagreement between the two shows up as a visible signal that the copy has
+-- drifted - rather than as a repair silently refused at a price nobody
+-- charged.
+--
+-- THE ENUM LISTS THE FULL UNION. Several kinds are being added by parallel
+-- branches ('auction' and 'mail' among them) and each branch's ALTER names
+-- every value, so the migrations apply in any order and the last one to run
+-- does not silently drop the others'. ENUM values cannot be added by re-running
+-- the CREATE TABLE: the base file is `CREATE TABLE IF NOT EXISTS`, a no-op
+-- against an existing table, so the column keeps whatever value set it already
+-- has. (The same trap is documented on the 'give', 'share', 'trade', 'sell'
+-- and 'bank' migrations; it has bitten this codebase more than once.)
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy')
+        NOT NULL DEFAULT 'bot';
