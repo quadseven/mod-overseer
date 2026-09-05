@@ -124,6 +124,15 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= overrideGap;
 }
 
+bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
+                      float maxGap)
+{
+    if (span > stepYards)
+        return true;
+    float const gap = verticalGap < 0.f ? -verticalGap : verticalGap;
+    return gap <= maxGap;
+}
+
 std::string RealmKind(std::string const& declared)
 {
     std::string const value = Normalized(declared);

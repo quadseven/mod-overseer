@@ -799,6 +799,11 @@ constexpr float TRAVEL_GROUND_UPHILL_YARDS = 50.0f;
 // exactly ON it and is rejected. See the fan in GroundedStep.
 constexpr float TRAVEL_STEP_SIDE_FRACTION = 0.6f;
 
+// How much height a single fallback step may bridge when the aim is the step
+// itself (#203). Only consulted for an aim within TRAVEL_STEP_YARDS; see
+// StepMayBridgeGap for why a far aim's height is not this step's business.
+constexpr float TRAVEL_STEP_VERTICAL_YARDS = 20.0f;
+
 // A follower that has stopped, and never closes the gap (#70).
 //
 // Two followers stopped at a zone border on the dev world 2026-08-30 and
@@ -8218,13 +8223,6 @@ private:
         float wz = want.GetPositionZ();
         float const span = bot->GetExactDist2d(wx, wy);   // Position.h:170
 
-        // A normal walking step cannot bridge a large vertical gap. Without
-        // this check, follower catch-up can keep handing a mountain-top
-        // endpoint to the short-step fallback after the navmesh refused it.
-        // Explicit dungeon jump and drop steps do not use GroundedStep.
-        if (std::fabs(wz - bot->GetPositionZ()) > 20.0f)
-            return false;
-
         // THE AIM'S OWN Z IS CORRECTED ONTO THE SURFACE UNDER IT, and only
         // when the character is near enough for that to be cheap: sampling the
         // ground four thousand yards away would CREATE the map grid there
@@ -8260,6 +8258,23 @@ private:
         }
 
         // 2. AND OTHERWISE A SHORT STEP, OVER GROUND THAT HOLDS.
+        //
+        // A normal walking step cannot bridge a large vertical gap (#203):
+        // without this, follower catch-up kept handing a mountain-top endpoint
+        // to this fallback after the navmesh refused it. The gap is measured
+        // against the AIM, so it bounds this step only when the aim is within
+        // one step; a far aim's height is not this step's height, and the
+        // footing of the step actually taken is sampled stride by stride in
+        // GroundHolds below. Written against the endpoint and placed above
+        // the navmesh, this test held four of five family members on ordinary
+        // overland errands the night it merged, because every long walk over
+        // hills ends more than twenty yards from where it starts. Explicit
+        // dungeon jump and drop steps do not use GroundedStep.
+        if (!OverseerDecisions::StepMayBridgeGap(
+                span, wz - bot->GetPositionZ(), TRAVEL_STEP_YARDS,
+                TRAVEL_STEP_VERTICAL_YARDS))
+            return false;
+
         float const bearing = bot->GetAngle(wx, wy);   // Position.h:190
         // The direct line, then either side of it, nearest bearing first.
         // Five and no more: this runs once per stepping character per poll and

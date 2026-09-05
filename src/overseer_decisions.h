@@ -119,6 +119,27 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
                                        bool surfaceValid, bool hasLocalNavmesh,
                                        float overrideGap);
 
+// A VERTICAL GAP IS A STEP'S BUSINESS, NOT AN ERRAND'S.
+//
+// mod-overseer#203 bounded the short-step fallback so that follower catch-up
+// could not keep handing a mountain-top endpoint to it: a single walking step
+// cannot bridge twenty yards of height. The bound was written against the
+// ERRAND'S endpoint, and it ran before the navmesh was asked. The night it
+// merged, four of the five family members were held in place on ordinary
+// overland errands - 233 to 1,629 yards off, aims on the Stormwind gate ramp
+// at z 162 and 185 from the Elwynn road at z 100 - because every long walk
+// across hills ends more than twenty yards above or below where it starts.
+//
+// The endpoint's height says something about THIS step only when the endpoint
+// IS this step, which is to say when the aim is within one step's reach.
+// Further than that, the step being taken lands somewhere else entirely, and
+// the ground under it is sampled stride by stride by the adapter's own footing
+// check, which already refuses a drop and a climb of its own. So: an aim
+// beyond one step may always be stepped toward; an aim within one step may be
+// stepped onto only if its height is within the gap a step can bridge.
+bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
+                      float maxGap);
+
 
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
 //
