@@ -2448,4 +2448,169 @@ char const* FallAccountName(FallAccount account)
     return "unsampled";
 }
 
+namespace
+{
+
+// Does this relation list name that faction? Both lists are searched only
+// under the caller's `other.faction` guard, which is the core's own and is
+// what keeps the DBC's trailing zero padding from matching a faction of zero.
+bool ListNames(std::vector<uint32_t> const& list, uint32_t faction)
+{
+    for (uint32_t entry : list)
+        if (entry == faction)
+            return true;
+    return false;
+}
+
+// FACTION_TEMPLATE_FLAG_HATES_ALL_EXCEPT_FRIENDS (DBCEnums.h:332). Named here
+// rather than included, because including DBCEnums.h is exactly the thing this
+// file may not do.
+constexpr uint32_t FACTION_TEMPLATE_HATES_ALL_EXCEPT_FRIENDS = 0x2000;
+
+}  // namespace
+
+bool FactionStanceHostileTo(FactionStance const& subject, FactionStance const& other)
+{
+    // ZERO IS NOT A FACTION, and this guard is why. The DBC pads both relation
+    // lists to four entries with zeros, so a nameless side searched against
+    // them would match the padding and read as an enemy of everything. The
+    // core writes the same guard for the same reason.
+    if (other.faction)
+    {
+        if (ListNames(subject.enemyFactions, other.faction))
+            return true;
+        if (ListNames(subject.friendFactions, other.faction))
+            return false;
+    }
+    return (subject.hostileMask & other.ourMask) != 0;
+}
+
+bool FactionStanceFriendlyTo(FactionStance const& subject, FactionStance const& other)
+{
+    // The core's own first line, and it is not redundant with the masks below:
+    // a template whose faction is its own faction is friendly to itself even
+    // when its masks say nothing.
+    if (subject.faction == other.faction)
+        return true;
+
+    if (other.faction)
+    {
+        if (ListNames(subject.enemyFactions, other.faction))
+            return false;
+        if (ListNames(subject.friendFactions, other.faction))
+            return true;
+    }
+    return (subject.friendlyMask & other.ourMask) != 0 ||
+           (subject.ourMask & other.friendlyMask) != 0;
+}
+
+Reaction FactionStanceReaction(FactionStance const& npc, FactionStance const& character)
+{
+    if (FactionStanceHostileTo(npc, character))
+        return Reaction::Hostile;
+    if (FactionStanceFriendlyTo(npc, character))
+        return Reaction::Friendly;
+    // BOTH DIRECTIONS ARE ASKED, and the second one is not a typo in the core.
+    // A goblin town's template names no friends and no masks at all, so it is
+    // friendly to nobody by its own reading; what keeps a neutral shop usable
+    // is the fall-through below, not this line. The line matters for a
+    // template the CHARACTER's side declares friendly.
+    if (FactionStanceFriendlyTo(character, npc))
+        return Reaction::Friendly;
+    if (npc.flags & FACTION_TEMPLATE_HATES_ALL_EXCEPT_FRIENDS)
+        return Reaction::Hostile;
+    return Reaction::Neutral;
+}
+
+bool MayInteractAt(Reaction reaction)
+{
+    return static_cast<int>(reaction) > static_cast<int>(Reaction::Unfriendly);
+}
+
+TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates)
+{
+    TravelTargetChoice choice;
+    choice.considered = candidates.size();
+    if (candidates.empty())
+        return choice;
+
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        TravelTargetCandidate const& candidate = candidates[i];
+        if (!candidate.mayInteract)
+        {
+            ++choice.refused;
+            if (choice.nearestRefused < 0 ||
+                candidate.distance < candidates[std::size_t(choice.nearestRefused)].distance)
+                choice.nearestRefused = int(i);
+            continue;
+        }
+        if (choice.index < 0 ||
+            candidate.distance < candidates[std::size_t(choice.index)].distance)
+            choice.index = int(i);
+    }
+
+    choice.verdict = choice.index >= 0 ? TravelTargetVerdict::Chosen
+                                       : TravelTargetVerdict::NoneWillDealWithUs;
+    return choice;
+}
+
+std::string TravelTargetExplanation(TravelTargetChoice const& choice,
+                                    std::vector<TravelTargetCandidate> const& candidates)
+{
+    // Distances are said as whole yards. A tenth of a yard changes nothing
+    // about the decision and a log line full of float noise is harder to
+    // compare between two polls than one that is not.
+    auto const yards = [](float distance)
+    {
+        long rounded = long(distance < 0.f ? 0.f : distance + 0.5f);
+        return std::to_string(rounded);
+    };
+    auto const nameOf = [&](int index)
+    {
+        TravelTargetCandidate const& candidate = candidates[std::size_t(index)];
+        return "entry " + std::to_string(candidate.entry) + " at " +
+               yards(candidate.distance) + " yards";
+    };
+
+    bool const haveRefused = choice.nearestRefused >= 0 &&
+                             std::size_t(choice.nearestRefused) < candidates.size();
+
+    if (choice.verdict == TravelTargetVerdict::NoneWillDealWithUs)
+    {
+        std::string said = std::to_string(choice.refused) +
+                           " of them are on this map and this character may interact with "
+                           "none of them";
+        if (haveRefused)
+            said += " - the nearest is " + nameOf(choice.nearestRefused);
+        return said;
+    }
+
+    if (choice.verdict != TravelTargetVerdict::Chosen || !choice.refused)
+        return {};
+    if (std::size_t(choice.index) >= candidates.size())
+        return {};
+
+    // ONLY WORTH SAYING WHEN THE GATE CHANGED THE ANSWER. A refused spawn
+    // farther away than the chosen one cost nobody a walk, and counting it
+    // would make an ordinary errand read like a near miss. So the number said
+    // is how many were passed over, not how many were refused anywhere on the
+    // map - the first is what this errand did and the second is a property of
+    // the world.
+    float const chosen = candidates[std::size_t(choice.index)].distance;
+    std::size_t nearer = 0;
+    for (TravelTargetCandidate const& candidate : candidates)
+        if (!candidate.mayInteract && candidate.distance < chosen)
+            ++nearer;
+    if (!nearer)
+        return {};
+
+    std::string said = "chose " + nameOf(choice.index) + " over " +
+                       std::to_string(nearer) +
+                       " nearer one(s) this character may not interact with";
+    if (haveRefused)
+        said += " - the nearest of those is " + nameOf(choice.nearestRefused);
+    return said;
+}
+
 }  // namespace OverseerDecisions

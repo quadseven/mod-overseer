@@ -2453,6 +2453,139 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
                            float rate = 1.f);
 char const* FallAccountName(FallAccount account);
 
+// ----------------------------- who a character can actually be sent to (#234) --
+//
+// THE ERRAND CHOSE ITS NPC BY DISTANCE AND NEVER ASKED WHETHER IT COULD BE
+// TRADED WITH, and that one omission is most of a day's failures on the dev
+// realm. Measured 2026-09-05: an Alliance family of level 24 to 29 parked
+// beside a Horde town, aimed at `vendor`, resolved to the nearest one at 118
+// to 258 yards, walked to it through level 40 guards, and could never have
+// completed the sale. `Player::GetNPCIfCanInteractWith` (Player.cpp:2113-2163)
+// ends with `if (creature->GetReactionTo(this) <= REP_UNFRIENDLY) return
+// nullptr`, so an unfriendly vendor refuses a character standing on top of it
+// exactly as it refuses one a mile away. Distance was never the question.
+//
+// WHAT CAME OF IT, all downstream of one comparison: 180 `sell` rows refused
+// with `vendor not in range` in an afternoon, the queue livelock those
+// refusals fed (#230), six deaths in five minutes to `Horde Guard` and five
+// earlier to `Stonetalon Grunt` on the walk there, a graveyard spiral because
+// dying in hostile ground resurrects you in hostile ground, and the
+// cross-continent splits that spiral escalates into (#241).
+//
+// NEUTRAL IS NOT A CONSOLATION PRIZE, IT IS THE ANSWER. The gate is
+// `> REP_UNFRIENDLY`, not `>= REP_FRIENDLY`, and reading it as "friendly"
+// would be a worse bug than the one being fixed: for an Alliance party in
+// Kalimdor there is no friendly vendor within reach at all, and the shop that
+// serves them is a goblin one that is neutral to everybody. Excluding neutral
+// would turn "walks to a vendor that refuses it" into "has no vendor", which
+// is not an improvement.
+
+// The fields of one FactionTemplate.dbc row that decide a reaction, copied out
+// by the caller so this file needs no core type. Names and order are
+// FactionTemplateEntry's own (DBCStructure.h:974-984); `enemyFactions` and
+// `friendFactions` are that struct's two fixed arrays of four, as vectors,
+// with the trailing zeros the DBC pads them with allowed to be dropped.
+struct FactionStance
+{
+    uint32_t faction{0};
+    uint32_t flags{0};          // factionFlags
+    uint32_t ourMask{0};
+    uint32_t friendlyMask{0};
+    uint32_t hostileMask{0};
+    std::vector<uint32_t> enemyFactions;
+    std::vector<uint32_t> friendFactions;
+};
+
+// The core's ReputationRank (SharedDefines.h:155-165), with its numbering, so
+// a caller can cast one straight into this and so the "greater than
+// unfriendly" comparison below is the same comparison the core makes.
+enum class Reaction : int
+{
+    Hated = 0,
+    Hostile = 1,
+    Unfriendly = 2,
+    Neutral = 3,
+    Friendly = 4,
+    Honored = 5,
+    Revered = 6,
+    Exalted = 7,
+};
+
+// FactionTemplateEntry::IsHostileTo and ::IsFriendlyTo (DBCStructure.h:987-1016),
+// reproduced. Both are asymmetric - the enemy and friend lists belong to
+// `subject` and are searched for `other`'s faction - so the argument order is
+// part of the meaning and not a detail.
+bool FactionStanceHostileTo(FactionStance const& subject, FactionStance const& other);
+bool FactionStanceFriendlyTo(FactionStance const& subject, FactionStance const& other);
+
+// Unit::GetFactionReactionTo(FactionTemplateEntry const*, FactionTemplateEntry
+// const*) (Unit.cpp:7287-7302), which is where the core lands when neither
+// side's faction carries a reputation the player can hold. `npc` first,
+// `character` second, because that is the direction the core asks in:
+// GetNPCIfCanInteractWith asks the CREATURE how it feels about the player.
+Reaction FactionStanceReaction(FactionStance const& npc, FactionStance const& character);
+
+// `GetReactionTo(player) > REP_UNFRIENDLY`, which is the whole of what the
+// core's interaction gate tests about faction. One function so no call site
+// gets to re-derive the threshold, and so a reader can find the >= vs > in
+// one place.
+bool MayInteractAt(Reaction reaction);
+
+// One spawn of the wanted role standing on the character's own map. The
+// caller has already asked whether this character may interact with it, the
+// same way the bank and repair candidate lists arrive already asked.
+struct TravelTargetCandidate
+{
+    uint32_t entry{0};
+    float distance{0.f};      // yards from the character, two-dimensional
+    bool mayInteract{false};
+};
+
+enum class TravelTargetVerdict : uint8_t
+{
+    Chosen,               // `index` names the spawn to walk to
+    NothingOfThatKind,    // no spawn of the role is on this map at all
+    NoneWillDealWithUs,   // there are spawns and this character may use none
+};
+
+struct TravelTargetChoice
+{
+    TravelTargetVerdict verdict{TravelTargetVerdict::NothingOfThatKind};
+    int index{-1};          // into the candidate list, -1 when nothing was chosen
+    int nearestRefused{-1}; // the nearest one it may NOT use, for the log line
+    std::size_t considered{0};
+    std::size_t refused{0};
+};
+
+// THE NEAREST SPAWN THIS CHARACTER CAN ACTUALLY USE, and nothing else about
+// it. A spawn it may not interact with is not a worse answer than one it can,
+// it is not an answer: the errand cannot end there however well the walk goes.
+// So they are excluded rather than ranked below, which is the difference
+// between this and ChooseSellVendor's flagged-but-still-chosen vendor - that
+// one is chosen only so a refusal can be named as the vendor's, and here
+// naming it costs a walk through hostile ground.
+//
+// THE RIGHT ANSWER IS OFTEN FARTHER AWAY AND THAT IS NOT A REASON TO REJECT
+// IT. The usable counter for the family this was written for is about 1,470
+// yards from the dungeon door while the unusable one is 510, and infra#3359
+// measured both before this existed. Distance only ever breaks a tie among
+// spawns that passed the gate; the index breaks a tie in distance, so the
+// answer never depends on the order a spawn sweep happened to produce.
+TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates);
+
+// What to put in the log for a choice, or empty when there is nothing worth
+// saying (nothing of the kind is on the map at all, which the caller already
+// says, or a clean nearest-spawn choice with nothing refused).
+//
+// A REFUSAL THAT NAMES ITS CAUSE IS WORTH MORE THAN A HOPEFUL JOURNEY, which
+// is the whole argument of this section: today the errand walked, and the
+// walking is what killed people. So the two lines this builds are the two
+// facts an operator needs and could not previously get - that the nearest
+// thing of the right kind is one this character may not use, and which one
+// was taken instead.
+std::string TravelTargetExplanation(TravelTargetChoice const& choice,
+                                    std::vector<TravelTargetCandidate> const& candidates);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
