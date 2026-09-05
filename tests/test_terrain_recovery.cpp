@@ -144,7 +144,6 @@ char const* Name(TerrainRemedy r)
     {
         case TerrainRemedy::Nothing:       return "Nothing";
         case TerrainRemedy::LiftToSurface: return "LiftToSurface";
-        case TerrainRemedy::SendToBind:    return "SendToBind";
         case TerrainRemedy::GiveUp:        return "GiveUp";
     }
     return "?";
@@ -211,9 +210,7 @@ void TheVendorUnderTheTowerIsNeverDisplaced()
     CheckRemedy("standing at a vendor under a 37-yard tower", v.remedy,
                 TerrainRemedy::GiveUp);
     Check("a live polygon is never displaced",
-          v.remedy != TerrainRemedy::SendToBind &&
-              v.remedy != TerrainRemedy::LiftToSurface,
-          true);
+          v.remedy != TerrainRemedy::LiftToSurface, true);
 }
 
 // THE REGRESSION THIS WHOLE CHANGE EXISTS FOR. The condition that fired 204
@@ -221,7 +218,7 @@ void TheVendorUnderTheTowerIsNeverDisplaced()
 void ARepeatedConditionIsABoundedSeriesAndThenSilence()
 {
     TerrainRecoveryState state;
-    int lifts = 0, binds = 0, giveUps = 0, nothings = 0;
+    int lifts = 0, giveUps = 0, nothings = 0;
     // Every 14 seconds, which was the measured walk-back interval, for the
     // 396 minutes the live worldserver ran.
     for (time_t t = 0; t < 396 * 60; t += 14)
@@ -230,13 +227,11 @@ void ARepeatedConditionIsABoundedSeriesAndThenSilence()
         switch (v.remedy)
         {
             case TerrainRemedy::LiftToSurface: ++lifts; break;
-            case TerrainRemedy::SendToBind:    ++binds; break;
             case TerrainRemedy::GiveUp:        ++giveUps; break;
             case TerrainRemedy::Nothing:       ++nothings; break;
         }
     }
     Check("at most one lift for an unbroken episode", lifts == 1, true);
-    Check("at most one bind for an unbroken episode", binds == 1, true);
     Check("at most one give-up for an unbroken episode", giveUps == 1, true);
     Check("and silence for the rest of the six hours", nothings > 1600, true);
 }
@@ -255,14 +250,17 @@ void ARemedyThatDidNotStickClimbsRatherThanRepeating()
     CheckRemedy("the poll right after the lift",
                 TerrainRecoveryStep(state, Here(117.3f, 117.3f, true), LIVE_LIMITS, 101).remedy,
                 TerrainRemedy::Nothing);
-    // Fourteen seconds later it is back under the arch.
+    // Fourteen seconds later it is back under the arch. The lift did not
+    // stick, so this module cannot fix this character where it stands, and
+    // that is where the ladder ENDS: it used to escalate to the bind point
+    // here, which is #188.
     CheckRemedy("back in the same condition fourteen seconds later",
                 TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 115).remedy,
-                TerrainRemedy::SendToBind);
-    CheckRemedy("and again after that",
-                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 129).remedy,
                 TerrainRemedy::GiveUp);
     CheckRemedy("and then it stops",
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 129).remedy,
+                TerrainRemedy::Nothing);
+    CheckRemedy("and stays stopped",
                 TerrainRecoveryStep(state, Here(88.6f, 116.8f, false), LIVE_LIMITS, 143).remedy,
                 TerrainRemedy::Nothing);
 }
@@ -435,8 +433,10 @@ void EveryDeliberatelyAirborneStateStandsDown()
 // THE OTHER HALF OF THE SAME INCIDENT, and the reason the tank got the bind
 // point rather than a lift. The ladder had a rung left over from a lift on map
 // 1 at 13:48:14 (-594.3, -2014.6, 61.0), and 37 minutes later at 14:25:28 on
-// map 43 that rung chose SendToBind for a completely unrelated incident. The
-// bind teleport is what ejected him from the instance.
+// map 43 that rung chose the bind-point fallback for a completely unrelated
+// incident, which is what ejected him from the instance. That fallback is gone
+// (#188) and the anchor still matters: what a leftover rung now steals is the
+// LIFT a real fall is entitled to.
 void ARungDoesNotFollowACharacterToAnotherIncident()
 {
     // The lift that set the rung: map 1, 13:48:14.
@@ -461,14 +461,13 @@ void ARungDoesNotFollowACharacterToAnotherIncident()
         TerrainRecoveryStep(state, Shaft(-39.8f), LIVE_LIMITS, 2220);
     CheckRemedy("a new map is a new incident", v.remedy,
                 TerrainRemedy::LiftToSurface);
-    Check("and above all it is not the bind point",
-          v.remedy != TerrainRemedy::SendToBind, true);
 }
 
-// Distance ends an episode too, so a character thrown 1,900 yards by the
-// fallback is not still inside the incident it was thrown out of. The radius
-// has to stay larger than the 140-yard walk back from the bind point, or every
-// repetition would look like a first occurrence and nothing would be bounded.
+// Distance ends an episode too. Nothing this module does moves a character in
+// x or y any more, so what this reads is the character's own wandering, and the
+// radius has to stay larger than the 140-yard walk back measured from the bind
+// point, or every repetition would look like a first occurrence and nothing
+// would be bounded.
 void DistanceEndsAnEpisodeButAWalkBackDoesNot()
 {
     TerrainRecoveryState nearby;
@@ -481,7 +480,7 @@ void DistanceEndsAnEpisodeButAWalkBackDoesNot()
                 TerrainRecoveryStep(nearby, Here(88.6f, 116.8f, false, 0, -9058.3f,
                                                  -185.4f),
                                     LIVE_LIMITS, 14).remedy,
-                TerrainRemedy::SendToBind);
+                TerrainRemedy::GiveUp);
 
     TerrainRecoveryState distant;
     CheckRemedy("the first occurrence",
@@ -493,6 +492,114 @@ void DistanceEndsAnEpisodeButAWalkBackDoesNot()
                                                   -45.4f),
                                     LIVE_LIMITS, 14).remedy,
                 TerrainRemedy::LiftToSurface);
+}
+
+// ---------------------------------------------------------------------------
+// #188, THE CROSS-CONTINENT ESCALATION. Captured whole on the dev realm
+// 2026-09-05, one character, sixteen seconds:
+//
+//   16:46:58  'Grog' below the world at map 1 (1202.6, -707.3, 72.3),
+//             surface z 97.7, no local navmesh; LIFTED to z 98.2
+//   16:47:03  'Grog' the condition is back, so this is the fallback:
+//             sent to the leader's bind point
+//   16:47:14  'Grog' STILL below the world at MAP 0 (-8902.6, -162.6, 81.9),
+//             surface z 128.0, local navmesh PRESENT
+//
+// Every roster bind row is map 0 (-8950, -132). The party ended that minute
+// two in Elwynn, two in the Barrens and one offline in Stonetalon.
+// ---------------------------------------------------------------------------
+
+// The northern Barrens readings, transcribed. The second occurrence used to be
+// the bind teleport; it is now the end of the ladder.
+void TheBarrensLadderEndsInAGiveUpAndNotAnOcean()
+{
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const lift =
+        TerrainRecoveryStep(state, Here(72.3f, 97.7f, false, 1, 1202.6f, -707.3f),
+                            LIVE_LIMITS, 0);
+    CheckRemedy("16:46:58, the first occurrence", lift.remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckNear("lifted to the surface at its own x and y", lift.liftZ, 98.2f);
+
+    // 16:47:03. Five seconds later, one and a half yards away, same condition.
+    TerrainRecoveryVerdict const second =
+        TerrainRecoveryStep(state, Here(73.1f, 95.8f, false, 1, 1204.1f, -708.5f),
+                            LIVE_LIMITS, 5);
+    CheckRemedy("16:47:03, the lift did not stick", second.remedy,
+                TerrainRemedy::GiveUp);
+    Check("and it is not a displacement of any kind",
+          second.remedy != TerrainRemedy::LiftToSurface, true);
+}
+
+// The far end of that teleport, which is the whole of #188's title. Grog reads
+// as 46 yards below a surface at Northshire, WITH a live polygon at his feet -
+// so he is standing on the ground and the probe found the abbey roof. It is
+// also the bind point's own neighbourhood, which is why the fallback fed the
+// detector that chose it.
+void TheAbbeyRoofIsNotACharacterUnderStormwind()
+{
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v =
+        TerrainRecoveryStep(state, Here(81.9f, 128.0f, true, 0, -8902.6f, -162.6f),
+                            LIVE_LIMITS, 1000);
+    CheckRemedy("16:47:14, map 0, local navmesh PRESENT", v.remedy,
+                TerrainRemedy::GiveUp);
+    Check("a character on a live polygon is never moved",
+          v.remedy != TerrainRemedy::LiftToSurface, true);
+    // And it does not spend a rung, so a real fall here still gets its lift.
+    Check("a warning is not a remedy", state.attempts == 0u, true);
+}
+
+// THE INVARIANT, ASKED THE WAY THE INCIDENT ASKS IT. The adapter turns a
+// verdict into a position: a lift keeps the map, the x and the y and changes
+// only z; anything else changes nothing. Drive the ladder through the whole
+// live trace and assert the map id never moves. This is the property the enum
+// now makes unrepresentable, checked at the level a party split cares about.
+struct Where
+{
+    uint32_t mapId;
+    float x, y, z;
+};
+
+Where Apply(Where at, TerrainRecoveryVerdict const& v)
+{
+    if (v.remedy == TerrainRemedy::LiftToSurface)
+        at.z = v.liftZ;   // same map, same x, same y: that is what a lift IS
+    return at;
+}
+
+void NoRecoveryMayEverChangeAMap()
+{
+    // The northern Barrens cluster, every reading the incident logged, run
+    // over and over with the condition never going false.
+    float const zs[] = {40.9f, 21.4f, 59.6f, 72.3f, 73.1f};
+    float const surfaces[] = {86.3f, 58.6f, 112.4f, 97.7f, 95.8f};
+    float const xs[] = {1161.7f, 1146.4f, 1140.4f, 1202.6f, 1204.1f};
+    float const ys[] = {-633.1f, -627.2f, -638.0f, -707.3f, -708.5f};
+
+    TerrainRecoveryState state;
+    Where at{1, xs[0], ys[0], zs[0]};
+    int moves = 0;
+    for (time_t t = 0; t < 4000; ++t)
+    {
+        size_t const i = static_cast<size_t>(t) % 5;
+        at.x = xs[i];
+        at.y = ys[i];
+        at.z = zs[i];
+        // Alternate the navmesh answer so both branches are exercised.
+        TerrainReading const r =
+            Here(zs[i], surfaces[i], (t % 3) == 0, at.mapId, at.x, at.y);
+        Where const after = Apply(at, TerrainRecoveryStep(state, r, LIVE_LIMITS, t));
+        Check("a recovery never changes the map", after.mapId == at.mapId, true);
+        Check("a recovery never changes x", after.x == at.x, true);
+        Check("a recovery never changes y", after.y == at.y, true);
+        if (after.z != at.z)
+            ++moves;
+        at = after;
+    }
+    // And it did really exercise the moving branch, so the three checks above
+    // are not passing because nothing ever happened.
+    Check("the lift did fire during that run", moves > 0, true);
 }
 }  // namespace
 
@@ -522,6 +629,10 @@ int main()
     EveryDeliberatelyAirborneStateStandsDown();
     ARungDoesNotFollowACharacterToAnotherIncident();
     DistanceEndsAnEpisodeButAWalkBackDoesNot();
+
+    TheBarrensLadderEndsInAGiveUpAndNotAnOcean();
+    TheAbbeyRoofIsNotACharacterUnderStormwind();
+    NoRecoveryMayEverChangeAMap();
 
     if (failures)
     {
