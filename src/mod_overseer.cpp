@@ -11783,6 +11783,20 @@ private:
                                            float& outX, float& outY, float& outZ,
                                            std::string& why)
     {
+        // ZEROED FIRST, SO THAT EVERY FAILURE BELOW LEAVES THE SAME ANSWER
+        // (#220). There are five ways out of this function that are not a
+        // staging point, and before this line each of them left whatever the
+        // caller's own locals happened to hold. That was harmless while every
+        // caller checked the return - and the defect this comment is named
+        // after was a path that reached a staging AIM without any caller having
+        // been involved at all. The origin is now a refusal
+        // (OverseerDecisions::StagingPointCheck), so failing into it is failing
+        // into something the consumer will not act on, rather than into three
+        // floats that look like a place.
+        outX = 0.f;
+        outY = 0.f;
+        outZ = 0.f;
+
         // AreaTrigger  ObjectMgr.h:425-428  map/x/y/z
         AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.entryTriggerId);
         if (!door)
@@ -11813,24 +11827,30 @@ private:
             return false;
         }
 
-        float dx = back->target_X - door->x;
-        float dy = back->target_Y - door->y;
-        float const span = std::sqrt(dx * dx + dy * dy);
-        // A landing point on top of the door names no direction at all, and a
-        // normalise of it would be a divide by something near zero dressed up
-        // as a bearing. Refusing is the honest answer; inventing an axis is how
-        // the wall got walked into the first time.
-        if (span < 1.0f)
+        // THE SUMS MOVED, THE ARGUMENT DID NOT (#220). Everything from here to
+        // the ground probe used to be four lines of arithmetic in the middle of
+        // an adapter, reachable only by a running world. It is a normalise, a
+        // scale and two adds - it needs no world at all - so it lives in
+        // OverseerDecisions::DungeonStagingPoint with the four portals' real
+        // door numbers as its test. What stayed here is the only part that
+        // genuinely needs a world: reading the two triggers, and asking the map
+        // how high the ground is where the answer landed.
+        OverseerDecisions::StagingPoint const staged =
+            OverseerDecisions::DungeonStagingPoint(door->x, door->y, back->target_X,
+                                                   back->target_Y, back->target_Z,
+                                                   DUNGEON_STAGING_STANDOFF_YARDS);
+        if (staged.verdict != OverseerDecisions::StagingPointVerdict::Usable)
         {
-            why = "the way back out lands on the door itself, so it names no approach axis";
+            why = OverseerDecisions::StagingPointRefusal(staged.verdict) +
+                  " - areatrigger " + std::to_string(portal.entryTriggerId) +
+                  " and the way out of areatrigger " +
+                  std::to_string(portal.exitTriggerId);
             return false;
         }
-        dx /= span;
-        dy /= span;
 
-        outX = door->x + dx * DUNGEON_STAGING_STANDOFF_YARDS;
-        outY = door->y + dy * DUNGEON_STAGING_STANDOFF_YARDS;
-        outZ = back->target_Z;
+        outX = staged.x;
+        outY = staged.y;
+        outZ = staged.z;
 
         // GetMap  Object.h:631  Map* GetMap() const
         Map* map = leader ? leader->GetMap() : nullptr;
@@ -11840,7 +11860,8 @@ private:
             // GetHeight  Map.h  float GetHeight(float x, float y, float z, ...) const
             float const ground =
                 map->GetHeight(outX, outY, door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS);
-            if (std::fabs(ground - door->z) <= DUNGEON_STAGING_Z_SANITY_YARDS)
+            if (OverseerDecisions::StagingGroundBelievable(ground, door->z,
+                                                           DUNGEON_STAGING_Z_SANITY_YARDS))
                 outZ = ground;
             else
                 LOG_WARN("module.overseer",
@@ -11850,6 +11871,21 @@ private:
                          "is used instead",
                          ground, portal.keyword, outX, outY, portal.entryTriggerId,
                          door->z, back->target_Z);
+        }
+
+        // AND THE ANSWER IS PUT THROUGH THE TEST ITS CONSUMERS APPLY, so that
+        // "this function returned true" and "this point may be walked to" are
+        // the same statement rather than two statements that happen to have
+        // agreed so far. The ground probe above is the one step that can change
+        // a derived point after it has been checked.
+        if (!OverseerDecisions::StagingPointUsable(outX, outY, outZ))
+        {
+            why = OverseerDecisions::StagingPointRefusal(
+                OverseerDecisions::StagingPointCheck(outX, outY, outZ));
+            outX = 0.f;
+            outY = 0.f;
+            outZ = 0.f;
+            return false;
         }
         return true;
     }
@@ -12030,6 +12066,50 @@ private:
         bool loggedApproachRefused{false};
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
+
+    // THE ONLY PLACE A STAGING AIM IS BUILT, AND THEREFORE THE ONLY PLACE THE
+    // POINT IS CHECKED (#220).
+    //
+    // WHAT WENT WRONG. `ResolveDungeonStagingPoint` carries a `why` and the
+    // contract "a run that cannot work out where to wait does not start and
+    // says why", and the LOG_ERROR for that contract sits at its single call
+    // site in the IDLE branch. Measured live, a run reached RESETTING with
+    // three zero staging floats and claimed `at:1:0,0,0` for its leader, who
+    // was then walked at the middle of Kalimdor - 2183 yards off - until the
+    // backstop gave up. No error fired, because the derivation was never
+    // attempted: the run had been ADOPTED (the party was already inside, which
+    // is the only way a Wailing Caverns run can begin while #158's crossing does
+    // not exist), and adoption sets up a coordinator without a staging point
+    // because an adopted run has no gathering left to do. `EndRunAndDecide`
+    // then carried those zeros into the next run of the campaign, correctly by
+    // its own rule and disastrously in fact, and set the phase straight to
+    // RESETTING - which skips the IDLE branch, and with it the only check.
+    //
+    // SO THE CHECK MOVED TO WHERE THE ANSWER IS USED. A contract enforced only
+    // where a value is DERIVED protects exactly the paths that derive it, which
+    // is the set of paths that were never the problem. Both places that used to
+    // format `at:<map>:<x>,<y>,<z>` out of the coordinator now come through
+    // here, and here refuses a point that was never resolved. A staging point of
+    // (0, 0, 0) is not walked at, logged as a destination, or written to a
+    // roster row: it is a refusal with a sentence attached.
+    static bool DungeonStagingAim(DungeonPortal const& portal,
+                                  DungeonRunCoordinatorState const& coord,
+                                  std::string& aim, std::string& why)
+    {
+        OverseerDecisions::StagingPointVerdict const verdict =
+            OverseerDecisions::StagingPointCheck(coord.stageX, coord.stageY, coord.stageZ);
+        if (verdict != OverseerDecisions::StagingPointVerdict::Usable)
+        {
+            why = OverseerDecisions::StagingPointRefusal(verdict);
+            return false;
+        }
+
+        std::ostringstream out;
+        out << "at:" << portal.outsideMapId << ':' << coord.stageX << ','
+            << coord.stageY << ',' << coord.stageZ;
+        aim = out.str();
+        return true;
+    }
 
     // THE BARRIER AND CROSSING PREDICATES NOW LIVE IN overseer_decisions.h,
     // unchanged. They were written free of every core type so that a unit test
@@ -13171,6 +13251,16 @@ private:
         // that gets harder the closer it gets. Between two runs of one campaign
         // the party is standing on that exact point, so the same argument says
         // to keep it rather than ask again.
+        //
+        // WHAT IT CARRIES WHEN THE FINISHED RUN NEVER HAD ONE (#220). An
+        // adopted run's coordinator holds three zeros here, and this rule
+        // promoted them from "nobody resolved this" to "this campaign's staging
+        // point" - which the next run then walked its leader at, for the length
+        // of its backstop, at the middle of the map. Carrying is still right;
+        // what was wrong is that nothing downstream could tell a carried answer
+        // from a carried absence. RESETTING now asks
+        // OverseerDecisions::StagingPointUsable before it trusts what arrives
+        // here, and derives a point when the answer is no.
         coord.stageX = stageX;
         coord.stageY = stageY;
         coord.stageZ = stageZ;
@@ -13307,6 +13397,29 @@ private:
                 std::vector<OverseerDecisions::DungeonRunEntryState> const adoptedStates =
                     DungeonRunCensus(members, entryDoor, inside->insideMapId, adoptedInside);
 
+                // AND THIS COORDINATOR DELIBERATELY HAS NO STAGING POINT (#220).
+                // An adopted run is already inside; there is no gather left to
+                // own, and asking the world where the party WOULD have waited
+                // would be work for an answer nothing here reads.
+                //
+                // WHAT THAT COST BEFORE IT WAS WRITTEN DOWN. The three staging
+                // floats stay at their initialised zeros, EndRunAndDecide
+                // carries a finished run's staging point into the next run of
+                // the campaign, and the next run formatted those zeros straight
+                // into `at:<outsideMapId>:0,0,0` and walked the leader at the
+                // middle of the map for its whole backstop. Every Wailing
+                // Caverns run took this path, because adoption after an
+                // operator teleport is the only way one can begin while #158's
+                // crossing does not exist - but nothing about the hole is
+                // Wailing-specific: a worldserver bounce mid-Deadmines adopts
+                // that run the same way.
+                //
+                // The fix is not here. Leaving the point unset is the honest
+                // thing for a phase that has no use for one; what was missing is
+                // that "unset" and "the origin" were the same three floats to
+                // everything downstream. RESETTING now derives a point when it
+                // inherited none, and DungeonStagingAim refuses to build an aim
+                // out of one that was never resolved.
                 coord = DungeonRunCoordinatorState();
                 coord.phase = OverseerDecisions::DungeonRunAllThrough(adoptedStates)
                                   ? DungeonRunPhase::Clearing
@@ -13724,9 +13837,77 @@ private:
             std::string why;
             if (ResetGroupInstance(leaderName, members, portal->insideMapId, why))
             {
-                std::ostringstream aim;
-                aim << "at:" << portal->outsideMapId << ':' << coord.stageX << ','
-                    << coord.stageY << ',' << coord.stageZ;
+                // THE LAST MOMENT THE STAGING POINT CAN STILL BE ASKED FOR, AND
+                // THEREFORE WHERE IT IS ASKED FOR (#220). Every other path into
+                // this phase brings a point with it: the IDLE branch resolves
+                // one before it opens a run, and EndRunAndDecide carries the
+                // finished run's forward on purpose (see its comment - a
+                // barrier circle that moves under a party standing in it is a
+                // gather that gets harder the closer it gets).
+                //
+                // THERE IS ONE PATH THAT BRINGS NOTHING, and it is the one the
+                // defect was measured on. An ADOPTED run - the party was
+                // already inside, which for Wailing Caverns is the only way in
+                // at all while #158's crossing does not exist - sets up a
+                // coordinator with no staging point, because an adopted run has
+                // no gathering left to do. When that run ends and the campaign
+                // goes again, EndRunAndDecide faithfully carries forward the
+                // three zeros it was given, and this line used to format them
+                // into `at:1:0,0,0` and claim it.
+                //
+                // So the point is DERIVED HERE when what was carried is not a
+                // place. This is the safest instant in the whole run to do it:
+                // the reset has just succeeded, so nobody is inside and nobody
+                // is standing in a barrier circle that could move under them,
+                // and the leader is out on the portal's own map, where the
+                // ground probe can actually answer. A run that still cannot be
+                // told where to wait does not walk anybody: it fails here, with
+                // the reason, exactly as the IDLE branch would have.
+                if (!OverseerDecisions::StagingPointUsable(coord.stageX, coord.stageY,
+                                                           coord.stageZ))
+                {
+                    float stageX = 0.f, stageY = 0.f, stageZ = 0.f;
+                    std::string stageWhy;
+                    if (!ResolveDungeonStagingPoint(*portal, leader, stageX, stageY,
+                                                    stageZ, stageWhy))
+                    {
+                        FailRunAtReset(coord, leaderName, members, *portal,
+                                       "the instance was reset but the '" +
+                                           std::string(portal->keyword) +
+                                           "' staging point cannot be worked out - " +
+                                           stageWhy +
+                                           ". Nothing is aimed anywhere; fix the portal's "
+                                           "areatrigger rows");
+                        return;
+                    }
+
+                    coord.stageX = stageX;
+                    coord.stageY = stageY;
+                    coord.stageZ = stageZ;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} inherited no staging point - the "
+                             "run before it was adopted rather than staged, which is the "
+                             "one path that carries none - so the '{}' point is derived "
+                             "now from areatrigger {} and the way out of areatrigger {}: "
+                             "({:.1f}, {:.1f}, {:.1f})",
+                             coord.runNumber, portal->keyword, portal->entryTriggerId,
+                             portal->exitTriggerId, coord.stageX, coord.stageY,
+                             coord.stageZ);
+                }
+
+                std::string aimTarget;
+                std::string aimWhy;
+                if (!DungeonStagingAim(*portal, coord, aimTarget, aimWhy))
+                {
+                    // Unreachable while the derivation above is the only way to
+                    // get here with a point - and said out loud rather than
+                    // assumed, because "unreachable" is what the old code
+                    // believed about three zeros reaching a travel errand.
+                    FailRunAtReset(coord, leaderName, members, *portal,
+                                   "the instance was reset but no staging aim can be "
+                                   "written - " + aimWhy);
+                    return;
+                }
 
                 // CLAIM, not a raw UPDATE: the run supersedes whatever the
                 // leader was doing, and taking the wheel also drops any errand
@@ -13739,7 +13920,7 @@ private:
                 // nowhere. See TravelAimBook. In a LOOP that argument stops
                 // being hypothetical: every run after the first aims at the
                 // identical string the previous run just finished with.
-                _travelAims.Claim(leaderName, aim.str());
+                _travelAims.Claim(leaderName, aimTarget);
 
                 coord.phase = DungeonRunPhase::Gathering;
                 coord.loggedGathering = false;
@@ -13748,7 +13929,7 @@ private:
                          "aimed at the staging point ({}); GATHERING begins {:.0f}y back "
                          "down the approach corridor from areatrigger {}",
                          coord.runNumber, coord.capKnown ? coord.runsWanted : 0,
-                         portal->insideMapId, leaderName, aim.str(),
+                         portal->insideMapId, leaderName, aimTarget,
                          DUNGEON_STAGING_STANDOFF_YARDS, portal->entryTriggerId);
                 return;
             }
@@ -14323,10 +14504,22 @@ private:
         // purpose: at 10 yards the leader is right there, so `follow` picks the
         // member up as the escort hands back, and the escort never has to end on
         // an arrival (which would idle it, see DriveTravel's escort branch).
-        std::ostringstream stageAim;
-        stageAim << "at:" << portal->outsideMapId << ':' << coord.stageX << ','
-                 << coord.stageY << ',' << coord.stageZ;
-        std::string const stageTarget = stageAim.str();
+        // AND IT IS BUILT THROUGH THE ONE FUNCTION THAT REFUSES AN UNRESOLVED
+        // POINT (#220), like the RESETTING aim above it. Nothing can reach
+        // BARRIER without passing through RESETTING, which now derives a point
+        // when it inherited none, so this refusal should be unreachable - and
+        // it is written anyway, because "unreachable" is precisely what was
+        // believed about the three zeros that got walked at. An escort is a
+        // character being sent somewhere; the check belongs at every place one
+        // is sent, not at the one place the destination was worked out.
+        std::string stageTarget;
+        std::string stageWhy;
+        if (!DungeonStagingAim(*portal, coord, stageTarget, stageWhy))
+        {
+            FailStaging(coord, leaderName, *portal, "BARRIER", stageWhy,
+                        IsDungeonJob(leaderJob));
+            return;
+        }
 
         std::vector<OverseerDecisions::DungeonRunMemberState> states;
         states.reserve(members.size());

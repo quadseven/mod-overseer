@@ -611,6 +611,115 @@ enum class DungeonApproach : std::uint8_t
 DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
                                       std::uint32_t portalOutsideMapId);
 
+// ------------------------------------------------- where the party waits --
+//
+// THE STAGING POINT'S ARITHMETIC, AND THE VERDICT ON WHAT IT PRODUCED.
+//
+// WHAT THIS IS FOR. The adapter derives the point the party gathers at from two
+// areatriggers: the door, and where the way back out lands. It reads both from
+// the world, and then does a normalise, a scale and two adds - none of which
+// needs a world at all. The world lookups stay in the adapter; the sums are
+// here, where a test can run them on the numbers a realm actually holds without
+// a realm.
+//
+// AND THE VERDICT IS THE HALF THAT MATTERS. Measured live: a run aimed its
+// leader at `at:1:0,0,0` and walked him at the middle of the map grid for the
+// length of its backstop. Nothing had gone wrong with the arithmetic - the
+// arithmetic never ran. The coordinator's three staging floats are zero
+// initialised, one path through the coordinator reached a staging aim without
+// ever asking for them to be filled in, and every consumer downstream happily
+// formatted the zeros into an errand because a float that was never set is
+// indistinguishable from a float that was set to zero.
+//
+// So "was this point ever resolved" is made a question with an answer, asked
+// where the point is USED rather than only where it is derived. A derivation
+// that is checked only at the point of derivation protects exactly the paths
+// that call the derivation, which is the set of paths that were never the
+// problem.
+enum class StagingPointVerdict : std::uint8_t
+{
+    // A real place on a real map, and the only verdict a staging aim may be
+    // built from.
+    Usable,
+    // The map origin. This is not a judgement about the ground there; it is the
+    // observation that three floats holding exactly zero are what "nobody has
+    // resolved this yet" looks like, and that no portal in this module's table
+    // has an approach corridor passing through the middle of its continent. A
+    // derivation that genuinely landed on the origin would be refused too, and
+    // that is the right trade: the sentinel reading is worth far more than the
+    // point.
+    //
+    // TESTED IN TWO DIMENSIONS, because every distance this module measures
+    // against a staging point is a 2D one (the barrier circle, the arrival
+    // check, the watchdog), so an x and y of zero is the sentinel whatever the
+    // z beside them says.
+    Unresolved,
+    // Outside the world grid entirely, or not a number at all. A NaN fails
+    // every comparison, so the bounds test below catches an arithmetic accident
+    // and an infinity by the same route it catches a coordinate that is simply
+    // impossible - and it catches the two sentinels a height query returns when
+    // it has nothing (-100000, -200000) without needing to name them.
+    OffTheMap,
+    // The door and the way-back-out landing point are the same place, so the
+    // vector between them names no direction to stand off along. Normalising it
+    // would be a divide by something near zero dressed up as a bearing.
+    NoApproachAxis,
+};
+
+// HOW FAR FROM THE MIDDLE OF A MAP THE WORLD GOES. WoW's terrain grid is 64 x 64
+// tiles of 533.33333 yards, so the coordinate space runs +/- 17066.666 about the
+// origin on both axes. Named here rather than passed in because it is a fact
+// about the coordinate system every one of these points lives in, not a tuning
+// knob a caller should get to disagree about.
+constexpr float MAP_EDGE_YARDS = 17066.666f;
+
+// The point, and what to think of it. `verdict` is the only field a caller may
+// act on first: the three floats are meaningful only when it is `Usable`, and
+// are left at zero otherwise so that a caller which ignores the verdict is
+// refused by the next check rather than handed a plausible-looking wrong place.
+struct StagingPoint
+{
+    StagingPointVerdict verdict{StagingPointVerdict::Unresolved};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// Is this a point a staging aim may be built from? Asked of three floats and
+// nothing else, so it can be asked at every place one is used.
+StagingPointVerdict StagingPointCheck(float x, float y, float z);
+bool StagingPointUsable(float x, float y, float z);
+
+// The refusal, in words, for the `why` an operator reads in the log. Kept apart
+// from the verdict for the reason DungeonRunBarrierBlockers already gives: a
+// pure function that also builds strings is a pure function that is harder to
+// test twice.
+std::string StagingPointRefusal(StagingPointVerdict verdict);
+
+// THE DERIVATION ITSELF. `door` is the entry areatrigger's own position;
+// `back` is where the exit areatrigger's teleport lands, which is a spot on the
+// outside map the game itself picked as standable ground in front of the
+// entrance. The vector between them is the approach corridor, measured by the
+// people who built the corridor, and the staging point is `standoffYards` back
+// down it from the door.
+//
+// The z returned is the landing point's own, which is real standable ground on
+// that map by construction. The adapter may refine it by asking the map for a
+// ground height and keeping the answer only if StagingGroundBelievable says so;
+// it has no better z to fall back to than this one.
+StagingPoint DungeonStagingPoint(float doorX, float doorY,
+                                 float backX, float backY, float backZ,
+                                 float standoffYards);
+
+// Is a height the map answered with believable for a point one short walk from
+// a doorway? A staging point that close to a door is on the same floor as that
+// door, so a reading tens of yards away from it is either a different surface -
+// the clifftop over a tunnel - or one of the sentinels a height query returns
+// when it has nothing. Both are answers to refuse rather than to walk at, and
+// refusing them by the same test is deliberate: it needs no separate list of
+// sentinel values to keep in step with a core.
+bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards);
+
 // THE CROSSING PREDICATES, KEPT FREE OF EVERY CORE TYPE FOR THE SAME REASON
 // THE BARRIER ONE IS. Nothing below touches Player, Map or PlayerbotAI, so
 // "when may the party be knocked through" can be exercised by a unit test
