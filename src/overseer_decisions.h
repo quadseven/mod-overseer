@@ -112,12 +112,168 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap);
 
-// A large measured separation is unsafe even when a misleading lower plane
-// reports a local polygon. This is the fail-closed backstop for geometry that
-// is technically navigable but clearly below the world surface.
+// A large measured separation over a reported local polygon. THIS IS A
+// DETECTOR AND NOT A LICENCE TO MOVE ANYBODY: what its caller does about a
+// true answer depends entirely on whether that polygon is there, and
+// TerrainRecoveryStep below owns that. Read its comment before changing this
+// one - it carries the live measurements showing that a bridge, an abbey roof
+// and a hidden lower terrain plane all produce the same number here, so the
+// number cannot be the thing that tells them apart.
 bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
                                        bool surfaceValid, bool hasLocalNavmesh,
                                        float overrideGap);
+
+// AND WHAT TO DO ABOUT IT, WHICH IS NOT "SEND IT TO THE LEADER'S BIND POINT".
+//
+// Measured on the dev world 2026-09-05, over 396 minutes of one worldserver:
+// 204 recoveries across the five family members, one every 1.9 minutes,
+// continuously, for the whole uptime. That is not a recovery. A remedy that
+// runs 204 times has fixed nothing 204 times, and the log said so every time
+// without anything noticing.
+//
+// WHAT THE READINGS ACTUALLY WERE. 79 of the 204 landed inside one 6-by-7
+// yard patch of the Northshire road at (-9057, -47, z 88.6), all five
+// characters, over six hours. The "surface" above them read 113.7 to 118.9 -
+// the arch they were walking under. One of the five was recovered at
+// (-10504.7, 1035.7, z 60.5) with a surface at z 97.9 ten seconds after the
+// module logged "sent to 'vendor' - creature 491 at 39 yards", and two
+// minutes later sold ten items to that same vendor: it was standing next to
+// the NPC it had been sent to, under the Sentinel Hill tower, on ground it
+// demonstrably could walk. Another was recovered at (-8905.6, -158.5, z 81.9)
+// with a surface at z 113.1, which is the abbey roof.
+//
+// SO THE SURFACE READING IS NOT THE FLOOR THIS CHARACTER FELL THROUGH. The
+// adapter probes from sixty yards ABOVE the character and searches the same
+// distance down, so what it finds is the highest geometry within sixty yards
+// OVERHEAD: a bridge deck, an abbey roof, a watchtower floor. A character
+// walking under any of those reads as thirty yards below the world.
+//
+// AND THE NAVMESH GUARD WAS BEING OVERRULED IN EXACTLY THE CASE IT EXISTS FOR.
+// LargeSurfaceMismatchNeedsRecovery fires on a large gap even when the
+// character's own position has a walkable polygon under it. In the live
+// distribution the vertical gaps were 2.3 recoveries per yard below the
+// 25-yard override and 31 per yard in the four yards above it - a cliff at the
+// threshold, not a distribution - which puts roughly 115 of the 204 in the
+// class "Detour said this character is standing on navigable ground and the
+// override moved it anyway". That is the false-positive guard being switched
+// off by the backstop that was meant to sit behind it.
+//
+// TWO THINGS FOLLOW, AND THEY ARE THE WHOLE OF THIS DECISION.
+//
+// FIRST: A LIVE LOCAL POLYGON IS AN ANSWER, NOT A HINT. If Detour finds
+// walkable ground at the character's own height, the character is standing on
+// walkable ground and whatever is overhead is architecture. Nothing about a
+// vertical gap can overturn that, because a bridge, a roof and a hidden lower
+// terrain plane all produce the same number. So this no longer moves such a
+// character at all. It says so once, loudly, and stops - which is the
+// fail-closed direction here, since the action under discussion is displacing
+// a character that may be perfectly fine.
+//
+// SECOND: WHEN THERE IS NO POLYGON, LIFT IT STRAIGHT UP. The adapter already
+// knows the height it needs and was printing it in every one of those 204
+// lines before discarding it: the surface is at the character's own x and y.
+// (x, y, surface + clearance) is the same place, on the ground, still on its
+// errand. The bind point instead displaced them 140 to 1,900 yards - the
+// measured party spread afterwards was 333 yards, it broke four dungeon
+// staging attempts that had already assembled, and it cleared the travel and
+// quest aims each time, which is a large silent undo repeated 204 times. It
+// also cannot converge: the leader's bind at (-8950, -132) is 140 yards from
+// the worst patch, and the median time for a character to walk back into the
+// condition after being sent there was FOURTEEN SECONDS.
+//
+// A LIFT IS FALSIFIABLE, WHICH IS THE REST OF THE VALUE. If it works, the
+// condition is false on the next poll. If it does not, the condition is true
+// again immediately and this says so, rather than a slow walk back disguising
+// a failed remedy as a fresh incident. That is what the attempt count below
+// is for: one lift, then the bind as the fallback of last resort, then a loud
+// give-up. Three actions, then silence, per episode. Never 204.
+enum class TerrainRemedy
+{
+    // Leave it where it is. Either nothing is wrong, or nothing this module
+    // may safely do about it is left.
+    Nothing,
+
+    // Straight up to `liftZ`, at the character's own x and y. Its errand,
+    // its aims and its party keep going.
+    LiftToSurface,
+
+    // The fallback of last resort, and the only remedy that displaces. For a
+    // lift that has already been tried and did not stick.
+    SendToBind,
+
+    // Say it once, loudly, and stop trying. A repeated identical condition is
+    // a bug in this rule or in the world, and either way silence is worse
+    // than one warning a person can go and look at.
+    GiveUp,
+};
+
+struct TerrainRecoveryVerdict
+{
+    TerrainRemedy remedy{TerrainRemedy::Nothing};
+    // Where a lift goes. Meaningful only for LiftToSurface, and never a
+    // sentinel: it is only ever computed from a surface reading the caller
+    // declared valid.
+    float liftZ{0.f};
+};
+
+// The tunables, in one constant a reader can take in at once, following
+// RatchetLimits below. The two gaps are the ones the two predicates above
+// already take; the caller passes what it always passed.
+struct TerrainRecoveryLimits
+{
+    float minimumGap{0.f};    // BelowTerrainNeedsRecovery's gap
+    float overrideGap{0.f};   // LargeSurfaceMismatchNeedsRecovery's gap
+    float liftClearance{0.f}; // how far above the surface a lift lands
+    // HOW LONG A CHARACTER HAS TO BE FINE BEFORE THE NEXT OCCURRENCE COUNTS
+    // AS A NEW EPISODE. Without this the memory is useless: the condition
+    // goes false the instant the character is moved, so a streak that reset
+    // on the first clean poll would reset every time and the ladder would
+    // never climb past its first rung. The measured walk-back was fourteen
+    // seconds and the median interval between one character's recoveries was
+    // seven to nine minutes, so this has to be minutes, not seconds. ZERO
+    // DISABLES THE MEMORY and makes every occurrence a first one, which is
+    // the old unbounded behaviour and is offered only so a caller can say so
+    // deliberately rather than by passing a number that looks like a bound.
+    time_t forgetSeconds{0};
+};
+
+// What one character's terrain recovery remembers between polls. Kept inside
+// the adapter's own per-character state, world-thread only and unguarded, like
+// RatchetState and the give refusals: losing it on a restart costs one extra
+// lift and no correctness.
+struct TerrainRecoveryState
+{
+    // Remedies applied in the current unbroken episode. This is the bound.
+    unsigned attempts{0};
+    // The "it is standing on a live polygon under a roof" warning, said once
+    // per episode. DELIBERATELY NOT A RUNG ON THE LADDER above: nothing was
+    // tried, so nothing should be crossed off. A character warned about
+    // walking under an arch that then really does fall through the world a
+    // minute later still gets the lift first, rather than being handed the
+    // fallback because a warning had used the lift's turn.
+    bool saidOnGround{false};
+    // When this episode was last touched by either of those; 0 = no memory.
+    time_t lastAttempt{0};
+};
+
+// One poll, for one character. Reads the two predicates above for the
+// condition and this character's own history for the remedy, and updates that
+// history in place.
+//
+// `hasLocalNavmesh` IS ASKED AT THE CHARACTER'S OWN HEIGHT by the adapter, and
+// that is worth knowing when reading the branch it drives: a character that
+// really is below the world will find no polygon there, so a false is only
+// weak evidence of trouble and can be self-confirming. It is the TRUE answer
+// that carries weight, because a polygon found at the character's own feet is
+// a positive statement about where those feet are. This function is built the
+// way round that fact allows: true is trusted and never overruled, false only
+// opens the bounded ladder rather than authorizing a displacement outright.
+TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
+                                           float currentZ, float surfaceAboveZ,
+                                           bool surfaceValid,
+                                           bool hasLocalNavmesh,
+                                           TerrainRecoveryLimits const& limits,
+                                           time_t now);
 
 // A VERTICAL GAP IS A STEP'S BUSINESS, NOT AN ERRAND'S.
 //

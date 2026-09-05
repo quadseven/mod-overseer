@@ -124,6 +124,77 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= overrideGap;
 }
 
+TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
+                                           float currentZ, float surfaceAboveZ,
+                                           bool surfaceValid,
+                                           bool hasLocalNavmesh,
+                                           TerrainRecoveryLimits const& limits,
+                                           time_t now)
+{
+    // The condition is exactly what the adapter asked before: the two
+    // predicates above, unchanged, in the same order. Only what happens next
+    // is new.
+    bool const holds =
+        BelowTerrainNeedsRecovery(currentZ, surfaceAboveZ, surfaceValid,
+                                  hasLocalNavmesh, limits.minimumGap) ||
+        LargeSurfaceMismatchNeedsRecovery(currentZ, surfaceAboveZ, surfaceValid,
+                                          hasLocalNavmesh, limits.overrideGap);
+
+    if (!holds)
+    {
+        // A CLEAN POLL IS NOT THE END OF AN EPISODE. Every remedy makes the
+        // condition false for at least one poll - that is what a remedy is -
+        // so forgetting here would forget the attempt that just happened and
+        // hand the next occurrence a fresh first rung, forever. The episode
+        // ends when the character has been fine for `forgetSeconds`, and a
+        // zero forget means the caller asked for no memory at all.
+        if ((state.attempts || state.saidOnGround) && limits.forgetSeconds > 0 &&
+            now - state.lastAttempt < limits.forgetSeconds)
+            return TerrainRecoveryVerdict{};
+        state = TerrainRecoveryState{};
+        return TerrainRecoveryVerdict{};
+    }
+
+    if (hasLocalNavmesh)
+    {
+        // DETOUR FOUND WALKABLE GROUND AT THIS CHARACTER'S OWN FEET, so it is
+        // standing on walkable ground and the gap above it is a roof. Nothing
+        // gets moved here. The one warning is still worth making, because a
+        // large gap over a live polygon is either architecture (and this rule
+        // should stop asking about that place) or a misleading lower plane
+        // (and a person needs to go and look). Silence would be the answer to
+        // neither.
+        state.lastAttempt = now;
+        if (state.saidOnGround)
+            return TerrainRecoveryVerdict{};
+        state.saidOnGround = true;
+        return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
+    }
+
+    // NO POLYGON. The ladder, and it is short on purpose: the failure this
+    // replaces was an unbounded series, so the bound is the fix and not a
+    // tuning knob. `surfaceValid` is already true here - neither predicate
+    // above returns true without it - so the lift height is a real reading
+    // and never a sentinel.
+    state.lastAttempt = now;
+    switch (state.attempts)
+    {
+        case 0:
+            state.attempts = 1;
+            return TerrainRecoveryVerdict{TerrainRemedy::LiftToSurface,
+                                          surfaceAboveZ + limits.liftClearance};
+        case 1:
+            state.attempts = 2;
+            return TerrainRecoveryVerdict{TerrainRemedy::SendToBind, 0.f};
+        case 2:
+            state.attempts = 3;
+            return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
+        default:
+            // Said and done. Staying quiet is the point of this rung.
+            return TerrainRecoveryVerdict{};
+    }
+}
+
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap)
 {
