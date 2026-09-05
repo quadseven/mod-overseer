@@ -5765,6 +5765,15 @@ private:
             if (!(npcFlags & wanted))
                 continue;
 
+            // The world database marks the Dungeon Finder TAR pedestals as
+            // vendors so the client can open their synthetic menus. They are
+            // not physical shops and have no sale interaction. Indexing one
+            // sends a travel errand onto the broken pedestal geometry instead
+            // of to a real town vendor.
+            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) &&
+                std::string(creatureTemplate->Name).rfind("[DND] TAR Pedestal", 0) == 0)
+                continue;
+
             TravelSpawn spawn;
             spawn.entry = data.id;
             spawn.mapId = data.mapid;
@@ -16662,6 +16671,7 @@ private:
         bool operator()(Creature* creature) const
         {
             return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR)
+                && std::string(creature->GetName()).rfind("[DND] TAR Pedestal", 0) != 0
                 && from->IsWithinDistInMap(creature, range);
         }
     };
