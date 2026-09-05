@@ -14225,13 +14225,25 @@ private:
             // portal rows carrying no corridor the point is the staging point
             // and this is bit-for-bit the check #228 wrote.
             //
-            // It matters because of where the party ends up when this fires.
-            // They stop ON THE RIM, which is Overhead of the door - so without
-            // this the run would be refused for as long as they stood there,
-            // and the corridor that exists to get them off it would never be
-            // walked. The state is a scratch one: IDLE is deciding whether to
-            // open a run, not walking a leg, and marking the run's own corridor
-            // passed before the run exists is exactly the drift #220 is about.
+            // WHAT IT IS WORTH, MEASURED. On the plateau 300 yards south of
+            // the ravine the door reads Overhead at 131 out and 76 up, so a run
+            // asked for from there is refused today; the corridor's start from
+            // the same spot reads Closing at 243 out and 26 up. The same holds
+            // from the plateau north of it and from the surface camp. Those are
+            // runs that can be walked and were being turned down.
+            //
+            // AND WHAT IT IS NOT WORTH, WHICH MATTERS JUST AS MUCH. From the
+            // rim itself the corridor is Overhead too - 105 yards down over 79
+            // along, and that holds for all 76 walkable samples matching the
+            // live stall shape. A party standing where they stopped is still
+            // held, and should be: there is no walk off that rim either. They
+            // are on their ordinary drives while this holds, so they move, and
+            // the run opens from the plateau. This does not rescue a party
+            // already on the rim and must not be read as doing so.
+            //
+            // The state is a scratch one: IDLE is deciding whether to open a
+            // run, not walking a leg, and marking the run's own corridor passed
+            // before the run exists is exactly the drift #220 is about.
             {
                 OverseerDecisions::ApproachRouteState scratch;
                 DungeonApproachAim const first = DungeonApproachAimFor(
