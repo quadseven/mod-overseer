@@ -140,6 +140,87 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap);
 
+// A ROUTE MUST END WHERE IT WAS ASKED TO END.
+//
+// PathGenerator answers an unreachable point with the NEAREST POLYGON it could
+// find, and hands that back as a path rather than as a refusal. So a caller
+// that treats "a path came back" as "there is a way there" has been told
+// something the pathfinder never said. The route check has to ask a second
+// question of its own: did the route it was handed actually finish at the
+// height that was requested?
+//
+// Observed on the dev world 2026-09-05: the five family members were walking
+// Redridge roads near z 100 while their routed aims came back at z 242, 262
+// and 303. Each of those was accepted as a real route, walked up the mountain
+// it named, and ended in a fall. The operator watched one of the five die that
+// way. A route that misses by a hundred and forty yards of height is not a
+// route to the place asked for; it is the mesh's best guess at the nearest
+// place it could reach, and walking it is walking up a peak.
+//
+// THE TOLERANCE IS A DISTANCE, so a negative one is not a stricter rule but a
+// nonsense one: nothing is within a negative distance of anything. Reading it
+// through an absolute value would quietly turn a sign typo into a rule LOOSER
+// than the one written, which is the failure mode this whole predicate exists
+// to close. It is refused instead, and a refused tolerance refuses the route,
+// so the caller falls through to whatever it already does when a route is not
+// trusted rather than proceeding on a number nobody meant.
+//
+// Plain floats and not a position type, because these two files know nothing
+// about the core's geometry classes and must not start now. The adapter
+// unpacks the routed endpoint and passes the two heights.
+bool TravelEndpointWithinTolerance(float routedEndZ, float requestedZ,
+                                   float toleranceYards);
+
+// AND THE WHOLE VERDICT ON A ROUTE, WHICH IS WHY INCOMPLETE IS NOT AN INPUT.
+//
+// mod-overseer#203 refused every path carrying PATHFIND_INCOMPLETE. That flag
+// does not mean what the name suggests. The pinned core sets it in exactly one
+// place for the ordinary case (PathGenerator.cpp:604-611): the last polygon of
+// the corridor is not the destination's polygon. Two completely different
+// things arrive under that one flag.
+//
+//   TRUNCATED, AND HEADING THE RIGHT WAY. The corridor hit MAX_PATH_LENGTH, so
+//   the route was cut off partway and the rest will be found on the next ask
+//   from further along. The core leaves the actual end position alone here: it
+//   is still the place that was requested.
+//
+//   MOVED, BECAUSE THE PLACE ASKED FOR COULD NOT BE REACHED. The core
+//   substitutes the closest point it could get to and SAYS SO, by calling
+//   SetActualEndPosition with it (PathGenerator.cpp:344-352, and again at :676
+//   when a climb was refused as too steep).
+//
+// Refusing both cost the family every long walk. Measured after #210 was
+// deployed: three characters were sent 455, 510 and 1,040 yards, got no route
+// at all because a route that long is always truncated, fell through to the
+// short-step fan, and had every bearing refused by the footing check in city
+// geometry. They stood still.
+//
+// So completeness is the wrong question and the core has already answered the
+// right one. ASK WHERE THE PATHFINDER SAYS YOU WILL ACTUALLY END UP, which is
+// GetActualEndPosition, and compare its height to the height asked for. A
+// truncated route passes, because its actual end IS the destination. A
+// substituted route is caught, because its actual end is the mountain shoulder
+// the mesh settled for. That is the same pairing the core itself uses in
+// PathGenerator::IsInvalidDestinationZ (PathGenerator.cpp:1230-1233), which
+// measures GetActualEndPosition against a five-yard bound.
+//
+// WHAT IS STILL REFUSED OUTRIGHT, because no amount of walking improves it:
+//
+//   noRouteAtAll  - PATHFIND_NOPATH. There is no route and there was no error
+//                   in saying so.
+//   endIsOffTheMesh - PATHFIND_FARFROMPOLY_END, which the core sets when the
+//                   requested end is more than seven yards from any polygon
+//                   (PathGenerator.cpp:301). That is not a route to refine, it
+//                   is an aim inside a rock or over a hole, and it stays in the
+//                   rejection mask on purpose: it is a fact about the PLACE
+//                   ASKED FOR rather than about the height a route reached, so
+//                   folding it into the tolerance would lose it.
+//   tooFewPoints  - two points or fewer is a straight line the core built by
+//                   BuildShortcut, not a route over the mesh.
+bool RoutedPathGoesWhereAsked(bool noRouteAtAll, bool endIsOffTheMesh,
+                              bool tooFewPoints, float actualEndZ,
+                              float requestedZ, float toleranceYards);
+
 
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).
 //
