@@ -1139,6 +1139,21 @@ constexpr uint32 DUNGEON_RUN_POLL_MS = 5000;
 // above), so this is that consensus number, not a measurement.
 constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
 
+// AND THE OTHER TWO DIMENSIONS OF IT (#217). The radius above is a circle drawn
+// on a map, and for the whole of this module's life it was the entire content
+// of "at the staging point" - which is why a character ten yards out and a
+// hundred and fifty yards up a cliff satisfied it.
+//
+// NO NEW NUMBER IS INTRODUCED HERE, and that is the point. The two beside the
+// radius are TRAVEL_STEP_YARDS and TRAVEL_STEP_VERTICAL_YARDS, unchanged, which
+// are the module's only measured statement about how much height walking
+// absorbs per yard of ground - sixty along for twenty up. ApproachShapeOf reads
+// them as a gradient and applies it over the distance that remains, so the
+// approach rule and the step bound that ends it are one rule at two scales
+// rather than two opinions about one cliff. See ApproachLimits.
+constexpr OverseerDecisions::ApproachLimits DUNGEON_APPROACH_LIMITS{
+    DUNGEON_BARRIER_RADIUS_YARDS, TRAVEL_STEP_YARDS, TRAVEL_STEP_VERTICAL_YARDS};
+
 // THE STAGING WATCHDOG'S TWO NUMBERS (#164). Both are taken off measurements
 // this module already made rather than chosen for feel, and both are written
 // down here with what they were taken from.
@@ -12154,6 +12169,13 @@ private:
         // exactly the behaviour wanted, since a run that DID start is a run
         // whose approach was walkable.
         bool loggedApproachRefused{false};
+        // AND THE SAME DISCIPLINE FOR THE OTHER REFUSAL (#217), which is said
+        // about a place rather than about a map. Unlike the one above this is
+        // NOT a standing fact - a leader that walks off the ridge is a leader
+        // the run may open for - so it is cleared as soon as the approach reads
+        // walkable again, and the line can therefore be said once per episode
+        // rather than once per coordinator.
+        bool loggedAboveTheDoor{false};
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
@@ -12453,27 +12475,22 @@ private:
     // reading (DistanceToTarget, because a staged member IS being sent
     // somewhere) and the reaction, which is the only part any of those five
     // sites ever had of its own.
-    void RunStagingWatchdog(DungeonRunCoordinatorState& coord, std::string const& name,
-                            Player* member,
-                            OverseerDecisions::DungeonRunMemberState const& state)
+    // RETURNS TRUE WHEN THE RUN MUST BE CLOSED (#217), which is the one verdict
+    // this cannot act on by itself: only the caller knows which phase it is in
+    // and which character is the leader the run is accounted against. Every
+    // other rung is a correction applied here and nowhere else, exactly as
+    // before.
+    bool RunStagingWatchdog(DungeonRunCoordinatorState& coord, std::string const& name,
+                            Player* member, OverseerDecisions::ApproachGap const& gap)
     {
-        // A STAGED MEMBER IS NOT WATCHED, AND ITS LADDER GOES WITH IT. Inside
-        // the barrier radius there is nothing left to close. The leader in
-        // particular is HELD there on purpose - BARRIER escorts him at any
-        // distance, including none, so that his own `new rpg` cannot go idle
-        // and wander off while the stragglers arrive - and a watchdog that
-        // measured him would find a character that never gets nearer, because
-        // it is already there, and start correcting the one member doing
-        // exactly what was asked. Erased rather than merely skipped, so a
-        // member that arrives, drifts back out and returns is watched from the
-        // bottom of the ladder rather than from the rung its last bad patch
-        // reached.
-        if (state.distanceFromStage >= 0.f &&
-            state.distanceFromStage <= DUNGEON_BARRIER_RADIUS_YARDS)
-        {
-            coord.staging.erase(name);
-            return;
-        }
+        // ARRIVAL IS NO LONGER DECIDED HERE, and its move into the decision is
+        // the fix rather than tidying (#217). This used to drop the state of
+        // anybody inside a flat ten-yard circle, so a character ten yards out
+        // and a hundred and fifty yards up a cliff was exempted from being
+        // watched at all - the one member most in need of it. StagingWatchdog
+        // now asks ApproachShapeOf and resets the state in place, which is the
+        // same fresh-ladder-on-arrival behaviour with the right test in front
+        // of it.
 
         // WHEN THIS POLL'S DISTANCE IS NOT A READING ABOUT WALKING. A fight is
         // a pause and not a stall. A taxi leg routinely goes the wrong way
@@ -12486,18 +12503,24 @@ private:
         // it, so none of them can spend a rung of the ladder.
         //
         // IsInFlight  Unit.h:1709  bool IsInFlight() const
-        bool const measurable = state.seen && state.alive && !state.inCombat &&
-                                state.distanceFromStage >= 0.f && !member->IsInFlight();
+        // IsAlive  Unit.h:1793  bool IsAlive() const
+        // IsInCombat  Unit.h:936  bool IsInCombat() const
+        bool const measurable = gap.measured && member->IsAlive() &&
+                                !member->IsInCombat() && !member->IsInFlight();
+
+        // The gap in whole yards, for every line below. Read once so the
+        // corrections and the diagnosis quote the same numbers.
+        std::string const where = OverseerDecisions::ApproachWhere(gap);
 
         OverseerDecisions::StagingStallState& stall = coord.staging[name];
         OverseerDecisions::StagingNudge const nudge = OverseerDecisions::StagingWatchdog(
-            stall, state.distanceFromStage, measurable, std::time(nullptr),
-            DUNGEON_STAGING_RATCHET);
+            stall, gap, measurable, std::time(nullptr), DUNGEON_STAGING_RATCHET,
+            DUNGEON_APPROACH_LIMITS);
 
         switch (nudge)
         {
             case OverseerDecisions::StagingNudge::Nothing:
-                return;
+                return false;
 
             case OverseerDecisions::StagingNudge::Restrategy:
             {
@@ -12509,18 +12532,17 @@ private:
                 // the live list and, usually, no write at all.
                 std::string const took = AssertTravelFocus(name);
                 LOG_WARN("module.overseer",
-                         "overseer: dungeon run BARRIER - '{}' has got no nearer than {} "
-                         "yards to the staging point for {} seconds and is {} yards out. "
+                         "overseer: dungeon run staging - '{}' has got no nearer than {} "
+                         "yards to the staging point for {} seconds and is {}. "
                          "Correction 1 of {}: re-asserting the escort's own strategy set "
                          "- {}",
                          name, static_cast<uint32>(stall.progress.best),
-                         static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS),
-                         static_cast<uint32>(state.distanceFromStage),
+                         static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS), where,
                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS),
                          took.empty() ? std::string("nothing had come back on, so this "
                                                     "is not what is holding it")
                                       : ("took " + took + " back off it"));
-                return;
+                return false;
             }
 
             case OverseerDecisions::StagingNudge::Reaim:
@@ -12532,13 +12554,13 @@ private:
                 // is the one caller that knows better; see TravelState::reissue.
                 _travelAims.StateFor(name).reissue = true;
                 LOG_WARN("module.overseer",
-                         "overseer: dungeon run BARRIER - '{}' is still {} yards out and "
+                         "overseer: dungeon run staging - '{}' is still {} and "
                          "no nearer. Correction 2 of {}: the walk is handed to it again "
                          "on the next travel poll, over the guard that would otherwise "
                          "read its own stale state as proof it is already walking",
-                         name, static_cast<uint32>(state.distanceFromStage),
+                         name, where,
                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS));
-                return;
+                return false;
             }
 
             case OverseerDecisions::StagingNudge::ClearMovement:
@@ -12554,13 +12576,13 @@ private:
                 // (Unit.h:1758, public from Unit.h:666).
                 member->GetMotionMaster()->Clear();
                 LOG_WARN("module.overseer",
-                         "overseer: dungeon run BARRIER - '{}' is still {} yards out and "
+                         "overseer: dungeon run staging - '{}' is still {} and "
                          "no nearer. Correction 3 of {}: clearing its movement so the "
                          "next tick starts fresh, the same recovery the follow drive uses "
                          "for a follower jittering in place",
-                         name, static_cast<uint32>(state.distanceFromStage),
+                         name, where,
                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS));
-                return;
+                return false;
             }
 
             case OverseerDecisions::StagingNudge::GiveUp:
@@ -12575,20 +12597,55 @@ private:
                 // operator, who now has one line naming the character, the gap
                 // and everything that was tried.
                 LOG_ERROR("module.overseer",
-                          "overseer: dungeon run BARRIER cannot stage '{}' - {} yards from "
+                          "overseer: dungeon run staging cannot stage '{}' - {} from "
                           "the staging point, no nearer for {} minutes, and all {} "
                           "corrections have been tried and made no difference. Nothing "
                           "further will be attempted for it; the errand's own {}-minute "
                           "unreachable backstop bounds the aim and the run's own timeout "
                           "owns the run",
-                          name, static_cast<uint32>(state.distanceFromStage),
+                          name, where,
                           static_cast<uint32>(
                               (OverseerDecisions::STAGING_NUDGE_STEPS + 1) *
                               DUNGEON_STAGING_STALL_SECONDS / 60),
                           static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS),
                           static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
-                return;
+                return false;
+
+            case OverseerDecisions::StagingNudge::Stranded:
+                // ABOVE THE DOOR AND NO LONGER COMING DOWN (#217). This is the
+                // one verdict that is not a correction, because none of the
+                // three could touch it: the character is not short of the
+                // staging point, it is over it, and the way in is a route round
+                // rather than a step toward. Said in full here - the caller
+                // gets a bool and closes the run - because this is where the
+                // numbers are.
+                //
+                // AND SAYING IT AT NINETY SECONDS RATHER THAN AT TWELVE MINUTES
+                // IS THE SAFETY HALF. A party held at the top of a drop by an
+                // aim it cannot satisfy is a party standing next to a fall:
+                // six of the six deaths measured on the Wailing Caverns
+                // approach were falls, all five characters, one of them twice
+                // inside a minute, with the last step's footing refusal firing
+                // throughout. Closing the run releases the aim, so nothing is
+                // pulling anybody at the edge while the operator reads this.
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run staging - '{}' is {}, and has got no "
+                          "nearer for {} seconds. That is ABOVE the staging point rather "
+                          "than near it: the height left is more than the ground left "
+                          "could absorb at the gradient a walking step manages ({:.0f}y "
+                          "up for every {:.0f}y along), so every direction that closes "
+                          "the gap steps off something and the last-step footing check "
+                          "refuses all of them. No correction reaches this - the route is "
+                          "wrong, not the walking - so none is spent on it and the run is "
+                          "closed rather than held here for the rest of its {}-minute "
+                          "backstop",
+                          name, where,
+                          static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS),
+                          TRAVEL_STEP_VERTICAL_YARDS, TRAVEL_STEP_YARDS,
+                          static_cast<uint32>(DUNGEON_STAGING_BACKSTOP_SECONDS / 60));
+                return true;
         }
+        return false;
     }
 
     // ---- the mechanical half of a crossing, shared by ENTER and EXIT ----
@@ -13249,6 +13306,51 @@ private:
                         stillWanted);
     }
 
+    // THE SAME CLOSING, FOR A RUN THAT DOES NOT NEED THE REST OF ITS CLOCK
+    // (#217).
+    //
+    // WHY IT IS A SECOND FUNCTION AND NOT A FLAG ON THE ONE ABOVE. That one's
+    // whole sentence is "it held for over twelve minutes", which is the
+    // evidence it closes on. This closes on evidence of a different kind - the
+    // approach is a cliff and a member on it has stopped descending - and
+    // writing that as a variant of a timeout message would put a number in the
+    // run row that never elapsed. The outcome word is deliberately the SAME
+    // (`staging_failed`): the accounting question "did this run get staged" has
+    // one answer, and splitting the vocabulary would make every query about it
+    // need to know about cliffs.
+    //
+    // AND FAILING EARLY IS THE POINT RATHER THAN A SIDE EFFECT. The alternative
+    // is what was measured: five characters left standing on a rim for the rest
+    // of a twelve-minute backstop, printing a line that reads like progress,
+    // beside a drop that killed all five of them in six minutes. A closed run
+    // releases the leader's aim, so nothing is pulling anybody toward the edge;
+    // the next poll re-opens from wherever they now are, and the approach check
+    // in IDLE refuses to re-open at all while the leader is still above the
+    // door. The campaign's own cap bounds the repeat, exactly as it does for
+    // every other closing reason.
+    void FailApproach(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                      DungeonPortal const& portal, char const* phase,
+                      std::string const& blockers, bool stillWanted)
+    {
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} cannot be staged in {} - {} "
+                  "is above the '{}' staging point rather than near it, and has stopped "
+                  "getting nearer. The run is CLOSED now rather than at the {}-minute "
+                  "backstop: no correction this module has can move a cliff, and holding "
+                  "a party at the top of one is how every member of it died of a fall on "
+                  "this approach. Closing releases the aim, so nothing keeps them at the "
+                  "edge",
+                  coord.runNumber, coord.campaignId, phase, blockers, portal.keyword,
+                  static_cast<uint32>(DUNGEON_STAGING_BACKSTOP_SECONDS / 60));
+        EndRunAndDecide(coord, leaderName, portal,
+                        coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
+                        "staging_failed",
+                        std::string(phase) +
+                            " was refused: the party is above the staging point, not "
+                            "near it, and has stopped descending - " + blockers,
+                        stillWanted);
+    }
+
     // THE END OF A RUN, AND THE DECISION TO GO AGAIN.
     //
     // Every path that used to say "the run is over, returning to IDLE" comes
@@ -13664,6 +13766,64 @@ private:
                 return;
             }
 
+            // AND IS THE LEADER ABOVE THAT POINT RATHER THAN NEAR IT? ASKED
+            // HERE FOR EXACTLY THE REASON THE MAP CHECK ABOVE IS (#217).
+            //
+            // WHAT HAPPENS WITHOUT IT. Everything past this line is paid for:
+            // RESETTING throws away the instance the party is bound to,
+            // GATHERING claims the leader's aim and supersedes whatever he was
+            // doing, and the whole assembly then runs on
+            // DUNGEON_STAGING_BACKSTOP_SECONDS. Opening a run for a leader
+            // standing on the rim above the door spends all of that and cannot
+            // work - every direction that reduces his distance goes off a
+            // cliff, GroundedStep correctly refuses to take him off it, and the
+            // run ends twelve minutes later having moved nobody.
+            //
+            // AND THE COST IS NOT ONLY TIME. Six of the six deaths on the
+            // Wailing Caverns approach were falls, all five characters, one of
+            // them twice inside a minute, while the last step's own footing
+            // refusal was firing throughout. A party held on a clifftop by an
+            // aim it cannot satisfy is a party being kept somewhere dangerous.
+            // Not opening the run leaves nothing pulling them at the edge.
+            //
+            // IT IS A REFUSAL RATHER THAN A ROUTE, on the same terms as the map
+            // one: the honest fix is a way round, and there is no navmesh query
+            // in this module to find one with. What this does is decline to
+            // spend a run - and five characters - on an approach that is known
+            // in advance not to be one.
+            //
+            // SAID ONCE PER EPISODE AND THEN CLEARED. The leader is on his
+            // ordinary drives while this holds, so he moves; the moment the
+            // approach reads walkable the flag is dropped and the run opens on
+            // that same poll.
+            {
+                OverseerDecisions::ApproachGap gap;
+                gap.horizontalYards = leader->GetDistance2d(stageX, stageY);
+                gap.verticalYards = leader->GetPositionZ() - stageZ;
+                gap.measured = true;
+                if (OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) ==
+                    OverseerDecisions::ApproachShape::Overhead)
+                {
+                    if (!coord.loggedAboveTheDoor)
+                    {
+                        coord.loggedAboveTheDoor = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run held - the '{}' staging point is "
+                                 "({:.1f}, {:.1f}, {:.1f}) and the leader '{}' is {}. That "
+                                 "is above it, not near it: no walk toward it from there "
+                                 "descends, and the last-step footing check would refuse "
+                                 "every direction that closed the gap. Nothing is reset, "
+                                 "aimed or moved, so nothing holds the party at the edge; "
+                                 "the run opens on the first poll the leader is somewhere "
+                                 "the approach can be walked from",
+                                 portal->keyword, stageX, stageY, stageZ, leaderName,
+                                 OverseerDecisions::ApproachWhere(gap));
+                    }
+                    return;
+                }
+                coord.loggedAboveTheDoor = false;
+            }
+
             // THERE IS NO `loggedCampaignOver = false` BETWEEN THE TWO STOP
             // CONDITIONS, AND ITS ABSENCE IS THE FIX. Clearing the flag here
             // re-armed the SECOND condition on every poll:
@@ -14061,6 +14221,23 @@ private:
             // the run is walking.
             AssertTravelFocus(leaderName);
 
+            // WHERE THE LEADER STANDS, IN BOTH DIMENSIONS THAT MATTER (#217).
+            // Resolved once here because the backstop's reason, the arrival
+            // test and the watchdog below all need the same answer, and three
+            // readings taken separately are three chances to disagree.
+            //
+            // GetMapId  Position.h:281  uint32 GetMapId() const
+            // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+            // GetPositionZ  Position.h:120  float GetPositionZ() const
+            bool const onTheOutsideMap = leader->GetMapId() == portal->outsideMapId;
+            OverseerDecisions::ApproachGap gap;
+            if (onTheOutsideMap)
+            {
+                gap.horizontalYards = leader->GetDistance2d(coord.stageX, coord.stageY);
+                gap.verticalYards = leader->GetPositionZ() - coord.stageZ;
+                gap.measured = true;
+            }
+
             // AND GATHERING IS BOUNDED (#165). It had no bound of its own at
             // all: it returns and waits until the leader arrives, and if his
             // errand is released as unreachable by the travel backstop he never
@@ -14070,26 +14247,50 @@ private:
             if (coord.stagingSince && std::time(nullptr) - coord.stagingSince >
                                           DUNGEON_STAGING_BACKSTOP_SECONDS)
             {
+                // AND THE REASON NAMES THE CAUSE (#217). This used to read
+                // "924y from the staging point", which is the symptom: a reader
+                // cannot tell a leader who never set off from one standing on
+                // the rim above the door. ApproachWhere carries the height, so
+                // the two look different in the log because they are different.
                 std::string const where =
-                    leader->GetMapId() != portal->outsideMapId
-                        ? "on map " + std::to_string(uint32(leader->GetMapId())) +
-                              " rather than map " + std::to_string(portal->outsideMapId)
-                        : std::to_string(static_cast<uint32>(leader->GetDistance2d(
-                              coord.stageX, coord.stageY))) +
-                              "y from the staging point";
+                    onTheOutsideMap
+                        ? OverseerDecisions::ApproachWhere(gap) + " from the staging point"
+                        : "on map " + std::to_string(uint32(leader->GetMapId())) +
+                              " rather than map " + std::to_string(portal->outsideMapId);
                 FailStaging(coord, leaderName, *portal, "GATHERING",
                             leaderName + " (" + where + ")", IsDungeonJob(leaderJob));
                 return;
             }
 
-            // GetMapId  Position.h:281  uint32 GetMapId() const
-            // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
-            if (leader->GetMapId() != portal->outsideMapId)
+            if (!onTheOutsideMap)
                 return;  // still travelling, or on a different map entirely - keep waiting
 
-            float const distance = leader->GetDistance2d(coord.stageX, coord.stageY);
-            if (distance > DUNGEON_BARRIER_RADIUS_YARDS)
+            // ARRIVED IS A THREE-DIMENSIONAL FACT (#217). This was
+            // `distance <= DUNGEON_BARRIER_RADIUS_YARDS`, which a leader ten
+            // yards out and a hundred and fifty yards up a cliff satisfied - so
+            // the phase could advance from a ledge and BARRIER then waited for a
+            // party to assemble somewhere it could not leave.
+            OverseerDecisions::ApproachShape const shape =
+                OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS);
+            if (shape != OverseerDecisions::ApproachShape::Arrived)
+            {
+                // AND GATHERING FINALLY WATCHES THE ONE CHARACTER IT IS WAITING
+                // FOR (#217). It never did: it returned and waited, so a leader
+                // that stopped getting nearer was indistinguishable from one
+                // still walking until the twelve minutes were spent. BARRIER
+                // has had this ladder since #164 and the leader is on the
+                // identical aim in both phases; the only reason it was not here
+                // is that nobody had asked the question in this phase.
+                //
+                // The state lives in the same per-member map BARRIER uses, and
+                // BARRIER clears it on entry, so a fresh ladder starts there.
+                if (RunStagingWatchdog(coord, leaderName, leader, gap))
+                    FailApproach(coord, leaderName, *portal, "GATHERING",
+                                 leaderName + " (" + OverseerDecisions::ApproachWhere(gap) +
+                                     " from the staging point)",
+                                 IsDungeonJob(leaderJob));
                 return;
+            }
 
             coord.phase = DungeonRunPhase::Barrier;
             coord.loggedBarrierWaiting = false;
@@ -14097,10 +14298,11 @@ private:
             // yet, nobody on the ladder.
             coord.staging.clear();
             LOG_INFO("module.overseer",
-                     "overseer: '{}' reached the staging point ({:.0f}y out) - GATHERING "
+                     "overseer: '{}' reached the staging point ({}) - GATHERING "
                      "done, BARRIER holds until the whole roster is alive, out of combat "
-                     "and within {:.0f}y",
-                     leaderName, distance, DUNGEON_BARRIER_RADIUS_YARDS);
+                     "and within {:.0f}y of it on the same surface",
+                     leaderName, OverseerDecisions::ApproachWhere(gap),
+                     DUNGEON_BARRIER_RADIUS_YARDS);
             return;
         }
 
@@ -14644,8 +14846,18 @@ private:
             state.inside = member->GetMapId() == portal->insideMapId;
             // GetMapId  Position.h:281  uint32 GetMapId() const
             if (member->GetMapId() == portal->outsideMapId)
+            {
                 // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
                 state.distanceFromStage = member->GetDistance2d(coord.stageX, coord.stageY);
+                // AND HOW FAR ABOVE OR BELOW IT (#217). Taken here, beside the
+                // reading it qualifies, so the two can never be measured from
+                // different polls. Ten yards out and a hundred and fifty yards
+                // up is what a member on the ridge above the door reads, and
+                // the line above on its own called that an arrival.
+                //
+                // GetPositionZ  Position.h:120  float GetPositionZ() const
+                state.verticalFromStage = member->GetPositionZ() - coord.stageZ;
+            }
 
             // A member on some other map carries a negative distance and cannot
             // be walked here by an `at:` aim at all - ResolveTravelTarget
@@ -14668,10 +14880,21 @@ private:
             //
             // A follower is escorted only while it is genuinely short of the
             // staging point. Inside the radius the leader is right there, so
-            // `follow` is both sufficient and preferable.
+            // `follow` is both sufficient and preferable - and "inside the
+            // radius" is now the same three-dimensional question the barrier
+            // itself asks (#217), because a follower ten yards out and a
+            // hundred and fifty yards up is not standing beside anybody.
+            // Leaving this one site on the flat test would be the module
+            // holding two opinions about where its own staging point is.
+            OverseerDecisions::ApproachGap gap;
+            gap.horizontalYards = state.distanceFromStage;
+            gap.verticalYards = state.verticalFromStage;
+            gap.measured = state.distanceFromStage >= 0.f;
             bool const isLeader = name == leaderName;
-            if (state.distanceFromStage >= 0.f &&
-                (isLeader || state.distanceFromStage > DUNGEON_BARRIER_RADIUS_YARDS))
+            if (gap.measured &&
+                (isLeader || OverseerDecisions::ApproachShapeOf(
+                                 gap, DUNGEON_APPROACH_LIMITS) !=
+                                 OverseerDecisions::ApproachShape::Arrived))
                 EscortToward(name, stageTarget, "BARRIER");
 
             // AND THE ESCORT RE-ASSERTS ITSELF ON THE RUN'S OWN CLOCK (#164).
@@ -14686,12 +14909,25 @@ private:
             // IS IT ACTUALLY COMING? The reading above is a distance, and a
             // distance alone cannot tell a member walking in from a member
             // standing still. This can, and corrects what it finds.
-            RunStagingWatchdog(coord, name, member, state);
+            if (RunStagingWatchdog(coord, name, member, gap))
+            {
+                // ABOVE THE DOOR AND NOT COMING DOWN (#217). One member in that
+                // state is enough to close the run: the barrier needs all of
+                // them, so there is nothing left for the remaining clock to
+                // achieve, and every minute of it is a minute the party spends
+                // standing beside a drop. The watchdog has already said which
+                // character and how far above.
+                FailApproach(coord, leaderName, *portal, "BARRIER",
+                             name + " (" + OverseerDecisions::ApproachWhere(gap) +
+                                 " from the staging point)",
+                             IsDungeonJob(leaderJob));
+                return;
+            }
 
             states.push_back(state);
         }
 
-        if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_BARRIER_RADIUS_YARDS))
+        if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_APPROACH_LIMITS))
         {
             // THE BARRIER IS A ONE-WAY DOOR INTO ENTER, not a condition ENTER
             // keeps re-asking. Once the party is gathered, the next thing that
@@ -14739,7 +14975,7 @@ private:
         {
             FailStaging(coord, leaderName, *portal, "BARRIER",
                         OverseerDecisions::DungeonRunBarrierBlockers(
-                            states, DUNGEON_BARRIER_RADIUS_YARDS),
+                            states, DUNGEON_APPROACH_LIMITS),
                         IsDungeonJob(leaderJob));
             return;
         }
@@ -14750,7 +14986,7 @@ private:
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER holds - {}",
                      OverseerDecisions::DungeonRunBarrierBlockers(
-                         states, DUNGEON_BARRIER_RADIUS_YARDS));
+                         states, DUNGEON_APPROACH_LIMITS));
         }
     }
 

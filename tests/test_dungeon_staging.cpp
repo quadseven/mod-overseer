@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <vector>
 
+using OverseerDecisions::ApproachLimits;
 using OverseerDecisions::DungeonRunBarrierMet;
 using OverseerDecisions::DungeonRunEntryState;
 using OverseerDecisions::DungeonRunMemberState;
@@ -29,6 +30,10 @@ void Check(char const* what, bool got, bool want)
     ++failures;
 }
 
+// The adapter's own three numbers: the barrier radius, one step's reach and
+// the height one step may bridge. See ApproachLimits.
+constexpr ApproachLimits LIMITS{10.f, 60.f, 20.f};
+
 DungeonRunMemberState ReadyMember(float distance)
 {
     DungeonRunMemberState state;
@@ -46,7 +51,7 @@ void AnEarlyEntrantDoesNotDeadlockTheBarrier()
     members.push_back(inside);
     members.push_back(ReadyMember(8.f));
 
-    Check("inside member counts as staged", DungeonRunBarrierMet(members, 10.f), true);
+    Check("inside member counts as staged", DungeonRunBarrierMet(members, LIMITS), true);
 }
 
 void MissingMembersStillFailClosed()
@@ -57,7 +62,7 @@ void MissingMembersStillFailClosed()
     members.push_back(inside);
     members.push_back(DungeonRunMemberState());
 
-    Check("unseen member blocks barrier", DungeonRunBarrierMet(members, 10.f), false);
+    Check("unseen member blocks barrier", DungeonRunBarrierMet(members, LIMITS), false);
 }
 
 void AnInsideDeadMemberStillBlocksTheBarrier()
@@ -69,7 +74,7 @@ void AnInsideDeadMemberStillBlocksTheBarrier()
     members.push_back(inside);
     members.push_back(ReadyMember(8.f));
 
-    Check("dead inside member blocks barrier", DungeonRunBarrierMet(members, 10.f), false);
+    Check("dead inside member blocks barrier", DungeonRunBarrierMet(members, LIMITS), false);
 }
 
 void OneMemberCannotPretendTheWholePartyCrossed()
