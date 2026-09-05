@@ -575,7 +575,9 @@ std::string ApproachWhere(ApproachGap const& gap);
 // defect is in the route that led to them.
 //
 // WHERE THE WAY IN ACTUALLY IS, read off the same navmesh the core's own
-// pathfinder reads (mmaps/0013336.mmtile and its neighbours, map 1 grid 33/36).
+// pathfinder reads: mmaps/0013336.mmtile, map 1 grid 33/36, which holds the
+// door and the rim over it, and its neighbours, which hold the corridor - the
+// terrace named below is on 0013335.mmtile, grid 33/35.
 // The entrance sits on the floor of a ravine at z 16.8. Directly over it, at
 // the same x and y, there is a second walkable surface at z 161.9 - which is
 // the ground the party keeps standing on, and it is genuinely walkable, so
@@ -586,7 +588,7 @@ std::string ApproachWhere(ApproachGap const& gap);
 // cover 179 yards of straight line.
 //
 // The world's own data says the same thing twice over. waypoint_data path
-// 138070, a patrol Blizzard wrote for the Devouring Ectoplasm at guid 13807,
+// 138070, the world database's own patrol for the creature at guid 13807,
 // walks (-642.07, -2185.48, 45.34) down to (-719.33, -2224.44, 16.96) - the
 // bottom of that corridor, point for point. And the creature spawns descend the
 // same line: (-602, -2178, 49.8), (-643, -2182, 45.1), (-694, -2193, 31.0),

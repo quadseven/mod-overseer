@@ -3,13 +3,19 @@
  *
  * This compiles against the pure decision file and nothing from AzerothCore.
  *
- * EVERY COORDINATE BELOW IS MEASURED. The Wailing Caverns staging point is the
- * one the module derives, (-733.71, -2214.91, 16.8179). The corridor's start,
- * (-705.0, -2045.0, 66.45), is a terrace read off the navmesh tile the core's
- * own pathfinder reads, mmaps/0013336.mmtile on map 1 grid 33/36; the height is
- * that tile's own lowest walkable surface at that x and y. The rim height,
- * 161.93, is the SECOND walkable surface the same tile carries at the staging
- * point's own x and y - the ground the party has stood on twice.
+ * EVERY COORDINATE BELOW IS MEASURED, off the navmesh tiles the core's own
+ * pathfinder reads. The Wailing Caverns staging point is the one the module
+ * derives, (-733.71, -2214.91, 16.8179); it and the door sit on map 1 grid
+ * 33/36, mmaps/0013336.mmtile. The rim height, 161.93, is the SECOND walkable
+ * surface that same tile carries at the staging point's own x and y, and it is
+ * the ground the party has stood on twice.
+ *
+ * The corridor's start, (-705.0, -2045.0, 66.45), is a terrace on the tile
+ * NORTH of that one, grid 33/35, mmaps/0013335.mmtile - the corridor crosses
+ * the tile boundary, which is why the descent was traced over a block of tiles
+ * rather than one. The height is that tile's own lowest walkable surface at
+ * that x and y; it carries a second one 45 yards above, so "lowest" is doing
+ * work here.
  *
  * The gaps below are those points subtracted, not chosen:
  *

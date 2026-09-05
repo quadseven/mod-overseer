@@ -11954,11 +11954,12 @@ private:
         //
         // HOW THE ONE THAT IS SET WAS MEASURED, and how a future reader can
         // check it without believing this comment. It was read off the same
-        // navmesh tile the core's own pathfinder reads,
-        // data/mmaps/0013336.mmtile (map 1, grid 33/36, the tile that contains
-        // the door), by walking that tile's polygon adjacency out from the
-        // staging point. The world's own data agrees twice: waypoint_data path
-        // 138070, a patrol Blizzard wrote for the creature at guid 13807,
+        // navmesh tiles the core's own pathfinder reads, by walking their
+        // polygon adjacency out from the staging point. The door and the rim
+        // over it are on data/mmaps/0013336.mmtile (map 1, grid 33/36); this
+        // point is on the tile north of it, 0013335.mmtile, grid 33/35, because
+        // the corridor crosses the boundary between them. The world's own data agrees twice: waypoint_data path
+        // 138070, the world database's own patrol for the creature at guid 13807,
         // descends the bottom of that same corridor from (-642.07, -2185.48,
         // 45.34) to (-719.33, -2224.44, 16.96); and the creature spawns descend
         // the same line, (-602, -2178, 49.8) through (-643, -2182, 45.1),
