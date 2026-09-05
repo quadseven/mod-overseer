@@ -257,9 +257,20 @@ constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
 // single-sample drop GroundHolds permits. The navmesh check, not a larger gap,
 // is what distinguishes a real lower interior from terrain below a WMO.
 constexpr float TERRAIN_RECOVERY_GAP_YARDS = 10.0f;
-// A lower plane can expose a misleading polygon, so a separation this large
-// is unsafe even when HasLocalNavmesh reports one. The incident measurements
-// were 31 to 35 yards below the Stormwind surface.
+// A separation this large is worth NOTICING even when HasLocalNavmesh reports
+// a polygon. The incident measurements were 31 to 35 yards below the Stormwind
+// surface.
+//
+// IT NO LONGER AUTHORIZES MOVING SUCH A CHARACTER, and the sentence that said
+// it did ("a lower plane can expose a misleading polygon, so a separation this
+// large is unsafe even when HasLocalNavmesh reports one") was the stated reason
+// nobody defended the navmesh guard against it. Live on 2026-09-05 that
+// override produced roughly 115 of 204 teleports in six hours, on characters
+// standing under an arch, under an abbey roof, and beside a vendor they had
+// just been sent to. A bridge, a roof and a hidden lower plane all read as the
+// same number, so the gap cannot tell them apart and this one is not allowed
+// to try. Over a live polygon it now buys a single loud line and nothing else -
+// see OverseerDecisions::TerrainRecoveryStep for the whole remedy.
 constexpr float TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS = 25.0f;
 
 // The surface lookup starts this far above the character and searches the
@@ -271,6 +282,29 @@ constexpr float TERRAIN_RECOVERY_PROBE_YARDS = 60.0f;
 // the local walkable mesh. Two yards fits inside an ordinary room while still
 // requiring the navmesh to find a real polygon rather than a point in place.
 constexpr float TERRAIN_RECOVERY_PATH_YARDS = 2.0f;
+
+// HOW FAR ABOVE THE SURFACE A LIFT LANDS. Small on purpose: the point is to be
+// standing ON that surface, so the character falls the last few inches under
+// its own weight rather than arriving embedded in the floor it was under.
+constexpr float TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS = 0.5f;
+
+// HOW LONG A CHARACTER HAS TO BE CLEAR BEFORE THE NEXT READING IS A NEW
+// EPISODE RATHER THAN THE SAME ONE. Every remedy makes the condition false for
+// at least one poll, so without this the memory would reset on the poll right
+// after each remedy and the ladder would never leave its first rung - which is
+// exactly the unbounded series being fixed. Ten minutes is longer than any
+// interval measured in the live loop of 2026-09-05: the median gap between one
+// character's own recoveries was seven to nine minutes and the worst was
+// fourteen seconds. A character that really has been fine for ten minutes and
+// then falls through the world gets the whole ladder again, which is right.
+constexpr time_t TERRAIN_RECOVERY_FORGET_SECONDS = 600;
+
+// The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
+// takes it. Everything it contains is declared just above; this only puts them
+// in the order that function reads them.
+constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
+    TERRAIN_RECOVERY_GAP_YARDS, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS,
+    TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -809,6 +843,44 @@ constexpr float TRAVEL_STEP_SIDE_FRACTION = 0.6f;
 // itself (#203). Only consulted for an aim within TRAVEL_STEP_YARDS; see
 // StepMayBridgeGap for why a far aim's height is not this step's business.
 constexpr float TRAVEL_STEP_VERTICAL_YARDS = 20.0f;
+
+// HOW FAR A ROUTED PATH'S LAST POINT MAY SIT FROM THE HEIGHT THAT WAS ASKED
+// FOR, before the route is read as the nearest polygon to somewhere
+// unreachable rather than as a way to the place requested. Five, and the five
+// is arrived at twice over.
+//
+// IT IS THE CORE'S OWN ANSWER TO THIS EXACT QUESTION. PathGenerator has a
+// predicate for "the destination this route reached is at the wrong height",
+// and it is five yards measured against GetActualEndPosition:
+//
+//     bool PathGenerator::IsInvalidDestinationZ(Unit const* target) const
+//     { return (target->GetPositionZ() - GetActualEndPosition().z) > 5.0f; }
+//                                                (PathGenerator.cpp:1230-1233)
+//
+// The same quantity, the same bound. This guard asks it symmetrically, in both
+// directions rather than only downward, because a route that ends five yards
+// too HIGH is the mountain case and is the one that killed somebody.
+//
+// It is also the reach of the navmesh's own first look: GetPolyByLocation
+// searches five yards above and below a point before widening to fifty
+// (PathGenerator.cpp:233, :247), which is the same five GroundedStep already
+// cites for why it snaps a near aim's z. So an end within five is one the mesh
+// placed on the polygon actually asked about.
+//
+// It is also the same five yards TRAVEL_GROUND_SNAP_YARDS already calls the
+// largest height correction that grounds an aim rather than relocating it.
+// Equal by derivation and not by coincidence: both are the distance past which
+// this module stops believing a point and a surface are the same place. Named
+// separately because one bounds a correction this module makes and the other
+// bounds an answer the core gives back, and a future reason to move one is not
+// a reason to move the other.
+//
+// IT WAS TWENTY, as TRAVEL_GROUND_DROP_YARDS doubled, and that doubling never
+// meant anything here: the drop constant is how far the SURFACE may fall
+// between two footing samples, which is a fact about falling and not about how
+// far a route may miss. Under twenty, aims at z 242, 262 and 303 were accepted
+// from Redridge roads near z 100 on 2026-09-05, walked, and fallen off.
+constexpr float TRAVEL_ROUTE_ENDPOINT_YARDS = 5.0f;
 
 // A follower that has stopped, and never closes the gap (#70).
 //
@@ -8222,9 +8294,6 @@ private:
         if (!path.CalculatePath(x, y, z))
             return false;
         PathType const type = path.GetPathType();
-        if ((type & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE |
-                     PATHFIND_FARFROMPOLY_END)) || path.GetPath().size() <= 2)
-            return false;
 
         // PathGenerator can return the nearest polygon for an unreachable
         // point. Treating that as a route made the family walk toward a
@@ -8232,10 +8301,27 @@ private:
         // route must finish near the requested ground height. Explicit jump
         // and drop steps do not use this helper, so this guard cannot remove a
         // deliberate dungeon traversal step.
-        G3D::Vector3 const& end = path.GetPath().back();
-        if (std::fabs(end.z - z) > TRAVEL_GROUND_DROP_YARDS * 2.0f)
-            return false;
-        return true;
+        //
+        // The tolerance was twenty yards and is now five: see
+        // TRAVEL_ROUTE_ENDPOINT_YARDS, and PathGenerator::IsInvalidDestinationZ
+        // (PathGenerator.cpp:1230-1233) where the core asks this same question
+        // of this same quantity with the same five.
+        //
+        // ASKED OF GetActualEndPosition AND NOT OF THE LAST PATH POINT. They
+        // are the same thing for a route that arrived, and they are not the
+        // same thing for a route that was cut short: the last point of a
+        // corridor truncated at MAX_PATH_LENGTH is a waypoint hundreds of yards
+        // from the aim, whose height says nothing about the aim's. The actual
+        // end position is what the core sets when it MOVED the destination on
+        // us, and leaves alone when it merely ran out of buffer. See
+        // RoutedPathGoesWhereAsked, which is also why PATHFIND_INCOMPLETE is no
+        // longer in the rejection mask and PATHFIND_FARFROMPOLY_END still is.
+        G3D::Vector3 const& actualEnd = path.GetActualEndPosition();
+        return OverseerDecisions::RoutedPathGoesWhereAsked(
+            (type & PATHFIND_NOPATH) != 0,
+            (type & PATHFIND_FARFROMPOLY_END) != 0,
+            path.GetPath().size() <= 2,
+            actualEnd.z, z, TRAVEL_ROUTE_ENDPOINT_YARDS);
     }
 
     // The point to hand the mover THIS POLL for a character wanted at `want`.
@@ -10543,29 +10629,22 @@ private:
             // Most characters see their own footing again and stop here. Ask
             // the pure rule first with the conservative no-navmesh answer so
             // four Detour probes are paid only where the vertical gap itself
-            // could possibly require recovery.
-            if (!OverseerDecisions::BelowTerrainNeedsRecovery(
-                    bot->GetPositionZ(), surface, surfaceValid, false,
-                    TERRAIN_RECOVERY_GAP_YARDS))
-                continue;
-            bool const hasLocalNavmesh = HasLocalNavmesh(bot);
-            if (!OverseerDecisions::BelowTerrainNeedsRecovery(
-                    bot->GetPositionZ(), surface, surfaceValid, hasLocalNavmesh,
-                    TERRAIN_RECOVERY_GAP_YARDS))
-            {
-                if (!OverseerDecisions::LargeSurfaceMismatchNeedsRecovery(
-                        bot->GetPositionZ(), surface, surfaceValid,
-                        hasLocalNavmesh, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS))
-                    continue;
-            }
+            // could possibly require recovery. A miss still goes through the
+            // remedy below, because a clean poll is what expires this
+            // character's memory of the last one - see TerrainRecoveryStep.
+            bool const gapCouldMatter = OverseerDecisions::BelowTerrainNeedsRecovery(
+                bot->GetPositionZ(), surface, surfaceValid, false,
+                TERRAIN_RECOVERY_GAP_YARDS);
+            bool const hasLocalNavmesh = gapCouldMatter && HasLocalNavmesh(bot);
 
-            // The leader's bind point keeps a grouped family together. This is
-            // the same destination DriveStuckRevival uses for a repeated death
-            // trap, but this character is alive and must not be resurrected.
-            Player* home = bot;
-            if (Group* group = bot->GetGroup())
-                if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
-                    home = leader;
+            OverseerDecisions::TerrainRecoveryState& memory =
+                _terrainRecovery[LowerName(name)];
+            OverseerDecisions::TerrainRecoveryVerdict const verdict =
+                OverseerDecisions::TerrainRecoveryStep(
+                    memory, bot->GetPositionZ(), surface, surfaceValid,
+                    hasLocalNavmesh, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
+            if (verdict.remedy == OverseerDecisions::TerrainRemedy::Nothing)
+                continue;
 
             uint16 const fromMap = static_cast<uint16>(bot->GetMapId());
             float const fromX = bot->GetPositionX();
@@ -10590,6 +10669,65 @@ private:
                     aimedZ = it->second.z;
                 }
             }
+
+            // A LIFT IS NOT A DISPLACEMENT, so it takes nothing away. Same map,
+            // same x and y, on top of the surface the probe just read - and the
+            // travel aim, the quest aim and the party the character had a
+            // moment ago are all still exactly right for where it now stands.
+            // The old bind-point teleport cleared both aims every time; over
+            // the 204 recoveries measured on 2026-09-05 that was 204 silent
+            // undos of errands the character was in the middle of, one of them
+            // ten seconds after it had been sent to a vendor 39 yards away.
+            if (verdict.remedy == OverseerDecisions::TerrainRemedy::LiftToSurface)
+            {
+                bot->TeleportTo(bot->GetMapId(), fromX, fromY, verdict.liftZ,
+                                bot->GetOrientation());
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' read as below the world at map {} position "
+                         "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
+                         "no local navmesh; LIFTED straight up to z {:.1f} at the same "
+                         "x/y - it keeps aim job='{}' quest={} travel='{}' and its party. "
+                         "If this is a real recovery the next poll is clean; if the same "
+                         "condition comes back it escalates rather than repeating",
+                         name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                         surface, surface - fromZ, verdict.liftZ, job, questAim,
+                         travelTarget);
+                continue;
+            }
+
+            // NOTHING BELOW THIS POINT IS A NORMAL OUTCOME. A polygon under the
+            // character's own feet, or a lift that did not stick, means either
+            // this rule is wrong about this place or the world is. Both are
+            // worth one loud line and neither is worth a two-minute loop.
+            if (verdict.remedy == OverseerDecisions::TerrainRemedy::GiveUp)
+            {
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' STILL reads as below the world at map {} "
+                          "position ({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} "
+                          "yards up), local navmesh {} - and this module has run out of "
+                          "remedies for it. GIVING UP on this character until it has "
+                          "been clear for {}s; it is NOT being moved and NOT being "
+                          "resurrected. Aim job='{}' quest={} travel='{}' last aimed "
+                          "position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody needs to "
+                          "look at what is overhead at these coordinates",
+                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                          surface, surface - fromZ, hasLocalNavmesh ? "PRESENT" : "absent",
+                          static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS), job,
+                          questAim, travelTarget, static_cast<uint32>(aimedMap),
+                          aimedX, aimedY, aimedZ);
+                continue;
+            }
+
+            // SendToBind, and only for a character with no polygon under it
+            // whose lift did not stick. The leader's bind point keeps a grouped
+            // family together. This is the same destination DriveStuckRevival
+            // uses for a repeated death trap, but this character is alive and
+            // must not be resurrected.
+            Player* home = bot;
+            if (Group* group = bot->GetGroup())
+                if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+                    home = leader;
+
             // Recovery is terminal for the unsafe travel aim. Clear it before
             // teleporting, otherwise the next travel poll re-issues the same
             // coordinate and sends the character back onto the bad plane.
@@ -10614,11 +10752,13 @@ private:
                             home->m_homebindY, home->m_homebindZ, 0.f);
             LOG_WARN("module.overseer",
                      "overseer: '{}' recovered at map {} position ({:.1f}, {:.1f}, {:.1f}), "
-                     "surface z {:.1f}, no local navmesh; aim job='{}' quest={} travel='{}' "
-                     "last aimed position map {} ({:.1f}, {:.1f}, {:.1f}); sent to '{}'s "
-                     "bind point; it was not resurrected",
+                     "surface z {:.1f}, no local navmesh; A LIFT TO z {:.1f} WAS TRIED "
+                     "FIRST AND DID NOT STICK, so this is the fallback: aim job='{}' "
+                     "quest={} travel='{}' last aimed position map {} ({:.1f}, {:.1f}, "
+                     "{:.1f}); sent to '{}'s bind point; it was not resurrected",
                      name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                     surface, job, questAim, travelTarget, static_cast<uint32>(aimedMap),
+                     surface, surface + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, job,
+                     questAim, travelTarget, static_cast<uint32>(aimedMap),
                      aimedX, aimedY, aimedZ, home->GetName());
         } while (result->NextRow());
     }
@@ -18050,6 +18190,17 @@ private:
     // per entry and no correctness. The rule it implements is in
     // OverseerDecisions::GiveHeldOff, where it can be tested without a world.
     std::map<std::string, OverseerDecisions::GiveRefusalBook> _giveRefusals;
+
+    // WHAT THIS MODULE HAS ALREADY TRIED FOR A CHARACTER THAT READS AS BELOW
+    // THE WORLD, so a condition it cannot fix is answered three times and then
+    // left alone rather than every two minutes for six hours
+    // (mod-overseer#174, and the live loop of 2026-09-05 that reopened it).
+    // Keyed by lowered name like _lastAim. World thread only, unguarded like
+    // every other memory on this loop, and lost on a restart - which costs one
+    // extra lift per character and no correctness. The rule it feeds is
+    // OverseerDecisions::TerrainRecoveryStep, where it is tested without a
+    // world.
+    std::map<std::string, OverseerDecisions::TerrainRecoveryState> _terrainRecovery;
 
     uint32 _eventTimer = 0;
     uint32 _deathTimer = 0;
