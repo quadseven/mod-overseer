@@ -8165,7 +8165,9 @@ private:
         PathGenerator path(bot);   // PathGenerator.h:61
         if (!path.CalculatePath(x, y, z))
             return false;
-        if ((path.GetPathType() & PATHFIND_NOPATH) || path.GetPath().size() <= 2)
+        PathType const type = path.GetPathType();
+        if ((type & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE |
+                     PATHFIND_FARFROMPOLY_END)) || path.GetPath().size() <= 2)
             return false;
 
         // PathGenerator can return the nearest polygon for an unreachable
