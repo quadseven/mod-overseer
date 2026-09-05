@@ -530,6 +530,29 @@ bool WithinTheWorld(float value)
     return value > -MAP_EDGE_YARDS && value < MAP_EDGE_YARDS;
 }
 
+// IS THIS READING A NUMBER AT ALL? Written as the positive test for the reason
+// WithinTheWorld above is: every comparison against a NaN is false, so a NaN
+// fails this and is refused, where the negated form would have let it through.
+//
+// `value != value` alone catches the NaN; `value * 0` is a NaN for an infinity
+// and zero for everything else, so the second half catches both infinities
+// without naming a bound a distance might one day legitimately exceed. A gap is
+// a DIFFERENCE rather than a coordinate, so WithinTheWorld is the wrong test for
+// it - two legal points on one map are further apart than MAP_EDGE_YARDS.
+// `<cmath>` would give std::isfinite; see the note at the top of this file for
+// why the include is not taken for two comparisons.
+//
+// UNREACHABLE THROUGH THE ADAPTER TODAY, and guarded anyway. A staging point is
+// put through StagingPointUsable before anything is measured against it and a
+// position in the world is a real number, so neither half of a gap can be one
+// of these. The guard costs one comparison; not having it costs an ARRIVAL
+// declared on a reading nobody can interpret, which is the exact failure this
+// whole section exists to stop.
+bool FiniteReading(float value)
+{
+    return value == value && value * 0.f == 0.f;
+}
+
 }  // namespace
 
 StagingPointVerdict StagingPointCheck(float x, float y, float z)
@@ -628,7 +651,12 @@ bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards)
 
 ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits)
 {
-    if (!gap.measured)
+    // NOT MEASURED, OR NOT A NUMBER, ARE THE SAME ANSWER. Both mean this poll
+    // has nothing to say about where the subject is, and both must fail to the
+    // verdict that leaves a caller waiting rather than to the one that advances
+    // a phase. See FiniteReading.
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
         return ApproachShape::Unmeasured;
 
     float const horizontal = Magnitude(gap.horizontalYards);
@@ -661,7 +689,8 @@ ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limi
 
 float ApproachDistance(ApproachGap const& gap)
 {
-    if (!gap.measured)
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
         return -1.f;
 
     double const horizontal = double(gap.horizontalYards);
@@ -671,7 +700,11 @@ float ApproachDistance(ApproachGap const& gap)
 
 std::string ApproachWhere(ApproachGap const& gap)
 {
-    if (!gap.measured)
+    // The same three conditions as the verdict, and deliberately not "whatever
+    // the verdict said": a caller may ask for the words without asking for the
+    // shape, and the cast below is undefined on a NaN.
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
         return "no reading";
 
     std::string where =

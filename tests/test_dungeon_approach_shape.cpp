@@ -14,6 +14,7 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -194,6 +195,25 @@ void AnUnmeasuredGapIsNeitherThing()
     Check("nothing measured", ApproachShapeOf(gap, LIMITS), ApproachShape::Unmeasured);
     CheckBool("and no distance either", ApproachDistance(gap) < 0.f, true);
     CheckText("and it says so", ApproachWhere(gap), "no reading");
+}
+
+// A READING THAT IS NOT A NUMBER IS NOT AN ARRIVAL EITHER. Unreachable through
+// the adapter - a staging point is checked before anything is measured against
+// it - but the failure it would cause is the exact one this whole section
+// exists to stop, so it is pinned rather than argued about.
+void ANonNumberIsNotAnArrival()
+{
+    float const nan = std::numeric_limits<float>::quiet_NaN();
+    float const inf = std::numeric_limits<float>::infinity();
+    ApproachGap const cases[] = {
+        Gap(nan, 5.f), Gap(5.f, nan), Gap(inf, 5.f), Gap(5.f, inf)};
+    for (ApproachGap const& gap : cases)
+    {
+        Check("not a number is not a shape", ApproachShapeOf(gap, LIMITS),
+              ApproachShape::Unmeasured);
+        CheckBool("and not a distance", ApproachDistance(gap) < 0.f, true);
+        CheckText("and not a sentence", ApproachWhere(gap), "no reading");
+    }
 }
 
 // A CALLER WITH NO STEP BOUND GETS THE FLAT TEST IT USED TO HAVE. The zero is
@@ -386,6 +406,7 @@ int main()
     ItAgreesWithTheStepBound();
     UnderneathIsAlsoOverhead();
     AnUnmeasuredGapIsNeitherThing();
+    ANonNumberIsNotAnArrival();
     WithoutStepLimitsNothingIsOverhead();
     TheDistanceIsTheWholeGap();
     TheRefusalNamesTheCause();
