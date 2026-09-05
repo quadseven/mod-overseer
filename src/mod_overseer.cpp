@@ -11502,9 +11502,13 @@ private:
     // so keeps the check where the argument for it is.
     static constexpr float DUNGEON_STAGING_Z_SANITY_YARDS = 15.0f;
 
-    // Each supported dungeon is one row. Stockades is a same-continent
-    // instance in Stormwind and is reachable without the cross-continent
-    // travel that Wailing Caverns still requires.
+    // Each supported dungeon is one row. Deadmines, Shadowfang and Stockades
+    // are all approached from map 0 and are reachable on foot from where the
+    // family lives. Wailing Caverns is approached from map 1 and is not: the
+    // row is measured and correct, and the crossing to Kalimdor that would make
+    // it reachable does not exist yet, so a run for it is refused rather than
+    // started. See DungeonPortals() below and the approach check in the
+    // coordinator's IDLE branch.
     static DungeonPortal const* FindDungeonPortal(std::string const& keyword)
     {
         for (DungeonPortal const& portal : DungeonPortals())
@@ -11527,6 +11531,34 @@ private:
             // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
             // areatrigger_teleport.sql: (503,'Stockades Instance',0,-8764.83,846.075,87.4842,3.77934)
             {"stockades", 0, 101, 34, 503},
+            // WAILING CAVERNS, AND THE FIRST ROW IN THIS TABLE WHOSE OUTSIDE
+            // MAP IS NOT 0. The four numbers are read out of the pinned core's
+            // own base world DB the same way every row above them is, and are
+            // quoted here so a future reader can check them without a running
+            // world:
+            //
+            // areatrigger.sql: (228,1,-753.596,-2212.78,21.5403,13,0,0,0,0)
+            // areatrigger_teleport.sql: (228,'The Barrens - Wailing Caverns',43,-163.49,132.9,-73.66,5.83)
+            // areatrigger.sql: (226,43,-172.181,138.98,-66.6471,12,0,0,0,0)
+            // areatrigger_teleport.sql: (226,'The Barrens - Wailing Caverns',1,-740.059,-2214.23,16.1374,5.68)
+            //
+            // so trigger 228 stands on map 1 - Kalimdor, in the Barrens - with
+            // radius 13 and lands on map 43, and trigger 226 stands inside on
+            // map 43 with radius 12 and lands back on map 1 about 14 yards from
+            // where the party went in. Same shape as the three rows above; only
+            // the continent is new.
+            //
+            // AND THAT ONE DIFFERENCE IS WHY THE ROW ARRIVES WITH A REFUSAL
+            // NEXT TO IT RATHER THAN ON ITS OWN. Nothing in the coordinator
+            // hard-codes 0 - `outsideMapId` is read from the row at every one
+            // of its use sites - but the travel layer beneath it can only walk
+            // within a single map, so a portal on a continent the family is not
+            // standing on cannot be walked to at all. The run therefore refuses
+            // to open rather than staging toward it; see
+            // OverseerDecisions::DungeonPortalApproach and its caller below.
+            // The row is correct and it is not yet runnable, and those are two
+            // different statements that both have to be true in public.
+            {"wailing", 1, 228, 43, 226},
         };
         return portals;
     }
@@ -11847,6 +11879,15 @@ private:
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
         bool loggedCampaignOver{false};
+        // Said once, on the idle coordinator, for the same reason
+        // `loggedCampaignOver` is: a portal the leader cannot walk to is a
+        // standing fact about the job column rather than a transient, so it is
+        // reached on every poll until an operator changes something. Nothing
+        // clears it, because the only thing that ever leaves IDLE assigns a
+        // fresh DungeonRunCoordinatorState over the whole struct - which is
+        // exactly the behaviour wanted, since a run that DID start is a run
+        // whose approach was walkable.
+        bool loggedApproachRefused{false};
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
@@ -13212,6 +13253,56 @@ private:
             DungeonPortal const* portal = FindDungeonPortal(dungeonKeyword);
             if (!portal)
                 return;  // no known portal for this job yet - nothing to gather toward
+
+            // CAN THE LEADER GET TO THIS DOOR AT ALL? ASKED BEFORE THE RESET,
+            // WHICH IS THE ONLY PLACE IT IS STILL FREE TO ASK (#158).
+            //
+            // WHAT WOULD HAPPEN WITHOUT THIS. Every step after this point is
+            // paid for. RESETTING throws away the instance the party is bound
+            // to; GATHERING claims the leader's aim, superseding whatever he
+            // was doing; the whole assembly then runs on
+            // DUNGEON_STAGING_BACKSTOP_SECONDS. For a portal on a map the
+            // leader is not standing on, all of that happens and none of it can
+            // work: ResolveTravelTarget refuses an `at:` aim whose map is not
+            // the character's own, so the errand is never taken up, the leader
+            // never moves, and the run fails at the backstop many minutes later
+            // with a reason ("on map 0 rather than map 1") that describes the
+            // symptom rather than the cause. Refusing here costs nothing and
+            // says the cause.
+            //
+            // AND IT IS A REFUSAL RATHER THAN A ROUTE. The honest fix is a
+            // crossing - a boat leg from Menethil, a taxi hop, some travel kind
+            // that does not exist in this module yet - and inventing one at the
+            // point of failure would mean aiming five characters at a shoreline
+            // and hoping. #158 has that work; this has the refusal that keeps
+            // the family out of it until then.
+            //
+            // SAID ONCE, on the same idle-coordinator flag discipline as the
+            // campaign-over line above and for the same reason: `job` stays
+            // `dungeon:wailing` until an operator changes it, so this branch is
+            // reached on every poll for as long as it is set.
+            if (OverseerDecisions::DungeonPortalApproach(
+                    leader->GetMapId(), portal->outsideMapId) !=
+                OverseerDecisions::DungeonApproach::Walkable)
+            {
+                if (!coord.loggedApproachRefused)
+                {
+                    coord.loggedApproachRefused = true;
+                    LOG_ERROR("module.overseer",
+                              "overseer: dungeon run refused - '{}' names the '{}' portal, "
+                              "which is approached from map {}, and the leader '{}' is on "
+                              "map {}. An `at:` aim is only ever resolved on the "
+                              "character's own map (there is no navmesh across an ocean), "
+                              "so no staging aim this run could write would be taken up, "
+                              "and nothing is reset, aimed or moved. Getting the party to "
+                              "map {} needs a crossing this module does not have yet; "
+                              "until then, name a portal on map {}",
+                              leaderJob, portal->keyword, portal->outsideMapId, leaderName,
+                              uint32(leader->GetMapId()), portal->outsideMapId,
+                              uint32(leader->GetMapId()));
+                }
+                return;
+            }
 
             // THE STAGING POINT IS RESOLVED HERE AND NOWHERE ELSE (#121), from
             // the two areatriggers this portal already names. A run that cannot

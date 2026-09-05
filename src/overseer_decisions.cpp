@@ -289,6 +289,17 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
     return blockers;
 }
 
+DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
+                                      std::uint32_t portalOutsideMapId)
+{
+    // EQUAL, NOT "SAME CONTINENT" OR "REACHABLE". The travel layer's rule is
+    // literally that the aim's map is the character's map, so this is literally
+    // that comparison. Anything softer here would be a promise the resolver
+    // underneath does not keep.
+    return leaderMapId == portalOutsideMapId ? DungeonApproach::Walkable
+                                             : DungeonApproach::OffOutsideMap;
+}
+
 bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
                           float doorstepYards)
 {
