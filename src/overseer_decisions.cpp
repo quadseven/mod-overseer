@@ -2448,4 +2448,35 @@ char const* FallAccountName(FallAccount account)
     return "unsampled";
 }
 
+char const* FollowGapName(FollowGap gap)
+{
+    switch (gap)
+    {
+        case FollowGap::SplitAcrossMaps: return "split across maps";
+        case FollowGap::InFormation:     return "in formation";
+        case FollowGap::Trailing:        return "trailing";
+        case FollowGap::Stranded:        return "stranded";
+    }
+    return "split across maps";
+}
+
+FollowGap ReadFollowGap(bool sameMap, float distance2d,
+                        FollowGapLimits const& limits)
+{
+    // Asked first and answered alone. A cross-map pair has no distance, so
+    // nothing below may look at the one that was handed in.
+    if (!sameMap)
+        return FollowGap::SplitAcrossMaps;
+    if (distance2d <= limits.formationYards)
+        return FollowGap::InFormation;
+    if (distance2d <= limits.catchUpYards)
+        return FollowGap::Trailing;
+    return FollowGap::Stranded;
+}
+
+bool FollowGapIsBehind(FollowGap gap)
+{
+    return gap == FollowGap::Trailing || gap == FollowGap::Stranded;
+}
+
 }  // namespace OverseerDecisions

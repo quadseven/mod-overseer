@@ -2453,6 +2453,85 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
                            float rate = 1.f);
 char const* FallAccountName(FallAccount account);
 
+// ----------------------------------------------- a follower and its leader --
+//
+// HOW FAR BEHIND ITS LEADER A FOLLOWER IS, AND WHETHER THAT IS A NUMBER AT ALL
+// (#241).
+//
+// WHY THIS IS A DECISION AND NOT TWO EXPRESSIONS. The same pair of players was
+// read twice in one loop, by two different expressions, and they disagreed.
+// KeepRosterFollowing asked `p->GetDistance2d(leader) > FOLLOW_STALL_GAP_YARDS`
+// with no map guard, and DriveCatchUp, called on the same two pointers on the
+// very next line, folded a cross-map pair to a sentinel of -1. Measured on the
+// dev realm 2026-09-05, with the leader in Duskwood and the followers in the
+// Barrens:
+//
+//   17:42:30 WARN 'Grog' has not moved more than 10 yards in over 5 minutes and
+//                 is 10560 yards from 'Grug' - clearing its movement so the
+//                 next follow tick starts fresh
+//   17:45:30 WARN 'Ugga' ... and is 9463 yards from 'Grug' ...
+//   17:46:30 WARN 'Og'   ... and is 10642 yards from 'Grug' ...
+//
+// Those distances are not distances. They are two coordinate systems
+// subtracted from each other, and the module acted on them: it cleared a
+// movement generator every five minutes at three followers whose problem was
+// not a stall. Over the same eleven minutes the other reading of the same fact
+// produced nothing at all - not one "is N yards behind" line, not one
+// "re-aimed at" line - because a cross-map gap of -1 takes the same exit as a
+// follower standing in formation.
+//
+// THE SILENCE IS THE DEFECT, and it is worth being plain about what this
+// decision does and does not do. It reunites nobody. `follow` cannot cross a
+// map (FollowActions.cpp:285), the catch-up walk has nowhere on this map to
+// aim at, and an `at:` aim cannot name a coordinate on another one
+// (ResolveTravelTarget refuses a spawn off-map). All of that is correct and
+// none of it changes. What changes is that a party split stops looking exactly
+// like a party that is merely slow. An operator lost real time to that twice
+// in one day, because eleven minutes of four characters standing still with no
+// log line is indistinguishable from four characters walking.
+enum class FollowGap
+{
+    // Not on the leader's map. NO DISTANCE IS MEANINGFUL HERE, which is the
+    // whole reason this is a separate value rather than a very large number:
+    // every reading downstream has to be able to refuse to answer.
+    SplitAcrossMaps,
+    // Close enough that upstream's own Follow() chases continuously and this
+    // module has no opinion.
+    InFormation,
+    // Past the formation line, inside the range where walking to the leader
+    // under its own aim is worth doing.
+    Trailing,
+    // Past anything `follow` will do for it.
+    Stranded,
+};
+
+char const* FollowGapName(FollowGap gap);
+
+// The two lines the reading is cut at. Both already exist at the call site and
+// neither is introduced here: FOLLOW_STALL_GAP_YARDS is upstream's own
+// SightDistance, the exact line inside which Follow() chases continuously
+// (MovementActions.cpp:1180-1224), and FOLLOW_CATCH_UP_YARDS is five times it.
+// Passing them rather than baking them in keeps this file free of the tuning
+// and keeps the two call sites provably reading the same thing.
+struct FollowGapLimits
+{
+    float formationYards{0.f};
+    float catchUpYards{0.f};
+};
+
+// `sameMap` FIRST AND ALONE. When it is false the distance is not consulted at
+// all, because there is nothing in it to consult: the caller may hand in a
+// number it computed anyway, and this will not use it.
+FollowGap ReadFollowGap(bool sameMap, float distance2d,
+                        FollowGapLimits const& limits);
+
+// Is this follower far enough back that a stall is worth acting on? False in
+// formation, and false across a map boundary, where there is no distance to be
+// far in. THE SECOND HALF IS THE FIX: nudging a movement generator is a remedy
+// for a follower that has stopped walking, and a follower on another continent
+// has not stopped walking, it has nowhere to walk.
+bool FollowGapIsBehind(FollowGap gap);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
