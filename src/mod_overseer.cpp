@@ -13722,12 +13722,21 @@ private:
                 // same reason the run number is taken from the counter: this run
                 // is the next one of whatever series is already under way on
                 // this map, not the start of a rival one.
-                if (!coord.campaignId)
-                    coord.campaignId = CampaignInProgress(leaderName, inside->insideMapId);
-                if (!coord.campaignId)
-                    coord.campaignId = AllocateCampaignId();
-                StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
-                                     JoinNames(members));
+                //
+                // GUARDED ON THE SCHEMA LIKE EVERY OTHER READER OF THESE
+                // COLUMNS, for the reason LoadQuestAims writes down at length:
+                // a SELECT naming a column the table does not have fails WHOLE,
+                // and both queries below name campaign_id.
+                if (RunAccountingPresent())
+                {
+                    if (!coord.campaignId)
+                        coord.campaignId =
+                            CampaignInProgress(leaderName, inside->insideMapId);
+                    if (!coord.campaignId)
+                        coord.campaignId = AllocateCampaignId();
+                    StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
+                                         JoinNames(members));
+                }
 
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is already inside a dungeon run on map {} - "
