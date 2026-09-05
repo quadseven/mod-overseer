@@ -2399,7 +2399,59 @@ DeathDriver NameTheDriver(DeathAttribution const& attribution);
 // them together is how a kill plane goes 223 deaths without an explanation.
 // A character that ended HIGHER than it was last seen did not fall, so that
 // reads zero rather than a negative distance.
+//
+// WHAT THIS CANNOT SEE, and #243 is the bill for not having said so here.
+// This is a position delta across ONE sample gap, so a drop that both begins
+// and ends inside that gap is invisible, and a character that was carried
+// upward on the way reads a flat zero however far it fell.
+//
+// Worse, the distance the core BILLS for is not a position delta at all.
+// Player::HandleFall charges m_lastFallZ minus the landing height, and
+// upstream's dismount sets m_lastFallZ by hand to the character's own feet
+// and the landing height to the ground beneath them, so it charges for the
+// terrain under a character that never moved. A zero in this column is not
+// evidence that a fall did not kill it. Read it through AccountForFall.
 float YardsFallen(bool sampled, float lastZ, float deathZ);
+
+// THE CORE'S OWN FALL ARITHMETIC, so a recorded drop can be CHECKED rather
+// than eyeballed. Mirrored from Player::HandleFall in the pinned core, and
+// mirrored on purpose: these two files may not include a core header, and a
+// number nobody could check is how "fell 0.0 yards" was read as a fall from
+// height for a day.
+//
+//   share of max health = SLOPE * (yards - safe fall) + INTERCEPT
+//
+// gated at MIN_YARDS, below which the core deals nothing at all at any rate,
+// and clamped at one, because the core caps fall damage at max health. That
+// cap is why a fall which reaches it kills a 656 HP character and a 1,610 HP
+// one alike, and why max health tells you nothing about who dies of one.
+constexpr float FALL_DAMAGE_SLOPE = 0.018f;
+constexpr float FALL_DAMAGE_INTERCEPT = -0.2426f;
+constexpr float FALL_DAMAGE_MIN_YARDS = 13.48f;
+
+// The share of max health a drop of this many yards costs, 0 through 1.
+// `rate` is the realm's Rate.Damage.Fall, 1.0 on a stock realm.
+float FallDamageShare(float yardsDropped, float safeFallYards = 0.f,
+                      float rate = 1.f);
+
+// The shortest drop that kills outright from full health: 69.0 yards on a
+// stock realm. A recorded drop under this cannot be the whole story.
+float LethalFallYards(float safeFallYards = 0.f, float rate = 1.f);
+
+// WHAT THE RECORDED DROP ACCOUNTS FOR. Takes the column exactly as written,
+// where a negative value is the unsampled marker YardsFallen returns, so a
+// caller reads the row it has rather than reconstructing the sample.
+enum class FallAccount
+{
+    Unsampled,       // no sample: the column says nothing either way
+    NoDrop,          // it ended level with, or above, where it was last seen
+    TooShortToHurt,  // a real drop, under the distance the core charges for
+    Survivable,      // would have hurt it, could not have killed it from full
+    EnoughToKill     // would have killed it from full health outright
+};
+FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
+                           float rate = 1.f);
+char const* FallAccountName(FallAccount account);
 
 }  // namespace OverseerDecisions
 

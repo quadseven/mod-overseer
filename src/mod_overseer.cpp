@@ -15827,15 +15827,24 @@ private:
         // The driver and the drop are on the line as well as in the row: a
         // death nobody can attribute is the thing #188 is about, and a log a
         // person is already reading is where they will notice it first.
+        //
+        // THE DROP CARRIES ITS OWN VERDICT, per #243. "fell 0.0 yards" was
+        // read as a fall from height for a day, because a distance on its own
+        // does not say whether it could have done the killing and the core's
+        // arithmetic was not written down anywhere a reader could reach.
+        // Now the line says which, and says "unsampled" rather than nothing
+        // when there was no sample to draw the distance from.
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
                  "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
-                 "fell {:.1f} yards, in combat {})",
+                 "fell {:.1f} yards which is {}, in combat {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
                  batch.back().killerType, batch.back().killerName,
                  batch.back().driver, batch.back().movement,
                  batch.back().yardsFallen,
+                 OverseerDecisions::FallAccountName(
+                     OverseerDecisions::AccountForFall(batch.back().yardsFallen)),
                  batch.back().inCombat < 0
                      ? "unsampled"
                      : (batch.back().inCombat ? "yes" : "no"));
