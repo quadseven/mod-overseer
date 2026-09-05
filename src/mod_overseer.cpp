@@ -14254,7 +14254,7 @@ private:
                 // the two look different in the log because they are different.
                 std::string const where =
                     onTheOutsideMap
-                        ? OverseerDecisions::ApproachWhere(gap) + " from the staging point"
+                        ? OverseerDecisions::ApproachWhere(gap)
                         : "on map " + std::to_string(uint32(leader->GetMapId())) +
                               " rather than map " + std::to_string(portal->outsideMapId);
                 FailStaging(coord, leaderName, *portal, "GATHERING",
@@ -14286,8 +14286,8 @@ private:
                 // BARRIER clears it on entry, so a fresh ladder starts there.
                 if (RunStagingWatchdog(coord, leaderName, leader, gap))
                     FailApproach(coord, leaderName, *portal, "GATHERING",
-                                 leaderName + " (" + OverseerDecisions::ApproachWhere(gap) +
-                                     " from the staging point)",
+                                 leaderName + " (" +
+                                     OverseerDecisions::ApproachWhere(gap) + ")",
                                  IsDungeonJob(leaderJob));
                 return;
             }
@@ -14918,8 +14918,7 @@ private:
                 // standing beside a drop. The watchdog has already said which
                 // character and how far above.
                 FailApproach(coord, leaderName, *portal, "BARRIER",
-                             name + " (" + OverseerDecisions::ApproachWhere(gap) +
-                                 " from the staging point)",
+                             name + " (" + OverseerDecisions::ApproachWhere(gap) + ")",
                              IsDungeonJob(leaderJob));
                 return;
             }
