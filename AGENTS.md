@@ -216,8 +216,17 @@ read past.
 
 A merge here does nothing on its own. The change reaches a world through a pin
 bump in the deployment repo, then an image build, then a digest move in that
-world's manifest. The build is around six minutes, not the forty-five an older
-comment claims - measure it before planning around it.
+world's manifest. The image build is the slow part, and it is slow: measured
+over all 37 successful runs in the workflow's history, the job takes 36 to 88
+minutes (median 60), and the wall clock from push to answer is 35 to 129
+minutes (median 66) once queueing is counted.
+
+This paragraph used to say six minutes, and before that a comment elsewhere
+said forty-five. Both were written by somebody who had measured, and both went
+stale without anybody noticing, which is the actual lesson: a duration written
+in a document is a reading from one day, not a property of the build. Measure
+it before planning around it rather than trusting the last person who did,
+this paragraph included.
 
 The PR body gate is strict and worth writing for on the first attempt: it wants a
 `## Why`, an `## Acceptance criteria` or `## Test plan`, a literal `Size:` line, an
