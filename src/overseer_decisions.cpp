@@ -2448,4 +2448,53 @@ char const* FallAccountName(FallAccount account)
     return "unsampled";
 }
 
+RevivalMoveVerdict RevivalMayCrossMaps(RevivalMove const& move)
+{
+    RevivalMoveVerdict verdict;
+
+    // The party's map: the most common one among the OTHER members. Counted by
+    // hand rather than with a map container so this file keeps needing nothing
+    // but <string> and <vector>, the same reason WithinRadius folds its own
+    // distance.
+    size_t best = 0;
+    for (size_t i = 0; i < move.partyMapIds.size(); ++i)
+    {
+        size_t count = 0;
+        for (size_t j = 0; j < move.partyMapIds.size(); ++j)
+            if (move.partyMapIds[j] == move.partyMapIds[i])
+                ++count;
+        // Strictly greater, so a tie keeps the map seen first.
+        if (count > best)
+        {
+            best = count;
+            verdict.partyMapKnown = true;
+            verdict.partyMapId = move.partyMapIds[i];
+        }
+    }
+
+    // 1. Nothing to split.
+    if (!verdict.partyMapKnown)
+    {
+        verdict.mayMove = true;
+        return verdict;
+    }
+
+    // 2. The bind is where the party already is.
+    if (move.bindMapId == verdict.partyMapId)
+    {
+        verdict.mayMove = true;
+        return verdict;
+    }
+
+    // 3. Somewhere on this map exists, so the ocean is not the only option and
+    //    is therefore not an option.
+    if (move.graveyardOnThisMap)
+        return verdict;
+
+    // 4. Nothing on this map at all. Move, and say what it costs.
+    verdict.mayMove = true;
+    verdict.splitsParty = true;
+    return verdict;
+}
+
 }  // namespace OverseerDecisions
