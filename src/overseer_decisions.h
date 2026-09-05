@@ -571,6 +571,46 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
                                       float radiusYards);
 
+// CAN THIS PORTAL BE APPROACHED AT ALL, ASKED BEFORE A RUN IS OPENED.
+//
+// THE RULE IS THE TRAVEL LAYER'S, NOT THIS ONE'S, and writing it down here is
+// the point. Every aim this module writes for a PLACE rather than a creature is
+// `at:<map>:<x>,<y>,<z>`, and the adapter that resolves one refuses it outright
+// when the character's own map is not the map named in the aim - "SAME MAP
+// ONLY, and that is a refusal rather than a limitation to fix later. MoveFarTo
+// paths through PathGenerator, and there is no navmesh across an ocean". A
+// staging point on a map the leader is not standing on is therefore a place no
+// errand can ever be taken up for, however correct its coordinates are.
+//
+// WHY IT NEEDED SAYING NOW. Nothing in the run's own code hard-codes map 0: the
+// outside map is carried per portal and every comparison already reads it from
+// there. But every portal in the table had outside map 0 and so did the family,
+// so the two were equal by accident on every poll that has ever run, and the
+// first portal on another continent turns that accident into a run that resets
+// an instance, claims an aim nothing accepts, moves nobody, and gives up at the
+// staging backstop many minutes later. An accident that has always held is not
+// a guard.
+//
+// A ONE-COMPARISON DECISION IS STILL A DECISION. It is here rather than inline
+// in the adapter for the reason the file's own header gives: what the module
+// decides is testable without a world, and "the outside map is the leader's
+// map" is exactly the kind of invariant that gets quietly relaxed by whoever
+// adds boat legs or taxi hops later. When that happens this function grows a
+// third answer and its test says what changed; an `if` in the middle of a
+// coordinator would just be edited.
+enum class DungeonApproach : std::uint8_t
+{
+    // The leader already stands on the map this portal is approached from, so a
+    // staging aim on that map is one the travel layer can accept.
+    Walkable,
+    // The leader is somewhere else entirely. No aim this run could write would
+    // be resolved, so the run must not be opened.
+    OffOutsideMap,
+};
+
+DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
+                                      std::uint32_t portalOutsideMapId);
+
 // THE CROSSING PREDICATES, KEPT FREE OF EVERY CORE TYPE FOR THE SAME REASON
 // THE BARRIER ONE IS. Nothing below touches Player, Map or PlayerbotAI, so
 // "when may the party be knocked through" can be exercised by a unit test
