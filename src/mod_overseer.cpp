@@ -13362,7 +13362,16 @@ private:
                   coord.runNumber, coord.campaignId, phase, minutes, blockers,
                   coord.runNumber);
 
-        if (!runId)
+        if (runId)
+            // A ROW OPENED BY A STRAY MEMBER IS STILL THIS ATTEMPT'S ROW, so it
+            // gets this attempt's numbers before it is closed. Nothing else
+            // would ever put them on it: the coordinator never reached the
+            // inside phases, which is where a run normally joins its campaign,
+            // and a row closed at 0/0 is invisible to the failure stop that is
+            // now the only thing bounding a staging that keeps failing.
+            StampRunIntoCampaign(runId, coord.campaignId, coord.runNumber,
+                                 JoinNames(members));
+        else
             RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
                                coord.runNumber, "staging_failed", reason,
                                JoinNames(members));
