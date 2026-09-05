@@ -1,0 +1,136 @@
+-- Let a family member post a letter to another - an item, some money, a
+-- message, or all three - and deal with what arrives: take an attachment, take
+-- the money, send a letter back, throw an empty one away (mod-overseer#18: the
+-- family hoards and starves outside any economy).
+--
+-- WHY MAIL. Mail is the only way one character hands another something without
+-- the two of them being in the same place. Everything else this module can do
+-- with an item across characters - kind='give', kind='trade' - needs the pair
+-- standing together, and walking is what has been failing: a character wedged
+-- in combat, a route that ends somewhere else, a step off a cliff. A letter
+-- crosses a continent while both ends stand still. The family is holding 161
+-- green items nobody can dispose of and the one character who can use them is
+-- the tailor and enchanter, standing somewhere else. That is a mail problem
+-- wearing a travel problem's clothes.
+--
+-- The other half is that mail is how five characters who share a stream get to
+-- have a relationship on camera - a letter is a thing one of them decided to
+-- write. Nothing here decides that. This executor never chooses an item, a
+-- recipient or a word; it carries out a row that already says.
+--
+-- WHY THE CORE'S PATH AND NOT A MODULE COPY. A letter lives in five places at
+-- once: the `mail` row, the `mail_items` rows, the `item_instance` row whose
+-- owner_guid changes hands, the sender's purse, and - when the recipient is
+-- online - a Mail* in that character's own in-memory list with the Item*
+-- parked beside it. WorldSession::HandleSendMail (MailHandler.cpp:65-380)
+-- keeps all five in step inside one transaction, through
+-- MailDraft::SendMailTo, and HandleMailTakeItem (:517-628), HandleMailTakeMoney
+-- (:631-673), HandleMailReturnToSender (:436-514) and HandleMailDelete
+-- (:406-433) unwind them the same way. Writing to `mail` and `mail_items` from
+-- a module would drift from the core's postage, its expiry, its delivery delay
+-- and its in-memory copy, and an online character would never see the letter
+-- at all. So the executor builds the packet a client would send and calls the
+-- handler, the way kind='sell' drives HandleSellItemOpcode.
+--
+-- WHY THE PRE-CHECKS EXIST WHEN THE HANDLERS CHECK THE SAME THINGS. Every one
+-- of these handlers answers a CLIENT: SMSG_SEND_MAIL_RESULT on the session, or
+-- - for the structural refusals (no mailbox in reach, an empty recipient name,
+-- text carrying the sequence that crashes the client) - nothing at all. A bot
+-- has no client, so left to the handler a refused row would finish saying
+-- 'delivered' with nothing changed. Each condition is therefore tested first
+-- and named in `detail` ("mailbox not in range", "item is soulbound", "mail is
+-- cash on delivery", "mail has not been delivered yet", ...), and the outcome
+-- is READ BACK from the world afterwards rather than assumed from the call
+-- having returned. The handler stays the authority; the pre-checks exist so an
+-- operator reading the row learns which wall was hit.
+--
+-- WHAT IS DELIBERATELY REFUSED, each one a difference from the core rather
+-- than an oversight:
+--
+--   * CASH ON DELIVERY IS NOT SENT. A COD letter charges its RECIPIENT on the
+--     way in, so sending one commits another character's gold to a price this
+--     row never named and the recipient never agreed to. `cod:` is refused by
+--     name in the parser. Taking an attachment out of a COD letter that
+--     arrived from elsewhere is refused for the same reason, and the core
+--     refuses to delete one at all (:423-427), so `return` is the disposal
+--     path and is why that verb exists here.
+--
+--   * A LETTER WITH ANYTHING STILL IN IT IS NOT DELETED. Player::_SaveMail
+--     issues CHAR_DEL_ITEM_INSTANCE for every attachment of a mail left in
+--     MAIL_STATE_DELETED: deleting a letter destroys what is in it, and the
+--     client greys the button out for the same reason. So `delete` refuses
+--     "mail still carries an attachment" and "mail still carries money", and
+--     the row that empties it is a take-item or a take-money first.
+--
+--   * A QUEST ITEM IS NOT POSTED, the same refusal kind='sell' makes for the
+--     same reason: it is the one thing a letter can carry away that gold
+--     cannot buy back, and 3.3.5a mail has no buyback slot at all.
+--
+--   * THE RECIPIENT MUST BE ONLINE. Not the core's rule - the handler posts to
+--     an offline character happily - but this module's, and it is about proof
+--     rather than about mail. With the recipient online, MailDraft::SendMailTo
+--     puts the letter straight into that character's own list before it
+--     returns, so the read-back can find it and say its id. Offline, the
+--     letter exists only inside a transaction that has not been executed yet,
+--     and a SELECT racing it would report "no mail" for a letter that was sent
+--     perfectly. A row that cannot prove what it claims does not get to claim
+--     it, so it is refused instead - retryably, since the family is online.
+--
+-- THE ONE THING AN OPERATOR HAS TO PLAN AROUND. An item posted to a character
+-- on ANOTHER ACCOUNT waits before it can be taken: HandleSendMail applies
+-- CONFIG_MAIL_DELIVERY_DELAY (an hour by default) when the letter carries an
+-- item and the accounts differ (:350, :362). The family plays on one named
+-- account per character, so mailing the greens to the tailor IS the
+-- cross-account case and the hour IS what happens. It is reported rather than
+-- refused - an hour late is what the game does, and refusing would be this
+-- module inventing a rule the world does not have. Every row carries
+-- delivery_delay_seconds and, on a send, the letter's own deliver_time. Money
+-- and text never wait, and nothing waits inside one account.
+--
+-- Column re-use, no new columns:
+--   target_name  the character acting
+--   target_arg   the RECIPIENT, for `send` only, the same way kind='give' and
+--                kind='trade' name the other character; unused by the rest
+--   command      one of
+--                  send [item:<item_instance.guid>] [money:<copper>] subject:<text> [body:<text>]
+--                  take-item mail:<mail.id> item:<item_instance.guid>
+--                  take-money mail:<mail.id>
+--                  return mail:<mail.id>
+--                  delete mail:<mail.id>
+--                The key:value pairs come first, in any order, each at most
+--                once. `subject:` opens the text tail and runs to the first
+--                ` body:` after it or to the end of the line; `body:` runs to
+--                the end. A subject is required even for a letter carrying an
+--                item, because it is the only part a character sees without
+--                opening anything. Lengths are the client's own: 64 characters
+--                of subject, 500 of body.
+--                ONE ITEM PER LETTER. The packet carries up to twelve and the
+--                handler takes them all, but postage is 30 copper per item
+--                either way (:163), so twelve letters cost what one
+--                twelve-attachment letter costs and twelve rows say twelve
+--                separate true things instead of one row explaining a partial
+--                failure. Every other executor here moves one named item too.
+--   detail       short refusal reason, or empty on success
+--   result       JSON: outcome (sent|taken|returned|deleted|refused), reason,
+--                retryable, verb, who, to, item {guid, entry, name, count},
+--                mail {id, sender, subject, money, cod, deliver_time},
+--                mailbox {name, yards}, nearest_mailbox_yards, cost,
+--                delivery_delay_seconds, money_before, money_after,
+--                inventory_result, note
+--
+-- READING THE MAILBOX IS NOT AN EXECUTOR. `mail` and `mail_items` already hold
+-- every message, its sender, its money and its attachments, and reading them
+-- changes nothing in the world. Whatever drives the queue reads those tables
+-- and then queues a take-item by id. Marking a letter read is not one either:
+-- it moves one flag no other decision in this module reads.
+--
+-- ENUM values cannot be added by re-running the CREATE TABLE: the base file is
+-- `CREATE TABLE IF NOT EXISTS`, a no-op against an existing table, so the
+-- column keeps whatever value set it already has. It takes an explicit ALTER.
+-- The value list is the full union across the executor branches written side
+-- by side (sell, bank, auction, mail), so they apply in any order and the last
+-- one applied does not drop a sibling's value; 'job', dispatched in C++ since
+-- 2026-08-26 but never added to the column, is in it too.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail')
+        NOT NULL DEFAULT 'bot';
