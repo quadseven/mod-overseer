@@ -2116,6 +2116,123 @@ int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates);
 
 TownRetry BuyRefusalRetry(std::string const& detail);
 
+// ------------------------------------------------------- a death's cause --
+//
+// WHAT WAS MOVING THIS CHARACTER, AND TOWARD WHAT (#188).
+//
+// THE GAP THIS CLOSES. `overseer_death` has held the victim's own position,
+// health and aim since infra#2912, and that has been enough to say WHERE a
+// character died and not once enough to say WHY. Two separate investigations
+// have now stopped at the same wall: #231 was filed on a plausible mechanism
+// for the falls and then refuted from the sources, because nothing recorded
+// what had hold of the character at the time. Over one measured day, 55 of 113
+// roster deaths carried no travel target at all and 21 carried no quest aim,
+// which is not a gap in the reporting so much as the most informative fact
+// anybody has established: something was moving these characters that this
+// module had not asked to move them.
+//
+// AND THE DEATHS ARE FALLS ONTO A KILL PLANE, not terrain. 223 under-world
+// deaths since 2026-08-30 all landed between z -642.2 and -500.1, and a
+// maximum that tight is a threshold rather than ground. Per day the count runs
+// 1, 56, 77, 75, 8, 0, 6, so whatever is dropping them is still happening and
+// nobody can yet attribute a single one of those drops to a cause.
+//
+// TWO ANSWERS, KEPT SEPARATE ON PURPOSE. The core's own movement generator is
+// a FACT about the character - what actually had hold of it - and the driver
+// below is this module's INTERPRETATION of that fact next to its own aims. The
+// row carries both, so a reader who thinks the interpretation is wrong can
+// re-derive it from the raw answer instead of having to trust it. That is the
+// same reason `killer_type` and `killer_name` are both kept.
+//
+// EVERYTHING HERE IS SAMPLED, NOT LIVE, and for the reason `health_at_death`
+// already is: by the time any death hook fires, the core has already torn the
+// state down. Unit::setDeathState stops combat and clears the motion master
+// before Player::KillPlayer runs, so a death hook asking "were you in combat"
+// or "what was moving you" gets the answer "no" and "nothing" every single
+// time. The last sample before the death is the only place those facts still
+// exist, and at a five-second cadence against falls that complete in nought to
+// five seconds it is the right resolution for exactly this question.
+enum class MoveGenerator
+{
+    Unsampled,  // no snapshot has been taken for this character yet
+    Idle,       // IDLE_MOTION_TYPE: nothing had hold of it
+    Follow,     // FOLLOW_MOTION_TYPE: it was following its leader
+    Point,      // POINT_MOTION_TYPE: a scripted move to a coordinate
+    Chase,      // CHASE_MOTION_TYPE: it was pursuing something
+    Flee,       // FLEEING / TIMED_FLEEING / CONFUSED: combat put it there too
+    Thrown,     // EFFECT_MOTION_TYPE: a spline SOMETHING ELSE put it on
+    Other,      // waypoint, flight, home, rotate: named so it is not guessed at
+};
+
+// WHAT THIS MODULE THINKS WAS DRIVING IT. Deliberately a small vocabulary: a
+// column somebody groups by is only useful if the values are few and mean the
+// same thing every time.
+enum class DeathDriver
+{
+    Unknown,       // never sampled. Say so rather than guess.
+    Recovery,      // THIS MODULE moved it, recently enough to own the death.
+    Errand,        // a move toward something this module aimed it at
+    Following,     // following the leader, with no aim of its own
+    Fighting,      // chasing or fleeing, which is combat either way
+    Thrown,        // a spline it did not choose: a fall, a knockback, a drop
+    Idle,          // nothing was moving it, which is itself an answer
+    Unattributed,  // something was moving it and this module did not ask
+};
+
+char const* DeathDriverName(DeathDriver driver);
+char const* MoveGeneratorName(MoveGenerator generator);
+
+// One death's worth of attribution, as the adapter sampled it.
+struct DeathAttribution
+{
+    // False when no snapshot has been taken for this character. Everything
+    // else here is then meaningless and the answer is Unknown, which is a
+    // better column value than a plausible guess.
+    bool sampled{false};
+    MoveGenerator movement{MoveGenerator::Unsampled};
+    // Seconds since this module last issued a terrain-recovery remedy for this
+    // character. NEGATIVE means it never has, which is not the same as zero.
+    long recoverySeconds{-1};
+    // How recent a remedy has to be for the recovery to own the death. ZERO
+    // DISABLES THE ATTRIBUTION and makes a recovery never the answer, which a
+    // caller has to write deliberately rather than reach by passing a number
+    // that looks like a window.
+    long recoveryWindow{0};
+    bool hasTravelTarget{false};
+    bool hasQuestAim{false};
+};
+
+// THE PRECEDENCE IS THE DECISION, so it is written out rather than left to the
+// order of a switch:
+//
+//   1. Never sampled beats everything. Unknown is an honest column value and
+//      the reason this function exists is that guessing produced two dead-end
+//      investigations.
+//   2. A recovery this module issued inside the window beats every other
+//      answer, INCLUDING the generator. This module's own remedy is the one
+//      cause it is in a position to be certain about, and a recovery that
+//      kills a character has to be attributable to the recovery even when the
+//      core has already moved on to some other generator. It is also the
+//      answer most likely to be inconvenient, which is the reason to put it
+//      first rather than last.
+//   3. A spline it did not choose (Thrown) beats an aim, because being thrown
+//      is what happened to it and the aim is only what it had wanted.
+//   4. Combat, then following, then idle: each is a positive statement about
+//      what had hold of it.
+//   5. Anything else is an Errand if this module had aimed it somewhere, and
+//      Unattributed if it had not. THAT LAST VALUE IS THE POINT OF THE WHOLE
+//      COLUMN: "something moved this character and it was not us" is the
+//      finding both previous investigations needed and neither could make.
+DeathDriver NameTheDriver(DeathAttribution const& attribution);
+
+// HOW FAR IT DROPPED, from the last sample to the place it died. Negative
+// means unsampled and is deliberately distinguishable from zero: "we do not
+// know" and "it did not fall" are different findings, and a report that folds
+// them together is how a kill plane goes 223 deaths without an explanation.
+// A character that ended HIGHER than it was last seen did not fall, so that
+// reads zero rather than a negative distance.
+float YardsFallen(bool sampled, float lastZ, float deathZ);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

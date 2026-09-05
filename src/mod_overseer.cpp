@@ -131,6 +131,7 @@
 #include "ObjectAccessor.h"
 #include "Map.h"
 #include "MapMgr.h"
+#include "MotionMaster.h"
 #include "PathGenerator.h"
 #include "ObjectMgr.h"
 #include "QuestDef.h"
@@ -193,6 +194,18 @@ namespace
 {
 constexpr uint32 COMMAND_POLL_MS = 2000;
 constexpr uint32 SNAPSHOT_MS = 5000;
+
+// HOW SOON AFTER A REMEDY A DEATH STILL BELONGS TO IT (#188). NOT A NEW
+// NUMBER, deliberately. Two independently measured quantities already agree on
+// it: the roster's falls complete in nought to five seconds (every under-world
+// sample goes from full health to dead in one event, with
+// `seconds_since_full_health` between 0 and 5, which is also how they were
+// told apart from drowning and fatigue - those tick), and SNAPSHOT_MS is the
+// cadence of the sample every other field on the death row is read from. A
+// third constant that happened to be five would be a third thing to keep in
+// step, so this is derived from the one that already exists.
+constexpr long DEATH_RECOVERY_WINDOW_SECONDS =
+    static_cast<long>(SNAPSHOT_MS / 1000);
 constexpr uint32 WATCH_RELOAD_MS = 30000;
 constexpr uint32 CHAT_SWEEP_MS = 300000;
 
@@ -2111,6 +2124,45 @@ struct AimSnapshot
 std::mutex g_aimMutex;
 std::map<std::string, AimSnapshot> g_aimSnapshot;  // key: lowercased character name
 
+// WHAT HAD HOLD OF A CHARACTER, sampled beside its health for the same reason
+// and by the same walk (#188). `overseer_death` could say where a character
+// died and never what was moving it, and two investigations dead-ended on
+// that: #231 was filed on a plausible mechanism for the falls and then refuted
+// from the sources because nothing recorded the cause. Over one measured day
+// 55 of 113 roster deaths carried no travel target at all.
+//
+// SAMPLED AND NOT LIVE, and this is not a compromise. Unit::setDeathState
+// stops combat and clears the motion master before Player::KillPlayer runs, so
+// a death hook that asks the live Player "were you in combat" or "what was
+// moving you" is guaranteed the answers "no" and "nothing" - exactly the trap
+// documented above for GetHealth(). The last sample before the death is the
+// only place either fact still exists.
+struct MoveReading
+{
+    uint16 mapId = 0;
+    float x = 0.f, y = 0.f, z = 0.f;
+    time_t sampledAt = 0;             // 0 = never sampled
+    bool inCombat = false;
+    OverseerDecisions::MoveGenerator movement =
+        OverseerDecisions::MoveGenerator::Unsampled;
+};
+std::mutex g_moveMutex;
+std::map<std::string, MoveReading> g_moveHistory;  // key: lowercased name
+
+// The last terrain-recovery remedy this module issued for a character, so a
+// death a few seconds later can be attributed to it rather than guessed at
+// (#188). A remedy is the one movement this module knows it caused, which
+// makes it the one cause it can be certain about and the one most worth being
+// able to blame itself for.
+struct RecoveryMark
+{
+    uint8 rung = 0;       // memory.attempts AFTER the remedy: 1 = the lift
+    uint8 prevRung = 0;   // and before it, so a repeat is visible as a climb
+    time_t at = 0;        // 0 = this module has never moved this character
+};
+std::mutex g_recoveryMutex;
+std::map<std::string, RecoveryMark> g_recoveryMarks;  // key: lowercased name
+
 struct PendingKill
 {
     std::string killerType;   // 'creature' | 'player'
@@ -2130,6 +2182,71 @@ void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
     r.sampledAt = std::time(nullptr);
     if (maxHealth > 0 && health >= maxHealth)
         r.lastFullHealthAt = r.sampledAt;
+}
+
+// The core's own answer to "what is moving this character", folded to the
+// vocabulary the pure decision speaks (#188). The fold happens HERE and not in
+// overseer_decisions.cpp because MovementGeneratorType is a core type and that
+// file is the one place in this module that may not name one - see its header.
+//
+// The groupings are the ones a reader of the death table needs, and each is a
+// statement rather than a bucket: CHASE and the three fleeing types are all
+// combat by another name; EFFECT is a spline something else put the character
+// on, which is what a knockback, a scripted drop and a fall all are; POINT is
+// a move to a coordinate, which covers this module's own travel steps and its
+// lift. Everything left over is named `Other` rather than guessed at, and the
+// raw name is written to the row beside it so a reader can disagree.
+// MotionMaster.h:37-60 on the pinned core.
+OverseerDecisions::MoveGenerator FoldMovementGenerator(MovementGeneratorType type)
+{
+    switch (type)
+    {
+        case IDLE_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Idle;
+        case FOLLOW_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Follow;
+        case POINT_MOTION_TYPE:
+        case ASSISTANCE_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Point;
+        case CHASE_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Chase;
+        case FLEEING_MOTION_TYPE:
+        case TIMED_FLEEING_MOTION_TYPE:
+        case CONFUSED_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Flee;
+        case EFFECT_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Thrown;
+        default:
+            return OverseerDecisions::MoveGenerator::Other;
+    }
+}
+
+// Called from WriteSnapshot, world thread only - see that function. The
+// generator has already been folded to the pure enum by the caller, because
+// MovementGeneratorType is a core type and OverseerDecisions may not name one.
+void RememberMovement(std::string const& name, uint16 mapId, float x, float y,
+                      float z, bool inCombat,
+                      OverseerDecisions::MoveGenerator movement)
+{
+    std::lock_guard<std::mutex> guard(g_moveMutex);
+    MoveReading& r = g_moveHistory[LowerName(name)];
+    r.mapId = mapId;
+    r.x = x;
+    r.y = y;
+    r.z = z;
+    r.inCombat = inCombat;
+    r.movement = movement;
+    r.sampledAt = std::time(nullptr);
+}
+
+// Called from DriveBelowTerrainRecovery, world thread only.
+void RememberRecovery(std::string const& name, uint8 prevRung, uint8 rung)
+{
+    std::lock_guard<std::mutex> guard(g_recoveryMutex);
+    RecoveryMark& m = g_recoveryMarks[LowerName(name)];
+    m.prevRung = prevRung;
+    m.rung = rung;
+    m.at = std::time(nullptr);
 }
 
 // Called from DriveQuests, world thread only - see that function.
@@ -2196,6 +2313,28 @@ struct PendingDeath
     uint8 grouped = 0;
     uint8 groupSize = 0;
     std::string groupLeader;
+
+    // WHAT WAS MOVING IT, AND TOWARD WHAT (#188). Everything below comes from
+    // the last sample rather than from the dying Player - see MoveReading.
+    std::string driver;            // OverseerDecisions::DeathDriverName
+    std::string movement;          // the core's own generator, unfolded
+    int8 inCombat = -1;            // -1 unsampled, 0 no, 1 yes
+    int32 lastSeenSeconds = -1;    // age of the sample below, -1 = none
+    float lastX = 0.f, lastY = 0.f, lastZ = 0.f;
+    float yardsFallen = -1.f;      // -1 = unsampled, 0 = it did not fall
+
+    // The LEADER'S last sampled position, which is what makes a party split
+    // visible on the row that matters. Taken from the same cache rather than
+    // from a Player*: the leader of a split party is on another map, owned by
+    // another map thread, and free to be deleted while this one reads it
+    // (#125, the same hazard groupLeader above already avoids).
+    uint8 leaderSeen = 0;
+    uint16 leaderMap = 0;
+    float leaderX = 0.f, leaderY = 0.f, leaderZ = 0.f;
+
+    int16 recoveryRung = -1;       // -1 = this module has never moved it
+    int16 recoveryPrevRung = -1;
+    int32 recoverySeconds = -1;
 };
 std::mutex g_deathMutex;
 std::vector<PendingDeath> g_deathQueue;
@@ -2271,6 +2410,60 @@ void RecordDeath(Player* player)
             d.travelTarget = it->second.travelTarget;
         }
     }
+
+    // The last remedy this module issued for this character, read before the
+    // driver is named because the driver's first question is about it.
+    {
+        std::lock_guard<std::mutex> guard(g_recoveryMutex);
+        auto it = g_recoveryMarks.find(lower);
+        if (it != g_recoveryMarks.end() && it->second.at)
+        {
+            d.recoveryRung = static_cast<int16>(it->second.rung);
+            d.recoveryPrevRung = static_cast<int16>(it->second.prevRung);
+            d.recoverySeconds = static_cast<int32>(now - it->second.at);
+        }
+    }
+
+    // What had hold of it, and where it and its leader were a moment ago.
+    OverseerDecisions::DeathAttribution attribution;
+    attribution.recoverySeconds = d.recoverySeconds;
+    attribution.recoveryWindow = DEATH_RECOVERY_WINDOW_SECONDS;
+    attribution.hasTravelTarget = !d.travelTarget.empty();
+    attribution.hasQuestAim = d.questAim != 0;
+    {
+        std::lock_guard<std::mutex> guard(g_moveMutex);
+        auto it = g_moveHistory.find(lower);
+        if (it != g_moveHistory.end() && it->second.sampledAt)
+        {
+            attribution.sampled = true;
+            attribution.movement = it->second.movement;
+            d.movement = OverseerDecisions::MoveGeneratorName(it->second.movement);
+            d.inCombat = it->second.inCombat ? 1 : 0;
+            d.lastSeenSeconds = static_cast<int32>(now - it->second.sampledAt);
+            d.lastX = it->second.x;
+            d.lastY = it->second.y;
+            d.lastZ = it->second.z;
+            d.yardsFallen = OverseerDecisions::YardsFallen(true, it->second.z, d.z);
+        }
+
+        // The leader's own last sample, by the name the Group already cached.
+        // A leader that is not on the roster is never sampled, which reads as
+        // leaderSeen = 0 rather than as a position of (0, 0, 0) on map 0.
+        if (!d.groupLeader.empty())
+        {
+            auto const leader = g_moveHistory.find(LowerName(d.groupLeader));
+            if (leader != g_moveHistory.end() && leader->second.sampledAt)
+            {
+                d.leaderSeen = 1;
+                d.leaderMap = leader->second.mapId;
+                d.leaderX = leader->second.x;
+                d.leaderY = leader->second.y;
+                d.leaderZ = leader->second.z;
+            }
+        }
+    }
+    d.driver = OverseerDecisions::DeathDriverName(
+        OverseerDecisions::NameTheDriver(attribution));
 
     // The killer, if this death arrived through one of the two kill hooks
     // below - CONSUMED, not copied: a stale entry left behind by a PREVIOUS
@@ -10734,11 +10927,22 @@ private:
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
+            uint8 const rungBefore = static_cast<uint8>(memory.attempts);
             OverseerDecisions::TerrainRecoveryVerdict const verdict =
                 OverseerDecisions::TerrainRecoveryStep(
                     memory, reading, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::Nothing)
                 continue;
+
+            // WHOSE DOING A DEATH IN THE NEXT FEW SECONDS WAS (#188). A remedy
+            // is the one movement this module KNOWS it caused, which makes it
+            // the one cause a death row can be certain about - and until now a
+            // character that died seconds after being moved by this module was
+            // indistinguishable on the row from one that died on its own
+            // errand. Recorded for every remedy including the give-up, because
+            // "this module stopped helping and it died" is as much an
+            // attribution as a lift is. Memory only; RecordDeath reads it.
+            RememberRecovery(name, rungBefore, static_cast<uint8>(memory.attempts));
 
             float const surface = reading.surfaceAboveZ;
             bool const hasLocalNavmesh = reading.hasLocalNavmesh;
@@ -15563,7 +15767,11 @@ private:
         ss << "INSERT INTO overseer_death (character_name, character_guid, level, "
               "map, zone, pos_x, pos_y, pos_z, killer_type, killer_name, killer_entry, "
               "health_at_death, max_health_at_death, seconds_since_full_health, "
-              "job, quest_aim, travel_target, grouped, group_size, group_leader) VALUES ";
+              "job, quest_aim, travel_target, grouped, group_size, group_leader, "
+              "driver, movement_generator, in_combat, last_seen_seconds, "
+              "last_pos_x, last_pos_y, last_pos_z, yards_fallen, "
+              "leader_seen, leader_map, leader_pos_x, leader_pos_y, leader_pos_z, "
+              "recovery_rung, recovery_prev_rung, recovery_seconds) VALUES ";
         bool first = true;
         for (PendingDeath const& d : batch)
         {
@@ -15587,16 +15795,37 @@ private:
                << ',' << static_cast<uint32>(d.grouped)
                << ',' << static_cast<uint32>(d.groupSize)
                << ",'" << Esc(d.groupLeader) << "'"
+               << ",'" << Esc(d.driver) << "'"
+               << ",'" << Esc(d.movement) << "'"
+               << ',' << static_cast<int32>(d.inCombat)
+               << ',' << d.lastSeenSeconds
+               << ',' << d.lastX << ',' << d.lastY << ',' << d.lastZ
+               << ',' << d.yardsFallen
+               << ',' << static_cast<uint32>(d.leaderSeen)
+               << ',' << static_cast<uint32>(d.leaderMap)
+               << ',' << d.leaderX << ',' << d.leaderY << ',' << d.leaderZ
+               << ',' << static_cast<int32>(d.recoveryRung)
+               << ',' << static_cast<int32>(d.recoveryPrevRung)
+               << ',' << d.recoverySeconds
                << ')';
         }
         CharacterDatabase.Execute(ss.str().c_str());
 
+        // The driver and the drop are on the line as well as in the row: a
+        // death nobody can attribute is the thing #188 is about, and a log a
+        // person is already reading is where they will notice it first.
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
-                 "in zone {} (killer: {} '{}')",
+                 "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
+                 "fell {:.1f} yards, in combat {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
-                 batch.back().killerType, batch.back().killerName);
+                 batch.back().killerType, batch.back().killerName,
+                 batch.back().driver, batch.back().movement,
+                 batch.back().yardsFallen,
+                 batch.back().inCombat < 0
+                     ? "unsampled"
+                     : (batch.back().inCombat ? "yes" : "no"));
     }
 
     // ------------------------------------------------------- outcome --
@@ -19404,7 +19633,24 @@ private:
             // pinned core cheap enough to use on a 500-bot world; sampling
             // alongside a walk that was happening anyway costs nothing extra.
             if (OnRoster(p->GetName()))
+            {
                 RememberHealth(p->GetName(), p->GetHealth(), p->GetMaxHealth());
+                // #188: the same argument, for the same walk. What had hold of
+                // this character and whether it was fighting are both gone by
+                // the time any death hook can ask, so they are sampled here
+                // where the position is already being read for the row above.
+                // GetCurrentMovementGeneratorType is MotionMaster.h:271 on the
+                // pinned core; GetMotionMaster returns a member pointer that
+                // is set in the Unit constructor, and is guarded anyway.
+                MotionMaster const* motion = p->GetMotionMaster();
+                RememberMovement(
+                    p->GetName(), static_cast<uint16>(p->GetMapId()),
+                    p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(),
+                    p->IsInCombat(),
+                    motion ? FoldMovementGenerator(
+                                 motion->GetCurrentMovementGeneratorType())
+                           : OverseerDecisions::MoveGenerator::Unsampled);
+            }
         }
 
         if (!first)
