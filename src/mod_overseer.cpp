@@ -15868,20 +15868,36 @@ private:
                  std::string(detail) == "seller is dead"))
                 status = "pending";
 
-            // The town trip's other two rows race travel the same way, and are
-            // kept pending for the same two reasons and no others. Deliberately
-            // NOT every retryable refusal: "cannot afford the repair" is also
-            // classified `later`, but a row that stays pending on it would spin
-            // against a purse nothing in this loop is going to fill. Arrival
-            // and getting up are things the rest of the system is actively
-            // doing; the rest belong to the sender.
-            if ((kind == "repair" &&
-                 (std::string(detail) == "repairer not in range" ||
-                  std::string(detail) == "character is dead")) ||
-                (kind == "buy" &&
-                 (std::string(detail) == "vendor not in range" ||
-                  std::string(detail) == "buyer is dead")))
-                status = "pending";
+            // AND THE TOWN TRIP'S TWO NEW ROWS DELIBERATELY DO NOT DO THIS.
+            //
+            // The obvious thing was to copy the four lines above for
+            // kind='repair' and kind='buy': both race travel exactly the way a
+            // sale does, and a row that arrives before its character reaches
+            // the counter is refused for a reason that will stop being true in
+            // a moment. That copy was written, and then removed, because the
+            // pattern it copies is #230.
+            //
+            // Measured on the dev realm while this was being written: twenty
+            // sell rows refused with "vendor not in range", each pushed back to
+            // `pending` with its low id intact, re-selected by the very next
+            // poll because the drain takes work `ORDER BY id ASC LIMIT 20`, and
+            // re-attempted for half an hour. Twenty is COMMANDS_PER_POLL, so
+            // they filled the window completely and the 322 rows behind them
+            // were never read at all. Not a stall - a livelock, with the drain
+            // running perfectly on the same twenty rows.
+            //
+            // A retry that keeps its place at the head of a FIFO is not a
+            // retry, it is a lock. So these two verbs carry their retry class
+            // OUT instead: `detail` names the wall, `result` carries
+            // "retry":"elsewhere" or "later" (RepairRefusalRetry /
+            // BuyRefusalRetry), and the side that decides re-queues a FRESH row
+            // - which lands at the TAIL, behind everything already waiting,
+            // and cannot hold the head against anybody.
+            //
+            // The sell path above is left exactly as it is. Changing it is
+            // #230's job and belongs in #230's diff, where the bounded retry,
+            // the claim lease and the logging can be designed together instead
+            // of being half-done here.
 
             // Conditional on the row still being OURS. If the bridge gave up
             // waiting and already ended this row, writing over it would
