@@ -1014,6 +1014,18 @@ bool GearIsUpgrade(GearVerdict const& candidate, float incumbent)
            incumbent * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR;
 }
 
+bool SiblingUpgradeDecision(SiblingUpgradeRequest const& request)
+{
+    // A transfer may only move a certain, wearable upgrade. In particular,
+    // an unjudged effect or random property must not turn uncertain value into
+    // an automatic trade.
+    if (request.questItem || request.equipped || request.soulbound)
+        return false;
+    if (!request.candidate.wearable || !request.candidate.judged)
+        return false;
+    return GearIsUpgrade(request.candidate, request.incumbent);
+}
+
 std::string GearNeedWinner(std::vector<GearContender> const& contenders)
 {
     std::string winner;
