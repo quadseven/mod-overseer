@@ -724,6 +724,62 @@ std::string ApproachWhere(ApproachGap const& gap)
     return where;
 }
 
+ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& route,
+                            ApproachLimits const& limits)
+{
+    // A ROW WITH NO CORRIDOR IS THE THREE DOORS THAT ALREADY WORK, and they get
+    // back exactly the behaviour they have. Asked first so that nothing below
+    // can touch `state` on their behalf.
+    if (!route.hasWaypoint)
+        return ApproachLeg::Direct;
+
+    // Walked once per run and not again. See ApproachRouteState.
+    if (state.waypointPassed)
+        return ApproachLeg::Direct;
+
+    // A CORRIDOR WHOSE OWN LENGTH IS NOT A READING IS NOT A CORRIDOR. Negative
+    // is ApproachDistance's "no reading", and it is refused rather than read
+    // through an absolute value for the reason TravelEndpointWithinTolerance
+    // gives about its tolerance: a sign that got in by accident must not
+    // quietly become a rule nobody wrote. Refusing lands on the behaviour that
+    // existed before this function did, which is the safe side.
+    if (!(route.waypointToStagingYards >= 0.f))
+        return ApproachLeg::Direct;
+
+    // NO READING ON THE LEG MEANS NO LEG TO JUDGE. The leader is on another map
+    // or was not found this poll; aiming him at a corridor whose distance from
+    // him is unknown would be acting on nothing. Deliberately not sticky: the
+    // next poll that can measure will decide.
+    if (ApproachShapeOf(route.leaderToWaypoint, limits) == ApproachShape::Unmeasured)
+        return ApproachLeg::Direct;
+
+    // ALREADY PAST IT. Nearer the door than the corridor's start is, AND on
+    // ground a walk can cover - the second half is what keeps the rim out, and
+    // it is doing real work rather than belt and braces. The walkable surface
+    // directly over the Wailing Caverns door is 145 yards from the staging
+    // point and the corridor's start is 179, so the rim is THIRTY-FOUR YARDS
+    // NEARER and passes the distance test outright. Only the shape says no.
+    float const toStaging = ApproachDistance(route.leaderToStagingPoint);
+    if (toStaging >= 0.f && toStaging <= route.waypointToStagingYards &&
+        ApproachShapeOf(route.leaderToStagingPoint, limits) != ApproachShape::Overhead)
+    {
+        state.waypointPassed = true;
+        return ApproachLeg::Direct;
+    }
+
+    // REACHED IT. Arrived is the same three-dimensional arrival the barrier and
+    // the staging watchdog already use, so a leader who is ten yards out and a
+    // hundred and fifty yards above the corridor's start has not reached it
+    // either.
+    if (ApproachShapeOf(route.leaderToWaypoint, limits) == ApproachShape::Arrived)
+    {
+        state.waypointPassed = true;
+        return ApproachLeg::Direct;
+    }
+
+    return ApproachLeg::ToWaypoint;
+}
+
 bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
                           float doorstepYards)
 {

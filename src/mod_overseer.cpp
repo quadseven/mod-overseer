@@ -11936,6 +11936,43 @@ private:
         // the offset landed on. See ResolveDungeonStagingPoint, which derives
         // it from these two triggers instead, so the table cannot drift from
         // the world the way a fourth and fifth hand-written float did.
+
+        // AND THESE THREE FLOATS ARE NOT THAT MISTAKE AGAIN (#242). The comment
+        // above is right and this row obeys it: a staging point is DERIVABLE
+        // from the two trigger rows, so writing one down by hand was inventing
+        // a fact the world already held. Where a walkable descent starts is not
+        // derivable from any table in the world database. No column anywhere
+        // says it. It is a fact about terrain, and the only honest way to get
+        // it is to measure the terrain - which is what was done.
+        //
+        // WHAT IT IS. The point where the approach corridor to this door
+        // starts, on `outsideMapId`. The leader walks here FIRST and at the
+        // staging point second. (0, 0, 0) means this door has no measured
+        // corridor and is walked at directly, which is three of the four rows
+        // below; the test for it is StagingPointCheck, the module's own
+        // existing "that is not a place", rather than a new flag beside it.
+        //
+        // HOW THE ONE THAT IS SET WAS MEASURED, and how a future reader can
+        // check it without believing this comment. It was read off the same
+        // navmesh tiles the core's own pathfinder reads, by walking their
+        // polygon adjacency out from the staging point. The door and the rim
+        // over it are on data/mmaps/0013336.mmtile (map 1, grid 33/36); this
+        // point is on the tile north of it, 0013335.mmtile, grid 33/35, because
+        // the corridor crosses the boundary between them. The world's own data agrees twice: waypoint_data path
+        // 138070, the world database's own patrol for the creature at guid 13807,
+        // descends the bottom of that same corridor from (-642.07, -2185.48,
+        // 45.34) to (-719.33, -2224.44, 16.96); and the creature spawns descend
+        // the same line, (-602, -2178, 49.8) through (-643, -2182, 45.1),
+        // (-694, -2193, 31.0), (-704, -2195, 26.4) to (-682, -2232, 17.4). A
+        // spawn point and a patrol point are both standable ground asserted by
+        // somebody other than this module.
+        //
+        // AND IT IS CHECKED AT RUNTIME RATHER THAN TRUSTED, by the same ground
+        // probe ResolveDungeonStagingPoint already runs on the staging point.
+        // A row whose corridor is not where it says is refused, not walked at.
+        float approachX;
+        float approachY;
+        float approachZ;
     };
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
@@ -11982,17 +12019,17 @@ private:
     static std::vector<DungeonPortal> const& DungeonPortals()
     {
         static std::vector<DungeonPortal> const portals = {
-            {"deadmines", 0, 78, 36, 119},
+            {"deadmines", 0, 78, 36, 119, 0.f, 0.f, 0.f},
             // areatrigger.sql: (145,0,-229.49,1576.35,78.8909,7,0,0,0,0)
             // areatrigger_teleport.sql: (145,'Shadowfang Keep Entrance',33,-229.135,2109.18,76.8898,1.267)
             // areatrigger.sql: (194,33,-230.953,2105.06,79.7533,5,0,0,0,0)
             // areatrigger_teleport.sql: (194,'Shadowfang keep - Entrance',0,-232.796,1568.28,76.8909,4.398)
-            {"shadowfang", 0, 145, 33, 194},
+            {"shadowfang", 0, 145, 33, 194, 0.f, 0.f, 0.f},
             // areatrigger.sql: (101,0,-8761.85,848.557,87.8052,0,4.972,9.694,7.444,0.6632)
             // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
             // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
             // areatrigger_teleport.sql: (503,'Stockades Instance',0,-8764.83,846.075,87.4842,3.77934)
-            {"stockades", 0, 101, 34, 503},
+            {"stockades", 0, 101, 34, 503, 0.f, 0.f, 0.f},
             // WAILING CAVERNS, AND THE FIRST ROW IN THIS TABLE WHOSE OUTSIDE
             // MAP IS NOT 0. The four numbers are read out of the pinned core's
             // own base world DB the same way every row above them is, and are
@@ -12020,7 +12057,27 @@ private:
             // OverseerDecisions::DungeonPortalApproach and its caller below.
             // The row is correct and it is not yet runnable, and those are two
             // different statements that both have to be true in public.
-            {"wailing", 1, 228, 43, 226},
+            // AND THE ONE ROW THAT CARRIES A CORRIDOR (#242). The three rows
+            // above end in three zeros, which is this table saying "walk
+            // straight at the door", and it is the right answer for all three:
+            // Deadmines, Shadowfang Keep and Stockades are all staged
+            // successfully on the dev realm today, and a corridor that has not
+            // been measured must not be invented for them.
+            //
+            // (-705.0, -2045.0, 66.45) is a terrace on the north-east side of
+            // the ravine, and it is where the only walkable descent to this
+            // door begins. From it the walk to the staging point is 465 yards
+            // to cover 179 yards of straight line, going first EAST and SOUTH
+            // around the rim and only then back west along y about -2185 to the
+            // floor. That shape is the whole defect: the way in starts by going
+            // away, and a bearing cannot be told to do that.
+            //
+            // The height is that navmesh tile's own lowest walkable surface at
+            // that x and y. It has a second surface 56 yards over it, which is
+            // why the runtime probe is started just above this z rather than
+            // from the terrain, exactly as DUNGEON_STAGING_Z_PROBE_LIFT_YARDS
+            // already does for the door.
+            {"wailing", 1, 228, 43, 226, -705.0f, -2045.0f, 66.45f},
         };
         return portals;
     }
@@ -12267,6 +12324,27 @@ private:
         // the grid loads, which is a gather that gets harder the closer it
         // gets. Resolved once, walked to, held to.
         float stageX{0.f}, stageY{0.f}, stageZ{0.f};
+        // WHETHER THE APPROACH CORRIDOR HAS BEEN WALKED YET (#242). A door
+        // whose portal row carries a corridor is approached in two legs, and
+        // this is the one bit that says which. It lives on the RUN and not on
+        // the portal because it is a fact about this leader on this approach,
+        // and it is cleared with the run: the next run of a campaign starts at
+        // the top of the corridor again, because the party comes back out of
+        // the door onto the ravine floor and has to be walked out and round.
+        //
+        // Sticky on purpose, and OverseerDecisions::ApproachLegStep is the only
+        // thing that ever sets it. Most of the descent takes the leader FURTHER
+        // from the corridor's start than he was when he reached it; without the
+        // stickiness every one of those polls would turn him round.
+        OverseerDecisions::ApproachRouteState approach;
+        // The aim string this run last claimed for the leader. Held so that the
+        // approach can be re-claimed WHEN THE LEG CHANGES and not on every
+        // poll: Claim deliberately drops the errand's memory, including the
+        // travel backstop's own clock, so claiming the same string every five
+        // seconds would keep resetting the clock that is supposed to notice a
+        // leader who is going nowhere. Empty until the first claim.
+        std::string legAim;
+        bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
         // TravelState, `stuckLogged` in RepickMemory) for the same reason:
@@ -12438,6 +12516,153 @@ private:
             << coord.stageY << ',' << coord.stageZ;
         aim = out.str();
         return true;
+    }
+
+    // THE GAP FROM A CHARACTER TO A PLACE ON THE PORTAL'S OUTSIDE MAP (#242).
+    // One function, because the approach now measures TWO of these every poll -
+    // the corridor's start and the staging point - and two readings taken
+    // separately are two chances to disagree. That is the same argument the
+    // single `gap` in GATHERING was already written on; it just has to hold for
+    // a pair now.
+    //
+    // GetMapId  Position.h:281  uint32 GetMapId() const
+    // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+    // GetPositionZ  Position.h:120  float GetPositionZ() const
+    static OverseerDecisions::ApproachGap DungeonGapTo(Player* who,
+                                                       DungeonPortal const& portal,
+                                                       float x, float y, float z)
+    {
+        OverseerDecisions::ApproachGap gap;
+        // LEFT UNMEASURED RATHER THAN ZEROED when there is nothing to read. A
+        // character on another map has no gap to a place on this one, and
+        // ApproachGap::measured exists precisely so that fact cannot be
+        // mistaken for having arrived.
+        if (!who || who->GetMapId() != portal.outsideMapId)
+            return gap;
+        gap.horizontalYards = who->GetDistance2d(x, y);
+        gap.verticalYards = who->GetPositionZ() - z;
+        gap.measured = true;
+        return gap;
+    }
+
+    // THE RUN'S APPROACH, PACKED THE WAY THE DECISION FILE READS IT (#242).
+    //
+    // The staging point is passed in rather than read off the coordinator,
+    // because the IDLE branch asks this question before it has written one:
+    // there the point is still a local, and reading a stale coordinator field
+    // instead would be judging the approach to the PREVIOUS run's door.
+    static OverseerDecisions::ApproachRoute DungeonApproachRoute(
+        DungeonPortal const& portal, Player* leader, float stageX, float stageY,
+        float stageZ)
+    {
+        OverseerDecisions::ApproachRoute route;
+        route.leaderToStagingPoint = DungeonGapTo(leader, portal, stageX, stageY, stageZ);
+
+        // (0, 0, 0) IS THIS TABLE'S "NO CORRIDOR", read through the module's
+        // own existing "that is not a place" rather than through a second flag
+        // that could disagree with it. See DungeonPortal::approachX.
+        route.hasWaypoint = OverseerDecisions::StagingPointUsable(
+            portal.approachX, portal.approachY, portal.approachZ);
+        if (!route.hasWaypoint)
+            return route;
+
+        route.leaderToWaypoint = DungeonGapTo(leader, portal, portal.approachX,
+                                              portal.approachY, portal.approachZ);
+
+        // HOW LONG THE CORRIDOR IS. A property of the two written-down places
+        // and not of the leader, so it is the same every poll of every run.
+        // Both are on `outsideMapId` by construction - the staging point is
+        // derived from two triggers on it, and the corridor is a row beside
+        // them - so this is a plain distance and not a crossing.
+        float const dx = portal.approachX - stageX;
+        float const dy = portal.approachY - stageY;
+        float const dz = portal.approachZ - stageZ;
+        route.waypointToStagingYards = std::sqrt(dx * dx + dy * dy + dz * dz);
+        return route;
+    }
+
+    // WHERE THE LEADER IS BEING WALKED THIS POLL, and the aim that says so.
+    //
+    // Both come back together on purpose. They were separate for one poll
+    // during development and that is exactly long enough to write an aim at one
+    // point and judge arrival against the other, which is the shape of the
+    // defect this whole change exists to remove.
+    struct DungeonApproachAim
+    {
+        OverseerDecisions::ApproachLeg leg{OverseerDecisions::ApproachLeg::Direct};
+        float x{0.f}, y{0.f}, z{0.f};
+        OverseerDecisions::ApproachGap gap{};   // the leader to THAT point
+        std::string aim;                        // "at:<map>:<x>,<y>,<z>"
+        bool usable{false};
+        std::string why;                        // why not, when it is not
+    };
+
+    // The one place a leg is chosen and an aim is formatted for it. `state` is
+    // the run's own ApproachRouteState and is the only thing here that is
+    // written to; see DungeonRunCoordinatorState::approach for why it sticks.
+    static DungeonApproachAim DungeonApproachAimFor(
+        DungeonPortal const& portal, OverseerDecisions::ApproachRouteState& state,
+        Player* leader, float stageX, float stageY, float stageZ)
+    {
+        DungeonApproachAim out;
+        OverseerDecisions::ApproachRoute const route =
+            DungeonApproachRoute(portal, leader, stageX, stageY, stageZ);
+        out.leg = OverseerDecisions::ApproachLegStep(state, route, DUNGEON_APPROACH_LIMITS);
+
+        if (out.leg == OverseerDecisions::ApproachLeg::ToWaypoint)
+        {
+            out.x = portal.approachX;
+            out.y = portal.approachY;
+            out.z = portal.approachZ;
+            out.gap = route.leaderToWaypoint;
+        }
+        else
+        {
+            out.x = stageX;
+            out.y = stageY;
+            out.z = stageZ;
+            out.gap = route.leaderToStagingPoint;
+        }
+
+        // THE DESTINATION IS CHECKED EVEN WHEN IT IS NOT THIS LEG'S TARGET,
+        // and that is #220's lesson applied to a new use site rather than
+        // belt and braces. A run whose STAGING POINT is not a place must not
+        // set off at all, and with a corridor in the picture it could: the
+        // corridor is a perfectly good place, so a leg of ToWaypoint would
+        // format a usable aim and walk the leader 1,161 yards toward a run
+        // whose destination is three zeros. Both callers happen to validate
+        // the staging point before they reach here - IDLE refuses when
+        // ResolveDungeonStagingPoint fails, and RESETTING derives it or fails -
+        // which is exactly the reasoning #220 was written to distrust. "A
+        // contract enforced only where a value is DERIVED protects exactly the
+        // paths that derive it", and this function is a new path.
+        OverseerDecisions::StagingPointVerdict const destination =
+            OverseerDecisions::StagingPointCheck(stageX, stageY, stageZ);
+        if (destination != OverseerDecisions::StagingPointVerdict::Usable)
+        {
+            out.why = OverseerDecisions::StagingPointRefusal(destination);
+            return out;
+        }
+
+        // AND THEN THIS LEG'S OWN TARGET, BY THE SAME REFUSAL. A corridor is a
+        // place like any other, so a corridor that is not a place is refused by
+        // the same check that refuses a staging point that is not one, and the
+        // run is closed with a sentence rather than walked at the middle of the
+        // map.
+        OverseerDecisions::StagingPointVerdict const verdict =
+            OverseerDecisions::StagingPointCheck(out.x, out.y, out.z);
+        if (verdict != OverseerDecisions::StagingPointVerdict::Usable)
+        {
+            out.why = OverseerDecisions::StagingPointRefusal(verdict);
+            return out;
+        }
+
+        std::ostringstream aim;
+        aim << "at:" << portal.outsideMapId << ':' << out.x << ',' << out.y << ','
+            << out.z;
+        out.aim = aim.str();
+        out.usable = true;
+        return out;
     }
 
     // THE BARRIER AND CROSSING PREDICATES NOW LIVE IN overseer_decisions.h,
@@ -14013,11 +14238,39 @@ private:
             // ordinary drives while this holds, so he moves; the moment the
             // approach reads walkable the flag is dropped and the run opens on
             // that same poll.
+            //
+            // AND IT IS ASKED ABOUT THE POINT THE LEADER WOULD ACTUALLY BE
+            // WALKED AT (#242), which for a door with a measured approach
+            // corridor is the corridor's start and not the door. That is the
+            // same rule on the right point rather than a weaker rule: a run
+            // that cannot be walked to is still refused, and for the three
+            // portal rows carrying no corridor the point is the staging point
+            // and this is bit-for-bit the check #228 wrote.
+            //
+            // WHAT IT IS WORTH, MEASURED. On the plateau 300 yards south of
+            // the ravine the door reads Overhead at 131 out and 76 up, so a run
+            // asked for from there is refused today; the corridor's start from
+            // the same spot reads Closing at 243 out and 26 up. The same holds
+            // from the plateau north of it and from the surface camp. Those are
+            // runs that can be walked and were being turned down.
+            //
+            // AND WHAT IT IS NOT WORTH, WHICH MATTERS JUST AS MUCH. From the
+            // rim itself the corridor is Overhead too - 105 yards down over 79
+            // along, and that holds for all 76 walkable samples matching the
+            // live stall shape. A party standing where they stopped is still
+            // held, and should be: there is no walk off that rim either. They
+            // are on their ordinary drives while this holds, so they move, and
+            // the run opens from the plateau. This does not rescue a party
+            // already on the rim and must not be read as doing so.
+            //
+            // The state is a scratch one: IDLE is deciding whether to open a
+            // run, not walking a leg, and marking the run's own corridor passed
+            // before the run exists is exactly the drift #220 is about.
             {
-                OverseerDecisions::ApproachGap gap;
-                gap.horizontalYards = leader->GetDistance2d(stageX, stageY);
-                gap.verticalYards = leader->GetPositionZ() - stageZ;
-                gap.measured = true;
+                OverseerDecisions::ApproachRouteState scratch;
+                DungeonApproachAim const first = DungeonApproachAimFor(
+                    *portal, scratch, leader, stageX, stageY, stageZ);
+                OverseerDecisions::ApproachGap const gap = first.gap;
                 if (OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) ==
                     OverseerDecisions::ApproachShape::Overhead)
                 {
@@ -14025,7 +14278,7 @@ private:
                     {
                         coord.loggedAboveTheDoor = true;
                         LOG_WARN("module.overseer",
-                                 "overseer: dungeon run held - the '{}' staging point is "
+                                 "overseer: dungeon run held - the '{}' {} is "
                                  "({:.1f}, {:.1f}, {:.1f}) and the leader '{}' is {}. That "
                                  "is above it, not near it: no walk toward it from there "
                                  "descends, and the last-step footing check would refuse "
@@ -14033,7 +14286,11 @@ private:
                                  "aimed or moved, so nothing holds the party at the edge; "
                                  "the run opens on the first poll the leader is somewhere "
                                  "the approach can be walked from",
-                                 portal->keyword, stageX, stageY, stageZ, leaderName,
+                                 portal->keyword,
+                                 first.leg == OverseerDecisions::ApproachLeg::ToWaypoint
+                                     ? "approach corridor starts at"
+                                     : "staging point is",
+                                 first.x, first.y, first.z, leaderName,
                                  OverseerDecisions::ApproachWhere(gap));
                     }
                     return;
@@ -14362,9 +14619,20 @@ private:
                              coord.stageZ);
                 }
 
-                std::string aimTarget;
-                std::string aimWhy;
-                if (!DungeonStagingAim(*portal, coord, aimTarget, aimWhy))
+                // A FRESH RUN WALKS THE CORRIDOR AGAIN (#242). The party
+                // comes back out of the door onto the ravine floor, so the run
+                // that follows starts below the corridor rather than above it -
+                // but it still has to be walked out and round, and a leftover
+                // "already passed" from the previous run would aim the next one
+                // straight back at the rim.
+                coord.approach = OverseerDecisions::ApproachRouteState();
+                coord.legAim.clear();
+                coord.loggedCorridor = false;
+
+                DungeonApproachAim const first = DungeonApproachAimFor(
+                    *portal, coord.approach, leader, coord.stageX, coord.stageY,
+                    coord.stageZ);
+                if (!first.usable)
                 {
                     // Unreachable while the derivation above is the only way to
                     // get here with a point - and said out loud rather than
@@ -14372,9 +14640,10 @@ private:
                     // believed about three zeros reaching a travel errand.
                     FailRunAtReset(coord, leaderName, members, *portal,
                                    "the instance was reset but no staging aim can be "
-                                   "written - " + aimWhy);
+                                   "written - " + first.why);
                     return;
                 }
+                std::string const& aimTarget = first.aim;
 
                 // CLAIM, not a raw UPDATE: the run supersedes whatever the
                 // leader was doing, and taking the wheel also drops any errand
@@ -14388,16 +14657,21 @@ private:
                 // being hypothetical: every run after the first aims at the
                 // identical string the previous run just finished with.
                 _travelAims.Claim(leaderName, aimTarget);
+                coord.legAim = aimTarget;
 
                 coord.phase = DungeonRunPhase::Gathering;
                 coord.loggedGathering = false;
                 LOG_INFO("module.overseer",
                          "overseer: dungeon run {} of {} - map {} is reset and '{}' is "
-                         "aimed at the staging point ({}); GATHERING begins {:.0f}y back "
+                         "aimed at {} ({}); GATHERING begins {:.0f}y back "
                          "down the approach corridor from areatrigger {}",
                          coord.runNumber, coord.capKnown ? coord.runsWanted : 0,
-                         portal->insideMapId, leaderName, aimTarget,
-                         DUNGEON_STAGING_STANDOFF_YARDS, portal->entryTriggerId);
+                         portal->insideMapId, leaderName,
+                         first.leg == OverseerDecisions::ApproachLeg::ToWaypoint
+                             ? "the start of the approach corridor"
+                             : "the staging point",
+                         aimTarget, DUNGEON_STAGING_STANDOFF_YARDS,
+                         portal->entryTriggerId);
                 return;
             }
 
@@ -14447,12 +14721,78 @@ private:
             // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
             // GetPositionZ  Position.h:120  float GetPositionZ() const
             bool const onTheOutsideMap = leader->GetMapId() == portal->outsideMapId;
-            OverseerDecisions::ApproachGap gap;
-            if (onTheOutsideMap)
+
+            // WHICH LEG IS BEING WALKED, AND THE GAP TO THE POINT IT ENDS AT
+            // (#242). This used to be the gap to the staging point and nothing
+            // else, which is right for a door you can walk straight at and
+            // wrong for one at the bottom of a ravine: the party arrived 97
+            // yards out and 152 yards ABOVE the Wailing Caverns staging point,
+            // on walkable ground with no walkable way down from it, and every
+            // number this phase then read was a number about a place on the far
+            // side of a cliff.
+            //
+            // The leg is chosen by OverseerDecisions::ApproachLegStep, and for
+            // the three portal rows that carry no corridor it is always Direct
+            // and this is exactly the reading it always was.
+            DungeonApproachAim const legAim = DungeonApproachAimFor(
+                *portal, coord.approach, leader, coord.stageX, coord.stageY,
+                coord.stageZ);
+            OverseerDecisions::ApproachGap const gap = legAim.gap;
+            bool const onTheCorridor =
+                legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
+
+            // AND THE AIM FOLLOWS THE LEG, RE-CLAIMED ONLY WHEN IT CHANGES.
+            // A leg that ends hands the leader on to the next point in the same
+            // poll it ends in, so without this he would arrive at the corridor
+            // and then stand there under an aim that had been satisfied. Guarded
+            // on the string because Claim drops the errand's memory: see
+            // DungeonRunCoordinatorState::legAim.
+            if (onTheOutsideMap && legAim.usable && legAim.aim != coord.legAim)
             {
-                gap.horizontalYards = leader->GetDistance2d(coord.stageX, coord.stageY);
-                gap.verticalYards = leader->GetPositionZ() - coord.stageZ;
-                gap.measured = true;
+                _travelAims.Claim(leaderName, legAim.aim);
+                coord.legAim = legAim.aim;
+
+                // AND A FRESH LEG GETS A FRESH RATCHET, which is not tidying:
+                // without it the second leg is given up on at ninety seconds
+                // every single time. DUNGEON_STAGING_RATCHET tracks the BEST
+                // distance to the point being walked at, and the point changes
+                // here. The leader reaches the corridor at about four yards,
+                // so `best` is four; the very next reading is his distance to
+                // the staging point, which for the Wailing Caverns corridor is
+                // 179 yards and falling. A ratchet that kept the four would
+                // read every yard of a 465 yard descent as no progress, start
+                // the stall clock at the top of it, and climb the correction
+                // ladder to GiveUp while the leader was walking correctly.
+                //
+                // This is the same clearing, for the same reason, that BARRIER
+                // already does on entry: a new thing to measure against is a
+                // new measurement. The whole-run clock `stagingSince` is
+                // deliberately NOT reset - it bounds the assembly end to end,
+                // and a leg change is not a new assembly.
+                coord.staging.clear();
+
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is now walking at {} ({}) - {}",
+                         leaderName,
+                         onTheCorridor ? "the start of the approach corridor"
+                                       : "the staging point",
+                         legAim.aim, OverseerDecisions::ApproachWhere(gap));
+            }
+
+            // SAID ONCE, AND ONLY WHERE THERE IS A CORRIDOR TO SAY IT ABOUT.
+            // An operator reading the log for a door that has one should be
+            // able to see that the party is deliberately walking away from it
+            // first, rather than read a run going the wrong way.
+            if (onTheCorridor && !coord.loggedCorridor)
+            {
+                coord.loggedCorridor = true;
+                LOG_INFO("module.overseer",
+                         "overseer: the '{}' door is at the bottom of a ravine and is "
+                         "reached by a corridor, not by a bearing: '{}' walks to "
+                         "({:.1f}, {:.1f}, {:.1f}) first and to the staging point after "
+                         "that. Walking straight at the door ends on the rim above it",
+                         portal->keyword, leaderName, portal->approachX,
+                         portal->approachY, portal->approachZ);
             }
 
             // AND GATHERING IS BOUNDED (#165). It had no bound of its own at
@@ -14489,7 +14829,14 @@ private:
             // party to assemble somewhere it could not leave.
             OverseerDecisions::ApproachShape const shape =
                 OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS);
-            if (shape != OverseerDecisions::ApproachShape::Arrived)
+            // ARRIVING AT THE CORRIDOR IS NOT ARRIVING AT THE DOOR (#242).
+            // ApproachLegStep already guarantees this - the poll a leader
+            // reaches the corridor is the poll it returns Direct, so a leg of
+            // ToWaypoint cannot also be an arrival - but BARRIER opening from
+            // the top of a corridor would strand the whole party 465 yards from
+            // the door, so the invariant is asserted here rather than relied on
+            // from another file.
+            if (onTheCorridor || shape != OverseerDecisions::ApproachShape::Arrived)
             {
                 // AND GATHERING FINALLY WATCHES THE ONE CHARACTER IT IS WAITING
                 // FOR (#217). It never did: it returned and waited, so a leader
@@ -14501,10 +14848,21 @@ private:
                 //
                 // The state lives in the same per-member map BARRIER uses, and
                 // BARRIER clears it on entry, so a fresh ladder starts there.
+                //
+                // AND THE REASON NAMES WHICH POINT WAS NOT REACHED (#242).
+                // A leader stalled on the way to the corridor and one stalled
+                // on the way to the door are different failures with different
+                // fixes, and a line that said only "the staging point" for both
+                // would send the next reader to the wrong one.
                 if (RunStagingWatchdog(coord, leaderName, leader, gap))
                     FailApproach(coord, leaderName, *portal, "GATHERING",
                                  leaderName + " (" +
-                                     OverseerDecisions::ApproachWhere(gap) + ")",
+                                     OverseerDecisions::ApproachWhere(gap) +
+                                     (onTheCorridor
+                                          ? ", walking to the start of the approach "
+                                            "corridor"
+                                          : "") +
+                                     ")",
                                  IsDungeonJob(leaderJob));
                 return;
             }

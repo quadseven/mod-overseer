@@ -563,6 +563,119 @@ float ApproachDistance(ApproachGap const& gap);
 // because every failure line this replaces named the symptom and not the cause.
 std::string ApproachWhere(ApproachGap const& gap);
 
+// A DOOR AT THE BOTTOM OF A RAVINE IS REACHED BY A CORRIDOR, NOT BY A BEARING
+// (#242).
+//
+// WHAT WAS WATCHED. On 2026-09-05 at 18:03 the party set out for the Wailing
+// Caverns entrance and arrived on the high ground over it: 97 yards out and 152
+// yards above the staging point, and no nearer after ninety seconds. #228's
+// rule read that correctly as Overhead and closed the run naming the cause,
+// which is the outcome that stopped the falls. Nobody died. But the run still
+// could not be staged, because the refusal is about the LAST yards and the
+// defect is in the route that led to them.
+//
+// WHERE THE WAY IN ACTUALLY IS, read off the same navmesh the core's own
+// pathfinder reads: mmaps/0013336.mmtile, map 1 grid 33/36, which holds the
+// door and the rim over it, and its neighbours, which hold the corridor - the
+// terrace named below is on 0013335.mmtile, grid 33/35.
+// The entrance sits on the floor of a ravine at z 16.8. Directly over it, at
+// the same x and y, there is a second walkable surface at z 161.9 - which is
+// the ground the party keeps standing on, and it is genuinely walkable, so
+// nothing about arriving there is a pathfinding error to be corrected. The only
+// walkable descent runs north-east of the ravine: a terrace at about
+// (-705, -2045, 66.5), then east and south around the rim, then back west along
+// y about -2185 to the door. From the terrace that is 465 yards of walking to
+// cover 179 yards of straight line.
+//
+// The world's own data says the same thing twice over. waypoint_data path
+// 138070, the world database's own patrol for the creature at guid 13807,
+// walks (-642.07, -2185.48, 45.34) down to (-719.33, -2224.44, 16.96) - the
+// bottom of that corridor, point for point. And the creature spawns descend the
+// same line: (-602, -2178, 49.8), (-643, -2182, 45.1), (-694, -2193, 31.0),
+// (-704, -2195, 26.4), (-682, -2232, 17.4). A spawn point and a patrol point
+// are both standable ground asserted by somebody other than this module.
+//
+// WHY A BEARING CANNOT FIND IT. The core's pathfinder is bounded twice over: it
+// searches with a pool of 1024 nodes (MMapMgr.cpp, the query is built with
+// exactly that) and returns at most MAX_PATH_LENGTH polygons (148 under
+// MOD_PLAYERBOTS). Asked for a point it cannot reach inside those bounds it
+// answers with the NEAREST POLYGON it did reach, which is the same behaviour
+// RoutedPathGoesWhereAsked below already exists to catch. Over a ravine, the
+// nearest polygon it reached is the rim, and from the rim the next answer is
+// the same rim. That is a fixed point, and it is where the party stood for
+// ninety seconds.
+//
+// SO THE FIX IS A PLACE, NOT A RULE. A door whose corridor has been measured
+// carries the point where that corridor starts, and the leader walks at that
+// first. Nothing here tries to make general pathfinding descend a cliff, and
+// nothing here weakens #228: the approach is still judged, still refused when
+// it stalls, and still refused from above. It is judged against the leg being
+// walked rather than against a point on the far side of a cliff.
+//
+// THIS IS DELIBERATELY NARROW. Three of the four doors in the portal table
+// carry no corridor and need none: Deadmines, Shadowfang Keep and Stockades are
+// all staged successfully on the dev realm today, and a corridor that has not
+// been measured must not be invented. A row with no corridor gets exactly the
+// behaviour it has now, which is what the Direct leg below means.
+
+// Which of the two points the leader is walking at this poll.
+enum class ApproachLeg : std::uint8_t
+{
+    // Straight at the staging point. This is every row that carries no
+    // corridor, and every leader who is already past the one his row carries.
+    Direct,
+    // At the corridor's start first. The staging point is still where the run
+    // is going; it is not where this leg ends.
+    ToWaypoint,
+};
+
+// The readings the choice is made on. All three come from the same poll, so a
+// caller that could not measure one could not measure any of them.
+struct ApproachRoute
+{
+    // False for a portal row that carries no corridor, which is the answer for
+    // (0,0,0) - the same "that is not a place" the staging point's own
+    // StagingPointCheck already gives. No second flag is invented for it.
+    bool hasWaypoint{false};
+    ApproachGap leaderToWaypoint{};      // leader -> the corridor's start
+    ApproachGap leaderToStagingPoint{};  // leader -> the door's staging point
+    // How far the corridor's start is from the staging point, in three
+    // dimensions. A property of the two written-down places and not of the
+    // leader, so it is the same every poll of a run. Negative means "no
+    // reading", the convention ApproachDistance already returns.
+    float waypointToStagingYards{-1.f};
+};
+
+// The sticky half. A leg that has been walked is not walked again inside one
+// run: without this the leader would be sent back up the corridor every time
+// the descent took him briefly further from its start than he was when he
+// reached it, which is most of the descent.
+struct ApproachRouteState
+{
+    bool waypointPassed{false};
+};
+
+// WHICH POINT TO AIM AT, and the one place `waypointPassed` is ever set.
+//
+// It is set on two different facts, and both of them are needed. The first is
+// arrival: the leader reached the corridor's start, so the leg is done. The
+// second is that the leader is ALREADY NEARER THE DOOR THAN THE CORRIDOR'S
+// START IS, on ground a walk can cover - a party standing at the door after a
+// run, or one that came in some other way. Sending those back out to the
+// corridor would be walking away from the run.
+//
+// The second test is guarded by the shape and not only by the distance, and
+// that guard is the whole of it. The walkable surface directly over the Wailing
+// Caverns door stands at z 161.9 against the staging point's 16.8: nought yards
+// out and 145 above, which is 145 yards away in three dimensions. The corridor's
+// start is 179 from the same point. So the rim - the one place this whole fix
+// exists for - is THIRTY-FOUR YARDS NEARER THE DOOR than the corridor is, and
+// on distance alone the corridor would be skipped precisely there. It is
+// Overhead, so it is not.
+ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& route,
+                            ApproachLimits const& limits);
+
+
 // A ROUTE MUST END WHERE IT WAS ASKED TO END.
 //
 // PathGenerator answers an unreachable point with the NEAREST POLYGON it could
