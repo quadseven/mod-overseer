@@ -1427,6 +1427,132 @@ bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
 bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
                      std::string const& reason, time_t now);
 
+// --------------------------------------------- the command queue drain (#230) --
+//
+// "THE QUEUE IS NOT STALLED. IT IS ATTEMPTING THE SAME TWENTY ROWS FOREVER."
+//
+// Measured on the dev realm, 2026-09-05 16:37 UTC. Nothing had reached a
+// terminal status since 16:11:03, 337 rows were pending and still growing, and
+// the drain was running on time the whole while: the twenty oldest pending rows
+// were re-touched every two seconds, the same twenty ids, all `kind = 'sell'`,
+// all carrying `detail = 'vendor not in range'`. Twenty is COMMANDS_PER_POLL.
+// The 322 rows behind them were never read at all, and not one line of log
+// mentioned the queue in twenty minutes.
+//
+// A retry that keeps its place at the head of a FIFO is not a retry, it is a
+// lock. The row that holds the head is fixed by `ORDER BY id ASC`, and the
+// refusal handed it back with its low id intact, so the queue drained in the
+// only order it could: the same twenty rows, over and over, while every command
+// asked after them waited on a sale that was never going to happen from where
+// those characters were standing. The module tick was perfectly healthy
+// throughout, which is exactly why nobody noticed for twenty five minutes.
+//
+// TWO RULES ARE HERE, AND NEITHER OF THEM IS "RETRY BETTER". The retry itself
+// is deleted at the call site rather than tuned: a refusal now leaves through
+// `detail` and `result` and the side that asked re-queues a FRESH row at the
+// TAIL, which is what mod-overseer#227 chose for the two sibling verbs an hour
+// before this was written, and which the queue was already doing on its own
+// (measured: 178 pending sales for 21 distinct asks, the same item queued ten
+// times over forty five minutes). What is left here is the two things that
+// cannot be fixed by deleting four lines.
+//
+//   A CLAIM EXPIRES. A row moved to `claimed` before it is executed - which is
+//   what makes this queue at-most-once for commands that create items and move
+//   characters - is invisible to `WHERE status = 'pending'` for the rest of
+//   time if the run holding it goes away. Nothing else in the world ends it. It
+//   expires to `error` rather than back to `pending`, because handing one back
+//   would undo the exact property the claim exists to provide.
+//
+//   THE QUEUE SAYS WHEN IT IS NOT DRAINING. This defect was invisible in the
+//   log and obvious in one database query, which is the wrong way round. A poll
+//   that selects rows and executes none of them, or a backlog whose oldest row
+//   is not being reached, is a line of log at the moment it starts rather than a
+//   thing somebody finds later. Rate limited, because the poll is every two
+//   seconds and a complaint repeated nine hundred times an hour is its own
+//   outage, and it says so ONCE when it clears so the log has an end as well as
+//   a beginning.
+//
+// KEPT FREE OF EVERY CORE TYPE, like everything else in this pair of files. A
+// rule whose whole content is "how many are waiting, how old is the oldest, who
+// holds this, and have we said so lately" needs no world, no bot and no
+// database to be exercised, which is the only way to pin the boundaries of it
+// at all.
+
+// Is a row sitting in a non-terminal status abandoned, so the drain should end
+// it rather than leave it where nothing can select it?
+//
+// Three ways to get this wrong, which is why it is a function and not an
+// inequality at the call site. It must not fire on a claim THIS run holds (that
+// row is in flight by definition, and ending it would be the drain cancelling
+// its own work a moment before it writes the result). It must not fire on a row
+// younger than the lease, because a `verifying` row is supposed to sit for
+// VERIFY_GRACE_MS while its post-condition is read back. And an empty
+// `claimed_by` on a non-pending row is abandoned on anybody's reading: nothing
+// that ever held it can still be holding it under a name that is not there.
+//
+// `heldForSeconds` is an AGE rather than a pair of timestamps, because that is
+// how the answer actually arrives: the call site reads it as TIMESTAMPDIFF from
+// the database, so both ends of the subtraction are the database's clock and a
+// worldserver whose host clock has drifted cannot expire a live claim or keep a
+// dead one.
+bool ClaimIsAbandoned(std::string const& claimedBy, std::string const& runToken,
+                      time_t heldForSeconds, time_t leaseSeconds);
+
+// What one poll of the drain saw, which is everything the voice below judges.
+struct CommandQueueSnapshot
+{
+    unsigned pending{0};   // rows waiting when this poll picked up its work
+    unsigned executed{0};  // rows this poll actually attempted
+    unsigned held{0};      // rows this poll selected and could NOT attempt
+    // Seconds since the oldest waiting row was last touched. Age since it was
+    // touched rather than since it was created, because a row that is being
+    // worked on is not being starved even if the ask is old.
+    time_t oldestPendingAge{0};
+};
+
+// The limits the snapshot is judged against.
+struct CommandQueueVoiceLimits
+{
+    // A waiting row untouched for longer than this is not being reached. It has
+    // to be well past a full drain of a deep queue: at COMMANDS_PER_POLL rows
+    // every COMMAND_POLL_MS, the queue would have to be many hundreds of rows
+    // deep for a two minute old row to be honest work rather than starvation.
+    time_t stuckSeconds{0};
+    // More rows waiting than this is worth saying once, even while they move.
+    unsigned deepRows{0};
+    // ...and not worth saying again inside this. The poll is every two seconds
+    // and the give backoff next door already records what happens to a log when
+    // a per-poll condition gets a per-poll line.
+    time_t repeatSeconds{0};
+};
+
+// What the drain has already said, so it does not say it again every poll.
+struct CommandQueueVoiceState
+{
+    bool complaining{false};  // an unwell verdict is currently standing
+    time_t lastSaid{0};       // when anything was last said
+};
+
+enum class CommandQueueVoice
+{
+    Silent,    // nothing worth a line, or it has been said recently enough
+    Deep,      // a lot is waiting, and it is moving
+    Stuck,     // rows are waiting and are not being reached
+    Recovered  // it was one of the two above, and is not any more
+};
+
+// Judge one poll, and remember what was said. STUCK OUTRANKS DEEP: a queue can
+// be both, and "it is deep" is the reassuring half of that pair, so a stuck
+// queue must never be reported as merely a busy one.
+//
+// The livelock signature is called out WITHOUT waiting for `stuckSeconds`: a
+// poll that selected rows and executed none of them is already wrong, whatever
+// the ages say, and on 2026-09-05 that was true on the very first poll and
+// stayed true for eight hundred more.
+CommandQueueVoice CommandQueueSay(CommandQueueVoiceState& state,
+                                  CommandQueueSnapshot const& snapshot, time_t now,
+                                  CommandQueueVoiceLimits const& limits);
+
 // ------------------------------------------------------------- gear (#145) --
 //
 // WHAT AN ITEM IS WORTH TO ONE CHARACTER, AND WHETHER IT MAY WEAR IT AT ALL.
