@@ -775,6 +775,12 @@ constexpr float TRAVEL_GROUND_SAMPLE_YARDS = 4.0f;
 // being refused is a single step into thin air, which is what a cliff is.
 constexpr float TRAVEL_GROUND_DROP_YARDS = 10.0f;
 
+// HOW FAR THE SURFACE MAY RISE BETWEEN TWO FOUR-YARD SAMPLES. A larger rise
+// is a rock face or wall, not a walkable slope. The old check only rejected
+// drops, so an unreachable quest point on a mountainside was approached by
+// repeated straight uphill steps even after navmesh had refused the route.
+constexpr float TRAVEL_GROUND_RISE_YARDS = 8.0f;
+
 // HOW FAR AN AIM'S OWN Z MAY BE CORRECTED onto the surface under it before the
 // correction is refused as relocating the aim rather than grounding it. Small
 // on purpose: an areatrigger's coordinates are the middle of its box, and the
@@ -8140,6 +8146,8 @@ private:
             }
             if (footing - next > TRAVEL_GROUND_DROP_YARDS)
                 return false;
+            if (next - footing > TRAVEL_GROUND_RISE_YARDS)
+                return false;
             footing = next;
         }
         return true;
@@ -10555,6 +10563,17 @@ private:
             // led the character onto the invalid surface. Leaving it in
             // overseer_roster would make DriveQuests select the same bad
             // target again immediately after the bind-point teleport.
+            // Keep the quest picker from selecting that same objective again
+            // in this process as well. Clearing the aim alone only removes
+            // the current coordinate; the quest remains in the log and was
+            // otherwise eligible on the very next poll.
+            if (questAim)
+            {
+                AimState& aimState = _lastAim[LowerName(name)];
+                aimState.repick.givenUp[questAim] = std::time(nullptr);
+                aimState.repick.lastPicked = 0;
+                aimState.repick.strikes = 0;
+            }
             ClearAim(name);
             bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
                             home->m_homebindY, home->m_homebindZ, 0.f);
