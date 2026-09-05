@@ -935,6 +935,157 @@ struct GearContender
 
 std::string GearNeedWinner(std::vector<GearContender> const& contenders);
 
+// ----------------------------------------------------------------- auction --
+//
+// THE PARTS OF kind='auction' THAT NEED NO WORLD: reading the command text,
+// the three-value duration rule, the bid rule as the core applies it, what a
+// bid actually costs, and whether a refusal is worth trying again unchanged.
+//
+// WHY THESE ARE HERE AND NOT NEXT TO DoAuction. The executor in
+// mod_overseer.cpp drives WorldSession::HandleAuctionSellItem /
+// HandleAuctionPlaceBid / HandleAuctionRemoveItem, and every one of those
+// answers the CLIENT - a status packet on the session, void return - so the
+// module has to test each refusal itself before the call in order to name it.
+// Most of those tests are questions about the world (is there an auctioneer
+// in reach, is the item soulbound, does the house hold that id). The ones
+// below are not: they are arithmetic on numbers the caller has already read,
+// and a rule like "is 105 copper enough over a 100 copper bid" that nothing
+// can exercise without a running worldserver is a rule nobody will check.
+//
+// THE GRAMMAR, one verb per row, `target_arg` unused:
+//
+//   list guid:<item_instance.guid> bid:<copper> buyout:<copper> hours:<12|24|48>
+//   buy auction:<auctionhouse.id>
+//   bid auction:<auctionhouse.id> bid:<copper>
+//   cancel auction:<auctionhouse.id>
+//
+// `key:value` pairs after the verb, in any order, each at most once. Every
+// value is a decimal copper amount or an id; there is no gold/silver notation
+// because the Python side already speaks copper (it reads `auctionhouse` and
+// `item_instance` directly for browsing, so it never needs the executor to
+// translate). `buyout:0` means no buyout, which is what the core means by it
+// (AuctionHouseHandler.cpp:492, `auction->buyout == 0`).
+
+enum class AuctionVerb
+{
+    None,    // did not parse; `error` says why
+    List,
+    Buy,
+    Bid,
+    Cancel,
+};
+
+struct AuctionRequest
+{
+    AuctionVerb verb{AuctionVerb::None};
+    uint32_t itemGuid{0};    // list: the carried item_instance guid
+    uint32_t auctionId{0};   // buy, bid, cancel: the auctionhouse.id
+    uint32_t bid{0};         // list: the starting bid; bid: the bid placed
+    uint32_t buyout{0};      // list: 0 = no buyout
+    uint32_t hours{0};       // list: 12, 24 or 48
+    // Empty when it parsed; otherwise one of the AuctionRefusal literals below,
+    // which have static storage so the executor can hand it on as `detail`
+    // without copying.
+    char const* error{""};
+};
+
+AuctionRequest ParseAuctionRequest(std::string const& command);
+
+// The listing lengths the core accepts, as the packet carries them. The sell
+// handler reads `etime` in MINUTES, multiplies by MINUTE and then accepts
+// exactly 1x, 2x and 4x MIN_AUCTION_TIME, which is 12 hours
+// (AuctionHouseHandler.cpp:156-193, AuctionHouseMgr.h:34); anything else
+// returns without a word. So hours:12/24/48 become 720/1440/2880, and every
+// other hour count is 0 here and a named refusal in the row.
+uint32_t AuctionDurationMinutes(uint32_t hours);
+
+// THE BID RULE, in the order HandleAuctionPlaceBid applies it
+// (AuctionHouseHandler.cpp:487-497). The core says nothing on any of these -
+// it simply returns - so this is the only place a bot learns which one it hit.
+//
+//   NotAboveCurrent  price <= the standing bid, or below the starting bid
+//   BelowIncrement   not a buyout, and short of bid + the core's outbid step
+//   Ok               the core will take it (money permitting)
+//
+// `outbidStep` is the core's own AuctionEntry::CalculateAuctionOutBid(bid)
+// (AuctionHouseMgr.cpp:580-584: 5% of the bid, or 1 copper), passed in rather
+// than recomputed here so this file does not carry a second copy of a rule
+// the core owns. A buyout (price >= buyout, buyout != 0) skips the increment
+// test, exactly as the handler does.
+enum class AuctionBidVerdict
+{
+    Ok,
+    NotAboveCurrent,
+    BelowIncrement,
+};
+
+AuctionBidVerdict AuctionBidAcceptable(uint32_t price, uint32_t startBid,
+                                       uint32_t currentBid, uint32_t buyout,
+                                       uint32_t outbidStep);
+
+// WHAT A BID OR BUYOUT COSTS THE BIDDER, which is not always the price: a
+// bidder raising their own standing bid pays only the difference
+// (AuctionHouseHandler.cpp:512-513 for a bid, :553-554 for a buyout). The
+// module checks HasEnoughMoney against this figure, not against the price, so
+// a character topping up their own bid is not refused for money they are not
+// about to spend.
+uint32_t AuctionBidCost(uint32_t price, uint32_t currentBid, bool alreadyTopBidder);
+
+// THE REFUSAL LITERALS, in one place. Each is written into `detail` and into
+// result.reason by DoAuction, and AuctionRefusalRetryable below is keyed on
+// them, so a literal that drifts between the two sides would silently turn a
+// permanent refusal into a retried one. Keeping them here is what keeps the
+// classification honest, and it is why the test exercises them by these
+// names rather than by retyped strings.
+namespace AuctionRefusal
+{
+constexpr char const* Malformed          = "malformed auction command";
+constexpr char const* InvalidDuration    = "invalid duration (want hours:12, 24 or 48)";
+constexpr char const* NoStartBid         = "no starting bid";
+constexpr char const* ZeroBid            = "bid is zero";
+constexpr char const* BuyoutBelowBid     = "buyout below starting bid";
+constexpr char const* PriceTooHigh       = "price above the money cap";
+constexpr char const* NotInRange         = "auctioneer not in range";
+constexpr char const* NoSession          = "character has no session";
+constexpr char const* NoHouse            = "auctioneer belongs to no auction house";
+constexpr char const* Dead               = "character is dead";
+constexpr char const* InCombat           = "character is in combat";
+constexpr char const* Trading            = "character is in a trade";
+constexpr char const* InFlight           = "character is on a flight path";
+constexpr char const* Stunned            = "character is stunned";
+constexpr char const* LoggingOut         = "character is logging out";
+constexpr char const* BelowLevel         = "below the auction level requirement";
+constexpr char const* ItemNotCarried     = "item not carried";
+constexpr char const* ItemSoulbound      = "item is soulbound";
+constexpr char const* ItemQuest          = "item is a quest item";
+constexpr char const* ItemNotTradable    = "item cannot be traded";
+constexpr char const* ItemAlreadyListed  = "item is already in an auction";
+constexpr char const* CannotAffordDeposit = "cannot afford deposit";
+constexpr char const* CannotAffordBuyout = "cannot afford buyout";
+constexpr char const* CannotAffordBid    = "cannot afford bid";
+constexpr char const* CannotAffordCut    = "cannot afford the cancel cut";
+constexpr char const* BidTooLow          = "bid too low";
+constexpr char const* NoBuyout           = "auction has no buyout";
+constexpr char const* AuctionNotFound    = "auction not found";
+constexpr char const* AuctionItemMissing = "auction item missing from the house";
+constexpr char const* WrongHouse         = "wrong auction house";
+constexpr char const* OwnAuction         = "own auction";
+constexpr char const* NotOwnAuction      = "not own auction";
+constexpr char const* CoreRefused        = "the core refused the transaction";
+constexpr char const* NotReadBack        = "the transaction did not read back";
+}  // namespace AuctionRefusal
+
+// IS THIS REFUSAL WORTH ASKING AGAIN WITHOUT CHANGING THE ROW. True for the
+// walls that move on their own - the character is fighting, dead, mid-trade,
+// mid-flight, short of money, or not yet standing at the auctioneer the
+// Python side is walking it to. False for everything the same row will hit
+// again for ever: a malformed command, a soulbound or quest item, an auction
+// that is gone or belongs to the wrong person, a bid the arithmetic rejects.
+// Written into result.retryable so the sender can tell a "wait" from a "stop"
+// without keeping its own list of this module's strings; the give backoff
+// (mod-overseer#169) is what happens when a sender cannot tell the two apart.
+bool AuctionRefusalRetryable(std::string const& reason);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

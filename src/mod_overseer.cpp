@@ -34,6 +34,12 @@
  *                     unconditional null-master dereference reachable
  *                     (AcceptQuestAction.cpp:139). Neither divider nor packet
  *                     is touched here; see 2026_08_24_03_overseer_share.sql.
+ *       kind='auction' - list an item target_name carries on the auction house,
+ *                     buy or bid on an auction, or cancel one, through the
+ *                     core's own auction handlers driven with a built packet.
+ *                     Every refusal the handler would make silently is named
+ *                     first, and the outcome is read back from the house and
+ *                     the bags. See 2026_09_04_03_overseer_auction.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -98,12 +104,16 @@
  * race.
  */
 
+#include "AuctionHouseMgr.h"
+#include "CellImpl.h"
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "Corpse.h"
 #include "Log.h"
 #include "DatabaseEnv.h"
 #include "GameGraveyard.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 // The core reporting its own commit, the same call Banner.cpp makes for the
 // startup line. It is what lets a realm say which AzerothCore it is running
 // without anybody having to declare it (mod-overseer#184).
@@ -156,6 +166,7 @@
 // compiles only by accident of somebody else's include is a catch
 // that stops compiling when they tidy up.
 #include <exception>
+#include <list>
 #include <map>
 #include <mutex>
 #include <random>
@@ -15055,12 +15066,13 @@ private:
             char const* detail = "";
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share' and 'job' do not go through PlayerbotAI::HandleCommand
+            // 'share', 'job' and 'auction' do not go through PlayerbotAI::HandleCommand
             // and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
-                && kind != "trade" && kind != "share" && kind != "job")
+                && kind != "trade" && kind != "share" && kind != "job"
+                && kind != "auction")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -15145,6 +15157,8 @@ private:
                 detail = DoShare(player, targetArg, command, status, rowResult);
             else if (kind == "job")
                 detail = DoJob(player, command, status);
+            else if (kind == "auction")
+                detail = DoAuction(player, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -16436,6 +16450,458 @@ private:
                  itemGuid.GetCounter(), itemEntry, giver->GetName(), receiver->GetName());
 
         describe("moved", "");
+        status = "delivered";
+        return "";
+    }
+
+
+    // ------------------------------------------------------------- auction --
+    //
+    // Put an item a family member carries up for auction, buy or bid on an
+    // auction, or take one down, through the core's own auction handlers.
+    //
+    // WHY THE CORE'S PATH AND NOT A REIMPLEMENTATION. Everything an auction
+    // touches lives in three places at once: the in-memory house
+    // (AuctionHouseObject), the `auctionhouse` table, and the item's
+    // ownership (the auctioned item is pulled out of the bag and parked in
+    // sAuctionMgr's item map until it sells or expires). The core keeps the
+    // three in step inside WorldSession::HandleAuctionSellItem
+    // (AuctionHouseHandler.cpp:117-422), HandleAuctionPlaceBid (:425-591) and
+    // HandleAuctionRemoveItem (:594-668), including the deposit
+    // (AuctionHouseMgr::GetAuctionDeposit, AuctionHouseMgr.cpp:92-111), the
+    // house cut, the outbid refund and the mails that carry items and money
+    // to their new owners. Any module copy of that would drift from the
+    // core's fees and from what everything else reading the table expects.
+    // So the module builds the packet a client would send and calls the
+    // handler directly, the way DoTrade above drives the trade handlers; the
+    // handlers are public (WorldSession.h:684 onwards, :907-910).
+    //
+    // WHY THE PRE-CHECKS EXIST WHEN THE HANDLERS CHECK THE SAME THINGS. The
+    // handlers answer a client with SMSG_AUCTION_COMMAND_RESULT or, for the
+    // structural refusals (no auctioneer in reach, bad item, bad duration),
+    // with nothing at all. A bot has no client, so a refusal would leave the
+    // row saying "delivered" with nothing changed, or "error" with no reason.
+    // Each condition the handler tests is therefore tested here first and
+    // named in `detail`, and the outcome is READ BACK from the world after the
+    // call rather than assumed from the call having returned. The layout of
+    // each packet is taken from what the handler reads, cited inline.
+    //
+    // WHY SOULBOUND IS REFUSED HERE TOO. The handler refuses a soulbound item
+    // through Item::CanBeTraded (Item.cpp:795-820, :216 in the handler) and
+    // says nothing. Naming it here ("item is soulbound") is the difference
+    // between a row the operator can act on and one they cannot; the same
+    // goes for quest items, conjured items and items with a duration, which
+    // CanBeTraded and the handler's own flag checks (:216-218) turn away.
+    //
+    // WHAT IS NOT HERE. Browsing (what is on the house, what it costs, what
+    // sold) is read straight from the `auctionhouse` table by whoever drives
+    // the queue; it needs no executor because nothing changes. The mail that
+    // carries a bought item or a cancelled one home is not opened here; that
+    // is the mailbox's job and a separate executor's, if one is ever wanted.
+    // Nothing here knows or cares whether the other side of a deal is an
+    // auction-house bot, a family member or a player: an auction is an
+    // auction.
+    //
+    // GRAMMAR (parsed by OverseerDecisions::ParseAuctionRequest, pure and
+    // tested):
+    //
+    //     list guid:<item_instance guid> bid:<copper> buyout:<copper> hours:<12|24|48>
+    //     buy auction:<auctionhouse.id>
+    //     bid auction:<auctionhouse.id> bid:<copper>
+    //     cancel auction:<auctionhouse.id>
+    //
+    // target_arg is unused. The whole stack is listed: the handler accepts a
+    // partial count (:144-145, :222) but the split it does (:279-302) gives
+    // the auction a fresh item guid, which the read-back could not tie to the
+    // request. Listing the whole stack keeps the guid (:304) and lets the row
+    // prove the listing it claims.
+
+    // The auctioneer this character could open a window with from where it
+    // stands, or null. The handler asks Player::GetNPCIfCanInteractWith
+    // (Player.cpp:2115-2165) for the guid the client sends; a bot sends no
+    // guid, so the module looks for one within INTERACTION_DISTANCE
+    // (ObjectDefines.h:24, 5.5 yards) and keeps the nearest that passes the
+    // same test the handler will apply (:169, :442, :607).
+    static Creature* FindAuctioneerInReach(Player* player)
+    {
+        std::list<Creature*> nearby;
+        Acore::AnyUnitInObjectRangeCheck check(player, INTERACTION_DISTANCE);
+        Acore::CreatureListSearcher<Acore::AnyUnitInObjectRangeCheck> searcher(player, nearby, check);
+        Cell::VisitObjects(player, searcher, INTERACTION_DISTANCE);
+
+        Creature* nearest = nullptr;
+        float nearestDist = 0.f;
+        for (Creature* creature : nearby)
+        {
+            if (!creature->HasNpcFlag(UNIT_NPC_FLAG_AUCTIONEER))
+                continue;
+            if (!player->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_AUCTIONEER))
+                continue;
+            float const dist = player->GetDistance(creature);
+            if (!nearest || dist < nearestDist)
+            {
+                nearest = creature;
+                nearestDist = dist;
+            }
+        }
+        return nearest;
+    }
+
+    // Returns the detail literal ("" on success) and fills `out` with the
+    // result JSON. `status` becomes "delivered" only when the read-back
+    // confirmed the change.
+    static char const* DoAuction(Player* player, std::string const& command,
+                                 char const*& status, std::string& out)
+    {
+        namespace D = OverseerDecisions;
+        namespace R = OverseerDecisions::AuctionRefusal;
+
+        D::AuctionRequest const req = D::ParseAuctionRequest(command);
+
+        // Money as it stood when the row was picked up; every exit reports
+        // it next to the money as it stands, so the delta is on the row.
+        uint32 const moneyBefore = player->GetMoney();
+
+        // Facts filled in as they are learned, so a refusal carries whatever
+        // was known at the point the row stopped.
+        struct
+        {
+            bool haveAuction = false;
+            uint32 auctionId = 0, house = 0, bid = 0, buyout = 0;
+            int64 expires = 0;
+            bool haveItem = false;
+            uint32 itemGuid = 0, itemEntry = 0, itemCount = 0;
+            std::string itemName;
+            uint32 deposit = 0;
+            bool haveAuctioneer = false;
+            uint32 auctioneerEntry = 0;
+            std::string auctioneerName;
+        } facts;
+
+        auto describe = [&](char const* outcome, char const* reason, char const* note)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason);
+            if (*reason)
+                o << ",\"retryable\":" << (D::AuctionRefusalRetryable(reason) ? "true" : "false");
+            o << ",\"who\":" << J(player->GetName())
+              << ",\"request\":" << J(command);
+            if (facts.haveAuction)
+                o << ",\"auction\":{\"id\":" << facts.auctionId
+                  << ",\"house\":" << facts.house
+                  << ",\"bid\":" << facts.bid
+                  << ",\"buyout\":" << facts.buyout
+                  << ",\"expires\":" << facts.expires << "}";
+            if (facts.haveItem)
+                o << ",\"item\":{\"guid\":" << facts.itemGuid
+                  << ",\"entry\":" << facts.itemEntry
+                  << ",\"name\":" << J(facts.itemName)
+                  << ",\"count\":" << facts.itemCount << "}";
+            o << ",\"money_before\":" << moneyBefore
+              << ",\"money_after\":" << player->GetMoney()
+              << ",\"deposit\":" << facts.deposit;
+            if (facts.haveAuctioneer)
+                o << ",\"auctioneer\":{\"entry\":" << facts.auctioneerEntry
+                  << ",\"name\":" << J(facts.auctioneerName) << "}";
+            if (*note)
+                o << ",\"note\":" << J(note);
+            o << "}";
+            out = o.str();
+        };
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason, "");
+            return reason;
+        };
+        auto noteAuction = [&](AuctionEntry const* auction)
+        {
+            facts.haveAuction = true;
+            facts.auctionId = auction->Id;
+            facts.house = uint32(auction->houseId);
+            facts.bid = auction->bid;
+            facts.buyout = auction->buyout;
+            facts.expires = int64(auction->expire_time);
+            facts.haveItem = true;
+            facts.itemGuid = auction->item_guid.GetCounter();
+            facts.itemEntry = auction->item_template;
+            facts.itemCount = auction->itemCount;
+            if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(auction->item_template))
+                facts.itemName = proto->Name1;
+        };
+
+        if (req.verb == D::AuctionVerb::None)
+            return refuse(req.error);
+
+        WorldSession* session = player->GetSession();
+        if (!session)
+            return refuse(R::NoSession);
+
+        // The states in which a client could not have the window open. The
+        // handlers test none of these (a client cannot send the packet), so
+        // they are the module's to hold.
+        if (!player->IsAlive())
+            return refuse(R::Dead);
+        if (player->IsInFlight())
+            return refuse(R::InFlight);
+        if (player->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse(R::Stunned);
+        if (session->isLogingOut())
+            return refuse(R::LoggingOut);
+        if (player->IsInCombat())
+            return refuse(R::InCombat);
+        if (player->GetTradeData())
+            return refuse(R::Trading);
+        if (player->GetLevel() < sWorld->getIntConfig(CONFIG_AUCTION_LEVEL_REQ))
+            return refuse(R::BelowLevel);
+
+        Creature* auctioneer = FindAuctioneerInReach(player);
+        if (!auctioneer)
+            return refuse(R::NotInRange);
+        facts.haveAuctioneer = true;
+        facts.auctioneerEntry = auctioneer->GetEntry();
+        facts.auctioneerName = auctioneer->GetName();
+
+        // Which house this auctioneer serves is decided by its faction
+        // template (AuctionHouseMgr.cpp:472-487, handler :176, :263); with
+        // two-side interaction on, everything maps to the neutral house.
+        AuctionHouseEntry const* houseEntry =
+            AuctionHouseMgr::GetAuctionHouseEntryFromFactionTemplate(auctioneer->GetFaction());
+        AuctionHouseObject* house = sAuctionMgr->GetAuctionsMap(auctioneer->GetFaction());
+        if (!houseEntry || !house)
+            return refuse(R::NoHouse);
+
+        ObjectGuid const playerGuid = player->GetGUID();
+
+        // ---- list ---------------------------------------------------------
+        if (req.verb == D::AuctionVerb::List)
+        {
+            // FindCarriedItem walks the bags and not the bank, on purpose:
+            // the handler takes any owned item (:207, Player::GetItemByGuid
+            // includes the bank) but a player could not drag a banked item
+            // into the window, and the operator addressed a bag.
+            Item* item = FindCarriedItem(player, true, req.itemGuid);
+            if (!item)
+                return refuse(R::ItemNotCarried);
+            ItemTemplate const* proto = item->GetTemplate();
+            facts.haveItem = true;
+            facts.itemGuid = item->GetGUID().GetCounter();
+            facts.itemEntry = item->GetEntry();
+            facts.itemCount = item->GetCount();
+            facts.itemName = proto->Name1;
+
+            // Named refusals first, then the handler's own test (:216-218)
+            // for whatever is left, so the operator hears the specific reason
+            // when there is one.
+            if (item->IsSoulBound())
+                return refuse(R::ItemSoulbound);
+            if (proto->Class == ITEM_CLASS_QUEST)
+                return refuse(R::ItemQuest);
+            if (sAuctionMgr->GetAItem(item->GetGUID()))
+                return refuse(R::ItemAlreadyListed);
+            if (!item->CanBeTraded() || item->IsNotEmptyBag()
+                || proto->HasFlag(ITEM_FLAG_CONJURED)
+                || item->GetUInt32Value(ITEM_FIELD_DURATION))
+                return refuse(R::ItemNotTradable);
+            // :161-167
+            if (req.bid > MAX_MONEY_AMOUNT || req.buyout > MAX_MONEY_AMOUNT)
+                return refuse(R::PriceTooHigh);
+
+            // The handler takes the duration in minutes and scales it to
+            // seconds itself (:183) before asking for the deposit (:265);
+            // the deposit is asked for here with the same scaled value.
+            uint32 const etimeMinutes = D::AuctionDurationMinutes(req.hours);
+            if (!etimeMinutes)
+                return refuse(R::InvalidDuration);
+            facts.deposit = sAuctionMgr->GetAuctionDeposit(houseEntry, etimeMinutes * MINUTE,
+                                                           item, item->GetCount());
+            if (!player->HasEnoughMoney(facts.deposit))
+                return refuse(R::CannotAffordDeposit);
+
+            ObjectGuid const itemGuid = item->GetGUID();
+
+            // CMSG_AUCTION_SELL_ITEM as the handler reads it: auctioneer guid
+            // (:121), item count (:122), then per item guid and count
+            // (:144-145), then bid, buyout, etime in minutes (:154-156).
+            WorldPacket packet(CMSG_AUCTION_SELL_ITEM, 8 + 4 + 8 + 4 + 4 + 4 + 4);
+            packet << auctioneer->GetGUID();
+            packet << uint32(1);
+            packet << itemGuid;
+            packet << uint32(item->GetCount());
+            packet << uint32(req.bid);
+            packet << uint32(req.buyout);
+            packet << uint32(etimeMinutes);
+            session->HandleAuctionSellItem(packet);
+
+            // Read back: the item must have left the bags (:321) and the
+            // house must hold an auction owned by this character on that
+            // very guid (:304, :319). The whole stack was listed, so the guid
+            // is the one the request named.
+            bool const stillCarried = player->GetItemByGuid(itemGuid) != nullptr;
+            AuctionEntry const* listed = nullptr;
+            for (auto const& pair : house->GetAuctions())
+            {
+                AuctionEntry const* candidate = pair.second;
+                if (candidate->owner == playerGuid && candidate->item_guid == itemGuid)
+                {
+                    listed = candidate;
+                    break;
+                }
+            }
+            if (!listed)
+                return refuse(stillCarried ? R::CoreRefused : R::NotReadBack);
+            if (stillCarried)
+                return refuse(R::NotReadBack);
+
+            noteAuction(listed);
+            LOG_INFO("module.overseer", "mod-overseer: auction {} listed item {} ({}x{}) by {} at house {} bid {} buyout {} deposit {}",
+                     listed->Id, itemGuid.GetCounter(), listed->item_template, listed->itemCount,
+                     player->GetName(), uint32(listed->houseId), listed->startbid, listed->buyout, facts.deposit);
+            describe("listed", "", "");
+            status = "delivered";
+            return "";
+        }
+
+        // ---- buy, bid, cancel: find the auction --------------------------
+        AuctionEntry const* auction = house->GetAuction(req.auctionId);
+        if (!auction)
+        {
+            // Not in this auctioneer's house. Say whether it is somewhere
+            // else (the operator sent the bot to the wrong auctioneer) or
+            // nowhere (sold, expired, cancelled, or never existed).
+            for (AuctionHouseId id : {AuctionHouseId::Alliance, AuctionHouseId::Horde, AuctionHouseId::Neutral})
+            {
+                AuctionHouseObject* other = sAuctionMgr->GetAuctionsMapByHouseId(id);
+                if (!other || other == house)
+                    continue;
+                if (AuctionEntry const* elsewhere = other->GetAuction(req.auctionId))
+                {
+                    noteAuction(elsewhere);
+                    return refuse(R::WrongHouse);
+                }
+            }
+            return refuse(R::AuctionNotFound);
+        }
+        noteAuction(auction);
+
+        // Snapshot what the call needs from the entry. The handlers delete
+        // the entry when the auction ends (AuctionHouseObject::RemoveAuction,
+        // AuctionHouseMgr.cpp:504-516), so nothing below touches the pointer
+        // after the call.
+        ObjectGuid const owner = auction->owner;
+        ObjectGuid const bidder = auction->bidder;
+        uint32 const startBid = auction->startbid;
+        uint32 const currentBid = auction->bid;
+        uint32 const buyout = auction->buyout;
+        uint32 const cut = auction->GetAuctionCut();
+        ObjectGuid const auctionItemGuid = auction->item_guid;
+        auction = nullptr;
+
+        // ---- cancel -------------------------------------------------------
+        if (req.verb == D::AuctionVerb::Cancel)
+        {
+            if (owner != playerGuid)
+                return refuse(R::NotOwnAuction);
+            // :626-628: the handler needs the parked item to send it home.
+            if (!sAuctionMgr->GetAItem(auctionItemGuid))
+                return refuse(R::AuctionItemMissing);
+            // :630-638: with a bidder standing, the owner pays the house cut
+            // to take it down.
+            if (bidder && !player->HasEnoughMoney(cut))
+                return refuse(R::CannotAffordCut);
+
+            // CMSG_AUCTION_REMOVE_ITEM: auctioneer guid, auction id
+            // (:598-599).
+            WorldPacket packet(CMSG_AUCTION_REMOVE_ITEM, 8 + 4);
+            packet << auctioneer->GetGUID();
+            packet << uint32(req.auctionId);
+            session->HandleAuctionRemoveItem(packet);
+
+            // Read back: gone from the house (:666-667).
+            if (house->GetAuction(req.auctionId))
+                return refuse(R::CoreRefused);
+
+            LOG_INFO("module.overseer", "mod-overseer: auction {} cancelled by {} (item {} returns by mail)",
+                     req.auctionId, player->GetName(), auctionItemGuid.GetCounter());
+            describe("cancelled", "", "the item returns by mail (:641-643); the mailbox is not read here");
+            status = "delivered";
+            return "";
+        }
+
+        // ---- buy and bid --------------------------------------------------
+        // :471-476 refuses one's own auction; :479-485 refuses an auction
+        // owned by a character of the same account when that character is
+        // offline. Both are silent, so both are mirrored.
+        if (owner == playerGuid)
+            return refuse(R::OwnAuction);
+        if (!ObjectAccessor::FindConnectedPlayer(owner)
+            && sCharacterCache->GetCharacterAccountIdByGuid(owner) == session->GetAccountId())
+            return refuse(R::OwnAuction);
+
+        uint32 price = 0;
+        if (req.verb == D::AuctionVerb::Buy)
+        {
+            if (!buyout)
+                return refuse(R::NoBuyout);
+            price = buyout;
+        }
+        else
+            price = req.bid;
+
+        if (price > MAX_MONEY_AMOUNT)
+            return refuse(R::PriceTooHigh);
+
+        // :488 and :492-497, mirrored in AuctionBidAcceptable. A buyout can
+        // only fail here when the row in the table is odd (buyout below
+        // the standing bid), which is worth a named refusal rather than a
+        // silent one.
+        if (D::AuctionBidAcceptable(price, startBid, currentBid, buyout,
+                                    AuctionEntry::CalculateAuctionOutBid(currentBid))
+            != D::AuctionBidVerdict::Ok)
+            return refuse(R::BidTooLow);
+
+        // :499 checks the full price even though a standing top bidder is
+        // charged only the difference (:512-513, :553-554); the handler's
+        // stricter test is the one mirrored. The difference goes on the row
+        // so the money delta reads right.
+        bool const alreadyTopBidder = bidder == playerGuid;
+        uint32 const cost = D::AuctionBidCost(price, currentBid, alreadyTopBidder);
+        if (!player->HasEnoughMoney(price))
+            return refuse(req.verb == D::AuctionVerb::Buy ? R::CannotAffordBuyout : R::CannotAffordBid);
+
+        // CMSG_AUCTION_PLACE_BID: auctioneer guid, auction id, price
+        // (:428-431).
+        WorldPacket packet(CMSG_AUCTION_PLACE_BID, 8 + 4 + 4);
+        packet << auctioneer->GetGUID();
+        packet << uint32(req.auctionId);
+        packet << uint32(price);
+        session->HandleAuctionPlaceBid(packet);
+
+        // Read back. A price at or above the buyout ends the auction
+        // (:550-588, the entry is removed :587): the row says "bought" and
+        // the item is on its way by mail. Otherwise the entry must now name
+        // this character as bidder at that price (:526-527).
+        AuctionEntry const* after = house->GetAuction(req.auctionId);
+        if (!after)
+        {
+            if (cost && player->GetMoney() != moneyBefore - cost)
+                return refuse(R::NotReadBack);
+            facts.bid = price;
+            LOG_INFO("module.overseer", "mod-overseer: auction {} bought by {} for {} (charged {}; item {} arrives by mail)",
+                     req.auctionId, player->GetName(), price, cost, auctionItemGuid.GetCounter());
+            describe("bought", "", "the item arrives by mail (AuctionHouseMgr::SendAuctionWonMail); the mailbox is not read here");
+            status = "delivered";
+            return "";
+        }
+        if (req.verb == D::AuctionVerb::Buy)
+            return refuse(R::CoreRefused);
+        if (after->bidder != playerGuid || after->bid != price)
+            return refuse(R::CoreRefused);
+
+        noteAuction(after);
+        LOG_INFO("module.overseer", "mod-overseer: auction {} bid {} placed by {} (charged {})",
+                 req.auctionId, price, player->GetName(), cost);
+        describe("bid", "", "");
         status = "delivered";
         return "";
     }

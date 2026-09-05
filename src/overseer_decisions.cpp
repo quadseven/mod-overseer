@@ -1018,4 +1018,260 @@ std::string GearNeedWinner(std::vector<GearContender> const& contenders)
     return winner;
 }
 
+// ----------------------------------------------------------------- auction --
+
+namespace
+{
+
+// A decimal field that fits a uint32, or false. Leading zeros are allowed;
+// signs, spaces and anything past 4294967295 are not, because every number in
+// this grammar is an id or a copper amount the core reads as uint32, and a
+// value that wraps would be a different bid from the one the operator typed.
+bool ParseDecimal(std::string const& text, uint32_t& value)
+{
+    if (text.empty() || text.size() > 10 ||
+        text.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    unsigned long long parsed = 0;
+    for (char c : text)
+        parsed = parsed * 10 + static_cast<unsigned long long>(c - '0');
+    if (parsed > 4294967295ULL)
+        return false;
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+std::vector<std::string> SplitWords(std::string const& text)
+{
+    std::vector<std::string> words;
+    std::string::size_type pos = 0;
+    while (pos < text.size())
+    {
+        std::string::size_type const start = text.find_first_not_of(" \t", pos);
+        if (start == std::string::npos)
+            break;
+        std::string::size_type const end = text.find_first_of(" \t", start);
+        words.push_back(text.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (end == std::string::npos)
+            break;
+        pos = end;
+    }
+    return words;
+}
+
+}  // namespace
+
+AuctionRequest ParseAuctionRequest(std::string const& command)
+{
+    AuctionRequest request;
+    std::vector<std::string> const words = SplitWords(command);
+    if (words.empty())
+    {
+        request.error = AuctionRefusal::Malformed;
+        return request;
+    }
+
+    AuctionVerb verb = AuctionVerb::None;
+    if (words[0] == "list")
+        verb = AuctionVerb::List;
+    else if (words[0] == "buy")
+        verb = AuctionVerb::Buy;
+    else if (words[0] == "bid")
+        verb = AuctionVerb::Bid;
+    else if (words[0] == "cancel")
+        verb = AuctionVerb::Cancel;
+    else
+    {
+        request.error = AuctionRefusal::Malformed;
+        return request;
+    }
+
+    // Which keys each verb takes. Every key is required and none may repeat:
+    // a `buy` carrying a bid, or a `list` missing its hours, is a row whose
+    // author meant something this executor cannot guess at, so it is refused
+    // rather than filled in.
+    bool sawGuid = false, sawAuction = false, sawBid = false, sawBuyout = false, sawHours = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        std::string const& word = words[i];
+        std::string::size_type const colon = word.find(':');
+        if (colon == std::string::npos)
+        {
+            request.error = AuctionRefusal::Malformed;
+            return request;
+        }
+        std::string const key = word.substr(0, colon);
+        uint32_t value = 0;
+        if (!ParseDecimal(word.substr(colon + 1), value))
+        {
+            request.error = AuctionRefusal::Malformed;
+            return request;
+        }
+
+        bool* seen = nullptr;
+        uint32_t* into = nullptr;
+        if (key == "guid" && verb == AuctionVerb::List)
+        {
+            seen = &sawGuid;
+            into = &request.itemGuid;
+        }
+        else if (key == "auction" && verb != AuctionVerb::List)
+        {
+            seen = &sawAuction;
+            into = &request.auctionId;
+        }
+        else if (key == "bid" && (verb == AuctionVerb::List || verb == AuctionVerb::Bid))
+        {
+            seen = &sawBid;
+            into = &request.bid;
+        }
+        else if (key == "buyout" && verb == AuctionVerb::List)
+        {
+            seen = &sawBuyout;
+            into = &request.buyout;
+        }
+        else if (key == "hours" && verb == AuctionVerb::List)
+        {
+            seen = &sawHours;
+            into = &request.hours;
+        }
+        else
+        {
+            request.error = AuctionRefusal::Malformed;
+            return request;
+        }
+
+        if (*seen)
+        {
+            request.error = AuctionRefusal::Malformed;
+            return request;
+        }
+        *seen = true;
+        *into = value;
+    }
+
+    bool complete = false;
+    switch (verb)
+    {
+        case AuctionVerb::List:
+            complete = sawGuid && sawBid && sawBuyout && sawHours;
+            break;
+        case AuctionVerb::Buy:
+        case AuctionVerb::Cancel:
+            complete = sawAuction;
+            break;
+        case AuctionVerb::Bid:
+            complete = sawAuction && sawBid;
+            break;
+        case AuctionVerb::None:
+            break;
+    }
+    if (!complete)
+    {
+        request.error = AuctionRefusal::Malformed;
+        return request;
+    }
+
+    // Ids are never zero: the core reads a zero item guid or auction id as a
+    // malformed packet and returns silently (AuctionHouseHandler.cpp:147,
+    // :433), so it is refused by name here instead.
+    if ((verb == AuctionVerb::List && request.itemGuid == 0) ||
+        (verb != AuctionVerb::List && request.auctionId == 0))
+    {
+        request.error = AuctionRefusal::Malformed;
+        return request;
+    }
+
+    // The rules a client enforces in its own window before the packet is
+    // ever built, named one at a time so the row says which one.
+    if (verb == AuctionVerb::List)
+    {
+        if (request.bid == 0)
+        {
+            request.error = AuctionRefusal::NoStartBid;
+            return request;
+        }
+        if (request.buyout != 0 && request.buyout < request.bid)
+        {
+            request.error = AuctionRefusal::BuyoutBelowBid;
+            return request;
+        }
+        if (AuctionDurationMinutes(request.hours) == 0)
+        {
+            request.error = AuctionRefusal::InvalidDuration;
+            return request;
+        }
+    }
+    if (verb == AuctionVerb::Bid && request.bid == 0)
+    {
+        request.error = AuctionRefusal::ZeroBid;
+        return request;
+    }
+
+    request.verb = verb;
+    return request;
+}
+
+uint32_t AuctionDurationMinutes(uint32_t hours)
+{
+    switch (hours)
+    {
+        case 12:
+        case 24:
+        case 48:
+            return hours * 60;
+        default:
+            return 0;
+    }
+}
+
+AuctionBidVerdict AuctionBidAcceptable(uint32_t price, uint32_t startBid,
+                                       uint32_t currentBid, uint32_t buyout,
+                                       uint32_t outbidStep)
+{
+    // AuctionHouseHandler.cpp:488: `price <= auction->bid || price < auction->startbid`
+    if (price <= currentBid || price < startBid)
+        return AuctionBidVerdict::NotAboveCurrent;
+
+    // AuctionHouseHandler.cpp:492-493: a bid that is not a buyout must clear
+    // the standing bid by the outbid step. The addition is done in 64 bits so
+    // a standing bid near the cap cannot wrap into a lower threshold.
+    bool const isBuyout = buyout != 0 && price >= buyout;
+    if (!isBuyout)
+    {
+        uint64_t const threshold = static_cast<uint64_t>(currentBid) + outbidStep;
+        if (static_cast<uint64_t>(price) < threshold)
+            return AuctionBidVerdict::BelowIncrement;
+    }
+    return AuctionBidVerdict::Ok;
+}
+
+uint32_t AuctionBidCost(uint32_t price, uint32_t currentBid, bool alreadyTopBidder)
+{
+    if (alreadyTopBidder && price > currentBid)
+        return price - currentBid;
+    return price;
+}
+
+bool AuctionRefusalRetryable(std::string const& reason)
+{
+    static char const* const retryable[] = {
+        AuctionRefusal::NotInRange,
+        AuctionRefusal::Dead,
+        AuctionRefusal::InCombat,
+        AuctionRefusal::Trading,
+        AuctionRefusal::InFlight,
+        AuctionRefusal::Stunned,
+        AuctionRefusal::LoggingOut,
+        AuctionRefusal::CannotAffordDeposit,
+        AuctionRefusal::CannotAffordBuyout,
+        AuctionRefusal::CannotAffordBid,
+        AuctionRefusal::CannotAffordCut,
+    };
+    for (char const* candidate : retryable)
+        if (reason == candidate)
+            return true;
+    return false;
+}
+
 }  // namespace OverseerDecisions
