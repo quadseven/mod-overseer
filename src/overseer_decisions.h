@@ -2453,6 +2453,133 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
                            float rate = 1.f);
 char const* FallAccountName(FallAccount account);
 
+// ------------------------------------------------- a revival and a party --
+//
+// A REVIVAL MAY NOT PUT A CHARACTER ON A MAP ITS PARTY IS NOT ON, unless there
+// is nowhere on its own map to put it (#241).
+//
+// WHAT HAPPENED. DriveStuckRevival has four escalations that end in a bind
+// point, and every roster character binds at map 0 (-8950, -132). On the dev
+// realm 2026-09-05 the party LEADER died twice at one Barrens graveyard inside
+// the repeat window, took the fourth of those escalations, and arrived in
+// Duskwood:
+//
+//   17:34:31  'Grug' resurrected at the nearest graveyard
+//   17:35:43  'Grug' twice at one graveyard inside 300s means it cannot live
+//             there, so it was sent to its own bind point instead
+//   17:47     Grug map 0 Duskwood, and Bork, Grog, Og and Ugga all map 1
+//
+// NOTHING IN THIS MODULE CAN UNDO THAT, which is what makes it worse than a
+// long walk. `follow` cannot cross a map, DriveCatchUp refuses to start on a
+// cross-map gap and returns silently, and an `at:` aim cannot name a
+// coordinate on another map. The measured result was eleven minutes of four
+// followers standing still with no log line, and an operator teleporting the
+// family back by hand three times in one day.
+//
+// AND THE PREMISE OF THE ESCALATION IS UNSOUND WHERE IT FIRED. "Twice at one
+// graveyard inside 300s means it cannot live there" reads like a rare verdict.
+// In hostile territory it is the ordinary outcome. Measured on overseer_death,
+// 18:18:24 to 18:22:30, four minutes:
+//
+//   Bork  Horde Guard  35%   travel_target ''
+//   Grug  Horde Guard  12%   'vendor'
+//   Ugga  Horde Guard  34%   'at:1:172.864,-1704.09,93.5606'
+//   Grog  Horde Guard  16%   'profession trainer'
+//   Og    Horde Guard   4%   'at:1:172.864,-1704.09,93.5606'
+//   Grug  Horde Guard  12%   'vendor'
+//
+// Six deaths, one killer, all in zone 17. Two of them were walking to
+// (172.9, -1704.1), and the only creature within 45 yards of that point is
+// entry 6491, a SPIRIT HEALER, 13.3 yards away: the aim is a graveyard. The
+// Barrens is Horde ground, so its graveyards stand beside Horde guards, and
+// for an Alliance party the loop closes on itself: die, revive at the
+// graveyard, be killed by the guards standing at it. A repeat there is
+// evidence about the ZONE and not about the graveyard, and a bind teleport
+// answers neither. Being routed into hostile ground at all is #234 and is not
+// this decision's business; not breaking the party in half over it is.
+//
+// SO THE RULE IS ABOUT THE PARTY'S MAP AND NOT ABOUT MOVING AT ALL, and that
+// is a deliberate narrowing of the closure #188 used. A terrain recovery could
+// be closed under "never change maps" outright because the character was ALIVE
+// and standing somewhere: doing nothing was always available. A revival has no
+// such luxury. One of these four escalations fires because `game_graveyard`
+// holds no row for the map at all, which is every death inside an instance,
+// and refusing to move there would restore the exact regression that branch
+// was written for: a body lay in the Deadmines for 29 minutes while this drive
+// ran and never considered it. "Never move" would be a worse rule honestly
+// applied. "Never move somewhere your party is not, while anywhere on your own
+// map exists" keeps the corpse recovery and stops the split.
+enum class RevivalDestination
+{
+    // Revive on this character's own map, at whatever graveyard the caller
+    // had. Chosen when a bind teleport would leave the party behind.
+    Graveyard,
+
+    // The bind point. Still the right answer when there is nothing on this
+    // map, and when the bind is where the party already is.
+    PartyBind,
+};
+
+// What the adapter measured about one revival that wants to escalate.
+struct RevivalMove
+{
+    // Where a bind teleport would land. The caller resolves this to the
+    // LEADER'S bind when the character is grouped, so that a party which does
+    // all take this exit lands together rather than scattered across two
+    // starting zones.
+    uint32_t bindMapId{0};
+
+    // The map each OTHER member of this character's group is on, one entry
+    // per member. Empty when it is not grouped, or when nobody else could be
+    // resolved, and that is deliberately not the same as "the party is on map
+    // 0": an unknown party map may not be used to refuse anything.
+    std::vector<uint32_t> partyMapIds;
+
+    // Is there ANY graveyard on this character's own map to revive it at
+    // instead? Not "a safe one" and not "a different one": the question this
+    // rule asks is whether an alternative exists at all, because the thing it
+    // is weighed against is a continent.
+    bool graveyardOnThisMap{false};
+};
+
+struct RevivalMoveVerdict
+{
+    // May the caller take its bind teleport?
+    bool mayMove{false};
+    // And does taking it leave the character on a different map from its
+    // party? Only ever true when `mayMove` is true and there was no
+    // alternative, so this is the line that has to be shouted rather than a
+    // reason to refuse.
+    bool splitsParty{false};
+    // Whether a party map could be established at all, and which it is.
+    bool partyMapKnown{false};
+    uint32_t partyMapId{0};
+};
+
+// THE PARTY'S MAP IS THE MAP MOST OF THE OTHERS ARE ON, which is the reading
+// that works whichever member is the one dying. Asking "the leader's map"
+// gets the wrong answer in exactly the case that caused #241, because there
+// the dying character WAS the leader and its own map was the one about to be
+// abandoned. A tie keeps the first map seen, so the answer is stable for a
+// given group rather than depending on iteration luck.
+//
+// FOUR RULES, IN THIS ORDER:
+//
+//   1. No party map known: move. An ungrouped character cannot split a party,
+//      and a group nobody could resolve is not evidence of anything.
+//   2. The bind is on the party's map: move. Nothing is being split; this is
+//      the ordinary case for a family that binds where it plays.
+//   3. The bind is elsewhere AND this map has a graveyard: DO NOT MOVE. The
+//      alternative may be a graveyard that has already killed this character
+//      once, and it is still the better answer, because a character revived
+//      into danger beside its party can be helped, walked away or revived
+//      again, and one revived onto another continent can do none of those and
+//      cannot be reached by anything this module has.
+//   4. The bind is elsewhere and this map has nothing: move, and say that the
+//      party is now split. This is the instance case and the alternative is
+//      leaving a corpse where it fell.
+RevivalMoveVerdict RevivalMayCrossMaps(RevivalMove const& move);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
