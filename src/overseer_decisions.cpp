@@ -2930,43 +2930,34 @@ void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now)
 }
 
 FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
-                                     bool falling, float standingZ, time_t now,
-                                     time_t holdSeconds)
+                                     bool falling, float standingZ, time_t now)
 {
-    // Nothing was handed over, so there is nothing to take back. This is the
-    // answer for every character on the roster that has never been lifted,
-    // which is nearly all of them nearly all of the time.
-    if (!state.held)
-        return FallBaselineVerdict{};
-
-    // THE OFF SWITCH, AND THE END OF ONE HEIGHT'S CLAIM. A guard with no bound
-    // would go on overwriting the core's own accounting for a character this
-    // module stopped being answerable for minutes ago, so both readings of
-    // "no window" end the same way: forget the height and leave the core to it.
-    if (holdSeconds <= 0 || now - state.at >= holdSeconds)
-    {
-        state = FallBaselineState{};
-        return FallBaselineVerdict{};
-    }
-
-    // A REAL FALL IS NOT THIS MODULE'S TO ERASE. Everything this rule exists to
-    // prevent is priced while the character is standing still, so declining
-    // here costs the fix nothing and is the whole of what keeps a genuine drop
-    // billable. The state is deliberately KEPT rather than forgotten: the poll
-    // after the landing puts the baseline back under the character's feet, by
-    // which time HandleFall has already charged for the drop it was owed.
+    // A REAL FALL IS NOT THIS MODULE'S TO ERASE, and this line is the whole of
+    // what stands between the rule and a roster that cannot be hurt by a drop.
+    // Everything this exists to prevent is charged while the character is
+    // STANDING, so declining here costs the fix nothing. The header carries
+    // why one second of poll is enough to catch every fall that could ever be
+    // charged for.
     //
     // The other stood-down states go the same way and for the same reason. A
     // taxi, a flying mount, a boat, a vehicle, a swimmer, a character mid
     // teleport or a dead one is somewhere this module has no opinion about,
     // and "I am not entitled to an opinion right now" is not grounds for
     // rewriting anything.
+    //
+    // The state is deliberately KEPT rather than forgotten here, so that the
+    // poll after a landing resumes - by which time HandleFall has already
+    // charged for the drop it was owed.
     if (!mayInspect || falling)
         return FallBaselineVerdict{};
 
-    // Standing. Whatever the core is holding, the truth is under this
-    // character's feet, and this is the one place that can say so.
+    // Standing. Whatever the core is holding, and whatever wrote it - this
+    // module's own lift, an errand's teleport, or a client packet from a
+    // hillside the character left four minutes ago - the truth is under this
+    // character's feet, and this is the one place that says so.
+    state.held = true;
     state.z = standingZ;
+    state.at = now;
     return FallBaselineVerdict{true, standingZ};
 }
 
