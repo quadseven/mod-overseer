@@ -981,6 +981,39 @@ char const* DungeonRunExitOutcome(bool provedComplete, bool stalled)
     return stalled ? "stalled" : "left";
 }
 
+bool IsMaintenanceErrand(std::string const& aim)
+{
+    // The bridge's ECONOMY_ERRANDS, kept in step by the same discipline the
+    // travel roles already are: two copies of a vocabulary that must agree, so
+    // a test compares them rather than a comment asking somebody to remember.
+    return aim == "vendor" || aim == "banker" || aim == "repair";
+}
+
+MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
+                                          unsigned outstandingErrands,
+                                          time_t heldForSeconds,
+                                          time_t boundSeconds)
+{
+    bool const walking = IsMaintenanceErrand(leaderAim);
+    bool const transacting = outstandingErrands > 0;
+    if (!walking && !transacting)
+        return MaintenanceHold::Open;
+
+    // THE BOUND IS TESTED ONLY ONCE THERE IS SOMETHING TO BOUND, which is why
+    // it is after the Open branch rather than before it. A campaign that is
+    // simply running has no hold clock at all, and reporting Overdue for one
+    // would open a run that was already free to open while claiming a fault.
+    if (heldForSeconds > boundSeconds)
+        return MaintenanceHold::Overdue;
+
+    // WALKING BEFORE TRANSACTING when both are true. They regularly are: the
+    // first member arrives and gets a row while the last is still on the road.
+    // The two answers only differ in what the log says, and "still walking" is
+    // the one an operator can act on, because it names a journey that may be
+    // going wrong rather than a queue that is merely waiting for it.
+    return walking ? MaintenanceHold::Walking : MaintenanceHold::Transacting;
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
                              RatchetLimits const& limits,

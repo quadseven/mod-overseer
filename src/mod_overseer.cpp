@@ -1577,6 +1577,22 @@ constexpr time_t DUNGEON_RESET_BACKSTOP_SECONDS = 5 * 60;
 // than from memory so it survives a worldserver bounce.
 constexpr uint32 DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES = 3;
 
+// HOW LONG THE NEXT RUN WAITS FOR A MAINTENANCE ERRAND SOMEBODY ELSE IS
+// RUNNING (#168), before it opens anyway and says so.
+//
+// WHY IT IS GENEROUS. The wait is a real walk, and the usable counter for
+// this family is about 1,470 yards from the dungeon door - the nearer one
+// belongs to the other faction and is correctly refused. Add a straggler
+// and a queue that polls every few seconds and twenty minutes is a normal
+// trip rather than a slow one.
+//
+// WHY IT EXISTS AT ALL. Not to keep the campaign brisk. The aim is written
+// by a process outside the worldserver, and if that process dies mid-errand
+// the column holds a role nothing will ever clear. Without a bound a
+// hundred-run campaign would stop there with nothing in any log to say why,
+// which is the failure this whole constant exists to prevent.
+constexpr time_t DUNGEON_MAINTENANCE_HOLD_SECONDS = 20 * 60;
+
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
 // thirty-eight times in twelve minutes and travelled 0.0 yards, because its
@@ -5006,6 +5022,50 @@ private:
                          "an outcome and the campaign loop stays off");
         }
         return _runAccountingColumns == SchemaColumns::Present;
+    }
+
+
+    // THE LEADER'S TRAVEL AIM, READ BACK RATHER THAN REMEMBERED (#168).
+    //
+    // The coordinator's own book (`_travelAims`) knows what THIS module wrote,
+    // and that is exactly what is not wanted here: the question is whether
+    // somebody ELSE wrote one. So the column is read, and the answer is
+    // whatever is in it now, including an errand written by a process that has
+    // since restarted.
+    static std::string LeaderTravelAim(std::string const& leaderName)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT travel_npc FROM overseer_roster WHERE name = '{}' AND enabled = 1",
+            Esc(leaderName));
+        return result ? result->Fetch()[0].Get<std::string>() : std::string();
+    }
+
+    // HOW MANY MAINTENANCE ROWS ARE STILL UNANSWERED, across the whole roster.
+    //
+    // WHY THE WHOLE ROSTER AND NOT THE LEADER. A trip repairs and restocks five
+    // characters; the leader is only the one who was walked to the counter.
+    // Starting a run because the leader's own rows happen to be answered would
+    // walk the other four away from theirs.
+    //
+    // `pending` AND `claimed` BOTH COUNT. A claimed row is one the command poll
+    // has taken and is in the middle of; it is the state a row spends its
+    // actual transaction in, and treating it as finished would open a run
+    // during the one moment the money is moving. Rows that have been answered,
+    // whether delivered or refused, are not outstanding: the pass that wrote
+    // them owns what happens next, and #230 is explicit that a retry is a fresh
+    // row rather than a re-queue of this one.
+    uint32 OutstandingMaintenanceRows()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_command "
+            "WHERE kind IN ('repair', 'buy', 'sell', 'bank') "
+            "AND status IN ('pending', 'claimed', 'verifying')");
+        // A world image whose `kind` ENUM predates these values answers nothing
+        // rather than failing: the query names no column that could be absent,
+        // and an ENUM value that does not exist simply matches no rows. So
+        // "this database cannot answer" and "nothing is outstanding" are the
+        // same answer here, and both mean the run may start.
+        return result ? static_cast<uint32>(result->Fetch()[0].Get<uint64>()) : 0;
     }
 
     struct DungeonCampaignCap
@@ -13016,6 +13076,13 @@ private:
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
         bool loggedCampaignOver{false};
+        // WHEN THIS COORDINATOR STARTED WAITING FOR SOMEBODY ELSE'S ERRAND
+        // (#168), and whether it has said so. In-process like every other
+        // flag on this struct: a bounce restarts the clock, which errs
+        // towards waiting longer for a trip that is probably still running,
+        // and the log line says how long it has been.
+        time_t holdSince{0};
+        bool loggedHold{false};
         // Said once, on the idle coordinator, for the same reason
         // `loggedCampaignOver` is: a portal the leader cannot walk to is a
         // standing fact about the job column rather than a transient, so it is
@@ -14844,6 +14911,96 @@ private:
                              leaderName, cap.done, cap.wanted);
                 }
                 return;
+            }
+
+
+            // DOES SOMEBODY ELSE HAVE THE FAMILY OUT ON AN ERRAND (#168)?
+            //
+            // ASKED HERE, WHICH IS THE LAST MOMENT IT IS FREE. Everything below
+            // this line is paid for: RESETTING throws away the instance the
+            // party is bound to, and GATHERING claims the leader's aim with an
+            // unconditional write. That write is what takes a vendor, bank or
+            // repair errand away from a pass that is in the middle of it - the
+            // character turns round and walks to a dungeon door, the errand
+            // never completes, and its rows are answered "not in range" until
+            // they age out. Nothing errors, which is why a hundred-run campaign
+            // has never had a maintenance trip.
+            //
+            // AND ONLY HERE. The claim itself is not weakened: once a run is
+            // staging, the coordinator taking a straggler over from whatever it
+            // was doing is what gets the party through the door and it is
+            // working. This asks whether to START a run, not whether to give
+            // one up. A run under way never yields.
+            uint32 const heldFor = coord.holdSince
+                                       ? uint32(std::time(nullptr) - coord.holdSince)
+                                       : 0;
+            OverseerDecisions::MaintenanceHold const hold =
+                OverseerDecisions::DungeonRunMaintenanceHold(
+                    LeaderTravelAim(leaderName), OutstandingMaintenanceRows(),
+                    heldFor, DUNGEON_MAINTENANCE_HOLD_SECONDS);
+
+            if (hold != OverseerDecisions::MaintenanceHold::Open)
+            {
+                if (!coord.holdSince)
+                    coord.holdSince = std::time(nullptr);
+
+                if (hold == OverseerDecisions::MaintenanceHold::Overdue)
+                {
+                    // SAID EVERY TIME, NOT ONCE. This one is not narration of a
+                    // steady state; it is the bound firing, and the run starts
+                    // on the same poll. An operator reading it is reading a
+                    // maintenance pass that did not finish, which is a thing to
+                    // go and look at rather than a thing to get used to.
+                    LOG_ERROR("module.overseer",
+                              "overseer: a maintenance errand for '{}' has been "
+                              "outstanding {} minutes, past the {} minute bound, so the "
+                              "dungeon run opens anyway and the errand loses its "
+                              "traveller. A trip that cannot finish costs one run's "
+                              "durability; a campaign that waits forever costs the "
+                              "campaign. The pass that wrote it is the thing to look at",
+                              leaderName, heldFor / 60,
+                              uint32(DUNGEON_MAINTENANCE_HOLD_SECONDS / 60));
+                    coord.holdSince = 0;
+                    coord.loggedHold = false;
+                }
+                else
+                {
+                    // SAID ONCE PER HOLD, on the same idle-coordinator flag
+                    // discipline the campaign-over line above uses and for the
+                    // same reason: this branch is reached on every poll for as
+                    // long as the errand runs, and a walk to a counter is
+                    // minutes of them.
+                    if (!coord.loggedHold)
+                    {
+                        coord.loggedHold = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: the next dungeon run for '{}' waits - {}. The "
+                                 "run does not open on top of an errand somebody else is "
+                                 "still running, because claiming the leader's aim would "
+                                 "turn them round mid-trip and the errand would never "
+                                 "complete. It opens as soon as the errand is done, or "
+                                 "after {} minutes whichever comes first",
+                                 leaderName,
+                                 hold == OverseerDecisions::MaintenanceHold::Walking
+                                     ? "the leader is walking to a counter"
+                                     : "errands are queued and not yet answered",
+                                 uint32(DUNGEON_MAINTENANCE_HOLD_SECONDS / 60));
+                    }
+                    return;
+                }
+            }
+            else if (coord.holdSince)
+            {
+                // The errand finished on its own, which is the ordinary way out
+                // of a hold and worth one line: an operator who read the wait
+                // should be able to read the end of it rather than infer it
+                // from a run starting.
+                LOG_INFO("module.overseer",
+                         "overseer: the maintenance errand for '{}' is done after {} "
+                         "minutes, so the dungeon run opens",
+                         leaderName, heldFor / 60);
+                coord.holdSince = 0;
+                coord.loggedHold = false;
             }
 
             std::string const dungeonKeyword = DungeonKeywordForJob(leaderJob);
