@@ -1,0 +1,98 @@
+-- Put one named item into a family member's bank, take one out, or buy the
+-- next bank bag slot, through the core's own bank handlers with a banker in
+-- reach (mod-overseer#18).
+--
+-- WHY THE BANK. Every member of the family has been carrying everything they
+-- own. The bank-side item count was measured at zero for every one of them,
+-- and had never been anything else, while the same characters were stuck on
+-- full bags. What fills the bags is profession material that nobody in the
+-- family can use YET: cloth for a tailor still at skill 1, ore with no smith
+-- to give it to, leather for a leatherworker who has not been trained. Each
+-- such stack costs a bag slot the character then cannot loot into, and the
+-- vendor is the wrong answer for it - it will be wanted in ten levels. The
+-- bank is the game's own place for "keep, but not here", and it is the one
+-- place the family has never once put anything.
+--
+-- WHY THE EXECUTOR NEVER CHOOSES THE ITEM. "Deposit the cloth" is a decision
+-- about the whole family, not about one character's bags: whether anyone
+-- will be able to use it, when, and whether the character who could use it
+-- is the one carrying it. That needs every member's bags, skills and quest
+-- logs side by side, and the side that has those is the bridge. This kind
+-- takes the item by item_instance guid and nothing else - not an entry, which
+-- names a TYPE, because a character holding two stacks of the same entry
+-- would then have the executor choosing between them. The module moves the
+-- named item or names why it cannot.
+--
+-- THE CORE'S OWN PATH. Player::CanBankItem / BankItem / CanStoreItem /
+-- StoreItem are the primitives, but a player at the bank does not call them:
+-- the client sends CMSG_AUTOBANK_ITEM (right-click an item with the bank
+-- open), CMSG_AUTOSTORE_BANK_ITEM (right-click one in the bank) or
+-- CMSG_BUY_BANK_SLOT, and each handler does the whole sequence - is the
+-- banker still in reach, where will it go, remove it, tell any quest that
+-- was counting it, put it down (BankHandler.cpp:64-96, :98-141, :143-184).
+-- All three are public on WorldSession (WorldSession.h:914-917) and take the
+-- typed packets of BankPackets.h, built from two bytes - bag and slot - the
+-- same way mod-playerbots itself builds its equip packet
+-- (EquipAction.cpp:206-211). The executor sends CMSG_BANKER_ACTIVATE first
+-- (BankHandler.cpp:44-62), because that is what sets the session's current
+-- banker and every later "can use bank" check reads it; then the move. No
+-- database write - item_instance and character_inventory are updated on the
+-- character's next save, as for a player. No GM command. No mod-playerbots
+-- code: its bank strategy needs a master to have said what to bank, and the
+-- family has none.
+--
+-- WHY EVERY CONDITION IS PRE-CHECKED AND NAMED. The handlers refuse with a
+-- void return or with a packet to the client, and a bot has no client. So the
+-- executor asks the same questions first - with the same calls and the same
+-- arguments - and puts the answer in `detail`; the core then asks again and
+-- is the authority. Refusals in `detail`: `banker not in range` (no creature
+-- that Player::GetNPCIfCanInteractWith accepts as a banker; interaction
+-- distance is 5.5 yards in this core, ObjectDefines.h:24), `banker in range
+-- but will not deal with the character`, `item not carried` (carried = worn,
+-- backpack, bags - not the bank), `item not in bank` (bank = the 28 bank
+-- slots and the bags worn in bought bank bag slots - nowhere else),
+-- `bank is full` (CanBankItem != EQUIP_ERR_OK, the InventoryResult is named in
+-- `result`), `bags are full` (CanStoreItem != EQUIP_ERR_OK, same), `a bag with
+-- items in it cannot be moved`, `cannot afford slot`, `no more slots`,
+-- `character is dead`, `character is on a flight path`, `character is in
+-- combat` (the client's rule: the bank frame does not open in combat, so the
+-- bot is held to what a player at a keyboard can do), `character is in a
+-- trade`, and the read-back failures `the core did not move the item into
+-- the bank` / `... into the bags` / `the core refused to sell the bank slot`.
+--
+-- THE READ-BACK IS THE RESULT. Nothing is believed because a handler
+-- returned. The item is found again by guid after the call and its position
+-- is tested with Player::IsBankPos; for a stack that merged into one already
+-- on the far side (and so no longer exists as its own item) the bank-side and
+-- bag-side counts of that entry must have moved by exactly the stack. For a
+-- slot purchase the slot count must be one higher and the purse lower by the
+-- DBC price. Not exercised on a live realm by this change: nothing here is
+-- deployed or observed, and the read-back is what will prove it.
+--
+-- Column re-use, no new columns, same shape as kind='give' and kind='trade':
+--   target_name  the CHARACTER, already standing at a banker
+--   command      `deposit guid:<item_instance.guid>`,
+--                `withdraw guid:<item_instance.guid>`, or `buy slot`
+--   target_arg   unused
+--   detail       short refusal literal, or empty on success
+--   result       JSON: outcome (deposited|withdrawn|bought_slot|refused),
+--                reason, verb, character, item {guid, entry, name, count} or
+--                null, from {bag, slot}, to {bag, slot} (-1 = unknown; 255 is
+--                the character itself, Player.h:657), bank_slots,
+--                money_before, money_after, banker {entry, name} or null,
+--                inventory_result / inventory_result_name when a
+--                CanBankItem / CanStoreItem answer was read, request
+--
+-- THE ENUM LISTS THE FULL UNION. Three kinds ('sell', 'bank', 'auction') are
+-- being added by three parallel branches, and 'job' has been dispatched in
+-- C++ since 2026_08_26 without ever being added here (a latent bug: a 'job'
+-- row could not be inserted at all). Each branch's ALTER names every value so
+-- the migrations apply in any order and the last one to run does not silently
+-- drop the others' values. ENUM values cannot be added by re-running the
+-- CREATE TABLE: the base file is `CREATE TABLE IF NOT EXISTS`, a no-op against
+-- an existing table, so the column keeps whatever value set it already has.
+-- (The same trap is documented on the 'give', 'share' and 'trade' migrations;
+-- it has bitten this codebase more than once.)
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction')
+        NOT NULL DEFAULT 'bot';

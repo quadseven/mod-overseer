@@ -57,8 +57,52 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# CONCURRENCY IS KEYED ON THE COMMIT, NOT ON THE REPOSITORY (2026-09-05).
+# This block used to read `group: build`: one bucket for every branch and
+# every push in the whole repository. GitHub keeps exactly ONE pending run per
+# concurrency group and cancels the older pending run when a newer one arrives,
+# and a build here takes 36 to 88 minutes (measured across the 37 successful
+# runs between 2026-09-02 and 2026-09-05, median 60). So the group was almost
+# always occupied, the queue behind it was one slot deep, and the gate mostly
+# did not run. Over those three days 60 of 100 runs were cancelled, and 53 of
+# those 60 were cancelled within five seconds of the next run entering the
+# group, which is the signature of eviction rather than of anyone pressing
+# cancel. 31 of 56 pushes to main produced no build result at all. On
+# 2026-09-05 that meant main carried unverified C++ across four merges (#224,
+# #223, #228, #227) for an hour and a half, and nothing said so, because an
+# evicted run is a grey tick and not a red one.
+#
+# WHY THE COMMIT AND NOT JUST THE REF. check.decisions.yml keys on
+# `decisions-${{ github.ref }}`, and that is right for it: it wants a second
+# push to a pull request to cancel the first, because it costs seconds and only
+# the tip of the branch matters. Copying that key here would fix only half of
+# this. Of the 53 evictions above, 24 were one ref evicting ITSELF: #228 and
+# #227 merged four seconds apart, both to refs/heads/main, so a per-ref group
+# would have had the second evict the first exactly as the global one did. The
+# property wanted here is not "one build per branch", it is "every commit that
+# reaches main gets compiled, and says so", and the only key that spells that
+# is the commit. Distinct commits now build in parallel; when that exceeds the
+# account's runner concurrency GitHub QUEUES the surplus jobs rather than
+# cancelling them, which is the entire difference being bought.
+#
+# CANCEL-IN-PROGRESS STAYS FALSE. Under a per-commit group the only thing it
+# could ever cancel is a second run of the same commit, and a running build is
+# the only compile signal that commit will ever get. Killing it at minute 50 of
+# 60 throws away both the answer and the hour, and leaves the commit looking
+# untested for precisely the reason this change exists to remove.
+#
+# THE CACHE DOES NOT ARGUE FOR A SHARED GROUP. Read the two cache steps below
+# before believing that it does. The key is `buildx-$CORE_SHA-$MODULE_SHA`: no
+# ref, no commit of this repository, no run id, so it is byte-identical under
+# every possible grouping. It is also written at most once per pin pair, since
+# the save step is skipped when `cache-hit == 'true'`, so after the first run
+# on a pin pair every later run only ever reads it. Serialising the whole
+# repository therefore bought no warming that parallel runs can lose. The one
+# real cost is the first run after a pin bump, where several cold builds can
+# race to save the same key and all but one gets a "cache already exists"
+# warning: one wasted save, once per bump, against 60 lost builds in three days.
 concurrency:
-  group: build
+  group: build-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 env:
