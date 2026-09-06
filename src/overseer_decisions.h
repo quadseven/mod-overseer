@@ -1096,10 +1096,22 @@ enum class DungeonApproach : std::uint8_t
     // The leader is somewhere else entirely. No aim this run could write would
     // be resolved, so the run must not be opened.
     OffOutsideMap,
+    // The leader is off the outside map AND a crossing to it exists. Still not
+    // walkable, and the run still must not open on this poll - but the reason
+    // is now "not yet" rather than "not ever", and the two must not share a
+    // log line. THE THIRD ANSWER THE COMMENT ABOVE PREDICTED (#241): the
+    // caller opens a crossing on this one and gives up on OffOutsideMap.
+    NeedsCrossing,
 };
 
+// `aCrossingExists` DEFAULTS TO FALSE so that every caller and test written
+// before there were boats keeps its exact previous answer, and so that the new
+// answer can only be produced by a caller that went and looked. A crossing this
+// function assumed rather than was told about would be the accident the
+// comment above warns of, in the other direction.
 DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
-                                      std::uint32_t portalOutsideMapId);
+                                      std::uint32_t portalOutsideMapId,
+                                      bool aCrossingExists = false);
 
 // ------------------------------------------------- where the party waits --
 //
@@ -3074,6 +3086,173 @@ FollowGap ReadFollowGap(bool sameMap, float distance2d,
 // for a follower that has stopped walking, and a follower on another continent
 // has not stopped walking, it has nowhere to walk.
 bool FollowGapIsBehind(FollowGap gap);
+
+// ------------------------------------- crossing a map boundary (#241, #158) --
+//
+// THE FAMILY CANNOT WALK BETWEEN CONTINENTS, AND THAT IS CORRECT. Every aim
+// this module writes for a place is `at:<map>:<x>,<y>,<z>`, and the resolver
+// refuses one whose map is not the character's own, because MoveFarTo paths
+// through PathGenerator and there is no navmesh across an ocean. The FollowGap
+// reading above says the same thing from the other end: a party on two maps
+// has no distance between its halves. None of that changes here.
+//
+// WHAT CHANGES IS THAT THERE IS A CROSSING AFTER ALL, AND IT WAS NEVER A
+// TELEPORT. The world runs boats. A boat is a MotionTransport: it walks its
+// own taxi path, it carries whoever stands on its deck by relocating them
+// every tick, and when that path changes map it teleports its passengers with
+// it. A character does not need to path across water to use one. It needs to
+// be standing on the deck when the boat leaves.
+//
+// AND STANDING ON THE DECK IS THE WHOLE JOB. Boarding, riding and landing are
+// already done, by code that is already running: the bot AI polls the map once
+// a second and boards whatever transport the map says the character is
+// standing on, the transport relocates its passengers itself, and the
+// far-teleport is acknowledged for a bot because a bot has a session with no
+// socket rather than no session. So this module must not board anybody, must
+// not teleport anybody, and must not simulate a packet. It has exactly one
+// thing to contribute that nothing else does: WALK THE LEADER TO THE BERTH,
+// and then get out of the way.
+//
+// WHY THE BERTH IS KNOWABLE HERE AND WAS NOT KNOWABLE BESIDE THE WORLD. An
+// earlier attempt at this ran next to the world rather than inside it and
+// stalled on one missing fact: nothing it could read said where a boat ties
+// up. Zone boxes are not piers, instance doors are not piers, and a berth
+// derived by offsetting some other landmark is the staging point that was
+// aimed into rock. The fact exists; it was on the other side of the wall. A
+// transport's own path carries a STOP FRAME on each map it serves, and that
+// frame's coordinates are the berth. The adapter reads it off the transport
+// and hands it in. This file never invents a coordinate and is never given the
+// chance to: a berth it was not handed is a refusal, below.
+//
+// THE UNITS OF THIS DECISION ARE MEMBERS, NOT THE PARTY. The party it was
+// written for was ALREADY split when the crossing became necessary: three
+// followers on the destination map beside the dungeon door, the leader and one
+// follower on the far continent. "Assemble, then cross together" would have
+// had nothing to say to it. So each member is read against the DESTINATION.
+// The ones already there have arrived and are not moved. The ones on the
+// origin map are the ones with a boat to catch. Anybody on a third map is a
+// refusal rather than a rounding error.
+//
+// ONLY THE LEADER IS EVER AIMED. That is not a simplification, it is the
+// standing rule this repository has already paid for: a party aimed member by
+// member across a long distance scatters, and the followers already have a
+// drive that walks them to their leader on their own map. This decision
+// therefore never produces per-follower orders. It says what the crossing
+// needs next, and the adapter aims one character.
+enum class CrossingLeg : std::uint8_t
+{
+    // Nothing readable enough to name a leg. The world is not answering.
+    Unknown,
+    // Somebody is on a map that is neither end of this crossing.
+    OffRoute,
+    // On the origin map and not aboard: the berth is the next place to be.
+    WalkToBerth,
+    // On the deck, or riding. The transport owns the crossing now.
+    Aboard,
+    // Every member read on the destination map.
+    Ashore,
+};
+
+char const* CrossingLegName(CrossingLeg leg);
+
+enum class CrossingAction : std::uint8_t
+{
+    // A fact needed to decide was missing. Do nothing, and say which.
+    Wait,
+    // The crossing cannot be made, and waiting will not make it makeable.
+    Refuse,
+    // Aim the leader at the berth. The only action that moves anybody.
+    Walk,
+    // Aboard. DO NOTHING, DELIBERATELY: the transport is the mechanism and
+    // anything issued now would fight it. A separate value from Wait because
+    // "doing nothing because the boat is sailing" and "doing nothing because
+    // the world did not answer" are one log line apart and must not be one
+    // value.
+    Ride,
+    // Every member is on the destination map. The crossing is over.
+    Done,
+};
+
+char const* CrossingActionName(CrossingAction action);
+
+// One member, as the adapter read it off the world.
+//
+// `readable` IS NOT `online`. It is "this character was steerable on this
+// poll", the same gate every other drive here uses, and a character that
+// failed it contributes no map, no distance and no vote. An unreadable member
+// is never counted as arrived: four of five seen on the far side says nothing
+// whatever about the fifth.
+struct CrossingMember
+{
+    bool readable{false};
+    bool isLeader{false};
+    bool aboard{false};       // the MAP says this character is on the transport
+    std::uint32_t mapId{0};
+    float berthDistance{0.f}; // yards, two-dimensional; meaningless off-map
+};
+
+// What the adapter could establish about the crossing itself. Every field is a
+// fact the world was ASKED for, and false means "not established", never
+// "established false".
+struct CrossingWorld
+{
+    std::uint32_t originMap{0};
+    std::uint32_t destinationMap{0};
+    // A transport was found on the origin map whose own path serves both maps.
+    bool transportFound{false};
+    // Its stop frame on the origin map. This is the berth to walk to.
+    bool berthKnown{false};
+    // Its stop frame on the destination map. Nothing is aimed at it, but its
+    // absence means the path does not land where this crossing claims it does.
+    bool landingKnown{false};
+    // The berth was swept for spawns above the party's level, the same sweep
+    // at the same radius a travel destination gets, and it is not clear.
+    bool berthGuarded{false};
+    std::uint32_t berthGuardLevel{0};
+};
+
+struct CrossingLimits
+{
+    // Inside this, the leader is AT the berth and the bot AI's own boarding
+    // poll is what happens next. An arrival tolerance, not a boarding radius:
+    // this module never decides anybody is aboard.
+    float berthArrivedYards{0.f};
+};
+
+struct CrossingStep
+{
+    CrossingLeg leg{CrossingLeg::Unknown};
+    CrossingAction action{CrossingAction::Wait};
+    std::size_t readable{0};
+    std::size_t unreadable{0};
+    std::size_t ashore{0};   // read on the destination map
+    std::size_t waiting{0};  // read on the origin map, not aboard
+    std::size_t aboard{0};
+    std::size_t offRoute{0}; // read on neither map
+    bool leaderReadable{false};
+    bool leaderOnOrigin{false};
+    bool leaderAtBerth{false};
+};
+
+// THE ORDER OF THE TESTS IS THE FAIL-CLOSED RULE, WRITTEN OUT.
+//
+// UNREADABLE FIRST, ahead of every other reading and ahead of Done in
+// particular. This is the one branch that separates this from a decision layer
+// that reads a missing member as a negative reading.
+//
+// REFUSALS BEFORE PROGRESS, because a crossing with no boat, no berth or a
+// guarded berth does not become makeable by taking a step toward it, and the
+// step taken anyway is the walk that kills people.
+//
+// ABOARD BEFORE WALK, because the moment anybody is on the deck the transport
+// owns the outcome, and a fresh aim would walk them back off it.
+CrossingStep ReadCrossing(CrossingWorld const& world,
+                          std::vector<CrossingMember> const& members,
+                          CrossingLimits const& limits);
+
+// The step as one sentence, including when the answer is "nothing". A refusal
+// that does not say which fact was missing trains an operator to ignore it.
+std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& world);
 
 // ----------------------------- who a character can actually be sent to (#234) --
 //
