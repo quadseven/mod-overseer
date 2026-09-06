@@ -510,6 +510,67 @@ static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float 
     return threat;
 }
 
+// The same question about MANY spots, answered in ONE pass over the spawn
+// table rather than one pass per spot (#267).
+//
+// WHY THIS EXISTS BESIDE THE ONE ABOVE INSTEAD OF REPLACING IT. A travel
+// resolve has to ask this about every candidate spawn of the wanted role on
+// the map, and `vendor` on Kalimdor is 823 of them. Eight hundred sweeps over
+// every creature spawn in the world, on the world thread, to answer a question
+// one sweep answers for all of them, is not a cost worth paying for a shorter
+// file.
+//
+// AND THE TWO TEST IN A DIFFERENT ORDER, WHICH IS THE ONLY REASON THEY ARE NOT
+// ONE FUNCTION. For a single spot, distance first is cheapest: two subtractions
+// reject nearly every spawn before a template is ever looked up, and the
+// graveyard path pays that cost on every death. For many spots, the template is
+// cheapest first: a friendly or too-low spawn is out for all 823 candidates at
+// once, so the lookup is amortised instead of repeated. Same rule, same members,
+// two access patterns, and folding them together would make one of the two
+// callers pay for the other's shape.
+//
+// `out` is sized here rather than by the caller so the two cannot disagree, and
+// its order is the order of `points`.
+static void HostileSpawnsNearEach(Player* bot, uint32 mapId,
+                                  std::vector<std::pair<float, float>> const& points,
+                                  float radius, uint32 aboveLevel,
+                                  std::vector<NearbyThreat>& out)
+{
+    out.assign(points.size(), NearbyThreat{});
+    FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
+    if (!mine || points.empty())
+        return;
+
+    float const r2 = radius * radius;
+    for (auto const& spawn : sObjectMgr->GetAllCreatureData())
+    {
+        CreatureData const& data = spawn.second;
+        if (data.mapid != mapId)
+            continue;
+        CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
+        if (!tmpl || tmpl->maxlevel <= aboveLevel)
+            continue;
+        FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
+        if (!theirs || !theirs->IsHostileTo(*mine))
+            continue;
+
+        for (std::size_t i = 0; i < points.size(); ++i)
+        {
+            float const dx = data.posX - points[i].first;
+            float const dy = data.posY - points[i].second;
+            if (dx * dx + dy * dy > r2)
+                continue;
+            NearbyThreat& threat = out[i];
+            ++threat.count;
+            if (tmpl->maxlevel > threat.level)
+            {
+                threat.level = tmpl->maxlevel;
+                threat.name = tmpl->Name;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WHETHER THIS CHARACTER COULD ACTUALLY DEAL WITH THAT NPC (#234).
 //
@@ -796,6 +857,29 @@ static Player* ResurrectOfferedBy(Player* dead)
 // it here means "would this read as `??` to a human looking at it" rather
 // than a number picked to fit one incident.
 constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
+
+// THE GROUND A TRAVEL DESTINATION STANDS ON (#267). A candidate NPC with
+// hostile spawns CON_COLOR_UNKNOWN_LEVEL_DIFF or more levels above the
+// character within this radius is not a place it can shop, however willing the
+// counter is. Measured live: an Alliance party of 25 to 31 was sent to a
+// faction 35 vendor it could trade with perfectly well, standing 21 yards from
+// eight level 65 elites, and died there eighteen times in sixteen minutes.
+//
+// THE RADIUS IS THE GRAVEYARD'S OWN NUMBER AND IS NAMED AS SUCH. The module
+// already refuses to RESURRECT a character where hostile spawns above its level
+// sit within GRAVEYARD_THREAT_RADIUS, and it was the same module walking it to
+// such a place on an errand. One number, so the two answers cannot drift.
+//
+// THE LEVEL GAP IS DELIBERATELY NOT THE GRAVEYARD'S, and the difference is the
+// only interesting judgement here. The graveyard test counts anything above the
+// character's level at all, because a ghost arriving there has no health, no
+// escape and no choice. A living party walking to a shop has all three, and a
+// hostile two levels up is an ordinary hazard of the world rather than a reason
+// to give up shopping. So this one asks the question the game's own nameplate
+// asks: would this read as `??`, maximum danger, to a human looking at it.
+// Refusing less than that would strand a party in any contested zone, which is
+// a worse bug than the one being fixed.
+constexpr float TRAVEL_THREAT_RADIUS = GRAVEYARD_THREAT_RADIUS;
 
 // How close counts as arrived. INTERACTION_DISTANCE is 5.0 yards and is what
 // the game uses to decide whether a player may talk to an NPC at all; this is
@@ -6618,6 +6702,40 @@ private:
             candidate.mayInteract = known->second;
             candidates.push_back(candidate);
             spawns.push_back(&spawn);
+        }
+
+        // WHAT IS STANDING AROUND EACH ONE (#267). Asked only of the spawns
+        // that survived the interaction gate, because a counter that will not
+        // serve this character is already out and its guards are nobody's
+        // business. Off spawn data rather than the live grid, for the reason
+        // GRAVEYARD_THREAT_RADIUS gives: a destination two grids away is not
+        // loaded, and an unloaded grid reads as "no creatures", which is
+        // exactly the wrong answer for this question.
+        //
+        // ONE SWEEP FOR ALL OF THEM. See HostileSpawnsNearEach: there are 823
+        // vendor spawns on the map this was measured on, and asking the
+        // one-spot version 823 times would be 823 passes over every creature
+        // spawn in the world on the world thread.
+        std::vector<std::pair<float, float>> usableAt;
+        std::vector<std::size_t> usableIndex;
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+        {
+            if (!candidates[i].mayInteract)
+                continue;
+            usableAt.emplace_back(spawns[i]->x, spawns[i]->y);
+            usableIndex.push_back(i);
+        }
+        if (!usableAt.empty())
+        {
+            std::vector<NearbyThreat> threats;
+            HostileSpawnsNearEach(bot, mapId, usableAt, TRAVEL_THREAT_RADIUS,
+                                  bot->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1,
+                                  threats);
+            for (std::size_t k = 0; k < usableIndex.size(); ++k)
+            {
+                candidates[usableIndex[k]].guardCount = threats[k].count;
+                candidates[usableIndex[k]].guardLevel = threats[k].level;
+            }
         }
 
         OverseerDecisions::TravelTargetChoice const choice =

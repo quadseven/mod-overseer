@@ -2811,13 +2811,28 @@ TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& 
                 choice.nearestRefused = int(i);
             continue;
         }
+        // The second gate (#267). A spawn standing in ground this character
+        // cannot survive is out for the same reason an unfriendly one is: the
+        // errand cannot end there, and the walk is what kills people.
+        if (candidate.guardCount)
+        {
+            ++choice.guarded;
+            if (choice.nearestGuarded < 0 ||
+                candidate.distance < candidates[std::size_t(choice.nearestGuarded)].distance)
+                choice.nearestGuarded = int(i);
+            continue;
+        }
         if (choice.index < 0 ||
             candidate.distance < candidates[std::size_t(choice.index)].distance)
             choice.index = int(i);
     }
 
-    choice.verdict = choice.index >= 0 ? TravelTargetVerdict::Chosen
-                                       : TravelTargetVerdict::NoneWillDealWithUs;
+    if (choice.index >= 0)
+        choice.verdict = TravelTargetVerdict::Chosen;
+    else if (choice.guarded)
+        choice.verdict = TravelTargetVerdict::EveryOneIsGuarded;
+    else
+        choice.verdict = TravelTargetVerdict::NoneWillDealWithUs;
     return choice;
 }
 
@@ -2838,9 +2853,20 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
         return "entry " + std::to_string(candidate.entry) + " at " +
                yards(candidate.distance) + " yards";
     };
+    // A guarded spawn is named with its guard, because "entry 14964 at 498
+    // yards" and "entry 14964 at 498 yards, guarded by 10 hostile spawn(s) up
+    // to level 65" send an operator to two different places.
+    auto const guardedNameOf = [&](int index)
+    {
+        TravelTargetCandidate const& candidate = candidates[std::size_t(index)];
+        return nameOf(index) + ", guarded by " + std::to_string(candidate.guardCount) +
+               " hostile spawn(s) up to level " + std::to_string(candidate.guardLevel);
+    };
 
     bool const haveRefused = choice.nearestRefused >= 0 &&
                              std::size_t(choice.nearestRefused) < candidates.size();
+    bool const haveGuarded = choice.nearestGuarded >= 0 &&
+                             std::size_t(choice.nearestGuarded) < candidates.size();
 
     if (choice.verdict == TravelTargetVerdict::NoneWillDealWithUs)
     {
@@ -2852,7 +2878,23 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
         return said;
     }
 
-    if (choice.verdict != TravelTargetVerdict::Chosen || !choice.refused)
+    // A THIRD FACT, NOT A SHADE OF THE SECOND (#267). "There are none here",
+    // "there are some and none will serve you" and "there are some that would
+    // serve you and every one stands in hostile ground" have three different
+    // answers: aim somewhere else, aim at a different faction's town, and send
+    // an escort or pick a different shop. Folding the third into the second is
+    // what let a fatal destination read as a missing one.
+    if (choice.verdict == TravelTargetVerdict::EveryOneIsGuarded)
+    {
+        std::string said = std::to_string(choice.guarded) +
+                           " of them on this map are ones this character may use and every "
+                           "one stands in hostile ground";
+        if (haveGuarded)
+            said += " - the nearest is " + guardedNameOf(choice.nearestGuarded);
+        return said;
+    }
+
+    if (choice.verdict != TravelTargetVerdict::Chosen)
         return {};
     if (std::size_t(choice.index) >= candidates.size())
         return {};
@@ -2865,17 +2907,39 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
     // the world.
     float const chosen = candidates[std::size_t(choice.index)].distance;
     std::size_t nearer = 0;
+    std::size_t nearerGuarded = 0;
     for (TravelTargetCandidate const& candidate : candidates)
-        if (!candidate.mayInteract && candidate.distance < chosen)
+    {
+        if (candidate.distance >= chosen)
+            continue;
+        if (!candidate.mayInteract)
             ++nearer;
-    if (!nearer)
+        else if (candidate.guardCount)
+            ++nearerGuarded;
+    }
+    if (!nearer && !nearerGuarded)
         return {};
 
-    std::string said = "chose " + nameOf(choice.index) + " over " +
-                       std::to_string(nearer) +
-                       " nearer one(s) this character may not interact with";
-    if (haveRefused)
-        said += " - the nearest of those is " + nameOf(choice.nearestRefused);
+    // The two halves are said separately and only when each one cost a walk,
+    // so a line that appears is always a line about this errand. A party that
+    // walked past a shop it may not use and a party that walked past one it
+    // would have died at are looking at different problems.
+    std::string said = "chose " + nameOf(choice.index);
+    if (nearer)
+    {
+        said += " over " + std::to_string(nearer) +
+                " nearer one(s) this character may not interact with";
+        if (haveRefused)
+            said += " - the nearest of those is " + nameOf(choice.nearestRefused);
+    }
+    if (nearerGuarded)
+    {
+        said += nearer ? "; and over " : " over ";
+        said += std::to_string(nearerGuarded) +
+                " nearer one(s) standing in hostile ground";
+        if (haveGuarded)
+            said += " - the nearest of those is " + guardedNameOf(choice.nearestGuarded);
+    }
     return said;
 }
 
