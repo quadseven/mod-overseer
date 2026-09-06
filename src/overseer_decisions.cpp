@@ -2729,7 +2729,9 @@ char const* CrossingLegName(CrossingLeg leg)
         case CrossingLeg::Unknown:     return "unknown";
         case CrossingLeg::OffRoute:    return "off route";
         case CrossingLeg::WalkToBerth: return "walk to the berth";
+        case CrossingLeg::WaitForTransport: return "wait for the transport";
         case CrossingLeg::Aboard:      return "aboard";
+        case CrossingLeg::Disembark:   return "disembark";
         case CrossingLeg::Ashore:      return "ashore";
     }
     return "unknown";
@@ -2739,11 +2741,13 @@ char const* CrossingActionName(CrossingAction action)
 {
     switch (action)
     {
-        case CrossingAction::Wait:   return "wait";
-        case CrossingAction::Refuse: return "refuse";
-        case CrossingAction::Walk:   return "walk";
-        case CrossingAction::Ride:   return "ride";
-        case CrossingAction::Done:   return "done";
+        case CrossingAction::Wait:      return "wait";
+        case CrossingAction::Refuse:    return "refuse";
+        case CrossingAction::Walk:      return "walk";
+        case CrossingAction::Hold:      return "hold";
+        case CrossingAction::Ride:      return "ride";
+        case CrossingAction::Disembark: return "disembark";
+        case CrossingAction::Done:      return "done";
     }
     return "wait";
 }
@@ -2762,23 +2766,30 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
             continue;
         }
         ++step.readable;
+
         if (m.isLeader)
         {
             step.leaderReadable = true;
-            step.leaderOnOrigin = m.mapId == world.originMap && !m.aboard;
+            step.leaderAboard = m.aboard;
+            step.leaderOnOrigin = !m.aboard && m.mapId == world.originMap;
             step.leaderAtBerth = step.leaderOnOrigin &&
                                  m.berthDistance <= limits.berthArrivedYards;
         }
-        // ABOARD IS ASKED BEFORE THE MAP. A passenger mid-ocean is on
-        // whichever map the transport currently occupies, and that reading
-        // flips under the transport's own teleport rather than under anything
-        // this party did. Counting it as "still on the origin map" would
-        // produce a fresh walk order for somebody standing on a moving deck.
+
+        // A PASSENGER IS COUNTED TWICE ON PURPOSE, ONCE AS A PASSENGER AND ONCE
+        // BY WHERE IT IS. The first version stopped at the first count, so a
+        // character that had arrived on the destination map while still standing
+        // on the deck could never be seen as needing to get off: it was aboard,
+        // and aboard skipped the map entirely. Both facts are true at once and
+        // both are needed.
         if (m.aboard)
         {
             ++step.aboard;
+            if (m.mapId == world.destinationMap)
+                ++step.stillAboard;
             continue;
         }
+
         if (m.mapId == world.destinationMap)
             ++step.ashore;
         else if (m.mapId == world.originMap)
@@ -2806,20 +2817,10 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 3. EVERYBODY ASHORE ENDS IT, and it is asked before the boat is, because
-    //    a party that has already landed does not care whether a boat can
-    //    still be found. This is also what makes the decision idempotent for
-    //    the four members who were never going to move.
-    if (step.ashore == step.readable)
-    {
-        step.leg = CrossingLeg::Ashore;
-        step.action = CrossingAction::Done;
-        return step;
-    }
-
-    // 4. SOMEBODY ON A THIRD MAP. Refused rather than waited on: no boat on
-    //    this route calls there, so nothing about this crossing improves it,
-    //    and reporting it as a wait would hide a member nobody is coming for.
+    // 3. SOMEBODY ON A THIRD MAP. Refused rather than waited on: no boat on
+    //    this route calls there, so nothing about this crossing improves it.
+    //    Ahead of Done and Disembark because it is the worse fact and must not
+    //    be described in a vocabulary that does not fit it.
     if (step.offRoute)
     {
         step.leg = CrossingLeg::OffRoute;
@@ -2827,41 +2828,92 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 5. ANYBODY ABOARD AND THE TRANSPORT OWNS IT. Ahead of the refusals
-    //    below on purpose: once a character is on the deck, a missing berth
-    //    or a guarded one is no longer a reason to do anything, and the one
-    //    thing that must not happen is a new order pulling a passenger off a
-    //    moving boat.
-    if (step.aboard)
+    // 4. STILL ON THE DECK AT THE FAR END. Asked BEFORE Done, because a
+    //    passenger standing on the destination map has not arrived anywhere: it
+    //    is on a boat that is about to sail back, and calling that Done ends the
+    //    crossing at the exact moment it is most likely to be undone.
+    //
+    //    THIS MODULE CANNOT WALK ANYBODY OFF, which is why the action is its own
+    //    kind of doing nothing rather than an order. Getting off a deck needs
+    //    the same thing getting on needs and does not have: a place the world
+    //    agrees is standable, next to a boat. Until one is supplied this
+    //    supervises and says so, which is strictly better than the previous
+    //    behaviour of never looking again.
+    if (step.stillAboard)
+    {
+        step.leg = CrossingLeg::Disembark;
+        step.action = CrossingAction::Disembark;
+        return step;
+    }
+
+    // 5. EVERYBODY ASHORE, AND OFF EVERY TRANSPORT, ENDS IT. Both halves: the
+    //    `aboard` test above has already taken every passenger out of `ashore`,
+    //    so this cannot be reached by somebody standing on a deck.
+    if (step.ashore == step.readable)
+    {
+        step.leg = CrossingLeg::Ashore;
+        step.action = CrossingAction::Done;
+        return step;
+    }
+
+    // 6. THE LEADER IS ABOARD, so the transport owns the outcome and nothing is
+    //    aimed. NOTE WHAT THIS IS NOT: it is not "somebody is aboard". A
+    //    follower on the deck while the leader is still walking is an ordinary
+    //    and expected state, and the previous version answered Ride to it, which
+    //    released the leader's aim and left the boat to sail without him.
+    if (step.leaderAboard)
     {
         step.leg = CrossingLeg::Aboard;
         step.action = CrossingAction::Ride;
         return step;
     }
 
-    // 6. THE FACTS THE WALK NEEDS. Each is a refusal rather than a wait,
-    //    because none of them arrives by waiting: a boat that does not serve
-    //    both maps never will, a path with no stop frame on a map has no berth
-    //    on it, and a berth in hostile ground is hostile on every poll.
+    // 7. THE FACTS THE WALK NEEDS. Each is a refusal rather than a wait, because
+    //    none of them arrives by waiting: a boat that does not serve both maps
+    //    never will, and a berth nothing has validated is not made walkable by
+    //    another poll.
+    //
+    //    `berthKnown` IS NO LONGER "A STOP FRAME WAS FOUND". It is "the world
+    //    agreed a character may stand here", and while nothing can establish
+    //    that, this refuses. That refusal is the deliverable, not a gap in it:
+    //    the alternative is aiming a family at a ship's mooring.
     if (!world.transportFound || !world.berthKnown || !world.landingKnown ||
-        world.berthGuarded)
+        world.berthGuarded || world.overdue)
     {
         step.leg = CrossingLeg::WalkToBerth;
         step.action = CrossingAction::Refuse;
         return step;
     }
 
-    // 7. THE LEADER IS THE ONLY CHARACTER THIS EVER AIMS. A crossing whose
-    //    leader is already on the far side is therefore one this cannot drive:
-    //    the followers left behind need their leader's aim, and it is not on
-    //    their map to be given. Said rather than worked around, because aiming
-    //    a follower on its own is the scatter this repository keeps paying
-    //    for, and because a leader ashore while followers wait is a real split
-    //    that somebody has to hear about.
+    // 8. THE LEADER IS THE ONLY CHARACTER THIS EVER AIMS. A leader already on
+    //    the far side is therefore a crossing this cannot drive: the followers
+    //    left behind need their leader's aim and it is not on their map to be
+    //    given. Said rather than worked around, because aiming a follower on its
+    //    own is the scatter this repository keeps paying for.
     if (!step.leaderOnOrigin)
     {
         step.leg = CrossingLeg::WalkToBerth;
         step.action = CrossingAction::Refuse;
+        return step;
+    }
+
+    // 9. ALREADY THERE. Answered before Walk, and the difference between the
+    //    two is the whole of the loop this closes: the travel drive releases an
+    //    `at:` errand once the traveller is within five yards of it, and a
+    //    reading that still said Walk made the caller claim it straight back.
+    //    Each of those reclaims looked like a brand new errand to the drive,
+    //    which restamped the clock the death breaker measures its window from,
+    //    so a leader waiting at a lethal pier had a window that was permanently
+    //    zero and a death query that was never issued.
+    //
+    //    THE TOLERANCE IS DELIBERATELY THE LOOSER OF THE TWO. This reads "at the
+    //    berth" from further out than the travel drive reads "arrived", so the
+    //    crossing has stopped asking for the walk before the drive finishes it.
+    //    The other order would leave a gap in which neither is true.
+    if (step.leaderAtBerth)
+    {
+        step.leg = CrossingLeg::WaitForTransport;
+        step.action = CrossingAction::Hold;
         return step;
     }
 
@@ -2886,21 +2938,38 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
 
         case CrossingAction::Done:
             return "every member read on map " + destination +
-                   ", so the crossing is over and ordinary travel takes it "
-                   "from here";
+                   " and off every transport, so the crossing is over and "
+                   "ordinary travel takes it from here";
+
+        case CrossingAction::Disembark:
+            return std::to_string(step.stillAboard) +
+                   " member(s) are on map " + destination +
+                   " but still standing on the transport, which is not the same "
+                   "fact as being ashore and is not an arrival; this module has "
+                   "no validated landing to walk them to, so it watches and "
+                   "says so rather than ending the crossing on a deck";
 
         case CrossingAction::Ride:
-            return std::to_string(step.aboard) +
-                   " member(s) aboard the transport, which carries its own "
-                   "passengers and teleports them when its path changes map; "
-                   "nothing is aimed while anybody is on the deck";
+            return "the leader is aboard between maps " + origin + " and " +
+                   destination +
+                   ", and the transport carries and teleports its own "
+                   "passengers, so nothing is aimed until it has landed";
+
+        case CrossingAction::Hold:
+            return "the leader is at the berth on map " + origin +
+                   " with nothing to do but wait for the transport; no errand is "
+                   "claimed or released while it stands there, because a reclaim "
+                   "would restart the clock the death breaker measures from";
 
         case CrossingAction::Walk:
             return "the leader is on map " + origin + " with " +
                    std::to_string(step.ashore) + " member(s) already on map " +
-                   destination + "; the berth is a stop frame on the "
-                   "transport's own path, so the leader is aimed at it and the "
-                   "followers on its map walk with it";
+                   destination +
+                   (step.leaderAtBerth
+                        ? "; it is at the berth and waiting for the transport"
+                        : "; it is walking to the berth") +
+                   ", and " + std::to_string(step.aboard) +
+                   " member(s) are already aboard";
 
         case CrossingAction::Refuse:
             break;
@@ -2914,16 +2983,30 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
                " member(s) on neither map " + origin + " nor map " +
                destination + ", and no transport on this route calls there";
     if (!world.transportFound)
-        return "no transport on map " + origin +
-               " serves map " + destination +
+        return "no transport is known that serves both map " + origin +
+               " and map " + destination +
                " (a crossing transport is one whose own path names both maps)";
     if (!world.berthKnown)
-        return "the transport serving map " + destination +
-               " has no stop frame on map " + origin + ", so this module has "
-               "no berth to walk to and will not derive one from anything else";
+        return "no boardable place on map " + origin +
+               " has been established. A transport's stop frame is the SHIP's "
+               "mooring, over water beside a pier, not somewhere a character "
+               "may stand, and this module will not aim a family at one or "
+               "derive a pier from it. There is also no way here to step onto "
+               "a deck: upstream boards over the last sixty yards with a "
+               "straight-line move that needs a master already aboard, and the "
+               "leader has no master" +
+               (world.mooringKnown ? " (the mooring itself is known, and is in "
+                                     "the log line above this one)"
+                                   : "");
     if (!world.landingKnown)
-        return "the transport has no stop frame on map " + destination +
-               ", so its path does not land where this crossing claims";
+        return "no place on map " + destination +
+               " has been established to walk ashore onto, and a crossing that "
+               "cannot end is not one to start";
+    if (world.overdue)
+        return "this crossing has been under way too long and is given up on. "
+               "The death breaker declines to call off an errand a run owns, on "
+               "the grounds that the run answers for it, so a crossing without a "
+               "backstop is an errand nothing can ever stop";
     if (world.berthGuarded)
         return "the berth on map " + origin +
                " stands in hostile ground, up to level " +
