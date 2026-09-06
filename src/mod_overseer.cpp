@@ -12962,6 +12962,18 @@ private:
         // on its row as what it was rather than as an ordinary 'left'. Empty for
         // every other way out.
         std::string stalledReason;
+        // AND WHETHER IT WAS FINISHED, which is a different fact from why it is
+        // leaving (#226). Set by CLEARING when every encounter the map credits
+        // has been credited, read by EXIT so the row says 'complete' rather than
+        // the 'left' that any walk-out used to write. It is deliberately a
+        // separate field from `stalledReason` and not the absence of one: a
+        // stall and a completion can both be true of the same run, and
+        // OverseerDecisions::DungeonRunExitOutcome owns which word wins.
+        bool provedComplete{false};
+        // Said once per run rather than once per poll, the same log-once
+        // discipline every other flag on this struct follows: a map with no
+        // encounter rows answers Unknowable on every poll for the whole run.
+        bool loggedNoCompletionSignal{false};
         bool anchorSet{false};
         float anchorX{0.f}, anchorY{0.f};
         time_t anchorAt{0};
@@ -13260,6 +13272,43 @@ private:
             if (bind->save)
                 return bind->save->GetCompletedEncounterMask();
         return 0;
+    }
+
+    // EVERY BIT THIS MAP CAN CREDIT, WHICH IS WHAT "FINISHED" HAS TO BE
+    // MEASURED AGAINST (#226).
+    //
+    // BUILT FROM THE SAME LIST THE CORE CREDITS OUT OF, so the two numbers
+    // cannot drift: Map::UpdateEncounterState (Map.cpp:2933-2975) walks exactly
+    // this list on every kill and ORs in `1 << dbcEntry->encounterIndex`, then
+    // writes the result to the InstanceSave that CompletedEncounters above reads
+    // back. Asking the same store for the whole set turns that running total
+    // into a completion test without a per-map constant anybody has to maintain,
+    // and without the boss-state framework neither Deadmines nor Wailing Caverns
+    // uses. See OverseerDecisions::DungeonRunCompletion for the argument at
+    // length.
+    //
+    // ZERO IS "THIS MAP CREDITS NOTHING", NOT "NOTHING LEFT TO DO", and the
+    // decision function is built around telling those apart. A map with no rows
+    // in the DBC answers nullptr here, and a run on it keeps exactly the endings
+    // it has today.
+    //
+    // GetDungeonEncounterList  ObjectMgr.h:953; DungeonEncounter::dbcEntry
+    // ObjectMgr.h:710; DungeonEncounterEntry::encounterIndex DBCStructure.h.
+    // Read every time rather than cached: it is a hash lookup in a store loaded
+    // once at startup, and a cached copy is one more thing that can be stale -
+    // the same argument the door's own coordinates are re-read under.
+    static uint32 ExpectedEncounterMask(uint32 mapId)
+    {
+        DungeonEncounterList const* encounters =
+            sObjectMgr->GetDungeonEncounterList(mapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (!encounters)
+            return 0;
+
+        uint32 mask = 0;
+        for (DungeonEncounter const* encounter : *encounters)
+            if (encounter && encounter->dbcEntry)
+                mask |= 1u << encounter->dbcEntry->encounterIndex;
+        return mask;
     }
 
     // ---- the CLEARING watchdog: has the run gone anywhere (#171) ----
@@ -15669,10 +15718,16 @@ private:
                             // that lived on `coord` would be destroyed under a
                             // reference the function still holds.
                             std::string const reason =
-                                coord.stalledReason.empty()
-                                    ? ("the party walked back out through areatrigger " +
+                                coord.provedComplete
+                                    ? ("every encounter map " +
+                                       std::to_string(portal->insideMapId) +
+                                       " credits was credited, and the party walked back "
+                                       "out through areatrigger " +
                                        std::to_string(triggerId))
-                                    : coord.stalledReason;
+                                    : coord.stalledReason.empty()
+                                          ? ("the party walked back out through "
+                                             "areatrigger " + std::to_string(triggerId))
+                                          : coord.stalledReason;
                             // AND THE ROW SAYS WHAT ACTUALLY HAPPENED (#171).
                             // 'stalled' was named and deliberately NOT written
                             // by the accounting migration, because this module
@@ -15683,7 +15738,9 @@ private:
                                             coord.runId
                                                 ? coord.runId
                                                 : ActiveRunIdOnMap(portal->insideMapId),
-                                            coord.stalledReason.empty() ? "left" : "stalled",
+                                            OverseerDecisions::DungeonRunExitOutcome(
+                                                coord.provedComplete,
+                                                !coord.stalledReason.empty()),
                                             reason, IsDungeonJob(leaderJob));
                         }
                         return;
@@ -15993,6 +16050,74 @@ private:
             // anything placed after it would never run again for the rest of
             // the run, which is precisely the window a twenty-six minute freeze
             // lives in.
+            // IS IT FINISHED? ASKED BEFORE THE WATCHDOG, because to that
+            // watchdog a finished dungeon and a stuck one are the same picture
+            // (#226). It looks for no boss credit, nobody busy and a leader that
+            // has not moved, which is exactly what a party that has killed
+            // everything looks like - so a clear that succeeded gets three
+            // pointless `dc skip`s and a row saying 'stalled', if it is noticed
+            // at all.
+            //
+            // MEASURED, AND IT WAS NOT NOTICED AT ALL. A confirmed 100 percent
+            // Wailing Caverns clear ran 121 minutes and ended 'emptied'. The
+            // dungeon module does not walk anybody out when it finishes - it
+            // disables itself and the party stands where it stopped - and a
+            // party standing about sits down to eat, which this watchdog counts
+            // as BUSY and which re-stamps its clock on every poll. So the one
+            // bound that could have ended the run was held open by the party
+            // resting after the run it had already won.
+            //
+            // Execution only reaches here in CLEARING - STAGED_INSIDE returns
+            // above - which is the only phase where the question means
+            // anything: before entry there is nothing to have finished, and
+            // EXIT has already decided to leave. The flag is an idempotence
+            // guard, not a phase test: once the answer is yes the phase changes
+            // and this is not asked again for the run.
+            if (!coord.provedComplete)
+            {
+                uint32 const expected = ExpectedEncounterMask(portal->insideMapId);
+                uint32 const credited = CompletedEncounters(leader);
+                OverseerDecisions::DungeonCompletion const done =
+                    OverseerDecisions::DungeonRunCompletion(expected, credited);
+
+                if (done == OverseerDecisions::DungeonCompletion::Complete)
+                {
+                    coord.provedComplete = true;
+                    coord.phase = DungeonRunPhase::Exiting;
+                    coord.crossing.best = 0.f;
+                    coord.crossing.since = std::time(nullptr);
+                    coord.loggedCrossingAim = false;
+                    coord.loggedCrossingWaiting = false;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} of campaign {} is FINISHED - every "
+                             "encounter map {} credits has been credited (mask {} of {}). "
+                             "EXIT walks them back out through the door they came in by, "
+                             "which is the first ending this coordinator has ever had for "
+                             "a run that simply worked",
+                             coord.runNumber, coord.campaignId, portal->insideMapId,
+                             credited, expected);
+                    return;
+                }
+
+                // SAID ONCE, AND ONLY WHEN THE ANSWER IS THAT THERE IS NO
+                // ANSWER. A map the DBC credits nothing for keeps every ending
+                // it has today, and an operator watching a campaign on such a
+                // map should be able to read why it never ends 'complete'
+                // rather than deduce it.
+                if (done == OverseerDecisions::DungeonCompletion::Unknowable &&
+                    !coord.loggedNoCompletionSignal)
+                {
+                    coord.loggedNoCompletionSignal = true;
+                    LOG_WARN("module.overseer",
+                             "overseer: map {} has no DungeonEncounter rows, so this "
+                             "coordinator cannot tell when a run on it is finished. The "
+                             "run still ends the ways it always could - the clearing "
+                             "watchdog, a job change, or the map emptying - and it will "
+                             "never be recorded 'complete'",
+                             portal->insideMapId);
+                }
+            }
+
             if (RunClearingWatchdog(coord, leader, states, portal->insideMapId))
                 return;   // the run is on its way out; the phase has changed
 
