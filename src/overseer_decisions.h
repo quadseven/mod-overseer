@@ -289,6 +289,16 @@ struct TerrainReading
     // invalid height sentinels. Invalid data grants no permission to move.
     bool surfaceValid{false};
     bool hasLocalNavmesh{false};
+    // DOES ANY DIRECTION OUT OF HERE PASS THIS MODULE'S OWN FOOTING CHECK?
+    // The adapter walks a short stride on four bearings and asks each one the
+    // same GroundHolds and NothingInTheWay every travel step is asked, so this
+    // is the module trying to leave and reporting whether it could.
+    //
+    // TRUE BY DEFAULT, and that default is the safe one: see
+    // StandingOnTheGround for why this can only ever take a reading AWAY from
+    // "on the ground" and never toward it. A caller that does not measure it
+    // gets exactly the behaviour this drive had before #262.
+    bool footingHolds{true};
 };
 
 struct TerrainRecoveryVerdict
@@ -385,6 +395,43 @@ struct TerrainRecoveryState
     float y{0.f};
 };
 
+// IS THIS CHARACTER STANDING ON THE GROUND, or only near some ground?
+//
+// `hasLocalNavmesh` is what Detour answers when it is asked for a path a
+// couple of yards away, and what it answers is "a polygon was found inside the
+// search box". That is a statement about the neighbourhood, not about the
+// feet. The core's own poly lookup searches five yards above and below a point
+// before widening to fifty (PathGenerator.cpp:233, :247), so a polygon several
+// yards OVERHEAD, on a patch joined to nothing, answers this question yes.
+//
+// MEASURED (#262). Four of the five family members stood at map 1
+// (-605.64, -2106.66, 44.97) beside the Wailing Caverns approach ramp for the
+// whole of two 12 minute staging attempts. There is no navmesh polygon under
+// their feet at all: the only surface at their x and y is 34.4 yards over
+// their heads and belongs to a different connected component from the door,
+// and the nearest polygon of any component is an isolated patch 3.8 yards
+// away, 1.4 along and 3.5 UP. That patch sits inside Detour's search box, so
+// the recovery drive read a live polygon, logged that the character was
+// "STANDING ON THE GROUND", and moved nobody. The travel drive was saying, in
+// the same minutes, that "there is no direction out of where it stands that
+// does not step off something".
+//
+// TWO INSTRUMENTS DISAGREED AND THE WEAKER ONE WAS BELIEVED. A polygon inside
+// a search box is circumstantial: nothing about it says the character is on
+// it, or that anything joins it to anywhere. A footing check that walked every
+// bearing it has and refused all of them is this module trying to leave and
+// failing. So the navmesh answer is trusted as "on the ground" only while the
+// ground it reports can be walked off; ground no step can be taken from is not
+// ground this character is standing on, whatever the mesh holds nearby.
+//
+// IT CAN ONLY EVER TAKE THE ANSWER AWAY. No polygon is still no polygon
+// however well the footing holds, so this never invents an "on the ground"
+// Detour did not report. That asymmetry is deliberate and is the same one the
+// comment on TerrainRecoveryStep already argues for: the TRUE answer is the
+// one that carries weight, so the only correction worth making is to the true
+// answer.
+bool StandingOnTheGround(bool hasLocalNavmesh, bool footingHolds);
+
 // One poll, for one character. Reads the two predicates above for the
 // condition and this character's own history for the remedy, and updates that
 // history in place.
@@ -395,8 +442,20 @@ struct TerrainRecoveryState
 // weak evidence of trouble and can be self-confirming. It is the TRUE answer
 // that carries weight, because a polygon found at the character's own feet is
 // a positive statement about where those feet are. This function is built the
-// way round that fact allows: true is trusted and never overruled, false only
-// opens the bounded ladder rather than authorizing a displacement outright.
+// way round that fact allows: a false only opens the bounded ladder rather
+// than authorizing a displacement outright.
+//
+// THE TRUE ANSWER IS NOW CHECKED RATHER THAN TAKEN (#262). It used to be
+// trusted and never overruled, and this comment said so. Then a polygon
+// several yards OVERHEAD, on a patch joined to nothing, answered true for four
+// characters sealed in a pocket beside the Wailing Caverns ramp, and this
+// function congratulated all four on standing on the ground while the travel
+// drive was reporting that no direction out of it was walkable. So the true
+// answer passes through StandingOnTheGround first, which is the only reading
+// this function takes that is NOT the adapter's word for it. Nothing else
+// changed: the correction can only ever take an "on the ground" away, never
+// add one, so a false is still a false and the ladder below is still the
+// bound.
 TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
                                            TerrainReading const& reading,
                                            TerrainRecoveryLimits const& limits,
@@ -422,6 +481,36 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
 // stepped onto only if its height is within the gap a step can bridge.
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap);
+
+// A STEP DOWN MUST ALSO BE A STEP BACK (#262).
+//
+// The footing check walks a straight step in strides and asks at each stride
+// how far the surface moved. It had two bounds and they were different sizes:
+// a DROP of up to ten yards was approved, because ten is under the height at
+// which the core starts charging for a fall, while a RISE of more than eight
+// was refused as a rock face rather than a slope. So a character could be
+// walked DOWN a nine yard stride that it would never afterwards be allowed to
+// climb. That is a one way door, and a check that approves a step whose
+// reverse it refuses can strand a character permanently.
+//
+// It stranded four, beside the Wailing Caverns approach ramp, for two 12
+// minute staging attempts each, with the travel drive reporting every errand
+// that no direction out of that pocket was walkable.
+//
+// SO THE BOUND IS THE SMALLER OF THE TWO, IN BOTH DIRECTIONS. That is the
+// whole rule: a stride is walkable exactly when the stride back is walkable.
+// It introduces no number, because a symmetric rule cannot have two of them,
+// and the larger of the pair was only ever reachable in the direction that
+// traps somebody. Everything the drop bound was chosen for survives the
+// tightening: eight yards is still well under the height at which a fall costs
+// health, so a drop this approves is still a free one.
+//
+// AND IT ONLY EVER RUNS OFF THE NAVMESH. The travel step asks the navmesh
+// first and takes its route whenever there is one, so this bounds the
+// straight-line fallback and nothing else. The fallback exists for exactly the
+// places the mesh has no route over, which is exactly where the one way doors
+// are.
+bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise);
 
 // A VERTICAL GAP AT SHORT RANGE MEANS "ABOVE IT", NOT "NEAR IT" (#217).
 //

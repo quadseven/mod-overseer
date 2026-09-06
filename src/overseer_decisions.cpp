@@ -124,6 +124,11 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= overrideGap;
 }
 
+bool StandingOnTheGround(bool hasLocalNavmesh, bool footingHolds)
+{
+    return hasLocalNavmesh && footingHolds;
+}
+
 namespace
 {
 
@@ -174,16 +179,24 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         state = TerrainRecoveryState{};
     }
 
+    // WHAT "IT HAS A POLYGON" IS WORTH, decided once and then read three
+    // times, because all three readings are the same question. A polygon
+    // Detour found inside its search box is only evidence about this
+    // character's feet while some direction out of here can be walked; see
+    // StandingOnTheGround for the pocket beside the Wailing Caverns ramp where
+    // it was not, and where believing it held four characters for 24 minutes.
+    bool const onTheGround =
+        StandingOnTheGround(reading.hasLocalNavmesh, reading.footingHolds);
+
     // The condition is exactly what the adapter asked before: the two
     // predicates above, unchanged, in the same order. Only what happens next
     // is new.
     bool const holds =
         BelowTerrainNeedsRecovery(reading.z, reading.surfaceAboveZ,
-                                  reading.surfaceValid, reading.hasLocalNavmesh,
+                                  reading.surfaceValid, onTheGround,
                                   limits.minimumGap) ||
         LargeSurfaceMismatchNeedsRecovery(reading.z, reading.surfaceAboveZ,
-                                          reading.surfaceValid,
-                                          reading.hasLocalNavmesh,
+                                          reading.surfaceValid, onTheGround,
                                           limits.overrideGap);
     if (!holds)
         return TerrainRecoveryVerdict{};
@@ -201,10 +214,11 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         state.y = reading.y;
     }
 
-    if (reading.hasLocalNavmesh)
+    if (onTheGround)
     {
-        // DETOUR FOUND WALKABLE GROUND AT THIS CHARACTER'S OWN FEET, so it is
-        // standing on walkable ground and the gap above it is a roof. Nothing
+        // DETOUR FOUND WALKABLE GROUND AT THIS CHARACTER'S OWN FEET AND THE
+        // CHARACTER CAN STILL WALK OFF IT, so it is standing on walkable
+        // ground and the gap above it is a roof. Nothing
         // gets moved here. The one warning is still worth making, because a
         // large gap over a live polygon is either architecture (and this rule
         // should stop asking about that place) or a misleading lower plane
@@ -258,6 +272,17 @@ bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
         return true;
     float const gap = verticalGap < 0.f ? -verticalGap : verticalGap;
     return gap <= maxGap;
+}
+
+bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise)
+{
+    // The smaller bound, applied to the magnitude. A stride is walkable
+    // exactly when the stride back is, so there is one number rather than two,
+    // and the sign is folded by hand for the same reason WithinRadius squares
+    // its comparison: this file includes its own header and nothing else.
+    float const bound = maxDrop < maxRise ? maxDrop : maxRise;
+    float const change = toZ - fromZ;
+    return (change < 0.f ? -change : change) <= bound;
 }
 
 bool TravelEndpointWithinTolerance(float routedEndZ, float requestedZ,
