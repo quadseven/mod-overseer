@@ -154,6 +154,8 @@
 #include "SpellMgr.h"
 #include "Timer.h"
 #include "Trainer.h"
+#include "Transport.h"
+#include "TransportMgr.h"
 #include "World.h"
 #include "WorldSession.h"
 #include "TradeData.h"
@@ -184,6 +186,7 @@
 // compiles only by accident of somebody else's include is a catch
 // that stops compiling when they tidy up.
 #include <exception>
+#include <iomanip>
 #include <list>
 #include <map>
 #include <mutex>
@@ -888,6 +891,24 @@ constexpr float TRAVEL_THREAT_RADIUS = GRAVEYARD_THREAT_RADIUS;
 // tight and the errand never reads as finished; too loose and it reads as
 // finished from across the room.
 constexpr float TRAVEL_ARRIVED_YARDS = 12.0f;
+
+// How wide `overseer_roster.travel_npc` is, which is the width every aim
+// this module writes has to fit in
+// (data/sql/characters/base/2026_08_25_00_overseer_roster_travel_npc.sql).
+// Written down here because outside strict mode MySQL truncates an
+// over-long value rather than refusing it, and a truncated aim is one the
+// parser can never read back: the errand is written, never resolves, and
+// looks exactly like a character that did not walk. Role keywords and
+// creature entries are nowhere near it; a berth two five-digit coordinates
+// from the origin is the first aim that can reach it.
+constexpr std::size_t TRAVEL_AIM_COLUMN_CHARS = 32;
+
+// How close the leader has to be to a berth before it counts as being AT
+// it. Deliberately the same order as TRAVEL_ARRIVED_YARDS and for the same
+// reason, and deliberately NOT a boarding radius: this module never decides
+// anybody is aboard. What happens inside this distance is that the bot AI
+// polls Map::GetTransportForPos, and the MAP decides.
+constexpr float CROSSING_BERTH_ARRIVED_YARDS = 12.0f;
 
 // The same question for an aimed POSITION, and it needs a different answer.
 // Everything above reasons about a creature: the slack exists because the
@@ -13621,6 +13642,45 @@ private:
         // walkable again, and the line can therefore be said once per episode
         // rather than once per coordinator.
         bool loggedAboveTheDoor{false};
+
+        // --- crossing a continent (#241) -----------------------------
+        //
+        // SAID ON CHANGE RATHER THAN ONCE, unlike the two flags above. A
+        // refusal is a standing fact; a crossing MOVES, through walking,
+        // riding and landing, and each of those transitions is worth one
+        // line while none of them is worth twelve a minute. 255 is "nothing
+        // said yet" and is not a CrossingAction.
+        uint8 crossingSaid{255};
+        // The berth sweep, kept against the berth it answered about. See
+        // BerthIsGuarded: this caches a reading of static spawn data, not a
+        // reading of the live grid, which is the only reason it may be
+        // cached at all.
+        bool crossingSwept{false};
+        uint32 crossingSweptMap{0};
+        float crossingSweptX{0.f};
+        float crossingSweptY{0.f};
+        bool crossingBerthGuarded{false};
+        uint32 crossingBerthGuardLevel{0};
+        // THE PIER DOES NOT DISAPPEAR WHEN THE BOAT SAILS, AND NEITHER MAY THIS.
+        // Map::GetAllTransports only reports transports currently ON that map,
+        // and a crossing transport spends half its period on the far one:
+        // DelayedTeleportTransport removes it from this Map and adds it to the
+        // other (Transport.cpp:716-721). So a live lookup alone would answer
+        // "no transport serves that map" for minutes at a time, which is false
+        // and is exactly the kind of log line that teaches an operator the
+        // feature does not work. What is actually being asked is whether a
+        // ROUTE exists, and a route is a property of the transport's path
+        // rather than of where the boat is standing this second. So the berth
+        // is remembered for as long as the crossing is the same one, and the
+        // live lookup only ever improves on it.
+        bool crossingBerthFound{false};
+        uint32 crossingBerthOriginMap{0};
+        uint32 crossingBerthDestinationMap{0};
+        float crossingBerthX{0.f};
+        float crossingBerthY{0.f};
+        float crossingBerthZ{0.f};
+        bool crossingLandingKnown{false};
+        std::string crossingTransportName;
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
@@ -15179,6 +15239,435 @@ private:
                      portal.insideMapId, DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES);
     }
 
+    // ------------------------------------------- crossing a continent (#241) --
+    //
+    // WHAT THIS ADAPTER IS FOR, AND WHAT IT DELIBERATELY IS NOT. The pure
+    // decision beside it (OverseerDecisions::ReadCrossing) needs six facts
+    // about the world that only the worldserver holds. This reads those six
+    // and aims one character. It boards nobody, teleports nobody and
+    // synthesises no packet, because all three are already done by code that
+    // is already running:
+    //
+    //   * BOARDING. PlayerbotAI::UpdateAI polls Map::GetTransportForPos once a
+    //     second for every bot and calls AddPassenger on whatever transport the
+    //     MAP says the character is standing on (PlayerbotAI.cpp:383-400). The
+    //     map's answer is a downward ray cast against the transport's own
+    //     collision model (Map.cpp:1139-1150), so it is the server's judgement
+    //     about the deck and not ours - the same relationship
+    //     StepThroughAreaTrigger has with IsInAreaTriggerRadius, except that
+    //     here we do not even have to send the knock.
+    //   * RIDING. MotionTransport::UpdatePassengerPositions relocates every
+    //     passenger from its stored offset on every tick (Transport.cpp:726),
+    //     server-side, with no client involved.
+    //   * THE MAP BOUNDARY ITSELF. When the path reaches a frame on another
+    //     map, DelayedTeleportTransport calls TeleportTo on every player
+    //     passenger with TELE_TO_NOT_LEAVE_TRANSPORT (Transport.cpp:706), and
+    //     PlayerbotAI::HandleTeleportAck answers the worldport for a bot
+    //     (PlayerbotAI.cpp:787), which it can do because a bot has a session
+    //     with no socket rather than no session.
+    //
+    // SO THE ONE THING MISSING WAS NEVER THE ABILITY TO RIDE A BOAT. It was
+    // that nothing ever walked a character onto one. That is a travel errand,
+    // this module owns travel errands, and the aim it needs is an ordinary
+    // `at:` aim on the character's own map, which the resolver already
+    // accepts. Nothing about the same-map rule is relaxed anywhere.
+    //
+    // WHERE A BOAT TIES UP, WHICH IS THE FACT EVERYTHING TURNED ON. A
+    // transport's path carries a STOP FRAME on each map it serves
+    // (KeyFrame::IsStopFrame, TransportMgr.h, `Node->actionFlag == 2`), and
+    // that frame's own coordinates ARE the berth, with a z that came from the
+    // same row as the x and y. Nothing is offset, scaled or guessed, which is
+    // the whole difference between this and the staging point of #121 that was
+    // derived from a neighbouring landmark and pointed into rock.
+    static bool TransportStopFrameOnMap(MotionTransport const* transport,
+                                        uint32 mapId, float& x, float& y, float& z)
+    {
+        TransportTemplate const* tmpl = transport ? transport->GetTransportTemplate() : nullptr;
+        if (!tmpl)
+            return false;
+        for (KeyFrame const& frame : tmpl->keyFrames)
+        {
+            if (!frame.Node || frame.Node->mapid != mapId || !frame.IsStopFrame())
+                continue;
+            x = frame.Node->x;
+            y = frame.Node->y;
+            z = frame.Node->z;
+            return true;
+        }
+        return false;
+    }
+
+    struct CrossingRoute
+    {
+        OverseerDecisions::CrossingWorld world;
+        std::vector<OverseerDecisions::CrossingMember> members;
+        MotionTransport* transport{nullptr};
+        float berthX{0.f};
+        float berthY{0.f};
+        float berthZ{0.f};
+        std::string transportName;
+    };
+
+    // THE TRANSPORT IS FOUND, NOT NAMED. No boat entry, no taxi path id and no
+    // coordinate is written down anywhere in this module. The question asked
+    // of the world is "is there a transport on the map I am standing on whose
+    // own path also names the map I need", which is one lookup on data the
+    // core built at startup (TransportTemplate::mapsUsed, TransportMgr.cpp:157)
+    // and which stays right if the world's transports ever change. A hardcoded
+    // "The Lady Mehley" would be a fact about one realm's data pretending to be
+    // a fact about the game.
+    //
+    // INSTANCE TRANSPORTS ARE SKIPPED because they are a different thing that
+    // happens to share a class, and because the core already guarantees a
+    // multi-map template is non-instanceable (TransportMgr.cpp:181-189) - so
+    // this is belt and braces on a promise rather than a real filter.
+    MotionTransport* FindCrossingTransport(Player* leader, uint32 destinationMap,
+                                           float& berthX, float& berthY, float& berthZ,
+                                           bool& berthKnown, bool& landingKnown)
+    {
+        berthKnown = false;
+        landingKnown = false;
+        if (!leader || !leader->GetMap())
+            return nullptr;
+
+        uint32 const originMap = leader->GetMapId();
+        if (originMap == destinationMap)
+            return nullptr;
+
+        MotionTransport* best = nullptr;
+        for (Transport* candidate : leader->GetMap()->GetAllTransports())
+        {
+            MotionTransport* transport = candidate ? candidate->ToMotionTransport() : nullptr;
+            if (!transport)
+                continue;
+            TransportTemplate const* tmpl = transport->GetTransportTemplate();
+            if (!tmpl || tmpl->inInstance)
+                continue;
+            if (!tmpl->mapsUsed.count(originMap) || !tmpl->mapsUsed.count(destinationMap))
+                continue;
+
+            float bx = 0.f, by = 0.f, bz = 0.f, lx = 0.f, ly = 0.f, lz = 0.f;
+            bool const berth = TransportStopFrameOnMap(transport, originMap, bx, by, bz);
+            bool const landing = TransportStopFrameOnMap(transport, destinationMap, lx, ly, lz);
+
+            // The first one that serves both maps is reported even when it has
+            // no berth, so the refusal can say "this boat has no stop frame on
+            // your map" rather than the much less useful "no boat". A LATER
+            // candidate that is complete still wins, which is why this does not
+            // return early on the incomplete one.
+            if (!best || (berth && landing && !(berthKnown && landingKnown)))
+            {
+                best = transport;
+                berthKnown = berth;
+                landingKnown = landing;
+                berthX = bx;
+                berthY = by;
+                berthZ = bz;
+            }
+        }
+        return best;
+    }
+
+    // THE BERTH IS A TRAVEL DESTINATION AND GETS A TRAVEL DESTINATION'S SWEEP
+    // (#267). The same spawn data, the same radius and the same level rule that
+    // refuses a vendor standing in a Horde military camp. This is the gate that
+    // stops a crossing turning into the eighteen deaths to one level 65 elite
+    // that #267 was filed for: a pier is not automatically safe just because it
+    // is a pier, and the walk to it is what kills people.
+    //
+    // The route to the berth is NOT swept, and saying so is more honest than
+    // implying it is. Nothing in this module reads what a path crosses; the
+    // aim is a destination, not a route. What bounds the risk here is that only
+    // ONE character is ever aimed, which is the discipline the repository
+    // already runs on, and that the destination itself is now checked.
+    // ANSWERED ONCE PER BERTH, NOT ONCE PER POLL. The sweep is a pass over
+    // every creature spawn on the map, and this branch is reached on every
+    // DUNGEON_RUN_POLL_MS poll for as long as the family is on the wrong
+    // continent, which can be hours. Spawn data does not move, so the answer is
+    // kept against the berth it was asked about and re-asked only if the berth
+    // changes. Caching a reading of the live grid would be wrong; this is a
+    // reading of static data, which is why HostileSpawnsNear uses it.
+    bool BerthIsGuarded(DungeonRunCoordinatorState& coord, Player* leader, uint32 mapId,
+                        float x, float y, uint32& outLevel)
+    {
+        outLevel = 0;
+        if (!leader)
+            return false;
+
+        if (coord.crossingSwept && coord.crossingSweptMap == mapId &&
+            std::fabs(coord.crossingSweptX - x) < 0.5f &&
+            std::fabs(coord.crossingSweptY - y) < 0.5f)
+        {
+            outLevel = coord.crossingBerthGuardLevel;
+            return coord.crossingBerthGuarded;
+        }
+
+        NearbyThreat const threat =
+            HostileSpawnsNear(leader, mapId, x, y, TRAVEL_THREAT_RADIUS,
+                              leader->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1);
+        coord.crossingSwept = true;
+        coord.crossingSweptMap = mapId;
+        coord.crossingSweptX = x;
+        coord.crossingSweptY = y;
+        coord.crossingBerthGuarded = threat.count != 0;
+        coord.crossingBerthGuardLevel = threat.level;
+        outLevel = threat.level;
+        return coord.crossingBerthGuarded;
+    }
+
+    // Read the whole crossing off the world: the boat, the berth, and one
+    // sighting per roster member.
+    //
+    // DRIVEN BY THE ROSTER AND NOT BY WHO HAPPENS TO BE ONLINE. A member this
+    // cannot steer produces a reading that says so, and the decision refuses to
+    // grade a party it cannot see. Iterating the living instead would produce
+    // four readings for a family of five and a count that looks complete, which
+    // is the exact failure that has cost this codebase four strandings.
+    CrossingRoute ReadCrossingFromWorld(DungeonRunCoordinatorState& coord,
+                                        std::vector<std::string> const& members,
+                                        std::string const& leaderName, Player* leader,
+                                        uint32 destinationMap)
+    {
+        CrossingRoute route;
+        route.world.originMap = leader ? leader->GetMapId() : 0;
+        route.world.destinationMap = destinationMap;
+
+        bool berthKnown = false;
+        bool landingKnown = false;
+        route.transport = FindCrossingTransport(leader, destinationMap, route.berthX,
+                                                route.berthY, route.berthZ, berthKnown,
+                                                landingKnown);
+
+        // A CROSSING IS THE SAME CROSSING WHILE BOTH ITS ENDS ARE. Anything
+        // else - a different origin map because the leader moved, a different
+        // portal - is a different route and must not inherit a berth.
+        bool const sameCrossing = coord.crossingBerthFound &&
+                                  coord.crossingBerthOriginMap == route.world.originMap &&
+                                  coord.crossingBerthDestinationMap == destinationMap;
+
+        if (route.transport && berthKnown)
+        {
+            coord.crossingBerthFound = true;
+            coord.crossingBerthOriginMap = route.world.originMap;
+            coord.crossingBerthDestinationMap = destinationMap;
+            coord.crossingBerthX = route.berthX;
+            coord.crossingBerthY = route.berthY;
+            coord.crossingBerthZ = route.berthZ;
+            coord.crossingLandingKnown = landingKnown;
+            coord.crossingTransportName = route.transport->GetName();
+        }
+        else if (sameCrossing)
+        {
+            // The boat is at the far end of its run. The route still exists and
+            // the berth is still where it was, so the leader keeps walking to
+            // it rather than being told there is no boat.
+            berthKnown = true;
+            landingKnown = coord.crossingLandingKnown;
+            route.berthX = coord.crossingBerthX;
+            route.berthY = coord.crossingBerthY;
+            route.berthZ = coord.crossingBerthZ;
+        }
+        else if (!coord.crossingBerthFound)
+        {
+            // Never found one, so nothing is remembered and nothing is claimed.
+            coord.crossingBerthOriginMap = route.world.originMap;
+            coord.crossingBerthDestinationMap = destinationMap;
+        }
+
+        // `transportFound` MEANS "THIS ROUTE EXISTS", not "the boat is in front
+        // of me". The distinction is the whole point of the block above, and it
+        // is what DungeonPortalApproach is being told when it is asked whether a
+        // crossing exists.
+        route.world.transportFound = route.transport != nullptr || (sameCrossing && berthKnown);
+        route.world.berthKnown = berthKnown;
+        route.world.landingKnown = landingKnown;
+        route.transportName = route.transport ? route.transport->GetName()
+                                              : coord.crossingTransportName;
+
+        if (route.world.transportFound && berthKnown)
+        {
+            // Keyed on the berth in hand, which may be the remembered one. The
+            // sweep is over static spawn data, so a berth that was clear when
+            // the boat was here is still clear now.
+
+            uint32 guardLevel = 0;
+            route.world.berthGuarded = BerthIsGuarded(coord, leader, route.world.originMap,
+                                                      route.berthX, route.berthY, guardLevel);
+            route.world.berthGuardLevel = guardLevel;
+        }
+
+        for (std::string const& name : members)
+        {
+            OverseerDecisions::CrossingMember member;
+            member.isLeader = name == leaderName;
+
+            Player* p = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(p))
+            {
+                // Unreadable, and left that way on purpose. A logged out
+                // member has no map, and a map it does not have must not be
+                // borrowed from a stale table row.
+                route.members.push_back(member);
+                continue;
+            }
+
+            member.readable = true;
+            member.mapId = p->GetMapId();
+            // THE MAP'S ANSWER, NOT OURS. GetTransport() is set by whoever
+            // boarded the character, which on this deployment is the bot AI
+            // acting on Map::GetTransportForPos. This module never writes it.
+            member.aboard = route.transport && p->GetTransport() == route.transport;
+            member.berthDistance =
+                (berthKnown && member.mapId == route.world.originMap)
+                    ? p->GetDistance2d(route.berthX, route.berthY)
+                    : 0.f;
+            route.members.push_back(member);
+        }
+        return route;
+    }
+
+    // ACT ON THE STEP, WHICH FOR FOUR OF THE FIVE ACTIONS MEANS SAY IT AND
+    // STOP. The only action that touches the world is Walk, and all it does is
+    // claim the leader's travel aim for an ordinary `at:` position on the map
+    // the leader is already standing on. Everything after that - stepping onto
+    // the deck, being taken aboard, being carried, being teleported to the far
+    // map and acknowledging it - belongs to code that already runs.
+    //
+    // SAID ON CHANGE, NOT ON EVERY POLL. A crossing is reached every
+    // DUNGEON_RUN_POLL_MS for as long as the family is on the wrong continent,
+    // and a line repeated twelve times a minute is a line an operator filters
+    // out. But unlike the flat refusal it replaces, a crossing MOVES through
+    // legs, and each transition is worth exactly one line.
+    // NAMED FOR THE CONTINENT AND NOT THE DUNGEON, because DriveDungeonCrossing
+    // already exists a few hundred lines up and means something completely
+    // different: crossing the THRESHOLD of an instance door. Two functions one
+    // overload apart, one of which walks a character through a portal and one
+    // of which puts a family on a boat, is a name collision waiting to be
+    // mis-called.
+    void DriveContinentCrossing(DungeonRunCoordinatorState& coord,
+                                OverseerDecisions::CrossingStep const& step,
+                                CrossingRoute const& route, std::string const& leaderName,
+                                Player* leader, std::string const& dungeonKeyword)
+    {
+        uint8 const said = static_cast<uint8>(step.action);
+        bool const fresh = coord.crossingSaid != said;
+        coord.crossingSaid = said;
+
+        std::string const why = OverseerDecisions::CrossingExplanation(step, route.world);
+        std::string const boat =
+            route.transportName.empty() ? std::string("a transport") : route.transportName;
+
+        switch (step.action)
+        {
+            case OverseerDecisions::CrossingAction::Walk:
+            {
+                // The aim is the berth, on the leader's OWN map, so
+                // ResolveTravelTarget accepts it under the same rule it has
+                // always applied. Nothing here relaxes the same-map check and
+                // nothing here crosses anything: the boat does that.
+                std::ostringstream aim;
+                aim << std::fixed << std::setprecision(1);
+                aim << "at:" << route.world.originMap << ':' << route.berthX << ','
+                    << route.berthY << ',' << route.berthZ;
+                std::string const aimText = aim.str();
+
+                // THE COLUMN IS THE OTHER HALF OF THE AIM'S CONTRACT, and it
+                // fails silently. `overseer_roster.travel_npc` is VARCHAR(32),
+                // and outside strict mode MySQL truncates an over-long value
+                // rather than refusing it. A truncated aim is one the parser can
+                // never read back: the errand is written, never resolves, and
+                // looks exactly like a character that simply did not walk. A
+                // berth is the longest aim this module has ever written - two
+                // five-digit coordinates are ordinary on these maps - so it is
+                // the first one that can actually hit the limit. Refusing here
+                // is the only place that failure can still be seen.
+                if (aimText.size() > TRAVEL_AIM_COLUMN_CHARS)
+                {
+                    if (fresh)
+                        LOG_ERROR("module.overseer",
+                                  "overseer: the berth aim for '{}' is {} characters and "
+                                  "overseer_roster.travel_npc holds {}, so it would be "
+                                  "truncated into something no errand could ever resolve: "
+                                  "{}",
+                                  leaderName, uint32(aimText.size()),
+                                  uint32(TRAVEL_AIM_COLUMN_CHARS), aimText);
+                    break;
+                }
+
+                _travelAims.Claim(leaderName, aimText);
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: the family is split across maps {} and {} for "
+                             "'{}', so '{}' is sent to the berth of '{}' at ({:.1f}, "
+                             "{:.1f}, {:.1f}) on map {} - {}. Nothing boards anybody: "
+                             "the bot AI takes a character standing on a deck aboard "
+                             "on its own, and the transport carries its passengers "
+                             "across the map boundary itself",
+                             route.world.originMap, route.world.destinationMap,
+                             dungeonKeyword, leaderName, boat, route.berthX, route.berthY,
+                             route.berthZ, route.world.originMap, why);
+                break;
+            }
+
+            case OverseerDecisions::CrossingAction::Ride:
+                // DELIBERATELY NOTHING. A travel aim now would walk a passenger
+                // off a moving deck. The berth errand is given back ONCE, on
+                // the transition, so no backstop is left counting against an
+                // errand that is no longer the mechanism - and not on every
+                // poll, because Release is a write and the crossing is read
+                // twelve times a minute.
+                if (fresh)
+                {
+                    _travelAims.Release(leaderName);
+                    LOG_INFO("module.overseer",
+                             "overseer: {} member(s) of the family are aboard '{}' "
+                             "between maps {} and {} - nothing is aimed while anybody "
+                             "is on a deck. {}",
+                             uint32(step.aboard), boat, route.world.originMap,
+                             route.world.destinationMap, why);
+                }
+                break;
+
+            case OverseerDecisions::CrossingAction::Done:
+                // NOT REACHABLE FROM THIS CALLER, AND SAYING SO IS BETTER THAN
+                // LEAVING IT LOOKING LIKE IT IS. Done needs every member on the
+                // destination map, the leader included - and a leader on the
+                // portal's own map makes DungeonPortalApproach answer Walkable
+                // several lines above, so this function is never called. The
+                // value exists because ReadCrossing has to be total over its
+                // inputs: "everybody is already across" is a real reading and
+                // answering it with a refusal would be a lie. Handled here so
+                // that a second caller with a crossing that is not a dungeon
+                // approach does not have to invent the branch.
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: the family is together again on map {} - the "
+                             "crossing for '{}' is over and ordinary travel takes it "
+                             "from here. {}",
+                             route.world.destinationMap, dungeonKeyword, why);
+                break;
+
+            case OverseerDecisions::CrossingAction::Wait:
+                if (fresh)
+                    LOG_WARN("module.overseer",
+                             "overseer: the crossing for '{}' is not decided this poll - "
+                             "{}",
+                             dungeonKeyword, why);
+                break;
+
+            case OverseerDecisions::CrossingAction::Refuse:
+                if (fresh)
+                    LOG_ERROR("module.overseer",
+                              "overseer: the crossing for '{}' is refused at '{}' - {}. "
+                              "The leader '{}' stays on map {} and nothing is reset, "
+                              "aimed or moved",
+                              dungeonKeyword,
+                              OverseerDecisions::CrossingLegName(step.leg), why, leaderName,
+                              uint32(leader ? leader->GetMapId() : 0));
+                break;
+        }
+    }
+
     void DriveDungeonRun()
     {
         // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN (#122). Everything
@@ -15546,21 +16035,53 @@ private:
             // symptom rather than the cause. Refusing here costs nothing and
             // says the cause.
             //
-            // AND IT IS A REFUSAL RATHER THAN A ROUTE. The honest fix is a
-            // crossing - a boat leg from Menethil, a taxi hop, some travel kind
-            // that does not exist in this module yet - and inventing one at the
-            // point of failure would mean aiming five characters at a shoreline
-            // and hoping. #158 has that work; this has the refusal that keeps
-            // the family out of it until then.
+            // AND IT IS NO LONGER A REFUSAL RATHER THAN A ROUTE (#241). This
+            // used to say the honest fix was "a boat leg from Menethil, a taxi
+            // hop, some travel kind that does not exist in this module yet",
+            // and that nothing should be invented at the point of failure. Both
+            // halves still hold. What changed is that the boat leg turned out
+            // not to need inventing: the world already runs transports that
+            // carry their own passengers across a map boundary, the bot AI
+            // already takes a character standing on a deck aboard, and the only
+            // missing step was ever walking one character to the pier. So this
+            // branch now asks whether such a transport exists and, when one
+            // does, opens a crossing instead of stopping. When one does not, it
+            // refuses exactly as it did before.
             //
-            // SAID ONCE, on the same idle-coordinator flag discipline as the
-            // campaign-over line above and for the same reason: `job` stays
-            // `dungeon:wailing` until an operator changes it, so this branch is
-            // reached on every poll for as long as it is set.
-            if (OverseerDecisions::DungeonPortalApproach(
-                    leader->GetMapId(), portal->outsideMapId) !=
-                OverseerDecisions::DungeonApproach::Walkable)
+            // THE CHEAP QUESTION FIRST. A healthy run pays one integer
+            // comparison here on every poll. Only a party genuinely on the
+            // wrong map pays for the world read below.
+            OverseerDecisions::DungeonApproach approach =
+                OverseerDecisions::DungeonPortalApproach(leader->GetMapId(),
+                                                         portal->outsideMapId);
+            if (approach != OverseerDecisions::DungeonApproach::Walkable)
             {
+                CrossingRoute const route = ReadCrossingFromWorld(
+                    coord, members, leaderName, leader, portal->outsideMapId);
+
+                // ASKED AGAIN, THIS TIME HAVING LOOKED. The third answer only
+                // ever comes from a caller that went and found a transport.
+                approach = OverseerDecisions::DungeonPortalApproach(
+                    leader->GetMapId(), portal->outsideMapId, route.world.transportFound);
+
+                if (approach == OverseerDecisions::DungeonApproach::NeedsCrossing)
+                {
+                    OverseerDecisions::CrossingLimits limits;
+                    limits.berthArrivedYards = CROSSING_BERTH_ARRIVED_YARDS;
+                    DriveContinentCrossing(
+                        coord,
+                        OverseerDecisions::ReadCrossing(route.world, route.members, limits),
+                        route, leaderName, leader, portal->keyword);
+                    return;
+                }
+
+                // NO TRANSPORT SERVES BOTH MAPS, which is the case the old
+                // refusal was written for and is still exactly right for.
+                //
+                // SAID ONCE, on the same idle-coordinator flag discipline as
+                // the campaign-over line above and for the same reason: `job`
+                // stays `dungeon:wailing` until an operator changes it, so this
+                // branch is reached on every poll for as long as it is set.
                 if (!coord.loggedApproachRefused)
                 {
                     coord.loggedApproachRefused = true;
@@ -15570,12 +16091,12 @@ private:
                               "map {}. An `at:` aim is only ever resolved on the "
                               "character's own map (there is no navmesh across an ocean), "
                               "so no staging aim this run could write would be taken up, "
-                              "and nothing is reset, aimed or moved. Getting the party to "
-                              "map {} needs a crossing this module does not have yet; "
-                              "until then, name a portal on map {}",
+                              "and nothing is reset, aimed or moved. No transport on map "
+                              "{} serves map {} either, so there is no crossing to open; "
+                              "name a portal on map {}",
                               leaderJob, portal->keyword, portal->outsideMapId, leaderName,
-                              uint32(leader->GetMapId()), portal->outsideMapId,
-                              uint32(leader->GetMapId()));
+                              uint32(leader->GetMapId()), uint32(leader->GetMapId()),
+                              portal->outsideMapId, uint32(leader->GetMapId()));
                 }
                 return;
             }
