@@ -3025,4 +3025,20 @@ FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
     return FallBaselineVerdict{true, standingZ};
 }
 
+// ------------------------------------------------ the addon language (#269) --
+
+GroupChatRoute GroupChatRouteFor(std::string const& channel)
+{
+    GroupChatRoute route;
+    if (channel == "party")
+        route.group = true;
+    else if (channel == "raid")
+        route.group = route.raid = true;
+    else if (channel == "party_addon")
+        route.group = route.addon = true;
+    else if (channel == "raid_addon")
+        route.group = route.raid = route.addon = true;
+    return route;
+}
+
 }  // namespace OverseerDecisions

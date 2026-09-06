@@ -18298,6 +18298,10 @@ private:
     // Speak as the character would. Language matches mod-playerbots' own
     // convention so a Discord-sent line is indistinguishable from a real one:
     // racial for say/yell, universal for the group channels.
+    //
+    // The exception is the `_addon` group channels, where LANG_ADDON is not a
+    // language at all but 3.3.5a's addon transport, and the line is not meant
+    // for a person to read. See GroupChatRouteFor in overseer_decisions.h.
     static char const* DoChat(Player* player, std::string const& channel, std::string const& text,
                               std::string const& targetArg, char const*& status)
     {
@@ -18305,6 +18309,12 @@ private:
             return "empty message";
 
         Language racial = (player->GetTeamId() == TeamId::TEAM_ALLIANCE) ? LANG_COMMON : LANG_ORCISH;
+
+        // party / raid, and the same two carried in the language no chat frame
+        // draws. Asked once, before the chain, so the group branch below stays
+        // one branch instead of becoming four.
+        OverseerDecisions::GroupChatRoute const groupRoute =
+            OverseerDecisions::GroupChatRouteFor(channel);
 
         if (channel == "say")
             player->Say(text, racial);
@@ -18319,17 +18329,28 @@ private:
                 return "whisper target not online";
             player->Whisper(text, LANG_UNIVERSAL, receiver);
         }
-        else if (channel == "party" || channel == "raid")
+        else if (groupRoute.group)
         {
             Group* group = player->GetGroup();
             if (!group)
                 return "not in a group";
-            if (channel == "raid" && !group->isRaidGroup())
+            if (groupRoute.raid && !group->isRaidGroup())
                 return "not in a raid";
-            bool isRaid = (channel == "raid");
+            bool isRaid = groupRoute.raid;
             WorldPacket data;
+            // LANG_ADDON IS NOT A LANGUAGE. It is 3.3.5a's addon transport: a
+            // group packet carrying it is handed to CHAT_MSG_ADDON on the
+            // receiving client and no chat frame is ever asked to draw it,
+            // which is the whole point - a status line addressed to an addon
+            // stops appearing in party chat in front of whoever is watching.
+            //
+            // Everything else on this branch is unchanged: same chat type,
+            // same recipients, same subgroup rule. So this is the packet a
+            // seated client's SendAddonMessage(prefix, body, "PARTY") already
+            // produces, and an addon cannot tell the two apart.
             ChatHandler::BuildChatPacket(data, isRaid ? CHAT_MSG_RAID : CHAT_MSG_PARTY,
-                                         LANG_UNIVERSAL, player, nullptr, text);
+                                         groupRoute.addon ? LANG_ADDON : LANG_UNIVERSAL,
+                                         player, nullptr, text);
 
             // Party chat inside a raid goes to the speaker's subgroup only -
             // the real handler passes GetMemberGroup here. Broadcasting to
@@ -18342,14 +18363,22 @@ private:
             else
                 group->BroadcastPacket(&data, false);
 
-            CaptureBypassed(player, KindFromName(channel), text, [&](ObjectGuid w)
+            // NOBODY SAID THIS, SO NOBODY HEARD IT. An addon line is a
+            // payload addressed to software, and filing it in the chat store
+            // as speech is the exact shape a relay then has to filter back out
+            // again before a person reads it. The watchers exist for what was
+            // said, so the addon route is not captured at all.
+            if (!groupRoute.addon)
             {
-                if (!group->IsMember(w))
-                    return false;
-                if (subgroupOnly && group->GetMemberGroup(w) != senderSub)
-                    return false;
-                return WatcherOnline(w);
-            });
+                CaptureBypassed(player, KindFromName(channel), text, [&](ObjectGuid w)
+                {
+                    if (!group->IsMember(w))
+                        return false;
+                    if (subgroupOnly && group->GetMemberGroup(w) != senderSub)
+                        return false;
+                    return WatcherOnline(w);
+                });
+            }
         }
         else if (channel == "guild" || channel == "officer")
         {
