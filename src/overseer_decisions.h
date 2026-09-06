@@ -3181,6 +3181,104 @@ KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
                          std::string const& killerName,
                          std::string const& victimName);
 
+// THE FALL BASELINE THIS MODULE HANDS THE CORE, AND WHY IT HAS TO BE TAKEN
+// BACK AGAIN.
+//
+// A lift is `Player::TeleportTo` to the same x and y at a higher z, and the
+// core's near-teleport branch ends with
+// `SetFallInformation(GameTime::GetGameTime().count(), z)` where `z` is the
+// DESTINATION (Player.cpp:1532); the client's teleport ack writes the same
+// value a second time (MovementHandler.cpp:321). So the instant a lift
+// lands, the core believes this character's fall began at the TOP of the
+// lift - which by construction is the whole gap that triggered the recovery
+// plus the clearance, at least ten and a half yards above where the
+// character was standing and bounded only by the surface probe.
+//
+// THAT IS A TRUTHFUL BASELINE FOR EXACTLY AS LONG AS THE CHARACTER STAYS UP
+// THERE, and the character never does: a lift is issued so that an errand can
+// carry on, and the errand walks it back down. `UpdateFallInformationIfNeed`
+// is what normally walks the baseline down with it, and it runs on a movement
+// packet from a client and on nothing else. This roster is moved by
+// server-side splines - every phantom death row carries movement_generator
+// 'point' - and a spline relocates a character without any packet at all, so
+// while the character descends the baseline stays where the teleport put it.
+// `Player::HandleFall` then bills `m_lastFallZ - landingZ` on the next
+// MSG_MOVE_FALL_LAND, and it runs BEFORE UpdateFallInformationIfNeed in the
+// same handler (MovementHandler.cpp:634 against :685), so the stale figure is
+// spent before anything corrects it.
+//
+// MEASURED, 2026-09-06. 'Bork' was lifted from z 142.2 to z 157.3 at 19:11:53
+// and died at z 65.7 at 19:15:22 - three and a half minutes later, at full
+// health, out of combat, 74 yards from where the lift put it, having moved
+// 2.3 yards horizontally and 0.6 yards DOWN in the last second of its life.
+// 157.3 - 65.7 is 91.6 yards. The core's own fall equation is
+// 0.018 * z_diff - 0.2426 (Player.cpp:14173-14175), so 91.6 yards is 1.41
+// times max health: a one-shot from full, which is exactly what the row says
+// happened. 69.0 yards is where that equation reaches full health, and a lift
+// out of the Wailing Caverns approach clears it easily.
+//
+// SO THE RULE IS THE ONE SENTENCE THE CORE CANNOT SAY HERE: a character that
+// is not falling is standing somewhere, and a character that is standing
+// somewhere owes nothing for having got there. While this module is
+// answerable for a height it chose, it keeps the baseline under that
+// character's own feet.
+//
+// AND IT CANNOT SWALLOW A REAL FALL. The only exemption it needs is `falling`,
+// and one poll is enough to catch every fall that could ever bill: a body in
+// free fall covers about 9.6 yards in its first second, and the core does not
+// charge for a drop under 13.48 yards at all (MIN_FALL_DMG_DIST), so any fall
+// large enough to hurt lasts longer than the caller's own one-second poll and
+// is seen with `falling` true at least once. A fall short enough to hide
+// between two polls is a fall the core would have priced at nothing.
+struct FallBaselineState
+{
+    // Whether this module is currently answerable for where the core thinks
+    // this character's fall began.
+    bool held{false};
+    // The last z this module handed over. Bookkeeping and a reader's aid; the
+    // rule below does not branch on it.
+    float z{0.f};
+    // When the height was chosen. The hold window is measured from here and
+    // deliberately not refreshed on every poll, so responsibility for one
+    // lift cannot roll forward indefinitely.
+    time_t at{0};
+};
+
+struct FallBaselineVerdict
+{
+    // Hand the core a fall baseline of `z` for this character.
+    bool rebase{false};
+    float z{0.f};
+};
+
+// THIS MODULE HAS JUST PUT A CHARACTER AT `z`. Called for the lift, which is
+// the only remedy that moves anything (see TerrainRemedy above), and separate
+// from the step below so that the arming is a statement about what the module
+// did rather than something inferred from a reading afterwards.
+void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now);
+
+// ONE POLL, FOR ONE CHARACTER.
+//
+// `mayInspect` is TerrainRecoveryMayInspect's answer and `falling` is the
+// character's own falling flag; both are asked again here rather than assumed,
+// because the whole safety of this rule is that it declines to act in exactly
+// those states and a caller that had already filtered them would leave that
+// property untested.
+//
+// `standingZ` is where the SERVER believes this character's feet are, which is
+// the right number whichever way the two disagree: if a spline has walked the
+// character down, that is the honest new baseline, and if a silent client has
+// fallen without the server hearing about it, the server's stale higher figure
+// is the honest OLD baseline and handing it back changes nothing.
+//
+// `holdSeconds` bounds how long one height stays this module's problem. NOT
+// POSITIVE MEANS THE GUARD DOES NOTHING, which is the off switch written down:
+// the dangerous reading of zero would be an unbounded guard, so zero is spelt
+// as the safe one and a caller that wants no bound has to say a number.
+FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
+                                     bool falling, float standingZ, time_t now,
+                                     time_t holdSeconds);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
