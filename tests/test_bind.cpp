@@ -1,13 +1,13 @@
 /*
  * Binding a home, and the read-back that decides whether one moved.
  *
- * mod-overseer#286. Every member of the family reads map 0 in
- * character_homebind, at the inn its race was born beside, because nothing in
- * this module or upstream could ever change a home for a character with no
- * client for the answer to be shown to. Upstream's `home` command
- * returns false on its second line for a masterless bot and the row still
- * reads `delivered`, which is the exact shape AGENTS.md warns about: a call
- * that reports its failure to a client, to a character that has no client.
+ * mod-overseer#286. All five members of the family read map 0, area 12, in
+ * character_homebind, within 0.68 yards of each other, because nothing in this
+ * module or upstream could ever change a home for a character with no client
+ * for the answer to be shown to. Upstream's `home` command returns false on
+ * its second decision for a masterless bot and the row still reads
+ * `delivered`, which is the exact shape AGENTS.md warns about: a call that
+ * reports its failure to a client, to a character that has no client.
  *
  * So the rule this file pins is not "the packet was sent". It is that a bind
  * is judged by comparing the home before, the home after, and the place the
@@ -70,12 +70,14 @@ void CheckWord(char const* what, char const* got, char const* want)
 // the rule rather than as a number.
 constexpr float SAME_SPOT = 10.f;
 
-// The two binds every member of the family actually carries, read from
-// character_homebind: three at the human start and two at the dwarf one, both
-// on map 0 and about 2,750 yards apart. They are here because they are why
-// this verb exists, and because "send everybody home" against these two is the
-// scatter this module must never call a reunion.
-HomeBind HumanStart()
+// The one bind every member of the family carries, read from
+// character_homebind: map 0, area 12, the same doorway in the human starting
+// zone for all five, with 0.68 yards between the furthest apart of them. It is
+// here because it is why this verb exists - five characters, one home between
+// them, and nothing able to choose it - and because "send everybody home"
+// against this row gathers the whole party on the continent the dungeon is not
+// on.
+HomeBind TheFamilyBind()
 {
     HomeBind home;
     home.known = true;
@@ -87,7 +89,11 @@ HomeBind HumanStart()
     return home;
 }
 
-HomeBind DwarfStart()
+// A second inn, far away on the SAME map. Not a bind anybody carries - it is
+// here only to separate "the home did not move and we are standing at it" from
+// "the home did not move and we are a continent's width away", without letting
+// a map comparison do the work.
+HomeBind AnotherInnOnTheSameMap()
 {
     HomeBind home;
     home.known = true;
@@ -139,38 +145,39 @@ void AHomeThatMovedIsTheOnlyChange()
 {
     HomeBind const standing = NeutralPortTown();
     CheckOutcome("a home that crossed a map moved",
-                 BindReadBack(HumanStart(), standing, standing, SAME_SPOT), BindOutcome::Moved);
+                 BindReadBack(TheFamilyBind(), standing, standing, SAME_SPOT), BindOutcome::Moved);
 
-    HomeBind after = HumanStart();
+    HomeBind after = TheFamilyBind();
     after.x += 40.f;
     CheckOutcome("a home that moved across one town moved",
-                 BindReadBack(HumanStart(), after, after, SAME_SPOT), BindOutcome::Moved);
+                 BindReadBack(TheFamilyBind(), after, after, SAME_SPOT), BindOutcome::Moved);
 
-    HomeBind upstairs = HumanStart();
+    HomeBind upstairs = TheFamilyBind();
     upstairs.z += 25.f;
     CheckOutcome("an inn has floors, so height alone is a move",
-                 BindReadBack(HumanStart(), upstairs, upstairs, SAME_SPOT), BindOutcome::Moved);
+                 BindReadBack(TheFamilyBind(), upstairs, upstairs, SAME_SPOT), BindOutcome::Moved);
 }
 
 void AHomeThatDidNotMoveSplitsTwoWays()
 {
     // Standing at the inn the character was already bound at. Nothing needed
     // to happen, so nothing happening is the right answer and not a failure.
-    HomeBind standing = HumanStart();
+    HomeBind standing = TheFamilyBind();
     standing.x += 3.f;
     CheckOutcome("already bound here is not a failure",
-                 BindReadBack(HumanStart(), HumanStart(), standing, SAME_SPOT),
+                 BindReadBack(TheFamilyBind(), TheFamilyBind(), standing, SAME_SPOT),
                  BindOutcome::SameSpot);
 
     // THE ONE THIS EXECUTOR EXISTS FOR. The packet went out beside an
     // innkeeper on another continent and the home is still where it was born.
     CheckOutcome("a home still on the other continent is the failure, not a success",
-                 BindReadBack(HumanStart(), HumanStart(), NeutralPortTown(), SAME_SPOT),
+                 BindReadBack(TheFamilyBind(), TheFamilyBind(), NeutralPortTown(), SAME_SPOT),
                  BindOutcome::Unchanged);
 
     // Same map, far away: still nothing happened.
-    CheckOutcome("a home unchanged while standing at the other family bind is a failure",
-                 BindReadBack(HumanStart(), HumanStart(), DwarfStart(), SAME_SPOT),
+    CheckOutcome("a home unchanged while standing at another inn on the same map is a failure",
+                 BindReadBack(TheFamilyBind(), TheFamilyBind(), AnotherInnOnTheSameMap(),
+                              SAME_SPOT),
                  BindOutcome::Unchanged);
 }
 
@@ -180,13 +187,13 @@ void AReadingNobodyTookIsNeitherOutcome()
     Check("an unread home defaults to unknown rather than to map zero", unread.known, false);
 
     CheckOutcome("no home before is unreadable",
-                 BindReadBack(unread, HumanStart(), HumanStart(), SAME_SPOT),
+                 BindReadBack(unread, TheFamilyBind(), TheFamilyBind(), SAME_SPOT),
                  BindOutcome::Unreadable);
     CheckOutcome("no home after is unreadable",
-                 BindReadBack(HumanStart(), unread, HumanStart(), SAME_SPOT),
+                 BindReadBack(TheFamilyBind(), unread, TheFamilyBind(), SAME_SPOT),
                  BindOutcome::Unreadable);
     CheckOutcome("nowhere standing is unreadable",
-                 BindReadBack(HumanStart(), HumanStart(), unread, SAME_SPOT),
+                 BindReadBack(TheFamilyBind(), TheFamilyBind(), unread, SAME_SPOT),
                  BindOutcome::Unreadable);
 }
 

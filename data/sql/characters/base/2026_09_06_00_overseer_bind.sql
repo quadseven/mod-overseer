@@ -7,16 +7,20 @@
 -- module can already do the second half - four separate revival exits teleport
 -- a character to m_homebind* - and it has never been able to do the first.
 -- Nothing here, and nothing upstream that a bot can reach, could ever CHANGE a
--- home. So every home is still the one the character was handed at level one,
--- chosen by the race it was rolled as.
+-- home. So "go home" has exactly one possible destination per character, and
+-- nothing on either side of the worldserver has ever been able to choose it.
 --
 -- WHAT THAT COSTS, MEASURED, on the roster this module steers: all five read
--- map 0 in character_homebind, at two different starting inns - three at the
--- human bind and two at the dwarf one, about 2,750 yards apart. The dungeon
--- they are meant to run a hundred times is on map 1. So the one verb that
--- could have reunited a party split across two continents would have reunited
--- it in the wrong hemisphere and split it again on arrival. "Send everybody
--- home" is not a reunion until somebody can choose where home is.
+-- map 0, area 12, in character_homebind, at one doorway in the human starting
+-- zone, the widest gap between any two of the five binds being 0.68 yards. Two
+-- of the five are not human, so this is not five characters keeping the home
+-- they were born with; it is five characters with one home between them, and
+-- no way to have chosen it. The dungeon they are asked to run a hundred times
+-- is on map 1, and the count stands at 0 of 100. So the one verb that could
+-- have reunited a party split across two continents would have gathered all
+-- five neatly on the wrong one. "Send everybody home" is a reunion; it is just
+-- not the reunion anybody wants, and it will not be until somebody can choose
+-- where home is.
 --
 -- WHY THE CORE'S BINDER HANDLER AND NOT Player::SetHomebind DIRECTLY.
 -- SetHomebind is public and would work, and that is exactly the problem: it

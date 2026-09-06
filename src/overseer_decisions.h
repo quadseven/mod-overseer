@@ -3958,18 +3958,20 @@ bool AuctionRefusalRetryable(std::string const& reason);
 // with no deck to board. This module can already do the second half - four
 // separate revival exits teleport a character to m_homebind* - and it has
 // never been able to do the first. Nothing here, and nothing upstream that a
-// bot can reach, could ever CHANGE a home. So every home is still the one the
-// character was given at level one, and "go home" has exactly one possible
-// meaning per character, chosen by the race it was rolled as.
+// bot can reach, could ever CHANGE a home. So "go home" has exactly one
+// possible destination per character, and nothing this module or its operator
+// can do has ever been able to choose it.
 //
-// WHAT THAT COST, MEASURED. Every member of the family reads map 0 in
-// character_homebind, at two different starting inns: three at the human bind
-// and two at the dwarf one. The dungeon they are meant to run a hundred times
-// is on map 1. So the one verb that could have reunited a split party would
-// have reunited it in the wrong hemisphere, and split it again between two
-// binds about 2,750 yards apart while doing it. That is not a crossing, it is
-// a scatter with a nicer name, and it is why this executor had to exist before
-// anything was allowed to send anybody home.
+// WHAT THAT COST, MEASURED. All five members of the family read map 0, area
+// 12, in character_homebind, at one doorway in the human starting zone: the
+// widest gap between any two of the five binds is 0.68 yards. Two of them are
+// not even human, so this is not five characters keeping the home they were
+// born with, it is five characters that have only ever had one home between
+// them. The dungeon they are asked to run a hundred times is on map 1, and
+// their runs stand at 0 of 100. So the one verb that could have reunited a
+// party split across two continents would have gathered all five neatly in the
+// wrong hemisphere. It is a reunion, and it is the wrong one, and that is why
+// this executor had to exist before anything was allowed to send anybody home.
 //
 // UPSTREAM HAS THE VERB AND IT CANNOT RUN. mod-playerbots ships
 // SetHomeAction, registered as the chat command `home`. Its first act is
