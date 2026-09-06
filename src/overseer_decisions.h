@@ -3224,12 +3224,21 @@ KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
 // character's own feet.
 //
 // AND IT CANNOT SWALLOW A REAL FALL. The only exemption it needs is `falling`,
-// and one poll is enough to catch every fall that could ever bill: a body in
-// free fall covers about 9.6 yards in its first second, and the core does not
-// charge for a drop under 13.48 yards at all (MIN_FALL_DMG_DIST), so any fall
-// large enough to hurt lasts longer than the caller's own one-second poll and
-// is seen with `falling` true at least once. A fall short enough to hide
-// between two polls is a fall the core would have priced at nothing.
+// and one poll is enough to catch every fall that could ever bill. The core's
+// gravity is 19.29110527 (Movement/Spline/MovementUtil.cpp:24), so a body in
+// free fall covers 0.5 * g * 1s^2 = 9.65 yards in its first second, and the
+// core does not charge for a drop under 13.48 yards at all
+// (MIN_FALL_DMG_DIST, Player.cpp:14175). Any fall large enough to hurt
+// therefore lasts longer than the caller's own one-second poll and is seen
+// with `falling` true at least once. A fall short enough to hide between two
+// polls is a fall the core would have priced at nothing.
+
+// The two numbers that argument rests on, written down where the rule is, so
+// that a caller polling at some other cadence has to notice: at 19.29110527
+// yards per second squared it takes just over 1.18 seconds to fall the 13.48
+// yards the core starts charging for. A poll slower than that could miss a
+// chargeable fall entirely, and would be a change to this rule and not only to
+// a timer.
 struct FallBaselineState
 {
     // Whether this module is currently answerable for where the core thinks

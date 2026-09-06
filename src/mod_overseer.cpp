@@ -11386,9 +11386,16 @@ private:
             // while a character is falling is not an optimisation here, it is
             // the whole of what keeps a genuine drop chargeable, so the rule
             // that declines has to be the tested one rather than the shape of
-            // this loop. A fall worth charging for cannot hide between two of
-            // these polls either: free fall covers about 9.6 yards in its
-            // first second and the core charges nothing under 13.48.
+            // this loop.
+            //
+            // AND TERRAIN_RECOVERY_POLL_MS IS PART OF THE ARGUMENT, which is
+            // why it is named here. The core's gravity is 19.29110527
+            // (Movement/Spline/MovementUtil.cpp:24), so falling the 13.48
+            // yards it starts charging for (MIN_FALL_DMG_DIST,
+            // Player.cpp:14175) takes just over 1.18 seconds. At a 1000 ms
+            // poll no chargeable fall can pass between two polls unseen. A
+            // slower poll could let one through, so that constant is load
+            // bearing for this and not only for the recovery.
             {
                 OverseerDecisions::FallBaselineVerdict const held =
                     OverseerDecisions::FallBaselineStep(
