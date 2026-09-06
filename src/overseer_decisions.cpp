@@ -2797,4 +2797,47 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
     return said;
 }
 
+
+char const* KillerKindName(KillerKind kind)
+{
+    switch (kind)
+    {
+        case KillerKind::Unattributed:  return "environment";
+        case KillerKind::Creature:      return "creature";
+        case KillerKind::Player:        return "player";
+        case KillerKind::SelfInflicted: return "self";
+    }
+    return "environment";
+}
+
+KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
+                         std::string const& killerName,
+                         std::string const& victimName)
+{
+    if (!hookFired)
+        return KillerKind::Unattributed;
+
+    std::string const type = Normalized(hookType);
+
+    // A creature killer is taken at its word. Unit::Kill reaches the creature
+    // hook only from the branch where the killer is not a Player at all, so
+    // there is no self-damage case hiding in it.
+    if (type == "creature")
+        return KillerKind::Creature;
+
+    if (type != "player")
+        return KillerKind::Unattributed;
+
+    // The whole point. An empty victim name cannot be matched against, and
+    // saying "another player" on the strength of a blank would be the guess
+    // this function exists to refuse - so an unnameable victim reads as
+    // unattributed rather than as a PvP kill.
+    std::string const victim = Normalized(victimName);
+    if (victim.empty())
+        return KillerKind::Unattributed;
+
+    return Normalized(killerName) == victim ? KillerKind::SelfInflicted
+                                            : KillerKind::Player;
+}
+
 }  // namespace OverseerDecisions
