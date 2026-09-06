@@ -328,20 +328,6 @@ constexpr time_t TERRAIN_RECOVERY_FORGET_SECONDS = 600;
 // 43, where it chose the bind point for a scripted fall and ejected the tank.
 constexpr float TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS = 250.0f;
 
-// HOW LONG A HEIGHT THIS MODULE CHOSE STAYS THIS MODULE'S PROBLEM.
-//
-// A lift hands the core a fall baseline at the top of the lift and nothing
-// walks it back down (see OverseerDecisions::FallBaselineStep for the whole
-// mechanism and the measurement), so for a while afterwards this module has to
-// keep that baseline under the character's own feet itself. "A while" is the
-// same while the recovery already uses for the incident: a height chosen for
-// an episode stops being anybody's problem when the episode does, and a second
-// number that happened to be six hundred would be a second thing to keep in
-// step. The measured lag from a lift to the death it paid for was 63 and 208
-// seconds, both comfortably inside it.
-constexpr time_t TERRAIN_RECOVERY_BASELINE_HOLD_SECONDS =
-    TERRAIN_RECOVERY_FORGET_SECONDS;
-
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
@@ -11368,25 +11354,34 @@ private:
                 bot->IsFlying(), bot->IsFalling(), bot->IsInWater(),
                 bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr);
 
-            // TAKE BACK THE FALL BASELINE A LIFT HANDED THE CORE (#259). The
-            // lift below is Player::TeleportTo, whose near branch ends with
-            // SetFallInformation at the DESTINATION z (Player.cpp:1532, and
-            // again on the client's teleport ack at MovementHandler.cpp:321).
-            // Nothing lowers that again while the character walks back down,
-            // because the only thing that would is UpdateFallInformationIfNeed
-            // and that runs on a client movement packet, which a server-side
-            // spline never sends - and every phantom death row carries
-            // movement_generator 'point'. HandleFall then charges the whole
-            // difference on the next landing, and it runs BEFORE
-            // UpdateFallInformationIfNeed in the same handler. So while this
-            // module is answerable for a height it chose, it puts the baseline
-            // back under the character's own feet once a second.
+            // PUT THE FALL BASELINE BACK UNDER THIS CHARACTER'S FEET (#259).
+            //
+            // The core charges m_lastFallZ - landingZ on the next landing, a
+            // teleport sets that baseline to its destination (Player.cpp:1532,
+            // and again on the client's ack at MovementHandler.cpp:321), and
+            // the only thing that walks it down again is
+            // UpdateFallInformationIfNeed, which runs on a client movement
+            // packet and on nothing else. This roster is moved by server-side
+            // splines, which send none, so a height written once stays written
+            // while the character walks away from it - and HandleFall runs
+            // BEFORE UpdateFallInformationIfNeed in the same handler
+            // (MovementHandler.cpp:634 against :685).
+            //
+            // FOR EVERY CHARACTER, NOT ONLY A LIFTED ONE, and that is the
+            // expensive half of what was learned. The lift below is one way to
+            // leave a stale height and it is not the only one: on 2026-09-06
+            // at 20:10:13 'Ugga' died of a fall at full health standing at z
+            // 93.37 having NEVER BEEN LIFTED, beside 'Grog' who had been
+            // lifted to a height 52 hp short of killing him. Both, and 'Grug'
+            // half a minute later, needed a baseline near z 162.4, and the
+            // party's travel aim was z 162.425. A guard keyed on this module's
+            // own lift would have prevented one of those four deaths.
             //
             // ABOVE THE STAND-DOWN AND NOT BELOW IT, on purpose. Declining
-            // while a character is falling is not an optimisation here, it is
-            // the whole of what keeps a genuine drop chargeable, so the rule
-            // that declines has to be the tested one rather than the shape of
-            // this loop.
+            // while a character is falling is not an optimisation, it is the
+            // whole of what keeps a genuine drop chargeable, so the rule that
+            // declines has to be the tested one rather than the shape of this
+            // loop.
             //
             // AND TERRAIN_RECOVERY_POLL_MS IS PART OF THE ARGUMENT, which is
             // why it is named here. The core's gravity is 19.29110527
@@ -11401,8 +11396,7 @@ private:
                     OverseerDecisions::FallBaselineStep(
                         _fallBaseline[LowerName(name)], mayInspect,
                         bot->IsFalling(), bot->GetPositionZ(),
-                        std::time(nullptr),
-                        TERRAIN_RECOVERY_BASELINE_HOLD_SECONDS);
+                        std::time(nullptr));
                 if (held.rebase)
                     bot->SetFallInformation(GameTime::GetGameTime().count(),
                                             held.z);
@@ -11491,12 +11485,14 @@ private:
                 bot->TeleportTo(bot->GetMapId(), fromX, fromY, verdict.liftZ,
                                 bot->GetOrientation());
                 // AND THE CORE NOW BELIEVES THIS CHARACTER'S FALL BEGAN UP
-                // HERE. Say so, so the poll above can take it back as the
-                // character walks down again. Measured on 2026-09-06: 'Bork'
-                // lifted from z 142.2 to z 157.3 at 19:11:53 and killed at z
-                // 65.7 at 19:15:22 by the 91.6-yard difference, at full
-                // health, out of combat, having moved 0.6 yards downward in
-                // the last second of its life (#259).
+                // HERE. Written down rather than acted on: the poll above
+                // guards every character whether or not it was lifted, so this
+                // is the module recording the one height it is certain it is
+                // answerable for, and not a gate on anything. Measured on
+                // 2026-09-06: 'Bork' lifted from z 142.2 to z 157.3 at
+                // 19:11:53 and killed at z 65.7 at 19:15:22 by the 91.6-yard
+                // difference, at full health, out of combat, having moved 0.6
+                // yards downward in the last second of its life (#259).
                 OverseerDecisions::FallBaselineHandedOver(
                     _fallBaseline[LowerName(name)], verdict.liftZ,
                     std::time(nullptr));
@@ -21525,13 +21521,13 @@ private:
     // world.
     std::map<std::string, OverseerDecisions::TerrainRecoveryState> _terrainRecovery;
 
-    // THE FALL BASELINE THIS MODULE HAS HANDED THE CORE FOR A CHARACTER, so a
-    // lift cannot leave the core believing a character's fall began fifteen
-    // yards above where it now stands and charge it for the walk down. Keyed,
-    // scoped and lost on a restart exactly like _terrainRecovery above, and
-    // for the same reason: losing it costs one unguarded descent and no
-    // correctness. The rule it feeds is OverseerDecisions::FallBaselineStep,
-    // where it is tested without a world.
+    // THE LAST FALL BASELINE THIS MODULE HANDED THE CORE FOR A CHARACTER, so
+    // that nothing can leave the core believing a character's fall began
+    // seventy yards above where it now stands and charge it for the walk down.
+    // Keyed, scoped and lost on a restart exactly like _terrainRecovery above,
+    // and for the same reason: losing it costs nothing, since the rule it
+    // feeds does not branch on what is in here. The rule is
+    // OverseerDecisions::FallBaselineStep, tested without a world.
     std::map<std::string, OverseerDecisions::FallBaselineState> _fallBaseline;
 
     uint32 _eventTimer = 0;

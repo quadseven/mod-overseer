@@ -3181,74 +3181,82 @@ KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
                          std::string const& killerName,
                          std::string const& victimName);
 
-// THE FALL BASELINE THIS MODULE HANDS THE CORE, AND WHY IT HAS TO BE TAKEN
-// BACK AGAIN.
+// THE FALL BASELINE, AND WHY IT HAS TO BE PUT BACK UNDER A CHARACTER'S FEET.
 //
-// A lift is `Player::TeleportTo` to the same x and y at a higher z, and the
-// core's near-teleport branch ends with
-// `SetFallInformation(GameTime::GetGameTime().count(), z)` where `z` is the
-// DESTINATION (Player.cpp:1532); the client's teleport ack writes the same
-// value a second time (MovementHandler.cpp:321). So the instant a lift
-// lands, the core believes this character's fall began at the TOP of the
-// lift - which by construction is the whole gap that triggered the recovery
-// plus the clearance, at least ten and a half yards above where the
-// character was standing and bounded only by the surface probe.
+// The core remembers where a character's current fall began and charges
+// `m_lastFallZ - landingZ` on the next MSG_MOVE_FALL_LAND
+// (`Player::HandleFall`). Two things keep that number honest, and NEITHER of
+// them works for this roster.
 //
-// THAT IS A TRUTHFUL BASELINE FOR EXACTLY AS LONG AS THE CHARACTER STAYS UP
-// THERE, and the character never does: a lift is issued so that an errand can
-// carry on, and the errand walks it back down. `UpdateFallInformationIfNeed`
-// is what normally walks the baseline down with it, and it runs on a movement
-// packet from a client and on nothing else. This roster is moved by
-// server-side splines - every phantom death row carries movement_generator
-// 'point' - and a spline relocates a character without any packet at all, so
-// while the character descends the baseline stays where the teleport put it.
-// `Player::HandleFall` then bills `m_lastFallZ - landingZ` on the next
-// MSG_MOVE_FALL_LAND, and it runs BEFORE UpdateFallInformationIfNeed in the
-// same handler (MovementHandler.cpp:634 against :685), so the stale figure is
-// spent before anything corrects it.
+// FIRST, A TELEPORT SETS IT TO THE DESTINATION. `Player::TeleportTo`'s near
+// branch ends with `SetFallInformation(GameTime::GetGameTime().count(), z)`
+// where `z` is where the character is going (Player.cpp:1532), and the
+// client's teleport ack writes it again (MovementHandler.cpp:321). That is
+// truthful at the instant it happens and stops being truthful the moment the
+// character walks away from there. THIS MODULE'S LIFT IS ONE SUCH TELEPORT,
+// and by construction its destination is the whole gap that triggered the
+// recovery plus the clearance above where the character stood: at least ten
+// and a half yards, bounded only by the surface probe.
 //
-// MEASURED, 2026-09-06. 'Bork' was lifted from z 142.2 to z 157.3 at 19:11:53
-// and died at z 65.7 at 19:15:22 - three and a half minutes later, at full
-// health, out of combat, 74 yards from where the lift put it, having moved
-// 2.3 yards horizontally and 0.6 yards DOWN in the last second of its life.
-// 157.3 - 65.7 is 91.6 yards. The core's own fall equation is
-// 0.018 * z_diff - 0.2426 (Player.cpp:14173-14175), so 91.6 yards is 1.41
-// times max health: a one-shot from full, which is exactly what the row says
-// happened. 69.0 yards is where that equation reaches full health, and a lift
-// out of the Wailing Caverns approach clears it easily.
+// SECOND, `Player::UpdateFallInformationIfNeed` WALKS IT BACK DOWN as the
+// character moves. It runs on a movement packet from a client and on nothing
+// else. THIS ROSTER IS MOVED BY SERVER-SIDE SPLINES - every death row of this
+// shape carries movement_generator 'point' - and a spline relocates a
+// character without any packet at all. So whatever height was last written
+// stays written for as long as the character is being driven, and
+// `HandleFall` runs BEFORE `UpdateFallInformationIfNeed` in the same handler
+// (MovementHandler.cpp:634 against :685), so a stale figure is spent before
+// anything corrects it.
 //
-// SO THE RULE IS THE ONE SENTENCE THE CORE CANNOT SAY HERE: a character that
-// is not falling is standing somewhere, and a character that is standing
-// somewhere owes nothing for having got there. While this module is
-// answerable for a height it chose, it keeps the baseline under that
-// character's own feet.
+// MEASURED, 2026-09-06, AND THE MEASUREMENT IS WHY THIS IS NOT ONLY ABOUT THE
+// LIFT. Four characters died of falls at full health while standing still:
+//
+//   19:15:22  Bork  died z 65.7   lifted to z 157.3 at 19:11:53
+//                   157.3 - 65.7 = 91.6 yards = 1.41x max health. Exact.
+//   20:10:13  Ugga  died z 93.37  NEVER LIFTED AT ALL
+//   20:10:13  Grog  died z 93.47  lifted to z 158.8, which is 52 hp SHORT
+//   20:10:40  Grug  died z 91.67  lifted to z 149.1, which is 297 hp SHORT
+//
+// The last three each need a baseline near z 162.4 to have been killed, and
+// the party's travel aim at that moment was z 162.425 - a match to within a
+// single hit point for the tightest of them, across three characters with
+// three different health pools. One had no lift behind it at all, and the two
+// that did were lifted to heights that could not have done it.
+//
+// SO THE LIFT IS ONE WAY TO LEAVE A STALE HEIGHT IN THERE AND NOT THE ONLY
+// ONE. A guard that watched only the lift would have prevented exactly one of
+// those four deaths. What the four have in common is not what wrote the
+// height. It is that the character was STANDING when the core charged it.
+//
+// THE RULE IS THEREFORE AN INVARIANT AND NOT AN EPISODE: a character that is
+// not falling is standing somewhere, and a character that is standing
+// somewhere owes nothing for having got there. Whenever this module is
+// entitled to an opinion about a character, it puts the baseline back under
+// that character's own feet.
 //
 // AND IT CANNOT SWALLOW A REAL FALL. The only exemption it needs is `falling`,
-// and one poll is enough to catch every fall that could ever bill. The core's
-// gravity is 19.29110527 (Movement/Spline/MovementUtil.cpp:24), so a body in
-// free fall covers 0.5 * g * 1s^2 = 9.65 yards in its first second, and the
-// core does not charge for a drop under 13.48 yards at all
-// (MIN_FALL_DMG_DIST, Player.cpp:14175). Any fall large enough to hurt
-// therefore lasts longer than the caller's own one-second poll and is seen
+// and one poll is enough to catch every fall that could ever be charged for.
+// The core's gravity is 19.29110527 (Movement/Spline/MovementUtil.cpp:24), so
+// a body in free fall covers 0.5 * g * t^2 = 9.65 yards in its first second,
+// and the core charges nothing for a drop under 13.48 yards at all
+// (MIN_FALL_DMG_DIST, Player.cpp:14175). Falling far enough to be charged for
+// takes just over 1.18 seconds, so at the caller's one-second poll no
+// chargeable fall can pass between two polls unseen: every one of them is met
 // with `falling` true at least once. A fall short enough to hide between two
 // polls is a fall the core would have priced at nothing.
 //
-// SO THE CALLER'S POLL CADENCE IS PART OF THIS RULE, and a reader changing it
-// has to know that: at 19.29110527 yards per second squared it takes just over
-// 1.18 seconds to fall the 13.48 yards the core starts charging for, so a poll
-// slower than that could let a chargeable fall pass between two of them
-// unseen. That would be a change to this decision and not only to a timer.
+// THAT MAKES THE CALLER'S POLL CADENCE PART OF THIS RULE. A poll slower than
+// 1.18 seconds could let a chargeable fall through, and that would be a change
+// to this decision and not only to a timer.
 struct FallBaselineState
 {
-    // Whether this module is currently answerable for where the core thinks
-    // this character's fall began.
+    // Whether this module has ever put a height under this character, and
+    // which. NOT a gate on the rule below - the rule holds for every character
+    // this module may inspect, lifted or not, which is the whole lesson of the
+    // 20:10:13 pair. It is here so the one height this module KNOWS it chose
+    // can be named by a reader and asserted by a test.
     bool held{false};
-    // The last z this module handed over. Bookkeeping and a reader's aid; the
-    // rule below does not branch on it.
     float z{0.f};
-    // When the height was chosen. The hold window is measured from here and
-    // deliberately not refreshed on every poll, so responsibility for one
-    // lift cannot roll forward indefinitely.
     time_t at{0};
 };
 
@@ -3259,33 +3267,26 @@ struct FallBaselineVerdict
     float z{0.f};
 };
 
-// THIS MODULE HAS JUST PUT A CHARACTER AT `z`. Called for the lift, which is
-// the only remedy that moves anything (see TerrainRemedy above), and separate
-// from the step below so that the arming is a statement about what the module
-// did rather than something inferred from a reading afterwards.
+// THIS MODULE HAS JUST PUT A CHARACTER AT `z`, which for now means the lift.
+// Recording it changes nothing about what the step below decides; it is the
+// module writing down the one height it is certain it is answerable for.
 void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now);
 
 // ONE POLL, FOR ONE CHARACTER.
 //
 // `mayInspect` is TerrainRecoveryMayInspect's answer and `falling` is the
-// character's own falling flag; both are asked again here rather than assumed,
-// because the whole safety of this rule is that it declines to act in exactly
-// those states and a caller that had already filtered them would leave that
-// property untested.
+// character's own falling flag. Both are asked again here rather than assumed,
+// because declining in exactly those states is the entire safety of this rule,
+// and a caller that had already filtered them would leave that untested.
 //
 // `standingZ` is where the SERVER believes this character's feet are, which is
-// the right number whichever way the two disagree: if a spline has walked the
-// character down, that is the honest new baseline, and if a silent client has
-// fallen without the server hearing about it, the server's stale higher figure
-// is the honest OLD baseline and handing it back changes nothing.
-//
-// `holdSeconds` bounds how long one height stays this module's problem. NOT
-// POSITIVE MEANS THE GUARD DOES NOTHING, which is the off switch written down:
-// the dangerous reading of zero would be an unbounded guard, so zero is spelt
-// as the safe one and a caller that wants no bound has to say a number.
+// the right number whichever way the server and the client disagree: if a
+// spline has walked the character down, that is the honest new baseline, and
+// if a silent client has fallen without the server hearing about it, the
+// server's stale higher figure is the honest OLD baseline and handing it back
+// changes nothing.
 FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
-                                     bool falling, float standingZ, time_t now,
-                                     time_t holdSeconds);
+                                     bool falling, float standingZ, time_t now);
 
 }  // namespace OverseerDecisions
 
