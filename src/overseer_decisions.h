@@ -3232,13 +3232,12 @@ KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
 // therefore lasts longer than the caller's own one-second poll and is seen
 // with `falling` true at least once. A fall short enough to hide between two
 // polls is a fall the core would have priced at nothing.
-
-// The two numbers that argument rests on, written down where the rule is, so
-// that a caller polling at some other cadence has to notice: at 19.29110527
-// yards per second squared it takes just over 1.18 seconds to fall the 13.48
-// yards the core starts charging for. A poll slower than that could miss a
-// chargeable fall entirely, and would be a change to this rule and not only to
-// a timer.
+//
+// SO THE CALLER'S POLL CADENCE IS PART OF THIS RULE, and a reader changing it
+// has to know that: at 19.29110527 yards per second squared it takes just over
+// 1.18 seconds to fall the 13.48 yards the core starts charging for, so a poll
+// slower than that could let a chargeable fall pass between two of them
+// unseen. That would be a change to this decision and not only to a timer.
 struct FallBaselineState
 {
     // Whether this module is currently answerable for where the core thinks
