@@ -3377,6 +3377,49 @@ void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now);
 FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
                                      bool falling, float standingZ, time_t now);
 
+// ------------------------------------------------ the addon language (#269) --
+
+// How a `kind='chat'` row addressed to a group is put on the wire.
+//
+// WHY THIS IS A DECISION AND NOT AN `if` AT THE CALL SITE. Two different
+// things travel over party chat and they want opposite treatment. One is
+// speech: a council answer, a trade, a crafting request, every word of it
+// written to be read by whoever is watching that character. The other is a
+// status push - a tab separated line addressed to an addon, which a person
+// reads as noise and which the sender has to keep out of the chat frames by
+// hand. The row already says which it is, in the only field that describes how
+// a line should travel, so that is where the answer is read from.
+//
+// 3.3.5a separates the two itself, and not by convention. LANG_ADDON on a
+// group channel is the transport every addon's SendAddonMessage uses: the
+// receiving client hands the packet to CHAT_MSG_ADDON and no chat frame is
+// ever asked to draw it. The core relies on this for its own addon channel
+// command replies, which would otherwise be printing into players' whisper
+// windows. So `party` is speech and `party_addon` is the same packet, to the
+// same recipients, in the language nothing renders.
+//
+// THE TOKENS ARE LISTED, NOT PARSED. Stripping an `_addon` suffix would also
+// accept `_addon` on its own and would quietly read `party_addonx` as party
+// chat, and a channel this function does not recognise has to stay
+// unrecognised: the caller rejects it by name, which is what makes a module
+// too old to know these tokens mark the row an error rather than deliver
+// machine text as speech.
+struct GroupChatRoute
+{
+    // Is this token a group channel at all? False sends the caller on to its
+    // other branches and finally to "unknown chat channel".
+    bool group = false;
+    // Raid rather than party. Decides the chat type on the packet and, inside
+    // a raid, who a party line reaches. Nothing else.
+    bool raid = false;
+    // Send it in the addon language. Delivered to addons, drawn by nothing,
+    // and therefore not speech - so it is not captured for the watchers
+    // either.
+    bool addon = false;
+};
+
+GroupChatRoute GroupChatRouteFor(std::string const& channel);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
