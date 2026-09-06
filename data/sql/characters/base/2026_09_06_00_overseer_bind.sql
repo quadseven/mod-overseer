@@ -12,7 +12,7 @@
 --
 -- WHAT THAT COSTS, MEASURED, on the roster this module steers: all five read
 -- map 0 in character_homebind, at two different starting inns - three at the
--- human bind and two at the dwarf one, about 4,400 yards apart. The dungeon
+-- human bind and two at the dwarf one, about 2,750 yards apart. The dungeon
 -- they are meant to run a hundred times is on map 1. So the one verb that
 -- could have reunited a party split across two continents would have reunited
 -- it in the wrong hemisphere and split it again on arrival. "Send everybody

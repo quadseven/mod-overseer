@@ -3967,8 +3967,8 @@ bool AuctionRefusalRetryable(std::string const& reason);
 // and two at the dwarf one. The dungeon they are meant to run a hundred times
 // is on map 1. So the one verb that could have reunited a split party would
 // have reunited it in the wrong hemisphere, and split it again between two
-// binds 4,400 yards apart while doing it. That is not a crossing, it is a
-// scatter with a nicer name, and it is why this executor had to exist before
+// binds about 2,750 yards apart while doing it. That is not a crossing, it is
+// a scatter with a nicer name, and it is why this executor had to exist before
 // anything was allowed to send anybody home.
 //
 // UPSTREAM HAS THE VERB AND IT CANNOT RUN. mod-playerbots ships

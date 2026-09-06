@@ -72,9 +72,9 @@ constexpr float SAME_SPOT = 10.f;
 
 // The two binds every member of the family actually carries, read from
 // character_homebind: three at the human start and two at the dwarf one, both
-// on map 0 and 4,400 yards apart. They are here because they are why this verb
-// exists, and because "send everybody home" against these two is the scatter
-// this module must never call a reunion.
+// on map 0 and about 2,750 yards apart. They are here because they are why
+// this verb exists, and because "send everybody home" against these two is the
+// scatter this module must never call a reunion.
 HomeBind HumanStart()
 {
     HomeBind home;
