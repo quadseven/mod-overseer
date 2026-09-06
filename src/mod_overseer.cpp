@@ -271,9 +271,13 @@ constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
 // character is underneath the world rather than walking an ordinary slope.
 // The first live Stormwind reading was a 34-36 yard gap, but the trapped party
 // later climbed hidden terrain until only part of that gap remained while its
-// point of view still showed it inside city geometry. Ten is the same maximum
-// single-sample drop GroundHolds permits. The navmesh check, not a larger gap,
-// is what distinguishes a real lower interior from terrain below a WMO.
+// point of view still showed it inside city geometry. Ten was the maximum
+// single-sample drop GroundHolds permitted when this was written; that bound
+// is eight since #262 made the footing rule symmetric, and this number stayed
+// where it was because it is the gap at which a SURFACE OVERHEAD stops being
+// an ordinary slope, which is a different question from how far one stride may
+// fall. The navmesh check, not a larger gap, is what distinguishes a real
+// lower interior from terrain below a WMO.
 constexpr float TERRAIN_RECOVERY_GAP_YARDS = 10.0f;
 // A separation this large is worth NOTICING even when HasLocalNavmesh reports
 // a polygon. The incident measurements were 31 to 35 yards below the Stormwind
@@ -959,12 +963,26 @@ constexpr float TRAVEL_GROUND_SAMPLE_YARDS = 4.0f;
 // would cost health. Measured from the LAST sample rather than from the start
 // of the step, so a long walk downhill is not mistaken for a cliff: what is
 // being refused is a single step into thin air, which is what a cliff is.
+//
+// IT IS A CEILING AND NO LONGER THE OPERATIVE BOUND (#262). A stride is
+// walkable exactly when the stride back is, so the drop a step may take is the
+// SMALLER of this and TRAVEL_GROUND_RISE_YARDS, and eight is the smaller. Both
+// are still passed to OverseerDecisions::FootingSampleHolds and named
+// separately, because a future reason to move one is not a reason to move the
+// other: this one is a fact about what a fall costs, and that one is a fact
+// about what a slope looks like.
 constexpr float TRAVEL_GROUND_DROP_YARDS = 10.0f;
 
 // HOW FAR THE SURFACE MAY RISE BETWEEN TWO FOUR-YARD SAMPLES. A larger rise
 // is a rock face or wall, not a walkable slope. The old check only rejected
 // drops, so an unreachable quest point on a mountainside was approached by
 // repeated straight uphill steps even after navmesh had refused the route.
+//
+// AND SINCE #262 IT BOUNDS THE DROP AS WELL, being the smaller of the pair: a
+// character may not be walked DOWN a stride it would not be allowed to climb
+// back UP, because a check that approves a step whose reverse it refuses can
+// strand a character permanently, and beside the Wailing Caverns ramp it
+// stranded four.
 constexpr float TRAVEL_GROUND_RISE_YARDS = 8.0f;
 
 // HOW FAR AN AIM'S OWN Z MAY BE CORRECTED onto the surface under it before the
@@ -8715,8 +8733,10 @@ private:
     //      is handed a SHORT STEP toward the destination instead - and only
     //      after the ground under that step has been walked in software,
     //      sampled every TRAVEL_GROUND_SAMPLE_YARDS and refused the moment the
-    //      surface falls further than TRAVEL_GROUND_DROP_YARDS below the last
-    //      footing. The next poll steps again from wherever the character then
+    //      surface moves further from the last footing than a stride back over
+    //      the same ground would be allowed to move (#262; see
+    //      OverseerDecisions::FootingSampleHolds). The next poll steps again
+    //      from wherever the character then
     //      stands. This is the "maximum straight-line step" and the "refusal to
     //      step where the ground falls away" the issue asks for, and they are
     //      the same mechanism.
@@ -8887,9 +8907,15 @@ private:
                 // second answer lower than the footing is not a hill, and the
                 // drop test immediately below still has to pass on it.
             }
-            if (footing - next > TRAVEL_GROUND_DROP_YARDS)
-                return false;
-            if (next - footing > TRAVEL_GROUND_RISE_YARDS)
+            // A STRIDE IS WALKABLE EXACTLY WHEN THE STRIDE BACK IS (#262).
+            // These used to be two separate tests with two different bounds,
+            // ten down and eight up, so a nine yard descent was approved and
+            // the climb out of it never could be. See
+            // OverseerDecisions::FootingSampleHolds for the four characters
+            // that cost.
+            if (!OverseerDecisions::FootingSampleHolds(
+                    footing, next, TRAVEL_GROUND_DROP_YARDS,
+                    TRAVEL_GROUND_RISE_YARDS))
                 return false;
             footing = next;
         }
@@ -8928,6 +8954,45 @@ private:
             toX, toY, toFooting + eye,
             p->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS,
             VMAP::ModelIgnoreFlags::Nothing);
+    }
+
+    // IS THERE ANY DIRECTION OUT OF WHERE THIS CHARACTER STANDS (#262)?
+    //
+    // The same two questions every travel step is asked, GroundHolds and
+    // NothingInTheWay, asked of four bearings around the character rather than
+    // toward an aim. It is not a route and it moves nobody: it is this module
+    // trying to leave and reporting whether it could, which is the one piece
+    // of evidence that separates a character walking under an arch from a
+    // character sealed in a pocket. See
+    // OverseerDecisions::StandingOnTheGround.
+    //
+    // FOUR BEARINGS, THE SAME FOUR HasLocalNavmesh ALREADY USES, so the two
+    // instruments are asked about the same neighbourhood and a disagreement
+    // between them is a difference of instrument rather than of direction.
+    //
+    // TWO STRIDES, AND TWO IS THE SHORTEST REACH THAT ASKS ANYTHING.
+    // GroundHolds returns true without looking for a step under
+    // TRAVEL_GROUND_SAMPLE_YARDS - "one stride, with nothing between to fall
+    // into" - so a probe of exactly one stride would land on that boundary and
+    // be answered by rounding. A longer reach would be a worse question rather
+    // than a better one: eight yards inside an ordinary room is still floor,
+    // while sixty would find a wall for a character that is perfectly fine and
+    // standing in a corridor.
+    static bool AnyDirectionHolds(Player* bot)
+    {
+        static constexpr float DIRECTIONS[] = {0.f, 1.5708f, 3.1416f, 4.7124f};
+        static constexpr float REACH = TRAVEL_GROUND_SAMPLE_YARDS * 2.f;
+        for (float delta : DIRECTIONS)
+        {
+            float const angle = bot->GetOrientation() + delta;
+            float const x = bot->GetPositionX() + std::cos(angle) * REACH;
+            float const y = bot->GetPositionY() + std::sin(angle) * REACH;
+            float footing = 0.f;
+            if (GroundHolds(bot, x, y, footing) &&
+                NothingInTheWay(bot, x, y, footing))
+                return true;
+        }
+        return false;
     }
 
     // Will the mover follow the navmesh from where `bot` stands to (x, y, z),
@@ -11427,6 +11492,16 @@ private:
                 reading.z, reading.surfaceAboveZ, reading.surfaceValid, false,
                 TERRAIN_RECOVERY_GAP_YARDS);
             reading.hasLocalNavmesh = gapCouldMatter && HasLocalNavmesh(bot);
+            // ONLY WHERE IT CAN CHANGE THE ANSWER, which is why this is not
+            // measured for every character every second: a reading with no
+            // polygon already goes through the ladder, and footing cannot put
+            // a polygon back. So the fan is walked only in the one ambiguous
+            // case, a large gap over a polygon Detour found nearby, which is
+            // the case #262 is about.
+            reading.footingHolds =
+                !reading.hasLocalNavmesh || AnyDirectionHolds(bot);
+            bool const onTheGround = OverseerDecisions::StandingOnTheGround(
+                reading.hasLocalNavmesh, reading.footingHolds);
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
@@ -11448,7 +11523,15 @@ private:
             RememberRecovery(name, rungBefore, static_cast<uint8>(memory.attempts));
 
             float const surface = reading.surfaceAboveZ;
-            bool const hasLocalNavmesh = reading.hasLocalNavmesh;
+            // WHY THE REMEDY IS HAPPENING, in the words of the reading that
+            // authorized it. A polygon that no direction out of here can be
+            // walked off is a different finding from no polygon at all, and a
+            // line that said "no local navmesh" for both would be untrue for
+            // the case #262 added.
+            char const* const footing =
+                reading.hasLocalNavmesh
+                    ? "a local polygon, but no direction out of here holds (#262)"
+                    : "no local navmesh";
 
             uint16 const fromMap = static_cast<uint16>(bot->GetMapId());
             float const fromX = bot->GetPositionX();
@@ -11503,13 +11586,13 @@ private:
                 LOG_WARN("module.overseer",
                          "overseer: '{}' read as below the world at map {} position "
                          "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
-                         "no local navmesh; LIFTED straight up to z {:.1f} at the same "
+                         "{}; LIFTED straight up to z {:.1f} at the same "
                          "x/y - it keeps aim job='{}' quest={} travel='{}' and its party. "
                          "If this is a real recovery the next poll is clean; if the same "
                          "condition comes back it escalates rather than repeating",
                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                         surface, surface - fromZ, verdict.liftZ, job, questAim,
-                         travelTarget);
+                         surface, surface - fromZ, footing, verdict.liftZ, job,
+                         questAim, travelTarget);
                 continue;
             }
 
@@ -11539,7 +11622,7 @@ private:
             // send a reader to different places, so they say different things.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::GiveUp)
             {
-                if (hasLocalNavmesh)
+                if (onTheGround)
                 {
                     LOG_ERROR("module.overseer",
                               "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
@@ -11559,7 +11642,7 @@ private:
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' STILL reads as below the world at map {} "
                           "position ({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} "
-                          "yards up), local navmesh absent, and a lift at these "
+                          "yards up), {}, and a lift at these "
                           "coordinates did not stick. This module is OUT OF REMEDIES for "
                           "it and is GIVING UP until it has been clear for {}s. It is NOT "
                           "being moved, NOT being sent to a bind point and NOT being "
@@ -11570,7 +11653,7 @@ private:
                           "last aimed position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody "
                           "needs to look at what is under these coordinates",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                          surface, surface - fromZ,
+                          surface, surface - fromZ, footing,
                           static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS), job,
                           questAim, travelTarget, static_cast<uint32>(aimedMap),
                           aimedX, aimedY, aimedZ);
