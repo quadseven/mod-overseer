@@ -11396,28 +11396,54 @@ private:
                 // Sending each to its own bind would scatter this roster
                 // across two starting zones (measured: Elwynn and Dun Morogh,
                 // ~2000 yards apart) and leave the party split on arrival.
-                Player* home = bot;
-                if (Group* group = bot->GetGroup())
-                    if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
-                        home = leader;
+                Player* const home = RevivalHome(bot);
 
-                bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                                home->m_homebindY, home->m_homebindZ, 0.f);
-                bot->ResurrectPlayer(1.0f);
-                bot->SpawnCorpseBones();
+                // ...AND NOT WHEN THAT BIND IS OFF THE PARTY'S MAP (#241). The
+                // escape from a death trap is worth taking; a continent is not
+                // an escape, it is a party split, and no drive in this module
+                // can rejoin one. Nothing here has looked for a graveyard yet,
+                // so the question asked is whether one exists on this map at
+                // all - and when it does, this branch DECLINES TO ESCALATE and
+                // falls through to the ordinary graveyard path below, which
+                // revives on this map. That is the whole remedy.
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(
+                        bot, home,
+                        sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId()) != nullptr);
+                if (crossing.mayMove)
+                {
+                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                    home->m_homebindY, home->m_homebindZ, 0.f);
+                    bot->ResurrectPlayer(1.0f);
+                    bot->SpawnCorpseBones();
+
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has died {} times within {}yd in the last "
+                             "{}min - the nearest graveyard is inside whatever is killing "
+                             "it, so reviving there again would only speed the loop up "
+                             "(measured: doing exactly that doubled this roster's death "
+                             "rate). Sent home to '{}'s bind point instead",
+                             name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
+                             STUCK_REVIVAL_TRAP_MINUTES, home->GetName());
+                    _lastRevival.erase(name);
+                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                     home->m_homebindX, home->m_homebindY);
+                    continue;
+                }
 
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' has died {} times within {}yd in the last {}min - "
-                         "the nearest graveyard is inside whatever is killing it, so reviving "
-                         "there again would only speed the loop up (measured: doing exactly "
-                         "that doubled this roster's death rate). Sent home to '{}'s bind "
-                         "point instead",
+                         "overseer: '{}' has died {} times within {}yd in the last {}min, "
+                         "which normally sends it to '{}'s bind point - REFUSED, because "
+                         "that bind is on map {} and the rest of this party is on map {}. "
+                         "A revival that changes continents is not an escape from a death "
+                         "trap, it is a party split, and nothing in this module can rejoin "
+                         "one: `follow` cannot cross a map and the catch-up walk refuses a "
+                         "cross-map gap (#241). Reviving on this map instead. Whatever "
+                         "keeps killing it here is a routing problem (#234), and no "
+                         "revival answers that one",
                          name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
-                         STUCK_REVIVAL_TRAP_MINUTES, home->GetName());
-                _lastRevival.erase(name);
-                HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
-                                 home->m_homebindX, home->m_homebindY);
-                continue;
+                         STUCK_REVIVAL_TRAP_MINUTES, home->GetName(),
+                         static_cast<uint32>(home->m_homebindMapId), crossing.partyMapId);
             }
 
             // NO GRAVEYARD ON THIS MAP IS NOT A REASON TO WALK AWAY.
@@ -11451,20 +11477,48 @@ private:
             GraveyardStruct const* grave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
             if (!grave)
             {
-                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
-                                bot->m_homebindY, bot->m_homebindZ, 0.f);
+                // THE ONE EXIT THAT STILL CROSSES MAPS UNCONDITIONALLY, and it
+                // has to (#241). There is no graveyard on this map, so there is
+                // no alternative to weigh: refusing here would restore the
+                // regression this branch was written for, a body lying in the
+                // Deadmines for 29 minutes while this drive ran the whole time.
+                // "Never change maps" would be a worse rule honestly applied,
+                // which is why the rule is about the PARTY'S map and not about
+                // moving. Two things do change: the destination is the LEADER'S
+                // bind, so a party that all takes this exit lands together, and
+                // leaving the rest of the party behind is now SAID rather than
+                // done quietly.
+                Player* const home = RevivalHome(bot);
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(bot, home, false);
+
+                bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                home->m_homebindY, home->m_homebindZ, 0.f);
                 bot->ResurrectPlayer(0.5f);
                 bot->SpawnCorpseBones();
 
                 LOG_WARN("module.overseer",
                          "overseer: '{}' has been dead for {}s on map {}, which has no "
                          "graveyard of its own - dying inside an instance leaves nothing "
-                         "for GetClosestGraveyard to return, so it was sent to its own "
+                         "for GetClosestGraveyard to return, so it was sent to '{}'s "
                          "bind point instead of being left where it fell",
-                         name, deadFor, static_cast<uint32>(bot->GetMapId()));
+                         name, deadFor, static_cast<uint32>(bot->GetMapId()),
+                         home->GetName());
+                if (crossing.splitsParty)
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' was revived onto map {} and the rest of its "
+                              "party is on map {} - THE FAMILY IS NOW SPLIT ACROSS TWO MAPS "
+                              "and nothing in this module can rejoin it: `follow` cannot "
+                              "cross a map, the catch-up walk refuses a cross-map gap, and "
+                              "an `at:` aim cannot name a coordinate on another map. There "
+                              "was no graveyard on map {} to revive it at instead, so the "
+                              "only alternative was leaving a corpse where it fell. "
+                              "Somebody has to move them (#241)",
+                              name, static_cast<uint32>(home->m_homebindMapId),
+                              crossing.partyMapId, static_cast<uint32>(bot->GetMapId()));
                 _lastRevival.erase(name);
-                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
-                                 bot->m_homebindX, bot->m_homebindY);
+                HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                 home->m_homebindX, home->m_homebindY);
                 continue;
             }
 
@@ -11477,20 +11531,51 @@ private:
                                                             corpseX, corpseY, corpseZ, refused);
             if (!safe)
             {
-                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
-                                bot->m_homebindY, bot->m_homebindZ, 0.f);
-                bot->ResurrectPlayer(0.5f);
-                bot->SpawnCorpseBones();
+                // `grave` exists, so this map HAS somewhere to revive at; it is
+                // only that every candidate was judged dangerous. That is a
+                // real alternative, and #241 is the argument for preferring it
+                // to an ocean. A character put down next to a threat can walk
+                // away - the hold below is written to release exactly that
+                // case, "not held there; it is left free to move away" - can be
+                // helped by four groupmates standing near it, and can be
+                // revived again if it does die. A character put down on another
+                // continent can do none of those and no drive here can reach
+                // it.
+                Player* const home = RevivalHome(bot);
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(bot, home, true);
+                if (crossing.mayMove)
+                {
+                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                    home->m_homebindY, home->m_homebindZ, 0.f);
+                    bot->ResurrectPlayer(0.5f);
+                    bot->SpawnCorpseBones();
+
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' (level {}) has been dead for {}s and no "
+                             "graveyard for its corpse is safe to stand at [{}] - sent to "
+                             "'{}'s bind point instead of the nearest graveyard",
+                             name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
+                             home->GetName());
+                    _lastRevival.erase(name);
+                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                     home->m_homebindX, home->m_homebindY);
+                    continue;
+                }
 
                 LOG_WARN("module.overseer",
                          "overseer: '{}' (level {}) has been dead for {}s and no graveyard "
-                         "for its corpse is safe to stand at [{}] - sent to its own bind "
-                         "point instead of the nearest graveyard",
-                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused);
-                _lastRevival.erase(name);
-                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
-                                 bot->m_homebindX, bot->m_homebindY);
-                continue;
+                         "for its corpse is safe to stand at [{}], which normally sends it "
+                         "to '{}'s bind point - REFUSED, because that bind is on map {} "
+                         "and the rest of this party is on map {}. Reviving at the nearest "
+                         "graveyard anyway: a character put down next to something "
+                         "dangerous can walk away and can be helped by the four standing "
+                         "beside it, and one put down on another continent can do neither "
+                         "(#241)",
+                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
+                         home->GetName(), static_cast<uint32>(home->m_homebindMapId),
+                         crossing.partyMapId);
+                safe = grave;
             }
 
             // THE SAME GRAVEYARD TWICE IN FIVE MINUTES IS A VERDICT, NOT A
@@ -11503,21 +11588,62 @@ private:
             if (last != _lastRevival.end() && last->second.first == safe->ID &&
                 now - last->second.second < GRAVEYARD_REPEAT_SECONDS)
             {
-                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
-                                bot->m_homebindY, bot->m_homebindZ, 0.f);
-                bot->ResurrectPlayer(0.5f);
-                bot->SpawnCorpseBones();
+                // THIS IS THE EXIT THAT SPLIT THE FAMILY (#241). The leader
+                // took it at 17:35:43 and was in Duskwood while the other four
+                // stayed in the Barrens, and eleven silent minutes followed
+                // because nothing here can walk a follower across an ocean.
+                //
+                // AND THE VERDICT ABOVE IT IS WEAKER THAN IT SOUNDS. "Twice at
+                // one graveyard inside 300s means it cannot live there" reads
+                // as a rare finding; in hostile territory it is the ordinary
+                // one. Measured on overseer_death 18:18:24 to 18:22:30: SIX
+                // deaths in four minutes, every one to a Horde Guard, worn down
+                // to between 4 and 35 percent health. Two of them were walking
+                // to (1, 172.9, -1704.1), and the only creature within 45 yards
+                // of that point is entry 6491, a Spirit Healer, 13.3 yards
+                // away - so the aim was a graveyard. The Barrens is Horde
+                // ground and its graveyards stand beside Horde guards, so an
+                // Alliance party revives into the thing that killed it. That is
+                // a statement about the ZONE, and a bind teleport does not
+                // answer it any better than reviving again does; it answers it
+                // on another continent. Being walked into hostile ground at all
+                // is #234, and no revival is going to fix that one.
+                Player* const home = RevivalHome(bot);
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(bot, home, true);
+                if (crossing.mayMove)
+                {
+                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                    home->m_homebindY, home->m_homebindZ, 0.f);
+                    bot->ResurrectPlayer(0.5f);
+                    bot->SpawnCorpseBones();
+
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has been dead for {}s and this drive already "
+                             "revived it at '{}' {}s ago - twice at one graveyard inside "
+                             "{}s means it cannot live there, so it was sent to '{}'s bind "
+                             "point instead",
+                             name, deadFor, safe->name, now - last->second.second,
+                             GRAVEYARD_REPEAT_SECONDS, home->GetName());
+                    _lastRevival.erase(last);
+                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                     home->m_homebindX, home->m_homebindY);
+                    continue;
+                }
 
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' has been dead for {}s and this drive already revived "
-                         "it at '{}' {}s ago - twice at one graveyard inside {}s means it "
-                         "cannot live there, so it was sent to its own bind point instead",
+                         "overseer: '{}' has been dead for {}s and this drive already "
+                         "revived it at '{}' {}s ago, which normally sends it to '{}'s "
+                         "bind point - REFUSED, because that bind is on map {} and the "
+                         "rest of this party is on map {}. It is in a revive-and-die loop "
+                         "at '{}' and this drive is putting it back there deliberately, "
+                         "because its only alternative is a continent the other four "
+                         "cannot follow it to (#241). The loop is a routing problem "
+                         "(#234): something keeps sending this family somewhere it cannot "
+                         "survive, and no revival fixes that",
                          name, deadFor, safe->name, now - last->second.second,
-                         GRAVEYARD_REPEAT_SECONDS);
-                _lastRevival.erase(last);
-                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
-                                 bot->m_homebindX, bot->m_homebindY);
-                continue;
+                         home->GetName(), static_cast<uint32>(home->m_homebindMapId),
+                         crossing.partyMapId, safe->name);
             }
 
             // Mirrors exactly what SpiritHealerAction::Execute already does
@@ -11546,6 +11672,66 @@ private:
             _lastRevival[name] = std::make_pair(safe->ID, now);
             HoldAfterRevival(bot, botAI, name, safe->Map, safe->x, safe->y);
         } while (result->NextRow());
+    }
+
+    // THE BIND POINT A REVIVAL SHOULD USE, which is the LEADER'S whenever
+    // there is one (#241). The repeated-deaths branch has always done this and
+    // said why - "sending each to its own bind would scatter this roster
+    // across two starting zones (measured: Elwynn and Dun Morogh, ~2000 yards
+    // apart) and leave the party split on arrival" - and the other three
+    // bind-point exits on the same ladder ignored it. Four exits, one
+    // discipline: three of them were contradicting a sibling branch a hundred
+    // lines above that has a comment explaining the hazard.
+    //
+    // For the leader itself this resolves to its own bind, which is correct
+    // and is also exactly the case RevivalMayCrossMaps exists to catch: a
+    // leader taking a bind point off the party's map does not reunite anybody,
+    // it takes the party's reference point away.
+    static Player* RevivalHome(Player* bot)
+    {
+        Player* home = bot;
+        if (Group* group = bot->GetGroup())
+            if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+                home = leader;
+        return home;
+    }
+
+    // The map each OTHER member of this character's group is on. World thread
+    // only, which is where this whole drive runs (OnUpdate): reading GetMapId
+    // off a groupmate owned by another map thread is what KeepRosterFollowing
+    // and DriveCatchUp already do on this same thread, and nothing here
+    // dereferences anything a map thread could be freeing.
+    //
+    // An empty answer means "not grouped, or nobody else was in the world",
+    // and the pure rule treats that as UNKNOWN rather than as agreement. A
+    // party map nobody could establish may not be used to refuse a revival.
+    static std::vector<uint32_t> PartyMapsAround(Player* bot)
+    {
+        std::vector<uint32_t> maps;
+        Group* group = bot->GetGroup();
+        if (!group)
+            return maps;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == bot || !member->IsInWorld())
+                continue;
+            maps.push_back(static_cast<uint32_t>(member->GetMapId()));
+        }
+        return maps;
+    }
+
+    // One question, asked at all four bind-point exits: may this revival put
+    // the character on `home`'s bind map? See RevivalMayCrossMaps for the rule
+    // and for the incident it came from.
+    static OverseerDecisions::RevivalMoveVerdict RevivalCrossMapCheck(
+        Player* bot, Player const* home, bool graveyardOnThisMap)
+    {
+        OverseerDecisions::RevivalMove move;
+        move.bindMapId = static_cast<uint32_t>(home->m_homebindMapId);
+        move.partyMapIds = PartyMapsAround(bot);
+        move.graveyardOnThisMap = graveyardOnThisMap;
+        return OverseerDecisions::RevivalMayCrossMaps(move);
     }
 
     // THE GRACE AFTER A REVIVAL - see REVIVAL_HOLD_SECONDS. `+stay` is
