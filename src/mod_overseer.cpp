@@ -1007,6 +1007,20 @@ constexpr uint32 TRAVEL_FLIGHT_MAX_PER_ERRAND = 2;
 // drive can never be the same poll. See TravelHoldsTheWheel.
 constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
 
+// WHAT AN ERRAND IS ALLOWED TO COST BEFORE IT IS CALLED OFF. The numbers are
+// AGENTS.md's own - "if deaths exceed roughly three in five minutes, clear the
+// aim" - and the cool-off is what stops the release being undone by the other
+// writer of this column a poll later. The whole argument, and the evening that
+// turned that sentence into code, is on OverseerDecisions::ErrandDeathLimits.
+constexpr OverseerDecisions::ErrandDeathLimits ERRAND_DEATH_LIMITS{};
+
+// HOW OFTEN A REFUSED RE-ISSUE IS WORTH SAYING AGAIN. The refusal itself acts
+// on every poll - it must, or the column stays armed - but a line every
+// TRAVEL_POLL_MS for fifteen minutes buries the release that caused it. Long
+// enough to be a heartbeat rather than a stream, short enough that "something
+// keeps re-arming this errand" is still visible while it is happening.
+constexpr time_t ERRAND_DEATH_SAY_SECONDS = 120;
+
 // THE GROUND UNDER AN AIM (#138). Four numbers, and the whole argument for
 // them is in the GroundedStep section beside the escort code.
 
@@ -2889,6 +2903,23 @@ public:
         // clock on. Nothing here reads or writes `best`, so the meaning of a
         // zero mark stays entirely OverseerDecisions::Ratchet's to define.
         OverseerDecisions::RatchetState progress;
+        // WHEN THIS ERRAND BEGAN, and never moved afterwards. Not
+        // `progress.since`, which is the ratchet's clock: that one is restarted
+        // by every yard of progress and held through every flight, because it
+        // is a reading about whether the walk is going anywhere rather than
+        // about how old it is. The death breaker needs the age, because an
+        // errand may only be charged for the stretch of the death table it was
+        // actually outstanding for. Stamped on the poll the errand changes,
+        // which is also the poll a restart re-reads the column on: a module
+        // that has just come up has no memory of the crossing so far, and
+        // starting the window from zero is the honest reading rather than a
+        // guessed one.
+        time_t errandSince{0};
+        // "Already said that a run owns this and the count is climbing", so a
+        // decline is one line per errand rather than one every poll. Same
+        // discipline as `flightSaid`, and cleared with the errand for the same
+        // reason.
+        bool deathSaid{false};
     };
 
     // Every enabled character with an outstanding errand, name -> target.
@@ -2978,6 +3009,14 @@ public:
             "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
             Esc(target), Esc(name));
         _state.erase(name);
+        // AND THIS IS THE ONE PLACE THAT KNOWS WHOSE AIM IT IS. Claim is the
+        // dungeon run coordinator's only door into this column, so membership
+        // here IS "a run issued this errand" - the fact the death breaker needs
+        // and the one an escort check cannot supply, because the LEADER on a
+        // staging aim is not escorted, he is aimed. Kept beside `_state` rather
+        // than inside it precisely because the line above erases `_state`: a
+        // new aim is a new errand, and this has to outlive that erase.
+        _claimed[name] = target;
     }
 
     // GIVE THE ERRAND BACK. THE ONE TERMINAL PATH - every release, in either
@@ -2986,6 +3025,11 @@ public:
     {
         CharacterDatabase.Execute(
             "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
+        // The run no longer owns what no longer exists. `_refused` is
+        // deliberately NOT swept here: a refusal that died with the errand it
+        // ended would be forgotten before whatever re-arms this column next
+        // writes to it, which is the entire failure it exists to answer.
+        _claimed.erase(name);
         // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
         // twenty-minute backstop, and a state entry outliving its errand is
         // inherited by the NEXT errand at the same target - which is then
@@ -3021,6 +3065,7 @@ public:
             // The character may be mid-walk under an aim nobody is renewing any
             // more, so this is a release like any other and takes the same grace.
             _handback[it->first] = std::time(nullptr);
+            _claimed.erase(it->first);
             it = _state.erase(it);
         }
     }
@@ -3055,8 +3100,77 @@ public:
         return _state[name];
     }
 
+    // DID A DUNGEON RUN ISSUE THIS ERRAND? Asked of the target as well as the
+    // name, so a run staging aim that has since been replaced by somebody
+    // else's errand for the same character does not answer for it.
+    bool RunOwns(std::string const& name, std::string const& target) const
+    {
+        auto const it = _claimed.find(name);
+        return it != _claimed.end() && it->second == target;
+    }
+
+    // THIS TARGET KILLED THIS CHARACTER AND THE ERRAND WAS CALLED OFF FOR IT.
+    // Recorded rather than merely released because this module is not the only
+    // writer of the column: a release with no memory is undone by the next
+    // thing that re-aims the family, and measurably was.
+    //
+    // ONE REFUSAL PER CHARACTER, not a growing list. The case this answers is
+    // an errand being re-armed within minutes of being called off, so the last
+    // one is the one that matters; a second lethal target simply replaces the
+    // first, and by then the first has stopped being what anybody is walking
+    // to. That also bounds this map at the size of the roster forever.
+    void Refuse(std::string const& name, std::string const& target)
+    {
+        Refusal& refusal = _refused[name];
+        refusal.target = target;
+        refusal.at = std::time(nullptr);
+        refusal.said = 0;
+    }
+
+    // Seconds since Refuse last named THIS target for this character, or -1
+    // when it never has. Whether that is still inside the cool-off is
+    // ErrandDeathBreaker's to decide and not this one's, so the rule lives in
+    // exactly one place and a reader is never asked which copy is the real one.
+    int64_t SecondsSinceRefused(std::string const& name, std::string const& target) const
+    {
+        auto const it = _refused.find(name);
+        if (it == _refused.end() || it->second.target != target)
+            return -1;
+        return static_cast<int64_t>(std::time(nullptr) - it->second.at);
+    }
+
+    // Is the refused re-issue worth a log line again yet? The refusal ACTS on
+    // every poll whatever this answers; this is only about the saying.
+    bool SayRefusalAgain(std::string const& name)
+    {
+        auto const it = _refused.find(name);
+        if (it == _refused.end())
+            return false;
+        time_t const now = std::time(nullptr);
+        if (it->second.said && now - it->second.said < ERRAND_DEATH_SAY_SECONDS)
+            return false;
+        it->second.said = now;
+        return true;
+    }
+
 private:
+    // One errand a character was sent on and died on, and when.
+    struct Refusal
+    {
+        std::string target;
+        time_t at{0};
+        time_t said{0};  // when the re-issue was last reported, 0 = never
+    };
+
     std::map<std::string, TravelState> _state;
+    // Which errands the dungeon run coordinator issued, name -> target. Written
+    // by Claim, which is its only door into the column, and erased by Release
+    // and PruneVanished - every way an errand can end.
+    std::map<std::string, std::string> _claimed;
+    // Which errand last killed each character, so a re-aim at it is refused
+    // rather than walked. Deliberately outlives the errand it ended; see
+    // Refuse. World thread only, like everything else on this loop.
+    std::map<std::string, Refusal> _refused;
     // When travel last let go of a character, so the quest drive does not pick
     // it up on the same tick the errand ended. Written by Release and by
     // PruneVanished - every way an errand can end - and read only by
@@ -10266,6 +10380,10 @@ private:
                 // clock starts now rather than carrying the last errand's over.
                 state.progress.best = 0.f;
                 state.progress.since = std::time(nullptr);
+                // And a new errand answers for its own bodies and nobody
+                // else's - see TravelState::errandSince.
+                state.errandSince = std::time(nullptr);
+                state.deathSaid = false;
             }
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -10289,6 +10407,134 @@ private:
             // is issued, and taken back when the escort ends. See the escort
             // section above for why those two things cannot be separated.
             bool const escorted = IsEscorted(name);
+
+            // THE DEATH-RATE BREAKER. AGENTS.md has asked for this in words
+            // since #78 and nothing ever counted: "watch the death table while
+            // it walks. If deaths exceed roughly three in five minutes, clear
+            // the aim - the destination is not worth the crossing."
+            // OverseerDecisions::ErrandDeathBreaker carries the rule, the
+            // numbers and the evening that turned the sentence into code.
+            //
+            // ASKED BEFORE ANYTHING BELOW CAN MOVE THIS CHARACTER. Everything
+            // from here down walks it, re-issues its walk or holds it where it
+            // is, and a release reached after any of those would still have
+            // spent the poll sending it back to what is killing it. It is
+            // asked after `escorted` only because that line costs nothing and
+            // the verdict wants to know whose aim this is.
+            {
+                OverseerDecisions::ErrandDeathToll toll;
+                toll.runOwned = _travelAims.RunOwns(name, target);
+                toll.sinceRefused = _travelAims.SecondsSinceRefused(name, target);
+
+                // THE ONLY STRETCH OF THE TABLE THIS ERRAND ANSWERS FOR. Zero
+                // for an errand with no age yet, which is a poll with nothing
+                // to ask rather than a poll with nothing to find.
+                int64 const window = int64(OverseerDecisions::ErrandDeathWindow(
+                    std::time(nullptr) - state.errandSince, ERRAND_DEATH_LIMITS));
+                if (window > 0)
+                {
+                    // NOW() and not UTC_TIMESTAMP(), because `created_at`
+                    // defaults to CURRENT_TIMESTAMP and the two have to be the
+                    // same clock. The stuck-revival trap counts the same table
+                    // the same way; if either ever has to change, both do.
+                    if (QueryResult tolled = CharacterDatabase.Query(
+                            "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+                            "AND created_at >= NOW() - INTERVAL {} SECOND",
+                            Esc(name), window))
+                        toll.deaths = uint32(tolled->Fetch()[0].Get<uint64>());
+                }
+
+                OverseerDecisions::ErrandDeathVerdict const verdict =
+                    OverseerDecisions::ErrandDeathBreaker(toll, ERRAND_DEATH_LIMITS);
+
+                switch (verdict.remedy)
+                {
+                    case OverseerDecisions::ErrandDeathRemedy::Continue:
+                        break;
+
+                    case OverseerDecisions::ErrandDeathRemedy::Release:
+                    {
+                        // WHO IS DOING IT, asked only on the path that fires so
+                        // the steady state costs one COUNT and nothing else. A
+                        // release that says "three deaths" and a release that
+                        // says "three deaths, all to one level 65 elite" are
+                        // the same decision and very different bug reports.
+                        std::string killer;
+                        if (QueryResult worst = CharacterDatabase.Query(
+                                "SELECT killer_name, COUNT(*) AS n FROM overseer_death "
+                                "WHERE character_name = '{}' "
+                                "AND created_at >= NOW() - INTERVAL {} SECOND "
+                                "AND killer_type = 'creature' "
+                                "GROUP BY killer_name ORDER BY n DESC LIMIT 1",
+                                Esc(name), window))
+                        {
+                            Field* f = worst->Fetch();
+                            killer = f[0].Get<std::string>();
+                        }
+
+                        LOG_WARN("module.overseer",
+                                 // "releasing the errand" on ONE source line,
+                                 // the same discipline the backstop above keeps
+                                 // and for the same reason: the guard test
+                                 // greps this function for it.
+                                 "overseer: '{}' has died {} times in the last {}s while "
+                                 "travelling to '{}'{} - releasing the errand, the "
+                                 "destination is not worth the crossing. It is refused for "
+                                 "this character for {} minutes, because clearing the column "
+                                 "is not enough on its own: something outside this module "
+                                 "writes it too and has re-armed a called-off errand within "
+                                 "five minutes before now",
+                                 name, toll.deaths, window, target,
+                                 killer.empty() ? std::string()
+                                                : ", mostly to '" + killer + "'",
+                                 static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60));
+                        _travelAims.Refuse(name, target);
+                        _travelAims.Release(name);
+                        continue;
+                    }
+
+                    case OverseerDecisions::ErrandDeathRemedy::RefuseReissue:
+                        // ACTED ON EVERY POLL AND SAID EVERY SO OFTEN. The
+                        // column has been written again by somebody, so it has
+                        // to be cleared again; that is the whole point of the
+                        // memory. Only the log line is rationed.
+                        if (_travelAims.SayRefusalAgain(name))
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' has been re-aimed at '{}', the errand "
+                                     "that was called off for killing it - clearing it "
+                                     "again, and refusing it for another {}s. Something "
+                                     "outside this drive keeps writing this column",
+                                     name, target, verdict.coolOffRemaining);
+                        _travelAims.Release(name);
+                        continue;
+
+                    case OverseerDecisions::ErrandDeathRemedy::DeclineRunOwned:
+                        // NOT RELEASED, AND SAID SO ONCE. A run re-Claims its
+                        // own aim within DUNGEON_RUN_POLL_MS, so a release here
+                        // would be undone in five seconds while resetting the
+                        // pin and the backstop clock every time - a mechanism
+                        // that reports itself and changes nothing. The run's
+                        // own stall handling is what answers this; the point of
+                        // the line is that the deaths are on the record against
+                        // the errand rather than nowhere.
+                        if (!state.deathSaid)
+                        {
+                            state.deathSaid = true;
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' has died {} times in the last {}s on "
+                                     "the errand to '{}', which is over the {}-in-{}min "
+                                     "line - NOT released, because a dungeon run issued "
+                                     "this aim and re-claims it every poll, so calling it "
+                                     "off here would change nothing. The run decides",
+                                     name, toll.deaths, window, target,
+                                     ERRAND_DEATH_LIMITS.deaths,
+                                     static_cast<uint32>(
+                                         ERRAND_DEATH_LIMITS.windowSeconds / 60));
+                        }
+                        break;
+                }
+            }
+
             if (!CanBeSentToNpc(botAI) && !escorted)
             {
                 if (!state.arrived)

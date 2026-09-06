@@ -3041,4 +3041,59 @@ GroupChatRoute GroupChatRouteFor(std::string const& channel)
     return route;
 }
 
+// ------------------------------------ an errand that is killing its traveller --
+
+int64_t ErrandDeathWindow(int64_t errandSeconds, ErrandDeathLimits const& limits)
+{
+    if (errandSeconds <= 0)
+        return 0;
+    return errandSeconds < limits.windowSeconds ? errandSeconds : limits.windowSeconds;
+}
+
+ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
+                                      ErrandDeathLimits const& limits)
+{
+    ErrandDeathVerdict verdict;
+
+    bool const coolingOff =
+        toll.sinceRefused >= 0 && toll.sinceRefused < limits.cooloffSeconds;
+
+    // 1. A RUN'S OWN AIM IS NEVER TAKEN OFF IT, whichever of the two things
+    //    below would otherwise happen. Answered first because it is the one
+    //    branch that is about who may act at all rather than about what the
+    //    table says, and because a coordinator that re-Claims a target this
+    //    rule refused is not a bridge re-arming a bad errand - it is the run
+    //    doing the job it was started for, and it would win the argument
+    //    every five seconds anyway.
+    if (toll.runOwned)
+    {
+        if (coolingOff || toll.deaths >= limits.deaths)
+            verdict.remedy = ErrandDeathRemedy::DeclineRunOwned;
+        return verdict;
+    }
+
+    // 2. A RE-ISSUE IS ANSWERED BEFORE THE DEATHS ARE COUNTED, because by then
+    //    the count is already wrong. Releasing an errand erases the memory of
+    //    it, so the same target re-aimed a poll later arrives looking like a
+    //    brand new errand: its window is a second wide and its toll is
+    //    therefore zero, forever, however many bodies are behind it. The
+    //    refusal is the only thing that still remembers, so it has to be asked
+    //    here or it can never be reached at all.
+    if (coolingOff)
+    {
+        verdict.remedy = ErrandDeathRemedy::RefuseReissue;
+        verdict.coolOffRemaining = limits.cooloffSeconds - toll.sinceRefused;
+        return verdict;
+    }
+
+    // 3. The rule itself. `>=` and not `>`: AGENTS.md says "exceed roughly
+    //    three in five minutes", and the third death in five minutes IS the
+    //    evidence - a rule that waits for a fourth body to be sure is a rule
+    //    that costs a body to be sure.
+    if (toll.deaths >= limits.deaths)
+        verdict.remedy = ErrandDeathRemedy::Release;
+
+    return verdict;
+}
+
 }  // namespace OverseerDecisions
