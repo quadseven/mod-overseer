@@ -1465,6 +1465,70 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
 // run has a goal to complete".
 char const* DungeonRunExitOutcome(bool provedComplete, bool stalled);
 
+// --------------------------- the run yields to an errand it would trample --
+//
+// WHAT THIS IS ACTUALLY FOR, AND IT IS NOT ONLY THE TOWN TRIP (#168). Three
+// passes outside the worldserver send the family to a counter and each of them
+// writes `travel_npc`: the vendor pass, the bank pass, and now the maintenance
+// trip. The run coordinator claims that same column the moment a run starts
+// staging, and its claim is an unconditional write - so an errand written in
+// the gap between two runs is taken back on the coordinator's next poll, and
+// the character walks to a dungeon door instead of to the counter it was sent
+// to. Nothing errors. The errand simply never completes, and its rows are
+// answered "not in range" until they age out.
+//
+// That is why a hundred-run campaign has never had a maintenance trip, and it
+// is why reading any of those three passes' success rate DURING a campaign is
+// reading noise rather than a measurement.
+//
+// WHAT IS DELIBERATELY NOT CHANGED: the claim itself. Once a run is staging,
+// the coordinator taking a straggler over from whatever it was doing is the
+// thing that gets the party through the door, and it is working. This decision
+// is asked only at IDLE, before a run has started, where the question is
+// whether to start one at all. A run already under way never yields.
+//
+// SO THE RULE IS: a run does not OPEN on top of an errand somebody else is
+// still running. Not "the run gives way", which would tear down staging that is
+// working; just "the run waits its turn", which costs one cycle of a campaign
+// that has ninety-nine more.
+
+// Is this travel aim one of the economy passes' errands?
+//
+// The three roles are the same three the bridge treats as economy errands, and
+// they are named rather than derived because the question is not "is this a
+// role" - every value in this column is - but "did a pass that transacts write
+// it". A trainer errand is somebody's profession and is not this.
+bool IsMaintenanceErrand(std::string const& aim);
+
+enum class MaintenanceHold : uint8_t
+{
+    Open,         // nothing is outstanding; the run may start
+    Walking,      // the leader is walking to a counter and must not be turned round
+    Transacting,  // rows are queued and unanswered; moving now loses the trip
+    Overdue,      // held past the bound; the run starts anyway and says so
+};
+
+// Should the coordinator hold at IDLE rather than open a run?
+//
+// TWO CONDITIONS, BECAUSE AN ERRAND HAS TWO HALVES AND ONLY ONE OF THEM IS
+// VISIBLE IN THE AIM COLUMN. While the family walks, `travel_npc` holds the
+// role; the moment they arrive the travel drive releases it, and what is left
+// is a queue of rows nobody has answered yet. A hold that watched only the aim
+// would let a run start in the seconds between arriving and transacting, which
+// is the worst possible moment to walk them away.
+//
+// AND IT IS BOUNDED, for the reason every wait in this file is bounded. The
+// aim is written by a process outside the worldserver; if that process dies
+// mid-errand the column can hold a role nothing will ever clear, and an
+// unbounded hold would stop a hundred-run campaign with nothing in any log to
+// say why. Past the bound the run opens anyway and the reason is said out loud
+// once, which is the honest direction to fail in: a missed repair costs one
+// run's durability, and a campaign that silently stopped costs the campaign.
+MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
+                                          unsigned outstandingErrands,
+                                          time_t heldForSeconds,
+                                          time_t boundSeconds);
+
 // -------------------------------------------------- the staging watchdog --
 //
 // "IT IS FAR AWAY" AND "IT IS NOT COMING" ARE DIFFERENT FACTS, and the
