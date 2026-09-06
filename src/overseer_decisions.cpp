@@ -3659,4 +3659,122 @@ bool AuctionRefusalRetryable(std::string const& reason)
     return false;
 }
 
+// ----------------------------------------- a home somebody chose (#274) --
+
+BindRequest ParseBindRequest(std::string const& command)
+{
+    BindRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    // An EMPTY command is `here`. A bind has exactly one form and no
+    // arguments, so an empty column is unambiguous rather than lazy, and the
+    // sender that writes the row does not have to know a magic word to ask for
+    // the only thing this verb does.
+    if (words.empty())
+    {
+        request.verb = BindVerb::Here;
+        return request;
+    }
+
+    if (words[0] == "here")
+    {
+        if (words.size() == 1)
+        {
+            request.verb = BindVerb::Here;
+            return request;
+        }
+        request.error = "malformed bind: here takes no arguments";
+        return request;
+    }
+
+    request.error = "malformed bind: unknown verb (want here, or nothing at all)";
+    return request;
+}
+
+char const* BindOutcomeWord(BindOutcome outcome)
+{
+    switch (outcome)
+    {
+        case BindOutcome::Moved:
+            return "moved";
+        case BindOutcome::SameSpot:
+            return "same-spot";
+        case BindOutcome::Unchanged:
+            return "unchanged";
+        case BindOutcome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
+BindOutcome BindReadBack(HomeBind const& before, HomeBind const& after,
+                         HomeBind const& standing, float sameSpotYards)
+{
+    // ALL THREE OR NOTHING. A home read after but not before cannot be
+    // compared, and a home compared against a place nobody read cannot say
+    // whether standing still was the right answer. Reporting either as a
+    // change or as a failure would be inventing the half that was missing.
+    if (!before.known || !after.known || !standing.known)
+        return BindOutcome::Unreadable;
+
+    // Squared throughout, so these two files keep including nothing but the
+    // five standard headers the decisions job compiles them with.
+    float const tolerance = sameSpotYards * sameSpotYards;
+
+    auto within = [tolerance](HomeBind const& a, HomeBind const& b)
+    {
+        if (a.mapId != b.mapId)
+            return false;
+        float const dx = a.x - b.x;
+        float const dy = a.y - b.y;
+        float const dz = a.z - b.z;  // an inn has floors
+        return dx * dx + dy * dy + dz * dz <= tolerance;
+    };
+
+    if (!within(before, after))
+        return BindOutcome::Moved;
+
+    // The home did not move. That is good news only if it was already here.
+    return within(after, standing) ? BindOutcome::SameSpot : BindOutcome::Unchanged;
+}
+
+int ChooseInnkeeper(std::vector<float> const& yards)
+{
+    int best = -1;
+    for (size_t i = 0; i < yards.size(); ++i)
+    {
+        if (best < 0 || yards[i] < yards[static_cast<size_t>(best)])
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+TownRetry BindRefusalRetry(std::string const& detail)
+{
+    // The literals mod_overseer.cpp's DoBind returns, grouped by what would
+    // have to change for the same row to succeed.
+    static char const* const NEVER[] = {
+        "malformed bind: here takes no arguments",
+        "malformed bind: unknown verb (want here, or nothing at all)",
+        "malformed bind request",
+    };
+    static char const* const ELSEWHERE[] = {
+        // Standing somewhere else answers both of these. The second is not a
+        // guess: WorldSession::SendBindPoint returns without doing anything at
+        // all when the character's map is instanceable, which is precisely a
+        // call that reports nothing and changes nothing, so it is refused on
+        // this side before the packet rather than read back as a mystery.
+        "innkeeper not in range",
+        "character is inside an instance",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return TownRetry::Elsewhere;
+    return TownRetry::Later;
+}
+
 }  // namespace OverseerDecisions

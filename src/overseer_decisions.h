@@ -3946,6 +3946,143 @@ constexpr char const* NotReadBack        = "the transaction did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool AuctionRefusalRetryable(std::string const& reason);
 
+// ----------------------------------------- a home somebody chose (#274) --
+//
+// WHAT A kind='bind' ROW MAY SAY.
+//
+//     here     bind at the innkeeper this character is already standing next to
+//
+// WHY THIS VERB EXISTS AT ALL. The game already ships a cross-continent
+// crossing that needs no boat and no pier: an innkeeper sets your home, and
+// from then on the hearthstone takes you there from anywhere, across an ocean,
+// with no deck to board. This module can already do the second half - four
+// separate revival exits teleport a character to m_homebind* - and it has
+// never been able to do the first. Nothing here, and nothing upstream that a
+// bot can reach, could ever CHANGE a home. So "go home" has exactly one
+// possible destination per character, and nothing this module or its operator
+// can do has ever been able to choose it.
+//
+// WHAT THAT COST, MEASURED. All five members of the family read map 0, area
+// 12, in character_homebind, at one doorway in the human starting zone: the
+// widest gap between any two of the five binds is 0.68 yards. Two of them are
+// not even human, so this is not five characters keeping the home they were
+// born with, it is five characters that have only ever had one home between
+// them. The dungeon they are asked to run a hundred times is on map 1, and
+// their runs stand at 0 of 100. So the one verb that could have reunited a
+// party split across two continents would have gathered all five neatly in the
+// wrong hemisphere. It is a reunion, and it is the wrong one, and that is why
+// this executor had to exist before anything was allowed to send anybody home.
+//
+// UPSTREAM HAS THE VERB AND IT CANNOT RUN. mod-playerbots ships
+// SetHomeAction, registered as the chat command `home`. Its first act is
+// `Player* master = GetMaster()`, and four lines later, when the selection did
+// not come from an rpg target, `else return false` (SetHomeAction.cpp:19-25).
+// A roster character is masterless whenever no client holds the party leader -
+// PlayerbotAI::FindNewMaster returns nullptr unless the leader is a real
+// player or a selfbot - so that early return is taken every time, before the
+// scan for a nearby innkeeper below it is ever reached. The failure is then
+// invisible in both directions: PlayerbotAI::HandleCommands erases the command
+// whatever ParseChatCommand answered, and TellError returns false without
+// sending anything when there is no master to send it to. The row reads
+// `delivered`. This is the pattern AGENTS.md already names - a call that
+// reports its failure to a client, to a character that has no client - and the
+// answer here is the same one the learn path took: do not trust the call, ask
+// the world afterwards.
+//
+// SO THE MODULE OWNS THE VERB. CMSG_BINDER_ACTIVATE goes to the core's own
+// WorldSession::HandleBinderActivateOpcode, exactly the way CMSG_AREATRIGGER
+// goes to HandleAreaTriggerOpcode, and for the same reason: the handler
+// re-checks everything itself. GetNPCIfCanInteractWith rejects a creature that
+// is not innkeeper-flagged, not alive, hostile, or further than
+// INTERACTION_DISTANCE, so nothing can be bound anywhere a character did not
+// walk to and stand beside. The chain from there is entirely server-side -
+// SendBindPoint casts spell 3286, Spell::EffectBind calls Player::SetHomebind,
+// and SetHomebind writes character_homebind itself - so no part of it is
+// waiting on a client that a bot does not have.
+//
+// WHAT THIS DELIBERATELY IS NOT. It is not a teleport, and it does not move
+// anybody one yard. A character can only be bound where it can already stand,
+// which means a bind can never itself be the crossing: it converts a crossing
+// that has already been made into a permanent one that costs nothing to make
+// again. That is the whole prize, and overstating it would be the same mistake
+// #275 made about a stop frame.
+enum class BindVerb
+{
+    None,  // not a bind request; `error` says why
+    Here,
+};
+
+struct BindRequest
+{
+    BindVerb verb{BindVerb::None};
+    std::string error;  // the refusal literal when verb is None, else empty
+};
+
+// ONE FORM, AND NO COORDINATES. Whitespace-tolerant, otherwise literal: the
+// single lower-case word `here`, or an empty command meaning the same thing.
+// There is deliberately no way to name an innkeeper, a map or a position: the
+// core decides who is in reach, and a grammar that could ask to be bound
+// somewhere the character is not standing would be a grammar for a request the
+// handler is always going to refuse.
+BindRequest ParseBindRequest(std::string const& command);
+
+// A home, or a place, as it was read off the world at one moment.
+//
+// `known` IS NOT `zero`. A map id of 0 is Eastern Kingdoms and a coordinate of
+// 0 is a real coordinate, so an unread home has to say so in a field of its
+// own rather than by being empty - the same distinction the ratchet had to
+// make between no reading and a real zero.
+struct HomeBind
+{
+    bool known{false};
+    uint32_t mapId{0};
+    uint32_t areaId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+enum class BindOutcome
+{
+    // The home before, the home after, or where the character was standing
+    // could not all be read. Says nothing about whether anything happened,
+    // and must never be reported as either outcome.
+    Unreadable,
+    // The home is somewhere else than it was. The only outcome that is a
+    // change, and the only one worth `applied`.
+    Moved,
+    // The home did not move AND it is already where this character is
+    // standing. Nothing happened because nothing needed to; this is a success
+    // and it is not a change, which is exactly what `unchanged` is for.
+    SameSpot,
+    // The home did not move and it is NOT where the character is standing.
+    // The call was made and the world did not agree. THE FAILURE THIS WHOLE
+    // EXECUTOR EXISTS TO MAKE VISIBLE.
+    Unchanged,
+};
+
+// "moved", "same-spot", "unchanged", "unreadable". Here rather than in the
+// executor so the word a test pins is the word a row carries.
+char const* BindOutcomeWord(BindOutcome outcome);
+
+// `standing` is where the character was when the packet went out, because a
+// home that did not move is only good news if it was already here. Distance is
+// compared in three dimensions: an inn has floors.
+BindOutcome BindReadBack(HomeBind const& before, HomeBind const& after,
+                         HomeBind const& standing, float sameSpotYards);
+
+// WHICH INNKEEPER, when more than one is in reach. NEAREST, and not the
+// cheapest-first rule ChooseRepairer uses, because a bind has no price for a
+// reputation discount to act on - every innkeeper sets the same home to the
+// same coordinates. Ties break on index so the answer never depends on the
+// order a cell sweep happened to produce. Returns -1 for an empty list.
+int ChooseInnkeeper(std::vector<float> const& yards);
+
+// Keyed on the `detail` literal the executor returns. Unknown is `Later`, the
+// same call the sell and repair tables make: a refusal this table has never
+// heard of is more likely a new transient than a new permanent.
+TownRetry BindRefusalRetry(std::string const& detail);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
