@@ -2982,6 +2982,68 @@ TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& 
 std::string TravelTargetExplanation(TravelTargetChoice const& choice,
                                     std::vector<TravelTargetCandidate> const& candidates);
 
+
+// -------------------------------------------- who the kill hooks named --
+//
+// WHY A KILLER TYPED 'player' CARRYING THE VICTIM'S OWN NAME IS NOT A KILLER
+// (#249).
+//
+// THE ROW THIS EXISTS TO STOP LYING. `overseer_death` fills its killer
+// columns from the two script hooks the core offers, and the comment beside
+// that code used to say an absent hook meant "fall damage, drowning, fatigue,
+// lava, a GM command", with 'environment' as the honest answer for the whole
+// class. THAT IS THE WRONG WAY ROUND, and it is wrong in the pinned core, at
+// two lines that can be read:
+//
+//   * Player::EnvironmentalDamage (Player.cpp:853) deals its damage with
+//     `Unit::DealDamage(this, this, ...)`. Attacker and victim are the same
+//     Player, for every environmental type there is: a fall, drowning,
+//     fatigue, fire, lava, slime, and the out-of-bounds kill.
+//   * Unit::Kill's hook block (Unit.cpp:14298-14306) then asks only whether
+//     the killer is a Player and whether the victim is a Player. It has NO
+//     `killer != victim` guard - unlike the KILLED_BY_PLAYER achievement two
+//     lines above it, which does have one. So it fires
+//     OnPlayerPVPKill(victim, victim).
+//
+// So an environmental death does NOT arrive with an absent killer. It arrives
+// through the player-kill hook naming the victim, and the row it writes is
+// `killer_type='player'`, `killer_entry=0`, `killer_name` = the character's
+// own name. On 2026-09-06 that row was read as "attributed to himself, so not
+// environmental" TWICE in one day, and the second reading survived long enough
+// to declare a fall bug fixed while the core's own falling counter was still
+// climbing. A column that means "no attributable killer" must not be spelled
+// the same way as one that means "another player did it".
+//
+// WHAT THIS DOES AND DOES NOT CLAIM. It separates the two, and no more. The
+// hook cannot say WHICH environmental type it was - EnvironmentalDamage keeps
+// that in a parameter it does not pass on - so SelfInflicted is exactly as far
+// as the evidence goes, and guessing 'falling' from a position would be the
+// same mistake in the other direction. `criteria 149-153` on the character is
+// where the type actually lives, and it is only written to the database when
+// the player is SAVED, so a read of it that has not been forced with a save
+// first is stale by up to PlayerSaveInterval.
+enum class KillerKind
+{
+    Unattributed,   // no kill hook fired: nothing named a killer at all
+    Creature,       // a creature landed the killing blow
+    Player,         // ANOTHER player did
+    SelfInflicted,  // the hook named the victim itself: self-damage
+};
+
+// The value written to `overseer_death.killer_type`. Unattributed stays
+// 'environment' because that is what the column has always held for it and
+// what every existing reader groups by; the new value is the one that used to
+// hide inside 'player'.
+char const* KillerKindName(KillerKind kind);
+
+// `hookFired` is false when neither kill hook left anything behind for this
+// death. `hookType` is what the hook itself said - 'creature' or 'player' -
+// and is ignored when hookFired is false. Names are compared without regard to
+// case, because the two sides reach this from different places.
+KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
+                         std::string const& killerName,
+                         std::string const& victimName);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

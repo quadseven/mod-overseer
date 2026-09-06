@@ -2433,7 +2433,7 @@ struct PendingDeath
     uint32 zoneId = 0;
     float x = 0.f, y = 0.f, z = 0.f;
 
-    std::string killerType;    // 'creature' | 'player' | 'environment'
+    std::string killerType;    // 'creature' | 'player' | 'self' | 'environment'
     std::string killerName;
     uint32 killerEntry = 0;
 
@@ -2603,24 +2603,36 @@ void RecordDeath(Player* player)
     // The killer, if this death arrived through one of the two kill hooks
     // below - CONSUMED, not copied: a stale entry left behind by a PREVIOUS
     // death on this same character must never attach itself to this one, so
-    // it is erased whether or not it is used. Absent means the death did not
-    // route through Unit::Kill with a non-null killer at all - fall damage,
-    // drowning, fatigue, lava, a GM command - and 'environment' is itself the
-    // honest answer to "what killed them" for that whole class of death,
-    // rather than a blank the reporting layer has to interpret.
+    // it is erased whether or not it is used.
+    //
+    // AN ABSENT HOOK IS NOT WHAT ENVIRONMENTAL DAMAGE LOOKS LIKE (#249). This
+    // comment used to say that a death with no hook meant "fall damage,
+    // drowning, fatigue, lava, a GM command". The first four of those are the
+    // exact opposite: Player::EnvironmentalDamage deals its damage with
+    // `Unit::DealDamage(this, this, ...)` (Player.cpp:853), and Unit::Kill's
+    // hook block has no `killer != victim` guard (Unit.cpp:14298-14306), so
+    // every one of them fires OnPlayerPVPKill with the victim in both slots
+    // and lands here typed 'player' with the character's own name in it. That
+    // reading cost a day: three of Bork's falls on 2026-09-06 were called
+    // self-attributed-therefore-not-environmental while the core's own falling
+    // counter climbed 28 to 31 over the same three deaths. NameTheKiller
+    // separates the two; the environmental TYPE is not knowable from here and
+    // is deliberately not guessed at.
+    bool hookFired = false;
     {
         std::lock_guard<std::mutex> guard(g_killMutex);
         auto it = g_pendingKill.find(lower);
         if (it != g_pendingKill.end())
         {
+            hookFired = true;
             d.killerType = it->second.killerType;
             d.killerName = it->second.killerName;
             d.killerEntry = it->second.killerEntry;
             g_pendingKill.erase(it);
         }
     }
-    if (d.killerType.empty())
-        d.killerType = "environment";
+    d.killerType = OverseerDecisions::KillerKindName(OverseerDecisions::NameTheKiller(
+        hookFired, d.killerType, d.killerName, d.characterName));
 
     std::lock_guard<std::mutex> guard(g_deathMutex);
     if (g_deathQueue.size() >= MAX_DEATH_QUEUE)
