@@ -13415,6 +13415,26 @@ private:
         float crossingSweptY{0.f};
         bool crossingBerthGuarded{false};
         uint32 crossingBerthGuardLevel{0};
+        // THE PIER DOES NOT DISAPPEAR WHEN THE BOAT SAILS, AND NEITHER MAY THIS.
+        // Map::GetAllTransports only reports transports currently ON that map,
+        // and a crossing transport spends half its period on the far one:
+        // DelayedTeleportTransport removes it from this Map and adds it to the
+        // other (Transport.cpp:716-721). So a live lookup alone would answer
+        // "no transport serves that map" for minutes at a time, which is false
+        // and is exactly the kind of log line that teaches an operator the
+        // feature does not work. What is actually being asked is whether a
+        // ROUTE exists, and a route is a property of the transport's path
+        // rather than of where the boat is standing this second. So the berth
+        // is remembered for as long as the crossing is the same one, and the
+        // live lookup only ever improves on it.
+        bool crossingBerthFound{false};
+        uint32 crossingBerthOriginMap{0};
+        uint32 crossingBerthDestinationMap{0};
+        float crossingBerthX{0.f};
+        float crossingBerthY{0.f};
+        float crossingBerthZ{0.f};
+        bool crossingLandingKnown{false};
+        std::string crossingTransportName;
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
 
@@ -15171,14 +15191,59 @@ private:
         route.transport = FindCrossingTransport(leader, destinationMap, route.berthX,
                                                 route.berthY, route.berthZ, berthKnown,
                                                 landingKnown);
-        route.world.transportFound = route.transport != nullptr;
+
+        // A CROSSING IS THE SAME CROSSING WHILE BOTH ITS ENDS ARE. Anything
+        // else - a different origin map because the leader moved, a different
+        // portal - is a different route and must not inherit a berth.
+        bool const sameCrossing = coord.crossingBerthFound &&
+                                  coord.crossingBerthOriginMap == route.world.originMap &&
+                                  coord.crossingBerthDestinationMap == destinationMap;
+
+        if (route.transport && berthKnown)
+        {
+            coord.crossingBerthFound = true;
+            coord.crossingBerthOriginMap = route.world.originMap;
+            coord.crossingBerthDestinationMap = destinationMap;
+            coord.crossingBerthX = route.berthX;
+            coord.crossingBerthY = route.berthY;
+            coord.crossingBerthZ = route.berthZ;
+            coord.crossingLandingKnown = landingKnown;
+            coord.crossingTransportName = route.transport->GetName();
+        }
+        else if (sameCrossing)
+        {
+            // The boat is at the far end of its run. The route still exists and
+            // the berth is still where it was, so the leader keeps walking to
+            // it rather than being told there is no boat.
+            berthKnown = true;
+            landingKnown = coord.crossingLandingKnown;
+            route.berthX = coord.crossingBerthX;
+            route.berthY = coord.crossingBerthY;
+            route.berthZ = coord.crossingBerthZ;
+        }
+        else if (!coord.crossingBerthFound)
+        {
+            // Never found one, so nothing is remembered and nothing is claimed.
+            coord.crossingBerthOriginMap = route.world.originMap;
+            coord.crossingBerthDestinationMap = destinationMap;
+        }
+
+        // `transportFound` MEANS "THIS ROUTE EXISTS", not "the boat is in front
+        // of me". The distinction is the whole point of the block above, and it
+        // is what DungeonPortalApproach is being told when it is asked whether a
+        // crossing exists.
+        route.world.transportFound = route.transport != nullptr || (sameCrossing && berthKnown);
         route.world.berthKnown = berthKnown;
         route.world.landingKnown = landingKnown;
-        if (route.transport)
-            route.transportName = route.transport->GetName();
+        route.transportName = route.transport ? route.transport->GetName()
+                                              : coord.crossingTransportName;
 
         if (route.world.transportFound && berthKnown)
         {
+            // Keyed on the berth in hand, which may be the remembered one. The
+            // sweep is over static spawn data, so a berth that was clear when
+            // the boat was here is still clear now.
+
             uint32 guardLevel = 0;
             route.world.berthGuarded = BerthIsGuarded(coord, leader, route.world.originMap,
                                                       route.berthX, route.berthY, guardLevel);
