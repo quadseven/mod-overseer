@@ -1392,6 +1392,79 @@ DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
                                                 uint32_t runsWanted,
                                                 bool capKnown);
 
+// ------------------------------------------ is the dungeon finished (#226) --
+//
+// THE QUESTION THE COORDINATOR COULD NEVER ASK, AND WHY IT CAN NOW.
+//
+// A run that goes perfectly has never had an ending it could reach. EXIT is
+// entered from exactly two places, a stall the watchdog gave up on and an
+// operator taking the job off 'dungeon', so a party that clears the whole
+// instance simply stands in it until the map empties by some other means.
+// Measured 2026-09-05: a confirmed 100 percent Wailing Caverns clear ran 121
+// minutes and was recorded 'emptied', which is the row honestly reporting that
+// the coordinator never walked them out.
+//
+// WHAT WAS LOOKED AT FIRST AND REJECTED, so nobody re-treads it. The obvious
+// test is InstanceScript::GetEncounterCount plus GetBossState, and the run
+// coordinator already carries a comment explaining that Deadmines' script never
+// calls SetBossState, so its count is 0 and "all encounters done" would read
+// TRUE the instant the party walked in. That is still true, and Wailing Caverns
+// is the same shape: instance_wailing_caverns keeps a private _encounters[5]
+// array behind SetData/GetData and never calls SetBossState either. So that
+// framework cannot answer this for either map.
+//
+// WHAT ACTUALLY ANSWERS IT IS A DIFFERENT MECHANISM WITH THE SAME NAME. The
+// completed-encounter MASK is not maintained by the instance script at all. It
+// is maintained by the core off DungeonEncounter.dbc: KillRewarder calls
+// Map::UpdateEncounterState, which walks
+// sObjectMgr->GetDungeonEncounterList(map, difficulty) and, for the entry whose
+// credit matches the kill, ORs in `1 << dbcEntry->encounterIndex` and writes the
+// result straight back to the InstanceSave. That is the same mask this module
+// already reads for its "a boss died" progress signal, and it rises on maps
+// whose scripts do not use the boss-state framework at all. Wailing Caverns
+// measured completedEncounters = 255 on all five characters, eight bits for
+// eight credited encounters, on a script that sets no boss states.
+//
+// So the complete mask is not a per-map constant anybody has to write down. It
+// is the OR of `1 << encounterIndex` over that same list, which the caller
+// builds from the same store the core credits from. Asking whether every bit
+// the map can credit has been credited is then exactly "every encounter this
+// dungeon has, has happened".
+//
+// A MAP THAT CREDITS NOTHING IS UNKNOWABLE, NOT COMPLETE, and that distinction
+// is the whole reason this returns three answers rather than a bool. An empty
+// or missing encounter list means the DBC has nothing for this map, so the
+// question has no answer here; reading that as "finished" would end every run
+// on such a map the moment it started, which is precisely the vacuous-TRUE trap
+// the boss-state route was rejected for. The caller keeps today's behaviour on
+// an Unknowable map: the run ends the ways it already could.
+enum class DungeonCompletion : uint8_t
+{
+    Unknowable,  // this map credits no encounters, so nothing here can be concluded
+    NotYet,      // at least one encounter this map credits has not been credited
+    Complete,    // every encounter this map credits has been credited
+};
+
+// `expectedMask` is every bit the map can credit; `completedMask` is what the
+// save says has been credited. Bits set in `completedMask` that are not in
+// `expectedMask` are ignored rather than treated as an error: the save is
+// written by the core and outlives this module's opinions, and a bit from a
+// difficulty this run is not on says nothing about this run.
+DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completedMask);
+
+// THE WORD THAT GOES ON THE ROW, in one place because the vocabulary is now
+// four wide at this one exit and picking it inline is how 'complete' would end
+// up written for a run that stalled.
+//
+// The order is the priority. A run the coordinator PROVED finished is
+// 'complete' whatever else was true of it; a run it walked out because the
+// clearing watchdog gave up is 'stalled'; anything else that reaches the door
+// is 'left', which is what this exit has always written. 'complete' needs no
+// migration: the outcome column is VARCHAR(16) and was made one for exactly
+// this, its own migration naming 'complete' as the value to add "the moment a
+// run has a goal to complete".
+char const* DungeonRunExitOutcome(bool provedComplete, bool stalled);
+
 // -------------------------------------------------- the staging watchdog --
 //
 // "IT IS FAR AWAY" AND "IT IS NOT COMING" ARE DIFFERENT FACTS, and the

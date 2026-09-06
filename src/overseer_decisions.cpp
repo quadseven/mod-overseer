@@ -957,6 +957,30 @@ DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
     return progress;
 }
 
+DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completedMask)
+{
+    // NO BITS TO CREDIT MEANS NO ANSWER. Said first, because every other branch
+    // below would report Complete for an empty expectation: zero bits are all
+    // set, trivially and uselessly, and a run that ends the instant it starts is
+    // worse than a run that never ends.
+    if (!expectedMask)
+        return DungeonCompletion::Unknowable;
+
+    return (completedMask & expectedMask) == expectedMask ? DungeonCompletion::Complete
+                                                          : DungeonCompletion::NotYet;
+}
+
+char const* DungeonRunExitOutcome(bool provedComplete, bool stalled)
+{
+    // PROOF OUTRANKS SUSPICION. A run can be both: the clearing watchdog can
+    // have spent its skips on the last pull of a dungeon that then finished, and
+    // the mask saying every encounter is credited is a fact where the stall is
+    // an inference from not having moved.
+    if (provedComplete)
+        return "complete";
+    return stalled ? "stalled" : "left";
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
                              RatchetLimits const& limits,
