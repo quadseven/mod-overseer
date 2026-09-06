@@ -3156,11 +3156,27 @@ bool MayInteractAt(Reaction reaction);
 // One spawn of the wanted role standing on the character's own map. The
 // caller has already asked whether this character may interact with it, the
 // same way the bank and repair candidate lists arrive already asked.
+//
+// AND WHETHER IT IS A PLACE THE CHARACTER CAN STAND (#267). `guardCount` is
+// how many creatures hostile to this character AND above its level are
+// spawned within the threat radius of this spawn, and `guardLevel` is the
+// highest level among them. Both are measured by the caller off spawn data
+// rather than the live grid, for the reason GRAVEYARD_THREAT_RADIUS gives: a
+// destination two grids away is not loaded, and an unloaded grid reads as "no
+// creatures", which is exactly the wrong answer for this question.
+//
+// A caller that has not measured a candidate leaves these zero, which reads as
+// unguarded. That is deliberate and it is what lets the measurement be done
+// lazily in distance order: an unmeasured candidate is always FARTHER than the
+// one chosen, so it could not have won and measuring it would have bought
+// nothing but a sweep over every spawn in the world.
 struct TravelTargetCandidate
 {
     uint32_t entry{0};
     float distance{0.f};      // yards from the character, two-dimensional
     bool mayInteract{false};
+    uint32_t guardCount{0};   // hostile spawns above this level within the radius
+    uint32_t guardLevel{0};   // the highest level among them, for the log line
 };
 
 enum class TravelTargetVerdict : uint8_t
@@ -3168,6 +3184,7 @@ enum class TravelTargetVerdict : uint8_t
     Chosen,               // `index` names the spawn to walk to
     NothingOfThatKind,    // no spawn of the role is on this map at all
     NoneWillDealWithUs,   // there are spawns and this character may use none
+    EveryOneIsGuarded,    // it may use some, and every one stands in hostile ground
 };
 
 struct TravelTargetChoice
@@ -3177,6 +3194,8 @@ struct TravelTargetChoice
     int nearestRefused{-1}; // the nearest one it may NOT use, for the log line
     std::size_t considered{0};
     std::size_t refused{0};
+    int nearestGuarded{-1}; // the nearest usable one standing in hostile ground
+    std::size_t guarded{0}; // how many usable ones were refused for their guards
 };
 
 // THE NEAREST SPAWN THIS CHARACTER CAN ACTUALLY USE, and nothing else about
@@ -3193,6 +3212,31 @@ struct TravelTargetChoice
 // measured both before this existed. Distance only ever breaks a tie among
 // spawns that passed the gate; the index breaks a tie in distance, so the
 // answer never depends on the order a spawn sweep happened to produce.
+//
+// AND A SPAWN IT CAN USE BUT CANNOT REACH ALIVE IS NOT AN ANSWER EITHER
+// (#267). A second gate, for the same reason and on the same terms as the
+// first: a candidate with hostile spawns above this character's level standing
+// within the threat radius of it is not ranked lower, it is not a candidate.
+// Measured live, an Alliance party of 25 to 31 was sent to a faction 35 vendor
+// it could trade with perfectly well, standing 21 yards from eight level 65
+// elites, and died there eighteen times in sixteen minutes. The interaction
+// gate above cannot see that: the counter was willing, the ground was not.
+//
+// THIS IS THE TEST THE GRAVEYARD PATH ALREADY MAKES, and the whole argument
+// for the shape is that the module was making two different answers to one
+// question. GraveyardRefusal will not RESURRECT a character where hostile
+// spawns above its level sit within GRAVEYARD_THREAT_RADIUS, and nothing
+// stopped the same module WALKING it to such a place on an errand. Now the two
+// refusals sit side by side and neither can be changed without the other being
+// read.
+//
+// THE ORDER OF THE TWO REFUSALS IS PART OF THE MEANING. Interaction is asked
+// first because it is a property of the counter and needs no sweep; the guard
+// test is asked only of candidates that survived it, so the expensive question
+// is never asked about a spawn that was already out. And when nothing at all
+// can be chosen, EveryOneIsGuarded wins over NoneWillDealWithUs whenever both
+// happened, because "there is a shop here you may use and it is lethal" names
+// a danger and a fix, while "nobody will serve you" names neither.
 TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates);
 
 // What to put in the log for a choice, or empty when there is nothing worth
