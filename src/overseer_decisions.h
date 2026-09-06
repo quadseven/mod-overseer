@@ -100,9 +100,38 @@ constexpr char VERSION[] = "0.1.0";
 //
 // Airborne travel is deliberately off the land navmesh, so the adapter passes
 // those current player states here before any geometry is interpreted.
+//
+// AND A SCRIPTED FALL IS ONE OF THEM, which cost a dungeon run to learn.
+// mod-dungeon-clear drops the party down a shaft as a measured traversal step,
+// and one second into that fall a character is in open air: no polygon under
+// it by definition, and a surface reading from the lip it just left or the
+// cavern roof above. Live on 2026-09-05 in Wailing Caverns, at 14:25:27
+// "DropInHole: MoveFall from (-49.5,47.6,-29.0)" and at 14:25:28 this module
+// answered (-49.5, 47.6, -39.8) with a surface at 6.6, moved the tank, and at
+// 14:25:29 the other four logged "follow-tank: released (DC tank gone)". The
+// run lost its tank at the second of its two traversal moments and the
+// operator put him back by hand.
+//
+// The travel half of this module already knew: GroundedStep's comment says
+// "Explicit dungeon jump and drop steps do not use GroundedStep." The recovery
+// half was never told, and that is the whole of this defect.
+//
+// A FALLING CHARACTER SHOULD NEVER BE RECOVERED, scripted or not, and that is
+// the more general reason to put it here rather than special-casing dungeons.
+// Mid-air there is nothing to be right about: the position is changing every
+// tick, no polygon under a falling body means nothing, and a genuine fall out
+// of the world resolves itself within seconds when the character lands or
+// dies - at which point this rule gets a stable reading to judge, and the
+// death drive gets the other case. Recovering mid-fall is guesswork against a
+// number that will be stale before the teleport lands.
+//
+// The adapter reads it from Unit::IsFalling (Unit.h:1718), which is true both
+// for the client's own MOVEMENTFLAG_FALLING/FALLING_FAR and for a server-side
+// fall spline (Unit.cpp:15934-15938) - and the second of those is exactly what
+// MoveFall issues, so the scripted drop is covered by the same question.
 bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
-                               bool flying, bool inWater, bool onTransport,
-                               bool onVehicle);
+                               bool flying, bool falling, bool inWater,
+                               bool onTransport, bool onVehicle);
 
 // `surfaceValid` is separate from the number because the core has two invalid
 // height sentinels. Invalid data grants no permission to move a character.
@@ -185,8 +214,43 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
 // condition is false on the next poll. If it does not, the condition is true
 // again immediately and this says so, rather than a slow walk back disguising
 // a failed remedy as a fresh incident. That is what the attempt count below
-// is for: one lift, then the bind as the fallback of last resort, then a loud
-// give-up. Three actions, then silence, per episode. Never 204.
+// is for: one lift, then a loud give-up. Two actions, then silence, per
+// episode. Never 204.
+//
+// AND NO REMEDY MAY CHANGE THE MAP, which is #188 and is why the fallback that
+// used to sit between those two is GONE rather than merely unreachable. The
+// whole ladder was caught in one trace on the dev realm 2026-09-05:
+//
+//   16:46:58  'Grog' below the world at map 1 (1202.6, -707.3, 72.3),
+//             surface z 97.7, no local navmesh; LIFTED to z 98.2
+//   16:47:03  'Grog' the condition is back, so this is the fallback:
+//             sent to the leader's bind point
+//   16:47:14  'Grog' STILL below the world at MAP 0 (-8902.6, -162.6, 81.9),
+//             surface z 128.0, local navmesh PRESENT
+//
+// Eleven seconds, one ocean, and the same unresolved reading at the far end.
+// Every roster member's bind row is map 0 (-8950, -132), the abbey grounds in
+// Elwynn, so a fallback taken on Kalimdor lands the character on the other
+// continent: the party ended that minute two in Elwynn, two in the Barrens and
+// one offline in Stonetalon, which is not a party and cannot run a dungeon on
+// either side of the ocean. The fallback also did not fix the condition it
+// escalated for, and could not have, because it moved a bad READING rather
+// than a bad position. There is no measured success to weigh against that.
+//
+// AND IT FED ITSELF. The bind point sits under the abbey, whose roof is the
+// highest geometry within the probe's sixty yards, so the destination is one
+// of the places most reliably guaranteed to read as "below the world" - which
+// is exactly the last line above, with `local navmesh PRESENT` naming it a
+// false positive out loud. A remedy whose destination re-triggers the detector
+// that chose it is a loop, and the "something keeps putting the family under
+// Stormwind" in #188's title was this ladder putting them there.
+//
+// SO THE REMEDY SET IS CLOSED UNDER "SAME MAP, SAME X, SAME Y". The only
+// remedy that moves anything is the lift, and a lift is a change of z alone.
+// There is no verdict this can return that a caller could turn into a
+// cross-map teleport, which is a stronger guarantee than a rung that merely
+// never gets chosen: the type says it, so the next change cannot bring it back
+// by accident.
 enum class TerrainRemedy
 {
     // Leave it where it is. Either nothing is wrong, or nothing this module
@@ -194,17 +258,47 @@ enum class TerrainRemedy
     Nothing,
 
     // Straight up to `liftZ`, at the character's own x and y. Its errand,
-    // its aims and its party keep going.
+    // its aims and its party keep going. THE ONLY REMEDY THAT MOVES ANYTHING,
+    // and it moves it in z alone (#188).
     LiftToSurface,
-
-    // The fallback of last resort, and the only remedy that displaces. For a
-    // lift that has already been tried and did not stick.
-    SendToBind,
 
     // Say it once, loudly, and stop trying. A repeated identical condition is
     // a bug in this rule or in the world, and either way silence is worse
     // than one warning a person can go and look at.
+    //
+    // This is now the END OF THE LADDER as well as the answer to a live
+    // polygon. When a lift has not stuck, this module cannot fix the character
+    // where it stands, and saying so is the whole remedy: the escalation that
+    // used to be here relocated the failure to another continent instead, and
+    // the character was still below the world when it arrived (#188).
     GiveUp,
+};
+
+// ONE POLL'S WORTH OF WORLD, as the adapter measured it. Grouped rather than
+// passed as eight positional arguments because the anchor below made this the
+// eighth, and a call site where two floats can be swapped without a compiler
+// noticing is a bad place to keep a character's map coordinates.
+struct TerrainReading
+{
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+    float surfaceAboveZ{0.f};
+    // `surfaceValid` is separate from the number because the core has two
+    // invalid height sentinels. Invalid data grants no permission to move.
+    bool surfaceValid{false};
+    bool hasLocalNavmesh{false};
+    // DOES ANY DIRECTION OUT OF HERE PASS THIS MODULE'S OWN FOOTING CHECK?
+    // The adapter walks a short stride on four bearings and asks each one the
+    // same GroundHolds and NothingInTheWay every travel step is asked, so this
+    // is the module trying to leave and reporting whether it could.
+    //
+    // TRUE BY DEFAULT, and that default is the safe one: see
+    // StandingOnTheGround for why this can only ever take a reading AWAY from
+    // "on the ground" and never toward it. A caller that does not measure it
+    // gets exactly the behaviour this drive had before #262.
+    bool footingHolds{true};
 };
 
 struct TerrainRecoveryVerdict
@@ -235,12 +329,37 @@ struct TerrainRecoveryLimits
     // the old unbounded behaviour and is offered only so a caller can say so
     // deliberately rather than by passing a number that looks like a bound.
     time_t forgetSeconds{0};
+    // HOW FAR A CHARACTER MAY MOVE AND STILL BE IN THE SAME INCIDENT. It has
+    // to be comfortably more than the distance a character covers between one
+    // occurrence and the next, or every repetition would look like a fresh
+    // first occurrence and the ladder would never bound anything: the measured
+    // walk back from the leader's bind point was 140 yards. Since #188 nothing
+    // this module does moves a character at all in x or y, so what this reads
+    // now is the character's own wandering, and 250 still separates "back in
+    // the same hole" from "somewhere else entirely". A map change ends the
+    // episode outright and needs no distance. ZERO DISABLES THE DISTANCE TEST
+    // and leaves only the map check, which is a defensible choice and has to
+    // be written.
+    float episodeRadius{0.f};
 };
 
 // What one character's terrain recovery remembers between polls. Kept inside
 // the adapter's own per-character state, world-thread only and unguarded, like
 // RatchetState and the give refusals: losing it on a restart costs one extra
 // lift and no correctness.
+//
+// AN EPISODE IS A PLACE, NOT JUST A STRETCH OF TIME, and that was learned the
+// expensive way. The first version of this remembered only how many remedies
+// had been applied and when, so "the same condition again" meant nothing more
+// than "again". Live on 2026-09-05 a lift on map 1 at 13:48 left a rung
+// standing, and at 14:25 on map 43 - a different map, a different incident, 37
+// minutes later - that leftover rung chose the fallback instead of the lift.
+// The fallback is a bind-point teleport, so it ejected the tank from the
+// instance and the run lost it. That fallback is gone (#188), but the anchor
+// still earns its place: a ladder is only a fair bound on repetition if the
+// thing it is counting really is a repetition, so the episode is anchored
+// where it started and abandoned when the character is somewhere else, and
+// what it protects now is the LIFT'S turn rather than a teleport's.
 struct TerrainRecoveryState
 {
     // Remedies applied in the current unbroken episode. This is the bound.
@@ -250,11 +369,68 @@ struct TerrainRecoveryState
     // tried, so nothing should be crossed off. A character warned about
     // walking under an arch that then really does fall through the world a
     // minute later still gets the lift first, rather than being handed the
-    // fallback because a warning had used the lift's turn.
+    // give-up because a warning had used the lift's turn.
     bool saidOnGround{false};
-    // When this episode was last touched by either of those; 0 = no memory.
+    // WHEN THIS MODULE LAST ACTUALLY DID SOMETHING, and deliberately not when
+    // it last saw the condition. A poll that issues nothing must not extend
+    // the episode, or the episode never ends anywhere the overhead geometry is
+    // permanent. Live on 2026-09-05: inside Wailing Caverns every poll reads a
+    // large gap over a live polygon, so refreshing the clock on those quiet
+    // polls kept one character's episode alive for 37 minutes across two maps,
+    // and a ladder rung left over from a lift on map 1 at 13:48 decided what
+    // happened to a fall on map 43 at 14:25. It was the bind point, and it
+    // ejected him from the instance. 0 = no memory.
     time_t lastAttempt{0};
+    // WHEN THE CONDITION WAS LAST TRUE, which is what the forget window is
+    // measured from. Deliberately not `lastAttempt`: the window asks "has this
+    // character been FINE for a while", and a module that is out of remedies
+    // and has gone quiet is not evidence that anything got better.
+    time_t lastHeld{0};
+    // WHERE THIS EPISODE STARTED. Anchored on the first poll that holds, and
+    // the episode is abandoned when the character turns up on another map or
+    // more than `episodeRadius` away.
+    bool anchored{false};
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
 };
+
+// IS THIS CHARACTER STANDING ON THE GROUND, or only near some ground?
+//
+// `hasLocalNavmesh` is what Detour answers when it is asked for a path a
+// couple of yards away, and what it answers is "a polygon was found inside the
+// search box". That is a statement about the neighbourhood, not about the
+// feet. The core's own poly lookup searches five yards above and below a point
+// before widening to fifty (PathGenerator.cpp:233, :247), so a polygon several
+// yards OVERHEAD, on a patch joined to nothing, answers this question yes.
+//
+// MEASURED (#262). Four of the five family members stood at map 1
+// (-605.64, -2106.66, 44.97) beside the Wailing Caverns approach ramp for the
+// whole of two 12 minute staging attempts. There is no navmesh polygon under
+// their feet at all: the only surface at their x and y is 34.4 yards over
+// their heads and belongs to a different connected component from the door,
+// and the nearest polygon of any component is an isolated patch 3.8 yards
+// away, 1.4 along and 3.5 UP. That patch sits inside Detour's search box, so
+// the recovery drive read a live polygon, logged that the character was
+// "STANDING ON THE GROUND", and moved nobody. The travel drive was saying, in
+// the same minutes, that "there is no direction out of where it stands that
+// does not step off something".
+//
+// TWO INSTRUMENTS DISAGREED AND THE WEAKER ONE WAS BELIEVED. A polygon inside
+// a search box is circumstantial: nothing about it says the character is on
+// it, or that anything joins it to anywhere. A footing check that walked every
+// bearing it has and refused all of them is this module trying to leave and
+// failing. So the navmesh answer is trusted as "on the ground" only while the
+// ground it reports can be walked off; ground no step can be taken from is not
+// ground this character is standing on, whatever the mesh holds nearby.
+//
+// IT CAN ONLY EVER TAKE THE ANSWER AWAY. No polygon is still no polygon
+// however well the footing holds, so this never invents an "on the ground"
+// Detour did not report. That asymmetry is deliberate and is the same one the
+// comment on TerrainRecoveryStep already argues for: the TRUE answer is the
+// one that carries weight, so the only correction worth making is to the true
+// answer.
+bool StandingOnTheGround(bool hasLocalNavmesh, bool footingHolds);
 
 // One poll, for one character. Reads the two predicates above for the
 // condition and this character's own history for the remedy, and updates that
@@ -266,12 +442,22 @@ struct TerrainRecoveryState
 // weak evidence of trouble and can be self-confirming. It is the TRUE answer
 // that carries weight, because a polygon found at the character's own feet is
 // a positive statement about where those feet are. This function is built the
-// way round that fact allows: true is trusted and never overruled, false only
-// opens the bounded ladder rather than authorizing a displacement outright.
+// way round that fact allows: a false only opens the bounded ladder rather
+// than authorizing a displacement outright.
+//
+// THE TRUE ANSWER IS NOW CHECKED RATHER THAN TAKEN (#262). It used to be
+// trusted and never overruled, and this comment said so. Then a polygon
+// several yards OVERHEAD, on a patch joined to nothing, answered true for four
+// characters sealed in a pocket beside the Wailing Caverns ramp, and this
+// function congratulated all four on standing on the ground while the travel
+// drive was reporting that no direction out of it was walkable. So the true
+// answer passes through StandingOnTheGround first, which is the only reading
+// this function takes that is NOT the adapter's word for it. Nothing else
+// changed: the correction can only ever take an "on the ground" away, never
+// add one, so a false is still a false and the ladder below is still the
+// bound.
 TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
-                                           float currentZ, float surfaceAboveZ,
-                                           bool surfaceValid,
-                                           bool hasLocalNavmesh,
+                                           TerrainReading const& reading,
                                            TerrainRecoveryLimits const& limits,
                                            time_t now);
 
@@ -295,6 +481,289 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
 // stepped onto only if its height is within the gap a step can bridge.
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap);
+
+// A STEP DOWN MUST ALSO BE A STEP BACK (#262).
+//
+// The footing check walks a straight step in strides and asks at each stride
+// how far the surface moved. It had two bounds and they were different sizes:
+// a DROP of up to ten yards was approved, because ten is under the height at
+// which the core starts charging for a fall, while a RISE of more than eight
+// was refused as a rock face rather than a slope. So a character could be
+// walked DOWN a nine yard stride that it would never afterwards be allowed to
+// climb. That is a one way door, and a check that approves a step whose
+// reverse it refuses can strand a character permanently.
+//
+// It stranded four, beside the Wailing Caverns approach ramp, for two 12
+// minute staging attempts each, with the travel drive reporting every errand
+// that no direction out of that pocket was walkable.
+//
+// SO THE BOUND IS THE SMALLER OF THE TWO, IN BOTH DIRECTIONS. That is the
+// whole rule: a stride is walkable exactly when the stride back is walkable.
+// It introduces no number, because a symmetric rule cannot have two of them,
+// and the larger of the pair was only ever reachable in the direction that
+// traps somebody. Everything the drop bound was chosen for survives the
+// tightening: eight yards is still well under the height at which a fall costs
+// health, so a drop this approves is still a free one.
+//
+// AND IT ONLY EVER RUNS OFF THE NAVMESH. The travel step asks the navmesh
+// first and takes its route whenever there is one, so this bounds the
+// straight-line fallback and nothing else. The fallback exists for exactly the
+// places the mesh has no route over, which is exactly where the one way doors
+// are.
+bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise);
+
+// A VERTICAL GAP AT SHORT RANGE MEANS "ABOVE IT", NOT "NEAR IT" (#217).
+//
+// WHAT WAS MEASURED. Every distance this module has ever taken against a PLACE
+// - the barrier circle, the arrival check, the staging watchdog's ratchet - is
+// a two-dimensional one, so nothing in it could tell "fifty yards away" from
+// "fifty yards away and eighty yards up". A dungeon door at the bottom of a
+// ravine is therefore approached by converging on the point nearest in TWO
+// dimensions, which is the ridge directly above it, and the party stops there.
+// Two doors, two nights, and the numbers are horizontal distance from the
+// staging point paired with height above it:
+//
+//   Deadmines, staging point (-11208.2, 1665.34, 24.66). One leader's approach
+//   sampled as it happened: 1029/+22.0, 534/+10.2, 205/+30.9, 99/+88.3,
+//   52/+83.2, 29/+43.1. He descends to the valley, climbs the hill over the
+//   entrance, and stops on top of it.
+//
+//   Wailing Caverns, staging point (-733.71, -2214.91, 16.8). Four of the
+//   family at one moment: 10/+150, 80/+184, 99/+80, 210/+71. And mid-approach
+//   on the night the campaign was stood down: 22/+151, 32/+114, 74/+194,
+//   282/+117.
+//
+// THE 10/+150 READING IS WHAT THE TWO-DIMENSIONAL MEASUREMENT IS WORTH. The
+// barrier radius is ten yards, so that character counted as standing AT the
+// staging point while he was a hundred and fifty yards above it, on the wrong
+// side of a cliff with no walkable way down. The phase can advance from a
+// ledge, and a party can be declared assembled somewhere it cannot leave.
+//
+// AND IT IS NOT A REPORTING PROBLEM. Six deaths in six minutes on that
+// approach, every one of them a fall, covering all five characters, one of them
+// twice fifty-seven seconds apart. Standing a party on a rim is not a neutral
+// outcome that wastes a backstop; it is where they die.
+//
+// THE REFUSAL AT THE LIP IS RIGHT AND THE APPROACH IS WRONG. StepMayBridgeGap
+// above already stops a character stepping off the rim toward an aim below it,
+// and it should - that step is the fall. But it is asked AT THE LIP, where
+// there is nowhere left to go and holding position is the only answer left.
+// This is the same question asked EARLY, while there is still route left to go
+// around, and while the answer can still be "do not send anybody here".
+//
+// IT IS LITERALLY THE SAME RULE, WIDENED FROM ONE STRIDE TO THE WHOLE APPROACH.
+// StepMayBridgeGap says a step of `stepYards` may bridge `maxGap` of height -
+// sixty yards along for twenty yards up, as this module has it - and that is
+// the only measured statement anything here owns about how much height walking
+// absorbs per yard of ground. So the approach rule is that same gradient
+// applied over the distance that REMAINS: a walk with `horizontal` yards left
+// to run may absorb `horizontal * stepVerticalYards / stepYards` of height, and
+// a gap larger than that is a wall rather than a hillside. At exactly one
+// step's reach the two rules return the identical answer, which is what makes
+// this an extension of the step bound rather than a second opinion about it.
+//
+// A GAP NO LARGER THAN ONE STEP'S IS NEVER OVERHEAD, WHATEVER THE RANGE, and
+// that floor is the same constant read the other way rather than a fudge. A gap
+// StepMayBridgeGap would let a character step across is, by that function's own
+// statement, a gap walking crosses; calling it a cliff here would contradict
+// the rule this is derived from. Without the floor the gradient degenerates at
+// the door, where it should not be asked at all: a character standing two yards
+// from the point would be "above" it for being two thirds of a yard off in z.
+//
+// WHERE THE BOUNDARY ACTUALLY FALLS, on the samples above. Everything walking
+// is on one side of it and everything stranded on the other, the nearest pair
+// being 205/+30.9 (walkable, and he was still on the valley floor) and
+// 210/+71.2 (overhead, and she was up on the high ground with the rest of
+// them). No measured sample sits in between.
+
+// The two halves of a gap, kept apart because the whole defect is that they
+// were only ever added up into one number that held the first.
+struct ApproachGap
+{
+    // The two-dimensional span - what every check in this module used to be.
+    float horizontalYards{0.f};
+    // SIGNED, SUBJECT MINUS POINT: positive is above it, negative below. The
+    // sign is carried for the sentence an operator reads; every test below is
+    // on the magnitude, because a door under a ledge and a door over one are
+    // the same defect upside down and a rule that knew only one of them would
+    // be half a rule.
+    float verticalYards{0.f};
+    // False when this poll took no reading at all - the character is on another
+    // map, or was not found. Distinguished from a gap of zero for the reason
+    // DungeonRunMemberState's negative distance already is: an unmeasured gap
+    // must never read as an arrival.
+    bool measured{false};
+};
+
+enum class ApproachShape : std::uint8_t
+{
+    // No reading this poll. Never Arrived and never Overhead: it fails to the
+    // answer that leaves a caller waiting rather than to either of the two that
+    // make it act.
+    Unmeasured,
+    // Near in all three dimensions, and the only shape that may satisfy a
+    // barrier or advance a phase.
+    Arrived,
+    // Short of the point, and what remains is ground a walk can cover. This is
+    // the ordinary answer for almost every yard of almost every approach.
+    Closing,
+    // Above the point, or below it, by more height than the walking that is
+    // left can absorb. Not a distance to close but a route to find, and no
+    // amount of stepping toward it will help.
+    Overhead,
+};
+
+// The three numbers the rule is read against. Two of them are deliberately the
+// step bound's own: an approach rule that disagreed with the step it ends in
+// would be two rules, and the one that fired last would win by accident.
+//
+// A CALLER THAT LEAVES THE TWO STEP NUMBERS AT ZERO GETS THE OLD BEHAVIOUR -
+// nothing is ever Overhead, and arrival is the flat two-dimensional test. That
+// is a deliberate degradation rather than an assertion: a zero here means the
+// caller has no step bound to extend, and inventing one on its behalf would be
+// this function deciding something it was never told.
+struct ApproachLimits
+{
+    float arrivalYards{0.f};       // near enough, horizontally, to count as there
+    float stepYards{0.f};          // one step's reach
+    float stepVerticalYards{0.f};  // the height one step may bridge
+};
+
+ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits);
+
+// HOW FAR AWAY IT REALLY IS - the three-dimensional distance, for the ratchet
+// that asks whether an approach is closing and for the line an operator reads.
+//
+// THIS IS THE OTHER HALF OF THE SAME DEFECT. A ratchet fed the horizontal span
+// sees a character who climbs a hundred and fifty yards straight up while
+// staying ten yards out as having arrived and stopped, which is exactly what it
+// looks like from directly overhead. Fed this, the same reading is a hundred
+// and fifty yards out and not improving, which is what it is.
+//
+// Negative when the gap was not measured, which is the same "no reading"
+// convention DungeonRunMemberState::distanceFromStage already carries, and a
+// value no ratchet can mistake for progress toward anything.
+float ApproachDistance(ApproachGap const& gap);
+
+// The gap in words, for the line that says why a run is being closed. Kept
+// apart from the verdict for the reason DungeonRunBarrierBlockers already
+// gives: a pure function that also builds strings is a pure function that is
+// harder to test twice. "52y out and 83y above it" rather than "52y away",
+// because every failure line this replaces named the symptom and not the cause.
+std::string ApproachWhere(ApproachGap const& gap);
+
+// A DOOR AT THE BOTTOM OF A RAVINE IS REACHED BY A CORRIDOR, NOT BY A BEARING
+// (#242).
+//
+// WHAT WAS WATCHED. On 2026-09-05 at 18:03 the party set out for the Wailing
+// Caverns entrance and arrived on the high ground over it: 97 yards out and 152
+// yards above the staging point, and no nearer after ninety seconds. #228's
+// rule read that correctly as Overhead and closed the run naming the cause,
+// which is the outcome that stopped the falls. Nobody died. But the run still
+// could not be staged, because the refusal is about the LAST yards and the
+// defect is in the route that led to them.
+//
+// WHERE THE WAY IN ACTUALLY IS, read off the same navmesh the core's own
+// pathfinder reads: mmaps/0013336.mmtile, map 1 grid 33/36, which holds the
+// door and the rim over it, and its neighbours, which hold the corridor - the
+// terrace named below is on 0013335.mmtile, grid 33/35.
+// The entrance sits on the floor of a ravine at z 16.8. Directly over it, at
+// the same x and y, there is a second walkable surface at z 161.9 - which is
+// the ground the party keeps standing on, and it is genuinely walkable, so
+// nothing about arriving there is a pathfinding error to be corrected. The only
+// walkable descent runs north-east of the ravine: a terrace at about
+// (-705, -2045, 66.5), then east and south around the rim, then back west along
+// y about -2185 to the door. From the terrace that is 465 yards of walking to
+// cover 179 yards of straight line.
+//
+// The world's own data says the same thing twice over. waypoint_data path
+// 138070, the world database's own patrol for the creature at guid 13807,
+// walks (-642.07, -2185.48, 45.34) down to (-719.33, -2224.44, 16.96) - the
+// bottom of that corridor, point for point. And the creature spawns descend the
+// same line: (-602, -2178, 49.8), (-643, -2182, 45.1), (-694, -2193, 31.0),
+// (-704, -2195, 26.4), (-682, -2232, 17.4). A spawn point and a patrol point
+// are both standable ground asserted by somebody other than this module.
+//
+// WHY A BEARING CANNOT FIND IT. The core's pathfinder is bounded twice over: it
+// searches with a pool of 1024 nodes (MMapMgr.cpp, the query is built with
+// exactly that) and returns at most MAX_PATH_LENGTH polygons (148 under
+// MOD_PLAYERBOTS). Asked for a point it cannot reach inside those bounds it
+// answers with the NEAREST POLYGON it did reach, which is the same behaviour
+// RoutedPathGoesWhereAsked below already exists to catch. Over a ravine, the
+// nearest polygon it reached is the rim, and from the rim the next answer is
+// the same rim. That is a fixed point, and it is where the party stood for
+// ninety seconds.
+//
+// SO THE FIX IS A PLACE, NOT A RULE. A door whose corridor has been measured
+// carries the point where that corridor starts, and the leader walks at that
+// first. Nothing here tries to make general pathfinding descend a cliff, and
+// nothing here weakens #228: the approach is still judged, still refused when
+// it stalls, and still refused from above. It is judged against the leg being
+// walked rather than against a point on the far side of a cliff.
+//
+// THIS IS DELIBERATELY NARROW. Three of the four doors in the portal table
+// carry no corridor and need none: Deadmines, Shadowfang Keep and Stockades are
+// all staged successfully on the dev realm today, and a corridor that has not
+// been measured must not be invented. A row with no corridor gets exactly the
+// behaviour it has now, which is what the Direct leg below means.
+
+// Which of the two points the leader is walking at this poll.
+enum class ApproachLeg : std::uint8_t
+{
+    // Straight at the staging point. This is every row that carries no
+    // corridor, and every leader who is already past the one his row carries.
+    Direct,
+    // At the corridor's start first. The staging point is still where the run
+    // is going; it is not where this leg ends.
+    ToWaypoint,
+};
+
+// The readings the choice is made on. All three come from the same poll, so a
+// caller that could not measure one could not measure any of them.
+struct ApproachRoute
+{
+    // False for a portal row that carries no corridor, which is the answer for
+    // (0,0,0) - the same "that is not a place" the staging point's own
+    // StagingPointCheck already gives. No second flag is invented for it.
+    bool hasWaypoint{false};
+    ApproachGap leaderToWaypoint{};      // leader -> the corridor's start
+    ApproachGap leaderToStagingPoint{};  // leader -> the door's staging point
+    // How far the corridor's start is from the staging point, in three
+    // dimensions. A property of the two written-down places and not of the
+    // leader, so it is the same every poll of a run. Negative means "no
+    // reading", the convention ApproachDistance already returns.
+    float waypointToStagingYards{-1.f};
+};
+
+// The sticky half. A leg that has been walked is not walked again inside one
+// run: without this the leader would be sent back up the corridor every time
+// the descent took him briefly further from its start than he was when he
+// reached it, which is most of the descent.
+struct ApproachRouteState
+{
+    bool waypointPassed{false};
+};
+
+// WHICH POINT TO AIM AT, and the one place `waypointPassed` is ever set.
+//
+// It is set on two different facts, and both of them are needed. The first is
+// arrival: the leader reached the corridor's start, so the leg is done. The
+// second is that the leader is ALREADY NEARER THE DOOR THAN THE CORRIDOR'S
+// START IS, on ground a walk can cover - a party standing at the door after a
+// run, or one that came in some other way. Sending those back out to the
+// corridor would be walking away from the run.
+//
+// The second test is guarded by the shape and not only by the distance, and
+// that guard is the whole of it. The walkable surface directly over the Wailing
+// Caverns door stands at z 161.9 against the staging point's 16.8: nought yards
+// out and 145 above, which is 145 yards away in three dimensions. The corridor's
+// start is 179 from the same point. So the rim - the one place this whole fix
+// exists for - is THIRTY-FOUR YARDS NEARER THE DOOR than the corridor is, and
+// on distance alone the corridor would be skipped precisely there. It is
+// Overhead, so it is not.
+ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& route,
+                            ApproachLimits const& limits);
+
 
 // A ROUTE MUST END WHERE IT WAS ASKED TO END.
 //
@@ -547,6 +1016,17 @@ struct DungeonRunMemberState
     bool alive{false};
     bool inCombat{false};
     float distanceFromStage{-1.f}; // negative = not measured (wrong map, or !seen)
+    // AND HOW FAR ABOVE OR BELOW IT (#217). Signed, member minus point, and
+    // meaningless unless `distanceFromStage` is a real reading - which is why
+    // it is a plain float with no sentinel of its own: the distance beside it
+    // already says whether this poll measured anything, and a second way of
+    // saying the same thing is a second thing to keep in step.
+    //
+    // A BARRIER THAT ONLY EVER READ THE LINE ABOVE COULD BE SATISFIED FROM A
+    // CLIFFTOP. Measured on Wailing Caverns: ten yards out and a hundred and
+    // fifty yards up, which the radius test read as "at the staging point".
+    // See ApproachShapeOf, which is what the two fields are now read through.
+    float verticalFromStage{0.f};
     // ALREADY THROUGH THE DOOR THIS BARRIER IS WAITING OUTSIDE (#165). Measured
     // live: a run sat `active` and unstaged for forty-three minutes while its
     // barrier line read "Ugga (not seen)" and, on the run before, "Ugga (wrong
@@ -561,15 +1041,186 @@ struct DungeonRunMemberState
     bool inside{false};
 };
 
+// A RADIUS BECAME LIMITS (#217), and the extra numbers are not a tuning knob:
+// `arrivalYards` IS the radius this used to take, and the two step numbers
+// beside it are what turns "within ten yards" into "within ten yards and on
+// the same surface". A caller that leaves them at zero gets the flat radius
+// test this always was. See ApproachLimits.
 bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
-                          float radiusYards);
+                          ApproachLimits const& limits);
 
 // Why a member is failing BARRIER, for the one log line BARRIER prints
 // while it waits. Kept separate from the predicate above so the predicate
 // itself stays a plain bool with nothing to format - a pure function that
 // also builds strings is a pure function that is harder to test twice.
+//
+// AND IT NAMES THE CAUSE RATHER THAN THE SYMPTOM. "Grug (80y out and 184y
+// above it)" is a sentence an operator can act on; "Grug (80y away)", which is
+// what this said for the whole of #217, is one that reads as "nearly there"
+// about a character standing on a cliff.
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
-                                      float radiusYards);
+                                      ApproachLimits const& limits);
+
+// CAN THIS PORTAL BE APPROACHED AT ALL, ASKED BEFORE A RUN IS OPENED.
+//
+// THE RULE IS THE TRAVEL LAYER'S, NOT THIS ONE'S, and writing it down here is
+// the point. Every aim this module writes for a PLACE rather than a creature is
+// `at:<map>:<x>,<y>,<z>`, and the adapter that resolves one refuses it outright
+// when the character's own map is not the map named in the aim - "SAME MAP
+// ONLY, and that is a refusal rather than a limitation to fix later. MoveFarTo
+// paths through PathGenerator, and there is no navmesh across an ocean". A
+// staging point on a map the leader is not standing on is therefore a place no
+// errand can ever be taken up for, however correct its coordinates are.
+//
+// WHY IT NEEDED SAYING NOW. Nothing in the run's own code hard-codes map 0: the
+// outside map is carried per portal and every comparison already reads it from
+// there. But every portal in the table had outside map 0 and so did the family,
+// so the two were equal by accident on every poll that has ever run, and the
+// first portal on another continent turns that accident into a run that resets
+// an instance, claims an aim nothing accepts, moves nobody, and gives up at the
+// staging backstop many minutes later. An accident that has always held is not
+// a guard.
+//
+// A ONE-COMPARISON DECISION IS STILL A DECISION. It is here rather than inline
+// in the adapter for the reason the file's own header gives: what the module
+// decides is testable without a world, and "the outside map is the leader's
+// map" is exactly the kind of invariant that gets quietly relaxed by whoever
+// adds boat legs or taxi hops later. When that happens this function grows a
+// third answer and its test says what changed; an `if` in the middle of a
+// coordinator would just be edited.
+enum class DungeonApproach : std::uint8_t
+{
+    // The leader already stands on the map this portal is approached from, so a
+    // staging aim on that map is one the travel layer can accept.
+    Walkable,
+    // The leader is somewhere else entirely. No aim this run could write would
+    // be resolved, so the run must not be opened.
+    OffOutsideMap,
+    // The leader is off the outside map AND a crossing to it exists. Still not
+    // walkable, and the run still must not open on this poll - but the reason
+    // is now "not yet" rather than "not ever", and the two must not share a
+    // log line. THE THIRD ANSWER THE COMMENT ABOVE PREDICTED (#241): the
+    // caller opens a crossing on this one and gives up on OffOutsideMap.
+    NeedsCrossing,
+};
+
+// `aCrossingExists` DEFAULTS TO FALSE so that every caller and test written
+// before there were boats keeps its exact previous answer, and so that the new
+// answer can only be produced by a caller that went and looked. A crossing this
+// function assumed rather than was told about would be the accident the
+// comment above warns of, in the other direction.
+DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
+                                      std::uint32_t portalOutsideMapId,
+                                      bool aCrossingExists = false);
+
+// ------------------------------------------------- where the party waits --
+//
+// THE STAGING POINT'S ARITHMETIC, AND THE VERDICT ON WHAT IT PRODUCED.
+//
+// WHAT THIS IS FOR. The adapter derives the point the party gathers at from two
+// areatriggers: the door, and where the way back out lands. It reads both from
+// the world, and then does a normalise, a scale and two adds - none of which
+// needs a world at all. The world lookups stay in the adapter; the sums are
+// here, where a test can run them on the numbers a realm actually holds without
+// a realm.
+//
+// AND THE VERDICT IS THE HALF THAT MATTERS. Measured live: a run aimed its
+// leader at `at:1:0,0,0` and walked him at the middle of the map grid for the
+// length of its backstop. Nothing had gone wrong with the arithmetic - the
+// arithmetic never ran. The coordinator's three staging floats are zero
+// initialised, one path through the coordinator reached a staging aim without
+// ever asking for them to be filled in, and every consumer downstream happily
+// formatted the zeros into an errand because a float that was never set is
+// indistinguishable from a float that was set to zero.
+//
+// So "was this point ever resolved" is made a question with an answer, asked
+// where the point is USED rather than only where it is derived. A derivation
+// that is checked only at the point of derivation protects exactly the paths
+// that call the derivation, which is the set of paths that were never the
+// problem.
+enum class StagingPointVerdict : std::uint8_t
+{
+    // A real place on a real map, and the only verdict a staging aim may be
+    // built from.
+    Usable,
+    // The map origin. This is not a judgement about the ground there; it is the
+    // observation that three floats holding exactly zero are what "nobody has
+    // resolved this yet" looks like, and that no portal in this module's table
+    // has an approach corridor passing through the middle of its continent. A
+    // derivation that genuinely landed on the origin would be refused too, and
+    // that is the right trade: the sentinel reading is worth far more than the
+    // point.
+    //
+    // TESTED IN TWO DIMENSIONS, because every distance this module measures
+    // against a staging point is a 2D one (the barrier circle, the arrival
+    // check, the watchdog), so an x and y of zero is the sentinel whatever the
+    // z beside them says.
+    Unresolved,
+    // Outside the world grid entirely, or not a number at all. A NaN fails
+    // every comparison, so the bounds test below catches an arithmetic accident
+    // and an infinity by the same route it catches a coordinate that is simply
+    // impossible - and it catches the two sentinels a height query returns when
+    // it has nothing (-100000, -200000) without needing to name them.
+    OffTheMap,
+    // The door and the way-back-out landing point are the same place, so the
+    // vector between them names no direction to stand off along. Normalising it
+    // would be a divide by something near zero dressed up as a bearing.
+    NoApproachAxis,
+};
+
+// HOW FAR FROM THE MIDDLE OF A MAP THE WORLD GOES. WoW's terrain grid is 64 x 64
+// tiles of 533.33333 yards, so the coordinate space runs +/- 17066.666 about the
+// origin on both axes. Named here rather than passed in because it is a fact
+// about the coordinate system every one of these points lives in, not a tuning
+// knob a caller should get to disagree about.
+constexpr float MAP_EDGE_YARDS = 17066.666f;
+
+// The point, and what to think of it. `verdict` is the only field a caller may
+// act on first: the three floats are meaningful only when it is `Usable`, and
+// are left at zero otherwise so that a caller which ignores the verdict is
+// refused by the next check rather than handed a plausible-looking wrong place.
+struct StagingPoint
+{
+    StagingPointVerdict verdict{StagingPointVerdict::Unresolved};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// Is this a point a staging aim may be built from? Asked of three floats and
+// nothing else, so it can be asked at every place one is used.
+StagingPointVerdict StagingPointCheck(float x, float y, float z);
+bool StagingPointUsable(float x, float y, float z);
+
+// The refusal, in words, for the `why` an operator reads in the log. Kept apart
+// from the verdict for the reason DungeonRunBarrierBlockers already gives: a
+// pure function that also builds strings is a pure function that is harder to
+// test twice.
+std::string StagingPointRefusal(StagingPointVerdict verdict);
+
+// THE DERIVATION ITSELF. `door` is the entry areatrigger's own position;
+// `back` is where the exit areatrigger's teleport lands, which is a spot on the
+// outside map the game itself picked as standable ground in front of the
+// entrance. The vector between them is the approach corridor, measured by the
+// people who built the corridor, and the staging point is `standoffYards` back
+// down it from the door.
+//
+// The z returned is the landing point's own, which is real standable ground on
+// that map by construction. The adapter may refine it by asking the map for a
+// ground height and keeping the answer only if StagingGroundBelievable says so;
+// it has no better z to fall back to than this one.
+StagingPoint DungeonStagingPoint(float doorX, float doorY,
+                                 float backX, float backY, float backZ,
+                                 float standoffYards);
+
+// Is a height the map answered with believable for a point one short walk from
+// a doorway? A staging point that close to a door is on the same floor as that
+// door, so a reading tens of yards away from it is either a different surface -
+// the clifftop over a tunnel - or one of the sentinels a height query returns
+// when it has nothing. Both are answers to refuse rather than to walk at, and
+// refusing them by the same test is deliberate: it needs no separate list of
+// sentinel values to keep in step with a core.
+bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards);
 
 // THE CROSSING PREDICATES, KEPT FREE OF EVERY CORE TYPE FOR THE SAME REASON
 // THE BARRIER ONE IS. Nothing below touches Player, Map or PlayerbotAI, so
@@ -765,6 +1416,220 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   unsigned skips,
                                                   unsigned maximumSkips);
 
+// ------------------------------------------- what counts as a run (#225) --
+//
+// DID THE PARTY ACTUALLY GET INTO THE DUNGEON? Measured 2026-09-05: a campaign
+// of 100 runs on map 43 had two rows in overseer_dungeon_run and
+// dungeon_runs_done reading 3. The third was a staging failure, twelve minutes
+// of a barrier that never opened, and it had consumed a slot in the campaign
+// without anybody ever standing on the instance map. At about twelve minutes an
+// attempt a campaign of 100 finishes in nineteen hours having cleared nothing,
+// and reports success.
+//
+// THE BAR IS THE INSTANCE MAP, and the run table already agrees with it: a run
+// ROW exists at all only because the arming drive saw a roster character
+// standing on that map. A run that never reached it is not a run, so it does
+// not fill a slot in a campaign of a hundred.
+//
+// THE DEFAULT FOR A WORD THIS FUNCTION HAS NEVER HEARD IS "IT ENTERED", and
+// that direction is chosen rather than fallen into. The vocabulary grows toward
+// endings of real runs - the accounting migration already names 'complete' as
+// the value #143 will add the moment a run has a goal to complete - while the
+// two outcomes that mean nobody got inside are a closed pair, both written by
+// this module at the two points in the state machine that come before anyone
+// crosses the door. An unknown word is far likelier to be a new way for a real
+// run to end than a third way to fail before one starts, and counting a real
+// run as no run is the failure that loses a campaign's progress silently. An
+// empty outcome is also "it entered": that is what the cold-heartbeat close
+// leaves on a row, and that row exists because somebody was on the map.
+bool DungeonRunEnteredTheInstance(std::string const& outcome);
+
+// HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
+// the newest and stopping at the first that did.
+//
+// WHY THIS HAD TO WIDEN WHEN THE COUNTER NARROWED. The consecutive-failure stop
+// used to ask only about 'reset_failed', and a staging failure was bounded by
+// something else: it consumed a campaign slot, so a staging that failed for a
+// reason that kept being true ran out of campaign eventually. Taking that slot
+// away (which is the fix #225 asks for) takes the bound away with it, so the
+// stop has to cover both ways of failing before entry or the fix trades a wrong
+// count for a loop with nothing at the end of it.
+//
+// `outcomesNewestFirst` is exactly what the caller's `ORDER BY id DESC LIMIT n`
+// returns, and the count stops at the first outcome that entered - so a
+// campaign that has had one good run since its last failure starts its streak
+// again from zero.
+unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst);
+
+// WHERE A CAMPAIGN STANDS ONCE A RUN HAS ENDED.
+//
+// This is arithmetic and it is the part that was got wrong, so it is here where
+// a test can pin it rather than inline at the one call site that does it. The
+// trap is the last slot: run 100 of 100 fails to stage, `runNumber` reads 100,
+// and a straight `finished >= wanted` declares the campaign done with
+// ninety-nine dungeons actually cleared. The slot the attempt was aimed at is
+// only filled by an attempt that entered.
+struct DungeonCampaignProgress
+{
+    // Did this run fill the slot it was attempting? The one input that decides
+    // everything else here, and the only one the caller may act on when it
+    // writes dungeon_runs_done.
+    bool counted{false};
+    // How many runs of this campaign have now happened, which is what the
+    // roster counter should read after this run.
+    uint32_t runsDone{0};
+    // Which slot the next attempt is for. Equal to `attemptedRunNumber` again
+    // when this attempt did not count, because a slot nobody filled is still
+    // the next slot to fill. 0 when the campaign is over.
+    uint32_t nextRunNumber{0};
+    // Has the campaign reached its cap? Always false when the cap is unknown:
+    // "this database cannot answer" is not "the campaign is finished", and the
+    // caller has its own branch for a cap it cannot read.
+    bool campaignOver{false};
+};
+
+DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
+                                                uint32_t attemptedRunNumber,
+                                                uint32_t runsWanted,
+                                                bool capKnown);
+
+// ------------------------------------------ is the dungeon finished (#226) --
+//
+// THE QUESTION THE COORDINATOR COULD NEVER ASK, AND WHY IT CAN NOW.
+//
+// A run that goes perfectly has never had an ending it could reach. EXIT is
+// entered from exactly two places, a stall the watchdog gave up on and an
+// operator taking the job off 'dungeon', so a party that clears the whole
+// instance simply stands in it until the map empties by some other means.
+// Measured 2026-09-05: a confirmed 100 percent Wailing Caverns clear ran 121
+// minutes and was recorded 'emptied', which is the row honestly reporting that
+// the coordinator never walked them out.
+//
+// WHAT WAS LOOKED AT FIRST AND REJECTED, so nobody re-treads it. The obvious
+// test is InstanceScript::GetEncounterCount plus GetBossState, and the run
+// coordinator already carries a comment explaining that Deadmines' script never
+// calls SetBossState, so its count is 0 and "all encounters done" would read
+// TRUE the instant the party walked in. That is still true, and Wailing Caverns
+// is the same shape: instance_wailing_caverns keeps a private _encounters[5]
+// array behind SetData/GetData and never calls SetBossState either. So that
+// framework cannot answer this for either map.
+//
+// WHAT ACTUALLY ANSWERS IT IS A DIFFERENT MECHANISM WITH THE SAME NAME. The
+// completed-encounter MASK is not maintained by the instance script at all. It
+// is maintained by the core off DungeonEncounter.dbc: KillRewarder calls
+// Map::UpdateEncounterState, which walks
+// sObjectMgr->GetDungeonEncounterList(map, difficulty) and, for the entry whose
+// credit matches the kill, ORs in `1 << dbcEntry->encounterIndex` and writes the
+// result straight back to the InstanceSave. That is the same mask this module
+// already reads for its "a boss died" progress signal, and it rises on maps
+// whose scripts do not use the boss-state framework at all. Wailing Caverns
+// measured completedEncounters = 255 on all five characters, eight bits for
+// eight credited encounters, on a script that sets no boss states.
+//
+// So the complete mask is not a per-map constant anybody has to write down. It
+// is the OR of `1 << encounterIndex` over that same list, which the caller
+// builds from the same store the core credits from. Asking whether every bit
+// the map can credit has been credited is then exactly "every encounter this
+// dungeon has, has happened".
+//
+// A MAP THAT CREDITS NOTHING IS UNKNOWABLE, NOT COMPLETE, and that distinction
+// is the whole reason this returns three answers rather than a bool. An empty
+// or missing encounter list means the DBC has nothing for this map, so the
+// question has no answer here; reading that as "finished" would end every run
+// on such a map the moment it started, which is precisely the vacuous-TRUE trap
+// the boss-state route was rejected for. The caller keeps today's behaviour on
+// an Unknowable map: the run ends the ways it already could.
+enum class DungeonCompletion : uint8_t
+{
+    Unknowable,  // this map credits no encounters, so nothing here can be concluded
+    NotYet,      // at least one encounter this map credits has not been credited
+    Complete,    // every encounter this map credits has been credited
+};
+
+// `expectedMask` is every bit the map can credit; `completedMask` is what the
+// save says has been credited. Bits set in `completedMask` that are not in
+// `expectedMask` are ignored rather than treated as an error: the save is
+// written by the core and outlives this module's opinions, and a bit from a
+// difficulty this run is not on says nothing about this run.
+DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completedMask);
+
+// THE WORD THAT GOES ON THE ROW, in one place because the vocabulary is now
+// four wide at this one exit and picking it inline is how 'complete' would end
+// up written for a run that stalled.
+//
+// The order is the priority. A run the coordinator PROVED finished is
+// 'complete' whatever else was true of it; a run it walked out because the
+// clearing watchdog gave up is 'stalled'; anything else that reaches the door
+// is 'left', which is what this exit has always written. 'complete' needs no
+// migration: the outcome column is VARCHAR(16) and was made one for exactly
+// this, its own migration naming 'complete' as the value to add "the moment a
+// run has a goal to complete".
+char const* DungeonRunExitOutcome(bool provedComplete, bool stalled);
+
+// --------------------------- the run yields to an errand it would trample --
+//
+// WHAT THIS IS ACTUALLY FOR, AND IT IS NOT ONLY THE TOWN TRIP (#168). Three
+// passes outside the worldserver send the family to a counter and each of them
+// writes `travel_npc`: the vendor pass, the bank pass, and now the maintenance
+// trip. The run coordinator claims that same column the moment a run starts
+// staging, and its claim is an unconditional write - so an errand written in
+// the gap between two runs is taken back on the coordinator's next poll, and
+// the character walks to a dungeon door instead of to the counter it was sent
+// to. Nothing errors. The errand simply never completes, and its rows are
+// answered "not in range" until they age out.
+//
+// That is why a hundred-run campaign has never had a maintenance trip, and it
+// is why reading any of those three passes' success rate DURING a campaign is
+// reading noise rather than a measurement.
+//
+// WHAT IS DELIBERATELY NOT CHANGED: the claim itself. Once a run is staging,
+// the coordinator taking a straggler over from whatever it was doing is the
+// thing that gets the party through the door, and it is working. This decision
+// is asked only at IDLE, before a run has started, where the question is
+// whether to start one at all. A run already under way never yields.
+//
+// SO THE RULE IS: a run does not OPEN on top of an errand somebody else is
+// still running. Not "the run gives way", which would tear down staging that is
+// working; just "the run waits its turn", which costs one cycle of a campaign
+// that has ninety-nine more.
+
+// Is this travel aim one of the economy passes' errands?
+//
+// The three roles are the same three the bridge treats as economy errands, and
+// they are named rather than derived because the question is not "is this a
+// role" - every value in this column is - but "did a pass that transacts write
+// it". A trainer errand is somebody's profession and is not this.
+bool IsMaintenanceErrand(std::string const& aim);
+
+enum class MaintenanceHold : uint8_t
+{
+    Open,         // nothing is outstanding; the run may start
+    Walking,      // the leader is walking to a counter and must not be turned round
+    Transacting,  // rows are queued and unanswered; moving now loses the trip
+    Overdue,      // held past the bound; the run starts anyway and says so
+};
+
+// Should the coordinator hold at IDLE rather than open a run?
+//
+// TWO CONDITIONS, BECAUSE AN ERRAND HAS TWO HALVES AND ONLY ONE OF THEM IS
+// VISIBLE IN THE AIM COLUMN. While the family walks, `travel_npc` holds the
+// role; the moment they arrive the travel drive releases it, and what is left
+// is a queue of rows nobody has answered yet. A hold that watched only the aim
+// would let a run start in the seconds between arriving and transacting, which
+// is the worst possible moment to walk them away.
+//
+// AND IT IS BOUNDED, for the reason every wait in this file is bounded. The
+// aim is written by a process outside the worldserver; if that process dies
+// mid-errand the column can hold a role nothing will ever clear, and an
+// unbounded hold would stop a hundred-run campaign with nothing in any log to
+// say why. Past the bound the run opens anyway and the reason is said out loud
+// once, which is the honest direction to fail in: a missed repair costs one
+// run's durability, and a campaign that silently stopped costs the campaign.
+MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
+                                          unsigned outstandingErrands,
+                                          time_t heldForSeconds,
+                                          time_t boundSeconds);
+
 // -------------------------------------------------- the staging watchdog --
 //
 // "IT IS FAR AWAY" AND "IT IS NOT COMING" ARE DIFFERENT FACTS, and the
@@ -804,6 +1669,15 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
 // from there. Any poll that shows real progress puts the whole ladder back to
 // the bottom, so a character that recovers is watched from scratch rather than
 // from the rung its last bad patch reached.
+// AND ONE OF THE FIVE ANSWERS IS NOT ON THE LADDER AT ALL (#217). Every rung
+// below is a remedy for a character that has STOPPED WALKING, and all three of
+// them assume that making it walk again is the fix. A character standing on the
+// rim above the point it was sent to has not stopped walking - it has arrived
+// at the only place the route it was given goes, and nothing on the ladder
+// changes that. Worse, two of the rungs restart movement, and the ledge is
+// still there: six of the six deaths on the Wailing Caverns approach were
+// falls, one character twice inside a minute. So that case is recognised BEFORE
+// the ladder and takes it out of use rather than climbing it.
 enum class StagingNudge
 {
     Nothing,        // walking, staged, or nothing worth reading this poll
@@ -811,6 +1685,12 @@ enum class StagingNudge
     Reaim,          // re-issue the aim
     ClearMovement,  // discard the movement generator, as the follow stall does
     GiveUp,         // say once that it cannot be staged, and stop
+    // ABOVE THE POINT AND NO LONGER CLOSING. Said once, and it is a diagnosis
+    // rather than a correction: this member is not short of the staging point,
+    // it is over it, and the way in is a route nothing here can supply. The
+    // caller's business is to stop pulling it toward the edge - which means
+    // ending the errand, not nudging it - and to say the cause out loud.
+    Stranded,
 };
 
 // How many rungs there are below GiveUp. Named so the bound is a number a
@@ -826,6 +1706,7 @@ struct StagingStallState
     RatchetState progress;
     unsigned escalated{0};  // how many rungs have been climbed
     bool gaveUp{false};     // the give-up line has been said
+    bool stranded{false};   // the above-it-not-near-it line has been said
 };
 
 // One member, one poll. `measurable` is false when this poll's distance is not
@@ -833,9 +1714,24 @@ struct StagingStallState
 // another map - and the clock is then held rather than run, for the reason the
 // travel drive already holds its own over a flight: half a taxi route goes the
 // wrong way round a mountain, and a fight is a pause rather than a stall.
-StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
+//
+// IT TAKES A GAP RATHER THAN A DISTANCE (#217), AND RATCHETS THE WHOLE OF IT.
+// The reading is ApproachDistance, not the horizontal span: a member who climbs
+// a hundred and fifty yards while staying ten yards out has not arrived and has
+// not stalled, he has gone up, and only the three-dimensional reading says so.
+// `approach` is what tells this the difference between a member short of the
+// point and a member above it; leave its step numbers at zero and this behaves
+// exactly as it did when it took a flat distance.
+//
+// ARRIVAL IS DECIDED HERE TOO, and that is a move rather than an addition: the
+// caller used to make it, with a flat radius, and drop the state of anyone
+// inside it. A member on the rim satisfied that test and so was never watched
+// at all - the one member most in need of watching was the one exempted. The
+// state is reset in place instead, so an arrival is still a fresh ladder.
+StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
-                             RatchetLimits const& limits);
+                             RatchetLimits const& limits,
+                             ApproachLimits const& approach);
 // ------------------------------------------------------------- professions --
 //
 // THE THIRD TENANT, AND THE SAME REASON AS THE OTHER TWO. The roster declares
@@ -1001,6 +1897,132 @@ bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
 bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
                      std::string const& reason, time_t now);
 
+// --------------------------------------------- the command queue drain (#230) --
+//
+// "THE QUEUE IS NOT STALLED. IT IS ATTEMPTING THE SAME TWENTY ROWS FOREVER."
+//
+// Measured on the dev realm, 2026-09-05 16:37 UTC. Nothing had reached a
+// terminal status since 16:11:03, 337 rows were pending and still growing, and
+// the drain was running on time the whole while: the twenty oldest pending rows
+// were re-touched every two seconds, the same twenty ids, all `kind = 'sell'`,
+// all carrying `detail = 'vendor not in range'`. Twenty is COMMANDS_PER_POLL.
+// The 322 rows behind them were never read at all, and not one line of log
+// mentioned the queue in twenty minutes.
+//
+// A retry that keeps its place at the head of a FIFO is not a retry, it is a
+// lock. The row that holds the head is fixed by `ORDER BY id ASC`, and the
+// refusal handed it back with its low id intact, so the queue drained in the
+// only order it could: the same twenty rows, over and over, while every command
+// asked after them waited on a sale that was never going to happen from where
+// those characters were standing. The module tick was perfectly healthy
+// throughout, which is exactly why nobody noticed for twenty five minutes.
+//
+// TWO RULES ARE HERE, AND NEITHER OF THEM IS "RETRY BETTER". The retry itself
+// is deleted at the call site rather than tuned: a refusal now leaves through
+// `detail` and `result` and the side that asked re-queues a FRESH row at the
+// TAIL, which is what mod-overseer#227 chose for the two sibling verbs an hour
+// before this was written, and which the queue was already doing on its own
+// (measured: 178 pending sales for 21 distinct asks, the same item queued ten
+// times over forty five minutes). What is left here is the two things that
+// cannot be fixed by deleting four lines.
+//
+//   A CLAIM EXPIRES. A row moved to `claimed` before it is executed - which is
+//   what makes this queue at-most-once for commands that create items and move
+//   characters - is invisible to `WHERE status = 'pending'` for the rest of
+//   time if the run holding it goes away. Nothing else in the world ends it. It
+//   expires to `error` rather than back to `pending`, because handing one back
+//   would undo the exact property the claim exists to provide.
+//
+//   THE QUEUE SAYS WHEN IT IS NOT DRAINING. This defect was invisible in the
+//   log and obvious in one database query, which is the wrong way round. A poll
+//   that selects rows and executes none of them, or a backlog whose oldest row
+//   is not being reached, is a line of log at the moment it starts rather than a
+//   thing somebody finds later. Rate limited, because the poll is every two
+//   seconds and a complaint repeated nine hundred times an hour is its own
+//   outage, and it says so ONCE when it clears so the log has an end as well as
+//   a beginning.
+//
+// KEPT FREE OF EVERY CORE TYPE, like everything else in this pair of files. A
+// rule whose whole content is "how many are waiting, how old is the oldest, who
+// holds this, and have we said so lately" needs no world, no bot and no
+// database to be exercised, which is the only way to pin the boundaries of it
+// at all.
+
+// Is a row sitting in a non-terminal status abandoned, so the drain should end
+// it rather than leave it where nothing can select it?
+//
+// Three ways to get this wrong, which is why it is a function and not an
+// inequality at the call site. It must not fire on a claim THIS run holds (that
+// row is in flight by definition, and ending it would be the drain cancelling
+// its own work a moment before it writes the result). It must not fire on a row
+// younger than the lease, because a `verifying` row is supposed to sit for
+// VERIFY_GRACE_MS while its post-condition is read back. And an empty
+// `claimed_by` on a non-pending row is abandoned on anybody's reading: nothing
+// that ever held it can still be holding it under a name that is not there.
+//
+// `heldForSeconds` is an AGE rather than a pair of timestamps, because that is
+// how the answer actually arrives: the call site reads it as TIMESTAMPDIFF from
+// the database, so both ends of the subtraction are the database's clock and a
+// worldserver whose host clock has drifted cannot expire a live claim or keep a
+// dead one.
+bool ClaimIsAbandoned(std::string const& claimedBy, std::string const& runToken,
+                      time_t heldForSeconds, time_t leaseSeconds);
+
+// What one poll of the drain saw, which is everything the voice below judges.
+struct CommandQueueSnapshot
+{
+    unsigned pending{0};   // rows waiting when this poll picked up its work
+    unsigned executed{0};  // rows this poll actually attempted
+    unsigned held{0};      // rows this poll selected and could NOT attempt
+    // Seconds since the oldest waiting row was last touched. Age since it was
+    // touched rather than since it was created, because a row that is being
+    // worked on is not being starved even if the ask is old.
+    time_t oldestPendingAge{0};
+};
+
+// The limits the snapshot is judged against.
+struct CommandQueueVoiceLimits
+{
+    // A waiting row untouched for longer than this is not being reached. It has
+    // to be well past a full drain of a deep queue: at COMMANDS_PER_POLL rows
+    // every COMMAND_POLL_MS, the queue would have to be many hundreds of rows
+    // deep for a two minute old row to be honest work rather than starvation.
+    time_t stuckSeconds{0};
+    // More rows waiting than this is worth saying once, even while they move.
+    unsigned deepRows{0};
+    // ...and not worth saying again inside this. The poll is every two seconds
+    // and the give backoff next door already records what happens to a log when
+    // a per-poll condition gets a per-poll line.
+    time_t repeatSeconds{0};
+};
+
+// What the drain has already said, so it does not say it again every poll.
+struct CommandQueueVoiceState
+{
+    bool complaining{false};  // an unwell verdict is currently standing
+    time_t lastSaid{0};       // when anything was last said
+};
+
+enum class CommandQueueVoice
+{
+    Silent,    // nothing worth a line, or it has been said recently enough
+    Deep,      // a lot is waiting, and it is moving
+    Stuck,     // rows are waiting and are not being reached
+    Recovered  // it was one of the two above, and is not any more
+};
+
+// Judge one poll, and remember what was said. STUCK OUTRANKS DEEP: a queue can
+// be both, and "it is deep" is the reassuring half of that pair, so a stuck
+// queue must never be reported as merely a busy one.
+//
+// The livelock signature is called out WITHOUT waiting for `stuckSeconds`: a
+// poll that selected rows and executed none of them is already wrong, whatever
+// the ages say, and on 2026-09-05 that was true on the very first poll and
+// stayed true for eight hundred more.
+CommandQueueVoice CommandQueueSay(CommandQueueVoiceState& state,
+                                  CommandQueueSnapshot const& snapshot, time_t now,
+                                  CommandQueueVoiceLimits const& limits);
+
 // ------------------------------------------------------------- gear (#145) --
 //
 // WHAT AN ITEM IS WORTH TO ONE CHARACTER, AND WHETHER IT MAY WEAR IT AT ALL.
@@ -1147,6 +2169,42 @@ struct GearItem
     bool unresolvedRandomProperty{false};
 };
 
+// HOW MUCH OF THE ITEM THE NUMBER COVERS (#221).
+//
+// `judged` below is a boolean, and a boolean threw away the one distinction
+// that decides most of the family's bags: the difference between a number that
+// might be too HIGH and a number that can only be too LOW.
+//
+// An on-equip effect this file does not price, and a random property whose
+// stats the caller could not resolve, can only ever ADD to what an item is
+// worth. So the score of such an item is not an unknown - it is a FLOOR, and a
+// floor that already beats what the character is wearing settles the question
+// without the missing part being read at all. Refusing to act on it, which is
+// what the boolean did, is how a level 26 mage ended up carrying a blue robe
+// scoring 25.8 while wearing a green one scoring 21.8: the robe's worth is
+// partly in an on-equip spell, so the score was declared incomplete and the
+// robe stayed in the bag forever.
+//
+// An unknown ROLE is a different thing altogether and must not be confused
+// with it. There the weights are all 1.0 and the ordering is a rough opinion
+// rather than a bound in either direction, so nothing may be concluded from it
+// in either direction. That is the case the boolean was right about.
+//
+// Three answers, then, and not two.
+enum class GearConfidence
+{
+    // The score is the whole of what this file can see, and nothing it could
+    // not see is missing. A refusal is Exact too: "she cannot wear leather" is
+    // certain, and so is the zero an empty slot is worth.
+    Exact,
+    // The score is a LOWER BOUND. Something unread - an effect, an unresolved
+    // random property - can only add to it.
+    Floor,
+    // Not even a bound. The role is unknown, or the thing is not worn gear at
+    // all, so the number orders items roughly and proves nothing.
+    Opinion,
+};
+
 struct GearVerdict
 {
     // May this character put it on at all? False is final: no score, no
@@ -1160,7 +2218,14 @@ struct GearVerdict
     // item's worth is partly in an effect this file does not read, or when a
     // random property could not be resolved. An unjudged verdict never drives
     // an automatic swap or a Need roll - it is said out loud instead.
+    //
+    // KEPT AS IT WAS, and it is exactly `confidence == GearConfidence::Exact`.
+    // The Need vote and the sibling hand-off both read it and both want the
+    // strict answer; only the swap needed the finer one.
     bool judged{false};
+
+    // The same answer, told apart. See GearConfidence above.
+    GearConfidence confidence{GearConfidence::Opinion};
 
     // One clause, for the line the caller prints: "mail, 113 armour", or
     // "no leather proficiency".
@@ -1185,6 +2250,134 @@ float GearIncumbent(float mainHandScore, float offHandScore, bool takesBothHands
 // one-way, so it cannot oscillate: once the better item is worn, the one now
 // in the bag is the lower score.
 bool GearIsUpgrade(GearVerdict const& candidate, float incumbent);
+
+// ------------------------------------------- a swap that settles (#221) --
+//
+// WHAT WENT WRONG, MEASURED. On the dev realm, one character's hands slot
+// filed 124 equip events across eleven hours between the same two pairs of
+// gloves - a level 23 rare and a level 29 common, both 122 armour - and twelve
+// slots across four of the five characters behaved the same way, 923 equips in
+// the hours a flip happened. Nothing was broken in either half. Each half was
+// individually correct and individually convergent, and they pointed opposite
+// ways:
+//
+//   - This file scores the rare higher for a tank, because 8 strength and 3
+//     stamina beat 6 stamina and 5 spirit at equal armour, and GearIsUpgrade's
+//     one-way margin means it will only ever move the character TOWARDS it.
+//   - Upstream's own auto-equip multiplies an item's whole stat weight through
+//     by its item level and then wants a 1.1x margin, which makes the common
+//     item win by 29/23, and it will only ever move the character towards THAT.
+//
+// Two monotone rules, opposite directions, each on its own timer. Neither can
+// oscillate alone; together they cannot do anything else. Both of the swaps
+// were "correct" every single time, which is why nothing in either half's logs
+// looked wrong, and why it ran for days.
+//
+// So the settlement is not a better margin. A margin cannot help: whatever it
+// is, the other writer has its own. The settlement is that ONE of them decides,
+// and that this one NOTICES when something disagrees with it instead of
+// arm-wrestling in silence. The first half is a deployment setting. This is the
+// second half, and it is here rather than in the adapter because "have I been
+// overruled?" is a judgement and belongs where it can be tested.
+
+// Is the candidate better than what is worn, given how much of each score the
+// file can actually vouch for? Three answers, because "I cannot tell" is a real
+// and common one and reporting it as "no" is what buried the bags.
+enum class GearComparison
+{
+    // Certainly better. Put it on.
+    Better,
+    // Certainly not better. Leave it, and say nothing - most of what a party
+    // carries out of a dungeon is this.
+    NotBetter,
+    // The numbers do not settle it. Leave it and SAY SO: either the candidate's
+    // score is a floor that does not clear the margin, or what is worn is
+    // itself only a floor and nothing above it can be proved.
+    Undecided,
+};
+
+// What a candidate is measured against: a number, and how much of what is worn
+// that number covers.
+struct GearIncumbentScore
+{
+    float score{0.f};
+    GearConfidence confidence{GearConfidence::Exact};
+};
+
+// What is worn in one slot, as something to be measured against. An empty slot
+// and an item the character can no longer wear are both worth EXACTLY zero -
+// certain, not a guess - which is what makes the first item into an empty slot
+// an upgrade by construction.
+GearIncumbentScore GearWorn(GearVerdict const& worn);
+
+// A TWO-HANDER HAS TO BEAT BOTH HANDS (#14, the Severing Axe). The scores add,
+// and the certainty is the WEAKER of the two: a pair is only exactly known when
+// both halves are.
+GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
+                                     GearIncumbentScore const& offHand);
+
+// The rule itself. `GearIsUpgrade` is the margin it uses and is unchanged, so
+// the two never disagree about where the line is - only about what to say when
+// the line cannot be located.
+GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore const& worn);
+
+// ---------------------------------------------- and the drive stands down --
+//
+// The comparison above converges on its own: it is antisymmetric, so under
+// unchanged inputs no pair of items can each be Better than the other, and a
+// sweep that swaps reaches a fixed point. `tests/test_gear_converges.cpp`
+// asserts both properties rather than asserting the arithmetic that happens to
+// give them.
+//
+// THAT IS NOT ENOUGH ON ITS OWN, because it only proves this file cannot fight
+// ITSELF. What actually happened was another writer, and no rule of ours can
+// stop one existing - a stray admin `autogear`, a deployment setting that comes
+// back on an upstream bump, an upstream path that has not been written yet. So
+// the drive also remembers what it put where, and gives up on a slot somebody
+// keeps undoing.
+//
+// The budget is deliberately small. Three attempts is enough to ride out a
+// transient - an item briefly unequipped by a durability break, a swap the
+// server refused once - and small enough that the 124-equip day becomes three
+// equips and one line in the log naming both items. Being WRONG and quiet is
+// the failure being fixed; being right and quiet was never the requirement.
+constexpr int GEAR_REVERSALS_ALLOWED = 3;
+
+// What the drive remembers about ONE character's ONE slot. Entries, not names:
+// a slot is disputed over particular items, and any other candidate is a fresh
+// question.
+struct GearSlotMemory
+{
+    // The item entry this drive last put into the slot, and what it took off to
+    // do it. Zero for a slot it has never touched.
+    unsigned chosen{0};
+    unsigned displaced{0};
+
+    // How many times it has since found `displaced` back on and `chosen` in the
+    // bags again. Nobody but another writer can do that.
+    int reversals{0};
+};
+
+// Should the swap happen, and what should be remembered afterwards?
+struct GearSwapIntent
+{
+    // Do it.
+    bool swap{false};
+
+    // Do not do it, and say out loud that this slot is being fought over. Set
+    // once, on the attempt that exhausts the budget, so the line is said once
+    // rather than every five seconds forever.
+    bool standDown{false};
+
+    // What to store against this character and slot, whatever the answer.
+    GearSlotMemory memory;
+};
+
+// `wanted` is the caller's GearCompare answer reduced to a yes: only a
+// GearComparison::Better reaches here as true. Everything else is the caller's
+// to report and is not this function's business.
+GearSwapIntent GearIntend(GearSlotMemory const& memory, unsigned candidateEntry,
+                          unsigned wornEntry, bool wanted);
 
 // WHO NEEDS WHEN TWO MEMBERS BOTH WANT THE SAME DROP (#145). The one with the
 // lower total equipped score, because what a dungeon run raises is the party's
@@ -1345,6 +2538,1222 @@ struct BankerCandidate
 };
 
 uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates);
+
+
+// ------------------------------------------- the town trip: repair and buy --
+//
+// TWO MORE EXECUTORS AT THE SAME COUNTER, and the reason they are one section.
+//
+// A family that clears a dungeon a hundred times has to come back to town in
+// between, and the trip has four errands: sell what it does not want (done -
+// kind='sell'), put away what it cannot use yet (done - kind='bank'), REPAIR
+// what the run wore out, and BUY the food, drink and reagents the next run
+// needs. The last two did not exist. Nothing else in this module spends money
+// at all; sell and bank only move things.
+//
+// The retry classes below are the sell path's three, and they are a SECOND
+// enum rather than a rename of SellRetry because renaming that one would edit
+// a literal tests/test_sell.cpp pins and a column live rows already carry.
+// Two enums with the same three members is a smaller cost than a rename that
+// reaches an executor already merged and running.
+enum class TownRetry
+{
+    Never,      // the item, the character's class, or the command is the wall
+    Elsewhere,  // this spot is the wall; another NPC may answer differently
+    Later,      // the character's own state is the wall; here, in a moment
+};
+
+// "never", "elsewhere", "later". Here rather than in the executor so the
+// string a test pins is the string a row carries.
+char const* TownRetryWord(TownRetry retry);
+
+// ------------------------------------------------------------ repair (#18) --
+//
+// WHAT A kind='repair' ROW MAY SAY.
+//
+//     all                                  everything worn and carried
+//     item guid:<item_instance.guid>       exactly that one item
+//
+// BOTH FORMS, and the argument for each. `all` is what a player actually does:
+// the repair window has one button for it, and it is one packet where the
+// per-item form is eighteen, each with its own chance of arriving after the
+// character has wandered out of range. It is also the only form whose whole
+// cost is one money delta, which makes the read-back a single subtraction
+// rather than a reconciliation.
+//
+// `item guid:` exists because `all` cannot say WHICH item it failed to pay
+// for. Player::DurabilityRepair charges per item and simply returns when the
+// purse is short, so a repair-all with 40 silver in hand and 60 silver of
+// damage on the gear restores some items and leaves others, silently. When the
+// purse is thin the sender wants the tank's weapon repaired and not the
+// rogue's spare shirt, and that is a choice about ONE item, addressed by the
+// guid the way every other item verb in this module addresses one.
+//
+// NO GUILD-FUNDS FORM, deliberately. CMSG_REPAIR_ITEM carries a third byte
+// meaning "take it out of the guild bank", and Player::DurabilityRepair
+// honours it - by returning immediately, having repaired nothing and charged
+// nothing, when GetGuildId() == 0. The family has no guild (that is its own
+// open issue), so the only thing a guild-funds repair could produce here is a
+// row that looks exactly like a successful repair and changed nothing, which
+// is the failure mode this whole module exists to stop reporting. The grammar
+// therefore has no way to ask for it and the executor always sends 0.
+enum class RepairVerb
+{
+    None,  // not a repair request; `error` says why
+    All,
+    One,
+};
+
+struct RepairRequest
+{
+    RepairVerb verb{RepairVerb::None};
+    uint32_t itemGuid{0};  // for One; 0 for All
+    std::string error;     // the refusal literal when verb is None, else empty
+};
+
+// Whitespace-tolerant, otherwise literal: lower-case words, `guid:` with
+// digits after it, nothing else on the line. A guid of 0 is refused rather
+// than passed on, because 0 is exactly what the core's repair path reads as
+// "no item named, repair everything" - so a row that meant one item and
+// carried a 0 would silently become a repair-all and spend the whole purse.
+RepairRequest ParseRepairRequest(std::string const& command);
+
+// WHICH REPAIRER, when a town square has several in reach. The nearest town to
+// the family's dungeon has four repair-flagged NPCs within a hundred yards of
+// each other, two of them standing about five yards apart.
+//
+// The candidates are the repair-flagged creatures the character may ALREADY
+// interact with, so every one of them is inside INTERACTION_DISTANCE and
+// walking to the nearer one saves nothing. What is not the same between them
+// is the price: Player::GetReputationPriceDiscount returns a per-creature
+// multiplier and the repair cost is multiplied by it. So the rule is CHEAPEST
+// FIRST, not nearest first - distance breaks a tie in the discount, and the
+// index breaks a tie in both so the answer never depends on the order a cell
+// sweep happened to produce. Returns -1 for an empty list.
+struct RepairerCandidate
+{
+    float distance{0.f};  // yards from the character
+    float discount{1.f};  // GetReputationPriceDiscount; lower is cheaper
+};
+
+int ChooseRepairer(std::vector<RepairerCandidate> const& candidates);
+
+// Keyed on the `detail` literal the executor returns. An unknown literal is
+// `Later`, for the same reason the sell table gives: a refusal this table has
+// never heard of is more likely a new transient than a new permanent, and
+// retrying a permanent costs a row while giving up on a transient costs the
+// errand.
+TownRetry RepairRefusalRetry(std::string const& detail);
+
+// --------------------------------------------------------------- buy (#18) --
+//
+// WHAT A kind='buy' ROW MAY SAY.
+//
+//     entry:<item_template.entry> [count:<n>] [max:<copper>]
+//
+// `entry:` AND NOT `guid:`, which is the opposite of every other item verb
+// here, and the reason is that the item does not exist yet. There is no
+// item_instance row to name until the purchase creates one. What a vendor
+// sells is a TYPE, the packet carries a type, and so does the row.
+//
+// `count` is the number of PURCHASES, not the number of items, because that is
+// what the packet's count means: Player::BuyItemFromVendorSlot stores
+// `pProto->BuyCount * count`. For everything a level-20s party restocks that
+// factor is 1 and the two numbers are the same, but the read-back multiplies
+// rather than assuming, so a vendor selling arrows two hundred at a time is
+// counted correctly instead of read as a hundred and ninety-nine missing.
+//
+// `max` is a copper ceiling on the WHOLE purchase, and it is the one part of
+// this grammar the core's packet has no field for. It is here because the
+// read-back proves the purse fell by the right amount only AFTER the money is
+// gone, and a mispriced row - a count typed with an extra zero, a vendor whose
+// price is not what the planner read - is exactly the thing a bot cannot
+// notice and cannot undo. A sale can be undone: the item sits in a buyback
+// slot. A purchase cannot; the gold is simply spent. `max` lets the sender say
+// what it expected to pay and the executor refuse rather than discover.
+// Absent, there is no ceiling.
+struct BuyRequest
+{
+    bool valid{false};
+    uint32_t entry{0};
+    uint32_t count{1};      // purchases, not items; never 0
+    bool capped{false};     // whether `max:` was given
+    uint32_t maxCopper{0};  // meaningful only when capped
+    std::string error;      // the refusal literal when invalid, else empty
+};
+
+// The first word must be `entry:`; `count:` and `max:` may follow in either
+// order, each at most once. A count of 0 is refused rather than read as 1,
+// because the core silently rewrites a count below 1 to 1 and a row asking for
+// nothing should be a malformed row rather than a purchase nobody asked for. A
+// `max:` of 0 is allowed and means "only if it is free", which is a real thing
+// to ask and is distinguishable from absent by `capped`.
+BuyRequest ParseBuyRequest(std::string const& command);
+
+// WHICH VENDOR, when several are in reach and only some of them sell the
+// thing. The family's town has eleven vendors inside a hundred and fifty
+// yards, and the one that sells water is not the one that sells arrows.
+//
+// The order is: a vendor that stocks the item and has it in stock beats one
+// that stocks it and is sold out, which beats one that does not stock it at
+// all. Then the cheaper reputation discount, then the nearer, then the lower
+// index. A vendor that does not stock the item is still CHOSEN when no better
+// one is in reach, and only so that the refusal can name it - "this vendor
+// does not stock 4594" is an aim a sender can correct; "no vendor" is not.
+struct BuyVendorCandidate
+{
+    float distance{0.f};
+    float discount{1.f};
+    bool stocksItem{false};  // the entry is in this vendor's list at all
+    bool inStock{false};     // and there are enough of them right now
+};
+
+int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates);
+
+TownRetry BuyRefusalRetry(std::string const& detail);
+
+// ------------------------------------------------------- a death's cause --
+//
+// WHAT WAS MOVING THIS CHARACTER, AND TOWARD WHAT (#188).
+//
+// THE GAP THIS CLOSES. `overseer_death` has held the victim's own position,
+// health and aim since infra#2912, and that has been enough to say WHERE a
+// character died and not once enough to say WHY. Two separate investigations
+// have now stopped at the same wall: #231 was filed on a plausible mechanism
+// for the falls and then refuted from the sources, because nothing recorded
+// what had hold of the character at the time. Over one measured day, 55 of 113
+// roster deaths carried no travel target at all and 21 carried no quest aim,
+// which is not a gap in the reporting so much as the most informative fact
+// anybody has established: something was moving these characters that this
+// module had not asked to move them.
+//
+// AND THE DEATHS ARE FALLS ONTO A KILL PLANE, not terrain. 223 under-world
+// deaths since 2026-08-30 all landed between z -642.2 and -500.1, and a
+// maximum that tight is a threshold rather than ground. Per day the count runs
+// 1, 56, 77, 75, 8, 0, 6, so whatever is dropping them is still happening and
+// nobody can yet attribute a single one of those drops to a cause.
+//
+// TWO ANSWERS, KEPT SEPARATE ON PURPOSE. The core's own movement generator is
+// a FACT about the character - what actually had hold of it - and the driver
+// below is this module's INTERPRETATION of that fact next to its own aims. The
+// row carries both, so a reader who thinks the interpretation is wrong can
+// re-derive it from the raw answer instead of having to trust it. That is the
+// same reason `killer_type` and `killer_name` are both kept.
+//
+// EVERYTHING HERE IS SAMPLED, NOT LIVE, and for the reason `health_at_death`
+// already is: by the time any death hook fires, the core has already torn the
+// state down. Unit::setDeathState stops combat and clears the motion master
+// before Player::KillPlayer runs, so a death hook asking "were you in combat"
+// or "what was moving you" gets the answer "no" and "nothing" every single
+// time. The last sample before the death is the only place those facts still
+// exist, and at a five-second cadence against falls that complete in nought to
+// five seconds it is the right resolution for exactly this question.
+enum class MoveGenerator
+{
+    Unsampled,  // no snapshot has been taken for this character yet
+    Idle,       // IDLE_MOTION_TYPE: nothing had hold of it
+    Follow,     // FOLLOW_MOTION_TYPE: it was following its leader
+    Point,      // POINT_MOTION_TYPE: a scripted move to a coordinate
+    Chase,      // CHASE_MOTION_TYPE: it was pursuing something
+    Flee,       // FLEEING / TIMED_FLEEING / CONFUSED: combat put it there too
+    Thrown,     // EFFECT_MOTION_TYPE: a spline SOMETHING ELSE put it on
+    Other,      // waypoint, flight, home, rotate: named so it is not guessed at
+};
+
+// WHAT THIS MODULE THINKS WAS DRIVING IT. Deliberately a small vocabulary: a
+// column somebody groups by is only useful if the values are few and mean the
+// same thing every time.
+enum class DeathDriver
+{
+    Unknown,       // never sampled. Say so rather than guess.
+    Recovery,      // THIS MODULE moved it, recently enough to own the death.
+    Errand,        // a move toward something this module aimed it at
+    Following,     // following the leader, with no aim of its own
+    Fighting,      // chasing or fleeing, which is combat either way
+    Thrown,        // a spline it did not choose: a fall, a knockback, a drop
+    Idle,          // nothing was moving it, which is itself an answer
+    Unattributed,  // something was moving it and this module did not ask
+};
+
+char const* DeathDriverName(DeathDriver driver);
+char const* MoveGeneratorName(MoveGenerator generator);
+
+// One death's worth of attribution, as the adapter sampled it.
+struct DeathAttribution
+{
+    // False when no snapshot has been taken for this character. Everything
+    // else here is then meaningless and the answer is Unknown, which is a
+    // better column value than a plausible guess.
+    bool sampled{false};
+    MoveGenerator movement{MoveGenerator::Unsampled};
+    // Seconds since this module last issued a terrain-recovery remedy for this
+    // character. NEGATIVE means it never has, which is not the same as zero.
+    long recoverySeconds{-1};
+    // How recent a remedy has to be for the recovery to own the death. ZERO
+    // DISABLES THE ATTRIBUTION and makes a recovery never the answer, which a
+    // caller has to write deliberately rather than reach by passing a number
+    // that looks like a window.
+    long recoveryWindow{0};
+    bool hasTravelTarget{false};
+    bool hasQuestAim{false};
+};
+
+// THE PRECEDENCE IS THE DECISION, so it is written out rather than left to the
+// order of a switch:
+//
+//   1. Never sampled beats everything. Unknown is an honest column value and
+//      the reason this function exists is that guessing produced two dead-end
+//      investigations.
+//   2. A recovery this module issued inside the window beats every other
+//      answer, INCLUDING the generator. This module's own remedy is the one
+//      cause it is in a position to be certain about, and a recovery that
+//      kills a character has to be attributable to the recovery even when the
+//      core has already moved on to some other generator. It is also the
+//      answer most likely to be inconvenient, which is the reason to put it
+//      first rather than last.
+//   3. A spline it did not choose (Thrown) beats an aim, because being thrown
+//      is what happened to it and the aim is only what it had wanted.
+//   4. Combat, then following, then idle: each is a positive statement about
+//      what had hold of it.
+//   5. Anything else is an Errand if this module had aimed it somewhere, and
+//      Unattributed if it had not. THAT LAST VALUE IS THE POINT OF THE WHOLE
+//      COLUMN: "something moved this character and it was not us" is the
+//      finding both previous investigations needed and neither could make.
+DeathDriver NameTheDriver(DeathAttribution const& attribution);
+
+// HOW FAR IT DROPPED, from the last sample to the place it died. Negative
+// means unsampled and is deliberately distinguishable from zero: "we do not
+// know" and "it did not fall" are different findings, and a report that folds
+// them together is how a kill plane goes 223 deaths without an explanation.
+// A character that ended HIGHER than it was last seen did not fall, so that
+// reads zero rather than a negative distance.
+//
+// WHAT THIS CANNOT SEE, and #243 is the bill for not having said so here.
+// This is a position delta across ONE sample gap, so a drop that both begins
+// and ends inside that gap is invisible, and a character that was carried
+// upward on the way reads a flat zero however far it fell.
+//
+// Worse, the distance the core BILLS for is not a position delta at all.
+// Player::HandleFall charges m_lastFallZ minus the landing height, and
+// upstream's dismount sets m_lastFallZ by hand to the character's own feet
+// and the landing height to the ground beneath them, so it charges for the
+// terrain under a character that never moved. A zero in this column is not
+// evidence that a fall did not kill it. Read it through AccountForFall.
+float YardsFallen(bool sampled, float lastZ, float deathZ);
+
+// THE CORE'S OWN FALL ARITHMETIC, so a recorded drop can be CHECKED rather
+// than eyeballed. Mirrored from Player::HandleFall in the pinned core, and
+// mirrored on purpose: these two files may not include a core header, and a
+// number nobody could check is how "fell 0.0 yards" was read as a fall from
+// height for a day.
+//
+//   share of max health = SLOPE * (yards - safe fall) + INTERCEPT
+//
+// gated at MIN_YARDS, below which the core deals nothing at all at any rate,
+// and clamped at one, because the core caps fall damage at max health. That
+// cap is why a fall which reaches it kills a 656 HP character and a 1,610 HP
+// one alike, and why max health tells you nothing about who dies of one.
+constexpr float FALL_DAMAGE_SLOPE = 0.018f;
+constexpr float FALL_DAMAGE_INTERCEPT = -0.2426f;
+constexpr float FALL_DAMAGE_MIN_YARDS = 13.48f;
+
+// The share of max health a drop of this many yards costs, 0 through 1.
+// `rate` is the realm's Rate.Damage.Fall, 1.0 on a stock realm.
+float FallDamageShare(float yardsDropped, float safeFallYards = 0.f,
+                      float rate = 1.f);
+
+// The shortest drop that kills outright from full health: 69.0 yards on a
+// stock realm. A recorded drop under this cannot be the whole story.
+float LethalFallYards(float safeFallYards = 0.f, float rate = 1.f);
+
+// WHAT THE RECORDED DROP ACCOUNTS FOR. Takes the column exactly as written,
+// where a negative value is the unsampled marker YardsFallen returns, so a
+// caller reads the row it has rather than reconstructing the sample.
+enum class FallAccount
+{
+    Unsampled,       // no sample: the column says nothing either way
+    NoDrop,          // it ended level with, or above, where it was last seen
+    TooShortToHurt,  // a real drop, under the distance the core charges for
+    Survivable,      // would have hurt it, could not have killed it from full
+    EnoughToKill     // would have killed it from full health outright
+};
+FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
+                           float rate = 1.f);
+char const* FallAccountName(FallAccount account);
+
+// ------------------------------------------------- a revival and a party --
+//
+// A REVIVAL MAY NOT PUT A CHARACTER ON A MAP ITS PARTY IS NOT ON, unless there
+// is nowhere on its own map to put it (#241).
+//
+// WHAT HAPPENED. DriveStuckRevival has four escalations that end in a bind
+// point, and every roster character binds at map 0 (-8950, -132). On the dev
+// realm 2026-09-05 the party LEADER died twice at one Barrens graveyard inside
+// the repeat window, took the fourth of those escalations, and arrived in
+// Duskwood:
+//
+//   17:34:31  'Grug' resurrected at the nearest graveyard
+//   17:35:43  'Grug' twice at one graveyard inside 300s means it cannot live
+//             there, so it was sent to its own bind point instead
+//   17:47     Grug map 0 Duskwood, and Bork, Grog, Og and Ugga all map 1
+//
+// NOTHING IN THIS MODULE CAN UNDO THAT, which is what makes it worse than a
+// long walk. `follow` cannot cross a map, DriveCatchUp refuses to start on a
+// cross-map gap and returns silently, and an `at:` aim cannot name a
+// coordinate on another map. The measured result was eleven minutes of four
+// followers standing still with no log line, and an operator teleporting the
+// family back by hand three times in one day.
+//
+// AND THE PREMISE OF THE ESCALATION IS UNSOUND WHERE IT FIRED. "Twice at one
+// graveyard inside 300s means it cannot live there" reads like a rare verdict.
+// In hostile territory it is the ordinary outcome. Measured on overseer_death,
+// 18:18:24 to 18:22:30, four minutes:
+//
+//   Bork  Horde Guard  35%   travel_target ''
+//   Grug  Horde Guard  12%   'vendor'
+//   Ugga  Horde Guard  34%   'at:1:172.864,-1704.09,93.5606'
+//   Grog  Horde Guard  16%   'profession trainer'
+//   Og    Horde Guard   4%   'at:1:172.864,-1704.09,93.5606'
+//   Grug  Horde Guard  12%   'vendor'
+//
+// Six deaths, one killer, all in zone 17. Two of them were walking to
+// (172.9, -1704.1), and the only creature within 45 yards of that point is
+// entry 6491, a SPIRIT HEALER, 13.3 yards away: the aim is a graveyard. The
+// Barrens is Horde ground, so its graveyards stand beside Horde guards, and
+// for an Alliance party the loop closes on itself: die, revive at the
+// graveyard, be killed by the guards standing at it. A repeat there is
+// evidence about the ZONE and not about the graveyard, and a bind teleport
+// answers neither. Being routed into hostile ground at all is #234 and is not
+// this decision's business; not breaking the party in half over it is.
+//
+// SO THE RULE IS ABOUT THE PARTY'S MAP AND NOT ABOUT MOVING AT ALL, and that
+// is a deliberate narrowing of the closure #188 used. A terrain recovery could
+// be closed under "never change maps" outright because the character was ALIVE
+// and standing somewhere: doing nothing was always available. A revival has no
+// such luxury. One of these four escalations fires because `game_graveyard`
+// holds no row for the map at all, which is every death inside an instance,
+// and refusing to move there would restore the exact regression that branch
+// was written for: a body lay in the Deadmines for 29 minutes while this drive
+// ran and never considered it. "Never move" would be a worse rule honestly
+// applied. "Never move somewhere your party is not, while anywhere on your own
+// map exists" keeps the corpse recovery and stops the split.
+enum class RevivalDestination
+{
+    // Revive on this character's own map, at whatever graveyard the caller
+    // had. Chosen when a bind teleport would leave the party behind.
+    Graveyard,
+
+    // The bind point. Still the right answer when there is nothing on this
+    // map, and when the bind is where the party already is.
+    PartyBind,
+};
+
+// What the adapter measured about one revival that wants to escalate.
+struct RevivalMove
+{
+    // Where a bind teleport would land. The caller resolves this to the
+    // LEADER'S bind when the character is grouped, so that a party which does
+    // all take this exit lands together rather than scattered across two
+    // starting zones.
+    uint32_t bindMapId{0};
+
+    // The map each OTHER member of this character's group is on, one entry
+    // per member. Empty when it is not grouped, or when nobody else could be
+    // resolved, and that is deliberately not the same as "the party is on map
+    // 0": an unknown party map may not be used to refuse anything.
+    std::vector<uint32_t> partyMapIds;
+
+    // Is there ANY graveyard on this character's own map to revive it at
+    // instead? Not "a safe one" and not "a different one": the question this
+    // rule asks is whether an alternative exists at all, because the thing it
+    // is weighed against is a continent.
+    bool graveyardOnThisMap{false};
+};
+
+struct RevivalMoveVerdict
+{
+    // May the caller take its bind teleport?
+    bool mayMove{false};
+    // And does taking it leave the character on a different map from its
+    // party? Only ever true when `mayMove` is true and there was no
+    // alternative, so this is the line that has to be shouted rather than a
+    // reason to refuse.
+    bool splitsParty{false};
+    // Whether a party map could be established at all, and which it is.
+    bool partyMapKnown{false};
+    uint32_t partyMapId{0};
+};
+
+// THE PARTY'S MAP IS THE MAP MOST OF THE OTHERS ARE ON, which is the reading
+// that works whichever member is the one dying. Asking "the leader's map"
+// gets the wrong answer in exactly the case that caused #241, because there
+// the dying character WAS the leader and its own map was the one about to be
+// abandoned. A tie keeps the first map seen, so the answer is stable for a
+// given group rather than depending on iteration luck.
+//
+// FOUR RULES, IN THIS ORDER:
+//
+//   1. No party map known: move. An ungrouped character cannot split a party,
+//      and a group nobody could resolve is not evidence of anything.
+//   2. The bind is on the party's map: move. Nothing is being split; this is
+//      the ordinary case for a family that binds where it plays.
+//   3. The bind is elsewhere AND this map has a graveyard: DO NOT MOVE. The
+//      alternative may be a graveyard that has already killed this character
+//      once, and it is still the better answer, because a character revived
+//      into danger beside its party can be helped, walked away or revived
+//      again, and one revived onto another continent can do none of those and
+//      cannot be reached by anything this module has.
+//   4. The bind is elsewhere and this map has nothing: move, and say that the
+//      party is now split. This is the instance case and the alternative is
+//      leaving a corpse where it fell.
+RevivalMoveVerdict RevivalMayCrossMaps(RevivalMove const& move);
+
+// ----------------------------------------------- a follower and its leader --
+//
+// HOW FAR BEHIND ITS LEADER A FOLLOWER IS, AND WHETHER THAT IS A NUMBER AT ALL
+// (#241).
+//
+// WHY THIS IS A DECISION AND NOT TWO EXPRESSIONS. The same pair of players was
+// read twice in one loop, by two different expressions, and they disagreed.
+// KeepRosterFollowing asked `p->GetDistance2d(leader) > FOLLOW_STALL_GAP_YARDS`
+// with no map guard, and DriveCatchUp, called on the same two pointers on the
+// very next line, folded a cross-map pair to a sentinel of -1. Measured on the
+// dev realm 2026-09-05, with the leader in Duskwood and the followers in the
+// Barrens:
+//
+//   17:42:30 WARN 'Grog' has not moved more than 10 yards in over 5 minutes and
+//                 is 10560 yards from 'Grug' - clearing its movement so the
+//                 next follow tick starts fresh
+//   17:45:30 WARN 'Ugga' ... and is 9463 yards from 'Grug' ...
+//   17:46:30 WARN 'Og'   ... and is 10642 yards from 'Grug' ...
+//
+// Those distances are not distances. They are two coordinate systems
+// subtracted from each other, and the module acted on them: it cleared a
+// movement generator every five minutes at three followers whose problem was
+// not a stall. Over the same eleven minutes the other reading of the same fact
+// produced nothing at all - not one "is N yards behind" line, not one
+// "re-aimed at" line - because a cross-map gap of -1 takes the same exit as a
+// follower standing in formation.
+//
+// THE SILENCE IS THE DEFECT, and it is worth being plain about what this
+// decision does and does not do. It reunites nobody. `follow` cannot cross a
+// map (FollowActions.cpp:285), the catch-up walk has nowhere on this map to
+// aim at, and an `at:` aim cannot name a coordinate on another one
+// (ResolveTravelTarget refuses a spawn off-map). All of that is correct and
+// none of it changes. What changes is that a party split stops looking exactly
+// like a party that is merely slow. An operator lost real time to that twice
+// in one day, because eleven minutes of four characters standing still with no
+// log line is indistinguishable from four characters walking.
+enum class FollowGap
+{
+    // Not on the leader's map. NO DISTANCE IS MEANINGFUL HERE, which is the
+    // whole reason this is a separate value rather than a very large number:
+    // every reading downstream has to be able to refuse to answer.
+    SplitAcrossMaps,
+    // Close enough that upstream's own Follow() chases continuously and this
+    // module has no opinion.
+    InFormation,
+    // Past the formation line, inside the range where walking to the leader
+    // under its own aim is worth doing.
+    Trailing,
+    // Past anything `follow` will do for it.
+    Stranded,
+};
+
+char const* FollowGapName(FollowGap gap);
+
+// The two lines the reading is cut at. Both already exist at the call site and
+// neither is introduced here: FOLLOW_STALL_GAP_YARDS is upstream's own
+// SightDistance, the exact line inside which Follow() chases continuously
+// (MovementActions.cpp:1180-1224), and FOLLOW_CATCH_UP_YARDS is five times it.
+// Passing them rather than baking them in keeps this file free of the tuning
+// and keeps the two call sites provably reading the same thing.
+struct FollowGapLimits
+{
+    float formationYards{0.f};
+    float catchUpYards{0.f};
+};
+
+// `sameMap` FIRST AND ALONE. When it is false the distance is not consulted at
+// all, because there is nothing in it to consult: the caller may hand in a
+// number it computed anyway, and this will not use it.
+FollowGap ReadFollowGap(bool sameMap, float distance2d,
+                        FollowGapLimits const& limits);
+
+// Is this follower far enough back that a stall is worth acting on? False in
+// formation, and false across a map boundary, where there is no distance to be
+// far in. THE SECOND HALF IS THE FIX: nudging a movement generator is a remedy
+// for a follower that has stopped walking, and a follower on another continent
+// has not stopped walking, it has nowhere to walk.
+bool FollowGapIsBehind(FollowGap gap);
+
+// ------------------------------------- crossing a map boundary (#241, #158) --
+//
+// THE FAMILY CANNOT WALK BETWEEN CONTINENTS, AND THAT IS CORRECT. Every aim
+// this module writes for a place is `at:<map>:<x>,<y>,<z>`, and the resolver
+// refuses one whose map is not the character's own, because MoveFarTo paths
+// through PathGenerator and there is no navmesh across an ocean. The FollowGap
+// reading above says the same thing from the other end: a party on two maps
+// has no distance between its halves. None of that changes here.
+//
+// WHAT CHANGES IS THAT THERE IS A CROSSING AFTER ALL, AND IT WAS NEVER A
+// TELEPORT. The world runs boats. A boat is a MotionTransport: it walks its
+// own taxi path, it carries whoever stands on its deck by relocating them
+// every tick, and when that path changes map it teleports its passengers with
+// it. A character does not need to path across water to use one. It needs to
+// be standing on the deck when the boat leaves.
+//
+// AND STANDING ON THE DECK IS THE WHOLE JOB. Boarding, riding and landing are
+// already done, by code that is already running: the bot AI polls the map once
+// a second and boards whatever transport the map says the character is
+// standing on, the transport relocates its passengers itself, and the
+// far-teleport is acknowledged for a bot because a bot has a session with no
+// socket rather than no session. So this module must not board anybody, must
+// not teleport anybody, and must not simulate a packet. It has exactly one
+// thing to contribute that nothing else does: WALK THE LEADER TO THE BERTH,
+// and then get out of the way.
+//
+// WHY THE BERTH IS KNOWABLE HERE AND WAS NOT KNOWABLE BESIDE THE WORLD. An
+// earlier attempt at this ran next to the world rather than inside it and
+// stalled on one missing fact: nothing it could read said where a boat ties
+// up. Zone boxes are not piers, instance doors are not piers, and a berth
+// derived by offsetting some other landmark is the staging point that was
+// aimed into rock. The fact exists; it was on the other side of the wall. A
+// transport's own path carries a STOP FRAME on each map it serves, and that
+// frame's coordinates are the berth. The adapter reads it off the transport
+// and hands it in. This file never invents a coordinate and is never given the
+// chance to: a berth it was not handed is a refusal, below.
+//
+// THE UNITS OF THIS DECISION ARE MEMBERS, NOT THE PARTY. The party it was
+// written for was ALREADY split when the crossing became necessary: three
+// followers on the destination map beside the dungeon door, the leader and one
+// follower on the far continent. "Assemble, then cross together" would have
+// had nothing to say to it. So each member is read against the DESTINATION.
+// The ones already there have arrived and are not moved. The ones on the
+// origin map are the ones with a boat to catch. Anybody on a third map is a
+// refusal rather than a rounding error.
+//
+// ONLY THE LEADER IS EVER AIMED. That is not a simplification, it is the
+// standing rule this repository has already paid for: a party aimed member by
+// member across a long distance scatters, and the followers already have a
+// drive that walks them to their leader on their own map. This decision
+// therefore never produces per-follower orders. It says what the crossing
+// needs next, and the adapter aims one character.
+enum class CrossingLeg : std::uint8_t
+{
+    // Nothing readable enough to name a leg. The world is not answering.
+    Unknown,
+    // Somebody is on a map that is neither end of this crossing.
+    OffRoute,
+    // On the origin map and not aboard: the berth is the next place to be.
+    WalkToBerth,
+    // On the deck, or riding. The transport owns the crossing now.
+    Aboard,
+    // Every member read on the destination map.
+    Ashore,
+};
+
+char const* CrossingLegName(CrossingLeg leg);
+
+enum class CrossingAction : std::uint8_t
+{
+    // A fact needed to decide was missing. Do nothing, and say which.
+    Wait,
+    // The crossing cannot be made, and waiting will not make it makeable.
+    Refuse,
+    // Aim the leader at the berth. The only action that moves anybody.
+    Walk,
+    // Aboard. DO NOTHING, DELIBERATELY: the transport is the mechanism and
+    // anything issued now would fight it. A separate value from Wait because
+    // "doing nothing because the boat is sailing" and "doing nothing because
+    // the world did not answer" are one log line apart and must not be one
+    // value.
+    Ride,
+    // Every member is on the destination map. The crossing is over.
+    Done,
+};
+
+char const* CrossingActionName(CrossingAction action);
+
+// One member, as the adapter read it off the world.
+//
+// `readable` IS NOT `online`. It is "this character was steerable on this
+// poll", the same gate every other drive here uses, and a character that
+// failed it contributes no map, no distance and no vote. An unreadable member
+// is never counted as arrived: four of five seen on the far side says nothing
+// whatever about the fifth.
+struct CrossingMember
+{
+    bool readable{false};
+    bool isLeader{false};
+    bool aboard{false};       // the MAP says this character is on the transport
+    std::uint32_t mapId{0};
+    float berthDistance{0.f}; // yards, two-dimensional; meaningless off-map
+};
+
+// What the adapter could establish about the crossing itself. Every field is a
+// fact the world was ASKED for, and false means "not established", never
+// "established false".
+struct CrossingWorld
+{
+    std::uint32_t originMap{0};
+    std::uint32_t destinationMap{0};
+    // A transport was found on the origin map whose own path serves both maps.
+    bool transportFound{false};
+    // Its stop frame on the origin map. This is the berth to walk to.
+    bool berthKnown{false};
+    // Its stop frame on the destination map. Nothing is aimed at it, but its
+    // absence means the path does not land where this crossing claims it does.
+    bool landingKnown{false};
+    // The berth was swept for spawns above the party's level, the same sweep
+    // at the same radius a travel destination gets, and it is not clear.
+    bool berthGuarded{false};
+    std::uint32_t berthGuardLevel{0};
+};
+
+struct CrossingLimits
+{
+    // Inside this, the leader is AT the berth and the bot AI's own boarding
+    // poll is what happens next. An arrival tolerance, not a boarding radius:
+    // this module never decides anybody is aboard.
+    float berthArrivedYards{0.f};
+};
+
+struct CrossingStep
+{
+    CrossingLeg leg{CrossingLeg::Unknown};
+    CrossingAction action{CrossingAction::Wait};
+    std::size_t readable{0};
+    std::size_t unreadable{0};
+    std::size_t ashore{0};   // read on the destination map
+    std::size_t waiting{0};  // read on the origin map, not aboard
+    std::size_t aboard{0};
+    std::size_t offRoute{0}; // read on neither map
+    bool leaderReadable{false};
+    bool leaderOnOrigin{false};
+    bool leaderAtBerth{false};
+};
+
+// THE ORDER OF THE TESTS IS THE FAIL-CLOSED RULE, WRITTEN OUT.
+//
+// UNREADABLE FIRST, ahead of every other reading and ahead of Done in
+// particular. This is the one branch that separates this from a decision layer
+// that reads a missing member as a negative reading.
+//
+// REFUSALS BEFORE PROGRESS, because a crossing with no boat, no berth or a
+// guarded berth does not become makeable by taking a step toward it, and the
+// step taken anyway is the walk that kills people.
+//
+// ABOARD BEFORE WALK, because the moment anybody is on the deck the transport
+// owns the outcome, and a fresh aim would walk them back off it.
+CrossingStep ReadCrossing(CrossingWorld const& world,
+                          std::vector<CrossingMember> const& members,
+                          CrossingLimits const& limits);
+
+// The step as one sentence, including when the answer is "nothing". A refusal
+// that does not say which fact was missing trains an operator to ignore it.
+std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& world);
+
+// ----------------------------- who a character can actually be sent to (#234) --
+//
+// THE ERRAND CHOSE ITS NPC BY DISTANCE AND NEVER ASKED WHETHER IT COULD BE
+// TRADED WITH, and that one omission is most of a day's failures on the dev
+// realm. Measured 2026-09-05: an Alliance family of level 24 to 29 parked
+// beside a Horde town, aimed at `vendor`, resolved to the nearest one at 118
+// to 258 yards, walked to it through level 40 guards, and could never have
+// completed the sale. `Player::GetNPCIfCanInteractWith` (Player.cpp:2113-2163)
+// ends with `if (creature->GetReactionTo(this) <= REP_UNFRIENDLY) return
+// nullptr`, so an unfriendly vendor refuses a character standing on top of it
+// exactly as it refuses one a mile away. Distance was never the question.
+//
+// WHAT CAME OF IT, all downstream of one comparison: 180 `sell` rows refused
+// with `vendor not in range` in an afternoon, the queue livelock those
+// refusals fed (#230), six deaths in five minutes to `Horde Guard` and five
+// earlier to `Stonetalon Grunt` on the walk there, a graveyard spiral because
+// dying in hostile ground resurrects you in hostile ground, and the
+// cross-continent splits that spiral escalates into (#241).
+//
+// NEUTRAL IS NOT A CONSOLATION PRIZE, IT IS THE ANSWER. The gate is
+// `> REP_UNFRIENDLY`, not `>= REP_FRIENDLY`, and reading it as "friendly"
+// would be a worse bug than the one being fixed: for an Alliance party in
+// Kalimdor there is no friendly vendor within reach at all, and the shop that
+// serves them is a goblin one that is neutral to everybody. Excluding neutral
+// would turn "walks to a vendor that refuses it" into "has no vendor", which
+// is not an improvement.
+
+// The fields of one FactionTemplate.dbc row that decide a reaction, copied out
+// by the caller so this file needs no core type. Names and order are
+// FactionTemplateEntry's own (DBCStructure.h:974-984); `enemyFactions` and
+// `friendFactions` are that struct's two fixed arrays of four, as vectors,
+// with the trailing zeros the DBC pads them with allowed to be dropped.
+struct FactionStance
+{
+    uint32_t faction{0};
+    uint32_t flags{0};          // factionFlags
+    uint32_t ourMask{0};
+    uint32_t friendlyMask{0};
+    uint32_t hostileMask{0};
+    std::vector<uint32_t> enemyFactions;
+    std::vector<uint32_t> friendFactions;
+};
+
+// The core's ReputationRank (SharedDefines.h:155-165), with its numbering, so
+// a caller can cast one straight into this and so the "greater than
+// unfriendly" comparison below is the same comparison the core makes.
+enum class Reaction : int
+{
+    Hated = 0,
+    Hostile = 1,
+    Unfriendly = 2,
+    Neutral = 3,
+    Friendly = 4,
+    Honored = 5,
+    Revered = 6,
+    Exalted = 7,
+};
+
+// FactionTemplateEntry::IsHostileTo and ::IsFriendlyTo (DBCStructure.h:987-1016),
+// reproduced. Both are asymmetric - the enemy and friend lists belong to
+// `subject` and are searched for `other`'s faction - so the argument order is
+// part of the meaning and not a detail.
+bool FactionStanceHostileTo(FactionStance const& subject, FactionStance const& other);
+bool FactionStanceFriendlyTo(FactionStance const& subject, FactionStance const& other);
+
+// Unit::GetFactionReactionTo(FactionTemplateEntry const*, FactionTemplateEntry
+// const*) (Unit.cpp:7287-7302), which is where the core lands when neither
+// side's faction carries a reputation the player can hold. `npc` first,
+// `character` second, because that is the direction the core asks in:
+// GetNPCIfCanInteractWith asks the CREATURE how it feels about the player.
+Reaction FactionStanceReaction(FactionStance const& npc, FactionStance const& character);
+
+// `GetReactionTo(player) > REP_UNFRIENDLY`, which is the whole of what the
+// core's interaction gate tests about faction. One function so no call site
+// gets to re-derive the threshold, and so a reader can find the >= vs > in
+// one place.
+bool MayInteractAt(Reaction reaction);
+
+// One spawn of the wanted role standing on the character's own map. The
+// caller has already asked whether this character may interact with it, the
+// same way the bank and repair candidate lists arrive already asked.
+//
+// AND WHETHER IT IS A PLACE THE CHARACTER CAN STAND (#267). `guardCount` is
+// how many creatures hostile to this character AND above its level are
+// spawned within the threat radius of this spawn, and `guardLevel` is the
+// highest level among them. Both are measured by the caller off spawn data
+// rather than the live grid, for the reason GRAVEYARD_THREAT_RADIUS gives: a
+// destination two grids away is not loaded, and an unloaded grid reads as "no
+// creatures", which is exactly the wrong answer for this question.
+//
+// A caller that has not measured a candidate leaves these zero, which reads as
+// unguarded. That is deliberate and it is what lets the measurement be done
+// lazily in distance order: an unmeasured candidate is always FARTHER than the
+// one chosen, so it could not have won and measuring it would have bought
+// nothing but a sweep over every spawn in the world.
+struct TravelTargetCandidate
+{
+    uint32_t entry{0};
+    float distance{0.f};      // yards from the character, two-dimensional
+    bool mayInteract{false};
+    uint32_t guardCount{0};   // hostile spawns above this level within the radius
+    uint32_t guardLevel{0};   // the highest level among them, for the log line
+};
+
+enum class TravelTargetVerdict : uint8_t
+{
+    Chosen,               // `index` names the spawn to walk to
+    NothingOfThatKind,    // no spawn of the role is on this map at all
+    NoneWillDealWithUs,   // there are spawns and this character may use none
+    EveryOneIsGuarded,    // it may use some, and every one stands in hostile ground
+};
+
+struct TravelTargetChoice
+{
+    TravelTargetVerdict verdict{TravelTargetVerdict::NothingOfThatKind};
+    int index{-1};          // into the candidate list, -1 when nothing was chosen
+    int nearestRefused{-1}; // the nearest one it may NOT use, for the log line
+    std::size_t considered{0};
+    std::size_t refused{0};
+    int nearestGuarded{-1}; // the nearest usable one standing in hostile ground
+    std::size_t guarded{0}; // how many usable ones were refused for their guards
+};
+
+// THE NEAREST SPAWN THIS CHARACTER CAN ACTUALLY USE, and nothing else about
+// it. A spawn it may not interact with is not a worse answer than one it can,
+// it is not an answer: the errand cannot end there however well the walk goes.
+// So they are excluded rather than ranked below, which is the difference
+// between this and ChooseSellVendor's flagged-but-still-chosen vendor - that
+// one is chosen only so a refusal can be named as the vendor's, and here
+// naming it costs a walk through hostile ground.
+//
+// THE RIGHT ANSWER IS OFTEN FARTHER AWAY AND THAT IS NOT A REASON TO REJECT
+// IT. The usable counter for the family this was written for is about 1,470
+// yards from the dungeon door while the unusable one is 510, and infra#3359
+// measured both before this existed. Distance only ever breaks a tie among
+// spawns that passed the gate; the index breaks a tie in distance, so the
+// answer never depends on the order a spawn sweep happened to produce.
+//
+// AND A SPAWN IT CAN USE BUT CANNOT REACH ALIVE IS NOT AN ANSWER EITHER
+// (#267). A second gate, for the same reason and on the same terms as the
+// first: a candidate with hostile spawns above this character's level standing
+// within the threat radius of it is not ranked lower, it is not a candidate.
+// Measured live, an Alliance party of 25 to 31 was sent to a faction 35 vendor
+// it could trade with perfectly well, standing 21 yards from eight level 65
+// elites, and died there eighteen times in sixteen minutes. The interaction
+// gate above cannot see that: the counter was willing, the ground was not.
+//
+// THIS IS THE TEST THE GRAVEYARD PATH ALREADY MAKES, and the whole argument
+// for the shape is that the module was making two different answers to one
+// question. GraveyardRefusal will not RESURRECT a character where hostile
+// spawns above its level sit within GRAVEYARD_THREAT_RADIUS, and nothing
+// stopped the same module WALKING it to such a place on an errand. Now the two
+// refusals sit side by side and neither can be changed without the other being
+// read.
+//
+// THE ORDER OF THE TWO REFUSALS IS PART OF THE MEANING. Interaction is asked
+// first because it is a property of the counter and needs no sweep; the guard
+// test is asked only of candidates that survived it, so the expensive question
+// is never asked about a spawn that was already out. And when nothing at all
+// can be chosen, EveryOneIsGuarded wins over NoneWillDealWithUs whenever both
+// happened, because "there is a shop here you may use and it is lethal" names
+// a danger and a fix, while "nobody will serve you" names neither.
+TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates);
+
+// What to put in the log for a choice, or empty when there is nothing worth
+// saying (nothing of the kind is on the map at all, which the caller already
+// says, or a clean nearest-spawn choice with nothing refused).
+//
+// A REFUSAL THAT NAMES ITS CAUSE IS WORTH MORE THAN A HOPEFUL JOURNEY, which
+// is the whole argument of this section: today the errand walked, and the
+// walking is what killed people. So the two lines this builds are the two
+// facts an operator needs and could not previously get - that the nearest
+// thing of the right kind is one this character may not use, and which one
+// was taken instead.
+std::string TravelTargetExplanation(TravelTargetChoice const& choice,
+                                    std::vector<TravelTargetCandidate> const& candidates);
+
+
+// -------------------------------------------- who the kill hooks named --
+//
+// WHY A KILLER TYPED 'player' CARRYING THE VICTIM'S OWN NAME IS NOT A KILLER
+// (#249).
+//
+// THE ROW THIS EXISTS TO STOP LYING. `overseer_death` fills its killer
+// columns from the two script hooks the core offers, and the comment beside
+// that code used to say an absent hook meant "fall damage, drowning, fatigue,
+// lava, a GM command", with 'environment' as the honest answer for the whole
+// class. THAT IS THE WRONG WAY ROUND, and it is wrong in the pinned core, at
+// two lines that can be read:
+//
+//   * Player::EnvironmentalDamage (Player.cpp:853) deals its damage with
+//     `Unit::DealDamage(this, this, ...)`. Attacker and victim are the same
+//     Player, for every environmental type there is: a fall, drowning,
+//     fatigue, fire, lava, slime, and the out-of-bounds kill.
+//   * Unit::Kill's hook block (Unit.cpp:14298-14306) then asks only whether
+//     the killer is a Player and whether the victim is a Player. It has NO
+//     `killer != victim` guard - unlike the KILLED_BY_PLAYER achievement two
+//     lines above it, which does have one. So it fires
+//     OnPlayerPVPKill(victim, victim).
+//
+// So an environmental death does NOT arrive with an absent killer. It arrives
+// through the player-kill hook naming the victim, and the row it writes is
+// `killer_type='player'`, `killer_entry=0`, `killer_name` = the character's
+// own name. On 2026-09-06 that row was read as "attributed to himself, so not
+// environmental" TWICE in one day, and the second reading survived long enough
+// to declare a fall bug fixed while the core's own falling counter was still
+// climbing. A column that means "no attributable killer" must not be spelled
+// the same way as one that means "another player did it".
+//
+// WHAT THIS DOES AND DOES NOT CLAIM. It separates the two, and no more. The
+// hook cannot say WHICH environmental type it was - EnvironmentalDamage keeps
+// that in a parameter it does not pass on - so SelfInflicted is exactly as far
+// as the evidence goes, and guessing 'falling' from a position would be the
+// same mistake in the other direction. `criteria 149-153` on the character is
+// where the type actually lives, and it is only written to the database when
+// the player is SAVED, so a read of it that has not been forced with a save
+// first is stale by up to PlayerSaveInterval.
+enum class KillerKind
+{
+    Unattributed,   // no kill hook fired: nothing named a killer at all
+    Creature,       // a creature landed the killing blow
+    Player,         // ANOTHER player did
+    SelfInflicted,  // the hook named the victim itself: self-damage
+};
+
+// The value written to `overseer_death.killer_type`. Unattributed stays
+// 'environment' because that is what the column has always held for it and
+// what every existing reader groups by; the new value is the one that used to
+// hide inside 'player'.
+char const* KillerKindName(KillerKind kind);
+
+// `hookFired` is false when neither kill hook left anything behind for this
+// death. `hookType` is what the hook itself said - 'creature' or 'player' -
+// and is ignored when hookFired is false. Names are compared without regard to
+// case, because the two sides reach this from different places.
+KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
+                         std::string const& killerName,
+                         std::string const& victimName);
+
+// THE FALL BASELINE, AND WHY IT HAS TO BE PUT BACK UNDER A CHARACTER'S FEET.
+//
+// The core remembers where a character's current fall began and charges
+// `m_lastFallZ - landingZ` on the next MSG_MOVE_FALL_LAND
+// (`Player::HandleFall`). Two things keep that number honest, and NEITHER of
+// them works for this roster.
+//
+// FIRST, A TELEPORT SETS IT TO THE DESTINATION. `Player::TeleportTo`'s near
+// branch ends with `SetFallInformation(GameTime::GetGameTime().count(), z)`
+// where `z` is where the character is going (Player.cpp:1532), and the
+// client's teleport ack writes it again (MovementHandler.cpp:321). That is
+// truthful at the instant it happens and stops being truthful the moment the
+// character walks away from there. THIS MODULE'S LIFT IS ONE SUCH TELEPORT,
+// and by construction its destination is the whole gap that triggered the
+// recovery plus the clearance above where the character stood: at least ten
+// and a half yards, bounded only by the surface probe.
+//
+// SECOND, `Player::UpdateFallInformationIfNeed` WALKS IT BACK DOWN as the
+// character moves. It runs on a movement packet from a client and on nothing
+// else. THIS ROSTER IS MOVED BY SERVER-SIDE SPLINES - every death row of this
+// shape carries movement_generator 'point' - and a spline relocates a
+// character without any packet at all. So whatever height was last written
+// stays written for as long as the character is being driven, and
+// `HandleFall` runs BEFORE `UpdateFallInformationIfNeed` in the same handler
+// (MovementHandler.cpp:634 against :685), so a stale figure is spent before
+// anything corrects it.
+//
+// MEASURED, 2026-09-06, AND THE MEASUREMENT IS WHY THIS IS NOT ONLY ABOUT THE
+// LIFT. Four characters died of falls at full health while standing still:
+//
+//   19:15:22  Bork  died z 65.7   lifted to z 157.3 at 19:11:53
+//                   157.3 - 65.7 = 91.6 yards = 1.41x max health. Exact.
+//   20:10:13  Ugga  died z 93.37  NEVER LIFTED AT ALL
+//   20:10:13  Grog  died z 93.47  lifted to z 158.8, which is 52 hp SHORT
+//   20:10:40  Grug  died z 91.67  lifted to z 149.1, which is 297 hp SHORT
+//
+// The last three each need a baseline near z 162.4 to have been killed, and
+// the party's travel aim at that moment was z 162.425 - a match to within a
+// single hit point for the tightest of them, across three characters with
+// three different health pools. One had no lift behind it at all, and the two
+// that did were lifted to heights that could not have done it.
+//
+// SO THE LIFT IS ONE WAY TO LEAVE A STALE HEIGHT IN THERE AND NOT THE ONLY
+// ONE. A guard that watched only the lift would have prevented exactly one of
+// those four deaths. What the four have in common is not what wrote the
+// height. It is that the character was STANDING when the core charged it.
+//
+// THE RULE IS THEREFORE AN INVARIANT AND NOT AN EPISODE: a character that is
+// not falling is standing somewhere, and a character that is standing
+// somewhere owes nothing for having got there. Whenever this module is
+// entitled to an opinion about a character, it puts the baseline back under
+// that character's own feet.
+//
+// AND IT CANNOT SWALLOW A REAL FALL. The only exemption it needs is `falling`,
+// and one poll is enough to catch every fall that could ever be charged for.
+// The core's gravity is 19.29110527 (Movement/Spline/MovementUtil.cpp:24), so
+// a body in free fall covers 0.5 * g * t^2 = 9.65 yards in its first second,
+// and the core charges nothing for a drop under 13.48 yards at all
+// (MIN_FALL_DMG_DIST, Player.cpp:14175). Falling far enough to be charged for
+// takes just over 1.18 seconds, so at the caller's one-second poll no
+// chargeable fall can pass between two polls unseen: every one of them is met
+// with `falling` true at least once. A fall short enough to hide between two
+// polls is a fall the core would have priced at nothing.
+//
+// THAT MAKES THE CALLER'S POLL CADENCE PART OF THIS RULE. A poll slower than
+// 1.18 seconds could let a chargeable fall through, and that would be a change
+// to this decision and not only to a timer.
+struct FallBaselineState
+{
+    // Whether this module has ever put a height under this character, and
+    // which. NOT a gate on the rule below - the rule holds for every character
+    // this module may inspect, lifted or not, which is the whole lesson of the
+    // 20:10:13 pair. It is here so the one height this module KNOWS it chose
+    // can be named by a reader and asserted by a test.
+    bool held{false};
+    float z{0.f};
+    time_t at{0};
+};
+
+struct FallBaselineVerdict
+{
+    // Hand the core a fall baseline of `z` for this character.
+    bool rebase{false};
+    float z{0.f};
+};
+
+// THIS MODULE HAS JUST PUT A CHARACTER AT `z`, which for now means the lift.
+// Recording it changes nothing about what the step below decides; it is the
+// module writing down the one height it is certain it is answerable for.
+void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now);
+
+// ONE POLL, FOR ONE CHARACTER.
+//
+// `mayInspect` is TerrainRecoveryMayInspect's answer and `falling` is the
+// character's own falling flag. Both are asked again here rather than assumed,
+// because declining in exactly those states is the entire safety of this rule,
+// and a caller that had already filtered them would leave that untested.
+//
+// `standingZ` is where the SERVER believes this character's feet are, which is
+// the right number whichever way the server and the client disagree: if a
+// spline has walked the character down, that is the honest new baseline, and
+// if a silent client has fallen without the server hearing about it, the
+// server's stale higher figure is the honest OLD baseline and handing it back
+// changes nothing.
+FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
+                                     bool falling, float standingZ, time_t now);
+
+// ------------------------------------------------ the addon language (#269) --
+
+// How a `kind='chat'` row addressed to a group is put on the wire.
+//
+// WHY THIS IS A DECISION AND NOT AN `if` AT THE CALL SITE. Two different
+// things travel over party chat and they want opposite treatment. One is
+// speech: a council answer, a trade, a crafting request, every word of it
+// written to be read by whoever is watching that character. The other is a
+// status push - a tab separated line addressed to an addon, which a person
+// reads as noise and which the sender has to keep out of the chat frames by
+// hand. The row already says which it is, in the only field that describes how
+// a line should travel, so that is where the answer is read from.
+//
+// 3.3.5a separates the two itself, and not by convention. LANG_ADDON on a
+// group channel is the transport every addon's SendAddonMessage uses: the
+// receiving client hands the packet to CHAT_MSG_ADDON and no chat frame is
+// ever asked to draw it. The core relies on this for its own addon channel
+// command replies, which would otherwise be printing into players' whisper
+// windows. So `party` is speech and `party_addon` is the same packet, to the
+// same recipients, in the language nothing renders.
+//
+// THE TOKENS ARE LISTED, NOT PARSED. Stripping an `_addon` suffix would also
+// accept `_addon` on its own and would quietly read `party_addonx` as party
+// chat, and a channel this function does not recognise has to stay
+// unrecognised: the caller rejects it by name, which is what makes a module
+// too old to know these tokens mark the row an error rather than deliver
+// machine text as speech.
+struct GroupChatRoute
+{
+    // Is this token a group channel at all? False sends the caller on to its
+    // other branches and finally to "unknown chat channel".
+    bool group = false;
+    // Raid rather than party. Decides the chat type on the packet and, inside
+    // a raid, who a party line reaches. Nothing else.
+    bool raid = false;
+    // Send it in the addon language. Delivered to addons, drawn by nothing,
+    // and therefore not speech - so it is not captured for the watchers
+    // either.
+    bool addon = false;
+};
+
+GroupChatRoute GroupChatRouteFor(std::string const& channel);
+
+// ------------------------------------ an errand that is killing its traveller --
+//
+// THE RULE AGENTS.md ALREADY STATES, AND WHICH NOTHING IMPLEMENTED. "Aim the
+// party leader only, and watch the death table while it walks. If deaths
+// exceed roughly three in five minutes, clear the aim - the destination is not
+// worth the crossing." That was written from #78, where a level 17 party was
+// routed through a level 20-30 zone and then into a level 50-58 one and the
+// deaths went from a six-hour quiet streak to 24 in fifteen minutes.
+//
+// It has been an instruction to whoever happened to be watching ever since,
+// and on 2026-09-06 nobody was. Measured on `overseer_death`: an Alliance
+// family of five, levels 25 to 31, died 46 times in 36 minutes inside one
+// hostile camp in zone 17, 43 of those to a single level 65 elite, with the
+// leader's `travel_npc` reading the same errand at every one of them. The
+// aimed leader ALONE died 13 times, four of them inside one four-minute
+// stretch. Nothing in the module counted.
+//
+// WHAT DID EXIST, AND WHY IT WAS NOT THIS. There is already one death-rate
+// rule - the stuck-revival trap, three deaths within 100 yards in 15 minutes -
+// and its condition was met over and over that evening. It answers a different
+// question: not "should this errand still be running" but "where should this
+// character come back to life". Its only remedy is a teleport to the leader's
+// bind point, and a revival may not change maps while a graveyard exists on
+// this one (#241). Every character on that roster binds to map 0 and the party
+// was on map 1, so the remedy was structurally out of reach for the whole
+// window: the trap was detected every time and fed every time. A breaker whose
+// one lever is held down by another rule is not a breaker.
+//
+// SO THIS ONE PULLS THE OTHER LEVER - the errand, which is the fuel. It does
+// not ask WHY the destination is lethal, and that is the point of having it as
+// well as a danger gate on the resolve (#267): a gate can only refuse what it
+// can see standing there when it looks. Bodies are the one measurement that
+// needs no theory of the danger - a patrol that wandered in, a route that
+// kills, a camp that grew, a level gap nothing sampled, or an aim written into
+// the column by a hand outside this module entirely.
+struct ErrandDeathLimits
+{
+    // Three in five minutes, from AGENTS.md, deliberately the same numbers a
+    // person was being asked to apply by eye. Nothing is gained by inventing
+    // better ones before this has ever run.
+    uint32_t deaths{3};
+    int64_t windowSeconds{5 * 60};
+    // HOW LONG A RELEASED TARGET STAYS REFUSED, WHICH IS NOT DECORATION. This
+    // module is not the only writer of `overseer_roster.travel_npc`; the
+    // deployment's own bridge writes it too. Measured on 2026-09-06: the aimed
+    // column was observed empty at 20:55 and was carrying the same errand again
+    // by 21:00. A release with no memory is therefore a mechanism that reports
+    // itself, changes nothing for longer than one poll, and sends the family
+    // back to the thing that killed them - which is worse than no breaker,
+    // because the log now says the breaker fired.
+    //
+    // Bounded rather than permanent: a vendor the family genuinely needs is
+    // worth trying again once whatever killed them has had time to be
+    // somewhere else, and nothing here can tell a camp from a patrol.
+    int64_t cooloffSeconds{15 * 60};
+};
+
+// How much of the death table this errand is answerable for, in seconds. An
+// errand younger than the window is judged over its OWN life and not one
+// second longer, for the same reason TravelAimBook::Release erases the errand
+// memory it ends: an aim that inherits the previous errand's corpses is
+// released before it has walked a yard. Zero for an errand with no age yet,
+// which the caller reads as "there is nothing to ask the table".
+int64_t ErrandDeathWindow(int64_t errandSeconds, ErrandDeathLimits const& limits);
+
+struct ErrandDeathToll
+{
+    // Deaths this TRAVELLER suffered inside ErrandDeathWindow. Its own, not
+    // the party's: only a character that carries `new rpg` can be sent
+    // anywhere, the followers arrive by following, and a follower's death is
+    // not evidence about a destination it was never sent to. Measured
+    // sufficient above - the aimed leader's own count crosses this threshold
+    // well before the family's does. Whether a leader that survives while its
+    // followers are farmed should also count is a real question and is not
+    // this one.
+    uint32_t deaths{0};
+    // Seconds since this character was last refused THIS target by this rule,
+    // or -1 when it never was.
+    int64_t sinceRefused{-1};
+    // A DUNGEON RUN ISSUED THIS AIM. TravelAimBook::Claim is the coordinator's
+    // only door into the column, so "claimed" is exactly this fact - and it is
+    // the one thing an escort check cannot supply, because a leader on a
+    // staging aim is not escorted, he is aimed.
+    //
+    // It matters because a release here would be UNDONE within one
+    // DUNGEON_RUN_POLL_MS and would reset the errand's pin and backstop clock
+    // every five seconds while it lasted. Firing into that is not a breaker
+    // either, so this declines and says so. A run that keeps killing its party
+    // is the run's own stall to answer.
+    bool runOwned{false};
+};
+
+enum class ErrandDeathRemedy
+{
+    Continue,         // nothing to answer
+    Release,          // the destination is not worth the crossing
+    RefuseReissue,    // released already, and something has re-aimed it since
+    DeclineRunOwned,  // it would fire, and a release here would be inert
+};
+
+struct ErrandDeathVerdict
+{
+    ErrandDeathRemedy remedy{ErrandDeathRemedy::Continue};
+    // Seconds of cool-off still to run. Meaningful for RefuseReissue only, and
+    // zero everywhere else.
+    int64_t coolOffRemaining{0};
+};
+
+// ONE POLL, FOR ONE OUTSTANDING ERRAND.
+ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
+                                      ErrandDeathLimits const& limits);
 
 // -------------------------------------------------------------------- mail --
 //

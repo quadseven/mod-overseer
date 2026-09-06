@@ -128,9 +128,19 @@
 -- `CREATE TABLE IF NOT EXISTS`, a no-op against an existing table, so the
 -- column keeps whatever value set it already has. It takes an explicit ALTER.
 -- The value list is the full union across the executor branches written side
--- by side (sell, bank, auction, mail), so they apply in any order and the last
--- one applied does not drop a sibling's value; 'job', dispatched in C++ since
--- 2026-08-26 but never added to the column, is in it too.
+-- by side, so they apply in any order and the last one applied does not drop a
+-- sibling's value; 'job', dispatched in C++ since 2026-08-26 but never added to
+-- the column, is in it too.
+--
+-- THE UNION GREW AFTER THIS FILE WAS FIRST WRITTEN, and that is worth spelling
+-- out because getting it wrong is silent. This file was authored when the union
+-- was twelve values and the parallel branches were sell, bank, auction and
+-- mail. 'repair' and 'buy' have been added to the column since, and both are
+-- already dispatched in C++ on main. A twelve-value ALTER here would silently
+-- truncate every existing 'repair' and 'buy' row and remove the two kinds from
+-- the column on any database that has already run their migrations. So the list
+-- below is the union as it stands today, not as it stood when the branch was
+-- opened. Anything adding a kind after this must add it here too.
 ALTER TABLE `overseer_command`
-    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail')
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy')
         NOT NULL DEFAULT 'bot';

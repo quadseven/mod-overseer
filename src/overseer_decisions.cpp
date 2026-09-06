@@ -97,11 +97,11 @@ void AppendDeclared(std::vector<BuildFact>& facts, std::string const& name,
 }  // namespace
 
 bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
-                               bool flying, bool inWater, bool onTransport,
-                               bool onVehicle)
+                               bool flying, bool falling, bool inWater,
+                               bool onTransport, bool onVehicle)
 {
-    return alive && !teleporting && !inFlight && !flying && !inWater &&
-           !onTransport && !onVehicle;
+    return alive && !teleporting && !inFlight && !flying && !falling &&
+           !inWater && !onTransport && !onVehicle;
 }
 
 bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
@@ -124,50 +124,110 @@ bool LargeSurfaceMismatchNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= overrideGap;
 }
 
+bool StandingOnTheGround(bool hasLocalNavmesh, bool footingHolds)
+{
+    return hasLocalNavmesh && footingHolds;
+}
+
+namespace
+{
+
+// Squared comparison so this file keeps needing nothing but its own header:
+// <cmath> for a square root would end the "includes its own header and nothing
+// else" property that the header exists to protect, the same reason
+// StepMayBridgeGap folds its sign by hand.
+bool WithinRadius(float ax, float ay, float bx, float by, float radius)
+{
+    float const dx = bx - ax;
+    float const dy = by - ay;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+}  // namespace
+
 TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
-                                           float currentZ, float surfaceAboveZ,
-                                           bool surfaceValid,
-                                           bool hasLocalNavmesh,
+                                           TerrainReading const& reading,
                                            TerrainRecoveryLimits const& limits,
                                            time_t now)
 {
+    // THE EPISODE IS ABANDONED FIRST, BEFORE ANYTHING IS DECIDED, and on every
+    // poll rather than only on a clean one. An episode that can only end when
+    // the condition goes false cannot end at all where the condition never
+    // does, and a cave is exactly such a place: on 2026-09-05 a rung survived
+    // 37 minutes and two maps that way and spent itself on an unrelated
+    // incident. Three separate things end it, and each catches a case the
+    // others do not.
+    if (limits.forgetSeconds <= 0)
+    {
+        // No memory was asked for. Every poll is a first occurrence.
+        state = TerrainRecoveryState{};
+    }
+    else if (state.lastHeld && now - state.lastHeld >= limits.forgetSeconds)
+    {
+        // The character has been fine for long enough that the next thing to
+        // go wrong is a new thing.
+        state = TerrainRecoveryState{};
+    }
+    else if (state.anchored &&
+             (state.mapId != reading.mapId ||
+              (limits.episodeRadius > 0.f &&
+               !WithinRadius(state.x, state.y, reading.x, reading.y,
+                             limits.episodeRadius))))
+    {
+        // Somewhere else entirely. Whatever is wrong here, the ladder climbed
+        // over there has nothing to say about it.
+        state = TerrainRecoveryState{};
+    }
+
+    // WHAT "IT HAS A POLYGON" IS WORTH, decided once and then read three
+    // times, because all three readings are the same question. A polygon
+    // Detour found inside its search box is only evidence about this
+    // character's feet while some direction out of here can be walked; see
+    // StandingOnTheGround for the pocket beside the Wailing Caverns ramp where
+    // it was not, and where believing it held four characters for 24 minutes.
+    bool const onTheGround =
+        StandingOnTheGround(reading.hasLocalNavmesh, reading.footingHolds);
+
     // The condition is exactly what the adapter asked before: the two
     // predicates above, unchanged, in the same order. Only what happens next
     // is new.
     bool const holds =
-        BelowTerrainNeedsRecovery(currentZ, surfaceAboveZ, surfaceValid,
-                                  hasLocalNavmesh, limits.minimumGap) ||
-        LargeSurfaceMismatchNeedsRecovery(currentZ, surfaceAboveZ, surfaceValid,
-                                          hasLocalNavmesh, limits.overrideGap);
-
+        BelowTerrainNeedsRecovery(reading.z, reading.surfaceAboveZ,
+                                  reading.surfaceValid, onTheGround,
+                                  limits.minimumGap) ||
+        LargeSurfaceMismatchNeedsRecovery(reading.z, reading.surfaceAboveZ,
+                                          reading.surfaceValid, onTheGround,
+                                          limits.overrideGap);
     if (!holds)
-    {
-        // A CLEAN POLL IS NOT THE END OF AN EPISODE. Every remedy makes the
-        // condition false for at least one poll - that is what a remedy is -
-        // so forgetting here would forget the attempt that just happened and
-        // hand the next occurrence a fresh first rung, forever. The episode
-        // ends when the character has been fine for `forgetSeconds`, and a
-        // zero forget means the caller asked for no memory at all.
-        if ((state.attempts || state.saidOnGround) && limits.forgetSeconds > 0 &&
-            now - state.lastAttempt < limits.forgetSeconds)
-            return TerrainRecoveryVerdict{};
-        state = TerrainRecoveryState{};
         return TerrainRecoveryVerdict{};
+
+    // The condition is live, so the forget window starts again from here and
+    // the episode learns where it is. Both happen even on a poll that goes on
+    // to issue nothing, because both are statements about the WORLD rather
+    // than about what this module did.
+    state.lastHeld = now;
+    if (!state.anchored)
+    {
+        state.anchored = true;
+        state.mapId = reading.mapId;
+        state.x = reading.x;
+        state.y = reading.y;
     }
 
-    if (hasLocalNavmesh)
+    if (onTheGround)
     {
-        // DETOUR FOUND WALKABLE GROUND AT THIS CHARACTER'S OWN FEET, so it is
-        // standing on walkable ground and the gap above it is a roof. Nothing
+        // DETOUR FOUND WALKABLE GROUND AT THIS CHARACTER'S OWN FEET AND THE
+        // CHARACTER CAN STILL WALK OFF IT, so it is standing on walkable
+        // ground and the gap above it is a roof. Nothing
         // gets moved here. The one warning is still worth making, because a
         // large gap over a live polygon is either architecture (and this rule
         // should stop asking about that place) or a misleading lower plane
         // (and a person needs to go and look). Silence would be the answer to
         // neither.
-        state.lastAttempt = now;
         if (state.saidOnGround)
             return TerrainRecoveryVerdict{};
         state.saidOnGround = true;
+        state.lastAttempt = now;
         return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
     }
 
@@ -176,18 +236,28 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
     // tuning knob. `surfaceValid` is already true here - neither predicate
     // above returns true without it - so the lift height is a real reading
     // and never a sentinel.
-    state.lastAttempt = now;
+    //
+    // TWO RUNGS, AND THE SECOND ONE MOVES NOBODY (#188). There used to be a
+    // bind-point teleport between them. On 2026-09-05 it took a character from
+    // map 1 (1204.1, -708.5) to map 0 (-8902.6, -162.6) in eleven seconds and
+    // he STILL read as below the world when he got there, so it relocated the
+    // failure rather than resolving it, and it left the roster split across an
+    // ocean with a dungeon to run on one side of it. A lift that did not stick
+    // means this module cannot fix this character WHERE IT STANDS, and the
+    // honest answer to that is to say so loudly. Escalating past a remedy that
+    // failed in place, to a remedy that cannot address the condition at all,
+    // is not an escalation.
     switch (state.attempts)
     {
         case 0:
             state.attempts = 1;
-            return TerrainRecoveryVerdict{TerrainRemedy::LiftToSurface,
-                                          surfaceAboveZ + limits.liftClearance};
+            state.lastAttempt = now;
+            return TerrainRecoveryVerdict{
+                TerrainRemedy::LiftToSurface,
+                reading.surfaceAboveZ + limits.liftClearance};
         case 1:
             state.attempts = 2;
-            return TerrainRecoveryVerdict{TerrainRemedy::SendToBind, 0.f};
-        case 2:
-            state.attempts = 3;
+            state.lastAttempt = now;
             return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
         default:
             // Said and done. Staying quiet is the point of this rung.
@@ -202,6 +272,17 @@ bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
         return true;
     float const gap = verticalGap < 0.f ? -verticalGap : verticalGap;
     return gap <= maxGap;
+}
+
+bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise)
+{
+    // The smaller bound, applied to the magnitude. A stride is walkable
+    // exactly when the stride back is, so there is one number rather than two,
+    // and the sign is folded by hand for the same reason WithinRadius squares
+    // its comparison: this file includes its own header and nothing else.
+    float const bound = maxDrop < maxRise ? maxDrop : maxRise;
+    float const change = toZ - fromZ;
+    return (change < 0.f ? -change : change) <= bound;
 }
 
 bool TravelEndpointWithinTolerance(float routedEndZ, float requestedZ,
@@ -324,8 +405,24 @@ std::vector<BuildFact> BuildReport(std::string const& coreVersion,
     return facts;
 }
 
+namespace
+{
+
+// The one place a member's two readings are turned into a gap, so the predicate
+// and the line it prints can never disagree about where somebody is standing.
+ApproachGap GapOf(DungeonRunMemberState const& member)
+{
+    ApproachGap gap;
+    gap.horizontalYards = member.distanceFromStage;
+    gap.verticalYards = member.verticalFromStage;
+    gap.measured = member.distanceFromStage >= 0.f;
+    return gap;
+}
+
+}  // namespace
+
 bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
-                          float radiusYards)
+                          ApproachLimits const& limits)
 {
     if (members.empty())
         return false;
@@ -344,14 +441,19 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
             return false;
         if (member.inCombat)
             return false;
-        if (member.distanceFromStage < 0.f || member.distanceFromStage > radiusYards)
+        // ARRIVED, NOT "INSIDE THE CIRCLE" (#217). Unmeasured and Overhead both
+        // fail here, and Overhead is the one that is new: a member ten yards
+        // out and a hundred and fifty yards up passed the circle test with room
+        // to spare, so a party could be declared assembled on a clifftop and
+        // then walked at a door it could not reach.
+        if (ApproachShapeOf(GapOf(member), limits) != ApproachShape::Arrived)
             return false;
     }
     return true;
 }
 
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
-                                      float radiusYards)
+                                      ApproachLimits const& limits)
 {
     std::string blockers;
     for (DungeonRunMemberState const& member : members)
@@ -370,16 +472,345 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
             why = "already inside";
         else if (member.distanceFromStage < 0.f)
             why = "wrong map";
-        else if (member.distanceFromStage > radiusYards)
-            why = std::to_string(static_cast<int>(member.distanceFromStage)) + "y away";
         else
-            continue;
+        {
+            ApproachGap const gap = GapOf(member);
+            switch (ApproachShapeOf(gap, limits))
+            {
+                case ApproachShape::Arrived:
+                    continue;
+                // THE TWO REMAINING SHAPES GET THE SAME SENTENCE, and that is
+                // the fix rather than a shortcut: ApproachWhere already carries
+                // the height, so "80y out and 184y above it" and "80y out" are
+                // told apart by the numbers in them rather than by a word this
+                // would have to choose. A reader who sees the second half knows
+                // the member is over the door; one who does not, knows it is
+                // simply short of it.
+                case ApproachShape::Overhead:
+                case ApproachShape::Closing:
+                case ApproachShape::Unmeasured:
+                    why = ApproachWhere(gap);
+                    break;
+            }
+        }
 
         if (!blockers.empty())
             blockers += ", ";
         blockers += member.name + " (" + why + ")";
     }
     return blockers;
+}
+
+DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
+                                      std::uint32_t portalOutsideMapId,
+                                      bool aCrossingExists)
+{
+    // EQUAL, NOT "SAME CONTINENT" OR "REACHABLE". The travel layer's rule is
+    // literally that the aim's map is the character's map, so this is literally
+    // that comparison. Anything softer here would be a promise the resolver
+    // underneath does not keep.
+    if (leaderMapId == portalOutsideMapId)
+        return DungeonApproach::Walkable;
+    // STILL NOT WALKABLE EITHER WAY. The difference is only what the caller
+    // does next, and it is worth a value rather than a second `if` at the call
+    // site because "the party is on the wrong continent and there is a boat"
+    // and "the party is on the wrong continent" are different situations that
+    // this function is the only place qualified to tell apart.
+    return aCrossingExists ? DungeonApproach::NeedsCrossing
+                           : DungeonApproach::OffOutsideMap;
+}
+
+namespace
+{
+
+// HAND-ROLLED FOR THE REASON THE THREE ASCII HELPERS AT THE TOP OF THIS FILE
+// ARE. `<cmath>` would give both of these, and taking it would be the second
+// include in a translation unit whose whole stated property is that it has
+// none. The rule is worth more than the two functions: it is what makes "a core
+// type cannot get in here" a build failure rather than a promise, and an
+// exception granted for a square root is an exception granted.
+float Magnitude(float value)
+{
+    return value < 0.f ? -value : value;
+}
+
+// Newton-Raphson on f(g) = g*g - value, in double so the iteration has room the
+// float inputs do not. It converges quadratically from any positive start, and
+// the loop is bounded by a COUNT rather than by a tolerance: the last step of a
+// converged Newton iteration can oscillate between two adjacent doubles forever,
+// and a fixed bound cannot spin on one. Sixty-four is far past what any distance
+// on a 34,000-yard map needs - the spans this is asked about are single-digit to
+// low-double-digit yards, which settle in about ten.
+//
+// Zero, a negative and a NaN all return zero, and the caller reads that as "no
+// distance between these two points" - which for the one caller here is exactly
+// the NoApproachAxis refusal it already has to make.
+double SquareRoot(double value)
+{
+    if (!(value > 0.0))
+        return 0.0;
+
+    double guess = value > 1.0 ? value : 1.0;
+    for (int i = 0; i < 64; ++i)
+    {
+        double const next = 0.5 * (guess + value / guess);
+        if (next == guess)
+            break;
+        guess = next;
+    }
+    return guess;
+}
+
+// Inside the world grid, and a number at all. Written as a positive test rather
+// than as `!(out of range)` on purpose: every comparison against a NaN is false,
+// so a NaN fails this and is refused, where the negated form would have let it
+// through.
+bool WithinTheWorld(float value)
+{
+    return value > -MAP_EDGE_YARDS && value < MAP_EDGE_YARDS;
+}
+
+// IS THIS READING A NUMBER AT ALL? Written as the positive test for the reason
+// WithinTheWorld above is: every comparison against a NaN is false, so a NaN
+// fails this and is refused, where the negated form would have let it through.
+//
+// `value != value` alone catches the NaN; `value * 0` is a NaN for an infinity
+// and zero for everything else, so the second half catches both infinities
+// without naming a bound a distance might one day legitimately exceed. A gap is
+// a DIFFERENCE rather than a coordinate, so WithinTheWorld is the wrong test for
+// it - two legal points on one map are further apart than MAP_EDGE_YARDS.
+// `<cmath>` would give std::isfinite; see the note at the top of this file for
+// why the include is not taken for two comparisons.
+//
+// UNREACHABLE THROUGH THE ADAPTER TODAY, and guarded anyway. A staging point is
+// put through StagingPointUsable before anything is measured against it and a
+// position in the world is a real number, so neither half of a gap can be one
+// of these. The guard costs one comparison; not having it costs an ARRIVAL
+// declared on a reading nobody can interpret, which is the exact failure this
+// whole section exists to stop.
+bool FiniteReading(float value)
+{
+    return value == value && value * 0.f == 0.f;
+}
+
+}  // namespace
+
+StagingPointVerdict StagingPointCheck(float x, float y, float z)
+{
+    // ORDER MATTERS, AND THE ORIGIN COMES FIRST. (0, 0, 0) is inside the world
+    // grid, so it passes every bounds test there is; it has to be named as its
+    // own answer or it is silently the most plausible-looking wrong point this
+    // module can produce. It is also the one that was actually measured.
+    if (x == 0.f && y == 0.f)
+        return StagingPointVerdict::Unresolved;
+
+    if (!WithinTheWorld(x) || !WithinTheWorld(y) || !WithinTheWorld(z))
+        return StagingPointVerdict::OffTheMap;
+
+    return StagingPointVerdict::Usable;
+}
+
+bool StagingPointUsable(float x, float y, float z)
+{
+    return StagingPointCheck(x, y, z) == StagingPointVerdict::Usable;
+}
+
+std::string StagingPointRefusal(StagingPointVerdict verdict)
+{
+    switch (verdict)
+    {
+        case StagingPointVerdict::Usable:
+            return "the staging point is usable";
+        case StagingPointVerdict::Unresolved:
+            return "the staging point is the origin of the map, which is what three "
+                   "floats hold when nothing has resolved them - so this run never "
+                   "worked out where to wait";
+        case StagingPointVerdict::OffTheMap:
+            return "the staging point is outside the world grid, so it is an "
+                   "arithmetic accident rather than a place";
+        case StagingPointVerdict::NoApproachAxis:
+            return "the way back out lands on the door itself, so it names no "
+                   "approach axis to stand off along";
+    }
+    // Unreachable while the enum and this switch agree, and a plain sentence
+    // rather than an assertion because the caller's job with any of these is to
+    // print it and refuse.
+    return "the staging point cannot be used, for a reason this module has no "
+           "words for yet";
+}
+
+StagingPoint DungeonStagingPoint(float doorX, float doorY,
+                                 float backX, float backY, float backZ,
+                                 float standoffYards)
+{
+    StagingPoint point;
+
+    double const dx = double(backX) - double(doorX);
+    double const dy = double(backY) - double(doorY);
+    double const span = SquareRoot(dx * dx + dy * dy);
+
+    // ONE YARD, and the number is not the interesting part - the refusal is. A
+    // landing point on top of the door names no direction at all, and
+    // normalising it would be a divide by something near zero dressed up as a
+    // bearing. Inventing an axis instead is how a party got walked into rock
+    // the first time this was written.
+    if (!(span > 1.0))
+    {
+        point.verdict = StagingPointVerdict::NoApproachAxis;
+        return point;
+    }
+
+    double const scale = double(standoffYards) / span;
+    float const x = float(double(doorX) + dx * scale);
+    float const y = float(double(doorY) + dy * scale);
+
+    // THE ARITHMETIC IS CHECKED BY THE SAME VERDICT THE CALLER WILL CHECK, and
+    // that is the point of it being one function. A derivation that produced an
+    // unusable point used to be able to return it as a success; now the only
+    // way to leave here with three floats set is to have passed the test the
+    // consumer applies. See StagingPointVerdict for the run this rule is named
+    // after.
+    StagingPointVerdict const verdict = StagingPointCheck(x, y, backZ);
+    if (verdict != StagingPointVerdict::Usable)
+    {
+        point.verdict = verdict;
+        return point;
+    }
+
+    point.verdict = StagingPointVerdict::Usable;
+    point.x = x;
+    point.y = y;
+    point.z = backZ;
+    return point;
+}
+
+bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards)
+{
+    return Magnitude(ground - doorZ) <= toleranceYards;
+}
+
+ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits)
+{
+    // NOT MEASURED, OR NOT A NUMBER, ARE THE SAME ANSWER. Both mean this poll
+    // has nothing to say about where the subject is, and both must fail to the
+    // verdict that leaves a caller waiting rather than to the one that advances
+    // a phase. See FiniteReading.
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
+        return ApproachShape::Unmeasured;
+
+    float const horizontal = Magnitude(gap.horizontalYards);
+    float const vertical = Magnitude(gap.verticalYards);
+
+    // THE FLOOR IS ASKED FIRST, and it is the step bound's own statement read
+    // backwards: a gap one step may bridge is a gap walking crosses, so it is
+    // never a cliff however little ground is left. Both step numbers have to be
+    // real for the rule to mean anything - a caller that supplied neither is
+    // one this cannot answer for, and it gets the flat test it used to have.
+    if (limits.stepYards > 0.f && limits.stepVerticalYards > 0.f &&
+        vertical > limits.stepVerticalYards)
+    {
+        // MULTIPLIED OUT RATHER THAN DIVIDED, so a character standing directly
+        // over the point is an ordinary comparison rather than a division by
+        // zero. It also reads as what it is: the height left, against the
+        // height the ground still to be walked could absorb at the one gradient
+        // this module has measured.
+        if (vertical * limits.stepYards > horizontal * limits.stepVerticalYards)
+            return ApproachShape::Overhead;
+    }
+
+    // A NaN in either half fails this comparison and lands on Closing, which is
+    // the answer that keeps a caller waiting rather than either acting on an
+    // arrival or writing off an approach. Written as the positive test for that
+    // reason; the negated form would have called it an arrival.
+    return horizontal <= limits.arrivalYards ? ApproachShape::Arrived
+                                             : ApproachShape::Closing;
+}
+
+float ApproachDistance(ApproachGap const& gap)
+{
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
+        return -1.f;
+
+    double const horizontal = double(gap.horizontalYards);
+    double const vertical = double(gap.verticalYards);
+    return float(SquareRoot(horizontal * horizontal + vertical * vertical));
+}
+
+std::string ApproachWhere(ApproachGap const& gap)
+{
+    // The same three conditions as the verdict, and deliberately not "whatever
+    // the verdict said": a caller may ask for the words without asking for the
+    // shape, and the cast below is undefined on a NaN.
+    if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
+        !FiniteReading(gap.verticalYards))
+        return "no reading";
+
+    std::string where =
+        std::to_string(static_cast<int>(gap.horizontalYards)) + "y out";
+    int const vertical = static_cast<int>(gap.verticalYards);
+    if (vertical > 0)
+        where += " and " + std::to_string(vertical) + "y above it";
+    else if (vertical < 0)
+        where += " and " + std::to_string(-vertical) + "y below it";
+    return where;
+}
+
+ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& route,
+                            ApproachLimits const& limits)
+{
+    // A ROW WITH NO CORRIDOR IS THE THREE DOORS THAT ALREADY WORK, and they get
+    // back exactly the behaviour they have. Asked first so that nothing below
+    // can touch `state` on their behalf.
+    if (!route.hasWaypoint)
+        return ApproachLeg::Direct;
+
+    // Walked once per run and not again. See ApproachRouteState.
+    if (state.waypointPassed)
+        return ApproachLeg::Direct;
+
+    // A CORRIDOR WHOSE OWN LENGTH IS NOT A READING IS NOT A CORRIDOR. Negative
+    // is ApproachDistance's "no reading", and it is refused rather than read
+    // through an absolute value for the reason TravelEndpointWithinTolerance
+    // gives about its tolerance: a sign that got in by accident must not
+    // quietly become a rule nobody wrote. Refusing lands on the behaviour that
+    // existed before this function did, which is the safe side.
+    if (!(route.waypointToStagingYards >= 0.f))
+        return ApproachLeg::Direct;
+
+    // NO READING ON THE LEG MEANS NO LEG TO JUDGE. The leader is on another map
+    // or was not found this poll; aiming him at a corridor whose distance from
+    // him is unknown would be acting on nothing. Deliberately not sticky: the
+    // next poll that can measure will decide.
+    if (ApproachShapeOf(route.leaderToWaypoint, limits) == ApproachShape::Unmeasured)
+        return ApproachLeg::Direct;
+
+    // ALREADY PAST IT. Nearer the door than the corridor's start is, AND on
+    // ground a walk can cover - the second half is what keeps the rim out, and
+    // it is doing real work rather than belt and braces. The walkable surface
+    // directly over the Wailing Caverns door is 145 yards from the staging
+    // point and the corridor's start is 179, so the rim is THIRTY-FOUR YARDS
+    // NEARER and passes the distance test outright. Only the shape says no.
+    float const toStaging = ApproachDistance(route.leaderToStagingPoint);
+    if (toStaging >= 0.f && toStaging <= route.waypointToStagingYards &&
+        ApproachShapeOf(route.leaderToStagingPoint, limits) != ApproachShape::Overhead)
+    {
+        state.waypointPassed = true;
+        return ApproachLeg::Direct;
+    }
+
+    // REACHED IT. Arrived is the same three-dimensional arrival the barrier and
+    // the staging watchdog already use, so a leader who is ten yards out and a
+    // hundred and fifty yards above the corridor's start has not reached it
+    // either.
+    if (ApproachShapeOf(route.leaderToWaypoint, limits) == ApproachShape::Arrived)
+    {
+        state.waypointPassed = true;
+        return ApproachLeg::Direct;
+    }
+
+    return ApproachLeg::ToWaypoint;
 }
 
 bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
@@ -511,10 +942,136 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                 : DungeonClearStallAction::Extract;
 }
 
-StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
-                             bool measurable, time_t now,
-                             RatchetLimits const& limits)
+bool DungeonRunEnteredTheInstance(std::string const& outcome)
 {
+    // THE CLOSED PAIR, NAMED RATHER THAN DERIVED. These are the only two
+    // outcomes this module writes at a point in the state machine that comes
+    // before anybody has crossed the door: the instance would not reset, and
+    // the party would not assemble. Everything else it writes - 'left',
+    // 'stalled', 'wipe', 'emptied' - is written about a party that was on the
+    // instance map, and so is an empty outcome, which is what the
+    // cold-heartbeat close leaves behind on a row that only exists because
+    // somebody was seen in there.
+    return outcome != "reset_failed" && outcome != "staging_failed";
+}
+
+unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst)
+{
+    unsigned failures = 0;
+    for (std::string const& outcome : outcomesNewestFirst)
+    {
+        if (DungeonRunEnteredTheInstance(outcome))
+            break;
+        ++failures;
+    }
+    return failures;
+}
+
+DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
+                                                uint32_t attemptedRunNumber,
+                                                uint32_t runsWanted,
+                                                bool capKnown)
+{
+    DungeonCampaignProgress progress;
+    progress.counted = DungeonRunEnteredTheInstance(outcome);
+
+    // THE SLOT IS ONLY FILLED BY AN ATTEMPT THAT ENTERED. `attemptedRunNumber`
+    // is which slot was being aimed at, not which slot is now full, and those
+    // are the same number only when the attempt got inside. Guarded against 0
+    // because an adopted run that was never stamped can reach here with no
+    // number of its own, and an unsigned 0 - 1 is the whole campaign.
+    if (progress.counted)
+        progress.runsDone = attemptedRunNumber;
+    else
+        progress.runsDone = attemptedRunNumber ? attemptedRunNumber - 1 : 0;
+
+    progress.campaignOver = capKnown && progress.runsDone >= runsWanted;
+    progress.nextRunNumber = progress.campaignOver ? 0 : progress.runsDone + 1;
+    return progress;
+}
+
+DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completedMask)
+{
+    // NO BITS TO CREDIT MEANS NO ANSWER. Said first, because every other branch
+    // below would report Complete for an empty expectation: zero bits are all
+    // set, trivially and uselessly, and a run that ends the instant it starts is
+    // worse than a run that never ends.
+    if (!expectedMask)
+        return DungeonCompletion::Unknowable;
+
+    return (completedMask & expectedMask) == expectedMask ? DungeonCompletion::Complete
+                                                          : DungeonCompletion::NotYet;
+}
+
+char const* DungeonRunExitOutcome(bool provedComplete, bool stalled)
+{
+    // PROOF OUTRANKS SUSPICION. A run can be both: the clearing watchdog can
+    // have spent its skips on the last pull of a dungeon that then finished, and
+    // the mask saying every encounter is credited is a fact where the stall is
+    // an inference from not having moved.
+    if (provedComplete)
+        return "complete";
+    return stalled ? "stalled" : "left";
+}
+
+bool IsMaintenanceErrand(std::string const& aim)
+{
+    // The bridge's ECONOMY_ERRANDS, kept in step by the same discipline the
+    // travel roles already are: two copies of a vocabulary that must agree, so
+    // a test compares them rather than a comment asking somebody to remember.
+    return aim == "vendor" || aim == "banker" || aim == "repair";
+}
+
+MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
+                                          unsigned outstandingErrands,
+                                          time_t heldForSeconds,
+                                          time_t boundSeconds)
+{
+    bool const walking = IsMaintenanceErrand(leaderAim);
+    bool const transacting = outstandingErrands > 0;
+    if (!walking && !transacting)
+        return MaintenanceHold::Open;
+
+    // THE BOUND IS TESTED ONLY ONCE THERE IS SOMETHING TO BOUND, which is why
+    // it is after the Open branch rather than before it. A campaign that is
+    // simply running has no hold clock at all, and reporting Overdue for one
+    // would open a run that was already free to open while claiming a fault.
+    if (heldForSeconds > boundSeconds)
+        return MaintenanceHold::Overdue;
+
+    // WALKING BEFORE TRANSACTING when both are true. They regularly are: the
+    // first member arrives and gets a row while the last is still on the road.
+    // The two answers only differ in what the log says, and "still walking" is
+    // the one an operator can act on, because it names a journey that may be
+    // going wrong rather than a queue that is merely waiting for it.
+    return walking ? MaintenanceHold::Walking : MaintenanceHold::Transacting;
+}
+
+StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
+                             bool measurable, time_t now,
+                             RatchetLimits const& limits,
+                             ApproachLimits const& approach)
+{
+    ApproachShape const shape = ApproachShapeOf(gap, approach);
+
+    // STAGED, SO NOT WATCHED, AND THE LADDER GOES WITH IT. Inside the barrier
+    // and on the same surface there is nothing left to close, and the leader in
+    // particular is HELD there on purpose - a watchdog measuring him would find
+    // a character that never gets nearer, because it is already there, and
+    // start correcting the one member doing exactly what was asked.
+    //
+    // THE STATE IS RESET RATHER THAN LEFT, so a member that arrives, drifts
+    // back out and returns is watched from the bottom of the ladder rather than
+    // from the rung its last bad patch reached. This used to be the caller's
+    // job and used to be asked with a flat radius, which is how a character on
+    // the rim - ten yards out, a hundred and fifty yards up - was exempted from
+    // being watched at all.
+    if (shape == ApproachShape::Arrived)
+    {
+        state = StagingStallState();
+        return StagingNudge::Nothing;
+    }
+
     if (!measurable)
     {
         // Held, not read. `best` is deliberately left alone: a member that
@@ -525,19 +1082,51 @@ StagingNudge StagingWatchdog(StagingStallState& state, float distanceFromStage,
         return StagingNudge::Nothing;
     }
 
-    RatchetVerdict const verdict = Ratchet(state.progress, distanceFromStage, now, limits);
+    // THE READING IS THE WHOLE GAP AND NOT ITS HORIZONTAL HALF (#217). A
+    // descent counts as progress on this reading, which is what keeps a party
+    // walking down a real ramp from being written off; a climb counts as going
+    // backwards, which is what the horizontal span could never say.
+    RatchetVerdict const verdict =
+        Ratchet(state.progress, ApproachDistance(gap), now, limits);
     if (verdict.progressed)
     {
         // IT IS COMING. The clock has already been restarted by the ratchet;
         // what is undone here is the ladder, so a member that closes the gap
         // after two nudges is watched from the bottom again rather than being
-        // one bad patch away from being given up on.
+        // one bad patch away from being given up on. `stranded` is undone with
+        // it: a member that was over the door and has since found a way down is
+        // not the case that diagnosis was about.
         state.escalated = 0;
         state.gaveUp = false;
+        state.stranded = false;
         return StagingNudge::Nothing;
     }
     if (!verdict.stalled)
         return StagingNudge::Nothing;
+
+    // ABOVE IT AND NO LONGER CLOSING, WHICH IS A DIFFERENT FACT FROM BEING
+    // STUCK AND TAKES THE LADDER OUT OF USE RATHER THAN CLIMBING IT (#217).
+    //
+    // BOTH HALVES ARE NEEDED AND NEITHER IS ENOUGH. Overhead on its own is a
+    // descent in progress: the Deadmines approach read 99/+88, 52/+83 and
+    // 29/+43 on its way down to twelve yards out, and every one of those is
+    // Overhead. Stalled on its own is the ordinary stuck-on-scenery case the
+    // three rungs below exist for and fix. It is the conjunction - a large gap
+    // straight up that has not shrunk for a whole patience window - that means
+    // the route is wrong rather than the walking, and no rung reaches that.
+    //
+    // AND SPENDING THE RUNGS ON IT IS WORSE THAN USELESS. Two of the three
+    // restart movement, and what they restart it into is a cliff edge: six of
+    // the six deaths on the Wailing Caverns approach were falls, and the last
+    // step's own footing refusal was firing throughout. Said once, and then
+    // this stops touching the character at all.
+    if (shape == ApproachShape::Overhead)
+    {
+        if (state.stranded)
+            return StagingNudge::Nothing;
+        state.stranded = true;
+        return StagingNudge::Stranded;
+    }
 
     if (state.escalated >= STAGING_NUDGE_STEPS)
     {
@@ -700,6 +1289,74 @@ bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
     memory.reason = reason;
     memory.since = now;
     return worthSaying;
+}
+
+// --------------------------------------------- the command queue drain (#230) --
+//
+// The argument for both rules is in the header, next to the declarations. What
+// is here is the arithmetic.
+
+bool ClaimIsAbandoned(std::string const& claimedBy, std::string const& runToken,
+                      time_t heldForSeconds, time_t leaseSeconds)
+{
+    // OURS IS NEVER ABANDONED. A row this run holds is being worked on inside
+    // the very poll that would be asking, so the only thing ending it could
+    // achieve is to cancel work that is about to report its own answer. Tested
+    // first, and against a non-empty token, so that a run token that has not
+    // been made yet cannot read as "everything unheld is mine" and disable the
+    // lease for every row at once.
+    if (!runToken.empty() && claimedBy == runToken)
+        return false;
+
+    // A row younger than the lease is somebody's in-flight work until proven
+    // otherwise, including a `verifying` row deliberately sitting out its
+    // read-back window.
+    if (heldForSeconds < leaseSeconds)
+        return false;
+
+    return true;
+}
+
+CommandQueueVoice CommandQueueSay(CommandQueueVoiceState& state,
+                                  CommandQueueSnapshot const& snapshot, time_t now,
+                                  CommandQueueVoiceLimits const& limits)
+{
+    // THE LIVELOCK SIGNATURE, and it does not wait for an age to accumulate: a
+    // poll that had rows in its hands and ran none of them is already the thing
+    // that went unnoticed for twenty five minutes.
+    bool const ranNothing = snapshot.held > 0 && snapshot.executed == 0;
+    bool const notReached = snapshot.pending > 0 && limits.stuckSeconds != 0 &&
+                            snapshot.oldestPendingAge >= limits.stuckSeconds;
+    bool const stuck = ranNothing || notReached;
+    bool const deep = limits.deepRows != 0 && snapshot.pending >= limits.deepRows;
+
+    if (stuck || deep)
+    {
+        // Rate limited only while a complaint is ALREADY standing. The first
+        // poll that goes wrong always speaks, whenever the last unrelated line
+        // happened to be, because the beginning of an outage is the one moment
+        // worth being loud at.
+        if (state.complaining && limits.repeatSeconds != 0 &&
+            now - state.lastSaid < limits.repeatSeconds)
+            return CommandQueueVoice::Silent;
+
+        state.complaining = true;
+        state.lastSaid = now;
+        // STUCK OUTRANKS DEEP. A queue that is both is stuck; saying it is
+        // merely busy would be the reassuring half of a true statement.
+        return stuck ? CommandQueueVoice::Stuck : CommandQueueVoice::Deep;
+    }
+
+    // Healthy. Said once, so the log has an end as well as a beginning, and
+    // then nothing until something goes wrong again.
+    if (state.complaining)
+    {
+        state.complaining = false;
+        state.lastSaid = now;
+        return CommandQueueVoice::Recovered;
+    }
+
+    return CommandQueueVoice::Silent;
 }
 
 // ------------------------------------------------------------- gear (#145) --
@@ -1023,8 +1680,10 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
     // is the answer being certain rather than the answer being good, and the
     // difference matters to the caller: an unjudged verdict is one this file
     // declines to have an opinion on and hands back for somebody else to
-    // decide, whereas "she cannot wear leather" is decided.
+    // decide, whereas "she cannot wear leather" is decided. Exact, too: there
+    // is no unread part of a refusal that might yet change the answer.
     verdict.judged = true;
+    verdict.confidence = GearConfidence::Exact;
 
     if (!who.classAllowed)
     {
@@ -1072,6 +1731,20 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
                      !item.unresolvedRandomProperty &&
                      (item.itemClass == CLASS_ARMOUR || item.itemClass == CLASS_WEAPON);
 
+    // THE SAME FACT, TOLD APART (#221). An unknown role, or a thing that is not
+    // worn gear at all, leaves a number that is not a bound in either
+    // direction - every stat weighted 1.0 orders items roughly and proves
+    // nothing. An unread effect or an unresolved random property is the other
+    // case entirely: both can only ADD, so what is left is a FLOOR, and a floor
+    // is something a comparison can still use.
+    if (who.role == GearRole::Unknown ||
+        (item.itemClass != CLASS_ARMOUR && item.itemClass != CLASS_WEAPON))
+        verdict.confidence = GearConfidence::Opinion;
+    else if (item.hasEffect || item.unresolvedRandomProperty)
+        verdict.confidence = GearConfidence::Floor;
+    else
+        verdict.confidence = GearConfidence::Exact;
+
     std::string const armourClass = ArmourClassName(item);
     verdict.why = armourClass.empty() ? std::string() : armourClass + ", ";
     if (item.armour)
@@ -1105,6 +1778,128 @@ bool GearIsUpgrade(GearVerdict const& candidate, float incumbent)
         return false;
     return candidate.score >
            incumbent * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR;
+}
+
+GearIncumbentScore GearWorn(GearVerdict const& worn)
+{
+    // NOTHING WORN AND NOTHING WEARABLE ARE THE SAME NUMBER, and it is an exact
+    // one. An empty slot is worth zero; a piece the character has lost the
+    // proficiency for is worth zero to it as well, and both of those are
+    // certain rather than a floor under something unknown.
+    if (!worn.wearable)
+        return GearIncumbentScore{0.f, GearConfidence::Exact};
+    return GearIncumbentScore{worn.score, worn.confidence};
+}
+
+GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
+                                     GearIncumbentScore const& offHand)
+{
+    GearIncumbentScore pair;
+    pair.score = mainHand.score + offHand.score;
+
+    // THE WEAKER HALF DECIDES WHAT THE PAIR IS WORTH KNOWING. A sum is only
+    // exactly known when both terms are; a sum with one floor in it is a floor;
+    // and an opinion anywhere makes the whole thing an opinion, because
+    // "roughly ordered" plus "exact" is still only roughly ordered.
+    if (mainHand.confidence == GearConfidence::Opinion ||
+        offHand.confidence == GearConfidence::Opinion)
+        pair.confidence = GearConfidence::Opinion;
+    else if (mainHand.confidence == GearConfidence::Floor ||
+             offHand.confidence == GearConfidence::Floor)
+        pair.confidence = GearConfidence::Floor;
+    else
+        pair.confidence = GearConfidence::Exact;
+    return pair;
+}
+
+GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore const& worn)
+{
+    // A refusal is final and has no number, exactly as it always was.
+    if (!candidate.wearable)
+        return GearComparison::NotBetter;
+
+    // An opinion on either side settles nothing. The role is unknown, or the
+    // thing is not worn gear, so the number does not bound anything and acting
+    // on it is the confident-but-wrong move that put a cloth robe on the tank.
+    if (candidate.confidence == GearConfidence::Opinion ||
+        worn.confidence == GearConfidence::Opinion)
+        return GearComparison::Undecided;
+
+    // What is worn is itself only a floor, so its true worth is somewhere above
+    // the number and nothing can be proved to beat it.
+    if (worn.confidence == GearConfidence::Floor)
+        return GearComparison::Undecided;
+
+    // From here what is worn is exactly known, and the margin is the same one
+    // GearIsUpgrade uses - the two must never disagree about where the line is.
+    bool const clears = candidate.score >
+                        worn.score * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR;
+
+    if (candidate.confidence == GearConfidence::Exact)
+        return clears ? GearComparison::Better : GearComparison::NotBetter;
+
+    // The candidate's score is a FLOOR (#221). A floor that already clears the
+    // margin settles it - the unread part can only widen the gap, never close
+    // it - which is the whole of why a rare with an on-equip effect now gets
+    // worn instead of carried. A floor that does NOT clear proves nothing
+    // either way, so it is said out loud rather than reported as a refusal.
+    return clears ? GearComparison::Better : GearComparison::Undecided;
+}
+
+GearSwapIntent GearIntend(GearSlotMemory const& memory, unsigned candidateEntry,
+                          unsigned wornEntry, bool wanted)
+{
+    GearSwapIntent intent;
+    intent.memory = memory;
+
+    if (!wanted)
+        return intent;
+
+    // IS THIS THE SAME SWAP, UNDONE? The drive put `chosen` on over `displaced`
+    // and is now looking at `chosen` in the bags with `displaced` worn again.
+    // Nothing this module does can produce that: its own swap is one-way, and
+    // after it the candidate IS what is worn. So somebody else moved it.
+    //
+    // AN EMPTY SLOT IS NOT A DISPUTE, and `wornEntry == 0` is what an empty one
+    // looks like. There is no rival item to be arm-wrestling over, an empty
+    // slot is worth exactly zero so filling it is unambiguously an improvement,
+    // and a slot that keeps ending up bare - a piece destroyed, a swap the
+    // server refused - wants filling again rather than giving up on. Standing
+    // down there would leave a character permanently missing a slot, which is
+    // strictly worse than the churn this guard exists to stop.
+    bool const reverted = candidateEntry != 0 && wornEntry != 0 &&
+                          memory.chosen == candidateEntry && memory.displaced == wornEntry;
+    if (!reverted)
+    {
+        // A different pair is a fresh question and gets a fresh budget.
+        intent.swap = true;
+        intent.memory.chosen = candidateEntry;
+        intent.memory.displaced = wornEntry;
+        intent.memory.reversals = 0;
+        return intent;
+    }
+
+    if (memory.reversals >= GEAR_REVERSALS_ALLOWED)
+    {
+        // Already given up on this pair, and already said so. Silence from here.
+        return intent;
+    }
+
+    intent.memory.reversals = memory.reversals + 1;
+    if (intent.memory.reversals >= GEAR_REVERSALS_ALLOWED)
+    {
+        // THE ATTEMPT THAT EXHAUSTS THE BUDGET DOES NOT HAPPEN, and is the one
+        // that speaks. Swapping and then giving up would leave the slot in this
+        // module's preferred state by luck of ordering and say nothing useful;
+        // standing down leaves it where the other writer put it and names both
+        // items, which is what a reader needs in order to go and find the other
+        // writer.
+        intent.standDown = true;
+        return intent;
+    }
+
+    intent.swap = true;
+    return intent;
 }
 
 std::string GearNeedWinner(std::vector<GearContender> const& contenders)
@@ -1399,6 +2194,1130 @@ uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates)
     // to hand to the core, and the core would refuse this one anyway; better
     // it is named "no banker in reach" here than "the core refused" there.
     return pickInteractable ? pick : 0;
+}
+
+
+// ------------------------------------------- the town trip: repair and buy --
+
+char const* TownRetryWord(TownRetry retry)
+{
+    switch (retry)
+    {
+        case TownRetry::Never:
+            return "never";
+        case TownRetry::Elsewhere:
+            return "elsewhere";
+        case TownRetry::Later:
+            break;
+    }
+    return "later";
+}
+
+namespace
+{
+
+// The words of the line, split on runs of blanks. The bank parser's own
+// splitter, duplicated here rather than shared because both live in anonymous
+// namespaces inside this one translation unit and a shared one would have to
+// become part of the header's public surface for no caller outside it.
+std::vector<std::string> TownWords(std::string const& text)
+{
+    std::vector<std::string> words;
+    std::string word;
+    for (char const c : text)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            if (!word.empty())
+                words.push_back(word);
+            word.clear();
+        }
+        else
+            word += c;
+    }
+    if (!word.empty())
+        words.push_back(word);
+    return words;
+}
+
+// `<key>:<digits>` -> true and the number, or false. Anything that is not
+// digits, an empty value, or a value that would not fit in uint32 is a
+// malformed word and not a zero: a wrapped number names a different item and a
+// silent zero is the core's own "all" special case in both of these grammars.
+bool TownKeyed(std::string const& word, char const* key, uint32_t& value)
+{
+    std::string const prefix = std::string(key) + ":";
+    if (word.size() <= prefix.size() || word.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    std::string const digits = word.substr(prefix.size());
+    if (digits.size() > 10)
+        return false;
+    uint64_t parsed = 0;
+    for (char const c : digits)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (parsed > 0xFFFFFFFFull)
+        return false;
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+}  // namespace
+
+RepairRequest ParseRepairRequest(std::string const& command)
+{
+    RepairRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    if (words.empty())
+    {
+        request.error = "malformed repair: want all, or item guid:<item_instance.guid>";
+        return request;
+    }
+
+    if (words[0] == "all")
+    {
+        if (words.size() == 1)
+        {
+            request.verb = RepairVerb::All;
+            return request;
+        }
+        request.error = "malformed repair: all takes no arguments";
+        return request;
+    }
+
+    if (words[0] == "item")
+    {
+        if (words.size() != 2)
+        {
+            request.error = "malformed repair: want item guid:<item_instance.guid>";
+            return request;
+        }
+        uint32_t guid = 0;
+        if (!TownKeyed(words[1], "guid", guid) || guid == 0)
+        {
+            request.error = "malformed repair: item must be guid:<item_instance.guid>, not 0";
+            return request;
+        }
+        request.verb = RepairVerb::One;
+        request.itemGuid = guid;
+        return request;
+    }
+
+    request.error = "malformed repair: unknown verb (want all, or item guid:<n>)";
+    return request;
+}
+
+int ChooseRepairer(std::vector<RepairerCandidate> const& candidates)
+{
+    int best = -1;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        if (best < 0)
+        {
+            best = static_cast<int>(i);
+            continue;
+        }
+        RepairerCandidate const& incumbent = candidates[static_cast<size_t>(best)];
+        RepairerCandidate const& candidate = candidates[i];
+
+        // Cheaper first. Every candidate is already inside interaction
+        // distance, so the yards cost nothing and the discount costs gold.
+        if (candidate.discount != incumbent.discount)
+        {
+            if (candidate.discount < incumbent.discount)
+                best = static_cast<int>(i);
+            continue;
+        }
+        if (candidate.distance < incumbent.distance)
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+TownRetry RepairRefusalRetry(std::string const& detail)
+{
+    // The literals mod_overseer.cpp's DoRepair returns, grouped by what would
+    // have to change for the same row to succeed.
+    static char const* const NEVER[] = {
+        "malformed repair: want all, or item guid:<item_instance.guid>",
+        "malformed repair: all takes no arguments",
+        "malformed repair: want item guid:<item_instance.guid>",
+        "malformed repair: item must be guid:<item_instance.guid>, not 0",
+        "malformed repair: unknown verb (want all, or item guid:<n>)",
+        "malformed repair request",
+        "item not carried",
+        "item has no template",
+        "item cannot be damaged",
+        "item is not damaged",
+        "nothing is damaged",
+    };
+    static char const* const ELSEWHERE[] = {
+        "repairer not in range",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return TownRetry::Elsewhere;
+    return TownRetry::Later;
+}
+
+BuyRequest ParseBuyRequest(std::string const& command)
+{
+    BuyRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    if (words.empty())
+    {
+        request.error = "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]";
+        return request;
+    }
+
+    uint32_t entry = 0;
+    if (!TownKeyed(words[0], "entry", entry) || entry == 0)
+    {
+        request.error = "malformed buy: first word must be entry:<item_template.entry>, not 0";
+        return request;
+    }
+
+    bool haveCount = false;
+    bool haveMax = false;
+    uint32_t count = 1;
+    uint32_t maxCopper = 0;
+
+    for (size_t i = 1; i < words.size(); ++i)
+    {
+        uint32_t value = 0;
+        if (TownKeyed(words[i], "count", value))
+        {
+            if (haveCount || value == 0)
+            {
+                request.error = haveCount ? "malformed buy: count given twice"
+                                          : "malformed buy: count must be 1 or more";
+                return request;
+            }
+            haveCount = true;
+            count = value;
+            continue;
+        }
+        if (TownKeyed(words[i], "max", value))
+        {
+            if (haveMax)
+            {
+                request.error = "malformed buy: max given twice";
+                return request;
+            }
+            haveMax = true;
+            maxCopper = value;
+            continue;
+        }
+        request.error = "malformed buy: unknown word (want count:<n> or max:<copper>)";
+        return request;
+    }
+
+    request.valid = true;
+    request.entry = entry;
+    request.count = count;
+    request.capped = haveMax;
+    request.maxCopper = maxCopper;
+    return request;
+}
+
+int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates)
+{
+    // A vendor's rank, high is better: it has the thing (2), it sells the
+    // thing but is out of it (1), it does not sell the thing (0). Named rather
+    // than written as two nested conditionals so the tie-breaking below reads
+    // as one comparison and not three.
+    auto rank = [](BuyVendorCandidate const& c) -> int
+    { return c.stocksItem ? (c.inStock ? 2 : 1) : 0; };
+
+    int best = -1;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        if (best < 0)
+        {
+            best = static_cast<int>(i);
+            continue;
+        }
+        BuyVendorCandidate const& incumbent = candidates[static_cast<size_t>(best)];
+        BuyVendorCandidate const& candidate = candidates[i];
+
+        int const incumbentRank = rank(incumbent);
+        int const candidateRank = rank(candidate);
+        if (candidateRank != incumbentRank)
+        {
+            if (candidateRank > incumbentRank)
+                best = static_cast<int>(i);
+            continue;
+        }
+        if (candidate.discount != incumbent.discount)
+        {
+            if (candidate.discount < incumbent.discount)
+                best = static_cast<int>(i);
+            continue;
+        }
+        if (candidate.distance < incumbent.distance)
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+TownRetry BuyRefusalRetry(std::string const& detail)
+{
+    static char const* const NEVER[] = {
+        "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]",
+        "malformed buy: first word must be entry:<item_template.entry>, not 0",
+        "malformed buy: count must be 1 or more",
+        "malformed buy: count given twice",
+        "malformed buy: max given twice",
+        "malformed buy: unknown word (want count:<n> or max:<copper>)",
+        "malformed buy request",
+        "no such item",
+        "item is not for this class",
+        "item is for the other faction",
+        "item is not bought with gold",
+        "price exceeds the cap the row set",
+        "count exceeds what the packet carries",
+        "count would overflow the purse",
+    };
+    static char const* const ELSEWHERE[] = {
+        "vendor not in range",
+        "vendor does not stock the item",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return TownRetry::Elsewhere;
+    return TownRetry::Later;
+}
+
+char const* DeathDriverName(DeathDriver driver)
+{
+    switch (driver)
+    {
+        case DeathDriver::Unknown:      return "unknown";
+        case DeathDriver::Recovery:     return "recovery";
+        case DeathDriver::Errand:       return "errand";
+        case DeathDriver::Following:    return "following";
+        case DeathDriver::Fighting:     return "fighting";
+        case DeathDriver::Thrown:       return "thrown";
+        case DeathDriver::Idle:         return "idle";
+        case DeathDriver::Unattributed: return "unattributed";
+    }
+    return "unknown";
+}
+
+char const* MoveGeneratorName(MoveGenerator generator)
+{
+    switch (generator)
+    {
+        case MoveGenerator::Unsampled: return "";
+        case MoveGenerator::Idle:      return "idle";
+        case MoveGenerator::Follow:    return "follow";
+        case MoveGenerator::Point:     return "point";
+        case MoveGenerator::Chase:     return "chase";
+        case MoveGenerator::Flee:      return "flee";
+        case MoveGenerator::Thrown:    return "effect";
+        case MoveGenerator::Other:     return "other";
+    }
+    return "";
+}
+
+DeathDriver NameTheDriver(DeathAttribution const& a)
+{
+    if (!a.sampled || a.movement == MoveGenerator::Unsampled)
+        return DeathDriver::Unknown;
+
+    // This module's own remedy, and it outranks the generator on purpose - see
+    // the header. A window of zero is a caller saying "never attribute a death
+    // to a recovery", and a negative age is "there has never been one".
+    if (a.recoveryWindow > 0 && a.recoverySeconds >= 0 &&
+        a.recoverySeconds <= a.recoveryWindow)
+        return DeathDriver::Recovery;
+
+    switch (a.movement)
+    {
+        case MoveGenerator::Thrown:
+            return DeathDriver::Thrown;
+        case MoveGenerator::Chase:
+        case MoveGenerator::Flee:
+            return DeathDriver::Fighting;
+        case MoveGenerator::Follow:
+            return DeathDriver::Following;
+        case MoveGenerator::Idle:
+            // Nothing had hold of it. An aim it was not executing is worth
+            // seeing, and the aim columns are on the same row, so this does
+            // not overwrite the fact with the intention.
+            return DeathDriver::Idle;
+        case MoveGenerator::Point:
+        case MoveGenerator::Other:
+            break;
+        case MoveGenerator::Unsampled:
+            return DeathDriver::Unknown;
+    }
+
+    return (a.hasTravelTarget || a.hasQuestAim) ? DeathDriver::Errand
+                                                : DeathDriver::Unattributed;
+}
+
+float YardsFallen(bool sampled, float lastZ, float deathZ)
+{
+    if (!sampled)
+        return -1.f;
+    float const dropped = lastZ - deathZ;
+    return dropped > 0.f ? dropped : 0.f;
+}
+
+float FallDamageShare(float yardsDropped, float safeFallYards, float rate)
+{
+    // The core's gate is on the distance itself, before any rate is applied,
+    // so no Rate.Damage.Fall makes a short drop hurt. Written as a negated
+    // >= so a NaN drop falls out here rather than propagating a NaN share.
+    if (!(yardsDropped >= FALL_DAMAGE_MIN_YARDS) || rate <= 0.f)
+        return 0.f;
+
+    float const share =
+        (FALL_DAMAGE_SLOPE * (yardsDropped - safeFallYards) +
+         FALL_DAMAGE_INTERCEPT) * rate;
+
+    if (share <= 0.f)
+        return 0.f;
+    // The core clamps the damage at max health, so the share clamps at one.
+    return share > 1.f ? 1.f : share;
+}
+
+float LethalFallYards(float safeFallYards, float rate)
+{
+    // Solve SLOPE * (yards - safeFall) + INTERCEPT >= 1 / rate. A rate of
+    // zero disables fall damage outright, and nothing is lethal then.
+    if (rate <= 0.f)
+        return -1.f;
+
+    float const yards =
+        (1.f / rate - FALL_DAMAGE_INTERCEPT) / FALL_DAMAGE_SLOPE + safeFallYards;
+
+    // The distance gate still applies underneath the arithmetic: a rate high
+    // enough to make a one-yard drop lethal still never gets to charge for it.
+    return yards < FALL_DAMAGE_MIN_YARDS ? FALL_DAMAGE_MIN_YARDS : yards;
+}
+
+FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards,
+                           float rate)
+{
+    // Negative is YardsFallen's unsampled marker, and it is not zero: see the
+    // header. Saying "it did not fall" about a row nobody sampled is exactly
+    // the mistake this whole function exists to stop.
+    if (recordedYardsFallen < 0.f)
+        return FallAccount::Unsampled;
+    if (recordedYardsFallen == 0.f)
+        return FallAccount::NoDrop;
+    if (recordedYardsFallen < FALL_DAMAGE_MIN_YARDS)
+        return FallAccount::TooShortToHurt;
+
+    return FallDamageShare(recordedYardsFallen, safeFallYards, rate) >= 1.f
+               ? FallAccount::EnoughToKill
+               : FallAccount::Survivable;
+}
+
+char const* FallAccountName(FallAccount account)
+{
+    switch (account)
+    {
+        case FallAccount::Unsampled:      return "unsampled";
+        case FallAccount::NoDrop:         return "no drop";
+        case FallAccount::TooShortToHurt: return "too short to hurt it";
+        case FallAccount::Survivable:     return "could not have killed it";
+        case FallAccount::EnoughToKill:   return "enough to kill it";
+    }
+    return "unsampled";
+}
+
+RevivalMoveVerdict RevivalMayCrossMaps(RevivalMove const& move)
+{
+    RevivalMoveVerdict verdict;
+
+    // The party's map: the most common one among the OTHER members. Counted by
+    // hand rather than with a map container so this file keeps needing nothing
+    // but <string> and <vector>, the same reason WithinRadius folds its own
+    // distance.
+    size_t best = 0;
+    for (size_t i = 0; i < move.partyMapIds.size(); ++i)
+    {
+        size_t count = 0;
+        for (size_t j = 0; j < move.partyMapIds.size(); ++j)
+            if (move.partyMapIds[j] == move.partyMapIds[i])
+                ++count;
+        // Strictly greater, so a tie keeps the map seen first.
+        if (count > best)
+        {
+            best = count;
+            verdict.partyMapKnown = true;
+            verdict.partyMapId = move.partyMapIds[i];
+        }
+    }
+
+    // 1. Nothing to split.
+    if (!verdict.partyMapKnown)
+    {
+        verdict.mayMove = true;
+        return verdict;
+    }
+
+    // 2. The bind is where the party already is.
+    if (move.bindMapId == verdict.partyMapId)
+    {
+        verdict.mayMove = true;
+        return verdict;
+    }
+
+    // 3. Somewhere on this map exists, so the ocean is not the only option and
+    //    is therefore not an option.
+    if (move.graveyardOnThisMap)
+        return verdict;
+
+    // 4. Nothing on this map at all. Move, and say what it costs.
+    verdict.mayMove = true;
+    verdict.splitsParty = true;
+    return verdict;
+}
+
+char const* FollowGapName(FollowGap gap)
+{
+    switch (gap)
+    {
+        case FollowGap::SplitAcrossMaps: return "split across maps";
+        case FollowGap::InFormation:     return "in formation";
+        case FollowGap::Trailing:        return "trailing";
+        case FollowGap::Stranded:        return "stranded";
+    }
+    return "split across maps";
+}
+
+FollowGap ReadFollowGap(bool sameMap, float distance2d,
+                        FollowGapLimits const& limits)
+{
+    // Asked first and answered alone. A cross-map pair has no distance, so
+    // nothing below may look at the one that was handed in.
+    if (!sameMap)
+        return FollowGap::SplitAcrossMaps;
+    if (distance2d <= limits.formationYards)
+        return FollowGap::InFormation;
+    if (distance2d <= limits.catchUpYards)
+        return FollowGap::Trailing;
+    return FollowGap::Stranded;
+}
+
+bool FollowGapIsBehind(FollowGap gap)
+{
+    return gap == FollowGap::Trailing || gap == FollowGap::Stranded;
+}
+
+char const* CrossingLegName(CrossingLeg leg)
+{
+    switch (leg)
+    {
+        case CrossingLeg::Unknown:     return "unknown";
+        case CrossingLeg::OffRoute:    return "off route";
+        case CrossingLeg::WalkToBerth: return "walk to the berth";
+        case CrossingLeg::Aboard:      return "aboard";
+        case CrossingLeg::Ashore:      return "ashore";
+    }
+    return "unknown";
+}
+
+char const* CrossingActionName(CrossingAction action)
+{
+    switch (action)
+    {
+        case CrossingAction::Wait:   return "wait";
+        case CrossingAction::Refuse: return "refuse";
+        case CrossingAction::Walk:   return "walk";
+        case CrossingAction::Ride:   return "ride";
+        case CrossingAction::Done:   return "done";
+    }
+    return "wait";
+}
+
+CrossingStep ReadCrossing(CrossingWorld const& world,
+                          std::vector<CrossingMember> const& members,
+                          CrossingLimits const& limits)
+{
+    CrossingStep step;
+
+    for (CrossingMember const& m : members)
+    {
+        if (!m.readable)
+        {
+            ++step.unreadable;
+            continue;
+        }
+        ++step.readable;
+        if (m.isLeader)
+        {
+            step.leaderReadable = true;
+            step.leaderOnOrigin = m.mapId == world.originMap && !m.aboard;
+            step.leaderAtBerth = step.leaderOnOrigin &&
+                                 m.berthDistance <= limits.berthArrivedYards;
+        }
+        // ABOARD IS ASKED BEFORE THE MAP. A passenger mid-ocean is on
+        // whichever map the transport currently occupies, and that reading
+        // flips under the transport's own teleport rather than under anything
+        // this party did. Counting it as "still on the origin map" would
+        // produce a fresh walk order for somebody standing on a moving deck.
+        if (m.aboard)
+        {
+            ++step.aboard;
+            continue;
+        }
+        if (m.mapId == world.destinationMap)
+            ++step.ashore;
+        else if (m.mapId == world.originMap)
+            ++step.waiting;
+        else
+            ++step.offRoute;
+    }
+
+    // 1. AN UNREADABLE MEMBER OUTRANKS EVERYTHING. Not "most of the party has
+    //    landed": a party is five characters and this reading covers four.
+    if (step.unreadable || !step.readable)
+    {
+        step.leg = CrossingLeg::Unknown;
+        step.action = CrossingAction::Wait;
+        return step;
+    }
+
+    // 2. THE CROSSING ITSELF, BEFORE ANY STEP ALONG IT. A crossing between one
+    //    map and itself is a caller bug rather than a finished crossing, and
+    //    answering Done would hide it.
+    if (world.originMap == world.destinationMap)
+    {
+        step.leg = CrossingLeg::Unknown;
+        step.action = CrossingAction::Refuse;
+        return step;
+    }
+
+    // 3. EVERYBODY ASHORE ENDS IT, and it is asked before the boat is, because
+    //    a party that has already landed does not care whether a boat can
+    //    still be found. This is also what makes the decision idempotent for
+    //    the four members who were never going to move.
+    if (step.ashore == step.readable)
+    {
+        step.leg = CrossingLeg::Ashore;
+        step.action = CrossingAction::Done;
+        return step;
+    }
+
+    // 4. SOMEBODY ON A THIRD MAP. Refused rather than waited on: no boat on
+    //    this route calls there, so nothing about this crossing improves it,
+    //    and reporting it as a wait would hide a member nobody is coming for.
+    if (step.offRoute)
+    {
+        step.leg = CrossingLeg::OffRoute;
+        step.action = CrossingAction::Refuse;
+        return step;
+    }
+
+    // 5. ANYBODY ABOARD AND THE TRANSPORT OWNS IT. Ahead of the refusals
+    //    below on purpose: once a character is on the deck, a missing berth
+    //    or a guarded one is no longer a reason to do anything, and the one
+    //    thing that must not happen is a new order pulling a passenger off a
+    //    moving boat.
+    if (step.aboard)
+    {
+        step.leg = CrossingLeg::Aboard;
+        step.action = CrossingAction::Ride;
+        return step;
+    }
+
+    // 6. THE FACTS THE WALK NEEDS. Each is a refusal rather than a wait,
+    //    because none of them arrives by waiting: a boat that does not serve
+    //    both maps never will, a path with no stop frame on a map has no berth
+    //    on it, and a berth in hostile ground is hostile on every poll.
+    if (!world.transportFound || !world.berthKnown || !world.landingKnown ||
+        world.berthGuarded)
+    {
+        step.leg = CrossingLeg::WalkToBerth;
+        step.action = CrossingAction::Refuse;
+        return step;
+    }
+
+    // 7. THE LEADER IS THE ONLY CHARACTER THIS EVER AIMS. A crossing whose
+    //    leader is already on the far side is therefore one this cannot drive:
+    //    the followers left behind need their leader's aim, and it is not on
+    //    their map to be given. Said rather than worked around, because aiming
+    //    a follower on its own is the scatter this repository keeps paying
+    //    for, and because a leader ashore while followers wait is a real split
+    //    that somebody has to hear about.
+    if (!step.leaderOnOrigin)
+    {
+        step.leg = CrossingLeg::WalkToBerth;
+        step.action = CrossingAction::Refuse;
+        return step;
+    }
+
+    step.leg = CrossingLeg::WalkToBerth;
+    step.action = CrossingAction::Walk;
+    return step;
+}
+
+std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& world)
+{
+    std::string const origin = std::to_string(world.originMap);
+    std::string const destination = std::to_string(world.destinationMap);
+
+    switch (step.action)
+    {
+        case CrossingAction::Wait:
+            return "the world is not answering for " +
+                   std::to_string(step.unreadable) + " of " +
+                   std::to_string(step.unreadable + step.readable) +
+                   " members, so nothing about this crossing is decided; "
+                   "a member that cannot be read has not arrived anywhere";
+
+        case CrossingAction::Done:
+            return "every member read on map " + destination +
+                   ", so the crossing is over and ordinary travel takes it "
+                   "from here";
+
+        case CrossingAction::Ride:
+            return std::to_string(step.aboard) +
+                   " member(s) aboard the transport, which carries its own "
+                   "passengers and teleports them when its path changes map; "
+                   "nothing is aimed while anybody is on the deck";
+
+        case CrossingAction::Walk:
+            return "the leader is on map " + origin + " with " +
+                   std::to_string(step.ashore) + " member(s) already on map " +
+                   destination + "; the berth is a stop frame on the "
+                   "transport's own path, so the leader is aimed at it and the "
+                   "followers on its map walk with it";
+
+        case CrossingAction::Refuse:
+            break;
+    }
+
+    if (world.originMap == world.destinationMap)
+        return "a crossing needs two maps, and this one names map " + origin +
+               " twice";
+    if (step.offRoute)
+        return std::to_string(step.offRoute) +
+               " member(s) on neither map " + origin + " nor map " +
+               destination + ", and no transport on this route calls there";
+    if (!world.transportFound)
+        return "no transport on map " + origin +
+               " serves map " + destination +
+               " (a crossing transport is one whose own path names both maps)";
+    if (!world.berthKnown)
+        return "the transport serving map " + destination +
+               " has no stop frame on map " + origin + ", so this module has "
+               "no berth to walk to and will not derive one from anything else";
+    if (!world.landingKnown)
+        return "the transport has no stop frame on map " + destination +
+               ", so its path does not land where this crossing claims";
+    if (world.berthGuarded)
+        return "the berth on map " + origin +
+               " stands in hostile ground, up to level " +
+               std::to_string(world.berthGuardLevel) +
+               ", and a destination the party cannot survive is not a "
+               "destination however correct its coordinates are";
+    if (!step.leaderOnOrigin)
+        return "the leader is not on map " + origin + " with the " +
+               std::to_string(step.waiting) +
+               " member(s) still waiting there, and this crossing only ever "
+               "aims the leader, so there is nothing here to aim";
+    return "the crossing is refused";
+}
+
+namespace
+{
+
+// Does this relation list name that faction? Both lists are searched only
+// under the caller's `other.faction` guard, which is the core's own and is
+// what keeps the DBC's trailing zero padding from matching a faction of zero.
+bool ListNames(std::vector<uint32_t> const& list, uint32_t faction)
+{
+    for (uint32_t entry : list)
+        if (entry == faction)
+            return true;
+    return false;
+}
+
+// FACTION_TEMPLATE_FLAG_HATES_ALL_EXCEPT_FRIENDS (DBCEnums.h:332). Named here
+// rather than included, because including DBCEnums.h is exactly the thing this
+// file may not do.
+constexpr uint32_t FACTION_TEMPLATE_HATES_ALL_EXCEPT_FRIENDS = 0x2000;
+
+}  // namespace
+
+bool FactionStanceHostileTo(FactionStance const& subject, FactionStance const& other)
+{
+    // ZERO IS NOT A FACTION, and this guard is why. The DBC pads both relation
+    // lists to four entries with zeros, so a nameless side searched against
+    // them would match the padding and read as an enemy of everything. The
+    // core writes the same guard for the same reason.
+    if (other.faction)
+    {
+        if (ListNames(subject.enemyFactions, other.faction))
+            return true;
+        if (ListNames(subject.friendFactions, other.faction))
+            return false;
+    }
+    return (subject.hostileMask & other.ourMask) != 0;
+}
+
+bool FactionStanceFriendlyTo(FactionStance const& subject, FactionStance const& other)
+{
+    // The core's own first line, and it is not redundant with the masks below:
+    // a template whose faction is its own faction is friendly to itself even
+    // when its masks say nothing.
+    if (subject.faction == other.faction)
+        return true;
+
+    if (other.faction)
+    {
+        if (ListNames(subject.enemyFactions, other.faction))
+            return false;
+        if (ListNames(subject.friendFactions, other.faction))
+            return true;
+    }
+    return (subject.friendlyMask & other.ourMask) != 0 ||
+           (subject.ourMask & other.friendlyMask) != 0;
+}
+
+Reaction FactionStanceReaction(FactionStance const& npc, FactionStance const& character)
+{
+    if (FactionStanceHostileTo(npc, character))
+        return Reaction::Hostile;
+    if (FactionStanceFriendlyTo(npc, character))
+        return Reaction::Friendly;
+    // BOTH DIRECTIONS ARE ASKED, and the second one is not a typo in the core.
+    // A goblin town's template names no friends and no masks at all, so it is
+    // friendly to nobody by its own reading; what keeps a neutral shop usable
+    // is the fall-through below, not this line. The line matters for a
+    // template the CHARACTER's side declares friendly.
+    if (FactionStanceFriendlyTo(character, npc))
+        return Reaction::Friendly;
+    if (npc.flags & FACTION_TEMPLATE_HATES_ALL_EXCEPT_FRIENDS)
+        return Reaction::Hostile;
+    return Reaction::Neutral;
+}
+
+bool MayInteractAt(Reaction reaction)
+{
+    return static_cast<int>(reaction) > static_cast<int>(Reaction::Unfriendly);
+}
+
+TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates)
+{
+    TravelTargetChoice choice;
+    choice.considered = candidates.size();
+    if (candidates.empty())
+        return choice;
+
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        TravelTargetCandidate const& candidate = candidates[i];
+        if (!candidate.mayInteract)
+        {
+            ++choice.refused;
+            if (choice.nearestRefused < 0 ||
+                candidate.distance < candidates[std::size_t(choice.nearestRefused)].distance)
+                choice.nearestRefused = int(i);
+            continue;
+        }
+        // The second gate (#267). A spawn standing in ground this character
+        // cannot survive is out for the same reason an unfriendly one is: the
+        // errand cannot end there, and the walk is what kills people.
+        if (candidate.guardCount)
+        {
+            ++choice.guarded;
+            if (choice.nearestGuarded < 0 ||
+                candidate.distance < candidates[std::size_t(choice.nearestGuarded)].distance)
+                choice.nearestGuarded = int(i);
+            continue;
+        }
+        if (choice.index < 0 ||
+            candidate.distance < candidates[std::size_t(choice.index)].distance)
+            choice.index = int(i);
+    }
+
+    if (choice.index >= 0)
+        choice.verdict = TravelTargetVerdict::Chosen;
+    else if (choice.guarded)
+        choice.verdict = TravelTargetVerdict::EveryOneIsGuarded;
+    else
+        choice.verdict = TravelTargetVerdict::NoneWillDealWithUs;
+    return choice;
+}
+
+std::string TravelTargetExplanation(TravelTargetChoice const& choice,
+                                    std::vector<TravelTargetCandidate> const& candidates)
+{
+    // Distances are said as whole yards. A tenth of a yard changes nothing
+    // about the decision and a log line full of float noise is harder to
+    // compare between two polls than one that is not.
+    auto const yards = [](float distance)
+    {
+        long rounded = long(distance < 0.f ? 0.f : distance + 0.5f);
+        return std::to_string(rounded);
+    };
+    auto const nameOf = [&](int index)
+    {
+        TravelTargetCandidate const& candidate = candidates[std::size_t(index)];
+        return "entry " + std::to_string(candidate.entry) + " at " +
+               yards(candidate.distance) + " yards";
+    };
+    // A guarded spawn is named with its guard, because "entry 14964 at 498
+    // yards" and "entry 14964 at 498 yards, guarded by 10 hostile spawn(s) up
+    // to level 65" send an operator to two different places.
+    auto const guardedNameOf = [&](int index)
+    {
+        TravelTargetCandidate const& candidate = candidates[std::size_t(index)];
+        return nameOf(index) + ", guarded by " + std::to_string(candidate.guardCount) +
+               " hostile spawn(s) up to level " + std::to_string(candidate.guardLevel);
+    };
+
+    bool const haveRefused = choice.nearestRefused >= 0 &&
+                             std::size_t(choice.nearestRefused) < candidates.size();
+    bool const haveGuarded = choice.nearestGuarded >= 0 &&
+                             std::size_t(choice.nearestGuarded) < candidates.size();
+
+    if (choice.verdict == TravelTargetVerdict::NoneWillDealWithUs)
+    {
+        std::string said = std::to_string(choice.refused) +
+                           " of them are on this map and this character may interact with "
+                           "none of them";
+        if (haveRefused)
+            said += " - the nearest is " + nameOf(choice.nearestRefused);
+        return said;
+    }
+
+    // A THIRD FACT, NOT A SHADE OF THE SECOND (#267). "There are none here",
+    // "there are some and none will serve you" and "there are some that would
+    // serve you and every one stands in hostile ground" have three different
+    // answers: aim somewhere else, aim at a different faction's town, and send
+    // an escort or pick a different shop. Folding the third into the second is
+    // what let a fatal destination read as a missing one.
+    if (choice.verdict == TravelTargetVerdict::EveryOneIsGuarded)
+    {
+        std::string said = std::to_string(choice.guarded) +
+                           " of them on this map are ones this character may use and every "
+                           "one stands in hostile ground";
+        if (haveGuarded)
+            said += " - the nearest is " + guardedNameOf(choice.nearestGuarded);
+        return said;
+    }
+
+    if (choice.verdict != TravelTargetVerdict::Chosen)
+        return {};
+    if (std::size_t(choice.index) >= candidates.size())
+        return {};
+
+    // ONLY WORTH SAYING WHEN THE GATE CHANGED THE ANSWER. A refused spawn
+    // farther away than the chosen one cost nobody a walk, and counting it
+    // would make an ordinary errand read like a near miss. So the number said
+    // is how many were passed over, not how many were refused anywhere on the
+    // map - the first is what this errand did and the second is a property of
+    // the world.
+    float const chosen = candidates[std::size_t(choice.index)].distance;
+    std::size_t nearer = 0;
+    std::size_t nearerGuarded = 0;
+    for (TravelTargetCandidate const& candidate : candidates)
+    {
+        if (candidate.distance >= chosen)
+            continue;
+        if (!candidate.mayInteract)
+            ++nearer;
+        else if (candidate.guardCount)
+            ++nearerGuarded;
+    }
+    if (!nearer && !nearerGuarded)
+        return {};
+
+    // The two halves are said separately and only when each one cost a walk,
+    // so a line that appears is always a line about this errand. A party that
+    // walked past a shop it may not use and a party that walked past one it
+    // would have died at are looking at different problems.
+    std::string said = "chose " + nameOf(choice.index);
+    if (nearer)
+    {
+        said += " over " + std::to_string(nearer) +
+                " nearer one(s) this character may not interact with";
+        if (haveRefused)
+            said += " - the nearest of those is " + nameOf(choice.nearestRefused);
+    }
+    if (nearerGuarded)
+    {
+        said += nearer ? "; and over " : " over ";
+        said += std::to_string(nearerGuarded) +
+                " nearer one(s) standing in hostile ground";
+        if (haveGuarded)
+            said += " - the nearest of those is " + guardedNameOf(choice.nearestGuarded);
+    }
+    return said;
+}
+
+
+char const* KillerKindName(KillerKind kind)
+{
+    switch (kind)
+    {
+        case KillerKind::Unattributed:  return "environment";
+        case KillerKind::Creature:      return "creature";
+        case KillerKind::Player:        return "player";
+        case KillerKind::SelfInflicted: return "self";
+    }
+    return "environment";
+}
+
+KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
+                         std::string const& killerName,
+                         std::string const& victimName)
+{
+    if (!hookFired)
+        return KillerKind::Unattributed;
+
+    std::string const type = Normalized(hookType);
+
+    // A creature killer is taken at its word. Unit::Kill reaches the creature
+    // hook only from the branch where the killer is not a Player at all, so
+    // there is no self-damage case hiding in it.
+    if (type == "creature")
+        return KillerKind::Creature;
+
+    if (type != "player")
+        return KillerKind::Unattributed;
+
+    // The whole point. An empty victim name cannot be matched against, and
+    // saying "another player" on the strength of a blank would be the guess
+    // this function exists to refuse - so an unnameable victim reads as
+    // unattributed rather than as a PvP kill.
+    std::string const victim = Normalized(victimName);
+    if (victim.empty())
+        return KillerKind::Unattributed;
+
+    return Normalized(killerName) == victim ? KillerKind::SelfInflicted
+                                            : KillerKind::Player;
+}
+
+void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now)
+{
+    state.held = true;
+    state.z = z;
+    state.at = now;
+}
+
+FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
+                                     bool falling, float standingZ, time_t now)
+{
+    // A REAL FALL IS NOT THIS MODULE'S TO ERASE, and this line is the whole of
+    // what stands between the rule and a roster that cannot be hurt by a drop.
+    // Everything this exists to prevent is charged while the character is
+    // STANDING, so declining here costs the fix nothing. The header carries
+    // why one second of poll is enough to catch every fall that could ever be
+    // charged for.
+    //
+    // The other stood-down states go the same way and for the same reason. A
+    // taxi, a flying mount, a boat, a vehicle, a swimmer, a character mid
+    // teleport or a dead one is somewhere this module has no opinion about,
+    // and "I am not entitled to an opinion right now" is not grounds for
+    // rewriting anything.
+    //
+    // The state is deliberately KEPT rather than forgotten here, so that the
+    // poll after a landing resumes - by which time HandleFall has already
+    // charged for the drop it was owed.
+    if (!mayInspect || falling)
+        return FallBaselineVerdict{};
+
+    // Standing. Whatever the core is holding, and whatever wrote it - this
+    // module's own lift, an errand's teleport, or a client packet from a
+    // hillside the character left four minutes ago - the truth is under this
+    // character's feet, and this is the one place that says so.
+    state.held = true;
+    state.z = standingZ;
+    state.at = now;
+    return FallBaselineVerdict{true, standingZ};
+}
+
+// ------------------------------------------------ the addon language (#269) --
+
+GroupChatRoute GroupChatRouteFor(std::string const& channel)
+{
+    GroupChatRoute route;
+    if (channel == "party")
+        route.group = true;
+    else if (channel == "raid")
+        route.group = route.raid = true;
+    else if (channel == "party_addon")
+        route.group = route.addon = true;
+    else if (channel == "raid_addon")
+        route.group = route.raid = route.addon = true;
+    return route;
+}
+
+// ------------------------------------ an errand that is killing its traveller --
+
+int64_t ErrandDeathWindow(int64_t errandSeconds, ErrandDeathLimits const& limits)
+{
+    if (errandSeconds <= 0)
+        return 0;
+    return errandSeconds < limits.windowSeconds ? errandSeconds : limits.windowSeconds;
+}
+
+ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
+                                      ErrandDeathLimits const& limits)
+{
+    ErrandDeathVerdict verdict;
+
+    bool const coolingOff =
+        toll.sinceRefused >= 0 && toll.sinceRefused < limits.cooloffSeconds;
+
+    // 1. A RUN'S OWN AIM IS NEVER TAKEN OFF IT, whichever of the two things
+    //    below would otherwise happen. Answered first because it is the one
+    //    branch that is about who may act at all rather than about what the
+    //    table says, and because a coordinator that re-Claims a target this
+    //    rule refused is not a bridge re-arming a bad errand - it is the run
+    //    doing the job it was started for, and it would win the argument
+    //    every five seconds anyway.
+    if (toll.runOwned)
+    {
+        if (coolingOff || toll.deaths >= limits.deaths)
+            verdict.remedy = ErrandDeathRemedy::DeclineRunOwned;
+        return verdict;
+    }
+
+    // 2. A RE-ISSUE IS ANSWERED BEFORE THE DEATHS ARE COUNTED, because by then
+    //    the count is already wrong. Releasing an errand erases the memory of
+    //    it, so the same target re-aimed a poll later arrives looking like a
+    //    brand new errand: its window is a second wide and its toll is
+    //    therefore zero, forever, however many bodies are behind it. The
+    //    refusal is the only thing that still remembers, so it has to be asked
+    //    here or it can never be reached at all.
+    if (coolingOff)
+    {
+        verdict.remedy = ErrandDeathRemedy::RefuseReissue;
+        verdict.coolOffRemaining = limits.cooloffSeconds - toll.sinceRefused;
+        return verdict;
+    }
+
+    // 3. The rule itself. `>=` and not `>`: AGENTS.md says "exceed roughly
+    //    three in five minutes", and the third death in five minutes IS the
+    //    evidence - a rule that waits for a fourth body to be sure is a rule
+    //    that costs a body to be sure.
+    if (toll.deaths >= limits.deaths)
+        verdict.remedy = ErrandDeathRemedy::Release;
+
+    return verdict;
 }
 
 // -------------------------------------------------------------------- mail --

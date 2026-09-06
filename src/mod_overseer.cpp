@@ -60,7 +60,7 @@
  *                     arrange. The executor never chooses what to send. Cash
  *                     on delivery is refused, and so is deleting a letter that
  *                     still carries something, because that destroys it. See
- *                     2026_09_05_00_overseer_mail.sql.
+ *                     2026_09_05_03_overseer_mail.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -131,6 +131,10 @@
 #include "Log.h"
 #include "DatabaseEnv.h"
 #include "GameGraveyard.h"
+// GameTime::GetGameTime, for the one number the core wants alongside a fall
+// baseline. Every call site in the core that sets one passes this; the single
+// place that passes 0 instead is a bug this module has already been bitten by.
+#include "GameTime.h"
 // The core reporting its own commit, the same call Banner.cpp makes for the
 // startup line. It is what lets a realm say which AzerothCore it is running
 // without anybody having to declare it (mod-overseer#184).
@@ -145,6 +149,7 @@
 #include "ObjectAccessor.h"
 #include "Map.h"
 #include "MapMgr.h"
+#include "MotionMaster.h"
 #include "PathGenerator.h"
 #include "ObjectMgr.h"
 #include "QuestDef.h"
@@ -155,6 +160,7 @@
 #include "DBCStructure.h"
 #include "PlayerbotFactory.h"
 #include "Playerbots.h"
+#include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "Creature.h"
@@ -162,6 +168,8 @@
 #include "SpellMgr.h"
 #include "Timer.h"
 #include "Trainer.h"
+#include "Transport.h"
+#include "TransportMgr.h"
 #include "World.h"
 #include "WorldSession.h"
 #include "TradeData.h"
@@ -176,11 +184,10 @@
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 // kind='mail' (#18): the Mail/MailItemInfo/MailState definitions the read-back
-// reads off a letter, the clock HandleMailTakeItem compares deliver_time
-// against, and the permission that lifts the cross-faction mail refusal - all
-// three named by MailHandler.cpp itself.
+// reads off a letter, and the permission that lifts the cross-faction mail
+// refusal - both named by MailHandler.cpp itself. The clock HandleMailTakeItem
+// compares deliver_time against is GameTime, already included above.
 #include "GameObject.h"
-#include "GameTime.h"
 #include "Mail.h"
 #include "RBAC.h"
 
@@ -200,6 +207,7 @@
 // compiles only by accident of somebody else's include is a catch
 // that stops compiling when they tidy up.
 #include <exception>
+#include <iomanip>
 #include <list>
 #include <map>
 #include <mutex>
@@ -215,6 +223,18 @@ namespace
 {
 constexpr uint32 COMMAND_POLL_MS = 2000;
 constexpr uint32 SNAPSHOT_MS = 5000;
+
+// HOW SOON AFTER A REMEDY A DEATH STILL BELONGS TO IT (#188). NOT A NEW
+// NUMBER, deliberately. Two independently measured quantities already agree on
+// it: the roster's falls complete in nought to five seconds (every under-world
+// sample goes from full health to dead in one event, with
+// `seconds_since_full_health` between 0 and 5, which is also how they were
+// told apart from drowning and fatigue - those tick), and SNAPSHOT_MS is the
+// cadence of the sample every other field on the death row is read from. A
+// third constant that happened to be five would be a third thing to keep in
+// step, so this is derived from the one that already exists.
+constexpr long DEATH_RECOVERY_WINDOW_SECONDS =
+    static_cast<long>(SNAPSHOT_MS / 1000);
 constexpr uint32 WATCH_RELOAD_MS = 30000;
 constexpr uint32 CHAT_SWEEP_MS = 300000;
 
@@ -275,9 +295,13 @@ constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
 // character is underneath the world rather than walking an ordinary slope.
 // The first live Stormwind reading was a 34-36 yard gap, but the trapped party
 // later climbed hidden terrain until only part of that gap remained while its
-// point of view still showed it inside city geometry. Ten is the same maximum
-// single-sample drop GroundHolds permits. The navmesh check, not a larger gap,
-// is what distinguishes a real lower interior from terrain below a WMO.
+// point of view still showed it inside city geometry. Ten was the maximum
+// single-sample drop GroundHolds permitted when this was written; that bound
+// is eight since #262 made the footing rule symmetric, and this number stayed
+// where it was because it is the gap at which a SURFACE OVERHEAD stops being
+// an ordinary slope, which is a different question from how far one stride may
+// fall. The navmesh check, not a larger gap, is what distinguishes a real
+// lower interior from terrain below a WMO.
 constexpr float TERRAIN_RECOVERY_GAP_YARDS = 10.0f;
 // A separation this large is worth NOTICING even when HasLocalNavmesh reports
 // a polygon. The incident measurements were 31 to 35 yards below the Stormwind
@@ -321,12 +345,24 @@ constexpr float TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS = 0.5f;
 // then falls through the world gets the whole ladder again, which is right.
 constexpr time_t TERRAIN_RECOVERY_FORGET_SECONDS = 600;
 
+// HOW FAR A CHARACTER MAY MOVE AND STILL BE INSIDE THE SAME INCIDENT. Bounded
+// from both directions by measurements, which is why it is not a round guess.
+// It must be well ABOVE the 140-yard walk back from the leader's bind point,
+// or every repetition would present as a fresh first occurrence and the ladder
+// would bound nothing. It must be well BELOW the 1,900-yard displacements the
+// fallback itself produces, so that being thrown across a continent really
+// does end the episode. A map change ends it outright and needs no distance:
+// on 2026-09-05 a rung set on map 1 was still standing 37 minutes later on map
+// 43, where it chose the bind point for a scripted fall and ejected the tank.
+constexpr float TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS = 250.0f;
+
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
 constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_GAP_YARDS, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS,
-    TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS};
+    TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS,
+    TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -496,6 +532,175 @@ static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float 
         }
     }
     return threat;
+}
+
+// The same question about MANY spots, answered in ONE pass over the spawn
+// table rather than one pass per spot (#267).
+//
+// WHY THIS EXISTS BESIDE THE ONE ABOVE INSTEAD OF REPLACING IT. A travel
+// resolve has to ask this about every candidate spawn of the wanted role on
+// the map, and `vendor` on Kalimdor is 823 of them. Eight hundred sweeps over
+// every creature spawn in the world, on the world thread, to answer a question
+// one sweep answers for all of them, is not a cost worth paying for a shorter
+// file.
+//
+// AND THE TWO TEST IN A DIFFERENT ORDER, WHICH IS THE ONLY REASON THEY ARE NOT
+// ONE FUNCTION. For a single spot, distance first is cheapest: two subtractions
+// reject nearly every spawn before a template is ever looked up, and the
+// graveyard path pays that cost on every death. For many spots, the template is
+// cheapest first: a friendly or too-low spawn is out for all 823 candidates at
+// once, so the lookup is amortised instead of repeated. Same rule, same members,
+// two access patterns, and folding them together would make one of the two
+// callers pay for the other's shape.
+//
+// `out` is sized here rather than by the caller so the two cannot disagree, and
+// its order is the order of `points`.
+static void HostileSpawnsNearEach(Player* bot, uint32 mapId,
+                                  std::vector<std::pair<float, float>> const& points,
+                                  float radius, uint32 aboveLevel,
+                                  std::vector<NearbyThreat>& out)
+{
+    out.assign(points.size(), NearbyThreat{});
+    FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
+    if (!mine || points.empty())
+        return;
+
+    float const r2 = radius * radius;
+    for (auto const& spawn : sObjectMgr->GetAllCreatureData())
+    {
+        CreatureData const& data = spawn.second;
+        if (data.mapid != mapId)
+            continue;
+        CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
+        if (!tmpl || tmpl->maxlevel <= aboveLevel)
+            continue;
+        FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
+        if (!theirs || !theirs->IsHostileTo(*mine))
+            continue;
+
+        for (std::size_t i = 0; i < points.size(); ++i)
+        {
+            float const dx = data.posX - points[i].first;
+            float const dy = data.posY - points[i].second;
+            if (dx * dx + dy * dy > r2)
+                continue;
+            NearbyThreat& threat = out[i];
+            ++threat.count;
+            if (tmpl->maxlevel > threat.level)
+            {
+                threat.level = tmpl->maxlevel;
+                threat.name = tmpl->Name;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WHETHER THIS CHARACTER COULD ACTUALLY DEAL WITH THAT NPC (#234).
+//
+// A travel errand used to choose its NPC by distance alone, and the nearest
+// vendor to a family parked beside a hostile town is a vendor that will never
+// serve it. `Player::GetNPCIfCanInteractWith` ends with
+//
+//     if (creature->GetReactionTo(this) <= REP_UNFRIENDLY)
+//         return nullptr;                        Player.cpp:2147
+//
+// so the walk cannot end in a sale however well it goes, and the route to it
+// runs through whatever stands between. The decision itself is pure and lives
+// in overseer_decisions; the two functions below are the adapter that reads
+// the DBC rows it needs.
+//
+// Members read at the pinned core:
+//   FactionTemplateEntry fields          DBCStructure.h:976-983
+//   MAX_FACTION_RELATIONS                DBCStructure.h:972
+//   GetFactionTemplateEntry              Unit.h:853
+//   sFactionTemplateStore, sFactionStore DBCStores.h:120-121
+//   FactionEntry::CanHaveReputation      DBCStructure.h:961
+//   Player::GetReputationMgr             Player.h:2159
+//   ReputationMgr::GetForcedRankIfAny    ReputationMgr.h:106
+//   ReputationMgr::GetRank               ReputationMgr.h:99
+//   ReputationMgr::IsAtWar               ReputationMgr.h:93
+//   HasPlayerFlag                        Player.h:1125
+//   HasUnitFlag2                         Unit.h:754
+static OverseerDecisions::FactionStance StanceOf(FactionTemplateEntry const* entry)
+{
+    OverseerDecisions::FactionStance stance;
+    if (!entry)
+        return stance;
+    stance.faction = entry->faction;
+    stance.flags = entry->factionFlags;
+    stance.ourMask = entry->ourMask;
+    stance.friendlyMask = entry->friendlyMask;
+    stance.hostileMask = entry->hostileMask;
+    for (uint32 i = 0; i < MAX_FACTION_RELATIONS; ++i)
+    {
+        stance.enemyFactions.push_back(entry->enemyFaction[i]);
+        stance.friendFactions.push_back(entry->friendFaction[i]);
+    }
+    return stance;
+}
+
+// How a creature of this `creature_template.faction` would react to this
+// character, asked the way the core asks it and in the core's own order.
+//
+// THIS IS SPAWN DATA, NOT A LIVE CREATURE, which is the whole reason it is
+// re-derived rather than delegated. A travel errand chooses a destination
+// hundreds or thousands of yards away, on a grid that is not loaded, so there
+// is no Creature object to put to `GetReactionTo` and there will not be one
+// until the character has already walked there. The four steps below are
+// Unit::GetReactionTo and Unit::GetFactionReactionTo for the one case that
+// matters here - a creature toward a player - with the branches that need a
+// live unit (self-ownership, duels, FFA-PvP, group membership) dropped
+// because a creature template is on neither side of any of them.
+//
+//   1. a forced reaction, from SPELL_AURA_FORCE_REACTION       Unit.cpp:7148
+//   2. the contested-guard flag against a PvP-active player    Unit.cpp:7263
+//   3. the character's REPUTATION with the creature's faction, when that
+//      faction carries one                                     Unit.cpp:7275
+//   4. and only then the faction template masks                Unit.cpp:7287
+//
+// STEP 3 IS NOT OPTIONAL AND IS NOT THE SAME AS STEP 4. Both the vendor that
+// killed this family and the one that will serve it are decided there: the
+// near town's faction is one an Alliance character starts at -42000 with, and
+// the goblin town's is one everybody starts at +500 with. The masks agree in
+// both cases, which is exactly why reading only the masks would look correct
+// while being wrong for any character who has since earned, or declared war
+// on, a reputation of its own.
+static OverseerDecisions::Reaction ReactionTowardCharacter(Player* who, uint32 creatureFaction)
+{
+    // A missing template is the core's own "neutral": GetFactionReactionTo
+    // returns REP_NEUTRAL when either side has none (Unit.cpp:7247-7254), and
+    // refusing here instead would strand an errand on a data gap.
+    if (!who)
+        return OverseerDecisions::Reaction::Neutral;
+    FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(creatureFaction);
+    FactionTemplateEntry const* mine = who->GetFactionTemplateEntry();
+    if (!theirs || !mine)
+        return OverseerDecisions::Reaction::Neutral;
+
+    if (ReputationRank const* forced = who->GetReputationMgr().GetForcedRankIfAny(theirs))
+        return static_cast<OverseerDecisions::Reaction>(*forced);
+
+    if ((theirs->factionFlags & FACTION_TEMPLATE_FLAG_ATTACK_PVP_ACTIVE_PLAYERS) &&
+        who->HasPlayerFlag(PLAYER_FLAGS_CONTESTED_PVP))
+        return OverseerDecisions::Reaction::Hostile;
+
+    if (!who->HasUnitFlag2(UNIT_FLAG2_IGNORE_REPUTATION))
+        if (FactionEntry const* faction = sFactionStore.LookupEntry(theirs->faction))
+            if (faction->CanHaveReputation())
+            {
+                ReputationRank rank = who->GetReputationMgr().GetRank(faction);
+                // At war caps the reaction at neutral rather than raising it,
+                // which is the core's own line and the reason a character who
+                // has declared war on a friendly town stops being able to shop
+                // there. Kept because losing it would send somebody to a
+                // counter that has just stopped serving them.
+                if (who->GetReputationMgr().IsAtWar(faction))
+                    rank = std::min(REP_NEUTRAL, rank);
+                return static_cast<OverseerDecisions::Reaction>(rank);
+            }
+
+    return OverseerDecisions::FactionStanceReaction(StanceOf(theirs), StanceOf(mine));
 }
 
 // The level the game gives the ground at a point: the sub-area's
@@ -677,6 +882,29 @@ static Player* ResurrectOfferedBy(Player* dead)
 // than a number picked to fit one incident.
 constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
 
+// THE GROUND A TRAVEL DESTINATION STANDS ON (#267). A candidate NPC with
+// hostile spawns CON_COLOR_UNKNOWN_LEVEL_DIFF or more levels above the
+// character within this radius is not a place it can shop, however willing the
+// counter is. Measured live: an Alliance party of 25 to 31 was sent to a
+// faction 35 vendor it could trade with perfectly well, standing 21 yards from
+// eight level 65 elites, and died there eighteen times in sixteen minutes.
+//
+// THE RADIUS IS THE GRAVEYARD'S OWN NUMBER AND IS NAMED AS SUCH. The module
+// already refuses to RESURRECT a character where hostile spawns above its level
+// sit within GRAVEYARD_THREAT_RADIUS, and it was the same module walking it to
+// such a place on an errand. One number, so the two answers cannot drift.
+//
+// THE LEVEL GAP IS DELIBERATELY NOT THE GRAVEYARD'S, and the difference is the
+// only interesting judgement here. The graveyard test counts anything above the
+// character's level at all, because a ghost arriving there has no health, no
+// escape and no choice. A living party walking to a shop has all three, and a
+// hostile two levels up is an ordinary hazard of the world rather than a reason
+// to give up shopping. So this one asks the question the game's own nameplate
+// asks: would this read as `??`, maximum danger, to a human looking at it.
+// Refusing less than that would strand a party in any contested zone, which is
+// a worse bug than the one being fixed.
+constexpr float TRAVEL_THREAT_RADIUS = GRAVEYARD_THREAT_RADIUS;
+
 // How close counts as arrived. INTERACTION_DISTANCE is 5.0 yards and is what
 // the game uses to decide whether a player may talk to an NPC at all; this is
 // deliberately looser, because arrival is measured against the SPAWN POINT out
@@ -684,6 +912,24 @@ constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
 // tight and the errand never reads as finished; too loose and it reads as
 // finished from across the room.
 constexpr float TRAVEL_ARRIVED_YARDS = 12.0f;
+
+// How wide `overseer_roster.travel_npc` is, which is the width every aim
+// this module writes has to fit in
+// (data/sql/characters/base/2026_08_25_00_overseer_roster_travel_npc.sql).
+// Written down here because outside strict mode MySQL truncates an
+// over-long value rather than refusing it, and a truncated aim is one the
+// parser can never read back: the errand is written, never resolves, and
+// looks exactly like a character that did not walk. Role keywords and
+// creature entries are nowhere near it; a berth two five-digit coordinates
+// from the origin is the first aim that can reach it.
+constexpr std::size_t TRAVEL_AIM_COLUMN_CHARS = 32;
+
+// How close the leader has to be to a berth before it counts as being AT
+// it. Deliberately the same order as TRAVEL_ARRIVED_YARDS and for the same
+// reason, and deliberately NOT a boarding radius: this module never decides
+// anybody is aboard. What happens inside this distance is that the bot AI
+// polls Map::GetTransportForPos, and the MAP decides.
+constexpr float CROSSING_BERTH_ARRIVED_YARDS = 12.0f;
 
 // The same question for an aimed POSITION, and it needs a different answer.
 // Everything above reasons about a creature: the slack exists because the
@@ -803,6 +1049,20 @@ constexpr uint32 TRAVEL_FLIGHT_MAX_PER_ERRAND = 2;
 // drive can never be the same poll. See TravelHoldsTheWheel.
 constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
 
+// WHAT AN ERRAND IS ALLOWED TO COST BEFORE IT IS CALLED OFF. The numbers are
+// AGENTS.md's own - "if deaths exceed roughly three in five minutes, clear the
+// aim" - and the cool-off is what stops the release being undone by the other
+// writer of this column a poll later. The whole argument, and the evening that
+// turned that sentence into code, is on OverseerDecisions::ErrandDeathLimits.
+constexpr OverseerDecisions::ErrandDeathLimits ERRAND_DEATH_LIMITS{};
+
+// HOW OFTEN A REFUSED RE-ISSUE IS WORTH SAYING AGAIN. The refusal itself acts
+// on every poll - it must, or the column stays armed - but a line every
+// TRAVEL_POLL_MS for fifteen minutes buries the release that caused it. Long
+// enough to be a heartbeat rather than a stream, short enough that "something
+// keeps re-arming this errand" is still visible while it is happening.
+constexpr time_t ERRAND_DEATH_SAY_SECONDS = 120;
+
 // THE GROUND UNDER AN AIM (#138). Four numbers, and the whole argument for
 // them is in the GroundedStep section beside the escort code.
 
@@ -829,12 +1089,26 @@ constexpr float TRAVEL_GROUND_SAMPLE_YARDS = 4.0f;
 // would cost health. Measured from the LAST sample rather than from the start
 // of the step, so a long walk downhill is not mistaken for a cliff: what is
 // being refused is a single step into thin air, which is what a cliff is.
+//
+// IT IS A CEILING AND NO LONGER THE OPERATIVE BOUND (#262). A stride is
+// walkable exactly when the stride back is, so the drop a step may take is the
+// SMALLER of this and TRAVEL_GROUND_RISE_YARDS, and eight is the smaller. Both
+// are still passed to OverseerDecisions::FootingSampleHolds and named
+// separately, because a future reason to move one is not a reason to move the
+// other: this one is a fact about what a fall costs, and that one is a fact
+// about what a slope looks like.
 constexpr float TRAVEL_GROUND_DROP_YARDS = 10.0f;
 
 // HOW FAR THE SURFACE MAY RISE BETWEEN TWO FOUR-YARD SAMPLES. A larger rise
 // is a rock face or wall, not a walkable slope. The old check only rejected
 // drops, so an unreachable quest point on a mountainside was approached by
 // repeated straight uphill steps even after navmesh had refused the route.
+//
+// AND SINCE #262 IT BOUNDS THE DROP AS WELL, being the smaller of the pair: a
+// character may not be walked DOWN a stride it would not be allowed to climb
+// back UP, because a check that approves a step whose reverse it refuses can
+// strand a character permanently, and beside the Wailing Caverns ramp it
+// stranded four.
 constexpr float TRAVEL_GROUND_RISE_YARDS = 8.0f;
 
 // HOW FAR AN AIM'S OWN Z MAY BE CORRECTED onto the surface under it before the
@@ -983,6 +1257,12 @@ constexpr float FOLLOW_CATCH_UP_YARDS = 500.0f;
 // under FOLLOW_CATCH_UP_YARDS so a follower on the line does not flap between
 // the two drives every poll.
 constexpr float FOLLOW_CATCH_UP_DONE_YARDS = FOLLOW_STALL_GAP_YARDS;
+
+// The two lines above, handed to the one rule that reads them, so the two
+// places that ask how far back a follower is provably ask the same question
+// (#241). No new number: both of these already existed and neither moves.
+constexpr OverseerDecisions::FollowGapLimits FOLLOW_GAP_LIMITS{
+    FOLLOW_STALL_GAP_YARDS, FOLLOW_CATCH_UP_YARDS};
 
 // How far the leader may walk from the point a catching-up follower was aimed
 // at before the aim is refreshed. Half of FOLLOW_CATCH_UP_DONE_YARDS, and the
@@ -1148,6 +1428,21 @@ constexpr uint32 DUNGEON_RUN_POLL_MS = 5000;
 // constant the way INTERACTION_DISTANCE is (see TRAVEL_ARRIVED_POSITION_YARDS
 // above), so this is that consensus number, not a measurement.
 constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
+
+// AND THE OTHER TWO DIMENSIONS OF IT (#217). The radius above is a circle drawn
+// on a map, and for the whole of this module's life it was the entire content
+// of "at the staging point" - which is why a character ten yards out and a
+// hundred and fifty yards up a cliff satisfied it.
+//
+// NO NEW NUMBER IS INTRODUCED HERE, and that is the point. The two beside the
+// radius are TRAVEL_STEP_YARDS and TRAVEL_STEP_VERTICAL_YARDS, unchanged, which
+// are the module's only measured statement about how much height walking
+// absorbs per yard of ground - sixty along for twenty up. ApproachShapeOf reads
+// them as a gradient and applies it over the distance that remains, so the
+// approach rule and the step bound that ends it are one rule at two scales
+// rather than two opinions about one cliff. See ApproachLimits.
+constexpr OverseerDecisions::ApproachLimits DUNGEON_APPROACH_LIMITS{
+    DUNGEON_BARRIER_RADIUS_YARDS, TRAVEL_STEP_YARDS, TRAVEL_STEP_VERTICAL_YARDS};
 
 // THE STAGING WATCHDOG'S TWO NUMBERS (#164). Both are taken off measurements
 // this module already made rather than chosen for feel, and both are written
@@ -1444,6 +1739,22 @@ constexpr time_t DUNGEON_RESET_BACKSTOP_SECONDS = 5 * 60;
 // than from memory so it survives a worldserver bounce.
 constexpr uint32 DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES = 3;
 
+// HOW LONG THE NEXT RUN WAITS FOR A MAINTENANCE ERRAND SOMEBODY ELSE IS
+// RUNNING (#168), before it opens anyway and says so.
+//
+// WHY IT IS GENEROUS. The wait is a real walk, and the usable counter for
+// this family is about 1,470 yards from the dungeon door - the nearer one
+// belongs to the other faction and is correctly refused. Add a straggler
+// and a queue that polls every few seconds and twenty minutes is a normal
+// trip rather than a slow one.
+//
+// WHY IT EXISTS AT ALL. Not to keep the campaign brisk. The aim is written
+// by a process outside the worldserver, and if that process dies mid-errand
+// the column holds a role nothing will ever clear. Without a bound a
+// hundred-run campaign would stop there with nothing in any log to say why,
+// which is the failure this whole constant exists to prevent.
+constexpr time_t DUNGEON_MAINTENANCE_HOLD_SECONDS = 20 * 60;
+
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
 // thirty-eight times in twelve minutes and travelled 0.0 yards, because its
@@ -1510,6 +1821,26 @@ constexpr uint8 MAX_TALENT_TAB = 2;
 constexpr uint32 CHAT_FLUSH_MS = 1000;
 // One world tick must never stall on a burst of queued commands.
 constexpr uint32 COMMANDS_PER_POLL = 20;
+// How long a row may sit in `claimed` or `verifying` under a run token that is
+// not this one before the drain ends it (mod-overseer#230). A claim is taken and
+// executed inside a single poll and a `verifying` row resolves within
+// VERIFY_GRACE_MS, so two minutes is far past anything legitimate. What is left
+// after that is a row held by a worldserver that went away, which
+// `WHERE status = 'pending'` can never select again and nothing else will end.
+constexpr time_t COMMAND_CLAIM_LEASE_SECONDS = 120;
+// A waiting row untouched for longer than this is not being REACHED, as opposed
+// to merely queued behind honest work: at COMMANDS_PER_POLL rows every
+// COMMAND_POLL_MS the queue would have to be over a thousand rows deep for a two
+// minute old row to be anything else.
+constexpr time_t COMMAND_QUEUE_STUCK_SECONDS = 120;
+// More than five polls' worth waiting is worth one line even while it moves,
+// because "deep and draining" and "wedged" look identical from outside and a
+// reader should not have to guess which they are looking at.
+constexpr unsigned COMMAND_QUEUE_DEEP_ROWS = COMMANDS_PER_POLL * 5;
+// ...and the queue does not say either of those again inside this. The poll is
+// every two seconds; the give backoff below already records what happens to a
+// log when a per-poll condition is given a per-poll line.
+constexpr time_t COMMAND_QUEUE_SAY_EVERY_SECONDS = 60;
 // How long a strategy command may go unobserved before the queue says so
 // (infra#2819). The bot's AI ticks far faster than this; the window is three
 // command polls rather than one so that a bot which happens to be mid-anything
@@ -2106,6 +2437,45 @@ struct AimSnapshot
 std::mutex g_aimMutex;
 std::map<std::string, AimSnapshot> g_aimSnapshot;  // key: lowercased character name
 
+// WHAT HAD HOLD OF A CHARACTER, sampled beside its health for the same reason
+// and by the same walk (#188). `overseer_death` could say where a character
+// died and never what was moving it, and two investigations dead-ended on
+// that: #231 was filed on a plausible mechanism for the falls and then refuted
+// from the sources because nothing recorded the cause. Over one measured day
+// 55 of 113 roster deaths carried no travel target at all.
+//
+// SAMPLED AND NOT LIVE, and this is not a compromise. Unit::setDeathState
+// stops combat and clears the motion master before Player::KillPlayer runs, so
+// a death hook that asks the live Player "were you in combat" or "what was
+// moving you" is guaranteed the answers "no" and "nothing" - exactly the trap
+// documented above for GetHealth(). The last sample before the death is the
+// only place either fact still exists.
+struct MoveReading
+{
+    uint16 mapId = 0;
+    float x = 0.f, y = 0.f, z = 0.f;
+    time_t sampledAt = 0;             // 0 = never sampled
+    bool inCombat = false;
+    OverseerDecisions::MoveGenerator movement =
+        OverseerDecisions::MoveGenerator::Unsampled;
+};
+std::mutex g_moveMutex;
+std::map<std::string, MoveReading> g_moveHistory;  // key: lowercased name
+
+// The last terrain-recovery remedy this module issued for a character, so a
+// death a few seconds later can be attributed to it rather than guessed at
+// (#188). A remedy is the one movement this module knows it caused, which
+// makes it the one cause it can be certain about and the one most worth being
+// able to blame itself for.
+struct RecoveryMark
+{
+    uint8 rung = 0;       // memory.attempts AFTER the remedy: 1 = the lift
+    uint8 prevRung = 0;   // and before it, so a repeat is visible as a climb
+    time_t at = 0;        // 0 = this module has never moved this character
+};
+std::mutex g_recoveryMutex;
+std::map<std::string, RecoveryMark> g_recoveryMarks;  // key: lowercased name
+
 struct PendingKill
 {
     std::string killerType;   // 'creature' | 'player'
@@ -2125,6 +2495,71 @@ void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
     r.sampledAt = std::time(nullptr);
     if (maxHealth > 0 && health >= maxHealth)
         r.lastFullHealthAt = r.sampledAt;
+}
+
+// The core's own answer to "what is moving this character", folded to the
+// vocabulary the pure decision speaks (#188). The fold happens HERE and not in
+// overseer_decisions.cpp because MovementGeneratorType is a core type and that
+// file is the one place in this module that may not name one - see its header.
+//
+// The groupings are the ones a reader of the death table needs, and each is a
+// statement rather than a bucket: CHASE and the three fleeing types are all
+// combat by another name; EFFECT is a spline something else put the character
+// on, which is what a knockback, a scripted drop and a fall all are; POINT is
+// a move to a coordinate, which covers this module's own travel steps and its
+// lift. Everything left over is named `Other` rather than guessed at, and the
+// raw name is written to the row beside it so a reader can disagree.
+// MotionMaster.h:37-60 on the pinned core.
+OverseerDecisions::MoveGenerator FoldMovementGenerator(MovementGeneratorType type)
+{
+    switch (type)
+    {
+        case IDLE_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Idle;
+        case FOLLOW_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Follow;
+        case POINT_MOTION_TYPE:
+        case ASSISTANCE_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Point;
+        case CHASE_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Chase;
+        case FLEEING_MOTION_TYPE:
+        case TIMED_FLEEING_MOTION_TYPE:
+        case CONFUSED_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Flee;
+        case EFFECT_MOTION_TYPE:
+            return OverseerDecisions::MoveGenerator::Thrown;
+        default:
+            return OverseerDecisions::MoveGenerator::Other;
+    }
+}
+
+// Called from WriteSnapshot, world thread only - see that function. The
+// generator has already been folded to the pure enum by the caller, because
+// MovementGeneratorType is a core type and OverseerDecisions may not name one.
+void RememberMovement(std::string const& name, uint16 mapId, float x, float y,
+                      float z, bool inCombat,
+                      OverseerDecisions::MoveGenerator movement)
+{
+    std::lock_guard<std::mutex> guard(g_moveMutex);
+    MoveReading& r = g_moveHistory[LowerName(name)];
+    r.mapId = mapId;
+    r.x = x;
+    r.y = y;
+    r.z = z;
+    r.inCombat = inCombat;
+    r.movement = movement;
+    r.sampledAt = std::time(nullptr);
+}
+
+// Called from DriveBelowTerrainRecovery, world thread only.
+void RememberRecovery(std::string const& name, uint8 prevRung, uint8 rung)
+{
+    std::lock_guard<std::mutex> guard(g_recoveryMutex);
+    RecoveryMark& m = g_recoveryMarks[LowerName(name)];
+    m.prevRung = prevRung;
+    m.rung = rung;
+    m.at = std::time(nullptr);
 }
 
 // Called from DriveQuests, world thread only - see that function.
@@ -2176,7 +2611,7 @@ struct PendingDeath
     uint32 zoneId = 0;
     float x = 0.f, y = 0.f, z = 0.f;
 
-    std::string killerType;    // 'creature' | 'player' | 'environment'
+    std::string killerType;    // 'creature' | 'player' | 'self' | 'environment'
     std::string killerName;
     uint32 killerEntry = 0;
 
@@ -2191,6 +2626,28 @@ struct PendingDeath
     uint8 grouped = 0;
     uint8 groupSize = 0;
     std::string groupLeader;
+
+    // WHAT WAS MOVING IT, AND TOWARD WHAT (#188). Everything below comes from
+    // the last sample rather than from the dying Player - see MoveReading.
+    std::string driver;            // OverseerDecisions::DeathDriverName
+    std::string movement;          // the core's own generator, unfolded
+    int8 inCombat = -1;            // -1 unsampled, 0 no, 1 yes
+    int32 lastSeenSeconds = -1;    // age of the sample below, -1 = none
+    float lastX = 0.f, lastY = 0.f, lastZ = 0.f;
+    float yardsFallen = -1.f;      // -1 = unsampled, 0 = it did not fall
+
+    // The LEADER'S last sampled position, which is what makes a party split
+    // visible on the row that matters. Taken from the same cache rather than
+    // from a Player*: the leader of a split party is on another map, owned by
+    // another map thread, and free to be deleted while this one reads it
+    // (#125, the same hazard groupLeader above already avoids).
+    uint8 leaderSeen = 0;
+    uint16 leaderMap = 0;
+    float leaderX = 0.f, leaderY = 0.f, leaderZ = 0.f;
+
+    int16 recoveryRung = -1;       // -1 = this module has never moved it
+    int16 recoveryPrevRung = -1;
+    int32 recoverySeconds = -1;
 };
 std::mutex g_deathMutex;
 std::vector<PendingDeath> g_deathQueue;
@@ -2267,27 +2724,93 @@ void RecordDeath(Player* player)
         }
     }
 
+    // The last remedy this module issued for this character, read before the
+    // driver is named because the driver's first question is about it.
+    {
+        std::lock_guard<std::mutex> guard(g_recoveryMutex);
+        auto it = g_recoveryMarks.find(lower);
+        if (it != g_recoveryMarks.end() && it->second.at)
+        {
+            d.recoveryRung = static_cast<int16>(it->second.rung);
+            d.recoveryPrevRung = static_cast<int16>(it->second.prevRung);
+            d.recoverySeconds = static_cast<int32>(now - it->second.at);
+        }
+    }
+
+    // What had hold of it, and where it and its leader were a moment ago.
+    OverseerDecisions::DeathAttribution attribution;
+    attribution.recoverySeconds = d.recoverySeconds;
+    attribution.recoveryWindow = DEATH_RECOVERY_WINDOW_SECONDS;
+    attribution.hasTravelTarget = !d.travelTarget.empty();
+    attribution.hasQuestAim = d.questAim != 0;
+    {
+        std::lock_guard<std::mutex> guard(g_moveMutex);
+        auto it = g_moveHistory.find(lower);
+        if (it != g_moveHistory.end() && it->second.sampledAt)
+        {
+            attribution.sampled = true;
+            attribution.movement = it->second.movement;
+            d.movement = OverseerDecisions::MoveGeneratorName(it->second.movement);
+            d.inCombat = it->second.inCombat ? 1 : 0;
+            d.lastSeenSeconds = static_cast<int32>(now - it->second.sampledAt);
+            d.lastX = it->second.x;
+            d.lastY = it->second.y;
+            d.lastZ = it->second.z;
+            d.yardsFallen = OverseerDecisions::YardsFallen(true, it->second.z, d.z);
+        }
+
+        // The leader's own last sample, by the name the Group already cached.
+        // A leader that is not on the roster is never sampled, which reads as
+        // leaderSeen = 0 rather than as a position of (0, 0, 0) on map 0.
+        if (!d.groupLeader.empty())
+        {
+            auto const leader = g_moveHistory.find(LowerName(d.groupLeader));
+            if (leader != g_moveHistory.end() && leader->second.sampledAt)
+            {
+                d.leaderSeen = 1;
+                d.leaderMap = leader->second.mapId;
+                d.leaderX = leader->second.x;
+                d.leaderY = leader->second.y;
+                d.leaderZ = leader->second.z;
+            }
+        }
+    }
+    d.driver = OverseerDecisions::DeathDriverName(
+        OverseerDecisions::NameTheDriver(attribution));
+
     // The killer, if this death arrived through one of the two kill hooks
     // below - CONSUMED, not copied: a stale entry left behind by a PREVIOUS
     // death on this same character must never attach itself to this one, so
-    // it is erased whether or not it is used. Absent means the death did not
-    // route through Unit::Kill with a non-null killer at all - fall damage,
-    // drowning, fatigue, lava, a GM command - and 'environment' is itself the
-    // honest answer to "what killed them" for that whole class of death,
-    // rather than a blank the reporting layer has to interpret.
+    // it is erased whether or not it is used.
+    //
+    // AN ABSENT HOOK IS NOT WHAT ENVIRONMENTAL DAMAGE LOOKS LIKE (#249). This
+    // comment used to say that a death with no hook meant "fall damage,
+    // drowning, fatigue, lava, a GM command". The first four of those are the
+    // exact opposite: Player::EnvironmentalDamage deals its damage with
+    // `Unit::DealDamage(this, this, ...)` (Player.cpp:853), and Unit::Kill's
+    // hook block has no `killer != victim` guard (Unit.cpp:14298-14306), so
+    // every one of them fires OnPlayerPVPKill with the victim in both slots
+    // and lands here typed 'player' with the character's own name in it. That
+    // reading cost a day: three of Bork's falls on 2026-09-06 were called
+    // self-attributed-therefore-not-environmental while the core's own falling
+    // counter climbed 28 to 31 over the same three deaths. NameTheKiller
+    // separates the two; the environmental TYPE is not knowable from here and
+    // is deliberately not guessed at.
+    bool hookFired = false;
     {
         std::lock_guard<std::mutex> guard(g_killMutex);
         auto it = g_pendingKill.find(lower);
         if (it != g_pendingKill.end())
         {
+            hookFired = true;
             d.killerType = it->second.killerType;
             d.killerName = it->second.killerName;
             d.killerEntry = it->second.killerEntry;
             g_pendingKill.erase(it);
         }
     }
-    if (d.killerType.empty())
-        d.killerType = "environment";
+    d.killerType = OverseerDecisions::KillerKindName(OverseerDecisions::NameTheKiller(
+        hookFired, d.killerType, d.killerName, d.characterName));
 
     std::lock_guard<std::mutex> guard(g_deathMutex);
     if (g_deathQueue.size() >= MAX_DEATH_QUEUE)
@@ -2422,6 +2945,23 @@ public:
         // clock on. Nothing here reads or writes `best`, so the meaning of a
         // zero mark stays entirely OverseerDecisions::Ratchet's to define.
         OverseerDecisions::RatchetState progress;
+        // WHEN THIS ERRAND BEGAN, and never moved afterwards. Not
+        // `progress.since`, which is the ratchet's clock: that one is restarted
+        // by every yard of progress and held through every flight, because it
+        // is a reading about whether the walk is going anywhere rather than
+        // about how old it is. The death breaker needs the age, because an
+        // errand may only be charged for the stretch of the death table it was
+        // actually outstanding for. Stamped on the poll the errand changes,
+        // which is also the poll a restart re-reads the column on: a module
+        // that has just come up has no memory of the crossing so far, and
+        // starting the window from zero is the honest reading rather than a
+        // guessed one.
+        time_t errandSince{0};
+        // "Already said that a run owns this and the count is climbing", so a
+        // decline is one line per errand rather than one every poll. Same
+        // discipline as `flightSaid`, and cleared with the errand for the same
+        // reason.
+        bool deathSaid{false};
     };
 
     // Every enabled character with an outstanding errand, name -> target.
@@ -2511,6 +3051,14 @@ public:
             "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
             Esc(target), Esc(name));
         _state.erase(name);
+        // AND THIS IS THE ONE PLACE THAT KNOWS WHOSE AIM IT IS. Claim is the
+        // dungeon run coordinator's only door into this column, so membership
+        // here IS "a run issued this errand" - the fact the death breaker needs
+        // and the one an escort check cannot supply, because the LEADER on a
+        // staging aim is not escorted, he is aimed. Kept beside `_state` rather
+        // than inside it precisely because the line above erases `_state`: a
+        // new aim is a new errand, and this has to outlive that erase.
+        _claimed[name] = target;
     }
 
     // GIVE THE ERRAND BACK. THE ONE TERMINAL PATH - every release, in either
@@ -2519,6 +3067,11 @@ public:
     {
         CharacterDatabase.Execute(
             "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
+        // The run no longer owns what no longer exists. `_refused` is
+        // deliberately NOT swept here: a refusal that died with the errand it
+        // ended would be forgotten before whatever re-arms this column next
+        // writes to it, which is the entire failure it exists to answer.
+        _claimed.erase(name);
         // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
         // twenty-minute backstop, and a state entry outliving its errand is
         // inherited by the NEXT errand at the same target - which is then
@@ -2554,6 +3107,7 @@ public:
             // The character may be mid-walk under an aim nobody is renewing any
             // more, so this is a release like any other and takes the same grace.
             _handback[it->first] = std::time(nullptr);
+            _claimed.erase(it->first);
             it = _state.erase(it);
         }
     }
@@ -2588,8 +3142,77 @@ public:
         return _state[name];
     }
 
+    // DID A DUNGEON RUN ISSUE THIS ERRAND? Asked of the target as well as the
+    // name, so a run staging aim that has since been replaced by somebody
+    // else's errand for the same character does not answer for it.
+    bool RunOwns(std::string const& name, std::string const& target) const
+    {
+        auto const it = _claimed.find(name);
+        return it != _claimed.end() && it->second == target;
+    }
+
+    // THIS TARGET KILLED THIS CHARACTER AND THE ERRAND WAS CALLED OFF FOR IT.
+    // Recorded rather than merely released because this module is not the only
+    // writer of the column: a release with no memory is undone by the next
+    // thing that re-aims the family, and measurably was.
+    //
+    // ONE REFUSAL PER CHARACTER, not a growing list. The case this answers is
+    // an errand being re-armed within minutes of being called off, so the last
+    // one is the one that matters; a second lethal target simply replaces the
+    // first, and by then the first has stopped being what anybody is walking
+    // to. That also bounds this map at the size of the roster forever.
+    void Refuse(std::string const& name, std::string const& target)
+    {
+        Refusal& refusal = _refused[name];
+        refusal.target = target;
+        refusal.at = std::time(nullptr);
+        refusal.said = 0;
+    }
+
+    // Seconds since Refuse last named THIS target for this character, or -1
+    // when it never has. Whether that is still inside the cool-off is
+    // ErrandDeathBreaker's to decide and not this one's, so the rule lives in
+    // exactly one place and a reader is never asked which copy is the real one.
+    int64_t SecondsSinceRefused(std::string const& name, std::string const& target) const
+    {
+        auto const it = _refused.find(name);
+        if (it == _refused.end() || it->second.target != target)
+            return -1;
+        return static_cast<int64_t>(std::time(nullptr) - it->second.at);
+    }
+
+    // Is the refused re-issue worth a log line again yet? The refusal ACTS on
+    // every poll whatever this answers; this is only about the saying.
+    bool SayRefusalAgain(std::string const& name)
+    {
+        auto const it = _refused.find(name);
+        if (it == _refused.end())
+            return false;
+        time_t const now = std::time(nullptr);
+        if (it->second.said && now - it->second.said < ERRAND_DEATH_SAY_SECONDS)
+            return false;
+        it->second.said = now;
+        return true;
+    }
+
 private:
+    // One errand a character was sent on and died on, and when.
+    struct Refusal
+    {
+        std::string target;
+        time_t at{0};
+        time_t said{0};  // when the re-issue was last reported, 0 = never
+    };
+
     std::map<std::string, TravelState> _state;
+    // Which errands the dungeon run coordinator issued, name -> target. Written
+    // by Claim, which is its only door into the column, and erased by Release
+    // and PruneVanished - every way an errand can end.
+    std::map<std::string, std::string> _claimed;
+    // Which errand last killed each character, so a re-aim at it is refused
+    // rather than walked. Deliberately outlives the errand it ended; see
+    // Refuse. World thread only, like everything else on this loop.
+    std::map<std::string, Refusal> _refused;
     // When travel last let go of a character, so the quest drive does not pick
     // it up on the same tick the errand ended. Written by Release and by
     // PruneVanished - every way an errand can end - and read only by
@@ -4083,6 +4706,12 @@ private:
                 OverseerDecisions::Ratchet(stall.progress, movedFromLast,
                                            std::time(nullptr), FOLLOW_STALL_RATCHET);
 
+            // The same reading DriveCatchUp takes below, from the same pair of
+            // players, so the two can never disagree about them again (#241).
+            float yardsBehind = 0.f;
+            OverseerDecisions::FollowGap const behind =
+                ReadGap(p, leader, yardsBehind);
+
             // THE MARK IS DROPPED HERE, not inside the ratchet, because it is
             // a position and the ratchet is fed one number. `progress.since`
             // is assigned with it for the one case the ratchet cannot see -
@@ -4103,7 +4732,18 @@ private:
             // follower has no errand, so the reaction is to clear a stale
             // movement generator and let it be tried again later, which is
             // what the cooldown below is for.
-            else if (p->GetDistance2d(leader) > FOLLOW_STALL_GAP_YARDS &&
+            //
+            // AND NOT ACROSS A MAP BOUNDARY (#241). This used to ask
+            // GetDistance2d with no map guard, which for a party split between
+            // Duskwood and the Barrens returned 10,560 yards - two coordinate
+            // systems subtracted from each other - reported it as a distance,
+            // and cleared a movement generator on the strength of it, every
+            // five minutes, at three followers whose problem was not a stall. A
+            // nudge is a remedy for a character that has stopped walking, and a
+            // character on another continent has not stopped walking, it has
+            // nowhere to walk. FollowGapIsBehind answers false there, and
+            // DriveCatchUp below says what is actually wrong instead.
+            else if (OverseerDecisions::FollowGapIsBehind(behind) &&
                      progress.stalled &&
                      std::time(nullptr) - stall.nudged > FOLLOW_STALL_SECONDS)
             {
@@ -4113,7 +4753,7 @@ private:
                          "so the next follow tick starts fresh",
                          p->GetName(), static_cast<uint32>(FOLLOW_STALL_JITTER_YARDS),
                          static_cast<uint32>(FOLLOW_STALL_SECONDS / 60),
-                         static_cast<uint32>(p->GetDistance2d(leader)), leader->GetName());
+                         static_cast<uint32>(yardsBehind), leader->GetName());
                 p->GetMotionMaster()->Clear();
                 stall.nudged = std::time(nullptr);
             }
@@ -4533,12 +5173,31 @@ private:
             // Carrying the predicate into the write makes the close atomic with
             // the decision to close. A run refreshed in that window simply is
             // not matched, and the next pass will judge it fresh.
-            CharacterDatabase.Execute(
-                "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
-                "ended_reason = 'heartbeat cold - nobody from the roster seen on the map' "
-                "WHERE id = {} AND state = 'active' "
-                "AND last_progress_at < NOW() - INTERVAL {} SECOND",
-                runId, RUN_COLD_SECONDS);
+            //
+            // AND IT WRITES AN OUTCOME NOW (#225). This was the last writer of
+            // `state = 'ended'` that left the outcome column at its empty
+            // default, so a table an operator reads for "how did each run end"
+            // had a class of row that answered nothing. 'emptied' is the word
+            // the vocabulary already has for it: the map holds nobody, the
+            // coordinator did not walk them out, and no wipe was proved. The
+            // reason column keeps saying which flavour of emptied it was.
+            if (RunAccountingPresent())
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
+                    "outcome = 'emptied', "
+                    "ended_reason = 'heartbeat cold - nobody from the roster seen on the "
+                    "map' "
+                    "WHERE id = {} AND state = 'active' "
+                    "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+                    runId, RUN_COLD_SECONDS);
+            else
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
+                    "ended_reason = 'heartbeat cold - nobody from the roster seen on the "
+                    "map' "
+                    "WHERE id = {} AND state = 'active' "
+                    "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+                    runId, RUN_COLD_SECONDS);
 
             LOG_INFO("module.overseer",
                      "overseer: closed dungeon run {} on map {} - its heartbeat had been "
@@ -4627,6 +5286,50 @@ private:
         return _runAccountingColumns == SchemaColumns::Present;
     }
 
+
+    // THE LEADER'S TRAVEL AIM, READ BACK RATHER THAN REMEMBERED (#168).
+    //
+    // The coordinator's own book (`_travelAims`) knows what THIS module wrote,
+    // and that is exactly what is not wanted here: the question is whether
+    // somebody ELSE wrote one. So the column is read, and the answer is
+    // whatever is in it now, including an errand written by a process that has
+    // since restarted.
+    static std::string LeaderTravelAim(std::string const& leaderName)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT travel_npc FROM overseer_roster WHERE name = '{}' AND enabled = 1",
+            Esc(leaderName));
+        return result ? result->Fetch()[0].Get<std::string>() : std::string();
+    }
+
+    // HOW MANY MAINTENANCE ROWS ARE STILL UNANSWERED, across the whole roster.
+    //
+    // WHY THE WHOLE ROSTER AND NOT THE LEADER. A trip repairs and restocks five
+    // characters; the leader is only the one who was walked to the counter.
+    // Starting a run because the leader's own rows happen to be answered would
+    // walk the other four away from theirs.
+    //
+    // `pending` AND `claimed` BOTH COUNT. A claimed row is one the command poll
+    // has taken and is in the middle of; it is the state a row spends its
+    // actual transaction in, and treating it as finished would open a run
+    // during the one moment the money is moving. Rows that have been answered,
+    // whether delivered or refused, are not outstanding: the pass that wrote
+    // them owns what happens next, and #230 is explicit that a retry is a fresh
+    // row rather than a re-queue of this one.
+    uint32 OutstandingMaintenanceRows()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_command "
+            "WHERE kind IN ('repair', 'buy', 'sell', 'bank') "
+            "AND status IN ('pending', 'claimed', 'verifying')");
+        // A world image whose `kind` ENUM predates these values answers nothing
+        // rather than failing: the query names no column that could be absent,
+        // and an ENUM value that does not exist simply matches no rows. So
+        // "this database cannot answer" and "nothing is outstanding" are the
+        // same answer here, and both mean the run may start.
+        return result ? static_cast<uint32>(result->Fetch()[0].Get<uint64>()) : 0;
+    }
+
     struct DungeonCampaignCap
     {
         uint32 wanted{0};
@@ -4657,10 +5360,20 @@ private:
         return cap;
     }
 
-    // One more run has ended, whatever it was. Incremented rather than written
-    // to a computed value so that a person editing the column between two runs
-    // (raising the cap mid-campaign, or resetting the count to start again)
-    // cannot be silently overwritten by this module's idea of the number.
+    // One more run has HAPPENED. Incremented rather than written to a computed
+    // value so that a person editing the column between two runs (raising the
+    // cap mid-campaign, or resetting the count to start again) cannot be
+    // silently overwritten by this module's idea of the number.
+    //
+    // "WHATEVER IT WAS" IS WHAT THIS USED TO SAY, AND IT WAS THE DEFECT (#225).
+    // Every caller reached here unconditionally, so a reset that would not take
+    // and a barrier that never opened each filled a slot in a campaign of a
+    // hundred without anybody ever standing on the instance map. Measured
+    // 2026-09-05: two rows in overseer_dungeon_run, dungeon_runs_done reading
+    // three, and a campaign that would have finished in nineteen hours having
+    // cleared nothing. The callers now ask
+    // OverseerDecisions::DungeonRunEnteredTheInstance first, and that predicate
+    // carries the argument for where the bar is.
     void CountRunDone(std::string const& leaderName)
     {
         if (!CampaignColumnsPresent())
@@ -4700,9 +5413,22 @@ private:
         return result ? result->Fetch()[0].Get<uint32>() : 0;
     }
 
-    // How many of this campaign's most recent runs failed at the reset, counting
-    // back from the newest and stopping at the first that did not.
-    static uint32 TrailingResetFailures(uint32 campaignId)
+    // How many of this campaign's most recent runs never got inside at all,
+    // counting back from the newest and stopping at the first that did.
+    //
+    // IT USED TO ASK ONLY ABOUT 'reset_failed', AND WIDENING IT IS NOT OPTIONAL
+    // (#225). A staging failure had a bound of its own for as long as it
+    // consumed a campaign slot, and FailStaging's own comment leaned on exactly
+    // that: "Each closed run counts against the campaign's own cap, so a staging
+    // that fails for a reason that keeps being true cannot run forever." Taking
+    // the slot away takes that bound with it, so this stop has to cover both
+    // ways of failing before entry or the count is fixed at the price of a loop
+    // with nothing at the end of it. Twelve minutes an attempt, forever.
+    //
+    // The rows come back newest first and the counting itself is
+    // OverseerDecisions::DungeonRunTrailingFailures, which is where the
+    // vocabulary lives and where it is tested.
+    static uint32 TrailingUnenteredRuns(uint32 campaignId)
     {
         if (!campaignId)
             return 0;
@@ -4714,14 +5440,46 @@ private:
         if (!result)
             return 0;
 
-        uint32 failures = 0;
+        std::vector<std::string> outcomes;
         do
         {
-            if (result->Fetch()[0].Get<std::string>() != "reset_failed")
-                break;
-            ++failures;
+            outcomes.push_back(result->Fetch()[0].Get<std::string>());
         } while (result->NextRow());
-        return failures;
+        return OverseerDecisions::DungeonRunTrailingFailures(outcomes);
+    }
+
+    // IS THE NEWEST ATTEMPT ON THIS MAP ONE THAT NEVER GOT INSIDE? Asked only
+    // when the roster counter reads zero, and asked because that counter can no
+    // longer tell two different situations apart (#225).
+    //
+    // `dungeon_runs_done == 0` is the operator's gesture for "start a new
+    // campaign", and while pre-entry failures still incremented the counter it
+    // was also a reliable sign that no attempt had been made yet. It is not any
+    // more: a campaign whose first four attempts all died at the barrier still
+    // reads zero. Allocating a fresh campaign id on each of those would give
+    // every failure a campaign of its own, and TrailingUnenteredRuns would then
+    // never see two rows together and never stop anything.
+    //
+    // So the rows are asked instead. If the last thing that happened on this
+    // map was an attempt that never reached it, this campaign is still trying to
+    // start and the next attempt belongs to it. If the last thing that happened
+    // was a real run, the zero is the operator's gesture and a new campaign is
+    // allocated. A row with campaign_id 0 is not a campaign to rejoin, so it
+    // answers 0 and a new one is allocated as before.
+    static uint32 UnstartedCampaignOnMap(std::string const& leaderName, uint32 mapId)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT campaign_id, outcome FROM overseer_dungeon_run "
+            "WHERE leader_name = '{}' AND map_id = {} "
+            "ORDER BY id DESC LIMIT 1", Esc(leaderName), mapId);
+        if (!result)
+            return 0;
+
+        uint32 const campaignId = result->Fetch()[0].Get<uint32>();
+        std::string const outcome = result->Fetch()[1].Get<std::string>();
+        if (OverseerDecisions::DungeonRunEnteredTheInstance(outcome))
+            return 0;
+        return campaignId;
     }
 
     // Put a run row into the campaign it belongs to. `AND campaign_id = 0` is
@@ -4788,21 +5546,32 @@ private:
                 Esc(reason), runId);
     }
 
-    // A RUN THAT NEVER GOT INSIDE STILL HAPPENED. The arming drive is the only
+    // A RUN THAT NEVER GOT INSIDE IS STILL AN ATTEMPT, AND AN ATTEMPT NOBODY
+    // WROTE DOWN IS AN ATTEMPT NOBODY CAN SEE. The arming drive is the only
     // thing that opens a run row, and it opens one when it sees a character on
-    // the instance map - so a reset that will not take produces no row at all,
-    // and the campaign would show a gap where its failures were. #144 asks for
-    // the opposite: a failed reset "counts as a failed run". So this inserts the
-    // row itself, born ended.
+    // the instance map - so an attempt that never reaches the map produces no
+    // row at all, and the table shows a gap where its failures were. So this
+    // inserts the row itself, born ended.
+    //
+    // IT TAKES THE OUTCOME AS AN ARGUMENT NOW (#225). It was written for #144's
+    // reset failure and hard-coded 'reset_failed', and the other way an attempt
+    // can die before entry - a barrier that never opens - was routed through
+    // CloseRun instead, which is a no-op when there is no row to close. Measured
+    // 2026-09-05: every staging failure of the day is absent from the table, and
+    // the log line saying so reads "dungeon run 0 ended 'staging_failed'",
+    // where the 0 is the row that was never written. One insert, both
+    // pre-entry failures, and nothing that ends a run may leave the table
+    // silent.
     //
     // THAT CANNOT COLLIDE WITH THE ONE-ACTIVE-RUN-PER-MAP UNIQUE KEY, and the
     // reason is the generated column that key is built on: `active_map` holds
     // the map id only while the run is active and NULL once it has ended, and
     // NULLs do not collide. A row inserted already-ended is therefore invisible
     // to that key by construction.
-    void RecordResetFailedRun(std::string const& leaderName, uint32 mapId,
-                              uint32 campaignId, uint32 runNumber,
-                              std::string const& reason, std::string const& members)
+    void RecordUnenteredRun(std::string const& leaderName, uint32 mapId,
+                            uint32 campaignId, uint32 runNumber,
+                            char const* outcome, std::string const& reason,
+                            std::string const& members)
     {
         if (!RunAccountingPresent())
             return;
@@ -4810,8 +5579,9 @@ private:
             "INSERT INTO overseer_dungeon_run "
             "(leader_name, map_id, state, ended_at, ended_reason, campaign_id, "
             " run_number, outcome, members) "
-            "VALUES ('{}', {}, 'ended', NOW(), '{}', {}, {}, 'reset_failed', '{}')",
-            Esc(leaderName), mapId, Esc(reason), campaignId, runNumber, Esc(members));
+            "VALUES ('{}', {}, 'ended', NOW(), '{}', {}, {}, '{}', '{}')",
+            Esc(leaderName), mapId, Esc(reason), campaignId, runNumber, outcome,
+            Esc(members));
     }
 
     // WAS THAT A WIPE, ASKED OF THE DEATH RECORD RATHER THAN OF A GUESS.
@@ -5897,6 +6667,7 @@ private:
             spawn.y = data.posY;
             spawn.z = data.posZ;
             spawn.npcFlags = npcFlags;
+            spawn.faction = creatureTemplate->faction;
             _travelSpawns.push_back(spawn);
         }
 
@@ -5917,9 +6688,24 @@ private:
     // this character in that primary profession (infra#2757). 0 means "no
     // opinion", which is every errand that is not a profession errand and is
     // byte for byte the behaviour this function has always had.
+    //
+    // AND THE SPAWN HAS TO BE ONE THIS CHARACTER CAN ACTUALLY DEAL WITH
+    // (#234). Every keyword in TravelRoles names an npcflag, and every one of
+    // those is an INTERACTION the core gates on faction: an errand aimed at a
+    // vendor, a repairer, a banker, a trainer or a flight master this
+    // character is unfriendly to cannot end in the thing it was sent to do,
+    // however perfectly the walk goes. So a spawn that fails the gate is not
+    // ranked below the others, it is not a candidate. `at:` and `trigger:`
+    // aims are untouched above, which is what an operator who wants GROUND
+    // rather than an NPC should be using anyway.
+    //
+    // `outSaid` takes a sentence for the log when there is one worth saying -
+    // which nearer spawns were passed over, or why nothing was chosen. It is
+    // an out-parameter rather than a return value so the two existing call
+    // sites that do not want it are unchanged.
     bool ResolveTravelTarget(Player* bot, std::string const& target,
                              uint32& outEntry, WorldPosition& outPos,
-                             uint32 wantSkill = 0)
+                             uint32 wantSkill = 0, std::string* outSaid = nullptr)
     {
         // A PLACE, NOT A CREATURE: `at:<map>:<x>,<y>,<z>`. Answered before the
         // NPC index is even built, because no spawn is involved - the aim names
@@ -6038,8 +6824,17 @@ private:
             (wantedFlag & (UNIT_NPC_FLAG_TRAINER | UNIT_NPC_FLAG_TRAINER_PROFESSION));
 
         uint32 const mapId = bot->GetMapId();
-        float bestDist = 0.f;
-        bool found = false;
+
+        // ONE ANSWER PER FACTION, NOT PER SPAWN. A town's shops share a
+        // faction and a continent's vendor spawns run to hundreds - 823 of
+        // them on the map this was measured on - so the reaction is worked
+        // out once for each distinct `creature_template.faction` and read back
+        // for every spawn that carries it. Scoped to this resolve because the
+        // answer depends on the character asking, and it is asked about one
+        // character.
+        std::map<uint32, bool> mayDealWith;
+        std::vector<OverseerDecisions::TravelTargetCandidate> candidates;
+        std::vector<TravelSpawn const*> spawns;
         for (TravelSpawn const& spawn : _travelSpawns)
         {
             if (spawn.mapId != mapId)
@@ -6049,16 +6844,67 @@ private:
             if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
                 continue;
 
-            float const dist = bot->GetDistance2d(spawn.x, spawn.y);
-            if (!found || dist < bestDist)
+            auto known = mayDealWith.find(spawn.faction);
+            if (known == mayDealWith.end())
+                known = mayDealWith
+                            .emplace(spawn.faction,
+                                     OverseerDecisions::MayInteractAt(
+                                         ReactionTowardCharacter(bot, spawn.faction)))
+                            .first;
+
+            OverseerDecisions::TravelTargetCandidate candidate;
+            candidate.entry = spawn.entry;
+            candidate.distance = bot->GetDistance2d(spawn.x, spawn.y);
+            candidate.mayInteract = known->second;
+            candidates.push_back(candidate);
+            spawns.push_back(&spawn);
+        }
+
+        // WHAT IS STANDING AROUND EACH ONE (#267). Asked only of the spawns
+        // that survived the interaction gate, because a counter that will not
+        // serve this character is already out and its guards are nobody's
+        // business. Off spawn data rather than the live grid, for the reason
+        // GRAVEYARD_THREAT_RADIUS gives: a destination two grids away is not
+        // loaded, and an unloaded grid reads as "no creatures", which is
+        // exactly the wrong answer for this question.
+        //
+        // ONE SWEEP FOR ALL OF THEM. See HostileSpawnsNearEach: there are 823
+        // vendor spawns on the map this was measured on, and asking the
+        // one-spot version 823 times would be 823 passes over every creature
+        // spawn in the world on the world thread.
+        std::vector<std::pair<float, float>> usableAt;
+        std::vector<std::size_t> usableIndex;
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+        {
+            if (!candidates[i].mayInteract)
+                continue;
+            usableAt.emplace_back(spawns[i]->x, spawns[i]->y);
+            usableIndex.push_back(i);
+        }
+        if (!usableAt.empty())
+        {
+            std::vector<NearbyThreat> threats;
+            HostileSpawnsNearEach(bot, mapId, usableAt, TRAVEL_THREAT_RADIUS,
+                                  bot->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1,
+                                  threats);
+            for (std::size_t k = 0; k < usableIndex.size(); ++k)
             {
-                found = true;
-                bestDist = dist;
-                outEntry = spawn.entry;
-                outPos = WorldPosition(spawn.mapId, spawn.x, spawn.y, spawn.z);
+                candidates[usableIndex[k]].guardCount = threats[k].count;
+                candidates[usableIndex[k]].guardLevel = threats[k].level;
             }
         }
-        return found;
+
+        OverseerDecisions::TravelTargetChoice const choice =
+            OverseerDecisions::ChooseTravelTarget(candidates);
+        if (outSaid)
+            *outSaid = OverseerDecisions::TravelTargetExplanation(choice, candidates);
+        if (choice.verdict != OverseerDecisions::TravelTargetVerdict::Chosen)
+            return false;
+
+        TravelSpawn const& chosen = *spawns[static_cast<std::size_t>(choice.index)];
+        outEntry = chosen.entry;
+        outPos = WorldPosition(chosen.mapId, chosen.x, chosen.y, chosen.z);
+        return true;
     }
 
     // ----------------------------------------------------------- professions --
@@ -6240,6 +7086,77 @@ private:
     // declared end state can produce no plan at all, so a stray `learn_skill`
     // on a row nobody has decided about is not merely refused later - it is
     // never even loaded.
+    // WHAT `overseer_death` SAYS ABOUT ONE CHARACTER, ASKED THE WAY EVERY
+    // OTHER TABLE IN THIS FILE IS ASKED.
+    //
+    // These two exist because the drive that wants them may not have a query
+    // of its own. infra#2846 is the reason and test_schema_degrade.py is the
+    // rule: MySQL fails a SELECT naming a missing column or table WHOLE, error
+    // 1054/1146 with no partial rows, and CharacterDatabase.Query hands that
+    // back as a null QueryResult indistinguishable from "nothing matched". A
+    // bare query inside a drive therefore cannot tell "this world has not run
+    // the migration" from "this character has not died", and the drive that
+    // guesses wrong stops working for a reason no log line explains.
+    //
+    // `overseer_death` IS EXACTLY SUCH A TABLE. This module added it, its DDL
+    // is applied by the db-import image, and this file is compiled into the
+    // worldserver image; the two are pinned by separate digests in the same
+    // manifest and bumped independently, so a world that has not run the
+    // migration is a real case rather than a hypothetical one.
+    //
+    // So the absence lives here, once, and both answers below are the same
+    // answer a quiet table would give: nobody has died. That is the safe
+    // direction for a breaker - a missing table cannot call off an errand -
+    // and it is the only direction that lets the drive read them as values.
+    //
+    // NOW() AND NOT UTC_TIMESTAMP(), because `created_at` defaults to
+    // CURRENT_TIMESTAMP and the two have to be the same clock. The
+    // stuck-revival trap counts this table the same way for the same reason;
+    // if either ever has to change, both do.
+
+    // How many times this character has died inside the last `seconds`. A
+    // window of zero or less is an errand with no age yet, which is a poll
+    // with nothing to ask rather than a poll with nothing to find - so it
+    // never reaches the database at all.
+    uint32 RecentDeathCount(std::string const& name, int64 seconds)
+    {
+        if (seconds <= 0)
+            return 0;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND",
+            Esc(name), seconds);
+        if (!result)
+            return 0;  // no such table on this world, or no such deaths - same answer
+
+        return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
+    }
+
+    // Who did most of it, or '' when nothing creature-shaped did and when the
+    // table is not there to ask. Only the release path calls this, so the
+    // steady state still costs one COUNT per character per poll and nothing
+    // else: a release that says "three deaths" and a release that says "three
+    // deaths, all to one level 65 elite" are the same decision and very
+    // different bug reports, but only one of them is worth a GROUP BY.
+    std::string WorstRecentKiller(std::string const& name, int64 seconds)
+    {
+        if (seconds <= 0)
+            return std::string();
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT killer_name, COUNT(*) AS n FROM overseer_death "
+            "WHERE character_name = '{}' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND "
+            "AND killer_type = 'creature' "
+            "GROUP BY killer_name ORDER BY n DESC LIMIT 1",
+            Esc(name), seconds);
+        if (!result)
+            return std::string();
+
+        return result->Fetch()[0].Get<std::string>();
+    }
+
     std::map<std::string, ProfessionPlan> LoadProfessionPlans()
     {
         std::map<std::string, ProfessionPlan> plans;
@@ -7543,20 +8460,29 @@ private:
         return OverseerDecisions::GearScore(GearItemFor(proto, unresolvedRandomProperty), who);
     }
 
-    // What is worn in one slot, scored. An empty slot is zero, which is what
-    // makes the first item into an empty slot an upgrade by construction.
-    static float GearWornScore(Player* bot, OverseerDecisions::GearWearer const& who,
-                               uint8 slot)
+    // What is worn in one slot, scored, AND how much of that score the file can
+    // vouch for (#221). An empty slot is an exact zero, which is what makes the
+    // first item into an empty slot an upgrade by construction.
+    static OverseerDecisions::GearIncumbentScore GearWornIncumbent(
+        Player* bot, OverseerDecisions::GearWearer const& who, uint8 slot)
     {
         Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
         if (!item)
-            return 0.f;
+            return OverseerDecisions::GearWorn(OverseerDecisions::GearVerdict{});
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto)
-            return 0.f;
-        OverseerDecisions::GearVerdict const verdict =
-            GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0);
-        return verdict.score;
+            return OverseerDecisions::GearWorn(OverseerDecisions::GearVerdict{});
+        return OverseerDecisions::GearWorn(
+            GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0));
+    }
+
+    // The same thing as a bare number, which is all the Need vote wants: what
+    // it is comparing is one member's total against another's, and a total is
+    // never exact anyway.
+    static float GearWornScore(Player* bot, OverseerDecisions::GearWearer const& who,
+                               uint8 slot)
+    {
+        return GearWornIncumbent(bot, who, slot).score;
     }
 
     // Everything a character is wearing, scored, which is what decides who
@@ -7608,6 +8534,22 @@ private:
     }
     std::map<std::string, std::set<uint32>> _gearSaid;
 
+    // WHAT THIS DRIVE PUT WHERE (#221), keyed by character and equipment slot.
+    // The same terms as `_gearSaid` above and every other per-character memory
+    // in this file: bounded by the roster times the equipment slots, unguarded
+    // because DriveGear runs only from OnUpdate on the world thread, and lost
+    // on a restart. Losing it costs at most three more swaps on a slot
+    // somebody else is fighting over, and no correctness.
+    std::map<std::string, OverseerDecisions::GearSlotMemory> _gearSlotMemory;
+
+    // The entry worn in one slot, or zero for an empty one. Zero is meaningful
+    // to GearIntend: an empty slot is never something to give up on.
+    static unsigned GearWornEntry(Player* bot, uint8 slot)
+    {
+        Item* const item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        return item ? static_cast<unsigned>(item->GetEntry()) : 0u;
+    }
+
     // One character's bags, against one character's worn gear.
     void SweepGear(Player* bot, OverseerDecisions::GearWearer const& who)
     {
@@ -7644,50 +8586,81 @@ private:
                 continue;
 
             uint8 target = found;
-            float incumbent = GearWornScore(bot, who, found);
+            OverseerDecisions::GearIncumbentScore incumbent =
+                GearWornIncumbent(bot, who, found);
 
             // A TWO-HANDER HAS TO BEAT BOTH HANDS (#14, the Severing Axe): the
             // off hand is emptied to make room for it, so what it is really
             // being compared against is the pair.
             if (proto->InventoryType == INVTYPE_2HWEAPON && found == EQUIPMENT_SLOT_MAINHAND)
             {
-                incumbent = OverseerDecisions::GearIncumbent(
-                    incumbent, GearWornScore(bot, who, EQUIPMENT_SLOT_OFFHAND), true);
+                incumbent = OverseerDecisions::GearIncumbentPair(
+                    incumbent, GearWornIncumbent(bot, who, EQUIPMENT_SLOT_OFFHAND));
             }
             // A RING OR A TRINKET HAS TWO HOMES, and the one worth taking is
             // the worse of them. FindEquipSlot names the first; this picks.
             else if (found == EQUIPMENT_SLOT_FINGER1 || found == EQUIPMENT_SLOT_TRINKET1)
             {
                 uint8 const other = static_cast<uint8>(found + 1);
-                float const second = GearWornScore(bot, who, other);
-                if (second < incumbent)
+                OverseerDecisions::GearIncumbentScore const second =
+                    GearWornIncumbent(bot, who, other);
+                if (second.score < incumbent.score)
                 {
                     target = other;
                     incumbent = second;
                 }
             }
 
-            if (!OverseerDecisions::GearIsUpgrade(candidate, incumbent))
+            // THE THREE-WAY ANSWER (#221). NotBetter is the ordinary state of
+            // most of what a party carries and is said about nothing.
+            OverseerDecisions::GearComparison const verdict =
+                OverseerDecisions::GearCompare(candidate, incumbent);
+            if (verdict == OverseerDecisions::GearComparison::NotBetter)
                 continue;
 
-            // IT SCORES HIGHER AND THE SCORE IS NOT THE WHOLE STORY. Said, and
-            // then left alone: the number that would justify the swap is one
-            // this file has already admitted is incomplete, and swapping on it
-            // anyway is exactly the confident-but-wrong move that put a cloth
-            // robe on the tank. Checked here rather than before the comparison
-            // so it is only ever said about an item that would OTHERWISE have
-            // been put on - the bags are full of things nobody needs told
-            // about.
-            if (!candidate.judged)
+            // UNDECIDED IS NOT A REFUSAL AND IS NOT A SWAP. Either the
+            // candidate's score is only a floor and the floor does not clear
+            // the margin, or what is being worn is itself only a floor and
+            // nothing above it can be proved. Both are worth saying once,
+            // because an item nobody can decide about is exactly the thing a
+            // person should look at - and worth saying ONCE, because the sweep
+            // runs on a five second timer.
+            if (verdict == OverseerDecisions::GearComparison::Undecided)
             {
                 if (SayGearOnce(who.name, item->GetEntry()))
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' is carrying {}, which scores above the {} it is "
-                             "wearing - {} - and it is left in the bags because that score is "
-                             "not the whole story",
+                             "overseer: '{}' is carrying {}, and whether it beats the {} it "
+                             "is wearing cannot be settled from the numbers - {} - so it "
+                             "stays in the bags",
                              who.name, proto->Name1, GearSlotName(target), candidate.why);
                 continue;
             }
+
+            // AM I BEING OVERRULED? (#221) The drive remembers what it put into
+            // this slot and what it took off to do it. Finding that pair the
+            // other way round means somebody else moved it back, because this
+            // drive's own swap is one-way and cannot produce it. Three attempts
+            // and then it stands down and says so, rather than the 124 equips
+            // in eleven hours that one pair of gloves actually cost.
+            std::string const slotKey = who.name + "/" + std::to_string(target);
+            OverseerDecisions::GearSwapIntent const intent = OverseerDecisions::GearIntend(
+                _gearSlotMemory[slotKey], item->GetEntry(), GearWornEntry(bot, target), true);
+            _gearSlotMemory[slotKey] = intent.memory;
+            if (intent.standDown)
+            {
+                Item* const held = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, target);
+                ItemTemplate const* heldProto = held ? held->GetTemplate() : nullptr;
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' has had {} put back on over {} in the {} slot {} "
+                          "times, so something else is equipping this character and the "
+                          "overseer is standing down on that slot - {}",
+                          who.name, heldProto ? heldProto->Name1 : "something",
+                          proto->Name1, GearSlotName(target),
+                          OverseerDecisions::GEAR_REVERSALS_ALLOWED, candidate.why);
+                continue;
+            }
+            if (!intent.swap)
+                continue;
 
             // EVERYTHING THE LOG LINE NEEDS IS READ BEFORE ANYTHING MOVES.
             // Player::SwapItem re-homes both items, so `item` is not where it
@@ -7716,7 +8689,7 @@ private:
                          "overseer: '{}' puts on {} in the {} slot over {} - {} against {} "
                          "for what it was wearing",
                          who.name, itemName, GearSlotName(target), replaced, candidate.why,
-                         static_cast<int>(incumbent));
+                         static_cast<int>(incumbent.score));
             }
             else if (SayGearOnce(who.name, entry))
             {
@@ -7725,7 +8698,7 @@ private:
                          "against {} - and the server refused the swap, so it stays in the "
                          "bags",
                          who.name, itemName, GearSlotName(target), replaced, candidate.why,
-                         static_cast<int>(incumbent));
+                         static_cast<int>(incumbent.score));
             }
         }
     }
@@ -8091,8 +9064,10 @@ private:
     //      is handed a SHORT STEP toward the destination instead - and only
     //      after the ground under that step has been walked in software,
     //      sampled every TRAVEL_GROUND_SAMPLE_YARDS and refused the moment the
-    //      surface falls further than TRAVEL_GROUND_DROP_YARDS below the last
-    //      footing. The next poll steps again from wherever the character then
+    //      surface moves further from the last footing than a stride back over
+    //      the same ground would be allowed to move (#262; see
+    //      OverseerDecisions::FootingSampleHolds). The next poll steps again
+    //      from wherever the character then
     //      stands. This is the "maximum straight-line step" and the "refusal to
     //      step where the ground falls away" the issue asks for, and they are
     //      the same mechanism.
@@ -8263,9 +9238,15 @@ private:
                 // second answer lower than the footing is not a hill, and the
                 // drop test immediately below still has to pass on it.
             }
-            if (footing - next > TRAVEL_GROUND_DROP_YARDS)
-                return false;
-            if (next - footing > TRAVEL_GROUND_RISE_YARDS)
+            // A STRIDE IS WALKABLE EXACTLY WHEN THE STRIDE BACK IS (#262).
+            // These used to be two separate tests with two different bounds,
+            // ten down and eight up, so a nine yard descent was approved and
+            // the climb out of it never could be. See
+            // OverseerDecisions::FootingSampleHolds for the four characters
+            // that cost.
+            if (!OverseerDecisions::FootingSampleHolds(
+                    footing, next, TRAVEL_GROUND_DROP_YARDS,
+                    TRAVEL_GROUND_RISE_YARDS))
                 return false;
             footing = next;
         }
@@ -8304,6 +9285,45 @@ private:
             toX, toY, toFooting + eye,
             p->GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS,
             VMAP::ModelIgnoreFlags::Nothing);
+    }
+
+    // IS THERE ANY DIRECTION OUT OF WHERE THIS CHARACTER STANDS (#262)?
+    //
+    // The same two questions every travel step is asked, GroundHolds and
+    // NothingInTheWay, asked of four bearings around the character rather than
+    // toward an aim. It is not a route and it moves nobody: it is this module
+    // trying to leave and reporting whether it could, which is the one piece
+    // of evidence that separates a character walking under an arch from a
+    // character sealed in a pocket. See
+    // OverseerDecisions::StandingOnTheGround.
+    //
+    // FOUR BEARINGS, THE SAME FOUR HasLocalNavmesh ALREADY USES, so the two
+    // instruments are asked about the same neighbourhood and a disagreement
+    // between them is a difference of instrument rather than of direction.
+    //
+    // TWO STRIDES, AND TWO IS THE SHORTEST REACH THAT ASKS ANYTHING.
+    // GroundHolds returns true without looking for a step under
+    // TRAVEL_GROUND_SAMPLE_YARDS - "one stride, with nothing between to fall
+    // into" - so a probe of exactly one stride would land on that boundary and
+    // be answered by rounding. A longer reach would be a worse question rather
+    // than a better one: eight yards inside an ordinary room is still floor,
+    // while sixty would find a wall for a character that is perfectly fine and
+    // standing in a corridor.
+    static bool AnyDirectionHolds(Player* bot)
+    {
+        static constexpr float DIRECTIONS[] = {0.f, 1.5708f, 3.1416f, 4.7124f};
+        static constexpr float REACH = TRAVEL_GROUND_SAMPLE_YARDS * 2.f;
+        for (float delta : DIRECTIONS)
+        {
+            float const angle = bot->GetOrientation() + delta;
+            float const x = bot->GetPositionX() + std::cos(angle) * REACH;
+            float const y = bot->GetPositionY() + std::sin(angle) * REACH;
+            float footing = 0.f;
+            if (GroundHolds(bot, x, y, footing) &&
+                NothingInTheWay(bot, x, y, footing))
+                return true;
+        }
+        return false;
     }
 
     // Will the mover follow the navmesh from where `bot` stands to (x, y, z),
@@ -8693,6 +9713,45 @@ private:
         return p && p->IsInWorld() && !p->IsInFlight() && !p->IsFalling();
     }
 
+    // THE ONE READING, TAKEN THE SAME WAY AT BOTH CALL SITES (#241). Two
+    // expressions over the same pair of players used to disagree: the stall
+    // check subtracted two coordinate systems and reported the result as a
+    // distance, and this drive folded the same pair to a sentinel. `yards` is
+    // only written when it means something; on a cross-map pair it is left at
+    // zero and the verdict is the thing to read.
+    static OverseerDecisions::FollowGap ReadGap(Player* p, Player* leader,
+                                                float& yards)
+    {
+        bool const sameMap = p->GetMapId() == leader->GetMapId();
+        yards = sameMap ? p->GetDistance2d(leader) : 0.f;
+        return OverseerDecisions::ReadFollowGap(sameMap, yards, FOLLOW_GAP_LIMITS);
+    }
+
+    // SAID ONCE PER SPLIT, NOT ONCE PER POLL, and re-said if the leader turns
+    // up on a third map. The party poll runs every few seconds and this
+    // condition can last for an hour, so a line per poll would bury itself;
+    // one line per follower per split is four lines for this roster and is
+    // what an operator needs, because it names WHICH characters are stranded.
+    // Cleared the moment the maps agree again, by DriveCatchUp.
+    void SayPartySplit(std::string const& name, Player* p, Player* leader)
+    {
+        uint32 const here = p->GetMapId();
+        uint32 const there = leader->GetMapId();
+        auto const said = _partySplitSaid.find(name);
+        if (said != _partySplitSaid.end() && said->second == there)
+            return;
+        _partySplitSaid[name] = there;
+        LOG_ERROR("module.overseer",
+                  "overseer: '{}' is on map {} and its leader '{}' is on map {} - THE "
+                  "PARTY IS SPLIT ACROSS TWO MAPS AND NOTHING IN THIS MODULE CAN REJOIN "
+                  "IT. `follow` cannot cross a map, this catch-up walk has nowhere on "
+                  "this map to aim at, and an `at:` aim cannot name a coordinate on "
+                  "another one, so this follower stands still until somebody moves it. "
+                  "Every errand that needs the family in one place is blocked for it "
+                  "until then (#241)",
+                  name, here, leader->GetName(), there);
+    }
+
     // ONE FOLLOWER, ONE POLL: should it be walking to the leader on its own,
     // and if it already is, should it still be (#138). Called from
     // KeepRosterFollowing for every follower in the group, after the master
@@ -8702,6 +9761,22 @@ private:
     void DriveCatchUp(Player* p, Player* leader)
     {
         std::string const name = p->GetName();
+
+        // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Read
+        // BEFORE the escorted early-return below, so that a split is forgotten
+        // as soon as the maps agree again, whatever else this poll decides to
+        // do. `gap` used to carry a -1 sentinel for "not on the leader's map",
+        // which an `at:` aim cannot cross (ResolveTravelTarget refuses a spawn
+        // on another map) and which following cannot cross either
+        // (FollowActions.cpp:285). The sentinel is a named verdict now, because
+        // -1 took the same exit as "in formation" one branch further down, and
+        // that exit is silent (#241).
+        float gap = 0.f;
+        OverseerDecisions::FollowGap const reading = ReadGap(p, leader, gap);
+        bool const split = reading == OverseerDecisions::FollowGap::SplitAcrossMaps;
+        if (!split)
+            _partySplitSaid.erase(name);
+
         auto const it = _dungeonEscorts.find(name);
         bool const escorted = it != _dungeonEscorts.end();
         // A run holds this member. Its staging point is where the leader is
@@ -8709,13 +9784,6 @@ private:
         // authority on when it stops.
         if (escorted && !it->second.catchUp)
             return;
-
-        // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Negative
-        // means "not on the leader's map", which an `at:` aim cannot cross -
-        // ResolveTravelTarget refuses a spawn on another map - and which
-        // following cannot cross either (FollowActions.cpp:285).
-        float const gap =
-            p->GetMapId() == leader->GetMapId() ? p->GetDistance2d(leader) : -1.f;
 
         if (escorted)
         {
@@ -8743,14 +9811,21 @@ private:
             // twenty-minute backstop releases the aim as unreachable and says
             // so, and the next party poll claims it again from wherever the
             // follower now stands.
-            if (gap < 0.f ||
+            if (split ||
                 (gap <= FOLLOW_CATCH_UP_DONE_YARDS && FollowStepHolds(p, leader)))
             {
-                if (gap < 0.f)
+                if (split)
+                {
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is no longer on the map '{}' is on - its "
                              "catch-up walk ends, there is nowhere on this map to walk to",
                              name, leader->GetName());
+                    // ...AND THAT ENDING IS NOT THE END OF THE PROBLEM (#241).
+                    // The line above says a walk stopped. It does not say that
+                    // nothing will ever start another one, which is the fact an
+                    // operator needs and the one that used to go unsaid.
+                    SayPartySplit(name, p, leader);
+                }
                 else
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is back within {} yards of '{}' on ground it "
@@ -8807,10 +9882,23 @@ private:
         // line it is already depending on one discrete straight step per
         // attempt landing (MovementActions.cpp:1224), and this check has just
         // found that the step does not land - so there is nothing to preserve.
-        // A follower in formation - or on another map, which is what a
-        // negative gap means - is nothing this drive has an opinion about, and
-        // answering that first keeps every reading below off the common path.
-        if (gap <= FOLLOW_STALL_GAP_YARDS)
+        // A follower in formation is nothing this drive has an opinion about,
+        // and answering that first keeps every reading below off the common
+        // path.
+        //
+        // A FOLLOWER ON ANOTHER MAP USED TO TAKE THE SAME EXIT, and that is
+        // #241. A gap of -1 is `<= FOLLOW_STALL_GAP_YARDS`, so the two cases
+        // were indistinguishable here and the second one produced no line at
+        // all: measured 17:36:00 to 17:47 on 2026-09-05, eleven minutes, four
+        // followers, not one "is N yards behind" line and not one "re-aimed
+        // at" line for any of them. This drive still cannot walk anybody across
+        // an ocean and does not pretend to. It says so instead.
+        if (split)
+        {
+            SayPartySplit(name, p, leader);
+            return;
+        }
+        if (reading == OverseerDecisions::FollowGap::InFormation)
             return;
         // A dead follower is a ghost walking to its corpse, which is
         // DriveStuckRevival's business and not a distance from anybody; a
@@ -8829,7 +9917,7 @@ private:
         // Asked LAST, because it is the only reading here that walks terrain,
         // and by this point every cheaper reason to do nothing has been ruled
         // out.
-        bool const stranded = gap > FOLLOW_CATCH_UP_YARDS;
+        bool const stranded = reading == OverseerDecisions::FollowGap::Stranded;
         if (!stranded && FollowStepHolds(p, leader))
             return;
 
@@ -9405,6 +10493,10 @@ private:
                 // clock starts now rather than carrying the last errand's over.
                 state.progress.best = 0.f;
                 state.progress.since = std::time(nullptr);
+                // And a new errand answers for its own bodies and nobody
+                // else's - see TravelState::errandSince.
+                state.errandSince = std::time(nullptr);
+                state.deathSaid = false;
             }
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -9428,6 +10520,117 @@ private:
             // is issued, and taken back when the escort ends. See the escort
             // section above for why those two things cannot be separated.
             bool const escorted = IsEscorted(name);
+
+            // THE DEATH-RATE BREAKER. AGENTS.md has asked for this in words
+            // since #78 and nothing ever counted: "watch the death table while
+            // it walks. If deaths exceed roughly three in five minutes, clear
+            // the aim - the destination is not worth the crossing."
+            // OverseerDecisions::ErrandDeathBreaker carries the rule, the
+            // numbers and the evening that turned the sentence into code.
+            //
+            // ASKED BEFORE ANYTHING BELOW CAN MOVE THIS CHARACTER. Everything
+            // from here down walks it, re-issues its walk or holds it where it
+            // is, and a release reached after any of those would still have
+            // spent the poll sending it back to what is killing it. It is
+            // asked after `escorted` only because that line costs nothing and
+            // the verdict wants to know whose aim this is.
+            {
+                OverseerDecisions::ErrandDeathToll toll;
+                toll.runOwned = _travelAims.RunOwns(name, target);
+                toll.sinceRefused = _travelAims.SecondsSinceRefused(name, target);
+
+                // THE ONLY STRETCH OF THE TABLE THIS ERRAND ANSWERS FOR. Zero
+                // for an errand with no age yet, which is a poll with nothing
+                // to ask rather than a poll with nothing to find.
+                int64 const window = int64(OverseerDecisions::ErrandDeathWindow(
+                    std::time(nullptr) - state.errandSince, ERRAND_DEATH_LIMITS));
+
+                // THROUGH THE LOADER, LIKE EVERY OTHER READ IN THIS DRIVE.
+                // `_travelAims.Load()` and LoadProfessionPlans() own their SQL
+                // and their absence, and this drive may not carry a query of
+                // its own - infra#2846, test_schema_degrade.py (#276). A zero window
+                // never reaches the database; RecentDeathCount owns that too.
+                toll.deaths = RecentDeathCount(name, window);
+
+                OverseerDecisions::ErrandDeathVerdict const verdict =
+                    OverseerDecisions::ErrandDeathBreaker(toll, ERRAND_DEATH_LIMITS);
+
+                switch (verdict.remedy)
+                {
+                    case OverseerDecisions::ErrandDeathRemedy::Continue:
+                        break;
+
+                    case OverseerDecisions::ErrandDeathRemedy::Release:
+                    {
+                        // WHO IS DOING IT, asked only on the path that fires
+                        // so the steady state costs one COUNT and nothing
+                        // else, and asked through the loader for the same
+                        // reason the count is (infra#2846).
+                        std::string const killer = WorstRecentKiller(name, window);
+
+                        LOG_WARN("module.overseer",
+                                 // "releasing the errand" on ONE source line,
+                                 // the same discipline the backstop above keeps
+                                 // and for the same reason: the guard test
+                                 // greps this function for it.
+                                 "overseer: '{}' has died {} times in the last {}s while "
+                                 "travelling to '{}'{} - releasing the errand, the "
+                                 "destination is not worth the crossing. It is refused for "
+                                 "this character for {} minutes, because clearing the column "
+                                 "is not enough on its own: something outside this module "
+                                 "writes it too and has re-armed a called-off errand within "
+                                 "five minutes before now",
+                                 name, toll.deaths, window, target,
+                                 killer.empty() ? std::string()
+                                                : ", mostly to '" + killer + "'",
+                                 static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60));
+                        _travelAims.Refuse(name, target);
+                        _travelAims.Release(name);
+                        continue;
+                    }
+
+                    case OverseerDecisions::ErrandDeathRemedy::RefuseReissue:
+                        // ACTED ON EVERY POLL AND SAID EVERY SO OFTEN. The
+                        // column has been written again by somebody, so it has
+                        // to be cleared again; that is the whole point of the
+                        // memory. Only the log line is rationed.
+                        if (_travelAims.SayRefusalAgain(name))
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' has been re-aimed at '{}', the errand "
+                                     "that was called off for killing it - clearing it "
+                                     "again, and refusing it for another {}s. Something "
+                                     "outside this drive keeps writing this column",
+                                     name, target, verdict.coolOffRemaining);
+                        _travelAims.Release(name);
+                        continue;
+
+                    case OverseerDecisions::ErrandDeathRemedy::DeclineRunOwned:
+                        // NOT RELEASED, AND SAID SO ONCE. A run re-Claims its
+                        // own aim within DUNGEON_RUN_POLL_MS, so a release here
+                        // would be undone in five seconds while resetting the
+                        // pin and the backstop clock every time - a mechanism
+                        // that reports itself and changes nothing. The run's
+                        // own stall handling is what answers this; the point of
+                        // the line is that the deaths are on the record against
+                        // the errand rather than nowhere.
+                        if (!state.deathSaid)
+                        {
+                            state.deathSaid = true;
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' has died {} times in the last {}s on "
+                                     "the errand to '{}', which is over the {}-in-{}min "
+                                     "line - NOT released, because a dungeon run issued "
+                                     "this aim and re-claims it every poll, so calling it "
+                                     "off here would change nothing. The run decides",
+                                     name, toll.deaths, window, target,
+                                     ERRAND_DEATH_LIMITS.deaths,
+                                     static_cast<uint32>(
+                                         ERRAND_DEATH_LIMITS.windowSeconds / 60));
+                        }
+                        break;
+                }
+            }
+
             if (!CanBeSentToNpc(botAI) && !escorted)
             {
                 if (!state.arrived)
@@ -9550,19 +10753,33 @@ private:
             // and ResolveTravelTarget would refuse it anyway.
             uint32 entry = 0;
             WorldPosition pos;
+            // What the resolve wants said about its choice, when there is
+            // anything: which nearer spawns this character may not deal with
+            // were passed over, or why none of them would do (#234). Empty for
+            // a pinned errand, which is not re-resolving anything, and empty
+            // for an ordinary choice the faction gate did not change.
+            std::string said;
             if (state.pinned && state.mapId == bot->GetMapId())
             {
                 entry = state.entry;
                 pos = WorldPosition(state.mapId, state.x, state.y, state.z);
             }
-            else if (!ResolveTravelTarget(bot, target, entry, pos, wantSkill))
+            else if (!ResolveTravelTarget(bot, target, entry, pos, wantSkill, &said))
             {
                 // Said unconditionally: the errand is released on this line and
                 // its state erased with it, so there is no second poll of this
                 // errand to repeat it.
+                //
+                // A REFUSAL THAT NAMES ITS CAUSE IS WORTH MORE THAN A HOPEFUL
+                // JOURNEY (#234). "There is no such spawn" and "there are five
+                // and this character may deal with none of them" are different
+                // facts with different fixes, and reading the second as the
+                // first is what made the vendor errand look like a missing
+                // town rather than a wrong one.
                 LOG_INFO("module.overseer",
-                         "overseer: '{}' was sent to '{}' and there is no such spawn on "
-                         "map {} - releasing the errand", name, target,
+                         "overseer: '{}' was sent to '{}' and {} on map {} - releasing "
+                         "the errand", name, target,
+                         said.empty() ? std::string("there is no such spawn") : said,
                          static_cast<uint32>(bot->GetMapId()));
                 _travelAims.Release(name);
                 continue;
@@ -9963,10 +11180,19 @@ private:
                               name, target,
                               bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
                 else
+                {
                     LOG_INFO("module.overseer",
                              "overseer: '{}' sent to '{}' - creature {} at {:.0f} yards",
                              name, target, entry,
                              bot->GetDistance2d(pos.GetPositionX(), pos.GetPositionY()));
+                    // THE FIX HAS TO BE VISIBLE WHEN IT WORKS, not only when
+                    // it refuses (#234). This is the line that says the errand
+                    // walked past a shop it could see, and why - without it a
+                    // 1,470 yard walk to a vendor with a 15 yard one in sight
+                    // reads as a routing fault rather than as the answer.
+                    if (!said.empty())
+                        LOG_INFO("module.overseer", "overseer: '{}' {}", name, said);
+                }
             }
         }
 
@@ -10637,36 +11863,129 @@ private:
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot)
                 continue;
-            // A taxi, flying mount, boat, vehicle or swimmer is deliberately
-            // away from a land navmesh. Elevated geometry above one of those
-            // states is not proof that it fell through the world.
-            if (!OverseerDecisions::TerrainRecoveryMayInspect(
-                    bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
-                    bot->IsFlying(), bot->IsInWater(), bot->GetTransport() != nullptr,
-                    bot->GetVehicle() != nullptr))
+            // A taxi, flying mount, boat, vehicle, swimmer or FALLING BODY is
+            // deliberately away from a land navmesh. Elevated geometry above
+            // one of those states is not proof that it fell through the world.
+            //
+            // IsFalling covers the scripted drop, which is the point of it
+            // being here: it is true for a server-side fall spline as well as
+            // for the client's own falling flags (Unit.cpp:15934-15938), and
+            // mod-dungeon-clear's DropInHole issues exactly such a spline. A
+            // stand-down deliberately leaves this character's memory alone -
+            // "I am not entitled to an opinion right now" is not evidence that
+            // anything is either wrong or fine.
+            bool const mayInspect = OverseerDecisions::TerrainRecoveryMayInspect(
+                bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
+                bot->IsFlying(), bot->IsFalling(), bot->IsInWater(),
+                bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr);
+
+            // PUT THE FALL BASELINE BACK UNDER THIS CHARACTER'S FEET (#265).
+            //
+            // The core charges m_lastFallZ - landingZ on the next landing, a
+            // teleport sets that baseline to its destination (Player.cpp:1532,
+            // and again on the client's ack at MovementHandler.cpp:321), and
+            // the only thing that walks it down again is
+            // UpdateFallInformationIfNeed, which runs on a client movement
+            // packet and on nothing else. This roster is moved by server-side
+            // splines, which send none, so a height written once stays written
+            // while the character walks away from it - and HandleFall runs
+            // BEFORE UpdateFallInformationIfNeed in the same handler
+            // (MovementHandler.cpp:634 against :685).
+            //
+            // FOR EVERY CHARACTER, NOT ONLY A LIFTED ONE, and that is the
+            // expensive half of what was learned. The lift below is one way to
+            // leave a stale height and it is not the only one: on 2026-09-06
+            // at 20:10:13 'Ugga' died of a fall at full health standing at z
+            // 93.37 having NEVER BEEN LIFTED, beside 'Grog' who had been
+            // lifted to a height 52 hp short of killing him. Both, and 'Grug'
+            // half a minute later, needed a baseline near z 162.4, and the
+            // party's travel aim was z 162.425. A guard keyed on this module's
+            // own lift would have prevented one of those four deaths.
+            //
+            // ABOVE THE STAND-DOWN AND NOT BELOW IT, on purpose. Declining
+            // while a character is falling is not an optimisation, it is the
+            // whole of what keeps a genuine drop chargeable, so the rule that
+            // declines has to be the tested one rather than the shape of this
+            // loop.
+            //
+            // AND TERRAIN_RECOVERY_POLL_MS IS PART OF THE ARGUMENT, which is
+            // why it is named here. The core's gravity is 19.29110527
+            // (Movement/Spline/MovementUtil.cpp:24), so falling the 13.48
+            // yards it starts charging for (MIN_FALL_DMG_DIST,
+            // Player.cpp:14175) takes just over 1.18 seconds. At a 1000 ms
+            // poll no chargeable fall can pass between two polls unseen. A
+            // slower poll could let one through, so that constant is load
+            // bearing for this and not only for the recovery.
+            {
+                OverseerDecisions::FallBaselineVerdict const held =
+                    OverseerDecisions::FallBaselineStep(
+                        _fallBaseline[LowerName(name)], mayInspect,
+                        bot->IsFalling(), bot->GetPositionZ(),
+                        std::time(nullptr));
+                if (held.rebase)
+                    bot->SetFallInformation(GameTime::GetGameTime().count(),
+                                            held.z);
+            }
+
+            if (!mayInspect)
                 continue;
 
-            float surface = 0.f;
-            bool const surfaceValid = SurfaceAbove(bot, surface);
+            OverseerDecisions::TerrainReading reading;
+            reading.mapId = bot->GetMapId();
+            reading.x = bot->GetPositionX();
+            reading.y = bot->GetPositionY();
+            reading.z = bot->GetPositionZ();
+            reading.surfaceValid = SurfaceAbove(bot, reading.surfaceAboveZ);
             // Most characters see their own footing again and stop here. Ask
             // the pure rule first with the conservative no-navmesh answer so
             // four Detour probes are paid only where the vertical gap itself
             // could possibly require recovery. A miss still goes through the
-            // remedy below, because a clean poll is what expires this
-            // character's memory of the last one - see TerrainRecoveryStep.
+            // remedy below, because the episode bookkeeping is in there and a
+            // poll that skipped it would be a poll the memory never saw.
             bool const gapCouldMatter = OverseerDecisions::BelowTerrainNeedsRecovery(
-                bot->GetPositionZ(), surface, surfaceValid, false,
+                reading.z, reading.surfaceAboveZ, reading.surfaceValid, false,
                 TERRAIN_RECOVERY_GAP_YARDS);
-            bool const hasLocalNavmesh = gapCouldMatter && HasLocalNavmesh(bot);
+            reading.hasLocalNavmesh = gapCouldMatter && HasLocalNavmesh(bot);
+            // ONLY WHERE IT CAN CHANGE THE ANSWER, which is why this is not
+            // measured for every character every second: a reading with no
+            // polygon already goes through the ladder, and footing cannot put
+            // a polygon back. So the fan is walked only in the one ambiguous
+            // case, a large gap over a polygon Detour found nearby, which is
+            // the case #262 is about.
+            reading.footingHolds =
+                !reading.hasLocalNavmesh || AnyDirectionHolds(bot);
+            bool const onTheGround = OverseerDecisions::StandingOnTheGround(
+                reading.hasLocalNavmesh, reading.footingHolds);
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
+            uint8 const rungBefore = static_cast<uint8>(memory.attempts);
             OverseerDecisions::TerrainRecoveryVerdict const verdict =
                 OverseerDecisions::TerrainRecoveryStep(
-                    memory, bot->GetPositionZ(), surface, surfaceValid,
-                    hasLocalNavmesh, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
+                    memory, reading, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::Nothing)
                 continue;
+
+            // WHOSE DOING A DEATH IN THE NEXT FEW SECONDS WAS (#188). A remedy
+            // is the one movement this module KNOWS it caused, which makes it
+            // the one cause a death row can be certain about - and until now a
+            // character that died seconds after being moved by this module was
+            // indistinguishable on the row from one that died on its own
+            // errand. Recorded for every remedy including the give-up, because
+            // "this module stopped helping and it died" is as much an
+            // attribution as a lift is. Memory only; RecordDeath reads it.
+            RememberRecovery(name, rungBefore, static_cast<uint8>(memory.attempts));
+
+            float const surface = reading.surfaceAboveZ;
+            // WHY THE REMEDY IS HAPPENING, in the words of the reading that
+            // authorized it. A polygon that no direction out of here can be
+            // walked off is a different finding from no polygon at all, and a
+            // line that said "no local navmesh" for both would be untrue for
+            // the case #262 added.
+            char const* const footing =
+                reading.hasLocalNavmesh
+                    ? "a local polygon, but no direction out of here holds (#262)"
+                    : "no local navmesh";
 
             uint16 const fromMap = static_cast<uint16>(bot->GetMapId());
             float const fromX = bot->GetPositionX();
@@ -10694,6 +12013,10 @@ private:
 
             // A LIFT IS NOT A DISPLACEMENT, so it takes nothing away. Same map,
             // same x and y, on top of the surface the probe just read - and the
+            // ONLY remedy in this drive that moves anything at all, since #188
+            // removed the bind-point escalation that followed it. The map id
+            // passed here is the character's own by construction, so a recovery
+            // cannot change continents even if the surface reading is nonsense.
             // travel aim, the quest aim and the party the character had a
             // moment ago are all still exactly right for where it now stands.
             // The old bind-point teleport cleared both aims every time; over
@@ -10704,16 +12027,28 @@ private:
             {
                 bot->TeleportTo(bot->GetMapId(), fromX, fromY, verdict.liftZ,
                                 bot->GetOrientation());
+                // AND THE CORE NOW BELIEVES THIS CHARACTER'S FALL BEGAN UP
+                // HERE. Written down rather than acted on: the poll above
+                // guards every character whether or not it was lifted, so this
+                // is the module recording the one height it is certain it is
+                // answerable for, and not a gate on anything. Measured on
+                // 2026-09-06: 'Bork' lifted from z 142.2 to z 157.3 at
+                // 19:11:53 and killed at z 65.7 at 19:15:22 by the 91.6-yard
+                // difference, at full health, out of combat, having moved 0.6
+                // yards downward in the last second of its life (#265).
+                OverseerDecisions::FallBaselineHandedOver(
+                    _fallBaseline[LowerName(name)], verdict.liftZ,
+                    std::time(nullptr));
                 LOG_WARN("module.overseer",
                          "overseer: '{}' read as below the world at map {} position "
                          "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
-                         "no local navmesh; LIFTED straight up to z {:.1f} at the same "
+                         "{}; LIFTED straight up to z {:.1f} at the same "
                          "x/y - it keeps aim job='{}' quest={} travel='{}' and its party. "
                          "If this is a real recovery the next poll is clean; if the same "
                          "condition comes back it escalates rather than repeating",
                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                         surface, surface - fromZ, verdict.liftZ, job, questAim,
-                         travelTarget);
+                         surface, surface - fromZ, footing, verdict.liftZ, job,
+                         questAim, travelTarget);
                 continue;
             }
 
@@ -10721,67 +12056,64 @@ private:
             // character's own feet, or a lift that did not stick, means either
             // this rule is wrong about this place or the world is. Both are
             // worth one loud line and neither is worth a two-minute loop.
+            //
+            // AND NEITHER IS WORTH A TELEPORT (#188). This used to escalate to
+            // the leader's bind point. On 2026-09-05 that carried 'Grog' from
+            // map 1 (1204.1, -708.5) to map 0 (-8902.6, -162.6) in eleven
+            // seconds, where he STILL read as below the world - so it moved the
+            // failure rather than fixing it - and it left two of the five in
+            // Elwynn, two in the Barrens and one offline in Stonetalon, which
+            // cannot run a dungeon on either continent and does not walk back
+            // without a boat. The remedy set is now closed under "same map,
+            // same x and y" in TerrainRemedy itself, so there is no branch here
+            // to reintroduce by accident. This is the end of the ladder, and it
+            // is deliberately loud: giving up in a log line a person can find
+            // beats a remedy that relocates the problem out of sight.
+            //
+            // THE TWO GIVE-UPS ARE NOT THE SAME THING, and one log line for
+            // both is how #188 got its title. With a polygon under its feet the
+            // character is standing on the ground and the DETECTOR is wrong,
+            // which is a note about this rule. Without one, a real remedy was
+            // tried and did not hold, which is a note about the world. They
+            // send a reader to different places, so they say different things.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::GiveUp)
             {
+                if (onTheGround)
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
+                              "reads {:.1f} yards under a surface at z {:.1f}, but Detour "
+                              "finds walkable ground at its own feet (local navmesh "
+                              "PRESENT), so it is STANDING ON THE GROUND and what the "
+                              "probe found overhead is a roof, a bridge or a tower floor. "
+                              "NOTHING IS BEING MOVED: this is the detector being wrong "
+                              "about this place, not a character below the world (#188). "
+                              "Aim job='{}' quest={} travel='{}'. Staying quiet about this "
+                              "character for {}s",
+                              name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                              surface - fromZ, surface, job, questAim, travelTarget,
+                              static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS));
+                    continue;
+                }
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' STILL reads as below the world at map {} "
                           "position ({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} "
-                          "yards up), local navmesh {} - and this module has run out of "
-                          "remedies for it. GIVING UP on this character until it has "
-                          "been clear for {}s; it is NOT being moved and NOT being "
-                          "resurrected. Aim job='{}' quest={} travel='{}' last aimed "
-                          "position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody needs to "
-                          "look at what is overhead at these coordinates",
+                          "yards up), {}, and a lift at these "
+                          "coordinates did not stick. This module is OUT OF REMEDIES for "
+                          "it and is GIVING UP until it has been clear for {}s. It is NOT "
+                          "being moved, NOT being sent to a bind point and NOT being "
+                          "resurrected: the cross-map escalation that used to be here "
+                          "split the family across an ocean without fixing the reading "
+                          "(#188), so a character this module cannot recover WHERE IT "
+                          "STANDS is reported and left. Aim job='{}' quest={} travel='{}' "
+                          "last aimed position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody "
+                          "needs to look at what is under these coordinates",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                          surface, surface - fromZ, hasLocalNavmesh ? "PRESENT" : "absent",
+                          surface, surface - fromZ, footing,
                           static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS), job,
                           questAim, travelTarget, static_cast<uint32>(aimedMap),
                           aimedX, aimedY, aimedZ);
-                continue;
             }
-
-            // SendToBind, and only for a character with no polygon under it
-            // whose lift did not stick. The leader's bind point keeps a grouped
-            // family together. This is the same destination DriveStuckRevival
-            // uses for a repeated death trap, but this character is alive and
-            // must not be resurrected.
-            Player* home = bot;
-            if (Group* group = bot->GetGroup())
-                if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
-                    home = leader;
-
-            // Recovery is terminal for the unsafe travel aim. Clear it before
-            // teleporting, otherwise the next travel poll re-issues the same
-            // coordinate and sends the character back onto the bad plane.
-            _travelAims.Release(name);
-            // A terrain recovery is also terminal for the quest aim that
-            // led the character onto the invalid surface. Leaving it in
-            // overseer_roster would make DriveQuests select the same bad
-            // target again immediately after the bind-point teleport.
-            // Keep the quest picker from selecting that same objective again
-            // in this process as well. Clearing the aim alone only removes
-            // the current coordinate; the quest remains in the log and was
-            // otherwise eligible on the very next poll.
-            if (questAim)
-            {
-                AimState& aimState = _lastAim[LowerName(name)];
-                aimState.repick.givenUp[questAim] = std::time(nullptr);
-                aimState.repick.lastPicked = 0;
-                aimState.repick.strikes = 0;
-            }
-            ClearAim(name);
-            bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                            home->m_homebindY, home->m_homebindZ, 0.f);
-            LOG_WARN("module.overseer",
-                     "overseer: '{}' recovered at map {} position ({:.1f}, {:.1f}, {:.1f}), "
-                     "surface z {:.1f}, no local navmesh; A LIFT TO z {:.1f} WAS TRIED "
-                     "FIRST AND DID NOT STICK, so this is the fallback: aim job='{}' "
-                     "quest={} travel='{}' last aimed position map {} ({:.1f}, {:.1f}, "
-                     "{:.1f}); sent to '{}'s bind point; it was not resurrected",
-                     name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                     surface, surface + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, job,
-                     questAim, travelTarget, static_cast<uint32>(aimedMap),
-                     aimedX, aimedY, aimedZ, home->GetName());
         } while (result->NextRow());
     }
 
@@ -11096,28 +12428,54 @@ private:
                 // Sending each to its own bind would scatter this roster
                 // across two starting zones (measured: Elwynn and Dun Morogh,
                 // ~2000 yards apart) and leave the party split on arrival.
-                Player* home = bot;
-                if (Group* group = bot->GetGroup())
-                    if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
-                        home = leader;
+                Player* const home = RevivalHome(bot);
 
-                bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                                home->m_homebindY, home->m_homebindZ, 0.f);
-                bot->ResurrectPlayer(1.0f);
-                bot->SpawnCorpseBones();
+                // ...AND NOT WHEN THAT BIND IS OFF THE PARTY'S MAP (#241). The
+                // escape from a death trap is worth taking; a continent is not
+                // an escape, it is a party split, and no drive in this module
+                // can rejoin one. Nothing here has looked for a graveyard yet,
+                // so the question asked is whether one exists on this map at
+                // all - and when it does, this branch DECLINES TO ESCALATE and
+                // falls through to the ordinary graveyard path below, which
+                // revives on this map. That is the whole remedy.
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(
+                        bot, home,
+                        sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId()) != nullptr);
+                if (crossing.mayMove)
+                {
+                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                    home->m_homebindY, home->m_homebindZ, 0.f);
+                    bot->ResurrectPlayer(1.0f);
+                    bot->SpawnCorpseBones();
+
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has died {} times within {}yd in the last "
+                             "{}min - the nearest graveyard is inside whatever is killing "
+                             "it, so reviving there again would only speed the loop up "
+                             "(measured: doing exactly that doubled this roster's death "
+                             "rate). Sent home to '{}'s bind point instead",
+                             name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
+                             STUCK_REVIVAL_TRAP_MINUTES, home->GetName());
+                    _lastRevival.erase(name);
+                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                     home->m_homebindX, home->m_homebindY);
+                    continue;
+                }
 
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' has died {} times within {}yd in the last {}min - "
-                         "the nearest graveyard is inside whatever is killing it, so reviving "
-                         "there again would only speed the loop up (measured: doing exactly "
-                         "that doubled this roster's death rate). Sent home to '{}'s bind "
-                         "point instead",
+                         "overseer: '{}' has died {} times within {}yd in the last {}min, "
+                         "which normally sends it to '{}'s bind point - REFUSED, because "
+                         "that bind is on map {} and the rest of this party is on map {}. "
+                         "A revival that changes continents is not an escape from a death "
+                         "trap, it is a party split, and nothing in this module can rejoin "
+                         "one: `follow` cannot cross a map and the catch-up walk refuses a "
+                         "cross-map gap (#241). Reviving on this map instead. Whatever "
+                         "keeps killing it here is a routing problem (#234), and no "
+                         "revival answers that one",
                          name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
-                         STUCK_REVIVAL_TRAP_MINUTES, home->GetName());
-                _lastRevival.erase(name);
-                HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
-                                 home->m_homebindX, home->m_homebindY);
-                continue;
+                         STUCK_REVIVAL_TRAP_MINUTES, home->GetName(),
+                         static_cast<uint32>(home->m_homebindMapId), crossing.partyMapId);
             }
 
             // NO GRAVEYARD ON THIS MAP IS NOT A REASON TO WALK AWAY.
@@ -11151,20 +12509,48 @@ private:
             GraveyardStruct const* grave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
             if (!grave)
             {
-                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
-                                bot->m_homebindY, bot->m_homebindZ, 0.f);
+                // THE ONE EXIT THAT STILL CROSSES MAPS UNCONDITIONALLY, and it
+                // has to (#241). There is no graveyard on this map, so there is
+                // no alternative to weigh: refusing here would restore the
+                // regression this branch was written for, a body lying in the
+                // Deadmines for 29 minutes while this drive ran the whole time.
+                // "Never change maps" would be a worse rule honestly applied,
+                // which is why the rule is about the PARTY'S map and not about
+                // moving. Two things do change: the destination is the LEADER'S
+                // bind, so a party that all takes this exit lands together, and
+                // leaving the rest of the party behind is now SAID rather than
+                // done quietly.
+                Player* const home = RevivalHome(bot);
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(bot, home, false);
+
+                bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                home->m_homebindY, home->m_homebindZ, 0.f);
                 bot->ResurrectPlayer(0.5f);
                 bot->SpawnCorpseBones();
 
                 LOG_WARN("module.overseer",
                          "overseer: '{}' has been dead for {}s on map {}, which has no "
                          "graveyard of its own - dying inside an instance leaves nothing "
-                         "for GetClosestGraveyard to return, so it was sent to its own "
+                         "for GetClosestGraveyard to return, so it was sent to '{}'s "
                          "bind point instead of being left where it fell",
-                         name, deadFor, static_cast<uint32>(bot->GetMapId()));
+                         name, deadFor, static_cast<uint32>(bot->GetMapId()),
+                         home->GetName());
+                if (crossing.splitsParty)
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' was revived onto map {} and the rest of its "
+                              "party is on map {} - THE FAMILY IS NOW SPLIT ACROSS TWO MAPS "
+                              "and nothing in this module can rejoin it: `follow` cannot "
+                              "cross a map, the catch-up walk refuses a cross-map gap, and "
+                              "an `at:` aim cannot name a coordinate on another map. There "
+                              "was no graveyard on map {} to revive it at instead, so the "
+                              "only alternative was leaving a corpse where it fell. "
+                              "Somebody has to move them (#241)",
+                              name, static_cast<uint32>(home->m_homebindMapId),
+                              crossing.partyMapId, static_cast<uint32>(bot->GetMapId()));
                 _lastRevival.erase(name);
-                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
-                                 bot->m_homebindX, bot->m_homebindY);
+                HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                 home->m_homebindX, home->m_homebindY);
                 continue;
             }
 
@@ -11177,20 +12563,51 @@ private:
                                                             corpseX, corpseY, corpseZ, refused);
             if (!safe)
             {
-                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
-                                bot->m_homebindY, bot->m_homebindZ, 0.f);
-                bot->ResurrectPlayer(0.5f);
-                bot->SpawnCorpseBones();
+                // `grave` exists, so this map HAS somewhere to revive at; it is
+                // only that every candidate was judged dangerous. That is a
+                // real alternative, and #241 is the argument for preferring it
+                // to an ocean. A character put down next to a threat can walk
+                // away - the hold below is written to release exactly that
+                // case, "not held there; it is left free to move away" - can be
+                // helped by four groupmates standing near it, and can be
+                // revived again if it does die. A character put down on another
+                // continent can do none of those and no drive here can reach
+                // it.
+                Player* const home = RevivalHome(bot);
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(bot, home, true);
+                if (crossing.mayMove)
+                {
+                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                    home->m_homebindY, home->m_homebindZ, 0.f);
+                    bot->ResurrectPlayer(0.5f);
+                    bot->SpawnCorpseBones();
+
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' (level {}) has been dead for {}s and no "
+                             "graveyard for its corpse is safe to stand at [{}] - sent to "
+                             "'{}'s bind point instead of the nearest graveyard",
+                             name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
+                             home->GetName());
+                    _lastRevival.erase(name);
+                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                     home->m_homebindX, home->m_homebindY);
+                    continue;
+                }
 
                 LOG_WARN("module.overseer",
                          "overseer: '{}' (level {}) has been dead for {}s and no graveyard "
-                         "for its corpse is safe to stand at [{}] - sent to its own bind "
-                         "point instead of the nearest graveyard",
-                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused);
-                _lastRevival.erase(name);
-                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
-                                 bot->m_homebindX, bot->m_homebindY);
-                continue;
+                         "for its corpse is safe to stand at [{}], which normally sends it "
+                         "to '{}'s bind point - REFUSED, because that bind is on map {} "
+                         "and the rest of this party is on map {}. Reviving at the nearest "
+                         "graveyard anyway: a character put down next to something "
+                         "dangerous can walk away and can be helped by the four standing "
+                         "beside it, and one put down on another continent can do neither "
+                         "(#241)",
+                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
+                         home->GetName(), static_cast<uint32>(home->m_homebindMapId),
+                         crossing.partyMapId);
+                safe = grave;
             }
 
             // THE SAME GRAVEYARD TWICE IN FIVE MINUTES IS A VERDICT, NOT A
@@ -11203,21 +12620,62 @@ private:
             if (last != _lastRevival.end() && last->second.first == safe->ID &&
                 now - last->second.second < GRAVEYARD_REPEAT_SECONDS)
             {
-                bot->TeleportTo(bot->m_homebindMapId, bot->m_homebindX,
-                                bot->m_homebindY, bot->m_homebindZ, 0.f);
-                bot->ResurrectPlayer(0.5f);
-                bot->SpawnCorpseBones();
+                // THIS IS THE EXIT THAT SPLIT THE FAMILY (#241). The leader
+                // took it at 17:35:43 and was in Duskwood while the other four
+                // stayed in the Barrens, and eleven silent minutes followed
+                // because nothing here can walk a follower across an ocean.
+                //
+                // AND THE VERDICT ABOVE IT IS WEAKER THAN IT SOUNDS. "Twice at
+                // one graveyard inside 300s means it cannot live there" reads
+                // as a rare finding; in hostile territory it is the ordinary
+                // one. Measured on overseer_death 18:18:24 to 18:22:30: SIX
+                // deaths in four minutes, every one to a Horde Guard, worn down
+                // to between 4 and 35 percent health. Two of them were walking
+                // to (1, 172.9, -1704.1), and the only creature within 45 yards
+                // of that point is entry 6491, a Spirit Healer, 13.3 yards
+                // away - so the aim was a graveyard. The Barrens is Horde
+                // ground and its graveyards stand beside Horde guards, so an
+                // Alliance party revives into the thing that killed it. That is
+                // a statement about the ZONE, and a bind teleport does not
+                // answer it any better than reviving again does; it answers it
+                // on another continent. Being walked into hostile ground at all
+                // is #234, and no revival is going to fix that one.
+                Player* const home = RevivalHome(bot);
+                OverseerDecisions::RevivalMoveVerdict const crossing =
+                    RevivalCrossMapCheck(bot, home, true);
+                if (crossing.mayMove)
+                {
+                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
+                                    home->m_homebindY, home->m_homebindZ, 0.f);
+                    bot->ResurrectPlayer(0.5f);
+                    bot->SpawnCorpseBones();
+
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has been dead for {}s and this drive already "
+                             "revived it at '{}' {}s ago - twice at one graveyard inside "
+                             "{}s means it cannot live there, so it was sent to '{}'s bind "
+                             "point instead",
+                             name, deadFor, safe->name, now - last->second.second,
+                             GRAVEYARD_REPEAT_SECONDS, home->GetName());
+                    _lastRevival.erase(last);
+                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
+                                     home->m_homebindX, home->m_homebindY);
+                    continue;
+                }
 
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' has been dead for {}s and this drive already revived "
-                         "it at '{}' {}s ago - twice at one graveyard inside {}s means it "
-                         "cannot live there, so it was sent to its own bind point instead",
+                         "overseer: '{}' has been dead for {}s and this drive already "
+                         "revived it at '{}' {}s ago, which normally sends it to '{}'s "
+                         "bind point - REFUSED, because that bind is on map {} and the "
+                         "rest of this party is on map {}. It is in a revive-and-die loop "
+                         "at '{}' and this drive is putting it back there deliberately, "
+                         "because its only alternative is a continent the other four "
+                         "cannot follow it to (#241). The loop is a routing problem "
+                         "(#234): something keeps sending this family somewhere it cannot "
+                         "survive, and no revival fixes that",
                          name, deadFor, safe->name, now - last->second.second,
-                         GRAVEYARD_REPEAT_SECONDS);
-                _lastRevival.erase(last);
-                HoldAfterRevival(bot, botAI, name, bot->m_homebindMapId,
-                                 bot->m_homebindX, bot->m_homebindY);
-                continue;
+                         home->GetName(), static_cast<uint32>(home->m_homebindMapId),
+                         crossing.partyMapId, safe->name);
             }
 
             // Mirrors exactly what SpiritHealerAction::Execute already does
@@ -11246,6 +12704,66 @@ private:
             _lastRevival[name] = std::make_pair(safe->ID, now);
             HoldAfterRevival(bot, botAI, name, safe->Map, safe->x, safe->y);
         } while (result->NextRow());
+    }
+
+    // THE BIND POINT A REVIVAL SHOULD USE, which is the LEADER'S whenever
+    // there is one (#241). The repeated-deaths branch has always done this and
+    // said why - "sending each to its own bind would scatter this roster
+    // across two starting zones (measured: Elwynn and Dun Morogh, ~2000 yards
+    // apart) and leave the party split on arrival" - and the other three
+    // bind-point exits on the same ladder ignored it. Four exits, one
+    // discipline: three of them were contradicting a sibling branch a hundred
+    // lines above that has a comment explaining the hazard.
+    //
+    // For the leader itself this resolves to its own bind, which is correct
+    // and is also exactly the case RevivalMayCrossMaps exists to catch: a
+    // leader taking a bind point off the party's map does not reunite anybody,
+    // it takes the party's reference point away.
+    static Player* RevivalHome(Player* bot)
+    {
+        Player* home = bot;
+        if (Group* group = bot->GetGroup())
+            if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+                home = leader;
+        return home;
+    }
+
+    // The map each OTHER member of this character's group is on. World thread
+    // only, which is where this whole drive runs (OnUpdate): reading GetMapId
+    // off a groupmate owned by another map thread is what KeepRosterFollowing
+    // and DriveCatchUp already do on this same thread, and nothing here
+    // dereferences anything a map thread could be freeing.
+    //
+    // An empty answer means "not grouped, or nobody else was in the world",
+    // and the pure rule treats that as UNKNOWN rather than as agreement. A
+    // party map nobody could establish may not be used to refuse a revival.
+    static std::vector<uint32_t> PartyMapsAround(Player* bot)
+    {
+        std::vector<uint32_t> maps;
+        Group* group = bot->GetGroup();
+        if (!group)
+            return maps;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == bot || !member->IsInWorld())
+                continue;
+            maps.push_back(static_cast<uint32_t>(member->GetMapId()));
+        }
+        return maps;
+    }
+
+    // One question, asked at all four bind-point exits: may this revival put
+    // the character on `home`'s bind map? See RevivalMayCrossMaps for the rule
+    // and for the incident it came from.
+    static OverseerDecisions::RevivalMoveVerdict RevivalCrossMapCheck(
+        Player* bot, Player const* home, bool graveyardOnThisMap)
+    {
+        OverseerDecisions::RevivalMove move;
+        move.bindMapId = static_cast<uint32_t>(home->m_homebindMapId);
+        move.partyMapIds = PartyMapsAround(bot);
+        move.graveyardOnThisMap = graveyardOnThisMap;
+        return OverseerDecisions::RevivalMayCrossMaps(move);
     }
 
     // THE GRACE AFTER A REVIVAL - see REVIVAL_HOLD_SECONDS. `+stay` is
@@ -11636,6 +13154,43 @@ private:
         // the offset landed on. See ResolveDungeonStagingPoint, which derives
         // it from these two triggers instead, so the table cannot drift from
         // the world the way a fourth and fifth hand-written float did.
+
+        // AND THESE THREE FLOATS ARE NOT THAT MISTAKE AGAIN (#242). The comment
+        // above is right and this row obeys it: a staging point is DERIVABLE
+        // from the two trigger rows, so writing one down by hand was inventing
+        // a fact the world already held. Where a walkable descent starts is not
+        // derivable from any table in the world database. No column anywhere
+        // says it. It is a fact about terrain, and the only honest way to get
+        // it is to measure the terrain - which is what was done.
+        //
+        // WHAT IT IS. The point where the approach corridor to this door
+        // starts, on `outsideMapId`. The leader walks here FIRST and at the
+        // staging point second. (0, 0, 0) means this door has no measured
+        // corridor and is walked at directly, which is three of the four rows
+        // below; the test for it is StagingPointCheck, the module's own
+        // existing "that is not a place", rather than a new flag beside it.
+        //
+        // HOW THE ONE THAT IS SET WAS MEASURED, and how a future reader can
+        // check it without believing this comment. It was read off the same
+        // navmesh tiles the core's own pathfinder reads, by walking their
+        // polygon adjacency out from the staging point. The door and the rim
+        // over it are on data/mmaps/0013336.mmtile (map 1, grid 33/36); this
+        // point is on the tile north of it, 0013335.mmtile, grid 33/35, because
+        // the corridor crosses the boundary between them. The world's own data agrees twice: waypoint_data path
+        // 138070, the world database's own patrol for the creature at guid 13807,
+        // descends the bottom of that same corridor from (-642.07, -2185.48,
+        // 45.34) to (-719.33, -2224.44, 16.96); and the creature spawns descend
+        // the same line, (-602, -2178, 49.8) through (-643, -2182, 45.1),
+        // (-694, -2193, 31.0), (-704, -2195, 26.4) to (-682, -2232, 17.4). A
+        // spawn point and a patrol point are both standable ground asserted by
+        // somebody other than this module.
+        //
+        // AND IT IS CHECKED AT RUNTIME RATHER THAN TRUSTED, by the same ground
+        // probe ResolveDungeonStagingPoint already runs on the staging point.
+        // A row whose corridor is not where it says is refused, not walked at.
+        float approachX;
+        float approachY;
+        float approachZ;
     };
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
@@ -11664,9 +13219,13 @@ private:
     // so keeps the check where the argument for it is.
     static constexpr float DUNGEON_STAGING_Z_SANITY_YARDS = 15.0f;
 
-    // Each supported dungeon is one row. Stockades is a same-continent
-    // instance in Stormwind and is reachable without the cross-continent
-    // travel that Wailing Caverns still requires.
+    // Each supported dungeon is one row. Deadmines, Shadowfang and Stockades
+    // are all approached from map 0 and are reachable on foot from where the
+    // family lives. Wailing Caverns is approached from map 1 and is not: the
+    // row is measured and correct, and the crossing to Kalimdor that would make
+    // it reachable does not exist yet, so a run for it is refused rather than
+    // started. See DungeonPortals() below and the approach check in the
+    // coordinator's IDLE branch.
     static DungeonPortal const* FindDungeonPortal(std::string const& keyword)
     {
         for (DungeonPortal const& portal : DungeonPortals())
@@ -11678,17 +13237,65 @@ private:
     static std::vector<DungeonPortal> const& DungeonPortals()
     {
         static std::vector<DungeonPortal> const portals = {
-            {"deadmines", 0, 78, 36, 119},
+            {"deadmines", 0, 78, 36, 119, 0.f, 0.f, 0.f},
             // areatrigger.sql: (145,0,-229.49,1576.35,78.8909,7,0,0,0,0)
             // areatrigger_teleport.sql: (145,'Shadowfang Keep Entrance',33,-229.135,2109.18,76.8898,1.267)
             // areatrigger.sql: (194,33,-230.953,2105.06,79.7533,5,0,0,0,0)
             // areatrigger_teleport.sql: (194,'Shadowfang keep - Entrance',0,-232.796,1568.28,76.8909,4.398)
-            {"shadowfang", 0, 145, 33, 194},
+            {"shadowfang", 0, 145, 33, 194, 0.f, 0.f, 0.f},
             // areatrigger.sql: (101,0,-8761.85,848.557,87.8052,0,4.972,9.694,7.444,0.6632)
             // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
             // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
             // areatrigger_teleport.sql: (503,'Stockades Instance',0,-8764.83,846.075,87.4842,3.77934)
-            {"stockades", 0, 101, 34, 503},
+            {"stockades", 0, 101, 34, 503, 0.f, 0.f, 0.f},
+            // WAILING CAVERNS, AND THE FIRST ROW IN THIS TABLE WHOSE OUTSIDE
+            // MAP IS NOT 0. The four numbers are read out of the pinned core's
+            // own base world DB the same way every row above them is, and are
+            // quoted here so a future reader can check them without a running
+            // world:
+            //
+            // areatrigger.sql: (228,1,-753.596,-2212.78,21.5403,13,0,0,0,0)
+            // areatrigger_teleport.sql: (228,'The Barrens - Wailing Caverns',43,-163.49,132.9,-73.66,5.83)
+            // areatrigger.sql: (226,43,-172.181,138.98,-66.6471,12,0,0,0,0)
+            // areatrigger_teleport.sql: (226,'The Barrens - Wailing Caverns',1,-740.059,-2214.23,16.1374,5.68)
+            //
+            // so trigger 228 stands on map 1 - Kalimdor, in the Barrens - with
+            // radius 13 and lands on map 43, and trigger 226 stands inside on
+            // map 43 with radius 12 and lands back on map 1 about 14 yards from
+            // where the party went in. Same shape as the three rows above; only
+            // the continent is new.
+            //
+            // AND THAT ONE DIFFERENCE IS WHY THE ROW ARRIVES WITH A REFUSAL
+            // NEXT TO IT RATHER THAN ON ITS OWN. Nothing in the coordinator
+            // hard-codes 0 - `outsideMapId` is read from the row at every one
+            // of its use sites - but the travel layer beneath it can only walk
+            // within a single map, so a portal on a continent the family is not
+            // standing on cannot be walked to at all. The run therefore refuses
+            // to open rather than staging toward it; see
+            // OverseerDecisions::DungeonPortalApproach and its caller below.
+            // The row is correct and it is not yet runnable, and those are two
+            // different statements that both have to be true in public.
+            // AND THE ONE ROW THAT CARRIES A CORRIDOR (#242). The three rows
+            // above end in three zeros, which is this table saying "walk
+            // straight at the door", and it is the right answer for all three:
+            // Deadmines, Shadowfang Keep and Stockades are all staged
+            // successfully on the dev realm today, and a corridor that has not
+            // been measured must not be invented for them.
+            //
+            // (-705.0, -2045.0, 66.45) is a terrace on the north-east side of
+            // the ravine, and it is where the only walkable descent to this
+            // door begins. From it the walk to the staging point is 465 yards
+            // to cover 179 yards of straight line, going first EAST and SOUTH
+            // around the rim and only then back west along y about -2185 to the
+            // floor. That shape is the whole defect: the way in starts by going
+            // away, and a bearing cannot be told to do that.
+            //
+            // The height is that navmesh tile's own lowest walkable surface at
+            // that x and y. It has a second surface 56 yards over it, which is
+            // why the runtime probe is started just above this z rather than
+            // from the terrain, exactly as DUNGEON_STAGING_Z_PROBE_LIFT_YARDS
+            // already does for the door.
+            {"wailing", 1, 228, 43, 226, -705.0f, -2045.0f, 66.45f},
         };
         return portals;
     }
@@ -11773,6 +13380,20 @@ private:
                                            float& outX, float& outY, float& outZ,
                                            std::string& why)
     {
+        // ZEROED FIRST, SO THAT EVERY FAILURE BELOW LEAVES THE SAME ANSWER
+        // (#220). There are five ways out of this function that are not a
+        // staging point, and before this line each of them left whatever the
+        // caller's own locals happened to hold. That was harmless while every
+        // caller checked the return - and the defect this comment is named
+        // after was a path that reached a staging AIM without any caller having
+        // been involved at all. The origin is now a refusal
+        // (OverseerDecisions::StagingPointCheck), so failing into it is failing
+        // into something the consumer will not act on, rather than into three
+        // floats that look like a place.
+        outX = 0.f;
+        outY = 0.f;
+        outZ = 0.f;
+
         // AreaTrigger  ObjectMgr.h:425-428  map/x/y/z
         AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.entryTriggerId);
         if (!door)
@@ -11803,24 +13424,30 @@ private:
             return false;
         }
 
-        float dx = back->target_X - door->x;
-        float dy = back->target_Y - door->y;
-        float const span = std::sqrt(dx * dx + dy * dy);
-        // A landing point on top of the door names no direction at all, and a
-        // normalise of it would be a divide by something near zero dressed up
-        // as a bearing. Refusing is the honest answer; inventing an axis is how
-        // the wall got walked into the first time.
-        if (span < 1.0f)
+        // THE SUMS MOVED, THE ARGUMENT DID NOT (#220). Everything from here to
+        // the ground probe used to be four lines of arithmetic in the middle of
+        // an adapter, reachable only by a running world. It is a normalise, a
+        // scale and two adds - it needs no world at all - so it lives in
+        // OverseerDecisions::DungeonStagingPoint with the four portals' real
+        // door numbers as its test. What stayed here is the only part that
+        // genuinely needs a world: reading the two triggers, and asking the map
+        // how high the ground is where the answer landed.
+        OverseerDecisions::StagingPoint const staged =
+            OverseerDecisions::DungeonStagingPoint(door->x, door->y, back->target_X,
+                                                   back->target_Y, back->target_Z,
+                                                   DUNGEON_STAGING_STANDOFF_YARDS);
+        if (staged.verdict != OverseerDecisions::StagingPointVerdict::Usable)
         {
-            why = "the way back out lands on the door itself, so it names no approach axis";
+            why = OverseerDecisions::StagingPointRefusal(staged.verdict) +
+                  " - areatrigger " + std::to_string(portal.entryTriggerId) +
+                  " and the way out of areatrigger " +
+                  std::to_string(portal.exitTriggerId);
             return false;
         }
-        dx /= span;
-        dy /= span;
 
-        outX = door->x + dx * DUNGEON_STAGING_STANDOFF_YARDS;
-        outY = door->y + dy * DUNGEON_STAGING_STANDOFF_YARDS;
-        outZ = back->target_Z;
+        outX = staged.x;
+        outY = staged.y;
+        outZ = staged.z;
 
         // GetMap  Object.h:631  Map* GetMap() const
         Map* map = leader ? leader->GetMap() : nullptr;
@@ -11830,7 +13457,8 @@ private:
             // GetHeight  Map.h  float GetHeight(float x, float y, float z, ...) const
             float const ground =
                 map->GetHeight(outX, outY, door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS);
-            if (std::fabs(ground - door->z) <= DUNGEON_STAGING_Z_SANITY_YARDS)
+            if (OverseerDecisions::StagingGroundBelievable(ground, door->z,
+                                                           DUNGEON_STAGING_Z_SANITY_YARDS))
                 outZ = ground;
             else
                 LOG_WARN("module.overseer",
@@ -11840,6 +13468,21 @@ private:
                          "is used instead",
                          ground, portal.keyword, outX, outY, portal.entryTriggerId,
                          door->z, back->target_Z);
+        }
+
+        // AND THE ANSWER IS PUT THROUGH THE TEST ITS CONSUMERS APPLY, so that
+        // "this function returned true" and "this point may be walked to" are
+        // the same statement rather than two statements that happen to have
+        // agreed so far. The ground probe above is the one step that can change
+        // a derived point after it has been checked.
+        if (!OverseerDecisions::StagingPointUsable(outX, outY, outZ))
+        {
+            why = OverseerDecisions::StagingPointRefusal(
+                OverseerDecisions::StagingPointCheck(outX, outY, outZ));
+            outX = 0.f;
+            outY = 0.f;
+            outZ = 0.f;
+            return false;
         }
         return true;
     }
@@ -11899,6 +13542,36 @@ private:
         // the grid loads, which is a gather that gets harder the closer it
         // gets. Resolved once, walked to, held to.
         float stageX{0.f}, stageY{0.f}, stageZ{0.f};
+        // WHETHER THE APPROACH CORRIDOR HAS BEEN WALKED YET (#242). A door
+        // whose portal row carries a corridor is approached in two legs, and
+        // this is the one bit that says which. It lives on the RUN and not on
+        // the portal because it is a fact about this leader on this approach,
+        // and it is cleared with the run: the next run of a campaign starts at
+        // the top of the corridor again, because the party comes back out of
+        // the door onto the ravine floor and has to be walked out and round.
+        //
+        // Sticky on purpose, and OverseerDecisions::ApproachLegStep is the only
+        // thing that ever sets it. Most of the descent takes the leader FURTHER
+        // from the corridor's start than he was when he reached it; without the
+        // stickiness every one of those polls would turn him round.
+        // PER MEMBER, AND #261 IS WHY IT IS NOT ONE ANY MORE. It was the
+        // leader's alone, because GATHERING walks the leader and the followers
+        // follow him, which is true and remains true. BARRIER is the other
+        // case: it escorts a member that following did not deliver, and it
+        // escorted it AT THE DOOR with no corridor. Every death on this
+        // approach resurrects a member at the Crossroads graveyard, 339 yards
+        // from the door and 75 yards above it, and an escort straight at the
+        // door from there walks onto the rim and stops. A corridor the leader
+        // walks and the followers do not is half a corridor.
+        std::map<std::string, OverseerDecisions::ApproachRouteState> approach;
+        // The aim string this run last claimed for the leader. Held so that the
+        // approach can be re-claimed WHEN THE LEG CHANGES and not on every
+        // poll: Claim deliberately drops the errand's memory, including the
+        // travel backstop's own clock, so claiming the same string every five
+        // seconds would keep resetting the clock that is supposed to notice a
+        // leader who is going nowhere. Empty until the first claim.
+        std::map<std::string, std::string> legAim;
+        bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
         // TravelState, `stuckLogged` in RepickMemory) for the same reason:
@@ -11967,6 +13640,18 @@ private:
         // on its row as what it was rather than as an ordinary 'left'. Empty for
         // every other way out.
         std::string stalledReason;
+        // AND WHETHER IT WAS FINISHED, which is a different fact from why it is
+        // leaving (#226). Set by CLEARING when every encounter the map credits
+        // has been credited, read by EXIT so the row says 'complete' rather than
+        // the 'left' that any walk-out used to write. It is deliberately a
+        // separate field from `stalledReason` and not the absence of one: a
+        // stall and a completion can both be true of the same run, and
+        // OverseerDecisions::DungeonRunExitOutcome owns which word wins.
+        bool provedComplete{false};
+        // Said once per run rather than once per poll, the same log-once
+        // discipline every other flag on this struct follows: a map with no
+        // encounter rows answers Unknowable on every poll for the whole run.
+        bool loggedNoCompletionSignal{false};
         bool anchorSet{false};
         float anchorX{0.f}, anchorY{0.f};
         time_t anchorAt{0};
@@ -12009,8 +13694,261 @@ private:
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
         bool loggedCampaignOver{false};
+        // WHEN THIS COORDINATOR STARTED WAITING FOR SOMEBODY ELSE'S ERRAND
+        // (#168), and whether it has said so. In-process like every other
+        // flag on this struct: a bounce restarts the clock, which errs
+        // towards waiting longer for a trip that is probably still running,
+        // and the log line says how long it has been.
+        time_t holdSince{0};
+        bool loggedHold{false};
+        // Said once, on the idle coordinator, for the same reason
+        // `loggedCampaignOver` is: a portal the leader cannot walk to is a
+        // standing fact about the job column rather than a transient, so it is
+        // reached on every poll until an operator changes something. Nothing
+        // clears it, because the only thing that ever leaves IDLE assigns a
+        // fresh DungeonRunCoordinatorState over the whole struct - which is
+        // exactly the behaviour wanted, since a run that DID start is a run
+        // whose approach was walkable.
+        bool loggedApproachRefused{false};
+        // AND THE SAME DISCIPLINE FOR THE OTHER REFUSAL (#217), which is said
+        // about a place rather than about a map. Unlike the one above this is
+        // NOT a standing fact - a leader that walks off the ridge is a leader
+        // the run may open for - so it is cleared as soon as the approach reads
+        // walkable again, and the line can therefore be said once per episode
+        // rather than once per coordinator.
+        bool loggedAboveTheDoor{false};
+
+        // --- crossing a continent (#241) -----------------------------
+        //
+        // SAID ON CHANGE RATHER THAN ONCE, unlike the two flags above. A
+        // refusal is a standing fact; a crossing MOVES, through walking,
+        // riding and landing, and each of those transitions is worth one
+        // line while none of them is worth twelve a minute. 255 is "nothing
+        // said yet" and is not a CrossingAction.
+        uint8 crossingSaid{255};
+        // The berth sweep, kept against the berth it answered about. See
+        // BerthIsGuarded: this caches a reading of static spawn data, not a
+        // reading of the live grid, which is the only reason it may be
+        // cached at all.
+        bool crossingSwept{false};
+        uint32 crossingSweptMap{0};
+        float crossingSweptX{0.f};
+        float crossingSweptY{0.f};
+        bool crossingBerthGuarded{false};
+        uint32 crossingBerthGuardLevel{0};
+        // THE PIER DOES NOT DISAPPEAR WHEN THE BOAT SAILS, AND NEITHER MAY THIS.
+        // Map::GetAllTransports only reports transports currently ON that map,
+        // and a crossing transport spends half its period on the far one:
+        // DelayedTeleportTransport removes it from this Map and adds it to the
+        // other (Transport.cpp:716-721). So a live lookup alone would answer
+        // "no transport serves that map" for minutes at a time, which is false
+        // and is exactly the kind of log line that teaches an operator the
+        // feature does not work. What is actually being asked is whether a
+        // ROUTE exists, and a route is a property of the transport's path
+        // rather than of where the boat is standing this second. So the berth
+        // is remembered for as long as the crossing is the same one, and the
+        // live lookup only ever improves on it.
+        bool crossingBerthFound{false};
+        uint32 crossingBerthOriginMap{0};
+        uint32 crossingBerthDestinationMap{0};
+        float crossingBerthX{0.f};
+        float crossingBerthY{0.f};
+        float crossingBerthZ{0.f};
+        bool crossingLandingKnown{false};
+        std::string crossingTransportName;
     };
     DungeonRunCoordinatorState _dungeonRunCoordinator;
+
+    // THE ONLY PLACE A STAGING AIM IS BUILT, AND THEREFORE THE ONLY PLACE THE
+    // POINT IS CHECKED (#220).
+    //
+    // WHAT WENT WRONG. `ResolveDungeonStagingPoint` carries a `why` and the
+    // contract "a run that cannot work out where to wait does not start and
+    // says why", and the LOG_ERROR for that contract sits at its single call
+    // site in the IDLE branch. Measured live, a run reached RESETTING with
+    // three zero staging floats and claimed `at:1:0,0,0` for its leader, who
+    // was then walked at the middle of Kalimdor - 2183 yards off - until the
+    // backstop gave up. No error fired, because the derivation was never
+    // attempted: the run had been ADOPTED (the party was already inside, which
+    // is the only way a Wailing Caverns run can begin while #158's crossing does
+    // not exist), and adoption sets up a coordinator without a staging point
+    // because an adopted run has no gathering left to do. `EndRunAndDecide`
+    // then carried those zeros into the next run of the campaign, correctly by
+    // its own rule and disastrously in fact, and set the phase straight to
+    // RESETTING - which skips the IDLE branch, and with it the only check.
+    //
+    // SO THE CHECK MOVED TO WHERE THE ANSWER IS USED. A contract enforced only
+    // where a value is DERIVED protects exactly the paths that derive it, which
+    // is the set of paths that were never the problem. Both places that used to
+    // format `at:<map>:<x>,<y>,<z>` out of the coordinator now come through
+    // here, and here refuses a point that was never resolved. A staging point of
+    // (0, 0, 0) is not walked at, logged as a destination, or written to a
+    // roster row: it is a refusal with a sentence attached.
+    static bool DungeonStagingAim(DungeonPortal const& portal,
+                                  DungeonRunCoordinatorState const& coord,
+                                  std::string& aim, std::string& why)
+    {
+        OverseerDecisions::StagingPointVerdict const verdict =
+            OverseerDecisions::StagingPointCheck(coord.stageX, coord.stageY, coord.stageZ);
+        if (verdict != OverseerDecisions::StagingPointVerdict::Usable)
+        {
+            why = OverseerDecisions::StagingPointRefusal(verdict);
+            return false;
+        }
+
+        std::ostringstream out;
+        out << "at:" << portal.outsideMapId << ':' << coord.stageX << ','
+            << coord.stageY << ',' << coord.stageZ;
+        aim = out.str();
+        return true;
+    }
+
+    // THE GAP FROM A CHARACTER TO A PLACE ON THE PORTAL'S OUTSIDE MAP (#242).
+    // One function, because the approach now measures TWO of these every poll -
+    // the corridor's start and the staging point - and two readings taken
+    // separately are two chances to disagree. That is the same argument the
+    // single `gap` in GATHERING was already written on; it just has to hold for
+    // a pair now.
+    //
+    // GetMapId  Position.h:281  uint32 GetMapId() const
+    // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+    // GetPositionZ  Position.h:120  float GetPositionZ() const
+    static OverseerDecisions::ApproachGap DungeonGapTo(Player* who,
+                                                       DungeonPortal const& portal,
+                                                       float x, float y, float z)
+    {
+        OverseerDecisions::ApproachGap gap;
+        // LEFT UNMEASURED RATHER THAN ZEROED when there is nothing to read. A
+        // character on another map has no gap to a place on this one, and
+        // ApproachGap::measured exists precisely so that fact cannot be
+        // mistaken for having arrived.
+        if (!who || who->GetMapId() != portal.outsideMapId)
+            return gap;
+        gap.horizontalYards = who->GetDistance2d(x, y);
+        gap.verticalYards = who->GetPositionZ() - z;
+        gap.measured = true;
+        return gap;
+    }
+
+    // THE RUN'S APPROACH, PACKED THE WAY THE DECISION FILE READS IT (#242).
+    //
+    // The staging point is passed in rather than read off the coordinator,
+    // because the IDLE branch asks this question before it has written one:
+    // there the point is still a local, and reading a stale coordinator field
+    // instead would be judging the approach to the PREVIOUS run's door.
+    static OverseerDecisions::ApproachRoute DungeonApproachRoute(
+        DungeonPortal const& portal, Player* leader, float stageX, float stageY,
+        float stageZ)
+    {
+        OverseerDecisions::ApproachRoute route;
+        route.leaderToStagingPoint = DungeonGapTo(leader, portal, stageX, stageY, stageZ);
+
+        // (0, 0, 0) IS THIS TABLE'S "NO CORRIDOR", read through the module's
+        // own existing "that is not a place" rather than through a second flag
+        // that could disagree with it. See DungeonPortal::approachX.
+        route.hasWaypoint = OverseerDecisions::StagingPointUsable(
+            portal.approachX, portal.approachY, portal.approachZ);
+        if (!route.hasWaypoint)
+            return route;
+
+        route.leaderToWaypoint = DungeonGapTo(leader, portal, portal.approachX,
+                                              portal.approachY, portal.approachZ);
+
+        // HOW LONG THE CORRIDOR IS. A property of the two written-down places
+        // and not of the leader, so it is the same every poll of every run.
+        // Both are on `outsideMapId` by construction - the staging point is
+        // derived from two triggers on it, and the corridor is a row beside
+        // them - so this is a plain distance and not a crossing.
+        float const dx = portal.approachX - stageX;
+        float const dy = portal.approachY - stageY;
+        float const dz = portal.approachZ - stageZ;
+        route.waypointToStagingYards = std::sqrt(dx * dx + dy * dy + dz * dz);
+        return route;
+    }
+
+    // WHERE THE LEADER IS BEING WALKED THIS POLL, and the aim that says so.
+    //
+    // Both come back together on purpose. They were separate for one poll
+    // during development and that is exactly long enough to write an aim at one
+    // point and judge arrival against the other, which is the shape of the
+    // defect this whole change exists to remove.
+    struct DungeonApproachAim
+    {
+        OverseerDecisions::ApproachLeg leg{OverseerDecisions::ApproachLeg::Direct};
+        float x{0.f}, y{0.f}, z{0.f};
+        OverseerDecisions::ApproachGap gap{};   // the leader to THAT point
+        std::string aim;                        // "at:<map>:<x>,<y>,<z>"
+        bool usable{false};
+        std::string why;                        // why not, when it is not
+    };
+
+    // The one place a leg is chosen and an aim is formatted for it. `state` is
+    // the run's own ApproachRouteState and is the only thing here that is
+    // written to; see DungeonRunCoordinatorState::approach for why it sticks.
+    static DungeonApproachAim DungeonApproachAimFor(
+        DungeonPortal const& portal, OverseerDecisions::ApproachRouteState& state,
+        Player* leader, float stageX, float stageY, float stageZ)
+    {
+        DungeonApproachAim out;
+        OverseerDecisions::ApproachRoute const route =
+            DungeonApproachRoute(portal, leader, stageX, stageY, stageZ);
+        out.leg = OverseerDecisions::ApproachLegStep(state, route, DUNGEON_APPROACH_LIMITS);
+
+        if (out.leg == OverseerDecisions::ApproachLeg::ToWaypoint)
+        {
+            out.x = portal.approachX;
+            out.y = portal.approachY;
+            out.z = portal.approachZ;
+            out.gap = route.leaderToWaypoint;
+        }
+        else
+        {
+            out.x = stageX;
+            out.y = stageY;
+            out.z = stageZ;
+            out.gap = route.leaderToStagingPoint;
+        }
+
+        // THE DESTINATION IS CHECKED EVEN WHEN IT IS NOT THIS LEG'S TARGET,
+        // and that is #220's lesson applied to a new use site rather than
+        // belt and braces. A run whose STAGING POINT is not a place must not
+        // set off at all, and with a corridor in the picture it could: the
+        // corridor is a perfectly good place, so a leg of ToWaypoint would
+        // format a usable aim and walk the leader 1,161 yards toward a run
+        // whose destination is three zeros. Both callers happen to validate
+        // the staging point before they reach here - IDLE refuses when
+        // ResolveDungeonStagingPoint fails, and RESETTING derives it or fails -
+        // which is exactly the reasoning #220 was written to distrust. "A
+        // contract enforced only where a value is DERIVED protects exactly the
+        // paths that derive it", and this function is a new path.
+        OverseerDecisions::StagingPointVerdict const destination =
+            OverseerDecisions::StagingPointCheck(stageX, stageY, stageZ);
+        if (destination != OverseerDecisions::StagingPointVerdict::Usable)
+        {
+            out.why = OverseerDecisions::StagingPointRefusal(destination);
+            return out;
+        }
+
+        // AND THEN THIS LEG'S OWN TARGET, BY THE SAME REFUSAL. A corridor is a
+        // place like any other, so a corridor that is not a place is refused by
+        // the same check that refuses a staging point that is not one, and the
+        // run is closed with a sentence rather than walked at the middle of the
+        // map.
+        OverseerDecisions::StagingPointVerdict const verdict =
+            OverseerDecisions::StagingPointCheck(out.x, out.y, out.z);
+        if (verdict != OverseerDecisions::StagingPointVerdict::Usable)
+        {
+            out.why = OverseerDecisions::StagingPointRefusal(verdict);
+            return out;
+        }
+
+        std::ostringstream aim;
+        aim << "at:" << portal.outsideMapId << ':' << out.x << ',' << out.y << ','
+            << out.z;
+        out.aim = aim.str();
+        out.usable = true;
+        return out;
+    }
 
     // THE BARRIER AND CROSSING PREDICATES NOW LIVE IN overseer_decisions.h,
     // unchanged. They were written free of every core type so that a unit test
@@ -12058,6 +13996,43 @@ private:
             if (bind->save)
                 return bind->save->GetCompletedEncounterMask();
         return 0;
+    }
+
+    // EVERY BIT THIS MAP CAN CREDIT, WHICH IS WHAT "FINISHED" HAS TO BE
+    // MEASURED AGAINST (#226).
+    //
+    // BUILT FROM THE SAME LIST THE CORE CREDITS OUT OF, so the two numbers
+    // cannot drift: Map::UpdateEncounterState (Map.cpp:2933-2975) walks exactly
+    // this list on every kill and ORs in `1 << dbcEntry->encounterIndex`, then
+    // writes the result to the InstanceSave that CompletedEncounters above reads
+    // back. Asking the same store for the whole set turns that running total
+    // into a completion test without a per-map constant anybody has to maintain,
+    // and without the boss-state framework neither Deadmines nor Wailing Caverns
+    // uses. See OverseerDecisions::DungeonRunCompletion for the argument at
+    // length.
+    //
+    // ZERO IS "THIS MAP CREDITS NOTHING", NOT "NOTHING LEFT TO DO", and the
+    // decision function is built around telling those apart. A map with no rows
+    // in the DBC answers nullptr here, and a run on it keeps exactly the endings
+    // it has today.
+    //
+    // GetDungeonEncounterList  ObjectMgr.h:953; DungeonEncounter::dbcEntry
+    // ObjectMgr.h:710; DungeonEncounterEntry::encounterIndex DBCStructure.h.
+    // Read every time rather than cached: it is a hash lookup in a store loaded
+    // once at startup, and a cached copy is one more thing that can be stale -
+    // the same argument the door's own coordinates are re-read under.
+    static uint32 ExpectedEncounterMask(uint32 mapId)
+    {
+        DungeonEncounterList const* encounters =
+            sObjectMgr->GetDungeonEncounterList(mapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (!encounters)
+            return 0;
+
+        uint32 mask = 0;
+        for (DungeonEncounter const* encounter : *encounters)
+            if (encounter && encounter->dbcEntry)
+                mask |= 1u << encounter->dbcEntry->encounterIndex;
+        return mask;
     }
 
     // ---- the CLEARING watchdog: has the run gone anywhere (#171) ----
@@ -12264,27 +14239,22 @@ private:
     // reading (DistanceToTarget, because a staged member IS being sent
     // somewhere) and the reaction, which is the only part any of those five
     // sites ever had of its own.
-    void RunStagingWatchdog(DungeonRunCoordinatorState& coord, std::string const& name,
-                            Player* member,
-                            OverseerDecisions::DungeonRunMemberState const& state)
+    // RETURNS TRUE WHEN THE RUN MUST BE CLOSED (#217), which is the one verdict
+    // this cannot act on by itself: only the caller knows which phase it is in
+    // and which character is the leader the run is accounted against. Every
+    // other rung is a correction applied here and nowhere else, exactly as
+    // before.
+    bool RunStagingWatchdog(DungeonRunCoordinatorState& coord, std::string const& name,
+                            Player* member, OverseerDecisions::ApproachGap const& gap)
     {
-        // A STAGED MEMBER IS NOT WATCHED, AND ITS LADDER GOES WITH IT. Inside
-        // the barrier radius there is nothing left to close. The leader in
-        // particular is HELD there on purpose - BARRIER escorts him at any
-        // distance, including none, so that his own `new rpg` cannot go idle
-        // and wander off while the stragglers arrive - and a watchdog that
-        // measured him would find a character that never gets nearer, because
-        // it is already there, and start correcting the one member doing
-        // exactly what was asked. Erased rather than merely skipped, so a
-        // member that arrives, drifts back out and returns is watched from the
-        // bottom of the ladder rather than from the rung its last bad patch
-        // reached.
-        if (state.distanceFromStage >= 0.f &&
-            state.distanceFromStage <= DUNGEON_BARRIER_RADIUS_YARDS)
-        {
-            coord.staging.erase(name);
-            return;
-        }
+        // ARRIVAL IS NO LONGER DECIDED HERE, and its move into the decision is
+        // the fix rather than tidying (#217). This used to drop the state of
+        // anybody inside a flat ten-yard circle, so a character ten yards out
+        // and a hundred and fifty yards up a cliff was exempted from being
+        // watched at all - the one member most in need of it. StagingWatchdog
+        // now asks ApproachShapeOf and resets the state in place, which is the
+        // same fresh-ladder-on-arrival behaviour with the right test in front
+        // of it.
 
         // WHEN THIS POLL'S DISTANCE IS NOT A READING ABOUT WALKING. A fight is
         // a pause and not a stall. A taxi leg routinely goes the wrong way
@@ -12297,18 +14267,24 @@ private:
         // it, so none of them can spend a rung of the ladder.
         //
         // IsInFlight  Unit.h:1709  bool IsInFlight() const
-        bool const measurable = state.seen && state.alive && !state.inCombat &&
-                                state.distanceFromStage >= 0.f && !member->IsInFlight();
+        // IsAlive  Unit.h:1793  bool IsAlive() const
+        // IsInCombat  Unit.h:936  bool IsInCombat() const
+        bool const measurable = gap.measured && member->IsAlive() &&
+                                !member->IsInCombat() && !member->IsInFlight();
+
+        // The gap in whole yards, for every line below. Read once so the
+        // corrections and the diagnosis quote the same numbers.
+        std::string const where = OverseerDecisions::ApproachWhere(gap);
 
         OverseerDecisions::StagingStallState& stall = coord.staging[name];
         OverseerDecisions::StagingNudge const nudge = OverseerDecisions::StagingWatchdog(
-            stall, state.distanceFromStage, measurable, std::time(nullptr),
-            DUNGEON_STAGING_RATCHET);
+            stall, gap, measurable, std::time(nullptr), DUNGEON_STAGING_RATCHET,
+            DUNGEON_APPROACH_LIMITS);
 
         switch (nudge)
         {
             case OverseerDecisions::StagingNudge::Nothing:
-                return;
+                return false;
 
             case OverseerDecisions::StagingNudge::Restrategy:
             {
@@ -12320,18 +14296,17 @@ private:
                 // the live list and, usually, no write at all.
                 std::string const took = AssertTravelFocus(name);
                 LOG_WARN("module.overseer",
-                         "overseer: dungeon run BARRIER - '{}' has got no nearer than {} "
-                         "yards to the staging point for {} seconds and is {} yards out. "
+                         "overseer: dungeon run staging - '{}' has got no nearer than {} "
+                         "yards to the staging point for {} seconds and is {}. "
                          "Correction 1 of {}: re-asserting the escort's own strategy set "
                          "- {}",
                          name, static_cast<uint32>(stall.progress.best),
-                         static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS),
-                         static_cast<uint32>(state.distanceFromStage),
+                         static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS), where,
                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS),
                          took.empty() ? std::string("nothing had come back on, so this "
                                                     "is not what is holding it")
                                       : ("took " + took + " back off it"));
-                return;
+                return false;
             }
 
             case OverseerDecisions::StagingNudge::Reaim:
@@ -12343,13 +14318,13 @@ private:
                 // is the one caller that knows better; see TravelState::reissue.
                 _travelAims.StateFor(name).reissue = true;
                 LOG_WARN("module.overseer",
-                         "overseer: dungeon run BARRIER - '{}' is still {} yards out and "
+                         "overseer: dungeon run staging - '{}' is still {} and "
                          "no nearer. Correction 2 of {}: the walk is handed to it again "
                          "on the next travel poll, over the guard that would otherwise "
                          "read its own stale state as proof it is already walking",
-                         name, static_cast<uint32>(state.distanceFromStage),
+                         name, where,
                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS));
-                return;
+                return false;
             }
 
             case OverseerDecisions::StagingNudge::ClearMovement:
@@ -12365,13 +14340,13 @@ private:
                 // (Unit.h:1758, public from Unit.h:666).
                 member->GetMotionMaster()->Clear();
                 LOG_WARN("module.overseer",
-                         "overseer: dungeon run BARRIER - '{}' is still {} yards out and "
+                         "overseer: dungeon run staging - '{}' is still {} and "
                          "no nearer. Correction 3 of {}: clearing its movement so the "
                          "next tick starts fresh, the same recovery the follow drive uses "
                          "for a follower jittering in place",
-                         name, static_cast<uint32>(state.distanceFromStage),
+                         name, where,
                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS));
-                return;
+                return false;
             }
 
             case OverseerDecisions::StagingNudge::GiveUp:
@@ -12386,20 +14361,55 @@ private:
                 // operator, who now has one line naming the character, the gap
                 // and everything that was tried.
                 LOG_ERROR("module.overseer",
-                          "overseer: dungeon run BARRIER cannot stage '{}' - {} yards from "
+                          "overseer: dungeon run staging cannot stage '{}' - {} from "
                           "the staging point, no nearer for {} minutes, and all {} "
                           "corrections have been tried and made no difference. Nothing "
                           "further will be attempted for it; the errand's own {}-minute "
                           "unreachable backstop bounds the aim and the run's own timeout "
                           "owns the run",
-                          name, static_cast<uint32>(state.distanceFromStage),
+                          name, where,
                           static_cast<uint32>(
                               (OverseerDecisions::STAGING_NUDGE_STEPS + 1) *
                               DUNGEON_STAGING_STALL_SECONDS / 60),
                           static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS),
                           static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
-                return;
+                return false;
+
+            case OverseerDecisions::StagingNudge::Stranded:
+                // ABOVE THE DOOR AND NO LONGER COMING DOWN (#217). This is the
+                // one verdict that is not a correction, because none of the
+                // three could touch it: the character is not short of the
+                // staging point, it is over it, and the way in is a route round
+                // rather than a step toward. Said in full here - the caller
+                // gets a bool and closes the run - because this is where the
+                // numbers are.
+                //
+                // AND SAYING IT AT NINETY SECONDS RATHER THAN AT TWELVE MINUTES
+                // IS THE SAFETY HALF. A party held at the top of a drop by an
+                // aim it cannot satisfy is a party standing next to a fall:
+                // six of the six deaths measured on the Wailing Caverns
+                // approach were falls, all five characters, one of them twice
+                // inside a minute, with the last step's footing refusal firing
+                // throughout. Closing the run releases the aim, so nothing is
+                // pulling anybody at the edge while the operator reads this.
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run staging - '{}' is {}, and has got no "
+                          "nearer for {} seconds. That is ABOVE the staging point rather "
+                          "than near it: the height left is more than the ground left "
+                          "could absorb at the gradient a walking step manages ({:.0f}y "
+                          "up for every {:.0f}y along), so every direction that closes "
+                          "the gap steps off something and the last-step footing check "
+                          "refuses all of them. No correction reaches this - the route is "
+                          "wrong, not the walking - so none is spent on it and the run is "
+                          "closed rather than held here for the rest of its {}-minute "
+                          "backstop",
+                          name, where,
+                          static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS),
+                          TRAVEL_STEP_VERTICAL_YARDS, TRAVEL_STEP_YARDS,
+                          static_cast<uint32>(DUNGEON_STAGING_BACKSTOP_SECONDS / 60));
+                return true;
         }
+        return false;
     }
 
     // ---- the mechanical half of a crossing, shared by ENTER and EXIT ----
@@ -12978,7 +14988,7 @@ private:
         return joined;
     }
 
-    // A RUN THAT NEVER STARTED IS STILL A RUN THAT HAPPENED (#144). Called only
+    // A RUN THAT NEVER STARTED IS STILL AN ATTEMPT (#144, #225). Called only
     // from RESETTING, on either of its two ways of giving up - preconditions
     // that never came true, or the core refusing DUNGEON_RESET_ATTEMPTS times.
     //
@@ -12987,6 +14997,16 @@ private:
     // drive like any other run. That is what makes the three-consecutive-
     // failures stop reachable at all: the failure is written down first and read
     // back as a row, not carried in a counter this process could lose.
+    //
+    // WHAT CHANGED IN #225: IT NO LONGER SPENDS A CAMPAIGN SLOT. #144 asked for
+    // a failed reset to "count as a failed run" and this counted it twice over -
+    // once as a row, once against dungeon_runs_done - and the second one is the
+    // one that hurts, because a campaign of 100 is 100 DUNGEONS to the person
+    // who asked for it and not 100 attempts at getting into one. The row and the
+    // consecutive-failure stop are what make a failed reset count; the slot
+    // stays open for the run that will eventually fill it. The next poll
+    // recomputes the same run number off the same unchanged counter, so the
+    // attempt is retried against the slot it failed at.
     void FailRunAtReset(DungeonRunCoordinatorState& coord,
                         std::string const& leaderName,
                         std::vector<std::string> const& members,
@@ -12994,15 +15014,15 @@ private:
                         std::string const& reason)
     {
         LOG_ERROR("module.overseer",
-                  "overseer: dungeon run {} of campaign {} could not start - {}. It counts "
-                  "as a failed run: the instance still holds whatever was already dead in "
-                  "it, so walking back in would be the empty dungeon this whole loop "
-                  "exists to stop happening",
-                  coord.runNumber, coord.campaignId, reason);
+                  "overseer: dungeon run {} of campaign {} could not start - {}. It is "
+                  "written down as a failed attempt but it does not spend run {} of the "
+                  "campaign, because nobody reached the instance: the instance still holds "
+                  "whatever was already dead in it, so walking back in would be the empty "
+                  "dungeon this whole loop exists to stop happening",
+                  coord.runNumber, coord.campaignId, reason, coord.runNumber);
 
-        RecordResetFailedRun(leaderName, portal.insideMapId, coord.campaignId,
-                             coord.runNumber, reason, JoinNames(members));
-        CountRunDone(leaderName);
+        RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
+                           coord.runNumber, "reset_failed", reason, JoinNames(members));
         _travelAims.Release(leaderName);
         coord = DungeonRunCoordinatorState();
     }
@@ -13030,33 +15050,113 @@ private:
     // about an instance that will not clear, which this is not.
     //
     // AND A REPEAT TERMINATES RATHER THAN LOOPING, which is the question a
-    // close-and-go-again always has to answer. Each closed run counts against
-    // the campaign's own cap, so a staging that fails for a reason that keeps
-    // being true cannot run forever. In the measured case it terminates much
-    // sooner than that: the member who deadlocks the barrier by being inside
-    // the instance is also the member who blocks the RESET the next run opens
-    // with (DungeonResetBlockers refuses while anybody is standing in there),
-    // so the next run fails at its reset, and three of those stop the campaign
-    // outright with the ERROR that already exists for it.
+    // close-and-go-again always has to answer. This used to be answered by the
+    // campaign cap - each closed run counted against it, so a staging that
+    // failed for a reason that kept being true ran out of campaign - and #225
+    // takes that answer away, deliberately, because spending a dungeon's worth
+    // of campaign on twelve minutes of a barrier that never opened is the defect
+    // it exists to fix. What answers it now is TrailingUnenteredRuns, widened in
+    // the same change to count 'staging_failed' beside 'reset_failed': three
+    // attempts in a row that never got inside stop the campaign with the ERROR
+    // that already exists for it, whichever of the two ways they failed.
+    //
+    // WHY THAT IS A BETTER BOUND AND NOT JUST A DIFFERENT ONE. It stops after
+    // three attempts rather than after a hundred, it says what is wrong instead
+    // of reporting a finished campaign, and it survives a worldserver bounce,
+    // because it is read back off rows rather than carried in this process.
+    //
+    // AND IT WRITES ITS OWN ROW WHEN THERE IS NONE TO CLOSE. The run row is
+    // opened by the arming drive when it first sees somebody on the instance
+    // map, so a staging that never gets anybody there has no row, CloseRun is a
+    // no-op on 0, and the whole failure used to vanish. Measured 2026-09-05:
+    // "dungeon run 0 ended 'staging_failed'" in the log and nothing in the
+    // table. When the row DOES exist - a member who walked in early is #165's
+    // own measured deadlock - it is closed rather than duplicated, and the
+    // attempt still does not count: one stray character on the map is not the
+    // party having started a run.
     void FailStaging(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                     std::vector<std::string> const& members,
                      DungeonPortal const& portal, char const* phase,
                      std::string const& blockers, bool stillWanted)
     {
         std::string const minutes =
             std::to_string(DUNGEON_STAGING_BACKSTOP_SECONDS / 60);
+        std::string const reason = std::string(phase) + " held for more than " + minutes +
+                                   " minutes and never opened - " + blockers;
+        uint32 const runId =
+            coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+
         LOG_ERROR("module.overseer",
                   "overseer: dungeon run {} of campaign {} cannot be staged - {} has held "
-                  "for over {} minutes. Unsatisfied: {}. The run is CLOSED rather than "
+                  "for over {} minutes. Unsatisfied: {}. The attempt is CLOSED rather than "
                   "left 'active', because a closed run is recoverable - the next poll "
                   "opens a fresh one and resets the instance before it aims anybody - and "
                   "a run that sits 'active' forever holds the one-active-run-per-map key "
-                  "the next one needs",
-                  coord.runNumber, coord.campaignId, phase, minutes, blockers);
+                  "the next one needs. It does not spend run {} of the campaign: nobody "
+                  "reached the instance",
+                  coord.runNumber, coord.campaignId, phase, minutes, blockers,
+                  coord.runNumber);
+
+        if (runId)
+            // A ROW OPENED BY A STRAY MEMBER IS STILL THIS ATTEMPT'S ROW, so it
+            // gets this attempt's numbers before it is closed. Nothing else
+            // would ever put them on it: the coordinator never reached the
+            // inside phases, which is where a run normally joins its campaign,
+            // and a row closed at 0/0 is invisible to the failure stop that is
+            // now the only thing bounding a staging that keeps failing.
+            StampRunIntoCampaign(runId, coord.campaignId, coord.runNumber,
+                                 JoinNames(members));
+        else
+            RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
+                               coord.runNumber, "staging_failed", reason,
+                               JoinNames(members));
+
+        EndRunAndDecide(coord, leaderName, portal, runId, "staging_failed", reason,
+                        stillWanted);
+    }
+
+    // THE SAME CLOSING, FOR A RUN THAT DOES NOT NEED THE REST OF ITS CLOCK
+    // (#217).
+    //
+    // WHY IT IS A SECOND FUNCTION AND NOT A FLAG ON THE ONE ABOVE. That one's
+    // whole sentence is "it held for over twelve minutes", which is the
+    // evidence it closes on. This closes on evidence of a different kind - the
+    // approach is a cliff and a member on it has stopped descending - and
+    // writing that as a variant of a timeout message would put a number in the
+    // run row that never elapsed. The outcome word is deliberately the SAME
+    // (`staging_failed`): the accounting question "did this run get staged" has
+    // one answer, and splitting the vocabulary would make every query about it
+    // need to know about cliffs.
+    //
+    // AND FAILING EARLY IS THE POINT RATHER THAN A SIDE EFFECT. The alternative
+    // is what was measured: five characters left standing on a rim for the rest
+    // of a twelve-minute backstop, printing a line that reads like progress,
+    // beside a drop that killed all five of them in six minutes. A closed run
+    // releases the leader's aim, so nothing is pulling anybody toward the edge;
+    // the next poll re-opens from wherever they now are, and the approach check
+    // in IDLE refuses to re-open at all while the leader is still above the
+    // door. The campaign's own cap bounds the repeat, exactly as it does for
+    // every other closing reason.
+    void FailApproach(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                      DungeonPortal const& portal, char const* phase,
+                      std::string const& blockers, bool stillWanted)
+    {
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} cannot be staged in {} - {} "
+                  "is above the '{}' staging point rather than near it, and has stopped "
+                  "getting nearer. The run is CLOSED now rather than at the {}-minute "
+                  "backstop: no correction this module has can move a cliff, and holding "
+                  "a party at the top of one is how every member of it died of a fall on "
+                  "this approach. Closing releases the aim, so nothing keeps them at the "
+                  "edge",
+                  coord.runNumber, coord.campaignId, phase, blockers, portal.keyword,
+                  static_cast<uint32>(DUNGEON_STAGING_BACKSTOP_SECONDS / 60));
         EndRunAndDecide(coord, leaderName, portal,
                         coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
                         "staging_failed",
-                        std::string(phase) + " held for more than " + minutes +
-                            " minutes and never opened - " + blockers,
+                        std::string(phase) +
+                            " was refused: the party is above the staging point, not "
+                            "near it, and has stopped descending - " + blockers,
                         stillWanted);
     }
 
@@ -13086,10 +15186,23 @@ private:
                          bool stillWanted)
     {
         CloseRun(runId, outcome, reason);
-        CountRunDone(leaderName);
+
+        // WHERE THE CAMPAIGN STANDS NOW, AND WHETHER THIS RUN MOVED IT (#225).
+        // The arithmetic is in the pure decisions because it is the part that
+        // was got wrong: `coord.runNumber` is the slot this attempt was AIMED
+        // at, not the slot it filled, and the two are the same number only when
+        // the party actually got onto the instance map. Reading them as the same
+        // number is what let a barrier that never opened both spend a run and,
+        // at the last slot, declare a campaign of a hundred finished on
+        // ninety-nine dungeons. See DungeonCampaignAfterRun, and its test.
+        OverseerDecisions::DungeonCampaignProgress const progress =
+            OverseerDecisions::DungeonCampaignAfterRun(outcome, coord.runNumber,
+                                                       coord.runsWanted, coord.capKnown);
+        if (progress.counted)
+            CountRunDone(leaderName);
         _travelAims.Release(leaderName);
 
-        uint32 const finished = coord.runNumber;
+        uint32 const finished = progress.runsDone;
         uint32 const wanted = coord.runsWanted;
         bool const known = coord.capKnown;
         uint32 const campaignId = coord.campaignId;
@@ -13128,7 +15241,12 @@ private:
             return;
         }
 
-        if (finished >= wanted)
+        // THE CAP IS TESTED AGAINST RUNS THAT HAPPENED, NOT AGAINST ATTEMPTS
+        // (#225). `progress.campaignOver` is `runsDone >= wanted` and runsDone
+        // only moves for a run that reached the instance, so the last slot can
+        // be attempted and missed as many times as the failure stop allows
+        // without the campaign reporting itself finished a dungeon short.
+        if (progress.campaignOver)
         {
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
@@ -13152,22 +15270,477 @@ private:
         // that gets harder the closer it gets. Between two runs of one campaign
         // the party is standing on that exact point, so the same argument says
         // to keep it rather than ask again.
+        //
+        // WHAT IT CARRIES WHEN THE FINISHED RUN NEVER HAD ONE (#220). An
+        // adopted run's coordinator holds three zeros here, and this rule
+        // promoted them from "nobody resolved this" to "this campaign's staging
+        // point" - which the next run then walked its leader at, for the length
+        // of its backstop, at the middle of the map. Carrying is still right;
+        // what was wrong is that nothing downstream could tell a carried answer
+        // from a carried absence. RESETTING now asks
+        // OverseerDecisions::StagingPointUsable before it trusts what arrives
+        // here, and derives a point when the answer is no.
         coord.stageX = stageX;
         coord.stageY = stageY;
         coord.stageZ = stageZ;
         coord.campaignId = campaignId;
-        coord.runNumber = finished + 1;
+        // THE NEXT SLOT, WHICH IS THE SAME SLOT AGAIN AFTER AN ATTEMPT THAT
+        // NEVER GOT INSIDE (#225). A run number is which of the wanted runs is
+        // being made, and an attempt that failed at the door did not make one -
+        // so the next attempt is aimed at the number the last one missed, and
+        // the rows of a campaign can carry the same run_number more than once
+        // with different outcomes. That is the honest reading: the failures are
+        // attempts at a slot, and exactly one row per slot ever counts.
+        coord.runNumber = progress.nextRunNumber;
         coord.runsWanted = wanted;
         coord.capKnown = known;
         coord.resetSince = std::time(nullptr);
 
-        LOG_INFO("module.overseer",
-                 "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
-                 "campaign {}, so the run goes again: RESET on map {} first, because the "
-                 "instance they just left still has its bosses dead in it and re-entering "
-                 "without a reset is a walk through an empty dungeon",
-                 runId, outcome, reason, finished, wanted, campaignId,
-                 portal.insideMapId);
+        if (progress.counted)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
+                     "campaign {}, so the run goes again: RESET on map {} first, because "
+                     "the instance they just left still has its bosses dead in it and "
+                     "re-entering without a reset is a walk through an empty dungeon",
+                     runId, outcome, reason, finished, wanted, campaignId,
+                     portal.insideMapId);
+        else
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon attempt ended '{}' - {}. Nobody reached the "
+                     "instance, so it is written down as a failed attempt and run {} of {} "
+                     "in campaign {} is still to be made: RESET on map {} first, and the "
+                     "campaign stops if {} attempts in a row fail this way",
+                     outcome, reason, coord.runNumber, wanted, campaignId,
+                     portal.insideMapId, DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES);
+    }
+
+    // ------------------------------------------- crossing a continent (#241) --
+    //
+    // WHAT THIS ADAPTER IS FOR, AND WHAT IT DELIBERATELY IS NOT. The pure
+    // decision beside it (OverseerDecisions::ReadCrossing) needs six facts
+    // about the world that only the worldserver holds. This reads those six
+    // and aims one character. It boards nobody, teleports nobody and
+    // synthesises no packet, because all three are already done by code that
+    // is already running:
+    //
+    //   * BOARDING. PlayerbotAI::UpdateAI polls Map::GetTransportForPos once a
+    //     second for every bot and calls AddPassenger on whatever transport the
+    //     MAP says the character is standing on (PlayerbotAI.cpp:383-400). The
+    //     map's answer is a downward ray cast against the transport's own
+    //     collision model (Map.cpp:1139-1150), so it is the server's judgement
+    //     about the deck and not ours - the same relationship
+    //     StepThroughAreaTrigger has with IsInAreaTriggerRadius, except that
+    //     here we do not even have to send the knock.
+    //   * RIDING. MotionTransport::UpdatePassengerPositions relocates every
+    //     passenger from its stored offset on every tick (Transport.cpp:726),
+    //     server-side, with no client involved.
+    //   * THE MAP BOUNDARY ITSELF. When the path reaches a frame on another
+    //     map, DelayedTeleportTransport calls TeleportTo on every player
+    //     passenger with TELE_TO_NOT_LEAVE_TRANSPORT (Transport.cpp:706), and
+    //     PlayerbotAI::HandleTeleportAck answers the worldport for a bot
+    //     (PlayerbotAI.cpp:787), which it can do because a bot has a session
+    //     with no socket rather than no session.
+    //
+    // SO THE ONE THING MISSING WAS NEVER THE ABILITY TO RIDE A BOAT. It was
+    // that nothing ever walked a character onto one. That is a travel errand,
+    // this module owns travel errands, and the aim it needs is an ordinary
+    // `at:` aim on the character's own map, which the resolver already
+    // accepts. Nothing about the same-map rule is relaxed anywhere.
+    //
+    // WHERE A BOAT TIES UP, WHICH IS THE FACT EVERYTHING TURNED ON. A
+    // transport's path carries a STOP FRAME on each map it serves
+    // (KeyFrame::IsStopFrame, TransportMgr.h, `Node->actionFlag == 2`), and
+    // that frame's own coordinates ARE the berth, with a z that came from the
+    // same row as the x and y. Nothing is offset, scaled or guessed, which is
+    // the whole difference between this and the staging point of #121 that was
+    // derived from a neighbouring landmark and pointed into rock.
+    static bool TransportStopFrameOnMap(MotionTransport const* transport,
+                                        uint32 mapId, float& x, float& y, float& z)
+    {
+        TransportTemplate const* tmpl = transport ? transport->GetTransportTemplate() : nullptr;
+        if (!tmpl)
+            return false;
+        for (KeyFrame const& frame : tmpl->keyFrames)
+        {
+            if (!frame.Node || frame.Node->mapid != mapId || !frame.IsStopFrame())
+                continue;
+            x = frame.Node->x;
+            y = frame.Node->y;
+            z = frame.Node->z;
+            return true;
+        }
+        return false;
+    }
+
+    struct CrossingRoute
+    {
+        OverseerDecisions::CrossingWorld world;
+        std::vector<OverseerDecisions::CrossingMember> members;
+        MotionTransport* transport{nullptr};
+        float berthX{0.f};
+        float berthY{0.f};
+        float berthZ{0.f};
+        std::string transportName;
+    };
+
+    // THE TRANSPORT IS FOUND, NOT NAMED. No boat entry, no taxi path id and no
+    // coordinate is written down anywhere in this module. The question asked
+    // of the world is "is there a transport on the map I am standing on whose
+    // own path also names the map I need", which is one lookup on data the
+    // core built at startup (TransportTemplate::mapsUsed, TransportMgr.cpp:157)
+    // and which stays right if the world's transports ever change. A hardcoded
+    // "The Lady Mehley" would be a fact about one realm's data pretending to be
+    // a fact about the game.
+    //
+    // INSTANCE TRANSPORTS ARE SKIPPED because they are a different thing that
+    // happens to share a class, and because the core already guarantees a
+    // multi-map template is non-instanceable (TransportMgr.cpp:181-189) - so
+    // this is belt and braces on a promise rather than a real filter.
+    MotionTransport* FindCrossingTransport(Player* leader, uint32 destinationMap,
+                                           float& berthX, float& berthY, float& berthZ,
+                                           bool& berthKnown, bool& landingKnown)
+    {
+        berthKnown = false;
+        landingKnown = false;
+        if (!leader || !leader->GetMap())
+            return nullptr;
+
+        uint32 const originMap = leader->GetMapId();
+        if (originMap == destinationMap)
+            return nullptr;
+
+        MotionTransport* best = nullptr;
+        for (Transport* candidate : leader->GetMap()->GetAllTransports())
+        {
+            MotionTransport* transport = candidate ? candidate->ToMotionTransport() : nullptr;
+            if (!transport)
+                continue;
+            TransportTemplate const* tmpl = transport->GetTransportTemplate();
+            if (!tmpl || tmpl->inInstance)
+                continue;
+            if (!tmpl->mapsUsed.count(originMap) || !tmpl->mapsUsed.count(destinationMap))
+                continue;
+
+            float bx = 0.f, by = 0.f, bz = 0.f, lx = 0.f, ly = 0.f, lz = 0.f;
+            bool const berth = TransportStopFrameOnMap(transport, originMap, bx, by, bz);
+            bool const landing = TransportStopFrameOnMap(transport, destinationMap, lx, ly, lz);
+
+            // The first one that serves both maps is reported even when it has
+            // no berth, so the refusal can say "this boat has no stop frame on
+            // your map" rather than the much less useful "no boat". A LATER
+            // candidate that is complete still wins, which is why this does not
+            // return early on the incomplete one.
+            if (!best || (berth && landing && !(berthKnown && landingKnown)))
+            {
+                best = transport;
+                berthKnown = berth;
+                landingKnown = landing;
+                berthX = bx;
+                berthY = by;
+                berthZ = bz;
+            }
+        }
+        return best;
+    }
+
+    // THE BERTH IS A TRAVEL DESTINATION AND GETS A TRAVEL DESTINATION'S SWEEP
+    // (#267). The same spawn data, the same radius and the same level rule that
+    // refuses a vendor standing in a Horde military camp. This is the gate that
+    // stops a crossing turning into the eighteen deaths to one level 65 elite
+    // that #267 was filed for: a pier is not automatically safe just because it
+    // is a pier, and the walk to it is what kills people.
+    //
+    // The route to the berth is NOT swept, and saying so is more honest than
+    // implying it is. Nothing in this module reads what a path crosses; the
+    // aim is a destination, not a route. What bounds the risk here is that only
+    // ONE character is ever aimed, which is the discipline the repository
+    // already runs on, and that the destination itself is now checked.
+    // ANSWERED ONCE PER BERTH, NOT ONCE PER POLL. The sweep is a pass over
+    // every creature spawn on the map, and this branch is reached on every
+    // DUNGEON_RUN_POLL_MS poll for as long as the family is on the wrong
+    // continent, which can be hours. Spawn data does not move, so the answer is
+    // kept against the berth it was asked about and re-asked only if the berth
+    // changes. Caching a reading of the live grid would be wrong; this is a
+    // reading of static data, which is why HostileSpawnsNear uses it.
+    bool BerthIsGuarded(DungeonRunCoordinatorState& coord, Player* leader, uint32 mapId,
+                        float x, float y, uint32& outLevel)
+    {
+        outLevel = 0;
+        if (!leader)
+            return false;
+
+        if (coord.crossingSwept && coord.crossingSweptMap == mapId &&
+            std::fabs(coord.crossingSweptX - x) < 0.5f &&
+            std::fabs(coord.crossingSweptY - y) < 0.5f)
+        {
+            outLevel = coord.crossingBerthGuardLevel;
+            return coord.crossingBerthGuarded;
+        }
+
+        NearbyThreat const threat =
+            HostileSpawnsNear(leader, mapId, x, y, TRAVEL_THREAT_RADIUS,
+                              leader->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1);
+        coord.crossingSwept = true;
+        coord.crossingSweptMap = mapId;
+        coord.crossingSweptX = x;
+        coord.crossingSweptY = y;
+        coord.crossingBerthGuarded = threat.count != 0;
+        coord.crossingBerthGuardLevel = threat.level;
+        outLevel = threat.level;
+        return coord.crossingBerthGuarded;
+    }
+
+    // Read the whole crossing off the world: the boat, the berth, and one
+    // sighting per roster member.
+    //
+    // DRIVEN BY THE ROSTER AND NOT BY WHO HAPPENS TO BE ONLINE. A member this
+    // cannot steer produces a reading that says so, and the decision refuses to
+    // grade a party it cannot see. Iterating the living instead would produce
+    // four readings for a family of five and a count that looks complete, which
+    // is the exact failure that has cost this codebase four strandings.
+    CrossingRoute ReadCrossingFromWorld(DungeonRunCoordinatorState& coord,
+                                        std::vector<std::string> const& members,
+                                        std::string const& leaderName, Player* leader,
+                                        uint32 destinationMap)
+    {
+        CrossingRoute route;
+        route.world.originMap = leader ? leader->GetMapId() : 0;
+        route.world.destinationMap = destinationMap;
+
+        bool berthKnown = false;
+        bool landingKnown = false;
+        route.transport = FindCrossingTransport(leader, destinationMap, route.berthX,
+                                                route.berthY, route.berthZ, berthKnown,
+                                                landingKnown);
+
+        // A CROSSING IS THE SAME CROSSING WHILE BOTH ITS ENDS ARE. Anything
+        // else - a different origin map because the leader moved, a different
+        // portal - is a different route and must not inherit a berth.
+        bool const sameCrossing = coord.crossingBerthFound &&
+                                  coord.crossingBerthOriginMap == route.world.originMap &&
+                                  coord.crossingBerthDestinationMap == destinationMap;
+
+        if (route.transport && berthKnown)
+        {
+            coord.crossingBerthFound = true;
+            coord.crossingBerthOriginMap = route.world.originMap;
+            coord.crossingBerthDestinationMap = destinationMap;
+            coord.crossingBerthX = route.berthX;
+            coord.crossingBerthY = route.berthY;
+            coord.crossingBerthZ = route.berthZ;
+            coord.crossingLandingKnown = landingKnown;
+            coord.crossingTransportName = route.transport->GetName();
+        }
+        else if (sameCrossing)
+        {
+            // The boat is at the far end of its run. The route still exists and
+            // the berth is still where it was, so the leader keeps walking to
+            // it rather than being told there is no boat.
+            berthKnown = true;
+            landingKnown = coord.crossingLandingKnown;
+            route.berthX = coord.crossingBerthX;
+            route.berthY = coord.crossingBerthY;
+            route.berthZ = coord.crossingBerthZ;
+        }
+        else if (!coord.crossingBerthFound)
+        {
+            // Never found one, so nothing is remembered and nothing is claimed.
+            coord.crossingBerthOriginMap = route.world.originMap;
+            coord.crossingBerthDestinationMap = destinationMap;
+        }
+
+        // `transportFound` MEANS "THIS ROUTE EXISTS", not "the boat is in front
+        // of me". The distinction is the whole point of the block above, and it
+        // is what DungeonPortalApproach is being told when it is asked whether a
+        // crossing exists.
+        route.world.transportFound = route.transport != nullptr || (sameCrossing && berthKnown);
+        route.world.berthKnown = berthKnown;
+        route.world.landingKnown = landingKnown;
+        route.transportName = route.transport ? route.transport->GetName()
+                                              : coord.crossingTransportName;
+
+        if (route.world.transportFound && berthKnown)
+        {
+            // Keyed on the berth in hand, which may be the remembered one. The
+            // sweep is over static spawn data, so a berth that was clear when
+            // the boat was here is still clear now.
+
+            uint32 guardLevel = 0;
+            route.world.berthGuarded = BerthIsGuarded(coord, leader, route.world.originMap,
+                                                      route.berthX, route.berthY, guardLevel);
+            route.world.berthGuardLevel = guardLevel;
+        }
+
+        for (std::string const& name : members)
+        {
+            OverseerDecisions::CrossingMember member;
+            member.isLeader = name == leaderName;
+
+            Player* p = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(p))
+            {
+                // Unreadable, and left that way on purpose. A logged out
+                // member has no map, and a map it does not have must not be
+                // borrowed from a stale table row.
+                route.members.push_back(member);
+                continue;
+            }
+
+            member.readable = true;
+            member.mapId = p->GetMapId();
+            // THE MAP'S ANSWER, NOT OURS. GetTransport() is set by whoever
+            // boarded the character, which on this deployment is the bot AI
+            // acting on Map::GetTransportForPos. This module never writes it.
+            member.aboard = route.transport && p->GetTransport() == route.transport;
+            member.berthDistance =
+                (berthKnown && member.mapId == route.world.originMap)
+                    ? p->GetDistance2d(route.berthX, route.berthY)
+                    : 0.f;
+            route.members.push_back(member);
+        }
+        return route;
+    }
+
+    // ACT ON THE STEP, WHICH FOR FOUR OF THE FIVE ACTIONS MEANS SAY IT AND
+    // STOP. The only action that touches the world is Walk, and all it does is
+    // claim the leader's travel aim for an ordinary `at:` position on the map
+    // the leader is already standing on. Everything after that - stepping onto
+    // the deck, being taken aboard, being carried, being teleported to the far
+    // map and acknowledging it - belongs to code that already runs.
+    //
+    // SAID ON CHANGE, NOT ON EVERY POLL. A crossing is reached every
+    // DUNGEON_RUN_POLL_MS for as long as the family is on the wrong continent,
+    // and a line repeated twelve times a minute is a line an operator filters
+    // out. But unlike the flat refusal it replaces, a crossing MOVES through
+    // legs, and each transition is worth exactly one line.
+    // NAMED FOR THE CONTINENT AND NOT THE DUNGEON, because DriveDungeonCrossing
+    // already exists a few hundred lines up and means something completely
+    // different: crossing the THRESHOLD of an instance door. Two functions one
+    // overload apart, one of which walks a character through a portal and one
+    // of which puts a family on a boat, is a name collision waiting to be
+    // mis-called.
+    void DriveContinentCrossing(DungeonRunCoordinatorState& coord,
+                                OverseerDecisions::CrossingStep const& step,
+                                CrossingRoute const& route, std::string const& leaderName,
+                                Player* leader, std::string const& dungeonKeyword)
+    {
+        uint8 const said = static_cast<uint8>(step.action);
+        bool const fresh = coord.crossingSaid != said;
+        coord.crossingSaid = said;
+
+        std::string const why = OverseerDecisions::CrossingExplanation(step, route.world);
+        std::string const boat =
+            route.transportName.empty() ? std::string("a transport") : route.transportName;
+
+        switch (step.action)
+        {
+            case OverseerDecisions::CrossingAction::Walk:
+            {
+                // The aim is the berth, on the leader's OWN map, so
+                // ResolveTravelTarget accepts it under the same rule it has
+                // always applied. Nothing here relaxes the same-map check and
+                // nothing here crosses anything: the boat does that.
+                std::ostringstream aim;
+                aim << std::fixed << std::setprecision(1);
+                aim << "at:" << route.world.originMap << ':' << route.berthX << ','
+                    << route.berthY << ',' << route.berthZ;
+                std::string const aimText = aim.str();
+
+                // THE COLUMN IS THE OTHER HALF OF THE AIM'S CONTRACT, and it
+                // fails silently. `overseer_roster.travel_npc` is VARCHAR(32),
+                // and outside strict mode MySQL truncates an over-long value
+                // rather than refusing it. A truncated aim is one the parser can
+                // never read back: the errand is written, never resolves, and
+                // looks exactly like a character that simply did not walk. A
+                // berth is the longest aim this module has ever written - two
+                // five-digit coordinates are ordinary on these maps - so it is
+                // the first one that can actually hit the limit. Refusing here
+                // is the only place that failure can still be seen.
+                if (aimText.size() > TRAVEL_AIM_COLUMN_CHARS)
+                {
+                    if (fresh)
+                        LOG_ERROR("module.overseer",
+                                  "overseer: the berth aim for '{}' is {} characters and "
+                                  "overseer_roster.travel_npc holds {}, so it would be "
+                                  "truncated into something no errand could ever resolve: "
+                                  "{}",
+                                  leaderName, uint32(aimText.size()),
+                                  uint32(TRAVEL_AIM_COLUMN_CHARS), aimText);
+                    break;
+                }
+
+                _travelAims.Claim(leaderName, aimText);
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: the family is split across maps {} and {} for "
+                             "'{}', so '{}' is sent to the berth of '{}' at ({:.1f}, "
+                             "{:.1f}, {:.1f}) on map {} - {}. Nothing boards anybody: "
+                             "the bot AI takes a character standing on a deck aboard "
+                             "on its own, and the transport carries its passengers "
+                             "across the map boundary itself",
+                             route.world.originMap, route.world.destinationMap,
+                             dungeonKeyword, leaderName, boat, route.berthX, route.berthY,
+                             route.berthZ, route.world.originMap, why);
+                break;
+            }
+
+            case OverseerDecisions::CrossingAction::Ride:
+                // DELIBERATELY NOTHING. A travel aim now would walk a passenger
+                // off a moving deck. The berth errand is given back ONCE, on
+                // the transition, so no backstop is left counting against an
+                // errand that is no longer the mechanism - and not on every
+                // poll, because Release is a write and the crossing is read
+                // twelve times a minute.
+                if (fresh)
+                {
+                    _travelAims.Release(leaderName);
+                    LOG_INFO("module.overseer",
+                             "overseer: {} member(s) of the family are aboard '{}' "
+                             "between maps {} and {} - nothing is aimed while anybody "
+                             "is on a deck. {}",
+                             uint32(step.aboard), boat, route.world.originMap,
+                             route.world.destinationMap, why);
+                }
+                break;
+
+            case OverseerDecisions::CrossingAction::Done:
+                // NOT REACHABLE FROM THIS CALLER, AND SAYING SO IS BETTER THAN
+                // LEAVING IT LOOKING LIKE IT IS. Done needs every member on the
+                // destination map, the leader included - and a leader on the
+                // portal's own map makes DungeonPortalApproach answer Walkable
+                // several lines above, so this function is never called. The
+                // value exists because ReadCrossing has to be total over its
+                // inputs: "everybody is already across" is a real reading and
+                // answering it with a refusal would be a lie. Handled here so
+                // that a second caller with a crossing that is not a dungeon
+                // approach does not have to invent the branch.
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: the family is together again on map {} - the "
+                             "crossing for '{}' is over and ordinary travel takes it "
+                             "from here. {}",
+                             route.world.destinationMap, dungeonKeyword, why);
+                break;
+
+            case OverseerDecisions::CrossingAction::Wait:
+                if (fresh)
+                    LOG_WARN("module.overseer",
+                             "overseer: the crossing for '{}' is not decided this poll - "
+                             "{}",
+                             dungeonKeyword, why);
+                break;
+
+            case OverseerDecisions::CrossingAction::Refuse:
+                if (fresh)
+                    LOG_ERROR("module.overseer",
+                              "overseer: the crossing for '{}' is refused at '{}' - {}. "
+                              "The leader '{}' stays on map {} and nothing is reset, "
+                              "aimed or moved",
+                              dungeonKeyword,
+                              OverseerDecisions::CrossingLegName(step.leg), why, leaderName,
+                              uint32(leader ? leader->GetMapId() : 0));
+                break;
+        }
     }
 
     void DriveDungeonRun()
@@ -13288,6 +15861,29 @@ private:
                 std::vector<OverseerDecisions::DungeonRunEntryState> const adoptedStates =
                     DungeonRunCensus(members, entryDoor, inside->insideMapId, adoptedInside);
 
+                // AND THIS COORDINATOR DELIBERATELY HAS NO STAGING POINT (#220).
+                // An adopted run is already inside; there is no gather left to
+                // own, and asking the world where the party WOULD have waited
+                // would be work for an answer nothing here reads.
+                //
+                // WHAT THAT COST BEFORE IT WAS WRITTEN DOWN. The three staging
+                // floats stay at their initialised zeros, EndRunAndDecide
+                // carries a finished run's staging point into the next run of
+                // the campaign, and the next run formatted those zeros straight
+                // into `at:<outsideMapId>:0,0,0` and walked the leader at the
+                // middle of the map for its whole backstop. Every Wailing
+                // Caverns run took this path, because adoption after an
+                // operator teleport is the only way one can begin while #158's
+                // crossing does not exist - but nothing about the hole is
+                // Wailing-specific: a worldserver bounce mid-Deadmines adopts
+                // that run the same way.
+                //
+                // The fix is not here. Leaving the point unset is the honest
+                // thing for a phase that has no use for one; what was missing is
+                // that "unset" and "the origin" were the same three floats to
+                // everything downstream. RESETTING now derives a point when it
+                // inherited none, and DungeonStagingAim refuses to build an aim
+                // out of one that was never resolved.
                 coord = DungeonRunCoordinatorState();
                 coord.phase = OverseerDecisions::DungeonRunAllThrough(adoptedStates)
                                   ? DungeonRunPhase::Clearing
@@ -13326,6 +15922,39 @@ private:
                 // ones already counted.
                 if (!coord.runNumber)
                     coord.runNumber = adoptedCap.done + 1;
+
+                // AND THE CAMPAIGN IS RESOLVED THE SAME WAY THE NUMBER IS
+                // (#225). This used to stop at the read-back and leave an
+                // unstamped run at campaign 0 for good, on the reasoning that
+                // "putting a number on a run nobody drove would be a claim about
+                // a series that never happened". That reasoning stopped holding
+                // the moment this coordinator adopted the run: it IS driving it,
+                // its ending will move this campaign's counter, and a row that
+                // moves a campaign's count while claiming to belong to no
+                // campaign is the harder thing to explain. Measured 2026-09-05:
+                // both of the day's runs, one of them a full clear, carry
+                // campaign_id 0 and run_number 0, so nothing can tell which
+                // campaign they were part of or in what order they came.
+                //
+                // The campaign in progress is preferred to a fresh id for the
+                // same reason the run number is taken from the counter: this run
+                // is the next one of whatever series is already under way on
+                // this map, not the start of a rival one.
+                //
+                // GUARDED ON THE SCHEMA LIKE EVERY OTHER READER OF THESE
+                // COLUMNS, for the reason LoadQuestAims writes down at length:
+                // a SELECT naming a column the table does not have fails WHOLE,
+                // and both queries below name campaign_id.
+                if (RunAccountingPresent())
+                {
+                    if (!coord.campaignId)
+                        coord.campaignId =
+                            CampaignInProgress(leaderName, inside->insideMapId);
+                    if (!coord.campaignId)
+                        coord.campaignId = AllocateCampaignId();
+                    StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
+                                         JoinNames(members));
+                }
 
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is already inside a dungeon run on map {} - "
@@ -13370,10 +15999,182 @@ private:
                 return;
             }
 
+
+            // DOES SOMEBODY ELSE HAVE THE FAMILY OUT ON AN ERRAND (#168)?
+            //
+            // ASKED HERE, WHICH IS THE LAST MOMENT IT IS FREE. Everything below
+            // this line is paid for: RESETTING throws away the instance the
+            // party is bound to, and GATHERING claims the leader's aim with an
+            // unconditional write. That write is what takes a vendor, bank or
+            // repair errand away from a pass that is in the middle of it - the
+            // character turns round and walks to a dungeon door, the errand
+            // never completes, and its rows are answered "not in range" until
+            // they age out. Nothing errors, which is why a hundred-run campaign
+            // has never had a maintenance trip.
+            //
+            // AND ONLY HERE. The claim itself is not weakened: once a run is
+            // staging, the coordinator taking a straggler over from whatever it
+            // was doing is what gets the party through the door and it is
+            // working. This asks whether to START a run, not whether to give
+            // one up. A run under way never yields.
+            uint32 const heldFor = coord.holdSince
+                                       ? uint32(std::time(nullptr) - coord.holdSince)
+                                       : 0;
+            OverseerDecisions::MaintenanceHold const hold =
+                OverseerDecisions::DungeonRunMaintenanceHold(
+                    LeaderTravelAim(leaderName), OutstandingMaintenanceRows(),
+                    heldFor, DUNGEON_MAINTENANCE_HOLD_SECONDS);
+
+            if (hold != OverseerDecisions::MaintenanceHold::Open)
+            {
+                if (!coord.holdSince)
+                    coord.holdSince = std::time(nullptr);
+
+                if (hold == OverseerDecisions::MaintenanceHold::Overdue)
+                {
+                    // SAID EVERY TIME, NOT ONCE. This one is not narration of a
+                    // steady state; it is the bound firing, and the run starts
+                    // on the same poll. An operator reading it is reading a
+                    // maintenance pass that did not finish, which is a thing to
+                    // go and look at rather than a thing to get used to.
+                    LOG_ERROR("module.overseer",
+                              "overseer: a maintenance errand for '{}' has been "
+                              "outstanding {} minutes, past the {} minute bound, so the "
+                              "dungeon run opens anyway and the errand loses its "
+                              "traveller. A trip that cannot finish costs one run's "
+                              "durability; a campaign that waits forever costs the "
+                              "campaign. The pass that wrote it is the thing to look at",
+                              leaderName, heldFor / 60,
+                              uint32(DUNGEON_MAINTENANCE_HOLD_SECONDS / 60));
+                    coord.holdSince = 0;
+                    coord.loggedHold = false;
+                }
+                else
+                {
+                    // SAID ONCE PER HOLD, on the same idle-coordinator flag
+                    // discipline the campaign-over line above uses and for the
+                    // same reason: this branch is reached on every poll for as
+                    // long as the errand runs, and a walk to a counter is
+                    // minutes of them.
+                    if (!coord.loggedHold)
+                    {
+                        coord.loggedHold = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: the next dungeon run for '{}' waits - {}. The "
+                                 "run does not open on top of an errand somebody else is "
+                                 "still running, because claiming the leader's aim would "
+                                 "turn them round mid-trip and the errand would never "
+                                 "complete. It opens as soon as the errand is done, or "
+                                 "after {} minutes whichever comes first",
+                                 leaderName,
+                                 hold == OverseerDecisions::MaintenanceHold::Walking
+                                     ? "the leader is walking to a counter"
+                                     : "errands are queued and not yet answered",
+                                 uint32(DUNGEON_MAINTENANCE_HOLD_SECONDS / 60));
+                    }
+                    return;
+                }
+            }
+            else if (coord.holdSince)
+            {
+                // The errand finished on its own, which is the ordinary way out
+                // of a hold and worth one line: an operator who read the wait
+                // should be able to read the end of it rather than infer it
+                // from a run starting.
+                LOG_INFO("module.overseer",
+                         "overseer: the maintenance errand for '{}' is done after {} "
+                         "minutes, so the dungeon run opens",
+                         leaderName, heldFor / 60);
+                coord.holdSince = 0;
+                coord.loggedHold = false;
+            }
+
             std::string const dungeonKeyword = DungeonKeywordForJob(leaderJob);
             DungeonPortal const* portal = FindDungeonPortal(dungeonKeyword);
             if (!portal)
                 return;  // no known portal for this job yet - nothing to gather toward
+
+            // CAN THE LEADER GET TO THIS DOOR AT ALL? ASKED BEFORE THE RESET,
+            // WHICH IS THE ONLY PLACE IT IS STILL FREE TO ASK (#158).
+            //
+            // WHAT WOULD HAPPEN WITHOUT THIS. Every step after this point is
+            // paid for. RESETTING throws away the instance the party is bound
+            // to; GATHERING claims the leader's aim, superseding whatever he
+            // was doing; the whole assembly then runs on
+            // DUNGEON_STAGING_BACKSTOP_SECONDS. For a portal on a map the
+            // leader is not standing on, all of that happens and none of it can
+            // work: ResolveTravelTarget refuses an `at:` aim whose map is not
+            // the character's own, so the errand is never taken up, the leader
+            // never moves, and the run fails at the backstop many minutes later
+            // with a reason ("on map 0 rather than map 1") that describes the
+            // symptom rather than the cause. Refusing here costs nothing and
+            // says the cause.
+            //
+            // AND IT IS NO LONGER A REFUSAL RATHER THAN A ROUTE (#241). This
+            // used to say the honest fix was "a boat leg from Menethil, a taxi
+            // hop, some travel kind that does not exist in this module yet",
+            // and that nothing should be invented at the point of failure. Both
+            // halves still hold. What changed is that the boat leg turned out
+            // not to need inventing: the world already runs transports that
+            // carry their own passengers across a map boundary, the bot AI
+            // already takes a character standing on a deck aboard, and the only
+            // missing step was ever walking one character to the pier. So this
+            // branch now asks whether such a transport exists and, when one
+            // does, opens a crossing instead of stopping. When one does not, it
+            // refuses exactly as it did before.
+            //
+            // THE CHEAP QUESTION FIRST. A healthy run pays one integer
+            // comparison here on every poll. Only a party genuinely on the
+            // wrong map pays for the world read below.
+            OverseerDecisions::DungeonApproach approach =
+                OverseerDecisions::DungeonPortalApproach(leader->GetMapId(),
+                                                         portal->outsideMapId);
+            if (approach != OverseerDecisions::DungeonApproach::Walkable)
+            {
+                CrossingRoute const route = ReadCrossingFromWorld(
+                    coord, members, leaderName, leader, portal->outsideMapId);
+
+                // ASKED AGAIN, THIS TIME HAVING LOOKED. The third answer only
+                // ever comes from a caller that went and found a transport.
+                approach = OverseerDecisions::DungeonPortalApproach(
+                    leader->GetMapId(), portal->outsideMapId, route.world.transportFound);
+
+                if (approach == OverseerDecisions::DungeonApproach::NeedsCrossing)
+                {
+                    OverseerDecisions::CrossingLimits limits;
+                    limits.berthArrivedYards = CROSSING_BERTH_ARRIVED_YARDS;
+                    DriveContinentCrossing(
+                        coord,
+                        OverseerDecisions::ReadCrossing(route.world, route.members, limits),
+                        route, leaderName, leader, portal->keyword);
+                    return;
+                }
+
+                // NO TRANSPORT SERVES BOTH MAPS, which is the case the old
+                // refusal was written for and is still exactly right for.
+                //
+                // SAID ONCE, on the same idle-coordinator flag discipline as
+                // the campaign-over line above and for the same reason: `job`
+                // stays `dungeon:wailing` until an operator changes it, so this
+                // branch is reached on every poll for as long as it is set.
+                if (!coord.loggedApproachRefused)
+                {
+                    coord.loggedApproachRefused = true;
+                    LOG_ERROR("module.overseer",
+                              "overseer: dungeon run refused - '{}' names the '{}' portal, "
+                              "which is approached from map {}, and the leader '{}' is on "
+                              "map {}. An `at:` aim is only ever resolved on the "
+                              "character's own map (there is no navmesh across an ocean), "
+                              "so no staging aim this run could write would be taken up, "
+                              "and nothing is reset, aimed or moved. No transport on map "
+                              "{} serves map {} either, so there is no crossing to open; "
+                              "name a portal on map {}",
+                              leaderJob, portal->keyword, portal->outsideMapId, leaderName,
+                              uint32(leader->GetMapId()), uint32(leader->GetMapId()),
+                              portal->outsideMapId, uint32(leader->GetMapId()));
+                }
+                return;
+            }
 
             // THE STAGING POINT IS RESOLVED HERE AND NOWHERE ELSE (#121), from
             // the two areatriggers this portal already names. A run that cannot
@@ -13390,6 +16191,96 @@ private:
                           "aimed anywhere; fix the portal's areatrigger rows",
                           leaderName, portal->keyword, why);
                 return;
+            }
+
+            // AND IS THE LEADER ABOVE THAT POINT RATHER THAN NEAR IT? ASKED
+            // HERE FOR EXACTLY THE REASON THE MAP CHECK ABOVE IS (#217).
+            //
+            // WHAT HAPPENS WITHOUT IT. Everything past this line is paid for:
+            // RESETTING throws away the instance the party is bound to,
+            // GATHERING claims the leader's aim and supersedes whatever he was
+            // doing, and the whole assembly then runs on
+            // DUNGEON_STAGING_BACKSTOP_SECONDS. Opening a run for a leader
+            // standing on the rim above the door spends all of that and cannot
+            // work - every direction that reduces his distance goes off a
+            // cliff, GroundedStep correctly refuses to take him off it, and the
+            // run ends twelve minutes later having moved nobody.
+            //
+            // AND THE COST IS NOT ONLY TIME. Six of the six deaths on the
+            // Wailing Caverns approach were falls, all five characters, one of
+            // them twice inside a minute, while the last step's own footing
+            // refusal was firing throughout. A party held on a clifftop by an
+            // aim it cannot satisfy is a party being kept somewhere dangerous.
+            // Not opening the run leaves nothing pulling them at the edge.
+            //
+            // IT IS A REFUSAL RATHER THAN A ROUTE, on the same terms as the map
+            // one: the honest fix is a way round, and there is no navmesh query
+            // in this module to find one with. What this does is decline to
+            // spend a run - and five characters - on an approach that is known
+            // in advance not to be one.
+            //
+            // SAID ONCE PER EPISODE AND THEN CLEARED. The leader is on his
+            // ordinary drives while this holds, so he moves; the moment the
+            // approach reads walkable the flag is dropped and the run opens on
+            // that same poll.
+            //
+            // AND IT IS ASKED ABOUT THE POINT THE LEADER WOULD ACTUALLY BE
+            // WALKED AT (#242), which for a door with a measured approach
+            // corridor is the corridor's start and not the door. That is the
+            // same rule on the right point rather than a weaker rule: a run
+            // that cannot be walked to is still refused, and for the three
+            // portal rows carrying no corridor the point is the staging point
+            // and this is bit-for-bit the check #228 wrote.
+            //
+            // WHAT IT IS WORTH, MEASURED. On the plateau 300 yards south of
+            // the ravine the door reads Overhead at 131 out and 76 up, so a run
+            // asked for from there is refused today; the corridor's start from
+            // the same spot reads Closing at 243 out and 26 up. The same holds
+            // from the plateau north of it and from the surface camp. Those are
+            // runs that can be walked and were being turned down.
+            //
+            // AND WHAT IT IS NOT WORTH, WHICH MATTERS JUST AS MUCH. From the
+            // rim itself the corridor is Overhead too - 105 yards down over 79
+            // along, and that holds for all 76 walkable samples matching the
+            // live stall shape. A party standing where they stopped is still
+            // held, and should be: there is no walk off that rim either. They
+            // are on their ordinary drives while this holds, so they move, and
+            // the run opens from the plateau. This does not rescue a party
+            // already on the rim and must not be read as doing so.
+            //
+            // The state is a scratch one: IDLE is deciding whether to open a
+            // run, not walking a leg, and marking the run's own corridor passed
+            // before the run exists is exactly the drift #220 is about.
+            {
+                OverseerDecisions::ApproachRouteState scratch;
+                DungeonApproachAim const first = DungeonApproachAimFor(
+                    *portal, scratch, leader, stageX, stageY, stageZ);
+                OverseerDecisions::ApproachGap const gap = first.gap;
+                if (OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) ==
+                    OverseerDecisions::ApproachShape::Overhead)
+                {
+                    if (!coord.loggedAboveTheDoor)
+                    {
+                        coord.loggedAboveTheDoor = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run held - the '{}' {} is "
+                                 "({:.1f}, {:.1f}, {:.1f}) and the leader '{}' is {}. That "
+                                 "is above it, not near it: no walk toward it from there "
+                                 "descends, and the last-step footing check would refuse "
+                                 "every direction that closed the gap. Nothing is reset, "
+                                 "aimed or moved, so nothing holds the party at the edge; "
+                                 "the run opens on the first poll the leader is somewhere "
+                                 "the approach can be walked from",
+                                 portal->keyword,
+                                 first.leg == OverseerDecisions::ApproachLeg::ToWaypoint
+                                     ? "approach corridor starts at"
+                                     : "staging point is",
+                                 first.x, first.y, first.z, leaderName,
+                                 OverseerDecisions::ApproachWhere(gap));
+                    }
+                    return;
+                }
+                coord.loggedAboveTheDoor = false;
             }
 
             // THERE IS NO `loggedCampaignOver = false` BETWEEN THE TWO STOP
@@ -13410,30 +16301,53 @@ private:
             // one. Everything here is skipped when the run table cannot carry a
             // campaign, in which case the run happens exactly as it does today
             // and simply is not numbered.
+            //
+            // AND `done == 0` NO LONGER MEANS "NOTHING HAS BEEN TRIED" (#225).
+            // It did while an attempt that failed before entry still moved the
+            // counter. Now that it does not, a campaign whose first four
+            // attempts all died at the barrier still reads zero, and taking that
+            // zero as the operator's gesture would hand every one of those
+            // failures a brand new campaign id - which is to say it would hide
+            // them from the consecutive-failure stop that is now the only thing
+            // bounding them. UnstartedCampaignOnMap asks the rows instead: if
+            // the last thing that happened on this map never got inside, this
+            // campaign is still trying to start and the attempt belongs to it.
             uint32 campaignId = 0;
             uint32 runNumber = cap.done + 1;
             if (RunAccountingPresent())
             {
-                campaignId = cap.done == 0
-                                 ? 0
-                                 : CampaignInProgress(leaderName, portal->insideMapId);
+                campaignId =
+                    cap.done == 0
+                        ? UnstartedCampaignOnMap(leaderName, portal->insideMapId)
+                        : CampaignInProgress(leaderName, portal->insideMapId);
                 if (!campaignId)
                     campaignId = AllocateCampaignId();
 
-                uint32 const failures = TrailingResetFailures(campaignId);
+                uint32 const failures = TrailingUnenteredRuns(campaignId);
                 if (failures >= DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES)
                 {
                     if (!coord.loggedCampaignOver)
                     {
                         coord.loggedCampaignOver = true;
+                        // THE ESCAPE HAD TO CHANGE WITH THE RULE ABOVE (#225).
+                        // "Set dungeon_runs_done to 0" used to clear this stop
+                        // as a side effect: it made the next run allocate a
+                        // fresh campaign, which orphaned the failing rows. That
+                        // is exactly the behaviour just removed, so the gesture
+                        // is named directly instead. Taking the attempts out of
+                        // the campaign is what the module reads, and
+                        // campaign_id 0 already means "a run this coordinator
+                        // did not drive".
                         LOG_ERROR("module.overseer",
                                   "overseer: the dungeon campaign for '{}' is stopped - the "
-                                  "last {} runs of campaign {} all ended 'reset_failed', so "
-                                  "the instance still has every boss dead in it and a "
-                                  "further run would walk into the same empty dungeon. The "
-                                  "reasons are on those rows; set dungeon_runs_done to 0 "
-                                  "once the cause is fixed",
-                                  leaderName, failures, campaignId);
+                                  "last {} attempts of campaign {} all ended without the "
+                                  "party ever reaching the instance, so a further one would "
+                                  "fail the same way. The reasons are on those rows. Once "
+                                  "the cause is fixed, take them out of the campaign to "
+                                  "start again: UPDATE overseer_dungeon_run SET campaign_id "
+                                  "= 0 WHERE campaign_id = {} AND outcome IN "
+                                  "('reset_failed','staging_failed')",
+                                  leaderName, failures, campaignId, campaignId);
                     }
                     return;
                 }
@@ -13655,9 +16569,89 @@ private:
             std::string why;
             if (ResetGroupInstance(leaderName, members, portal->insideMapId, why))
             {
-                std::ostringstream aim;
-                aim << "at:" << portal->outsideMapId << ':' << coord.stageX << ','
-                    << coord.stageY << ',' << coord.stageZ;
+                // THE LAST MOMENT THE STAGING POINT CAN STILL BE ASKED FOR, AND
+                // THEREFORE WHERE IT IS ASKED FOR (#220). Every other path into
+                // this phase brings a point with it: the IDLE branch resolves
+                // one before it opens a run, and EndRunAndDecide carries the
+                // finished run's forward on purpose (see its comment - a
+                // barrier circle that moves under a party standing in it is a
+                // gather that gets harder the closer it gets).
+                //
+                // THERE IS ONE PATH THAT BRINGS NOTHING, and it is the one the
+                // defect was measured on. An ADOPTED run - the party was
+                // already inside, which for Wailing Caverns is the only way in
+                // at all while #158's crossing does not exist - sets up a
+                // coordinator with no staging point, because an adopted run has
+                // no gathering left to do. When that run ends and the campaign
+                // goes again, EndRunAndDecide faithfully carries forward the
+                // three zeros it was given, and this line used to format them
+                // into `at:1:0,0,0` and claim it.
+                //
+                // So the point is DERIVED HERE when what was carried is not a
+                // place. This is the safest instant in the whole run to do it:
+                // the reset has just succeeded, so nobody is inside and nobody
+                // is standing in a barrier circle that could move under them,
+                // and the leader is out on the portal's own map, where the
+                // ground probe can actually answer. A run that still cannot be
+                // told where to wait does not walk anybody: it fails here, with
+                // the reason, exactly as the IDLE branch would have.
+                if (!OverseerDecisions::StagingPointUsable(coord.stageX, coord.stageY,
+                                                           coord.stageZ))
+                {
+                    float stageX = 0.f, stageY = 0.f, stageZ = 0.f;
+                    std::string stageWhy;
+                    if (!ResolveDungeonStagingPoint(*portal, leader, stageX, stageY,
+                                                    stageZ, stageWhy))
+                    {
+                        FailRunAtReset(coord, leaderName, members, *portal,
+                                       "the instance was reset but the '" +
+                                           std::string(portal->keyword) +
+                                           "' staging point cannot be worked out - " +
+                                           stageWhy +
+                                           ". Nothing is aimed anywhere; fix the portal's "
+                                           "areatrigger rows");
+                        return;
+                    }
+
+                    coord.stageX = stageX;
+                    coord.stageY = stageY;
+                    coord.stageZ = stageZ;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} inherited no staging point - the "
+                             "run before it was adopted rather than staged, which is the "
+                             "one path that carries none - so the '{}' point is derived "
+                             "now from areatrigger {} and the way out of areatrigger {}: "
+                             "({:.1f}, {:.1f}, {:.1f})",
+                             coord.runNumber, portal->keyword, portal->entryTriggerId,
+                             portal->exitTriggerId, coord.stageX, coord.stageY,
+                             coord.stageZ);
+                }
+
+                // A FRESH RUN WALKS THE CORRIDOR AGAIN (#242). The party
+                // comes back out of the door onto the ravine floor, so the run
+                // that follows starts below the corridor rather than above it -
+                // but it still has to be walked out and round, and a leftover
+                // "already passed" from the previous run would aim the next one
+                // straight back at the rim.
+                coord.approach.clear();
+                coord.legAim.clear();
+                coord.loggedCorridor = false;
+
+                DungeonApproachAim const first = DungeonApproachAimFor(
+                    *portal, coord.approach[leaderName], leader, coord.stageX,
+                    coord.stageY, coord.stageZ);
+                if (!first.usable)
+                {
+                    // Unreachable while the derivation above is the only way to
+                    // get here with a point - and said out loud rather than
+                    // assumed, because "unreachable" is what the old code
+                    // believed about three zeros reaching a travel errand.
+                    FailRunAtReset(coord, leaderName, members, *portal,
+                                   "the instance was reset but no staging aim can be "
+                                   "written - " + first.why);
+                    return;
+                }
+                std::string const& aimTarget = first.aim;
 
                 // CLAIM, not a raw UPDATE: the run supersedes whatever the
                 // leader was doing, and taking the wheel also drops any errand
@@ -13670,17 +16664,22 @@ private:
                 // nowhere. See TravelAimBook. In a LOOP that argument stops
                 // being hypothetical: every run after the first aims at the
                 // identical string the previous run just finished with.
-                _travelAims.Claim(leaderName, aim.str());
+                _travelAims.Claim(leaderName, aimTarget);
+                coord.legAim[leaderName] = aimTarget;
 
                 coord.phase = DungeonRunPhase::Gathering;
                 coord.loggedGathering = false;
                 LOG_INFO("module.overseer",
                          "overseer: dungeon run {} of {} - map {} is reset and '{}' is "
-                         "aimed at the staging point ({}); GATHERING begins {:.0f}y back "
+                         "aimed at {} ({}); GATHERING begins {:.0f}y back "
                          "down the approach corridor from areatrigger {}",
                          coord.runNumber, coord.capKnown ? coord.runsWanted : 0,
-                         portal->insideMapId, leaderName, aim.str(),
-                         DUNGEON_STAGING_STANDOFF_YARDS, portal->entryTriggerId);
+                         portal->insideMapId, leaderName,
+                         first.leg == OverseerDecisions::ApproachLeg::ToWaypoint
+                             ? "the start of the approach corridor"
+                             : "the staging point",
+                         aimTarget, DUNGEON_STAGING_STANDOFF_YARDS,
+                         portal->entryTriggerId);
                 return;
             }
 
@@ -13721,6 +16720,89 @@ private:
             // the run is walking.
             AssertTravelFocus(leaderName);
 
+            // WHERE THE LEADER STANDS, IN BOTH DIMENSIONS THAT MATTER (#217).
+            // Resolved once here because the backstop's reason, the arrival
+            // test and the watchdog below all need the same answer, and three
+            // readings taken separately are three chances to disagree.
+            //
+            // GetMapId  Position.h:281  uint32 GetMapId() const
+            // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+            // GetPositionZ  Position.h:120  float GetPositionZ() const
+            bool const onTheOutsideMap = leader->GetMapId() == portal->outsideMapId;
+
+            // WHICH LEG IS BEING WALKED, AND THE GAP TO THE POINT IT ENDS AT
+            // (#242). This used to be the gap to the staging point and nothing
+            // else, which is right for a door you can walk straight at and
+            // wrong for one at the bottom of a ravine: the party arrived 97
+            // yards out and 152 yards ABOVE the Wailing Caverns staging point,
+            // on walkable ground with no walkable way down from it, and every
+            // number this phase then read was a number about a place on the far
+            // side of a cliff.
+            //
+            // The leg is chosen by OverseerDecisions::ApproachLegStep, and for
+            // the three portal rows that carry no corridor it is always Direct
+            // and this is exactly the reading it always was.
+            DungeonApproachAim const legAim = DungeonApproachAimFor(
+                *portal, coord.approach[leaderName], leader, coord.stageX,
+                coord.stageY, coord.stageZ);
+            OverseerDecisions::ApproachGap const gap = legAim.gap;
+            bool const onTheCorridor =
+                legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
+
+            // AND THE AIM FOLLOWS THE LEG, RE-CLAIMED ONLY WHEN IT CHANGES.
+            // A leg that ends hands the leader on to the next point in the same
+            // poll it ends in, so without this he would arrive at the corridor
+            // and then stand there under an aim that had been satisfied. Guarded
+            // on the string because Claim drops the errand's memory: see
+            // DungeonRunCoordinatorState::legAim.
+            if (onTheOutsideMap && legAim.usable && legAim.aim != coord.legAim[leaderName])
+            {
+                _travelAims.Claim(leaderName, legAim.aim);
+                coord.legAim[leaderName] = legAim.aim;
+
+                // AND A FRESH LEG GETS A FRESH RATCHET, which is not tidying:
+                // without it the second leg is given up on at ninety seconds
+                // every single time. DUNGEON_STAGING_RATCHET tracks the BEST
+                // distance to the point being walked at, and the point changes
+                // here. The leader reaches the corridor at about four yards,
+                // so `best` is four; the very next reading is his distance to
+                // the staging point, which for the Wailing Caverns corridor is
+                // 179 yards and falling. A ratchet that kept the four would
+                // read every yard of a 465 yard descent as no progress, start
+                // the stall clock at the top of it, and climb the correction
+                // ladder to GiveUp while the leader was walking correctly.
+                //
+                // This is the same clearing, for the same reason, that BARRIER
+                // already does on entry: a new thing to measure against is a
+                // new measurement. The whole-run clock `stagingSince` is
+                // deliberately NOT reset - it bounds the assembly end to end,
+                // and a leg change is not a new assembly.
+                coord.staging.clear();
+
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is now walking at {} ({}) - {}",
+                         leaderName,
+                         onTheCorridor ? "the start of the approach corridor"
+                                       : "the staging point",
+                         legAim.aim, OverseerDecisions::ApproachWhere(gap));
+            }
+
+            // SAID ONCE, AND ONLY WHERE THERE IS A CORRIDOR TO SAY IT ABOUT.
+            // An operator reading the log for a door that has one should be
+            // able to see that the party is deliberately walking away from it
+            // first, rather than read a run going the wrong way.
+            if (onTheCorridor && !coord.loggedCorridor)
+            {
+                coord.loggedCorridor = true;
+                LOG_INFO("module.overseer",
+                         "overseer: the '{}' door is at the bottom of a ravine and is "
+                         "reached by a corridor, not by a bearing: '{}' walks to "
+                         "({:.1f}, {:.1f}, {:.1f}) first and to the staging point after "
+                         "that. Walking straight at the door ends on the rim above it",
+                         portal->keyword, leaderName, portal->approachX,
+                         portal->approachY, portal->approachZ);
+            }
+
             // AND GATHERING IS BOUNDED (#165). It had no bound of its own at
             // all: it returns and waits until the leader arrives, and if his
             // errand is released as unreachable by the travel backstop he never
@@ -13730,26 +16812,68 @@ private:
             if (coord.stagingSince && std::time(nullptr) - coord.stagingSince >
                                           DUNGEON_STAGING_BACKSTOP_SECONDS)
             {
+                // AND THE REASON NAMES THE CAUSE (#217). This used to read
+                // "924y from the staging point", which is the symptom: a reader
+                // cannot tell a leader who never set off from one standing on
+                // the rim above the door. ApproachWhere carries the height, so
+                // the two look different in the log because they are different.
                 std::string const where =
-                    leader->GetMapId() != portal->outsideMapId
-                        ? "on map " + std::to_string(uint32(leader->GetMapId())) +
-                              " rather than map " + std::to_string(portal->outsideMapId)
-                        : std::to_string(static_cast<uint32>(leader->GetDistance2d(
-                              coord.stageX, coord.stageY))) +
-                              "y from the staging point";
-                FailStaging(coord, leaderName, *portal, "GATHERING",
+                    onTheOutsideMap
+                        ? OverseerDecisions::ApproachWhere(gap)
+                        : "on map " + std::to_string(uint32(leader->GetMapId())) +
+                              " rather than map " + std::to_string(portal->outsideMapId);
+                FailStaging(coord, leaderName, members, *portal, "GATHERING",
                             leaderName + " (" + where + ")", IsDungeonJob(leaderJob));
                 return;
             }
 
-            // GetMapId  Position.h:281  uint32 GetMapId() const
-            // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
-            if (leader->GetMapId() != portal->outsideMapId)
+            if (!onTheOutsideMap)
                 return;  // still travelling, or on a different map entirely - keep waiting
 
-            float const distance = leader->GetDistance2d(coord.stageX, coord.stageY);
-            if (distance > DUNGEON_BARRIER_RADIUS_YARDS)
+            // ARRIVED IS A THREE-DIMENSIONAL FACT (#217). This was
+            // `distance <= DUNGEON_BARRIER_RADIUS_YARDS`, which a leader ten
+            // yards out and a hundred and fifty yards up a cliff satisfied - so
+            // the phase could advance from a ledge and BARRIER then waited for a
+            // party to assemble somewhere it could not leave.
+            OverseerDecisions::ApproachShape const shape =
+                OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS);
+            // ARRIVING AT THE CORRIDOR IS NOT ARRIVING AT THE DOOR (#242).
+            // ApproachLegStep already guarantees this - the poll a leader
+            // reaches the corridor is the poll it returns Direct, so a leg of
+            // ToWaypoint cannot also be an arrival - but BARRIER opening from
+            // the top of a corridor would strand the whole party 465 yards from
+            // the door, so the invariant is asserted here rather than relied on
+            // from another file.
+            if (onTheCorridor || shape != OverseerDecisions::ApproachShape::Arrived)
+            {
+                // AND GATHERING FINALLY WATCHES THE ONE CHARACTER IT IS WAITING
+                // FOR (#217). It never did: it returned and waited, so a leader
+                // that stopped getting nearer was indistinguishable from one
+                // still walking until the twelve minutes were spent. BARRIER
+                // has had this ladder since #164 and the leader is on the
+                // identical aim in both phases; the only reason it was not here
+                // is that nobody had asked the question in this phase.
+                //
+                // The state lives in the same per-member map BARRIER uses, and
+                // BARRIER clears it on entry, so a fresh ladder starts there.
+                //
+                // AND THE REASON NAMES WHICH POINT WAS NOT REACHED (#242).
+                // A leader stalled on the way to the corridor and one stalled
+                // on the way to the door are different failures with different
+                // fixes, and a line that said only "the staging point" for both
+                // would send the next reader to the wrong one.
+                if (RunStagingWatchdog(coord, leaderName, leader, gap))
+                    FailApproach(coord, leaderName, *portal, "GATHERING",
+                                 leaderName + " (" +
+                                     OverseerDecisions::ApproachWhere(gap) +
+                                     (onTheCorridor
+                                          ? ", walking to the start of the approach "
+                                            "corridor"
+                                          : "") +
+                                     ")",
+                                 IsDungeonJob(leaderJob));
                 return;
+            }
 
             coord.phase = DungeonRunPhase::Barrier;
             coord.loggedBarrierWaiting = false;
@@ -13757,10 +16881,11 @@ private:
             // yet, nobody on the ladder.
             coord.staging.clear();
             LOG_INFO("module.overseer",
-                     "overseer: '{}' reached the staging point ({:.0f}y out) - GATHERING "
+                     "overseer: '{}' reached the staging point ({}) - GATHERING "
                      "done, BARRIER holds until the whole roster is alive, out of combat "
-                     "and within {:.0f}y",
-                     leaderName, distance, DUNGEON_BARRIER_RADIUS_YARDS);
+                     "and within {:.0f}y of it on the same surface",
+                     leaderName, OverseerDecisions::ApproachWhere(gap),
+                     DUNGEON_BARRIER_RADIUS_YARDS);
             return;
         }
 
@@ -13868,10 +16993,16 @@ private:
                             // that lived on `coord` would be destroyed under a
                             // reference the function still holds.
                             std::string const reason =
-                                coord.stalledReason.empty()
-                                    ? ("the party walked back out through areatrigger " +
+                                coord.provedComplete
+                                    ? ("every encounter map " +
+                                       std::to_string(portal->insideMapId) +
+                                       " credits was credited, and the party walked back "
+                                       "out through areatrigger " +
                                        std::to_string(triggerId))
-                                    : coord.stalledReason;
+                                    : coord.stalledReason.empty()
+                                          ? ("the party walked back out through "
+                                             "areatrigger " + std::to_string(triggerId))
+                                          : coord.stalledReason;
                             // AND THE ROW SAYS WHAT ACTUALLY HAPPENED (#171).
                             // 'stalled' was named and deliberately NOT written
                             // by the accounting migration, because this module
@@ -13882,7 +17013,9 @@ private:
                                             coord.runId
                                                 ? coord.runId
                                                 : ActiveRunIdOnMap(portal->insideMapId),
-                                            coord.stalledReason.empty() ? "left" : "stalled",
+                                            OverseerDecisions::DungeonRunExitOutcome(
+                                                coord.provedComplete,
+                                                !coord.stalledReason.empty()),
                                             reason, IsDungeonJob(leaderJob));
                         }
                         return;
@@ -13936,6 +17069,31 @@ private:
             uint32 inside = 0;
             std::vector<OverseerDecisions::DungeonRunEntryState> const states =
                 DungeonRunCensus(members, door, portal->insideMapId, inside);
+
+            // THE RUN JOINS ITS CAMPAIGN AS SOON AS THERE IS A ROW TO STAMP,
+            // WHICH IS NOT WHERE THIS USED TO HAPPEN (#225). It was done at the
+            // STAGED_INSIDE -> CLEARING transition, on the reasoning that the
+            // row cannot exist before somebody is inside and that transition is
+            // the first moment the coordinator knows it does. The first half is
+            // right and the second is a poll too late: every way a run can end
+            // from STAGED_INSIDE - the party splits after entry, the map empties
+            // before the census sees the last one through, a worldserver bounce
+            // between the two polls - closes a row still reading campaign_id 0,
+            // run_number 0. Measured 2026-09-05: both of the day's rows,
+            // including a full clear, carry those two zeros.
+            //
+            // Once per run rather than once per poll: coord.runId is 0 only
+            // until the row is found, and StampRunIntoCampaign is a no-op on a
+            // row already in a campaign anyway (`AND campaign_id = 0`), so this
+            // stays idempotent against a re-entry and against a run some other
+            // process numbered first.
+            if (!coord.runId)
+            {
+                coord.runId = ActiveRunIdOnMap(portal->insideMapId);
+                if (coord.runId)
+                    StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
+                                         JoinNames(members));
+            }
 
             // NOBODY LEFT INSIDE MEANS THE RUN IS OVER, however it ended - a
             // wipe that released everyone to a graveyard, a party that walked
@@ -14015,18 +17173,12 @@ private:
                 coord.loggedMoved = false;
                 coord.loggedNotMoved = false;
 
-                // THE RUN JOINS ITS CAMPAIGN HERE, AND HERE IS THE FIRST MOMENT
-                // IT COULD (#144). The run ROW is opened by the arming drive,
-                // which is the thing that notices somebody is on the instance
-                // map - so it exists by now and not before, and this is the
-                // earliest point at which the coordinator can put its own
-                // numbers on it. `AND campaign_id = 0` inside StampRunIntoCampaign
-                // is what keeps this idempotent against a re-entry to this
-                // transition and against a run some other process already
-                // numbered.
-                coord.runId = ActiveRunIdOnMap(portal->insideMapId);
-                StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
-                                     JoinNames(members));
+                // THE RUN HAS ALREADY JOINED ITS CAMPAIGN BY NOW (#225). That
+                // used to happen on this line, and it happened a poll too late
+                // for every run that ended from STAGED_INSIDE without ever
+                // reaching CLEARING; it is done above instead, on the first poll
+                // that finds a row at all. See the comment beside the census.
+
                 // THE LINE THIS WHOLE EPIC WAS OPENED TO MAKE POSSIBLE, so it
                 // says what is now true rather than what was attempted.
                 LOG_INFO("module.overseer",
@@ -14173,6 +17325,74 @@ private:
             // anything placed after it would never run again for the rest of
             // the run, which is precisely the window a twenty-six minute freeze
             // lives in.
+            // IS IT FINISHED? ASKED BEFORE THE WATCHDOG, because to that
+            // watchdog a finished dungeon and a stuck one are the same picture
+            // (#226). It looks for no boss credit, nobody busy and a leader that
+            // has not moved, which is exactly what a party that has killed
+            // everything looks like - so a clear that succeeded gets three
+            // pointless `dc skip`s and a row saying 'stalled', if it is noticed
+            // at all.
+            //
+            // MEASURED, AND IT WAS NOT NOTICED AT ALL. A confirmed 100 percent
+            // Wailing Caverns clear ran 121 minutes and ended 'emptied'. The
+            // dungeon module does not walk anybody out when it finishes - it
+            // disables itself and the party stands where it stopped - and a
+            // party standing about sits down to eat, which this watchdog counts
+            // as BUSY and which re-stamps its clock on every poll. So the one
+            // bound that could have ended the run was held open by the party
+            // resting after the run it had already won.
+            //
+            // Execution only reaches here in CLEARING - STAGED_INSIDE returns
+            // above - which is the only phase where the question means
+            // anything: before entry there is nothing to have finished, and
+            // EXIT has already decided to leave. The flag is an idempotence
+            // guard, not a phase test: once the answer is yes the phase changes
+            // and this is not asked again for the run.
+            if (!coord.provedComplete)
+            {
+                uint32 const expected = ExpectedEncounterMask(portal->insideMapId);
+                uint32 const credited = CompletedEncounters(leader);
+                OverseerDecisions::DungeonCompletion const done =
+                    OverseerDecisions::DungeonRunCompletion(expected, credited);
+
+                if (done == OverseerDecisions::DungeonCompletion::Complete)
+                {
+                    coord.provedComplete = true;
+                    coord.phase = DungeonRunPhase::Exiting;
+                    coord.crossing.best = 0.f;
+                    coord.crossing.since = std::time(nullptr);
+                    coord.loggedCrossingAim = false;
+                    coord.loggedCrossingWaiting = false;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} of campaign {} is FINISHED - every "
+                             "encounter map {} credits has been credited (mask {} of {}). "
+                             "EXIT walks them back out through the door they came in by, "
+                             "which is the first ending this coordinator has ever had for "
+                             "a run that simply worked",
+                             coord.runNumber, coord.campaignId, portal->insideMapId,
+                             credited, expected);
+                    return;
+                }
+
+                // SAID ONCE, AND ONLY WHEN THE ANSWER IS THAT THERE IS NO
+                // ANSWER. A map the DBC credits nothing for keeps every ending
+                // it has today, and an operator watching a campaign on such a
+                // map should be able to read why it never ends 'complete'
+                // rather than deduce it.
+                if (done == OverseerDecisions::DungeonCompletion::Unknowable &&
+                    !coord.loggedNoCompletionSignal)
+                {
+                    coord.loggedNoCompletionSignal = true;
+                    LOG_WARN("module.overseer",
+                             "overseer: map {} has no DungeonEncounter rows, so this "
+                             "coordinator cannot tell when a run on it is finished. The "
+                             "run still ends the ways it always could - the clearing "
+                             "watchdog, a job change, or the map emptying - and it will "
+                             "never be recorded 'complete'",
+                             portal->insideMapId);
+                }
+            }
+
             if (RunClearingWatchdog(coord, leader, states, portal->insideMapId))
                 return;   // the run is on its way out; the phase has changed
 
@@ -14254,10 +17474,22 @@ private:
         // purpose: at 10 yards the leader is right there, so `follow` picks the
         // member up as the escort hands back, and the escort never has to end on
         // an arrival (which would idle it, see DriveTravel's escort branch).
-        std::ostringstream stageAim;
-        stageAim << "at:" << portal->outsideMapId << ':' << coord.stageX << ','
-                 << coord.stageY << ',' << coord.stageZ;
-        std::string const stageTarget = stageAim.str();
+        // AND IT IS BUILT THROUGH THE ONE FUNCTION THAT REFUSES AN UNRESOLVED
+        // POINT (#220), like the RESETTING aim above it. Nothing can reach
+        // BARRIER without passing through RESETTING, which now derives a point
+        // when it inherited none, so this refusal should be unreachable - and
+        // it is written anyway, because "unreachable" is precisely what was
+        // believed about the three zeros that got walked at. An escort is a
+        // character being sent somewhere; the check belongs at every place one
+        // is sent, not at the one place the destination was worked out.
+        std::string stageTarget;
+        std::string stageWhy;
+        if (!DungeonStagingAim(*portal, coord, stageTarget, stageWhy))
+        {
+            FailStaging(coord, leaderName, members, *portal, "BARRIER", stageWhy,
+                        IsDungeonJob(leaderJob));
+            return;
+        }
 
         std::vector<OverseerDecisions::DungeonRunMemberState> states;
         states.reserve(members.size());
@@ -14292,8 +17524,18 @@ private:
             state.inside = member->GetMapId() == portal->insideMapId;
             // GetMapId  Position.h:281  uint32 GetMapId() const
             if (member->GetMapId() == portal->outsideMapId)
+            {
                 // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
                 state.distanceFromStage = member->GetDistance2d(coord.stageX, coord.stageY);
+                // AND HOW FAR ABOVE OR BELOW IT (#217). Taken here, beside the
+                // reading it qualifies, so the two can never be measured from
+                // different polls. Ten yards out and a hundred and fifty yards
+                // up is what a member on the ridge above the door reads, and
+                // the line above on its own called that an arrival.
+                //
+                // GetPositionZ  Position.h:120  float GetPositionZ() const
+                state.verticalFromStage = member->GetPositionZ() - coord.stageZ;
+            }
 
             // A member on some other map carries a negative distance and cannot
             // be walked here by an `at:` aim at all - ResolveTravelTarget
@@ -14316,11 +17558,68 @@ private:
             //
             // A follower is escorted only while it is genuinely short of the
             // staging point. Inside the radius the leader is right there, so
-            // `follow` is both sufficient and preferable.
+            // `follow` is both sufficient and preferable - and "inside the
+            // radius" is now the same three-dimensional question the barrier
+            // itself asks (#217), because a follower ten yards out and a
+            // hundred and fifty yards up is not standing beside anybody.
+            // Leaving this one site on the flat test would be the module
+            // holding two opinions about where its own staging point is.
+            OverseerDecisions::ApproachGap gap;
+            gap.horizontalYards = state.distanceFromStage;
+            gap.verticalYards = state.verticalFromStage;
+            gap.measured = state.distanceFromStage >= 0.f;
             bool const isLeader = name == leaderName;
-            if (state.distanceFromStage >= 0.f &&
-                (isLeader || state.distanceFromStage > DUNGEON_BARRIER_RADIUS_YARDS))
-                EscortToward(name, stageTarget, "BARRIER");
+
+            // AND THE ESCORT WALKS THE CORRIDOR TOO (#261). This used to send
+            // every member at `stageTarget`, the door itself, which is the
+            // exact defect #242 fixed for the leader and left standing here.
+            //
+            // IT IS NOT A CORNER CASE, IT IS THE COMMON ONE. A member only
+            // needs escorting because following did not deliver it, and on this
+            // approach the usual reason is that it died and was resurrected:
+            // the nearest graveyard to the Wailing Caverns door is The
+            // Crossroads at (-592.6, -2523.5, 91.8), 339 yards from the door
+            // and 75 yards ABOVE it. That reads Closing, so nothing refuses it,
+            // and an escort straight at the door from there walks onto the rim
+            // and stops. Measured live on 2026-09-06: one member at 71 yards
+            // out and 146 above, which closed the run in BARRIER.
+            //
+            // Escorted at the corridor instead, the same member walks down the
+            // ramp and arrives. The barrier itself is unchanged and still
+            // measured against the DOOR - `state` above is untouched - because
+            // whether the party is assembled is a question about the staging
+            // point and always was. Only where each member is being WALKED
+            // changes.
+            DungeonApproachAim const legAim = DungeonApproachAimFor(
+                *portal, coord.approach[name], member, coord.stageX, coord.stageY,
+                coord.stageZ);
+            bool const onTheCorridor =
+                legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
+
+            if (gap.measured && legAim.usable &&
+                (isLeader || onTheCorridor ||
+                 OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) !=
+                     OverseerDecisions::ApproachShape::Arrived))
+            {
+                EscortToward(name, legAim.aim, "BARRIER");
+                if (coord.legAim[name] != legAim.aim)
+                {
+                    coord.legAim[name] = legAim.aim;
+                    // A NEW LEG GETS A NEW RATCHET, the same clearing #242 made
+                    // in GATHERING and for the same reason: the ladder measures
+                    // the best distance to the point being walked at, and that
+                    // point has just changed. Only this member's, because only
+                    // this member's leg changed.
+                    coord.staging.erase(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run BARRIER walks '{}' to {} ({}) - {}",
+                             name,
+                             onTheCorridor ? "the start of the approach corridor"
+                                           : "the staging point",
+                             legAim.aim,
+                             OverseerDecisions::ApproachWhere(legAim.gap));
+                }
+            }
 
             // AND THE ESCORT RE-ASSERTS ITSELF ON THE RUN'S OWN CLOCK (#164).
             // DriveTravel asserts the focus on every travel poll already; this
@@ -14334,12 +17633,36 @@ private:
             // IS IT ACTUALLY COMING? The reading above is a distance, and a
             // distance alone cannot tell a member walking in from a member
             // standing still. This can, and corrects what it finds.
-            RunStagingWatchdog(coord, name, member, state);
+            //
+            // AND IT WATCHES THE LEG THAT IS BEING WALKED (#261).
+            // Fed the gap to the DOOR while a member is walking the corridor,
+            // it reads every yard of a correct descent as no progress, because
+            // the corridor's first half increases the distance to the door. It
+            // is handed the leg's own gap for the same reason GATHERING's is.
+            OverseerDecisions::ApproachGap const legGap =
+                onTheCorridor ? legAim.gap : gap;
+            if (RunStagingWatchdog(coord, name, member, legGap))
+            {
+                // ABOVE THE DOOR AND NOT COMING DOWN (#217). One member in that
+                // state is enough to close the run: the barrier needs all of
+                // them, so there is nothing left for the remaining clock to
+                // achieve, and every minute of it is a minute the party spends
+                // standing beside a drop. The watchdog has already said which
+                // character and how far above.
+                FailApproach(coord, leaderName, *portal, "BARRIER",
+                             name + " (" + OverseerDecisions::ApproachWhere(legGap) +
+                                 (onTheCorridor
+                                      ? ", walking to the start of the approach corridor"
+                                      : "") +
+                                 ")",
+                             IsDungeonJob(leaderJob));
+                return;
+            }
 
             states.push_back(state);
         }
 
-        if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_BARRIER_RADIUS_YARDS))
+        if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_APPROACH_LIMITS))
         {
             // THE BARRIER IS A ONE-WAY DOOR INTO ENTER, not a condition ENTER
             // keeps re-asking. Once the party is gathered, the next thing that
@@ -14385,9 +17708,9 @@ private:
         if (coord.stagingSince &&
             std::time(nullptr) - coord.stagingSince > DUNGEON_STAGING_BACKSTOP_SECONDS)
         {
-            FailStaging(coord, leaderName, *portal, "BARRIER",
+            FailStaging(coord, leaderName, members, *portal, "BARRIER",
                         OverseerDecisions::DungeonRunBarrierBlockers(
-                            states, DUNGEON_BARRIER_RADIUS_YARDS),
+                            states, DUNGEON_APPROACH_LIMITS),
                         IsDungeonJob(leaderJob));
             return;
         }
@@ -14398,7 +17721,7 @@ private:
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER holds - {}",
                      OverseerDecisions::DungeonRunBarrierBlockers(
-                         states, DUNGEON_BARRIER_RADIUS_YARDS));
+                         states, DUNGEON_APPROACH_LIMITS));
         }
     }
 
@@ -14976,7 +18299,11 @@ private:
         ss << "INSERT INTO overseer_death (character_name, character_guid, level, "
               "map, zone, pos_x, pos_y, pos_z, killer_type, killer_name, killer_entry, "
               "health_at_death, max_health_at_death, seconds_since_full_health, "
-              "job, quest_aim, travel_target, grouped, group_size, group_leader) VALUES ";
+              "job, quest_aim, travel_target, grouped, group_size, group_leader, "
+              "driver, movement_generator, in_combat, last_seen_seconds, "
+              "last_pos_x, last_pos_y, last_pos_z, yards_fallen, "
+              "leader_seen, leader_map, leader_pos_x, leader_pos_y, leader_pos_z, "
+              "recovery_rung, recovery_prev_rung, recovery_seconds) VALUES ";
         bool first = true;
         for (PendingDeath const& d : batch)
         {
@@ -15000,16 +18327,46 @@ private:
                << ',' << static_cast<uint32>(d.grouped)
                << ',' << static_cast<uint32>(d.groupSize)
                << ",'" << Esc(d.groupLeader) << "'"
+               << ",'" << Esc(d.driver) << "'"
+               << ",'" << Esc(d.movement) << "'"
+               << ',' << static_cast<int32>(d.inCombat)
+               << ',' << d.lastSeenSeconds
+               << ',' << d.lastX << ',' << d.lastY << ',' << d.lastZ
+               << ',' << d.yardsFallen
+               << ',' << static_cast<uint32>(d.leaderSeen)
+               << ',' << static_cast<uint32>(d.leaderMap)
+               << ',' << d.leaderX << ',' << d.leaderY << ',' << d.leaderZ
+               << ',' << static_cast<int32>(d.recoveryRung)
+               << ',' << static_cast<int32>(d.recoveryPrevRung)
+               << ',' << d.recoverySeconds
                << ')';
         }
         CharacterDatabase.Execute(ss.str().c_str());
 
+        // The driver and the drop are on the line as well as in the row: a
+        // death nobody can attribute is the thing #188 is about, and a log a
+        // person is already reading is where they will notice it first.
+        //
+        // THE DROP CARRIES ITS OWN VERDICT, per #243. "fell 0.0 yards" was
+        // read as a fall from height for a day, because a distance on its own
+        // does not say whether it could have done the killing and the core's
+        // arithmetic was not written down anywhere a reader could reach.
+        // Now the line says which, and says "unsampled" rather than nothing
+        // when there was no sample to draw the distance from.
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
-                 "in zone {} (killer: {} '{}')",
+                 "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
+                 "fell {:.1f} yards which is {}, in combat {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
-                 batch.back().killerType, batch.back().killerName);
+                 batch.back().killerType, batch.back().killerName,
+                 batch.back().driver, batch.back().movement,
+                 batch.back().yardsFallen,
+                 OverseerDecisions::FallAccountName(
+                     OverseerDecisions::AccountForFall(batch.back().yardsFallen)),
+                 batch.back().inCombat < 0
+                     ? "unsampled"
+                     : (batch.back().inCombat ? "yes" : "no"));
     }
 
     // ------------------------------------------------------- outcome --
@@ -15100,6 +18457,129 @@ private:
     // at most COMMANDS_PER_POLL entries are added per poll and every entry is
     // resolved within VERIFY_GRACE_MS.
     std::vector<StrategyCheck> _pendingChecks;
+
+    // What the drain has already said about its own health (mod-overseer#230).
+    // World thread only, like _pendingChecks beside it and for the same reason.
+    OverseerDecisions::CommandQueueVoiceState _queueVoice;
+
+    // END ROWS A RUN THAT IS GONE IS STILL HOLDING.
+    //
+    // A row is moved to `claimed` before it is executed, which is what makes
+    // this queue at-most-once for commands that create items and move
+    // characters (see DeliverPendingCommands). The cost of that is a row left in
+    // `claimed` by a worldserver that died between the claim and the result:
+    // `WHERE status = 'pending'` can never select it again, this module has no
+    // memory of it after a restart, and nothing in the world will ever end it. A
+    // `verifying` row is the same leak one step later, its check having died
+    // with the _pendingChecks that held it.
+    //
+    // ENDED AS `error`, NOT RETURNED TO `pending`. Handing one back would undo
+    // the whole point of claiming first: a dot-command that creates items or
+    // moves a character would run a second time, which is the at-least-once
+    // behaviour the claim exists to remove. The sender gets a bad answer, which
+    // is what it is owed and is strictly better than none.
+    //
+    // THE AGE COMES FROM THE DATABASE, so a worldserver whose host clock has
+    // drifted from the database's cannot expire a live claim or keep a dead one.
+    // The rule is pure and tested (OverseerDecisions::ClaimIsAbandoned); what is
+    // here is the reading and the writing.
+    //
+    // The bridge sweeps these too, and this write is guarded on the status and
+    // the token it is collecting, so whichever gets there second changes
+    // nothing.
+    void ExpireAbandonedClaims()
+    {
+        QueryResult holders = CharacterDatabase.Query(
+            "SELECT id, claimed_by, TIMESTAMPDIFF(SECOND, updated_at, NOW()) "
+            "FROM overseer_command WHERE status IN ('claimed', 'verifying') "
+            "ORDER BY updated_at ASC LIMIT {}",
+            COMMANDS_PER_POLL);
+        if (!holders)
+            return;
+
+        do
+        {
+            Field* fields = holders->Fetch();
+            uint32 const id = fields[0].Get<uint32>();
+            std::string const claimedBy = fields[1].Get<std::string>();
+            int64 const heldFor = fields[2].Get<int64>();
+
+            if (!OverseerDecisions::ClaimIsAbandoned(claimedBy, g_runToken,
+                                                     static_cast<time_t>(heldFor),
+                                                     COMMAND_CLAIM_LEASE_SECONDS))
+                continue;
+
+            // SAID, EVERY TIME. These are rare by construction - one burst per
+            // worldserver that died holding rows - and each one is a command
+            // somebody is still waiting on, so there is nothing here to spare
+            // the log from.
+            LOG_WARN("module.overseer",
+                     "overseer: command {} has been held for {}s by a run that is not this "
+                     "one, where nothing can select it again; ending it. It is NOT re-queued, "
+                     "because a claimed command may already have half run",
+                     id, static_cast<long long>(heldFor));
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = 'error', "
+                "detail = 'claim expired: the run holding it is gone', claimed_by = '' "
+                "WHERE id = {} AND status IN ('claimed', 'verifying') AND claimed_by = '{}'",
+                id, Esc(claimedBy));
+        } while (holders->NextRow());
+    }
+
+    // THE QUEUE SAYS WHEN IT IS NOT DRAINING (mod-overseer#230).
+    //
+    // The defect this exists for was invisible in the log and obvious in one
+    // database query, which is the wrong way round for something an operator is
+    // meant to notice: the queue delivered nothing for twenty five minutes while
+    // the module logged two hundred perfectly healthy lines beside it. A poll
+    // that had rows in its hands and executed none of them, or a backlog whose
+    // oldest row is not being reached, now says so at the moment it starts.
+    //
+    // The judgement is pure and tested (OverseerDecisions::CommandQueueSay),
+    // including the rate limit and the line that ends a complaint; what is here
+    // is the wording and the level.
+    void SayHowTheQueueIsDoing(unsigned pending, unsigned executed, unsigned held,
+                               time_t oldestPendingAge)
+    {
+        OverseerDecisions::CommandQueueSnapshot snapshot;
+        snapshot.pending = pending;
+        snapshot.executed = executed;
+        snapshot.held = held;
+        snapshot.oldestPendingAge = oldestPendingAge;
+
+        OverseerDecisions::CommandQueueVoiceLimits limits;
+        limits.stuckSeconds = COMMAND_QUEUE_STUCK_SECONDS;
+        limits.deepRows = COMMAND_QUEUE_DEEP_ROWS;
+        limits.repeatSeconds = COMMAND_QUEUE_SAY_EVERY_SECONDS;
+
+        switch (OverseerDecisions::CommandQueueSay(_queueVoice, snapshot, time(nullptr),
+                                                   limits))
+        {
+            case OverseerDecisions::CommandQueueVoice::Stuck:
+                LOG_WARN("module.overseer",
+                         "overseer: the command queue is NOT draining - {} row(s) waiting, {} "
+                         "run this poll, {} selected and not run, oldest waiting row untouched "
+                         "for {}s. Something at the head is refusing every poll and everything "
+                         "behind it is waiting on it",
+                         pending, executed, held, static_cast<long long>(oldestPendingAge));
+                break;
+            case OverseerDecisions::CommandQueueVoice::Deep:
+                LOG_INFO("module.overseer",
+                         "overseer: the command queue is {} row(s) deep and moving - {} run "
+                         "this poll, oldest waiting row is {}s old",
+                         pending, executed, static_cast<long long>(oldestPendingAge));
+                break;
+            case OverseerDecisions::CommandQueueVoice::Recovered:
+                LOG_INFO("module.overseer",
+                         "overseer: the command queue is draining normally again - {} row(s) "
+                         "waiting, {} run this poll",
+                         pending, executed);
+                break;
+            case OverseerDecisions::CommandQueueVoice::Silent:
+                break;
+        }
+    }
 
     // `nc -new rpg`, `co +grind,-loot`. Returns false for everything with no
     // post-condition to read: a different verb, `~` (toggle) or `?` (query),
@@ -15338,12 +18818,55 @@ private:
         // answer by a whole poll.
         ResolveStrategyChecks(sincePollMs);
 
+        // Then collect any row a run that is no longer here is still holding,
+        // because nothing below this line can ever see one.
+        ExpireAbandonedClaims();
+
+        // ORDERED BY WHEN THE ROW WAS LAST TOUCHED, NOT BY ITS ID
+        // (mod-overseer#230).
+        //
+        // In id order the head of this queue is FIXED, and any path that leaves
+        // a selected row pending keeps that head against everything behind it.
+        // That is what wedged this queue for twenty five minutes on 2026-09-05,
+        // and the retry that did it is deleted below - but the ordering is what
+        // makes the property structural rather than a promise that no future
+        // executor reaches for `status = "pending"` again. One did, an hour
+        // before this was written (see the town trip's comment below), which is
+        // the argument for closing the hole rather than only the instance.
+        //
+        // `updated_at` moves when a row is deferred and does not otherwise, so
+        // this costs nothing for a row nothing has held: for those it is still
+        // creation order, which for an auto-increment queue is id order. Every
+        // pending row is then reached within ceil(rows / COMMANDS_PER_POLL)
+        // polls whatever any one of them keeps doing. `id ASC` remains the
+        // tie-break so two commands inserted in the same second still go out in
+        // the order they were asked for, which the trigger-collision rule above
+        // depends on.
+        //
+        // The age comes back with the row for the health line at the bottom of
+        // this function, from the database's clock rather than this host's.
         QueryResult result = CharacterDatabase.Query(
-            "SELECT id, target_name, command, kind, channel, target_arg FROM overseer_command "
-            "WHERE status = 'pending' ORDER BY id ASC LIMIT {}",
+            "SELECT id, target_name, command, kind, channel, target_arg, "
+            "TIMESTAMPDIFF(SECOND, updated_at, NOW()) FROM overseer_command "
+            "WHERE status = 'pending' ORDER BY updated_at ASC, id ASC LIMIT {}",
             COMMANDS_PER_POLL);
         if (!result)
+        {
+            // Judged even so. A queue that has just drained to nothing is how a
+            // complaint ENDS, and returning early without a word here is how the
+            // log would carry the beginning of one and never the end.
+            SayHowTheQueueIsDoing(0, 0, 0, 0);
             return;
+        }
+
+        // WHAT THIS POLL WAS LIKE, gathered as it goes. `selected` counts rows
+        // taken out of the queue, `executed` the ones actually attempted, and
+        // `held` the ones handed back untried - and it is the gap between those
+        // last two that names a wedge.
+        unsigned selected = 0;
+        unsigned executed = 0;
+        unsigned held = 0;
+        time_t oldestPendingAge = 0;
 
         // "<character>\n<verb>" already handed to a bot in THIS poll. Local to
         // the poll on purpose: the trigger slot is only contended between
@@ -15360,11 +18883,22 @@ private:
             std::string channel = fields[4].Get<std::string>();
             std::string targetArg = fields[5].Get<std::string>();
 
+            // The SELECT is ordered oldest first, so the FIRST row carries the
+            // age the health line below judges. Clamped at zero because a
+            // TIMESTAMPDIFF against a row written in the same second, or by a
+            // host running slightly ahead, can come back negative.
+            ++selected;
+            if (selected == 1)
+            {
+                int64 const waiting = fields[6].Get<int64>();
+                oldestPendingAge = waiting > 0 ? static_cast<time_t>(waiting) : 0;
+            }
+
             char const* status = "error";
             char const* detail = "";
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share', 'job', 'sell' and 'bank' do not go through
+            // 'share', 'job', 'sell', 'bank' and 'mail' do not go through
             // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
@@ -15385,6 +18919,20 @@ private:
                               "overseer: holding command {} ('{}' for '{}') until next poll; "
                               "'{}' already sent this poll and they share a trigger",
                               id, command, targetName, verb);
+                    // ...AND IT GIVES UP ITS PLACE IN THE QUEUE
+                    // (mod-overseer#230). The SELECT above is ordered by
+                    // `updated_at`, so a row held here without a touch keeps the
+                    // head it is holding and is selected and held again on every
+                    // poll for as long as its character has other rows sharing
+                    // that verb - the same head-of-line block that wedged this
+                    // queue, merely bounded. One small write sends it behind
+                    // whatever can actually run now, and it is still pending,
+                    // still unclaimed and still unanswered, exactly as before.
+                    CharacterDatabase.Execute(
+                        "UPDATE overseer_command SET updated_at = NOW() "
+                        "WHERE id = {} AND status = 'pending'",
+                        id);
+                    ++held;
                     continue;
                 }
             }
@@ -15424,6 +18972,11 @@ private:
                 {
                     LOG_WARN("module.overseer",
                              "overseer: did not win the claim on command {}; not running it", id);
+                    // Counted as held rather than run, so a poll that loses
+                    // every claim it tries for reads as the wedge it is
+                    // (mod-overseer#230). No touch: the row is not pending any
+                    // more, so it cannot be holding the head of anything.
+                    ++held;
                     continue;
                 }
             }
@@ -15437,6 +18990,10 @@ private:
             // kind='share' and kind='sell' fill the same column, for the same
             // reason: the row must carry ITS OWN outcome.
             std::string rowResult;
+
+            // Claimed and about to run: this row is work done, whatever it
+            // answers (mod-overseer#230).
+            ++executed;
 
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
             if (!player)
@@ -15461,6 +19018,10 @@ private:
                 detail = DoBank(player, command, status, rowResult);
             else if (kind == "mail")
                 detail = DoMail(player, targetArg, command, status, rowResult);
+            else if (kind == "repair")
+                detail = DoRepair(player, command, status, rowResult);
+            else if (kind == "buy")
+                detail = DoBuy(player, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -15504,15 +19065,41 @@ private:
             else
                 detail = "target has no bot AI (selfbot not enabled?)";
 
-            // A vendor row is claimed before execution, but reaching the NPC
-            // is asynchronous: the travel errand may still be walking the
-            // seller when this poll handles the row. Keep transient proximity
-            // and death failures pending so the next poll can retry after the
-            // holder arrives, rather than losing the sale permanently.
-            if (kind == "sell" &&
-                (std::string(detail) == "vendor not in range" ||
-                 std::string(detail) == "seller is dead"))
-                status = "pending";
+            // NO ROW GOES BACK ON THE QUEUE IN PLACE. NOT `sell` EITHER, NOW.
+            //
+            // A vendor row is claimed before execution and reaching the NPC is
+            // asynchronous, so a sale can arrive while the travel errand is
+            // still walking its seller. That used to be answered here by setting
+            // `status = "pending"` and letting the next poll try again.
+            // mod-overseer#227 declined to copy those four lines for `repair`
+            // and `buy` because the pattern they copy is #230; this is #230's
+            // own diff, so they are gone from `sell` as well and no verb has
+            // them any more.
+            //
+            // Measured on the dev realm, 2026-09-05: twenty sell rows refused
+            // with "vendor not in range", each pushed back to `pending` with its
+            // low id intact, re-selected by the very next poll because the drain
+            // took its work `ORDER BY id ASC LIMIT 20`, and re-attempted for
+            // half an hour. Twenty is COMMANDS_PER_POLL, so they filled the
+            // window completely and the 322 rows behind them were never read at
+            // all. Not a stall - a livelock, with the drain running perfectly on
+            // the same twenty rows.
+            //
+            // A retry that keeps its place at the head of a FIFO is not a retry,
+            // it is a lock. So every one of these verbs carries its retry class
+            // OUT instead: `detail` names the wall and `result` carries
+            // "retry":"elsewhere" or "later" (SellRefusalRetry,
+            // RepairRefusalRetry, BuyRefusalRetry), and the side that decides
+            // re-queues a FRESH row - which lands at the TAIL, behind everything
+            // already waiting, and cannot hold the head against anybody.
+            //
+            // AND IT ALREADY DOES, WHICH IS THE OTHER HALF OF THE ARGUMENT. In
+            // the same measurement the 178 pending sales were only 21 distinct
+            // asks: the sender had re-queued the same item as many as ten times
+            // over forty five minutes while the original row sat at the head
+            // being refused. Recycling in place was never what kept a sale from
+            // being lost. It was holding the queue shut beside a sender that was
+            // already asking again.
 
             // Conditional on the row still being OURS. If the bridge gave up
             // waiting and already ended this row, writing over it would
@@ -15533,11 +19120,32 @@ private:
                     "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
                     status, detail, EscLong(rowResult), id, g_runToken);
         } while (result->NextRow());
+
+        // AND SAY HOW THAT WENT, IF IT IS WORTH SAYING (mod-overseer#230).
+        //
+        // `selected` is the whole answer whenever the window came back short,
+        // because a short window means the queue held nothing else. The COUNT is
+        // paid only when the window came back FULL, which is the one case where
+        // `selected` is a floor rather than the depth, and is also the only case
+        // where the depth could be worth complaining about.
+        unsigned pending = selected;
+        if (selected >= COMMANDS_PER_POLL)
+        {
+            if (QueryResult depth = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM overseer_command WHERE status = 'pending'"))
+                pending = static_cast<unsigned>(depth->Fetch()[0].Get<uint64>());
+        }
+
+        SayHowTheQueueIsDoing(pending, executed, held, oldestPendingAge);
     }
 
     // Speak as the character would. Language matches mod-playerbots' own
     // convention so a Discord-sent line is indistinguishable from a real one:
     // racial for say/yell, universal for the group channels.
+    //
+    // The exception is the `_addon` group channels, where LANG_ADDON is not a
+    // language at all but 3.3.5a's addon transport, and the line is not meant
+    // for a person to read. See GroupChatRouteFor in overseer_decisions.h.
     static char const* DoChat(Player* player, std::string const& channel, std::string const& text,
                               std::string const& targetArg, char const*& status)
     {
@@ -15545,6 +19153,12 @@ private:
             return "empty message";
 
         Language racial = (player->GetTeamId() == TeamId::TEAM_ALLIANCE) ? LANG_COMMON : LANG_ORCISH;
+
+        // party / raid, and the same two carried in the language no chat frame
+        // draws. Asked once, before the chain, so the group branch below stays
+        // one branch instead of becoming four.
+        OverseerDecisions::GroupChatRoute const groupRoute =
+            OverseerDecisions::GroupChatRouteFor(channel);
 
         if (channel == "say")
             player->Say(text, racial);
@@ -15559,17 +19173,28 @@ private:
                 return "whisper target not online";
             player->Whisper(text, LANG_UNIVERSAL, receiver);
         }
-        else if (channel == "party" || channel == "raid")
+        else if (groupRoute.group)
         {
             Group* group = player->GetGroup();
             if (!group)
                 return "not in a group";
-            if (channel == "raid" && !group->isRaidGroup())
+            if (groupRoute.raid && !group->isRaidGroup())
                 return "not in a raid";
-            bool isRaid = (channel == "raid");
+            bool isRaid = groupRoute.raid;
             WorldPacket data;
+            // LANG_ADDON IS NOT A LANGUAGE. It is 3.3.5a's addon transport: a
+            // group packet carrying it is handed to CHAT_MSG_ADDON on the
+            // receiving client and no chat frame is ever asked to draw it,
+            // which is the whole point - a status line addressed to an addon
+            // stops appearing in party chat in front of whoever is watching.
+            //
+            // Everything else on this branch is unchanged: same chat type,
+            // same recipients, same subgroup rule. So this is the packet a
+            // seated client's SendAddonMessage(prefix, body, "PARTY") already
+            // produces, and an addon cannot tell the two apart.
             ChatHandler::BuildChatPacket(data, isRaid ? CHAT_MSG_RAID : CHAT_MSG_PARTY,
-                                         LANG_UNIVERSAL, player, nullptr, text);
+                                         groupRoute.addon ? LANG_ADDON : LANG_UNIVERSAL,
+                                         player, nullptr, text);
 
             // Party chat inside a raid goes to the speaker's subgroup only -
             // the real handler passes GetMemberGroup here. Broadcasting to
@@ -15582,14 +19207,22 @@ private:
             else
                 group->BroadcastPacket(&data, false);
 
-            CaptureBypassed(player, KindFromName(channel), text, [&](ObjectGuid w)
+            // NOBODY SAID THIS, SO NOBODY HEARD IT. An addon line is a
+            // payload addressed to software, and filing it in the chat store
+            // as speech is the exact shape a relay then has to filter back out
+            // again before a person reads it. The watchers exist for what was
+            // said, so the addon route is not captured at all.
+            if (!groupRoute.addon)
             {
-                if (!group->IsMember(w))
-                    return false;
-                if (subgroupOnly && group->GetMemberGroup(w) != senderSub)
-                    return false;
-                return WatcherOnline(w);
-            });
+                CaptureBypassed(player, KindFromName(channel), text, [&](ObjectGuid w)
+                {
+                    if (!group->IsMember(w))
+                        return false;
+                    if (subgroupOnly && group->GetMemberGroup(w) != senderSub)
+                        return false;
+                    return WatcherOnline(w);
+                });
+            }
         }
         else if (channel == "guild" || channel == "officer")
         {
@@ -17650,6 +21283,867 @@ private:
         return "";
     }
 
+    // -------------------------------------------------------------- repair --
+    //
+    // Pay a repairer to put the durability back, the way a player at the
+    // repair window does it.
+    //
+    // WHY THIS EXISTS. The family is being asked to clear the same instance a
+    // hundred times. Nothing in this module has ever spent a copper, and
+    // nothing has ever restored a point of durability. Gear does not wear out
+    // quickly - measured after a clear, the five characters were between 99.0%
+    // and 100%, ten missing points across nine items - but it wears out
+    // MONOTONICALLY, and the loss is dominated by deaths (10% of maximum, each
+    // time) rather than by hits taken. Over a hundred runs that is the
+    // difference between a tank who is wearing armour and a tank who is not:
+    // at 0% durability an item stops contributing its stats entirely. The
+    // ninety-ninth run fails because of what nobody did after the first one.
+    //
+    // THE CORE'S OWN PATH. WorldSession::HandleRepairItemOpcode
+    // (NPCHandler.cpp) reads a repairer guid, an item guid and a guild-bank
+    // byte, puts the repairer through Player::GetNPCIfCanInteractWith with
+    // UNIT_NPC_FLAG_REPAIR, takes the reputation discount from
+    // Player::GetReputationPriceDiscount, and then calls either
+    // Player::DurabilityRepair for the named item or Player::DurabilityRepairAll
+    // for everything. Those two are public on Player (Player.h:2083-2084) and
+    // calling them directly would work - but the handler is what applies the
+    // interaction gate and the discount, and a module that skipped it would be
+    // repairing at a price no player pays, from a distance no player can.
+    //
+    // WHY THE READ-BACK IS THE ONLY EVIDENCE, and this is the strongest case
+    // for it anywhere in this file. Player::DurabilityRepair returns a
+    // `uint32 TotalCost` that is ONLY EVER ASSIGNED ON THE GUILD-BANK BRANCH.
+    // Repairing out of the character's own purse - the only kind this module
+    // does - returns 0 whether it repaired a full set of plate or refused for
+    // want of a copper. So does the "not enough money" path. So does a missing
+    // DurabilityCosts.dbc row. And HandleRepairItemOpcode returns void on top
+    // of that. There is no value anywhere in the call chain that distinguishes
+    // a repair from a no-op. The durability fields and the purse do, and they
+    // are read before and after.
+    //
+    // NO GUILD FUNDS. The byte is always sent as 0. The family has no guild,
+    // and Player::DurabilityRepair's guild branch returns immediately when
+    // GetGuildId() == 0 - having repaired nothing, charged nothing, and told
+    // nobody. A grammar that could ask for it would be a grammar whose most
+    // likely outcome is a row that looks like a success and changed nothing.
+    //
+    // WHAT THIS DOES NOT DECIDE. Whether the family can afford to repair now,
+    // whether it should sell first, and which item matters most when it
+    // cannot afford all of them - every one of those needs the whole family's
+    // bags, purses and plans side by side, which is what the side outside the
+    // worldserver holds. This executor repairs what it is told to repair
+    // where the character already stands, or names why it cannot.
+    //
+    // Column re-use, no new columns, same shape as kind='sell' and kind='bank':
+    //   target_name  the CHARACTER, already standing at a repairer
+    //   command      `all`, or `item guid:<item_instance.guid>`
+    //   target_arg   unused
+    //   detail       short refusal literal, or empty on success
+    //   result       JSON, described on the migration
+
+    // The predicate the repairer sweep runs over each creature in the visited
+    // cells. The same three tests Acore::AnyUnitInObjectRangeCheck makes, plus
+    // the npcflag, so the list is repairers and not every guard in town.
+    //
+    // Deliberately WITHOUT the bad-spawn exclusions VendorNearbyCheck carries:
+    // those exist so the TRAVEL aim does not walk a character to a synthetic
+    // pedestal on the far side of a city, and this sweep never aims anything.
+    // It runs where the character already is, and every creature it finds is
+    // then put to the core's own interaction gate anyway.
+    struct RepairerNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_REPAIR)
+                && from->IsWithinDistInMap(creature, range);
+        }
+    };
+
+    // One carried item's durability, as it stood at a moment.
+    struct DurabilityReading
+    {
+        uint32 guid = 0;
+        uint32 entry = 0;
+        std::string name;
+        uint32 current = 0;
+        uint32 maximum = 0;
+    };
+
+    // Every carried item that CAN wear out, over exactly the slots
+    // Player::DurabilityRepairAll walks: equipment, the bag slots, the
+    // backpack, and then the contents of every worn bag. The bank is not
+    // included, because DurabilityRepairAll does not repair it either
+    // ("bank, buyback and keys not repaired", Player.cpp) - so a read-back
+    // that counted it would be measuring something the call never touched.
+    //
+    // The instance fields are read rather than ItemTemplate::MaxDurability,
+    // because the instance is what the core reads and what a repair writes.
+    static std::vector<DurabilityReading> ReadCarriedDurability(Player* who)
+    {
+        std::vector<DurabilityReading> readings;
+
+        auto take = [&](Item* item)
+        {
+            if (!item)
+                return;
+            uint32 const maximum = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
+            if (!maximum)
+                return;
+            DurabilityReading reading;
+            reading.guid = item->GetGUID().GetCounter();
+            reading.entry = item->GetEntry();
+            if (ItemTemplate const* proto = item->GetTemplate())
+                reading.name = proto->Name1;
+            reading.current = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
+            reading.maximum = maximum;
+            readings.push_back(reading);
+        };
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            take(who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                take(bag->GetItemByPos(uint8(i)));
+        }
+        return readings;
+    }
+
+    // The core's own repair arithmetic (Player::DurabilityRepair), run without
+    // paying, purely so that a row can say what it expected the bill to be.
+    //
+    // THIS IS A WITNESS, NOT AN AUTHORITY, and the distinction is the whole
+    // reason it is safe to have a second copy of a formula in this file. It
+    // never refuses a repair: the core is asked either way, and if this number
+    // is wrong the repair still happens at the core's price. It is written
+    // into the JSON beside what was actually spent, so a disagreement between
+    // them is a visible signal that this copy has drifted from the core's -
+    // rather than a repair silently refused for a price nobody charged.
+    //
+    // `priceable` comes back false when a DBC row is missing, which is the one
+    // case where the core also gives up and repairs nothing.
+    static uint32 RepairQuote(Item const* item, float discountMod, bool& priceable)
+    {
+        priceable = false;
+        if (!item)
+            return 0;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return 0;
+
+        uint32 const maximum = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
+        uint32 const current = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
+        if (!maximum || current >= maximum)
+        {
+            priceable = true;
+            return 0;
+        }
+
+        DurabilityCostsEntry const* cost = sDurabilityCostsStore.LookupEntry(proto->ItemLevel);
+        if (!cost)
+            return 0;
+        DurabilityQualityEntry const* quality =
+            sDurabilityQualityStore.LookupEntry((proto->Quality + 1) * 2);
+        if (!quality)
+            return 0;
+
+        uint32 const multiplier =
+            cost->multiplier[ItemSubClassToDurabilityMultiplierId(proto->Class, proto->SubClass)];
+        uint32 copper = uint32((maximum - current) * multiplier * double(quality->quality_mod));
+        copper = uint32(copper * discountMod * sWorld->getRate(RATE_REPAIRCOST));
+        if (copper == 0)
+            copper = 1;  // the core's own floor, for items a rounding would make free
+
+        priceable = true;
+        return copper;
+    }
+
+    static char const* DoRepair(Player* who, std::string const& command, char const*& status,
+                                std::string& out)
+    {
+        using OverseerDecisions::ChooseRepairer;
+        using OverseerDecisions::ParseRepairRequest;
+        using OverseerDecisions::RepairerCandidate;
+        using OverseerDecisions::RepairRefusalRetry;
+        using OverseerDecisions::RepairRequest;
+        using OverseerDecisions::RepairVerb;
+        using OverseerDecisions::TownRetryWord;
+
+        RepairRequest const request = ParseRepairRequest(command);
+
+        // Everything a row can be answered with, gathered as it becomes known
+        // and written by EVERY exit, refusals included. Unknowns stay -1
+        // because 0 is a real amount of money and a real number of items.
+        struct Evidence
+        {
+            char const* verb = "";
+            bool haveRepairer = false;
+            uint32 repairerEntry = 0;
+            std::string repairerName;
+            float repairerYards = 0.f;
+            float discount = 1.f;
+            float nearestYards = -1.f;
+            int32 damagedBefore = -1;
+            int32 repaired = -1;
+            int32 leftDamaged = -1;
+            int32 pointsRestored = -1;
+            int64 moneyBefore = -1;
+            int64 moneyAfter = -1;
+            int64 quoted = -1;  // -1 when no DBC row priced it
+            bool haveItem = false;
+            uint32 itemGuid = 0;
+            uint32 itemEntry = 0;
+            std::string itemName;
+            uint32 itemDurabilityBefore = 0;
+            uint32 itemDurabilityMax = 0;
+        } ev;
+
+        switch (request.verb)
+        {
+            case RepairVerb::All:  ev.verb = "all";  break;
+            case RepairVerb::One:  ev.verb = "item"; break;
+            case RepairVerb::None: ev.verb = "";     break;
+        }
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            int64 const spent = (ev.moneyBefore >= 0 && ev.moneyAfter >= 0 &&
+                                 ev.moneyBefore >= ev.moneyAfter)
+                                    ? ev.moneyBefore - ev.moneyAfter
+                                    : -1;
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"retry\":" << J(*reason ? TownRetryWord(RepairRefusalRetry(reason)) : "")
+              << ",\"verb\":" << J(ev.verb)
+              << ",\"character\":" << J(who->GetName());
+            if (ev.haveItem)
+                o << ",\"item\":{\"guid\":" << ev.itemGuid
+                  << ",\"entry\":" << ev.itemEntry
+                  << ",\"name\":" << J(ev.itemName)
+                  << ",\"durability\":" << ev.itemDurabilityBefore
+                  << ",\"max_durability\":" << ev.itemDurabilityMax << "}";
+            else
+                o << ",\"item\":null";
+            if (ev.haveRepairer)
+                o << ",\"repairer\":{\"entry\":" << ev.repairerEntry
+                  << ",\"name\":" << J(ev.repairerName)
+                  << ",\"yards\":" << ev.repairerYards
+                  << ",\"discount\":" << ev.discount << "}";
+            else
+                o << ",\"repairer\":null";
+            if (ev.nearestYards >= 0.f)
+                o << ",\"nearest_repairer_yards\":" << ev.nearestYards;
+            o << ",\"damaged_before\":" << ev.damagedBefore
+              << ",\"repaired\":" << ev.repaired
+              << ",\"left_damaged\":" << ev.leftDamaged
+              << ",\"points_restored\":" << ev.pointsRestored
+              << ",\"money_before\":" << ev.moneyBefore
+              << ",\"money_after\":" << ev.moneyAfter
+              << ",\"spent\":" << spent
+              << ",\"quoted\":" << ev.quoted
+              << ",\"quote_matches_spend\":"
+              << ((ev.quoted >= 0 && spent >= 0 && ev.quoted == spent) ? "true" : "false")
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        // The refusal literals go straight into the UPDATE, so none may carry
+        // a quote character - the same rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (request.verb == RepairVerb::None)
+        {
+            // The parser's exact words are pinned in tests/test_repair.cpp and
+            // go into the JSON. `detail` has to outlive this call, so the
+            // column gets the literal the table keys on.
+            describe("refused", request.error.c_str());
+            return "malformed repair request";
+        }
+
+        ev.moneyBefore = who->GetMoney();
+        ev.moneyAfter = ev.moneyBefore;
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("character has no session");
+        if (!who->IsInWorld())
+            return refuse("character is not in the world");
+        if (!who->IsAlive())
+            return refuse("character is dead");
+        if (who->IsInFlight())
+            return refuse("character is in flight");
+
+        // COMBAT IS NOT REFUSED, unlike in DoBank. The bank frame does not
+        // open in combat for a player, so a bot that banked mid-fight would be
+        // doing something no player can. The repair window is the vendor
+        // window and it does not close, and neither HandleRepairItemOpcode nor
+        // GetNPCIfCanInteractWith asks. Refusing here would make the bot
+        // stricter than the player it is imitating, which is the same call
+        // DoSell already made about selling in combat.
+
+        // ---- who is in reach ------------------------------------------------
+        //
+        // A sweep wider than the interaction distance on purpose: the gate is
+        // the core's own GetNPCIfCanInteractWith and it decides who counts;
+        // the wider sweep exists only so a refusal can say how far the nearest
+        // repairer WAS. "repairer not in range" with "8.4 yards" beside it is
+        // an aim error the sender can correct, and without the number it is a
+        // mystery. It is also how the one refusal this town cannot avoid gets
+        // named: the repairers nearest the family's dungeon belong to the
+        // other faction, and GetNPCIfCanInteractWith turns those down for
+        // being unfriendly no matter how close the character stands.
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        RepairerNearbyCheck check{who, SWEEP_YARDS};
+        Acore::CreatureListSearcher<RepairerNearbyCheck> searcher(who, nearby, check);
+        Cell::VisitObjects(who, searcher, SWEEP_YARDS);
+
+        std::vector<RepairerCandidate> candidates;
+        std::vector<Creature*> reachable;
+        for (Creature* creature : nearby)
+        {
+            float const yards = who->GetDistance(creature);
+            if (ev.nearestYards < 0.f || yards < ev.nearestYards)
+                ev.nearestYards = yards;
+
+            // THE GATE. The same call HandleRepairItemOpcode makes with the
+            // same flag, so a creature this accepts is one the handler will.
+            if (!who->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_REPAIR))
+                continue;
+
+            RepairerCandidate candidate;
+            candidate.distance = yards;
+            candidate.discount = who->GetReputationPriceDiscount(creature);
+            candidates.push_back(candidate);
+            reachable.push_back(creature);
+        }
+
+        if (reachable.empty())
+            return refuse("repairer not in range");
+
+        int const choice = ChooseRepairer(candidates);
+        Creature* repairer = reachable[static_cast<size_t>(choice)];
+        ev.haveRepairer = true;
+        ev.repairerEntry = repairer->GetEntry();
+        ev.repairerName = repairer->GetName();
+        ev.repairerYards = candidates[static_cast<size_t>(choice)].distance;
+        ev.discount = candidates[static_cast<size_t>(choice)].discount;
+
+        // ---- what is damaged, before ----------------------------------------
+        ObjectGuid namedItem = ObjectGuid::Empty;
+        std::vector<DurabilityReading> before;
+
+        if (request.verb == RepairVerb::One)
+        {
+            Item* item = FindCarriedItem(who, true, request.itemGuid);
+            if (!item)
+                return refuse("item not carried");
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!proto)
+                return refuse("item has no template");
+
+            uint32 const maximum = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
+            uint32 const current = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
+            ev.haveItem = true;
+            ev.itemGuid = item->GetGUID().GetCounter();
+            ev.itemEntry = item->GetEntry();
+            ev.itemName = proto->Name1;
+            ev.itemDurabilityBefore = current;
+            ev.itemDurabilityMax = maximum;
+
+            if (!maximum)
+                return refuse("item cannot be damaged");
+            if (current >= maximum)
+                return refuse("item is not damaged");
+
+            namedItem = item->GetGUID();
+            bool priceable = false;
+            uint32 const quote = RepairQuote(item, ev.discount, priceable);
+            if (priceable)
+                ev.quoted = int64(quote);
+
+            DurabilityReading reading;
+            reading.guid = ev.itemGuid;
+            reading.entry = ev.itemEntry;
+            reading.name = ev.itemName;
+            reading.current = current;
+            reading.maximum = maximum;
+            before.push_back(reading);
+        }
+        else
+        {
+            before = ReadCarriedDurability(who);
+            uint32 quote = 0;
+            bool allPriceable = true;
+            for (DurabilityReading const& reading : before)
+            {
+                if (reading.current >= reading.maximum)
+                    continue;
+                Item* item = FindCarriedItem(who, true, reading.guid);
+                bool priceable = false;
+                quote += RepairQuote(item, ev.discount, priceable);
+                if (!priceable)
+                    allPriceable = false;
+            }
+            if (allPriceable)
+                ev.quoted = int64(quote);
+        }
+
+        ev.damagedBefore = 0;
+        for (DurabilityReading const& reading : before)
+            if (reading.current < reading.maximum)
+                ++ev.damagedBefore;
+
+        if (ev.damagedBefore == 0)
+        {
+            // A repair that pays nothing and restores nothing is
+            // indistinguishable from a repairer that refused, so it is named
+            // here rather than reported as a success with a zero in it.
+            return refuse(request.verb == RepairVerb::One ? "item is not damaged"
+                                                          : "nothing is damaged");
+        }
+
+        // ---- drive the core's own handler ------------------------------------
+        //
+        // CMSG_REPAIR_ITEM is repairer guid, item guid, guild-bank byte, in
+        // that order (NPCHandler.cpp). An EMPTY item guid is the core's own
+        // "repair everything" and is what `all` sends; the byte is always 0.
+        // This handler takes a raw WorldPacket rather than a typed one, unlike
+        // the sell and bank handlers, so there is no Read() to call.
+        {
+            WorldPacket raw(CMSG_REPAIR_ITEM, 8 + 8 + 1);
+            raw << repairer->GetGUID();
+            raw << namedItem;
+            raw << uint8(0);
+            session->HandleRepairItemOpcode(raw);
+        }
+
+        // ---- believe nothing; read the durability back -----------------------
+        ev.moneyAfter = who->GetMoney();
+
+        ev.repaired = 0;
+        ev.leftDamaged = 0;
+        ev.pointsRestored = 0;
+        for (DurabilityReading const& was : before)
+        {
+            Item* item = FindCarriedItem(who, true, was.guid);
+            uint32 const now = item ? item->GetUInt32Value(ITEM_FIELD_DURABILITY) : was.current;
+            if (was.current >= was.maximum)
+                continue;
+            if (now > was.current)
+            {
+                ++ev.repaired;
+                ev.pointsRestored += int32(now - was.current);
+            }
+            if (now < was.maximum)
+                ++ev.leftDamaged;
+        }
+
+        if (ev.repaired == 0)
+        {
+            // Nothing moved. Every other wall this function knows about was
+            // tested before the call, so what is left is the purse (which the
+            // core refuses silently, by returning) or a wall this module has
+            // not heard of - a missing DurabilityCosts row, or the
+            // OnPlayerBeforeDurabilityRepair script hook.
+            if (ev.quoted >= 0 && ev.moneyBefore < ev.quoted)
+                return refuse("cannot afford the repair");
+            return refuse("the core repaired nothing");
+        }
+
+        if (ev.moneyAfter >= ev.moneyBefore)
+        {
+            // Durability came back and no money left. The core's own floor
+            // makes every priced repair cost at least one copper, so this is
+            // half the evidence being wrong, and it is reported as that rather
+            // than as a repair.
+            describe("error", "durability was restored but nothing was paid");
+            return "durability was restored but nothing was paid";
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' repaired {} item(s) for {} copper at {} ({}), {} still damaged",
+                 who->GetName(), ev.repaired, ev.moneyBefore - ev.moneyAfter, ev.repairerName,
+                 ev.repairerEntry, ev.leftDamaged);
+
+        describe("repaired", ev.leftDamaged > 0 ? "some items were left damaged" : "");
+        status = "delivered";
+        return "";
+    }
+
+    // ----------------------------------------------------------------- buy --
+    //
+    // Restock from a vendor: food, drink, and whatever else the next run needs.
+    //
+    // WHY THIS EXISTS. Measured across the whole family: four of the five
+    // carry NO food and NO drink at all, and the fifth carries one bowl of
+    // soup. The healer and the mage - the two whose mana is what makes a
+    // dungeon finishable - carry nothing to drink. Out of combat a level 26
+    // character regenerates mana slowly enough that a party with no water
+    // spends most of a dungeon sitting down. Nothing in this module could buy
+    // anything; kind='sell' takes money in and kind='bank' moves things
+    // sideways, and neither has ever put an item into a bag from outside.
+    //
+    // THE CORE'S OWN PURCHASE. WorldSession::HandleBuyItemOpcode
+    // (ItemHandler.cpp) decrements the vendor slot - the client numbers from 1
+    // and the handler expects that - and calls
+    // Player::BuyItemFromVendorSlot (Player.cpp), which is where all of it
+    // happens: the interaction gate, the class and faction gates, the vendor
+    // condition list, the slot-matches-item check, the limited-stock check,
+    // the reputation discount, the money, the storage, and the vendor's stock
+    // counter. Reimplementing any of that would be a second, worse copy.
+    //
+    // AND WHY THE VENDOR LIST IS OPENED FIRST. BuyItemFromVendorSlot reads
+    // `GetSession()->GetCurrentVendor()` and, when it is non-zero, looks the
+    // stock up by THAT entry instead of by the creature in front of the
+    // character. Only SendListInventory sets it, and that is what
+    // HandleListInventoryOpcode calls. So this executor sends
+    // CMSG_LIST_INVENTORY first, exactly as a client does when the vendor
+    // window opens: not for the packet, which nobody will read, but because
+    // without it a stale current-vendor left behind by some other system would
+    // silently price this purchase against a different shop's list.
+    //
+    // WHY THE READ-BACK IS THE ONLY EVIDENCE. HandleBuyItemOpcode returns
+    // void, and the bool underneath it is not a success flag: on a completed
+    // purchase BuyItemFromVendorSlot returns `crItem->maxcount != 0`, so
+    // buying something a vendor has an unlimited supply of - which is every
+    // food and drink in this town - returns FALSE from a purchase that worked
+    // perfectly. Every refusal inside it is a SendBuyError or SendEquipError
+    // to a session a bot does not have. So the proof is two readings taken on
+    // both sides: how many of the entry the character carries, and the purse.
+    //
+    // ONE REFUSAL THE CORE DOES NOT MAKE, made here anyway: `max:<copper>`.
+    // The core buys at whatever the vendor charges, and a sale can be undone
+    // because the item sits in a buyback slot for a while. A PURCHASE CANNOT.
+    // The gold is gone, and a count with one extra zero on it is exactly the
+    // kind of mistake a bot cannot notice. `max` is the sender saying what it
+    // expected to pay, checked before the packet rather than discovered after.
+    //
+    // Column re-use, no new columns:
+    //   target_name  the BUYER, already standing at the vendor
+    //   command      `entry:<item_template.entry> [count:<n>] [max:<copper>]`
+    //   target_arg   unused
+    //   detail       short refusal literal, or empty on success
+    //   result       JSON, described on the migration
+
+    static char const* DoBuy(Player* buyer, std::string const& command, char const*& status,
+                             std::string& out)
+    {
+        using OverseerDecisions::BuyRefusalRetry;
+        using OverseerDecisions::BuyRequest;
+        using OverseerDecisions::BuyVendorCandidate;
+        using OverseerDecisions::ChooseBuyVendor;
+        using OverseerDecisions::ParseBuyRequest;
+        using OverseerDecisions::TownRetryWord;
+
+        BuyRequest const request = ParseBuyRequest(command);
+
+        struct Evidence
+        {
+            uint32 entry = 0;
+            std::string itemName;
+            uint32 purchases = 0;
+            int32 itemsWanted = -1;  // purchases * ItemTemplate::BuyCount
+            int32 carriedBefore = -1;
+            int32 carriedAfter = -1;
+            int64 price = -1;
+            int64 cap = -1;  // -1 when the row set none
+            int64 moneyBefore = -1;
+            int64 moneyAfter = -1;
+            bool haveVendor = false;
+            uint32 vendorEntry = 0;
+            std::string vendorName;
+            float vendorYards = 0.f;
+            float discount = 1.f;
+            int32 vendorSlot = -1;
+            int32 stockLeft = -1;  // -1 for an unlimited vendor
+            float nearestYards = -1.f;
+            bool haveInventoryResult = false;
+            InventoryResult inventoryResult = EQUIP_ERR_OK;
+        } ev;
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            int64 const spent = (ev.moneyBefore >= 0 && ev.moneyAfter >= 0 &&
+                                 ev.moneyBefore >= ev.moneyAfter)
+                                    ? ev.moneyBefore - ev.moneyAfter
+                                    : -1;
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"retry\":" << J(*reason ? TownRetryWord(BuyRefusalRetry(reason)) : "")
+              << ",\"buyer\":" << J(buyer->GetName())
+              << ",\"item\":{\"entry\":" << ev.entry
+              << ",\"name\":" << J(ev.itemName)
+              << ",\"purchases\":" << ev.purchases
+              << ",\"items_wanted\":" << ev.itemsWanted << "}"
+              << ",\"carried_before\":" << ev.carriedBefore
+              << ",\"carried_after\":" << ev.carriedAfter
+              << ",\"price\":" << ev.price
+              << ",\"cap\":" << ev.cap
+              << ",\"money_before\":" << ev.moneyBefore
+              << ",\"money_after\":" << ev.moneyAfter
+              << ",\"spent\":" << spent
+              << ",\"price_matches_spend\":"
+              << ((ev.price >= 0 && spent >= 0 && ev.price == spent) ? "true" : "false");
+            if (ev.haveVendor)
+                o << ",\"vendor\":{\"entry\":" << ev.vendorEntry
+                  << ",\"name\":" << J(ev.vendorName)
+                  << ",\"yards\":" << ev.vendorYards
+                  << ",\"discount\":" << ev.discount
+                  << ",\"slot\":" << ev.vendorSlot
+                  << ",\"stock_left\":" << ev.stockLeft << "}";
+            else
+                o << ",\"vendor\":null";
+            if (ev.nearestYards >= 0.f)
+                o << ",\"nearest_vendor_yards\":" << ev.nearestYards;
+            if (ev.haveInventoryResult)
+                o << ",\"inventory_result\":" << int32(ev.inventoryResult)
+                  << ",\"inventory_result_name\":" << J(InventoryResultName(ev.inventoryResult));
+            o << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (!request.valid)
+        {
+            describe("refused", request.error.c_str());
+            return "malformed buy request";
+        }
+
+        ev.entry = request.entry;
+        ev.purchases = request.count;
+        if (request.capped)
+            ev.cap = int64(request.maxCopper);
+        ev.moneyBefore = buyer->GetMoney();
+        ev.moneyAfter = ev.moneyBefore;
+
+        WorldSession* session = buyer->GetSession();
+        if (!session)
+            return refuse("buyer has no session");
+        if (!buyer->IsInWorld())
+            return refuse("buyer is not in the world");
+        // BuyItemFromVendorSlot's own IsAlive test, and HandleListInventory's,
+        // named here so a dead buyer is not reported as a missing vendor.
+        if (!buyer->IsAlive())
+            return refuse("buyer is dead");
+        if (buyer->IsInFlight())
+            return refuse("buyer is in flight");
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(request.entry);
+        if (!proto)
+            return refuse("no such item");
+        ev.itemName = proto->Name1;
+
+        // The core's own class gate: an item bound on pickup that this class
+        // cannot use is refused outright, because buying it would spend gold on
+        // something that can then never be sold, given away or traded.
+        if (!(proto->AllowableClass & buyer->getClassMask()) && proto->Bonding == BIND_WHEN_PICKED_UP)
+            return refuse("item is not for this class");
+        if ((proto->HasFlag2(ITEM_FLAG2_FACTION_HORDE) && buyer->GetTeamId(true) == TeamId::TEAM_ALLIANCE) ||
+            (proto->HasFlag2(ITEM_FLAG2_FACTION_ALLIANCE) && buyer->GetTeamId(true) == TeamId::TEAM_HORDE))
+            return refuse("item is for the other faction");
+
+        // THE COUNT IS A BYTE BY THE TIME THE CORE SEES IT. The packet field is
+        // four bytes but HandleBuyItemOpcode passes it into
+        // BuyItemFromVendorSlot's `uint8 count`, so 256 arrives as 0, is
+        // rewritten to 1 by that function's own cheat guard, and the row would
+        // report a purchase of 256 that bought one. Refused rather than
+        // truncated.
+        if (request.count > 255)
+            return refuse("count exceeds what the packet carries");
+        if (proto->BuyPrice > 0 && request.count > MAX_MONEY_AMOUNT / uint32(proto->BuyPrice))
+            return refuse("count would overflow the purse");
+
+        // The core stores `ItemTemplate::BuyCount * count`, so that is what the
+        // read-back expects. Not defended against a BuyCount of 0: the core would
+        // then store nothing, and a read-back expecting 1 would report a purchase
+        // that never happened as a mismatch instead of as the refusal it is.
+        ev.itemsWanted = int32(uint32(proto->BuyCount) * request.count);
+
+        // ---- who is in reach -------------------------------------------------
+        //
+        // The same sweep and the same gate the sale uses, so a vendor this
+        // accepts is one BuyItemFromVendorSlot will accept.
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        VendorNearbyCheck check{buyer, SWEEP_YARDS};
+        Acore::CreatureListSearcher<VendorNearbyCheck> searcher(buyer, nearby, check);
+        Cell::VisitObjects(buyer, searcher, SWEEP_YARDS);
+
+        std::vector<BuyVendorCandidate> candidates;
+        std::vector<Creature*> reachable;
+        std::vector<int32> slots;
+        std::vector<VendorItem const*> lines;
+        for (Creature* creature : nearby)
+        {
+            float const yards = buyer->GetDistance(creature);
+            if (ev.nearestYards < 0.f || yards < ev.nearestYards)
+                ev.nearestYards = yards;
+
+            if (!buyer->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_VENDOR))
+                continue;
+
+            // WHICH SLOT THE ITEM SITS IN, which is what the packet carries.
+            // BuyItemFromVendorSlot refuses a slot whose item is not the one
+            // asked for, so the index has to be found rather than guessed.
+            int32 slot = -1;
+            VendorItem const* line = nullptr;
+            if (VendorItemData const* items = creature->GetVendorItems())
+            {
+                uint32 const lineCount = items->GetItemCount();
+                for (uint32 i = 0; i < lineCount; ++i)
+                {
+                    VendorItem const* candidateLine = items->GetItem(i);
+                    if (candidateLine && candidateLine->item == request.entry)
+                    {
+                        slot = int32(i);
+                        line = candidateLine;
+                        break;
+                    }
+                }
+            }
+
+            BuyVendorCandidate candidate;
+            candidate.distance = yards;
+            candidate.discount = buyer->GetReputationPriceDiscount(creature);
+            candidate.stocksItem = line != nullptr;
+            candidate.inStock =
+                line && (line->maxcount == 0 ||
+                         creature->GetVendorItemCurrentCount(line) >= uint32(ev.itemsWanted));
+            candidates.push_back(candidate);
+            reachable.push_back(creature);
+            slots.push_back(slot);
+            lines.push_back(line);
+        }
+
+        if (reachable.empty())
+            return refuse("vendor not in range");
+
+        size_t const choice = static_cast<size_t>(ChooseBuyVendor(candidates));
+        Creature* vendor = reachable[choice];
+        VendorItem const* line = lines[choice];
+        ev.haveVendor = true;
+        ev.vendorEntry = vendor->GetEntry();
+        ev.vendorName = vendor->GetName();
+        ev.vendorYards = candidates[choice].distance;
+        ev.discount = candidates[choice].discount;
+        ev.vendorSlot = slots[choice];
+        if (line && line->maxcount != 0)
+            ev.stockLeft = int32(vendor->GetVendorItemCurrentCount(line));
+
+        if (!line)
+            return refuse("vendor does not stock the item");
+        if (!candidates[choice].inStock)
+            return refuse("vendor is out of stock");
+        if (line->ExtendedCost && !line->IsGoldRequired(proto))
+            return refuse("item is not bought with gold");
+
+        // The core's own price, computed the same way and in the same order:
+        // the whole stack first, then floor() of the reputation discount.
+        uint32 price = 0;
+        if (line->IsGoldRequired(proto) && proto->BuyPrice > 0)
+            price = uint32(std::floor(uint32(proto->BuyPrice) * request.count * ev.discount));
+        ev.price = int64(price);
+
+        if (request.capped && price > request.maxCopper)
+            return refuse("price exceeds the cap the row set");
+        if (!buyer->HasEnoughMoney(price))
+            return refuse("cannot afford the purchase");
+
+        // Where it will go, asked with the same call and the same count the
+        // core will use, so this answer and the core's are the same answer.
+        {
+            ItemPosCountVec dest;
+            InventoryResult const msg = buyer->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
+                                                              request.entry, uint32(ev.itemsWanted));
+            ev.haveInventoryResult = true;
+            ev.inventoryResult = msg;
+            if (msg != EQUIP_ERR_OK)
+                return refuse("bags cannot take the item");
+        }
+
+        ev.carriedBefore = int32(buyer->GetItemCount(request.entry, false));
+
+        // ---- open the vendor list, the way the client does --------------------
+        {
+            WorldPacket raw(CMSG_LIST_INVENTORY, 8);
+            raw << vendor->GetGUID();
+            WorldPackets::Item::ListInventory listing(std::move(raw));
+            listing.Read();
+            session->HandleListInventoryOpcode(listing);
+        }
+
+        // ---- drive the core's own purchase ------------------------------------
+        //
+        // Vendor guid, item entry, slot, count, and a byte the handler never
+        // reads (ItemPackets.cpp). THE SLOT IS SENT PLUS ONE: the client
+        // numbers vendor slots from 1 and HandleBuyItemOpcode decrements before
+        // it does anything, treating a 0 as a cheat and returning.
+        {
+            WorldPacket raw(CMSG_BUY_ITEM, 8 + 4 + 4 + 4 + 1);
+            raw << vendor->GetGUID();
+            raw << uint32(request.entry);
+            raw << uint32(uint32(ev.vendorSlot) + 1);
+            raw << uint32(request.count);
+            raw << uint8(0);
+            WorldPackets::Item::BuyItem packet(std::move(raw));
+            packet.Read();
+            session->HandleBuyItemOpcode(packet);
+        }
+
+        // ---- believe nothing; read the bags and the purse back ----------------
+        ev.moneyAfter = buyer->GetMoney();
+        ev.carriedAfter = int32(buyer->GetItemCount(request.entry, false));
+        if (line->maxcount != 0)
+            ev.stockLeft = int32(vendor->GetVendorItemCurrentCount(line));
+
+        if (ev.carriedAfter == ev.carriedBefore && ev.moneyAfter == ev.moneyBefore)
+        {
+            describe("refused", "the core refused the purchase");
+            return "the core refused the purchase";
+        }
+        if (ev.carriedAfter != ev.carriedBefore + ev.itemsWanted)
+        {
+            // Something arrived but not what was asked for. Reported as such
+            // and NOT as a purchase, because a row that says twenty when five
+            // came is the wrong number in a ledger somebody will balance.
+            describe("refused", "the purchase did not read back as requested");
+            return "the purchase did not read back as requested";
+        }
+        if (ev.moneyAfter != ev.moneyBefore - int64(price))
+        {
+            describe("error", "the item arrived but the price paid does not match");
+            return "the item arrived but the price paid does not match";
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' bought {} x {} (entry {}) from {} ({}) for {} copper",
+                 buyer->GetName(), ev.itemsWanted, ev.itemName, request.entry, ev.vendorName,
+                 ev.vendorEntry, price);
+
+        describe("bought", "");
+        status = "delivered";
+        return "";
+    }
+
+
     // ---------------------------------------------------------------- mail --
     //
     // Post a letter from one family member to another - an item, some money, a
@@ -18722,7 +23216,24 @@ private:
             // pinned core cheap enough to use on a 500-bot world; sampling
             // alongside a walk that was happening anyway costs nothing extra.
             if (OnRoster(p->GetName()))
+            {
                 RememberHealth(p->GetName(), p->GetHealth(), p->GetMaxHealth());
+                // #188: the same argument, for the same walk. What had hold of
+                // this character and whether it was fighting are both gone by
+                // the time any death hook can ask, so they are sampled here
+                // where the position is already being read for the row above.
+                // GetCurrentMovementGeneratorType is MotionMaster.h:271 on the
+                // pinned core; GetMotionMaster returns a member pointer that
+                // is set in the Unit constructor, and is guarded anyway.
+                MotionMaster const* motion = p->GetMotionMaster();
+                RememberMovement(
+                    p->GetName(), static_cast<uint16>(p->GetMapId()),
+                    p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(),
+                    p->IsInCombat(),
+                    motion ? FoldMovementGenerator(
+                                 motion->GetCurrentMovementGeneratorType())
+                           : OverseerDecisions::MoveGenerator::Unsampled);
+            }
         }
 
         if (!first)
@@ -18801,6 +23312,13 @@ private:
     };
     std::map<std::string, FollowStallState> _followStall;
 
+    // Which map this follower's leader was on when the split was last said
+    // (#241). World thread only and unguarded, like _followStall beside it:
+    // losing it on a restart costs one repeated log line and no correctness.
+    // Erased by DriveCatchUp the moment the two are on one map again, so a
+    // family that splits, reunites and splits again is announced twice.
+    std::map<std::string, uint32> _partySplitSaid;
+
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
     uint32 _gearTimer = 0;
@@ -18828,6 +23346,15 @@ private:
         float y{0.f};
         float z{0.f};
         uint32 npcFlags{0};
+        // `creature_template.faction`, cached here for the same reason the
+        // rest of the row is: whether a character may deal with this spawn is
+        // asked once per errand and the answer never changes, and looking the
+        // template up again at resolve time would be a map lookup per spawn
+        // per errand for a number this loop already had in its hand. There is
+        // no per-spawn override of it the way there is for npcflag - the
+        // `creature` table carries no faction column - so the template is the
+        // whole of the answer (#234).
+        uint32 faction{0};
     };
     std::vector<TravelSpawn> _travelSpawns;
     bool _travelIndexBuilt = false;
@@ -18933,6 +23460,15 @@ private:
     // OverseerDecisions::TerrainRecoveryStep, where it is tested without a
     // world.
     std::map<std::string, OverseerDecisions::TerrainRecoveryState> _terrainRecovery;
+
+    // THE LAST FALL BASELINE THIS MODULE HANDED THE CORE FOR A CHARACTER, so
+    // that nothing can leave the core believing a character's fall began
+    // seventy yards above where it now stands and charge it for the walk down.
+    // Keyed, scoped and lost on a restart exactly like _terrainRecovery above,
+    // and for the same reason: losing it costs nothing, since the rule it
+    // feeds does not branch on what is in here. The rule is
+    // OverseerDecisions::FallBaselineStep, tested without a world.
+    std::map<std::string, OverseerDecisions::FallBaselineState> _fallBaseline;
 
     uint32 _eventTimer = 0;
     uint32 _deathTimer = 0;
