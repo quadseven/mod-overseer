@@ -1,0 +1,81 @@
+-- Let a family member list an item on the auction house, buy or bid on an
+-- auction, or take one of its own down, through the core's own auction
+-- handlers (mod-overseer#18: the family hoards and starves outside any
+-- economy).
+--
+-- WHY THE CORE'S PATH AND NOT A MODULE COPY. An auction lives in three places
+-- at once: the in-memory house (AuctionHouseObject), the `auctionhouse` table,
+-- and the item itself, which leaves the seller's bag and is parked in
+-- AuctionHouseMgr's item map until it sells or expires. The core keeps the
+-- three in step inside WorldSession::HandleAuctionSellItem
+-- (AuctionHouseHandler.cpp:117-422), HandleAuctionPlaceBid (:425-591) and
+-- HandleAuctionRemoveItem (:594-668): the deposit
+-- (AuctionHouseMgr::GetAuctionDeposit, AuctionHouseMgr.cpp:92-111), the house
+-- cut on a cancel with a bidder standing, the refund to an outbid bidder, and
+-- the mails that carry the item to the winner and the item back to a seller
+-- who cancelled. A module copy of any of that would drift from the core's
+-- fees and from what everything else that reads the table expects. So the
+-- executor builds the packet a client would send and calls the handler, the
+-- way kind='trade' drives the trade handlers (the handlers are public,
+-- WorldSession.h:684 onwards; the three auction ones at :907-910).
+--
+-- WHY SOULBOUND IS REFUSED HERE AS WELL AS UPSTREAM. The handler turns a
+-- soulbound item away through Item::CanBeTraded (:216) and says so only with
+-- a packet to the client, which a bot does not have. Left to the handler, the
+-- row would finish with nothing listed and no reason. The executor therefore
+-- tests every condition the handler tests BEFORE the call and names it in
+-- `detail` ("item is soulbound", "item is a quest item", "item cannot be
+-- traded", "auctioneer not in range", "cannot afford deposit", ...), and after
+-- the call READS BACK the house and the bags instead of trusting that the
+-- handler returned. The handler remains the authority; the pre-checks exist
+-- so an operator reading the row learns which wall was hit.
+--
+-- WHY BROWSING IS NOT AN EXECUTOR. What is on the house, at what price, and
+-- what sold is all in the `auctionhouse` table already, and reading it changes
+-- nothing in the world. Whatever drives the queue reads the table directly
+-- and then queues a buy or a bid by auction id. Nothing here knows or cares
+-- whether the other side of a deal is an auction-house bot, a family member
+-- or a player.
+--
+-- Column re-use, no new columns:
+--   target_name  the character acting
+--   target_arg   unused
+--   command      one of
+--                  list guid:<item_instance.guid> bid:<copper> buyout:<copper> hours:<12|24|48>
+--                  buy auction:<auctionhouse.id>
+--                  bid auction:<auctionhouse.id> bid:<copper>
+--                  cancel auction:<auctionhouse.id>
+--                (the whole stack is listed; a partial count would give the
+--                auction a fresh item guid the read-back could not tie to the
+--                request)
+--   detail       short refusal reason, or empty on success
+--   result       JSON: outcome (listed|bought|bid|cancelled|refused), reason,
+--                retryable, auction {id, house, bid, buyout, expires},
+--                item {guid, entry, name, count}, money_before, money_after,
+--                deposit, auctioneer {entry, name}, note
+--
+-- A bought or cancelled item arrives by MAIL; the mailbox is not read here.
+--
+-- ENUM values cannot be added by re-running the CREATE TABLE: the base file is
+-- `CREATE TABLE IF NOT EXISTS`, a no-op against an existing table, so the
+-- column keeps whatever value set it already has. It takes an explicit ALTER.
+-- The value list is the full union across every executor branch written side
+-- by side, so they apply in any order and the last one applied does not drop a
+-- sibling's value; 'job', dispatched in C++ since 2026-08-26 but never added to
+-- the column, is in it too.
+--
+-- THE UNION GREW AFTER THIS FILE WAS FIRST WRITTEN, and that is worth spelling
+-- out because getting it wrong is silent. This file was authored when the
+-- union was eleven values and the parallel branches were sell, bank and
+-- auction. 'mail', 'repair' and 'buy' have been added to the column since, and
+-- 'repair' and 'buy' are already dispatched in C++ on main. Because this file
+-- sorts BEFORE both of theirs, a FRESH database ends up correct either way -
+-- but a database that has already run them applies this one afterwards, as a
+-- newly added file, and an eleven-value ALTER here would silently truncate
+-- every existing 'repair' and 'buy' row and remove the two kinds from the
+-- column. So the list below is the union as it stands today, not as it stood
+-- when the branch was opened. Anything adding a kind after this must add it
+-- here too.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy')
+        NOT NULL DEFAULT 'bot';
