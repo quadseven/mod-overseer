@@ -3464,6 +3464,118 @@ struct GroupChatRoute
 
 GroupChatRoute GroupChatRouteFor(std::string const& channel);
 
+// ------------------------------------ an errand that is killing its traveller --
+//
+// THE RULE AGENTS.md ALREADY STATES, AND WHICH NOTHING IMPLEMENTED. "Aim the
+// party leader only, and watch the death table while it walks. If deaths
+// exceed roughly three in five minutes, clear the aim - the destination is not
+// worth the crossing." That was written from #78, where a level 17 party was
+// routed through a level 20-30 zone and then into a level 50-58 one and the
+// deaths went from a six-hour quiet streak to 24 in fifteen minutes.
+//
+// It has been an instruction to whoever happened to be watching ever since,
+// and on 2026-09-06 nobody was. Measured on `overseer_death`: an Alliance
+// family of five, levels 25 to 31, died 46 times in 36 minutes inside one
+// hostile camp in zone 17, 43 of those to a single level 65 elite, with the
+// leader's `travel_npc` reading the same errand at every one of them. The
+// aimed leader ALONE died 13 times, four of them inside one four-minute
+// stretch. Nothing in the module counted.
+//
+// WHAT DID EXIST, AND WHY IT WAS NOT THIS. There is already one death-rate
+// rule - the stuck-revival trap, three deaths within 100 yards in 15 minutes -
+// and its condition was met over and over that evening. It answers a different
+// question: not "should this errand still be running" but "where should this
+// character come back to life". Its only remedy is a teleport to the leader's
+// bind point, and a revival may not change maps while a graveyard exists on
+// this one (#241). Every character on that roster binds to map 0 and the party
+// was on map 1, so the remedy was structurally out of reach for the whole
+// window: the trap was detected every time and fed every time. A breaker whose
+// one lever is held down by another rule is not a breaker.
+//
+// SO THIS ONE PULLS THE OTHER LEVER - the errand, which is the fuel. It does
+// not ask WHY the destination is lethal, and that is the point of having it as
+// well as a danger gate on the resolve (#267): a gate can only refuse what it
+// can see standing there when it looks. Bodies are the one measurement that
+// needs no theory of the danger - a patrol that wandered in, a route that
+// kills, a camp that grew, a level gap nothing sampled, or an aim written into
+// the column by a hand outside this module entirely.
+struct ErrandDeathLimits
+{
+    // Three in five minutes, from AGENTS.md, deliberately the same numbers a
+    // person was being asked to apply by eye. Nothing is gained by inventing
+    // better ones before this has ever run.
+    uint32_t deaths{3};
+    int64_t windowSeconds{5 * 60};
+    // HOW LONG A RELEASED TARGET STAYS REFUSED, WHICH IS NOT DECORATION. This
+    // module is not the only writer of `overseer_roster.travel_npc`; the
+    // deployment's own bridge writes it too. Measured on 2026-09-06: the aimed
+    // column was observed empty at 20:55 and was carrying the same errand again
+    // by 21:00. A release with no memory is therefore a mechanism that reports
+    // itself, changes nothing for longer than one poll, and sends the family
+    // back to the thing that killed them - which is worse than no breaker,
+    // because the log now says the breaker fired.
+    //
+    // Bounded rather than permanent: a vendor the family genuinely needs is
+    // worth trying again once whatever killed them has had time to be
+    // somewhere else, and nothing here can tell a camp from a patrol.
+    int64_t cooloffSeconds{15 * 60};
+};
+
+// How much of the death table this errand is answerable for, in seconds. An
+// errand younger than the window is judged over its OWN life and not one
+// second longer, for the same reason TravelAimBook::Release erases the errand
+// memory it ends: an aim that inherits the previous errand's corpses is
+// released before it has walked a yard. Zero for an errand with no age yet,
+// which the caller reads as "there is nothing to ask the table".
+int64_t ErrandDeathWindow(int64_t errandSeconds, ErrandDeathLimits const& limits);
+
+struct ErrandDeathToll
+{
+    // Deaths this TRAVELLER suffered inside ErrandDeathWindow. Its own, not
+    // the party's: only a character that carries `new rpg` can be sent
+    // anywhere, the followers arrive by following, and a follower's death is
+    // not evidence about a destination it was never sent to. Measured
+    // sufficient above - the aimed leader's own count crosses this threshold
+    // well before the family's does. Whether a leader that survives while its
+    // followers are farmed should also count is a real question and is not
+    // this one.
+    uint32_t deaths{0};
+    // Seconds since this character was last refused THIS target by this rule,
+    // or -1 when it never was.
+    int64_t sinceRefused{-1};
+    // A DUNGEON RUN ISSUED THIS AIM. TravelAimBook::Claim is the coordinator's
+    // only door into the column, so "claimed" is exactly this fact - and it is
+    // the one thing an escort check cannot supply, because a leader on a
+    // staging aim is not escorted, he is aimed.
+    //
+    // It matters because a release here would be UNDONE within one
+    // DUNGEON_RUN_POLL_MS and would reset the errand's pin and backstop clock
+    // every five seconds while it lasted. Firing into that is not a breaker
+    // either, so this declines and says so. A run that keeps killing its party
+    // is the run's own stall to answer.
+    bool runOwned{false};
+};
+
+enum class ErrandDeathRemedy
+{
+    Continue,         // nothing to answer
+    Release,          // the destination is not worth the crossing
+    RefuseReissue,    // released already, and something has re-aimed it since
+    DeclineRunOwned,  // it would fire, and a release here would be inert
+};
+
+struct ErrandDeathVerdict
+{
+    ErrandDeathRemedy remedy{ErrandDeathRemedy::Continue};
+    // Seconds of cool-off still to run. Meaningful for RefuseReissue only, and
+    // zero everywhere else.
+    int64_t coolOffRemaining{0};
+};
+
+// ONE POLL, FOR ONE OUTSTANDING ERRAND.
+ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
+                                      ErrandDeathLimits const& limits);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
