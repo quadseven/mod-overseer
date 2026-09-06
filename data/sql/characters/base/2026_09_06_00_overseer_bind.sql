@@ -1,0 +1,109 @@
+-- Set a family member's home at the innkeeper it is standing beside, through
+-- the core's own binder handler, the way a player does it (part of #274).
+--
+-- WHY THIS EXISTS. The game already ships a cross-continent crossing that
+-- needs no boat and no pier: an innkeeper sets your home, and the hearthstone
+-- takes you there from anywhere, across an ocean, with no deck to board. This
+-- module can already do the second half - four separate revival exits teleport
+-- a character to m_homebind* - and it has never been able to do the first.
+-- Nothing here, and nothing upstream that a bot can reach, could ever CHANGE a
+-- home. So every home is still the one the character was handed at level one,
+-- chosen by the race it was rolled as.
+--
+-- WHAT THAT COSTS, MEASURED, on the roster this module steers: all five read
+-- map 0 in character_homebind, at two different starting inns - three at the
+-- human bind and two at the dwarf one, about 4,400 yards apart. The dungeon
+-- they are meant to run a hundred times is on map 1. So the one verb that
+-- could have reunited a party split across two continents would have reunited
+-- it in the wrong hemisphere and split it again on arrival. "Send everybody
+-- home" is not a reunion until somebody can choose where home is.
+--
+-- WHY THE CORE'S BINDER HANDLER AND NOT Player::SetHomebind DIRECTLY.
+-- SetHomebind is public and would work, and that is exactly the problem: it
+-- takes any coordinate at all and asks nothing. Called directly it is an admin
+-- teleport's twin - a home set somewhere the character never stood, with no
+-- innkeeper, no walk, and no evidence. CMSG_BINDER_ACTIVATE goes to
+-- WorldSession::HandleBinderActivateOpcode instead, which asks
+-- Player::GetNPCIfCanInteractWith for an innkeeper-flagged creature and
+-- refuses anything hostile or further away than INTERACTION_DISTANCE. So
+-- nothing can be bound anywhere a character did not walk to and stand beside,
+-- and the walk is the ordinary travel errand that already exists
+-- (`overseer_roster.travel_npc = 'innkeeper'`; the role has been in
+-- TravelRoles() since travel was written and nothing has ever used it).
+--
+-- This is the same shape as the areatrigger knock: the packet is sent
+-- deliberately to the core's own handler, and the handler re-checks the world
+-- itself, so this module is never the thing deciding a bind was allowed.
+--
+-- WHY UPSTREAM'S VERB CANNOT BE USED. mod-playerbots ships SetHomeAction,
+-- registered as the chat command `home`. Its second line is
+-- `Player* master = GetMaster()`, and when the selection did not come from an
+-- rpg target it takes `else return false` before the scan for a nearby
+-- innkeeper further down is ever reached. A roster character is masterless
+-- whenever no client holds the party leader, so that early return is taken
+-- every time. Neither half of the failure is visible: the command is erased
+-- from the queue whatever it answered, and the error is whispered to a master
+-- that does not exist. The row reads `delivered` and the home has not moved.
+-- That is one of exactly two verbs AGENTS.md records behaving this way, and it
+-- is the pattern that file names: a call that reports its failure to a client,
+-- to a character that has no client.
+--
+-- WHY THE ROW IS BELIEVED ONLY AFTER THE WORLD IS READ BACK. Everything past
+-- the handler returns void: SendBindPoint casts spell 3286, Spell::EffectBind
+-- calls Player::SetHomebind, and SetHomebind writes character_homebind. Not
+-- one of them reports anything to this side, and SendBindPoint's first act is
+-- to return silently when the character's map is instanceable. So the proof is
+-- two readings taken on both sides of the call - the home before and the home
+-- after - compared against a third, where the character was standing, because
+-- a home that did not move is good news only if it was already here. That
+-- three-way comparison is BindReadBack in overseer_decisions.h and
+-- tests/test_bind.cpp pins it.
+--
+-- WHAT THIS DELIBERATELY IS NOT. It is not a teleport and it moves nobody one
+-- yard. A character can only be bound where it can already stand, so a bind
+-- can never itself be a crossing: it converts a crossing that has already been
+-- made into a permanent one that costs nothing to make again. For a family
+-- whose only route to the other continent is a boat nothing can board yet
+-- (#279), that is the difference between paying for the crossing once and
+-- paying for it every time.
+--
+-- WHAT THE EXECUTOR NEVER DECIDES: which inn is worth binding at. That needs
+-- the whole party's maps, the dungeon's map, and which innkeepers this
+-- faction may speak to at all, side by side - which is what the side outside
+-- the worldserver holds. This executor binds where the character already
+-- stands, or names why it cannot.
+--
+-- Column re-use, no new columns:
+--   target_name  the character to bind, already standing at the innkeeper
+--   command      `here`, or empty, which means the same thing
+--   target_arg   unused
+--   detail       short refusal literal, or empty on success
+--   result       JSON: outcome (bound|refused), reason, retry
+--                (never|elsewhere|later - see BindRefusalRetry in
+--                overseer_decisions.h), character, home_verdict
+--                (moved|same-spot|unchanged|unreadable), home_before,
+--                home_after and standing each {map, area, x, y, z} or null,
+--                innkeeper {entry, name, yards} or null,
+--                nearest_innkeeper_yards, innkeepers_in_reach, request
+--   status       'applied' when the home moved, 'unchanged' when the character
+--                was already bound at this inn, 'error' otherwise. NOT
+--                'delivered': the whole point of this verb is that a bind
+--                which reports delivery and changes nothing is the bug.
+--
+-- THE REFUSAL THAT IS `elsewhere` AND LOOKS LIKE `never`: "character is inside
+-- an instance". SendBindPoint returns without doing anything when the map is
+-- instanceable, so it is refused here, before the packet, and classed as
+-- something that walking outside fixes. "innkeeper not in range" is the other
+-- one, and it is the refusal this roster cannot avoid by walking further: the
+-- innkeeper nearest their dungeon belongs to the other faction, and
+-- GetNPCIfCanInteractWith turns that one down however close a character
+-- stands. The refusal carries the distance to the nearest innkeeper that was
+-- seen at all, so an aim error and a faction wall do not read alike.
+--
+-- THE ENUM LISTS THE FULL UNION, for the reason spelled out on the repair and
+-- buy migrations alongside this one: parallel branches are adding values, each
+-- ALTER names every one of them, and the base CREATE TABLE is
+-- `IF NOT EXISTS` so it can never add one.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind')
+        NOT NULL DEFAULT 'bot';
