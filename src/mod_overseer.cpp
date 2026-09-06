@@ -920,9 +920,6 @@ constexpr float CROSSING_BERTH_ARRIVED_YARDS = 12.0f;
 // query would never be issued at all. Reading "at the berth" from further out
 // than the drive reads "arrived" is what closes that loop, and asserting it
 // here is what stops somebody closing the gap again by tuning one number.
-static_assert(CROSSING_BERTH_ARRIVED_YARDS > TRAVEL_ARRIVED_POSITION_YARDS,
-              "the crossing must stop asking for the walk before the travel "
-              "drive finishes it, or the two loop against each other");
 
 // How many polls a route is believed for after the transport was last actually
 // seen. A crossing transport spends much of its period on the far map, where
@@ -974,6 +971,10 @@ constexpr uint32 CROSSING_BACKSTOP_SECONDS = 1800;
 // INTERACTION_DISTANCE is the same 5.0 and is the game's own answer to "close
 // enough to act on a thing", which is exactly the question here.
 constexpr float TRAVEL_ARRIVED_POSITION_YARDS = 5.0f;
+
+static_assert(CROSSING_BERTH_ARRIVED_YARDS > TRAVEL_ARRIVED_POSITION_YARDS,
+              "the crossing must stop asking for the walk before the travel "
+              "drive finishes it, or the two loop against each other");
 
 // How long a character may be sent somewhere before the errand is given up on.
 // The primary release is ARRIVING; this is the backstop for a target that
