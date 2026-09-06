@@ -3092,53 +3092,47 @@ bool FollowGapIsBehind(FollowGap gap);
 // THE FAMILY CANNOT WALK BETWEEN CONTINENTS, AND THAT IS CORRECT. Every aim
 // this module writes for a place is `at:<map>:<x>,<y>,<z>`, and the resolver
 // refuses one whose map is not the character's own, because MoveFarTo paths
-// through PathGenerator and there is no navmesh across an ocean. The FollowGap
-// reading above says the same thing from the other end: a party on two maps
-// has no distance between its halves. None of that changes here.
+// through PathGenerator and there is no navmesh across an ocean. None of that
+// changes here.
 //
-// WHAT CHANGES IS THAT THERE IS A CROSSING AFTER ALL, AND IT WAS NEVER A
-// TELEPORT. The world runs boats. A boat is a MotionTransport: it walks its
-// own taxi path, it carries whoever stands on its deck by relocating them
-// every tick, and when that path changes map it teleports its passengers with
-// it. A character does not need to path across water to use one. It needs to
-// be standing on the deck when the boat leaves.
+// THERE IS A CROSSING, AND IT IS A BOAT. A MotionTransport walks its own taxi
+// path, carries whoever stands on its deck by relocating them every tick, and
+// teleports its passengers when that path changes map. Boarding is already
+// solved by code that is already running: the bot AI polls
+// `Map::GetTransportForPos` once a second and boards whatever transport the MAP
+// says the character is standing on. This module must not board anybody, must
+// not teleport anybody, and must not simulate a packet.
 //
-// AND STANDING ON THE DECK IS THE WHOLE JOB. Boarding, riding and landing are
-// already done, by code that is already running: the bot AI polls the map once
-// a second and boards whatever transport the map says the character is
-// standing on, the transport relocates its passengers itself, and the
-// far-teleport is acknowledged for a bot because a bot has a session with no
-// socket rather than no session. So this module must not board anybody, must
-// not teleport anybody, and must not simulate a packet. It has exactly one
-// thing to contribute that nothing else does: WALK THE LEADER TO THE BERTH,
-// and then get out of the way.
+// WHAT THIS MODULE STILL CANNOT DO, WRITTEN DOWN BECAUSE THE FIRST VERSION OF
+// THIS FILE CLAIMED OTHERWISE. It cannot get a character onto a deck. Upstream
+// boards a follower with a straight-line `MovePoint(generatePath = false)` over
+// the last sixty yards, and it only ever does so because the MASTER is already
+// aboard and supplies the point (FollowActions.cpp). There is no navmesh on a
+// moving transport, so an `at:` aim cannot path onto one, and the party leader
+// has no master to be pulled aboard by. A transport's stop frame is not a
+// substitute: it is the SHIP's own world-space origin at its mooring, which is
+// over water beside a pier rather than anywhere a character may stand.
 //
-// WHY THE BERTH IS KNOWABLE HERE AND WAS NOT KNOWABLE BESIDE THE WORLD. An
-// earlier attempt at this ran next to the world rather than inside it and
-// stalled on one missing fact: nothing it could read said where a boat ties
-// up. Zone boxes are not piers, instance doors are not piers, and a berth
-// derived by offsetting some other landmark is the staging point that was
-// aimed into rock. The fact exists; it was on the other side of the wall. A
-// transport's own path carries a STOP FRAME on each map it serves, and that
-// frame's coordinates are the berth. The adapter reads it off the transport
-// and hands it in. This file never invents a coordinate and is never given the
-// chance to: a berth it was not handed is a refusal, below.
+// SO EVERY LEG THAT NEEDS A PLACE TO STAND IS FAIL-CLOSED UNTIL SOMETHING
+// SUPPLIES ONE. The first version of this decision took a stop frame as a
+// walkable berth and would have aimed the family at a mooring. It is now the
+// caller's job to hand in a berth that the WORLD has agreed is standable, and
+// a berth that was not handed in is a refusal that says so. That is the #121
+// discipline applied to the one place this file could still have broken it: a
+// coordinate nobody validated is not a destination, however exactly it was
+// read out of the right table.
 //
 // THE UNITS OF THIS DECISION ARE MEMBERS, NOT THE PARTY. The party it was
 // written for was ALREADY split when the crossing became necessary: three
 // followers on the destination map beside the dungeon door, the leader and one
 // follower on the far continent. "Assemble, then cross together" would have
-// had nothing to say to it. So each member is read against the DESTINATION.
-// The ones already there have arrived and are not moved. The ones on the
-// origin map are the ones with a boat to catch. Anybody on a third map is a
-// refusal rather than a rounding error.
+// had nothing to say to it. Each member is read against the DESTINATION.
 //
-// ONLY THE LEADER IS EVER AIMED. That is not a simplification, it is the
-// standing rule this repository has already paid for: a party aimed member by
-// member across a long distance scatters, and the followers already have a
-// drive that walks them to their leader on their own map. This decision
-// therefore never produces per-follower orders. It says what the crossing
-// needs next, and the adapter aims one character.
+// ONLY THE LEADER IS EVER AIMED, which is the standing rule this repository has
+// already paid for. The followers have a drive that walks them to their leader
+// on their own map, and upstream's boarding assist takes them onto a deck their
+// leader is standing on. The leader is therefore both the only character this
+// aims and the only character whose boarding is unsolved.
 enum class CrossingLeg : std::uint8_t
 {
     // Nothing readable enough to name a leg. The world is not answering.
@@ -3147,9 +3141,21 @@ enum class CrossingLeg : std::uint8_t
     OffRoute,
     // On the origin map and not aboard: the berth is the next place to be.
     WalkToBerth,
-    // On the deck, or riding. The transport owns the crossing now.
+    // At the berth, with nothing to do but wait for the transport. ITS OWN LEG
+    // BECAUSE THE ARRIVAL IS WHERE THE LAST VERSION LOOPED: the travel drive
+    // releases an `at:` errand at five yards, this reading called it Walk all
+    // the way in, so the aim was released and reclaimed forever, and every
+    // reclaim restamped the errand clock that the death breaker measures its
+    // window from. A leader standing at the berth is not walking to it.
+    WaitForTransport,
+    // The LEADER is on the deck, or riding. The transport owns the crossing.
     Aboard,
-    // Every member read on the destination map.
+    // On the destination map and STILL A PASSENGER. A distinct leg from Ashore
+    // because "the boat has arrived" and "the family is off the boat" are two
+    // facts, and treating the first as the second ends the crossing with
+    // characters standing on a deck that is about to sail back.
+    Disembark,
+    // Every member read on the destination map and off every transport.
     Ashore,
 };
 
@@ -3163,13 +3169,22 @@ enum class CrossingAction : std::uint8_t
     Refuse,
     // Aim the leader at the berth. The only action that moves anybody.
     Walk,
-    // Aboard. DO NOTHING, DELIBERATELY: the transport is the mechanism and
-    // anything issued now would fight it. A separate value from Wait because
-    // "doing nothing because the boat is sailing" and "doing nothing because
-    // the world did not answer" are one log line apart and must not be one
-    // value.
+    // At the berth. CLAIM NOTHING AND RELEASE NOTHING. The distinction from
+    // Walk is not cosmetic: re-claiming an errand the traveller has already
+    // finished is what pinned the death window to zero, because the travel
+    // drive stamps a fresh errand clock whenever the target it sees differs
+    // from the one it had, and it had just released this one on arrival.
+    Hold,
+    // The LEADER is aboard. DO NOTHING, DELIBERATELY: the transport is the
+    // mechanism and anything issued now would fight it. A separate value from
+    // Wait because "doing nothing because the boat is sailing" and "doing
+    // nothing because the world did not answer" must not be one value.
     Ride,
-    // Every member is on the destination map. The crossing is over.
+    // Somebody is on the destination map and still a passenger. This module has
+    // no way to walk them off, so this is a Wait that says something completely
+    // different and must be visible as its own thing.
+    Disembark,
+    // Every member is on the destination map, off every transport. Over.
     Done,
 };
 
@@ -3178,15 +3193,21 @@ char const* CrossingActionName(CrossingAction action);
 // One member, as the adapter read it off the world.
 //
 // `readable` IS NOT `online`. It is "this character was steerable on this
-// poll", the same gate every other drive here uses, and a character that
-// failed it contributes no map, no distance and no vote. An unreadable member
-// is never counted as arrived: four of five seen on the far side says nothing
+// poll", the same gate every other drive here uses. An unreadable member is
+// never counted as arrived: four of five seen on the far side says nothing
 // whatever about the fifth.
+//
+// `aboard` IS READ FROM THE MEMBER, NOT FROM THE BOAT. The first version asked
+// whether the member's transport pointer equalled a transport found by scanning
+// the LEADER's map, so a follower genuinely riding a boat that was currently at
+// the far dock read as not aboard, and flipped back when it returned. The
+// adapter now asks the member what it is standing on and matches the route by
+// transport identity, so the answer does not depend on where the boat is.
 struct CrossingMember
 {
     bool readable{false};
     bool isLeader{false};
-    bool aboard{false};       // the MAP says this character is on the transport
+    bool aboard{false};       // the member's own transport IS this route's
     std::uint32_t mapId{0};
     float berthDistance{0.f}; // yards, two-dimensional; meaningless off-map
 };
@@ -3198,24 +3219,36 @@ struct CrossingWorld
 {
     std::uint32_t originMap{0};
     std::uint32_t destinationMap{0};
-    // A transport was found on the origin map whose own path serves both maps.
+    // A transport is known whose own path serves both maps.
     bool transportFound{false};
-    // Its stop frame on the origin map. This is the berth to walk to.
+    // A place on the ORIGIN map that the world agreed a character may stand on
+    // and from which that transport can be boarded. NOT a stop frame. Until
+    // something can supply one, this is false and the crossing refuses.
     bool berthKnown{false};
-    // Its stop frame on the destination map. Nothing is aimed at it, but its
-    // absence means the path does not land where this crossing claims it does.
+    // The same, on the destination map, for walking off at the far end.
     bool landingKnown{false};
-    // The berth was swept for spawns above the party's level, the same sweep
-    // at the same radius a travel destination gets, and it is not clear.
+    // The berth was swept for spawns above the party's level, the same sweep at
+    // the same radius a travel destination gets, and it is not clear.
     bool berthGuarded{false};
     std::uint32_t berthGuardLevel{0};
+    // THIS CROSSING HAS TAKEN TOO LONG AND IS GIVEN UP ON. A fact rather than a
+    // policy here: the caller owns the clock. It exists because the death
+    // breaker declines to act on an errand a run owns, on the stated grounds
+    // that the run's own stall handling will answer it - and every other
+    // run-owned claim in this module has a backstop behind it while this one
+    // shipped without any timer at all. An errand nothing can call off and
+    // nothing can time out is an errand that kills a family slowly.
+    bool overdue{false};
+    // The transport's own mooring on each map, which is what a stop frame
+    // actually is. Carried for the log line only: it says where the boat ties
+    // up, so an operator reading a refusal can go and look. NEVER an aim.
+    bool mooringKnown{false};
 };
 
 struct CrossingLimits
 {
-    // Inside this, the leader is AT the berth and the bot AI's own boarding
-    // poll is what happens next. An arrival tolerance, not a boarding radius:
-    // this module never decides anybody is aboard.
+    // Inside this, the leader is AT the berth. An arrival tolerance, not a
+    // boarding radius: this module never decides anybody is aboard.
     float berthArrivedYards{0.f};
 };
 
@@ -3225,27 +3258,34 @@ struct CrossingStep
     CrossingAction action{CrossingAction::Wait};
     std::size_t readable{0};
     std::size_t unreadable{0};
-    std::size_t ashore{0};   // read on the destination map
-    std::size_t waiting{0};  // read on the origin map, not aboard
-    std::size_t aboard{0};
-    std::size_t offRoute{0}; // read on neither map
+    std::size_t ashore{0};        // destination map, off every transport
+    std::size_t waiting{0};       // origin map, not aboard
+    std::size_t aboard{0};        // a passenger, wherever the boat is
+    std::size_t stillAboard{0};   // a passenger AND on the destination map
+    std::size_t offRoute{0};      // read on neither map
     bool leaderReadable{false};
     bool leaderOnOrigin{false};
+    bool leaderAboard{false};
     bool leaderAtBerth{false};
 };
 
 // THE ORDER OF THE TESTS IS THE FAIL-CLOSED RULE, WRITTEN OUT.
 //
-// UNREADABLE FIRST, ahead of every other reading and ahead of Done in
-// particular. This is the one branch that separates this from a decision layer
-// that reads a missing member as a negative reading.
+// UNREADABLE FIRST, ahead of everything and ahead of Done in particular. This
+// is the one branch that separates this from a decision layer that reads a
+// missing member as a negative reading.
 //
-// REFUSALS BEFORE PROGRESS, because a crossing with no boat, no berth or a
-// guarded berth does not become makeable by taking a step toward it, and the
-// step taken anyway is the walk that kills people.
+// DISEMBARK BEFORE DONE, because a character on the destination map that is
+// still a passenger has not arrived: it is standing on a boat that is about to
+// go back. Done requires every member ashore AND off every transport.
 //
-// ABOARD BEFORE WALK, because the moment anybody is on the deck the transport
-// owns the outcome, and a fresh aim would walk them back off it.
+// THE LEADER'S OWN STATE DECIDES WHETHER ANYTHING IS AIMED, not the party's.
+// The first version promoted the whole family to Ride as soon as ANY member was
+// aboard, and the adapter's Ride branch released the leader's aim - so a
+// follower stepping onto the deck one second early stopped the leader walking
+// and the boat left without him, every circuit. A follower aboard is not a
+// reason to stop aiming the leader, because the leader is the only character
+// this ever aims and a passenger is never the one being aimed.
 CrossingStep ReadCrossing(CrossingWorld const& world,
                           std::vector<CrossingMember> const& members,
                           CrossingLimits const& limits);
@@ -3754,6 +3794,157 @@ struct ErrandDeathVerdict
 // ONE POLL, FOR ONE OUTSTANDING ERRAND.
 ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
                                       ErrandDeathLimits const& limits);
+
+// ----------------------------------------------------------------- auction --
+//
+// THE PARTS OF kind='auction' THAT NEED NO WORLD: reading the command text,
+// the three-value duration rule, the bid rule as the core applies it, what a
+// bid actually costs, and whether a refusal is worth trying again unchanged.
+//
+// WHY THESE ARE HERE AND NOT NEXT TO DoAuction. The executor in
+// mod_overseer.cpp drives WorldSession::HandleAuctionSellItem /
+// HandleAuctionPlaceBid / HandleAuctionRemoveItem, and every one of those
+// answers the CLIENT - a status packet on the session, void return - so the
+// module has to test each refusal itself before the call in order to name it.
+// Most of those tests are questions about the world (is there an auctioneer
+// in reach, is the item soulbound, does the house hold that id). The ones
+// below are not: they are arithmetic on numbers the caller has already read,
+// and a rule like "is 105 copper enough over a 100 copper bid" that nothing
+// can exercise without a running worldserver is a rule nobody will check.
+//
+// THE GRAMMAR, one verb per row, `target_arg` unused:
+//
+//   list guid:<item_instance.guid> bid:<copper> buyout:<copper> hours:<12|24|48>
+//   buy auction:<auctionhouse.id>
+//   bid auction:<auctionhouse.id> bid:<copper>
+//   cancel auction:<auctionhouse.id>
+//
+// `key:value` pairs after the verb, in any order, each at most once. Every
+// value is a decimal copper amount or an id; there is no gold/silver notation
+// because the Python side already speaks copper (it reads `auctionhouse` and
+// `item_instance` directly for browsing, so it never needs the executor to
+// translate). `buyout:0` means no buyout, which is what the core means by it
+// (AuctionHouseHandler.cpp:492, `auction->buyout == 0`).
+
+enum class AuctionVerb
+{
+    None,    // did not parse; `error` says why
+    List,
+    Buy,
+    Bid,
+    Cancel,
+};
+
+struct AuctionRequest
+{
+    AuctionVerb verb{AuctionVerb::None};
+    uint32_t itemGuid{0};    // list: the carried item_instance guid
+    uint32_t auctionId{0};   // buy, bid, cancel: the auctionhouse.id
+    uint32_t bid{0};         // list: the starting bid; bid: the bid placed
+    uint32_t buyout{0};      // list: 0 = no buyout
+    uint32_t hours{0};       // list: 12, 24 or 48
+    // Empty when it parsed; otherwise one of the AuctionRefusal literals below,
+    // which have static storage so the executor can hand it on as `detail`
+    // without copying.
+    char const* error{""};
+};
+
+AuctionRequest ParseAuctionRequest(std::string const& command);
+
+// The listing lengths the core accepts, as the packet carries them. The sell
+// handler reads `etime` in MINUTES, multiplies by MINUTE and then accepts
+// exactly 1x, 2x and 4x MIN_AUCTION_TIME, which is 12 hours
+// (AuctionHouseHandler.cpp:156-193, AuctionHouseMgr.h:34); anything else
+// returns without a word. So hours:12/24/48 become 720/1440/2880, and every
+// other hour count is 0 here and a named refusal in the row.
+uint32_t AuctionDurationMinutes(uint32_t hours);
+
+// THE BID RULE, in the order HandleAuctionPlaceBid applies it
+// (AuctionHouseHandler.cpp:487-497). The core says nothing on any of these -
+// it simply returns - so this is the only place a bot learns which one it hit.
+//
+//   NotAboveCurrent  price <= the standing bid, or below the starting bid
+//   BelowIncrement   not a buyout, and short of bid + the core's outbid step
+//   Ok               the core will take it (money permitting)
+//
+// `outbidStep` is the core's own AuctionEntry::CalculateAuctionOutBid(bid)
+// (AuctionHouseMgr.cpp:580-584: 5% of the bid, or 1 copper), passed in rather
+// than recomputed here so this file does not carry a second copy of a rule
+// the core owns. A buyout (price >= buyout, buyout != 0) skips the increment
+// test, exactly as the handler does.
+enum class AuctionBidVerdict
+{
+    Ok,
+    NotAboveCurrent,
+    BelowIncrement,
+};
+
+AuctionBidVerdict AuctionBidAcceptable(uint32_t price, uint32_t startBid,
+                                       uint32_t currentBid, uint32_t buyout,
+                                       uint32_t outbidStep);
+
+// WHAT A BID OR BUYOUT COSTS THE BIDDER, which is not always the price: a
+// bidder raising their own standing bid pays only the difference
+// (AuctionHouseHandler.cpp:512-513 for a bid, :553-554 for a buyout). The
+// module checks HasEnoughMoney against this figure, not against the price, so
+// a character topping up their own bid is not refused for money they are not
+// about to spend.
+uint32_t AuctionBidCost(uint32_t price, uint32_t currentBid, bool alreadyTopBidder);
+
+// THE REFUSAL LITERALS, in one place. Each is written into `detail` and into
+// result.reason by DoAuction, and AuctionRefusalRetryable below is keyed on
+// them, so a literal that drifts between the two sides would silently turn a
+// permanent refusal into a retried one. Keeping them here is what keeps the
+// classification honest, and it is why the test exercises them by these
+// names rather than by retyped strings.
+namespace AuctionRefusal
+{
+constexpr char const* Malformed          = "malformed auction command";
+constexpr char const* InvalidDuration    = "invalid duration (want hours:12, 24 or 48)";
+constexpr char const* NoStartBid         = "no starting bid";
+constexpr char const* ZeroBid            = "bid is zero";
+constexpr char const* BuyoutBelowBid     = "buyout below starting bid";
+constexpr char const* PriceTooHigh       = "price above the money cap";
+constexpr char const* NotInRange         = "auctioneer not in range";
+constexpr char const* NoSession          = "character has no session";
+constexpr char const* NoHouse            = "auctioneer belongs to no auction house";
+constexpr char const* Dead               = "character is dead";
+constexpr char const* InCombat           = "character is in combat";
+constexpr char const* Trading            = "character is in a trade";
+constexpr char const* InFlight           = "character is on a flight path";
+constexpr char const* Stunned            = "character is stunned";
+constexpr char const* LoggingOut         = "character is logging out";
+constexpr char const* BelowLevel         = "below the auction level requirement";
+constexpr char const* ItemNotCarried     = "item not carried";
+constexpr char const* ItemSoulbound      = "item is soulbound";
+constexpr char const* ItemQuest          = "item is a quest item";
+constexpr char const* ItemNotTradable    = "item cannot be traded";
+constexpr char const* ItemAlreadyListed  = "item is already in an auction";
+constexpr char const* CannotAffordDeposit = "cannot afford deposit";
+constexpr char const* CannotAffordBuyout = "cannot afford buyout";
+constexpr char const* CannotAffordBid    = "cannot afford bid";
+constexpr char const* CannotAffordCut    = "cannot afford the cancel cut";
+constexpr char const* BidTooLow          = "bid too low";
+constexpr char const* NoBuyout           = "auction has no buyout";
+constexpr char const* AuctionNotFound    = "auction not found";
+constexpr char const* AuctionItemMissing = "auction item missing from the house";
+constexpr char const* WrongHouse         = "wrong auction house";
+constexpr char const* OwnAuction         = "own auction";
+constexpr char const* NotOwnAuction      = "not own auction";
+constexpr char const* CoreRefused        = "the core refused the transaction";
+constexpr char const* NotReadBack        = "the transaction did not read back";
+}  // namespace AuctionRefusal
+
+// IS THIS REFUSAL WORTH ASKING AGAIN WITHOUT CHANGING THE ROW. True for the
+// walls that move on their own - the character is fighting, dead, mid-trade,
+// mid-flight, short of money, or not yet standing at the auctioneer the
+// Python side is walking it to. False for everything the same row will hit
+// again for ever: a malformed command, a soulbound or quest item, an auction
+// that is gone or belongs to the wrong person, a bid the arithmetic rejects.
+// Written into result.retryable so the sender can tell a "wait" from a "stop"
+// without keeping its own list of this module's strings; the give backoff
+// (mod-overseer#169) is what happens when a sender cannot tell the two apart.
+bool AuctionRefusalRetryable(std::string const& reason);
 
 // -------------------------------------------------------------------- mail --
 //
