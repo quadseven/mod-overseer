@@ -277,6 +277,84 @@ void WithoutStepLimitsTheGuardDegradesToDistance()
     CheckBool("passed, on distance alone", state.waypointPassed, true);
 }
 
+
+// A FOLLOWER IS WALKED THE SAME WAY THE LEADER IS (#261).
+//
+// GATHERING walks the leader and the followers follow him. BARRIER is the
+// other case: it escorts a member that following did not deliver, and until
+// #261 it escorted that member AT THE DOOR with no corridor - the exact defect
+// #242 fixed for the leader and left standing for everybody else.
+//
+// THE NUMBERS ARE THE LIVE ONES. The nearest graveyard to the Wailing Caverns
+// door is The Crossroads at (-592.6, -2523.5, 91.8), so every death on this
+// approach puts a member 339.32 yards from the door and 74.98 above it. That
+// reads Closing, so nothing refuses it, and an escort straight at the door
+// from there walks onto the rim and stops: measured on 2026-09-06 at 71 yards
+// out and 146 above, which closed the run in BARRIER.
+void AResurrectedFollowerIsWalkedToTheCorridorAndNotAtTheDoor()
+{
+    ApproachRouteState fromTheGraveyard;
+    Check("resurrected at the Crossroads graveyard",
+          ApproachLegStep(fromTheGraveyard,
+                          Route(Gap(491.52f, 25.35f), Gap(339.32f, 74.98f)), LIMITS),
+          ApproachLeg::ToWaypoint);
+    CheckBool("and the corridor is still ahead of him",
+              fromTheGraveyard.waypointPassed, false);
+
+    // Where escorting him at the door actually put him, on the night this was
+    // measured. He must be turned round rather than left there.
+    ApproachRouteState onTheRim;
+    Check("a follower stopped on the rim at 71y out and 146y up",
+          ApproachLegStep(onTheRim, Route(Gap(116.41f, 98.87f), Gap(71.f, 146.f)),
+                          LIMITS),
+          ApproachLeg::ToWaypoint);
+    CheckBool("the rim is not past the corridor", onTheRim.waypointPassed, false);
+}
+
+// AND A FOLLOWER THAT IS ALREADY THERE IS LEFT ALONE. The barrier opens at ten
+// yards, so a member inside it must not be handed a corridor to walk.
+void AFollowerAtTheDoorIsNotSentBackUpTheCorridor()
+{
+    ApproachRouteState state;
+    Check("a follower 4y from the staging point",
+          ApproachLegStep(state, Route(Gap(174.f, -50.f), Gap(4.f, 1.f)), LIMITS),
+          ApproachLeg::Direct);
+    CheckBool("passed", state.waypointPassed, true);
+}
+
+// WHAT THIS RULE CANNOT DO, PINNED SO NOBODY LATER BELIEVES IT CAN.
+//
+// On 2026-09-06 four members stalled at (-605.64, -2106.66, 44.97), which is
+// 167.69 yards from the door and 28.15 above it. That is Closing, and it is
+// 170.04 yards from the door against the corridor's 179.32, so this function
+// says Direct: the corridor is behind them. It is the right answer for the
+// place and the wrong answer for those four, because they were not on the ramp
+// at all - they were in a pocket beside it with no navmesh under their feet,
+// 11.3 yards in three dimensions from ground that IS genuinely past the
+// corridor and 8.3 yards below it.
+//
+// No distance can separate those two places, and this test exists to say so
+// rather than to invite a fudge factor that would send everybody on the lower
+// ramp back up it. Telling them apart needs the navmesh, which these two files
+// may not reach; see the issue.
+void APocketBesideTheRampReadsAsPastTheCorridor()
+{
+    ApproachRouteState inThePocket;
+    Check("the measured stall at 167.69y out and 28.15y up",
+          ApproachLegStep(inThePocket, Route(Gap(116.94f, -21.48f), Gap(167.69f, 28.15f)),
+                          LIMITS),
+          ApproachLeg::Direct);
+    CheckBool("and it is recorded as passed", inThePocket.waypointPassed, true);
+
+    // Eleven yards away, on the ramp proper, the same answer is correct - which
+    // is the whole point.
+    ApproachRouteState onTheRamp;
+    Check("11y away on the ramp, the same verdict is right",
+          ApproachLegStep(onTheRamp, Route(Gap(117.f, -13.f), Gap(170.f, 36.5f)), LIMITS),
+          ApproachLeg::Direct);
+    CheckBool("passed", onTheRamp.waypointPassed, true);
+}
+
 }  // namespace
 
 int main()
@@ -290,6 +368,9 @@ int main()
     AnUnmeasuredLegIsNotJudged();
     ACorridorWithNoLengthIsRefused();
     WithoutStepLimitsTheGuardDegradesToDistance();
+    AResurrectedFollowerIsWalkedToTheCorridorAndNotAtTheDoor();
+    AFollowerAtTheDoorIsNotSentBackUpTheCorridor();
+    APocketBesideTheRampReadsAsPastTheCorridor();
     if (!failures)
         std::printf("the way in is a corridor, not a bearing: the approach leg holds\n");
     return failures ? 1 : 0;

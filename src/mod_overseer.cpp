@@ -12945,14 +12945,23 @@ private:
         // thing that ever sets it. Most of the descent takes the leader FURTHER
         // from the corridor's start than he was when he reached it; without the
         // stickiness every one of those polls would turn him round.
-        OverseerDecisions::ApproachRouteState approach;
+        // PER MEMBER, AND #261 IS WHY IT IS NOT ONE ANY MORE. It was the
+        // leader's alone, because GATHERING walks the leader and the followers
+        // follow him, which is true and remains true. BARRIER is the other
+        // case: it escorts a member that following did not deliver, and it
+        // escorted it AT THE DOOR with no corridor. Every death on this
+        // approach resurrects a member at the Crossroads graveyard, 339 yards
+        // from the door and 75 yards above it, and an escort straight at the
+        // door from there walks onto the rim and stops. A corridor the leader
+        // walks and the followers do not is half a corridor.
+        std::map<std::string, OverseerDecisions::ApproachRouteState> approach;
         // The aim string this run last claimed for the leader. Held so that the
         // approach can be re-claimed WHEN THE LEG CHANGES and not on every
         // poll: Claim deliberately drops the errand's memory, including the
         // travel backstop's own clock, so claiming the same string every five
         // seconds would keep resetting the clock that is supposed to notice a
         // leader who is going nowhere. Empty until the first claim.
-        std::string legAim;
+        std::map<std::string, std::string> legAim;
         bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
@@ -15515,13 +15524,13 @@ private:
                 // but it still has to be walked out and round, and a leftover
                 // "already passed" from the previous run would aim the next one
                 // straight back at the rim.
-                coord.approach = OverseerDecisions::ApproachRouteState();
+                coord.approach.clear();
                 coord.legAim.clear();
                 coord.loggedCorridor = false;
 
                 DungeonApproachAim const first = DungeonApproachAimFor(
-                    *portal, coord.approach, leader, coord.stageX, coord.stageY,
-                    coord.stageZ);
+                    *portal, coord.approach[leaderName], leader, coord.stageX,
+                    coord.stageY, coord.stageZ);
                 if (!first.usable)
                 {
                     // Unreachable while the derivation above is the only way to
@@ -15547,7 +15556,7 @@ private:
                 // being hypothetical: every run after the first aims at the
                 // identical string the previous run just finished with.
                 _travelAims.Claim(leaderName, aimTarget);
-                coord.legAim = aimTarget;
+                coord.legAim[leaderName] = aimTarget;
 
                 coord.phase = DungeonRunPhase::Gathering;
                 coord.loggedGathering = false;
@@ -15625,8 +15634,8 @@ private:
             // the three portal rows that carry no corridor it is always Direct
             // and this is exactly the reading it always was.
             DungeonApproachAim const legAim = DungeonApproachAimFor(
-                *portal, coord.approach, leader, coord.stageX, coord.stageY,
-                coord.stageZ);
+                *portal, coord.approach[leaderName], leader, coord.stageX,
+                coord.stageY, coord.stageZ);
             OverseerDecisions::ApproachGap const gap = legAim.gap;
             bool const onTheCorridor =
                 legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
@@ -15637,10 +15646,10 @@ private:
             // and then stand there under an aim that had been satisfied. Guarded
             // on the string because Claim drops the errand's memory: see
             // DungeonRunCoordinatorState::legAim.
-            if (onTheOutsideMap && legAim.usable && legAim.aim != coord.legAim)
+            if (onTheOutsideMap && legAim.usable && legAim.aim != coord.legAim[leaderName])
             {
                 _travelAims.Claim(leaderName, legAim.aim);
-                coord.legAim = legAim.aim;
+                coord.legAim[leaderName] = legAim.aim;
 
                 // AND A FRESH LEG GETS A FRESH RATCHET, which is not tidying:
                 // without it the second leg is given up on at ninety seconds
@@ -16451,11 +16460,57 @@ private:
             gap.verticalYards = state.verticalFromStage;
             gap.measured = state.distanceFromStage >= 0.f;
             bool const isLeader = name == leaderName;
-            if (gap.measured &&
-                (isLeader || OverseerDecisions::ApproachShapeOf(
-                                 gap, DUNGEON_APPROACH_LIMITS) !=
-                                 OverseerDecisions::ApproachShape::Arrived))
-                EscortToward(name, stageTarget, "BARRIER");
+
+            // AND THE ESCORT WALKS THE CORRIDOR TOO (#261). This used to send
+            // every member at `stageTarget`, the door itself, which is the
+            // exact defect #242 fixed for the leader and left standing here.
+            //
+            // IT IS NOT A CORNER CASE, IT IS THE COMMON ONE. A member only
+            // needs escorting because following did not deliver it, and on this
+            // approach the usual reason is that it died and was resurrected:
+            // the nearest graveyard to the Wailing Caverns door is The
+            // Crossroads at (-592.6, -2523.5, 91.8), 339 yards from the door
+            // and 75 yards ABOVE it. That reads Closing, so nothing refuses it,
+            // and an escort straight at the door from there walks onto the rim
+            // and stops. Measured live on 2026-09-06: one member at 71 yards
+            // out and 146 above, which closed the run in BARRIER.
+            //
+            // Escorted at the corridor instead, the same member walks down the
+            // ramp and arrives. The barrier itself is unchanged and still
+            // measured against the DOOR - `state` above is untouched - because
+            // whether the party is assembled is a question about the staging
+            // point and always was. Only where each member is being WALKED
+            // changes.
+            DungeonApproachAim const legAim = DungeonApproachAimFor(
+                *portal, coord.approach[name], member, coord.stageX, coord.stageY,
+                coord.stageZ);
+            bool const onTheCorridor =
+                legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
+
+            if (gap.measured && legAim.usable &&
+                (isLeader || onTheCorridor ||
+                 OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) !=
+                     OverseerDecisions::ApproachShape::Arrived))
+            {
+                EscortToward(name, legAim.aim, "BARRIER");
+                if (coord.legAim[name] != legAim.aim)
+                {
+                    coord.legAim[name] = legAim.aim;
+                    // A NEW LEG GETS A NEW RATCHET, the same clearing #242 made
+                    // in GATHERING and for the same reason: the ladder measures
+                    // the best distance to the point being walked at, and that
+                    // point has just changed. Only this member's, because only
+                    // this member's leg changed.
+                    coord.staging.erase(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run BARRIER walks '{}' to {} ({}) - {}",
+                             name,
+                             onTheCorridor ? "the start of the approach corridor"
+                                           : "the staging point",
+                             legAim.aim,
+                             OverseerDecisions::ApproachWhere(legAim.gap));
+                }
+            }
 
             // AND THE ESCORT RE-ASSERTS ITSELF ON THE RUN'S OWN CLOCK (#164).
             // DriveTravel asserts the focus on every travel poll already; this
@@ -16469,7 +16524,15 @@ private:
             // IS IT ACTUALLY COMING? The reading above is a distance, and a
             // distance alone cannot tell a member walking in from a member
             // standing still. This can, and corrects what it finds.
-            if (RunStagingWatchdog(coord, name, member, gap))
+            //
+            // AND IT WATCHES THE LEG THAT IS BEING WALKED (#261).
+            // Fed the gap to the DOOR while a member is walking the corridor,
+            // it reads every yard of a correct descent as no progress, because
+            // the corridor's first half increases the distance to the door. It
+            // is handed the leg's own gap for the same reason GATHERING's is.
+            OverseerDecisions::ApproachGap const legGap =
+                onTheCorridor ? legAim.gap : gap;
+            if (RunStagingWatchdog(coord, name, member, legGap))
             {
                 // ABOVE THE DOOR AND NOT COMING DOWN (#217). One member in that
                 // state is enough to close the run: the barrier needs all of
@@ -16478,7 +16541,11 @@ private:
                 // standing beside a drop. The watchdog has already said which
                 // character and how far above.
                 FailApproach(coord, leaderName, *portal, "BARRIER",
-                             name + " (" + OverseerDecisions::ApproachWhere(gap) + ")",
+                             name + " (" + OverseerDecisions::ApproachWhere(legGap) +
+                                 (onTheCorridor
+                                      ? ", walking to the start of the approach corridor"
+                                      : "") +
+                                 ")",
                              IsDungeonJob(leaderJob));
                 return;
             }
