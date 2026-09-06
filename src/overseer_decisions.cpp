@@ -3777,4 +3777,76 @@ TownRetry BindRefusalRetry(std::string const& detail)
     return TownRetry::Later;
 }
 
+uint16_t FallGuardStandDownMask(bool alive, bool teleporting, bool inFlight,
+                               bool flying, bool falling, bool inWater,
+                               bool onTransport, bool inVehicle)
+{
+    uint16_t mask = FALL_GUARD_RAN;
+
+    // NO `else`, ANYWHERE. Two of these being true at once is the finding, not
+    // a tie to be broken: a character whose flags say both falling and flying
+    // is in a different state from one whose flags say only one of them, and a
+    // rule that reported whichever was tested first would erase the difference
+    // it exists to show.
+    if (!alive)
+        mask |= FALL_GUARD_DEAD;
+    if (teleporting)
+        mask |= FALL_GUARD_TELEPORTING;
+    if (inFlight)
+        mask |= FALL_GUARD_IN_FLIGHT;
+    if (flying)
+        mask |= FALL_GUARD_FLYING;
+    if (falling)
+        mask |= FALL_GUARD_FALLING;
+    if (inWater)
+        mask |= FALL_GUARD_IN_WATER;
+    if (onTransport)
+        mask |= FALL_GUARD_TRANSPORT;
+    if (inVehicle)
+        mask |= FALL_GUARD_VEHICLE;
+
+    return mask;
+}
+
+std::string FallGuardStandDownNames(uint16_t mask)
+{
+    if (mask == FALL_GUARD_RAN)
+        return "ran";
+
+    // Lowest bit first, so two rows carrying the same mask always read the
+    // same way round and can be compared by eye as well as by value.
+    static struct
+    {
+        uint16_t bit;
+        char const* name;
+    } const NAMES[] = {
+        {FALL_GUARD_DEAD, "dead"},
+        {FALL_GUARD_TELEPORTING, "teleporting"},
+        {FALL_GUARD_IN_FLIGHT, "in-flight"},
+        {FALL_GUARD_FLYING, "flying"},
+        {FALL_GUARD_FALLING, "falling"},
+        {FALL_GUARD_IN_WATER, "in-water"},
+        {FALL_GUARD_TRANSPORT, "transport"},
+        {FALL_GUARD_VEHICLE, "vehicle"},
+    };
+
+    std::string out;
+    for (auto const& entry : NAMES)
+    {
+        if (!(mask & entry.bit))
+            continue;
+        if (!out.empty())
+            out += '|';
+        out += entry.name;
+    }
+
+    // A bit this build does not know about is still worth seeing. It cannot
+    // happen today, because the mask is built from this file's own enum, and
+    // saying so costs one branch and stops a future bit reading as "ran".
+    if (out.empty())
+        return "unknown";
+
+    return out;
+}
+
 }  // namespace OverseerDecisions

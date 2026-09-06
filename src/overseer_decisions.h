@@ -4083,6 +4083,85 @@ int ChooseInnkeeper(std::vector<float> const& yards);
 // heard of is more likely a new transient than a new permanent.
 TownRetry BindRefusalRetry(std::string const& detail);
 
+// WHY THE FALL BASELINE GUARD DECLINED, AS A NUMBER THAT CAN BE COUNTED.
+//
+// #266 deployed the invariant that a character which is not falling is
+// standing somewhere, and a character that is standing somewhere owes nothing
+// for having got there, so every poll hands the core a baseline at that
+// character's own feet. Phantom fall deaths continued anyway, and the reason
+// turned out not to be the rule.
+//
+// FallBaselineStep declines in exactly one circumstance, `!mayInspect ||
+// falling`, and its call site sits ABOVE the recovery's own stand-down and is
+// not gated by the episode cooldown. The drive polls once a second, so if the
+// guard ran, `m_lastFallZ` could not be more than one second of movement from
+// the character's feet. The deaths measured on 2026-09-06 require it to have
+// been 69 or more yards away: 0.018 * z_diff - 0.2426 reaches a full health
+// bar at 69.03 yards, and two of those rows had a measured descent of exactly
+// zero. Both cannot be true, so the guard was not called. It is correct and it
+// is not running, and those two look identical in the data.
+//
+// SO THIS RECORDS WHICH INPUT DECLINED IT, and it is a mask rather than a
+// first-match answer on purpose: "the flags say falling AND the flags say
+// flying" is itself the diagnosis, and a rule that reported whichever the code
+// tested first would hide exactly that. Every reason that is true is set.
+//
+// AND THE ABSENCE OF A READING IS NOT A READING. A mask of zero means the
+// drive looked and nothing stood it down, which is a finding. Never having
+// looked is a different finding and is carried as a NEGATIVE sentinel by the
+// caller, the same way `recovery_rung` and `yards_fallen` already do. Folding
+// the two together is how 223 kill-plane deaths went unexplained
+// (2026_09_05_02_overseer_death_context.sql), so they are kept apart here too.
+//
+// WHAT THIS IS FOR, BEYOND THIS ONE BUG. The module stands down on movement
+// FLAGS and the core charges fall damage on the absence of AURAS, and those
+// are different questions. `Unit::IsFlying()` is
+// `HasMovementFlag(MOVEMENTFLAG_FLYING | MOVEMENTFLAG_DISABLE_GRAVITY)`
+// (Unit.h:1717); `Player::HandleFall` charges unless `HasHoverAura()`,
+// `HasFeatherFallAura()` or `HasFlyAura()` (Player.cpp:14187-14189). A flag
+// set without its aura is a state where the core will charge this character
+// and this module has decided it has no opinion. Two core facts make that
+// state easy to enter and hard to leave: `EffectMovementGenerator::Finalize`
+// opens with `if (!unit->IsCreature()) return;`, so a player's
+// MOVEMENTFLAG_FALLING is never cleared server-side and this roster sends no
+// client packets to clear it; and `Player::TeleportTo` reduces the flags to
+// MOVEMENTFLAG_MASK_HAS_PLAYER_STATUS_OPCODE (UnitDefines.h:423), which drops
+// FALLING but KEEPS DISABLE_GRAVITY, CAN_FLY and HOVER, so a stand-down caused
+// by one of those survives every death and every revival.
+//
+// This tells us which. It does not fix it, and deliberately changes no
+// decision: every value here is written down and nothing reads it back.
+enum FallGuardStandDown : uint16_t
+{
+    // The drive looked and nothing declined it, so the baseline was handed
+    // over. Zero is a reading and not an absence.
+    FALL_GUARD_RAN = 0,
+
+    FALL_GUARD_DEAD        = 1u << 0,  // !alive
+    FALL_GUARD_TELEPORTING = 1u << 1,  // Player::IsBeingTeleported
+    FALL_GUARD_IN_FLIGHT   = 1u << 2,  // Player::IsInFlight, a taxi
+    FALL_GUARD_FLYING      = 1u << 3,  // Unit::IsFlying, FLYING | DISABLE_GRAVITY
+    FALL_GUARD_FALLING     = 1u << 4,  // Unit::IsFalling, FALLING | FALLING_FAR | a falling spline
+    FALL_GUARD_IN_WATER    = 1u << 5,  // Unit::IsInWater
+    FALL_GUARD_TRANSPORT   = 1u << 6,  // on a boat or a zeppelin
+    FALL_GUARD_VEHICLE     = 1u << 7,  // in a vehicle
+};
+
+// EVERY REASON THAT IS TRUE, not the first one found. The argument order is
+// TerrainRecoveryMayInspect's, unchanged, so the two cannot drift apart
+// without a compiler noticing that one of them has the wrong arity.
+uint16_t FallGuardStandDownMask(bool alive, bool teleporting, bool inFlight,
+                                bool flying, bool falling, bool inWater,
+                                bool onTransport, bool inVehicle);
+
+// The same mask as something a person reading a log line can act on, lowest
+// bit first and joined with '|', or "ran" when nothing declined it. The COLUMN
+// keeps the number, because the question this exists to answer is "group the
+// deaths by why the guard did not run and count them"; this is for the one
+// line in the log beside it, so a reader does not need a lookup table at three
+// in the morning.
+std::string FallGuardStandDownNames(uint16_t mask);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
