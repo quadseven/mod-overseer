@@ -10,17 +10,28 @@
  *     Grug  map 0  (-8601,  -496) online   <- the party leader
  *     Ugga  map 0  (-10042, -711) online
  *
- * Five characters alive at full health, an Alliance family of humans, a dwarf
- * and a gnome, on job `dungeon:wailing`, whose door is on map 1. The leader is
- * on the wrong continent from the dungeon and from three of its four
- * followers, and every drive in the module declines: `follow` acts only while
- * the master is on the same map, the catch-up walk has nowhere on this map to
- * aim, and an `at:` aim is refused outright when its map is not the
- * character's own.
+ * An Alliance family of five on job `dungeon:wailing`, whose door is on map 1,
+ * with its leader on the wrong continent from the dungeon and from three of its
+ * four followers. Every drive declines: `follow` acts only while the master is
+ * on the same map, the catch-up walk has nowhere on this map to aim, and an
+ * `at:` aim is refused outright when its map is not the character's own.
  *
- * The thing this test exists to pin is that the answer to that is a BOAT, that
- * the module's whole contribution to a boat is walking one character to a
- * berth, and that every fact it cannot read resolves toward doing nothing.
+ * MOST OF THIS FILE IS ABOUT THE FIRST VERSION'S DEFECTS, found by review
+ * before the first live crossing. Each has a case named after what it did:
+ *
+ *   * A follower boarding one second before the leader promoted the whole
+ *     family to Ride, which released the leader's aim, and the boat left
+ *     without him. Ride is now about the LEADER.
+ *   * A passenger standing on the destination map was counted as riding and
+ *     never as needing to get off, because `aboard` was read before the map and
+ *     skipped it. Both are read now, and Disembark is its own leg.
+ *   * "At the berth" was still called Walk, so the caller reclaimed an errand
+ *     the travel drive had just released on arrival, and every reclaim
+ *     restamped the clock the death breaker measures its window from. Hold is
+ *     its own action and claims nothing.
+ *   * A crossing had no backstop at all, while the death breaker declines to
+ *     act on any errand a run owns because "the run answers for it". Overdue is
+ *     a fact the caller can set.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else.
  */
@@ -91,8 +102,10 @@ void CheckSays(char const* what, std::string const& said, char const* fragment)
     ++failures;
 }
 
-// Menethil Harbour on map 0 to Theramore on map 1, which is the Alliance
-// route this family would actually take, with every fact in hand.
+// A crossing from the Eastern Kingdoms to Kalimdor with every fact in hand,
+// including a boardable place at each end. Nothing in the world can supply the
+// last two today, which is exactly why the tests supply them: the decision has
+// to be provably right for the day something can.
 CrossingWorld GoodWorld()
 {
     CrossingWorld w;
@@ -101,8 +114,10 @@ CrossingWorld GoodWorld()
     w.transportFound = true;
     w.berthKnown = true;
     w.landingKnown = true;
+    w.mooringKnown = true;
     w.berthGuarded = false;
     w.berthGuardLevel = 0;
+    w.overdue = false;
     return w;
 }
 
@@ -139,25 +154,157 @@ CrossingMember Aboard(bool leader, std::uint32_t map)
     return m;
 }
 
-// The family exactly as it was read tonight: leader and one follower on map 0,
-// two followers on map 1, one unreadable because it is logged out.
-std::vector<CrossingMember> TheFamilyTonight()
+// ------------------------------------------------- the reviewed defects --
+
+// DEFECT 1. A follower stepping onto the deck one second before the leader
+// promoted the whole family to Ride, and the caller's Ride branch released the
+// leader's aim. The leader stopped walking and the boat left without him, every
+// circuit. A passenger is never the character being aimed, so a passenger is
+// never a reason to stop aiming the leader.
+void AFollowerAboardDoesNotStopTheLeaderWalking()
 {
-    return {At(true, 0, 4200.f), At(false, 0, 4600.f), At(false, 1),
-            At(false, 1), Unread()};
+    std::vector<CrossingMember> members = {At(true, 0, 400.f), Aboard(false, 0),
+                                           At(false, 1)};
+    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
+    CheckAction("the leader keeps walking", step.action, CrossingAction::Walk);
+    CheckLeg("on the walk-to-berth leg", step.leg, CrossingLeg::WalkToBerth);
+    CheckCount("one follower aboard", step.aboard, 1u);
+    Check("and the leader is not aboard", step.leaderAboard, false);
 }
 
-// ---------------------------------------------------------------- fail closed
+// The other half of the same rule: when it IS the leader, the transport owns
+// the outcome and nothing may be aimed.
+void TheLeaderAboardIsWhatRideMeans()
+{
+    std::vector<CrossingMember> members = {Aboard(true, 0), At(false, 0),
+                                           At(false, 1)};
+    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
+    CheckAction("the leader aboard rides", step.action, CrossingAction::Ride);
+    CheckLeg("on the aboard leg", step.leg, CrossingLeg::Aboard);
+    Check("and the leader is aboard", step.leaderAboard, true);
+    Check("and is not counted as on the origin map", step.leaderOnOrigin, false);
+}
 
-// THE BRANCH THE WHOLE FILE IS BUILT AROUND. Bork is logged out. Four of five
-// read cleanly, two of them already standing on the destination map. That is
-// not four fifths of an answer, it is no answer: nothing whatever is known
-// about the fifth, including whether it is on a boat, in an instance, or in
-// the ocean.
+// DEFECT 2. `aboard` was read before the map and then skipped it, so a
+// character who had arrived on the destination map while still standing on the
+// deck could never be seen as needing to get off. It rode back.
+void APassengerOnTheDestinationMapNeedsToGetOff()
+{
+    std::vector<CrossingMember> members = {Aboard(true, 1), Aboard(false, 1),
+                                           At(false, 1)};
+    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
+    CheckAction("still on the deck at the far end", step.action,
+                CrossingAction::Disembark);
+    CheckLeg("on the disembark leg", step.leg, CrossingLeg::Disembark);
+    CheckCount("two still aboard on the destination map", step.stillAboard, 2u);
+    Check("and it is certainly not Done", step.action == CrossingAction::Done,
+          false);
+    CheckSays("and it says being on the deck is not being ashore",
+              CrossingExplanation(step, GoodWorld()), "not the same fact as being ashore");
+}
+
+// And Done needs BOTH halves: on the destination map, and off every transport.
+// A single passenger holds the whole crossing open.
+void DoneNeedsEverybodyAshoreAndOffEveryTransport()
+{
+    std::vector<CrossingMember> allAshore = {At(true, 1), At(false, 1),
+                                             At(false, 1), At(false, 1),
+                                             At(false, 1)};
+    CrossingWorld w = GoodWorld();
+    w.transportFound = false;   // a landed party does not need a boat any more
+    w.berthKnown = false;
+    CrossingStep const done = ReadCrossing(w, allAshore, Limits());
+    CheckAction("all five ashore is done", done.action, CrossingAction::Done);
+    CheckLeg("on the ashore leg", done.leg, CrossingLeg::Ashore);
+    CheckCount("five ashore", done.ashore, 5u);
+
+    std::vector<CrossingMember> oneStillOn = allAshore;
+    oneStillOn[3] = Aboard(false, 1);
+    CrossingStep const held = ReadCrossing(w, oneStillOn, Limits());
+    CheckAction("one passenger holds it open", held.action,
+                CrossingAction::Disembark);
+    CheckCount("and four are ashore, not five", held.ashore, 4u);
+}
+
+// DEFECT 3, at the decision's own level. A passenger's map flips under the
+// transport's teleport rather than under anything the party did, so the reading
+// must never treat a passenger as being somewhere by map alone.
+void APassengerIsCountedAsAPassengerWhereverTheBoatIs()
+{
+    CrossingStep const onOrigin =
+        ReadCrossing(GoodWorld(), {At(true, 0, 400.f), Aboard(false, 0)}, Limits());
+    CheckCount("a passenger on the origin map is not waiting", onOrigin.waiting, 1u);
+    CheckCount("and is counted aboard", onOrigin.aboard, 1u);
+
+    CrossingStep const onDestination =
+        ReadCrossing(GoodWorld(), {At(true, 0, 400.f), Aboard(false, 1)}, Limits());
+    CheckCount("a passenger on the destination map is not ashore",
+               onDestination.ashore, 0u);
+    CheckCount("and is counted as still aboard", onDestination.stillAboard, 1u);
+}
+
+// DEFECT 4 (5a in the review). Arrival was still called Walk, so the caller
+// reclaimed an errand the travel drive had just handed back at five yards, and
+// every reclaim restamped the errand clock the death breaker measures from.
+// Holding is a different instruction from walking and the caller acts on it
+// differently: it claims nothing.
+void AtTheBerthIsHoldingAndNotWalking()
+{
+    std::vector<CrossingMember> members = {At(true, 0, 4.f), At(false, 1)};
+    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
+    CheckAction("at the berth, hold", step.action, CrossingAction::Hold);
+    CheckLeg("on the wait-for-transport leg", step.leg,
+             CrossingLeg::WaitForTransport);
+    Check("and the leader reads as at the berth", step.leaderAtBerth, true);
+    CheckSays("and it says why nothing is reclaimed",
+              CrossingExplanation(step, GoodWorld()), "restart the clock");
+}
+
+// One yard outside the tolerance is still a walk, so the two readings cannot
+// both be false at once and leave nobody instructed.
+void JustOutsideTheBerthIsStillAWalk()
+{
+    std::vector<CrossingMember> members = {At(true, 0, 10.5f), At(false, 1)};
+    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
+    CheckAction("outside the tolerance, walk", step.action, CrossingAction::Walk);
+    Check("and it does not read as at the berth", step.leaderAtBerth, false);
+}
+
+// DEFECT 5 (5b in the review). The death breaker declines to call off any
+// errand a run owns, on the stated grounds that the run's own stall handling
+// answers for it. Every other run-owned claim sits behind a backstop; this one
+// shipped with no timer at all, so it was the one errand nothing could stop.
+void AnOverdueCrossingIsGivenUpOn()
+{
+    CrossingWorld w = GoodWorld();
+    w.overdue = true;
+    CrossingStep const step =
+        ReadCrossing(w, {At(true, 0, 400.f), At(false, 1)}, Limits());
+    CheckAction("an overdue crossing refuses", step.action,
+                CrossingAction::Refuse);
+    CheckSays("and says the breaker cannot do it for us",
+              CrossingExplanation(step, w), "nothing can ever stop");
+}
+
+// But a passenger outranks the backstop, because giving up on a crossing does
+// not get anybody off a boat, and an aim issued now would pull them off it.
+void AnOverdueCrossingStillDoesNotDisturbAPassenger()
+{
+    CrossingWorld w = GoodWorld();
+    w.overdue = true;
+    CrossingStep const step = ReadCrossing(w, {Aboard(true, 0)}, Limits());
+    CheckAction("aboard outranks overdue", step.action, CrossingAction::Ride);
+}
+
+// ---------------------------------------------------------- fail closed --
+
+// THE BRANCH THE WHOLE FILE IS BUILT AROUND. Four of five read cleanly, two of
+// them already on the destination map. That is not four fifths of an answer.
 void OneUnreadableMemberOutranksEveryOtherReading()
 {
-    CrossingStep const step =
-        ReadCrossing(GoodWorld(), TheFamilyTonight(), Limits());
+    std::vector<CrossingMember> members = {At(true, 0, 4200.f), At(false, 0),
+                                           At(false, 1), At(false, 1), Unread()};
+    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
     CheckAction("a party with a logged-out member waits", step.action,
                 CrossingAction::Wait);
     CheckLeg("and names no leg", step.leg, CrossingLeg::Unknown);
@@ -166,24 +313,17 @@ void OneUnreadableMemberOutranksEveryOtherReading()
               CrossingExplanation(step, GoodWorld()), "1 of 5");
 }
 
-// The same shape at the far end, which is the one that would actually cost
-// something: four members read on the destination map and one unreadable is
-// not an arrival, and calling it one would end the crossing with a character
-// nobody has seen.
 void FourAshoreAndOneUnreadableIsNotAnArrival()
 {
     std::vector<CrossingMember> members = {At(true, 1), At(false, 1),
-                                           At(false, 1), At(false, 1),
-                                           Unread()};
+                                           At(false, 1), At(false, 1), Unread()};
     CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
     CheckAction("four ashore and one unread is not done", step.action,
                 CrossingAction::Wait);
-    Check("and it is certainly not Done",
-          step.action == CrossingAction::Done, false);
+    Check("and it is certainly not Done", step.action == CrossingAction::Done,
+          false);
 }
 
-// An empty roster is a caller that lost its roster, not a crossing that
-// finished. It must not grade as arrived either.
 void AnEmptyRosterIsNotAnArrival()
 {
     CrossingStep const step = ReadCrossing(GoodWorld(), {}, Limits());
@@ -191,89 +331,80 @@ void AnEmptyRosterIsNotAnArrival()
     CheckLeg("and names no leg", step.leg, CrossingLeg::Unknown);
 }
 
-// A crossing from a map to itself is a caller bug. Answering Done would hide
-// it behind a success.
 void ACrossingFromAMapToItselfIsRefused()
 {
     CrossingWorld w = GoodWorld();
     w.destinationMap = 0;
     CrossingStep const step =
         ReadCrossing(w, {At(true, 0), At(false, 0)}, Limits());
-    CheckAction("one map twice is refused", step.action,
-                CrossingAction::Refuse);
+    CheckAction("one map twice is refused", step.action, CrossingAction::Refuse);
     CheckSays("and says so", CrossingExplanation(step, w), "map 0 twice");
 }
 
-// ------------------------------------------------------------ the refusals
+// ------------------------------------------------------------ refusals --
 
-// No boat is a refusal and not a wait. Waiting implies the fact arrives on
-// its own; this one does not, and a permanently true wait trains itself away.
 void NoTransportIsRefusedRatherThanWaitedOn()
 {
     CrossingWorld w = GoodWorld();
     w.transportFound = false;
     CrossingStep const step =
-        ReadCrossing(w, {At(true, 0), At(false, 1)}, Limits());
+        ReadCrossing(w, {At(true, 0, 400.f), At(false, 1)}, Limits());
     CheckAction("no transport refuses", step.action, CrossingAction::Refuse);
-    CheckSays("and says no transport serves the far map",
-              CrossingExplanation(step, w), "no transport on map 0");
+    CheckSays("and says no transport serves both maps",
+              CrossingExplanation(step, w), "no transport is known");
 }
 
-// THE FACT THE EARLIER ATTEMPT AT THIS DIED ON. A boat with no stop frame on
-// our map gives no berth, and this module will not derive one by offsetting
-// something else: that is exactly how a staging point ended up inside rock.
-void ABoatWithNoBerthOnThisMapIsRefusedAndNothingIsInvented()
+// THE CORRECTION AT THE HEART OF THIS REVISION. A transport's stop frame is the
+// SHIP's mooring, over water beside a pier, and the first version took it for a
+// berth and would have aimed the family at it. `berthKnown` now means the world
+// agreed a character may stand there, and nothing can say that yet.
+void AMooringIsNotABerthAndABerthlessCrossingRefuses()
 {
     CrossingWorld w = GoodWorld();
-    w.berthKnown = false;
+    w.berthKnown = false;      // the mooring is known; a standable place is not
+    w.mooringKnown = true;
     CrossingStep const step =
-        ReadCrossing(w, {At(true, 0), At(false, 1)}, Limits());
-    CheckAction("no berth refuses", step.action, CrossingAction::Refuse);
-    CheckSays("and says the berth is what is missing",
-              CrossingExplanation(step, w), "no stop frame on map 0");
-    CheckSays("and says it will not derive one",
-              CrossingExplanation(step, w), "will not derive one");
+        ReadCrossing(w, {At(true, 0, 400.f), At(false, 1)}, Limits());
+    CheckAction("no boardable place refuses", step.action,
+                CrossingAction::Refuse);
+    CheckSays("and says a stop frame is the ship's mooring",
+              CrossingExplanation(step, w), "SHIP's");
+    CheckSays("and says it will not derive a pier from one",
+              CrossingExplanation(step, w), "derive a pier");
+    CheckSays("and says the deck cannot be stepped onto either",
+              CrossingExplanation(step, w), "sixty yards");
 }
 
-// A path that never stops on the destination map does not land there, whatever
-// its two ends claim.
-void ABoatThatDoesNotStopAtTheFarEndIsRefused()
+void ACrossingThatCannotEndIsNotStarted()
 {
     CrossingWorld w = GoodWorld();
     w.landingKnown = false;
     CrossingStep const step =
-        ReadCrossing(w, {At(true, 0), At(false, 1)}, Limits());
+        ReadCrossing(w, {At(true, 0, 400.f), At(false, 1)}, Limits());
     CheckAction("no landing refuses", step.action, CrossingAction::Refuse);
-    CheckSays("and says the path does not land there",
-              CrossingExplanation(step, w), "does not land where");
+    CheckSays("and says a crossing that cannot end is not started",
+              CrossingExplanation(step, w), "cannot end");
 }
 
-// THE GUARD THAT MUST NOT BE LOST. A travel destination standing in ground the
-// party cannot survive is not a destination, however correct its coordinates.
-// The berth is a travel destination like any other and gets the same sweep,
-// because the last time a destination was chosen without regard for what
-// surrounds it the family took eighteen deaths to one level 65 elite.
+// The gate that must not be lost: a destination the party cannot survive is not
+// a destination, however correct its coordinates are.
 void AGuardedBerthIsNotADestination()
 {
     CrossingWorld w = GoodWorld();
     w.berthGuarded = true;
     w.berthGuardLevel = 65;
     CrossingStep const step =
-        ReadCrossing(w, {At(true, 0), At(false, 1)}, Limits());
-    CheckAction("a guarded berth refuses", step.action,
-                CrossingAction::Refuse);
+        ReadCrossing(w, {At(true, 0, 400.f), At(false, 1)}, Limits());
+    CheckAction("a guarded berth refuses", step.action, CrossingAction::Refuse);
     CheckSays("and names the level that guards it",
               CrossingExplanation(step, w), "level 65");
     CheckSays("and gives the reason a destination is refused",
               CrossingExplanation(step, w), "cannot survive");
 }
 
-// A member on a third map is worse news than a member at the wrong end of a
-// known route, and it is reported in its own words rather than folded into
-// the split it is not.
 void AMemberOnAThirdMapIsRefusedInItsOwnWords()
 {
-    std::vector<CrossingMember> members = {At(true, 0), At(false, 1),
+    std::vector<CrossingMember> members = {At(true, 0, 400.f), At(false, 1),
                                            At(false, 530)};
     CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
     CheckAction("a third map refuses", step.action, CrossingAction::Refuse);
@@ -283,10 +414,9 @@ void AMemberOnAThirdMapIsRefusedInItsOwnWords()
               CrossingExplanation(step, GoodWorld()), "neither map 0 nor map 1");
 }
 
-// ONLY THE LEADER IS EVER AIMED, so a leader that has already crossed leaves
-// nothing to aim. This is a real split and it is said out loud rather than
-// worked around by aiming a follower, which is the scatter this repository
-// keeps paying for.
+// Only the leader is ever aimed, so a leader already across leaves nothing to
+// aim, and that is a real split somebody has to hear about rather than
+// something to work around by aiming a follower.
 void ALeaderAlreadyAshoreLeavesNothingToAim()
 {
     std::vector<CrossingMember> members = {At(true, 1), At(false, 0),
@@ -294,151 +424,44 @@ void ALeaderAlreadyAshoreLeavesNothingToAim()
     CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
     CheckAction("a leader ashore with followers behind refuses", step.action,
                 CrossingAction::Refuse);
-    Check("and the leader is not on the origin map", step.leaderOnOrigin,
-          false);
+    Check("and the leader is not on the origin map", step.leaderOnOrigin, false);
     CheckSays("and says only the leader is ever aimed",
               CrossingExplanation(step, GoodWorld()), "only ever aims the leader");
 }
 
-// ------------------------------------------------------------- the crossing
+// ----------------------------------------------------------- the words --
 
-// THE ONE THAT MOVES ANYBODY. The family as it was tonight, minus the logged
-// out member: the leader on map 0 with a follower, two followers already on
-// map 1 beside the dungeon door, a boat that serves both maps and a clear
-// berth. One aim, at the berth, for one character.
-void AnAssembledLeaderWithABerthWalksToIt()
-{
-    std::vector<CrossingMember> members = {At(true, 0, 4200.f),
-                                           At(false, 0, 4600.f), At(false, 1),
-                                           At(false, 1)};
-    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
-    CheckAction("the leader walks to the berth", step.action,
-                CrossingAction::Walk);
-    CheckLeg("on the walk-to-berth leg", step.leg, CrossingLeg::WalkToBerth);
-    CheckCount("two members already ashore", step.ashore, 2u);
-    CheckCount("two still on the origin map", step.waiting, 2u);
-    Check("the leader is on the origin map", step.leaderOnOrigin, true);
-    Check("and is not at the berth yet", step.leaderAtBerth, false);
-    CheckSays("and it says who is already across",
-              CrossingExplanation(step, GoodWorld()), "already on map 1");
-}
-
-// Arrival is a tolerance, not a boarding decision. Inside it the leader is AT
-// the berth, and what happens next is the bot AI's own once-a-second boarding
-// poll, not anything this module does.
-void ArrivingAtTheBerthIsNotBoarding()
-{
-    std::vector<CrossingMember> members = {At(true, 0, 4.f), At(false, 1)};
-    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
-    Check("the leader reads as at the berth", step.leaderAtBerth, true);
-    CheckAction("and the action is still only to walk", step.action,
-                CrossingAction::Walk);
-    CheckCount("nobody is aboard", step.aboard, 0u);
-}
-
-// THE MOMENT THE MODULE STOPS HAVING AN OPINION. A passenger is carried by the
-// transport, which relocates it every tick and teleports it when its path
-// changes map. Any order issued now fights that, so the answer is a value that
-// does nothing and is distinguishable from every other way of doing nothing.
-void AboardMeansTheTransportOwnsItAndNothingIsAimed()
-{
-    std::vector<CrossingMember> members = {Aboard(true, 0), At(false, 0),
-                                           At(false, 1)};
-    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
-    CheckAction("aboard rides", step.action, CrossingAction::Ride);
-    CheckLeg("on the aboard leg", step.leg, CrossingLeg::Aboard);
-    CheckCount("one aboard", step.aboard, 1u);
-    Check("a passenger is not counted as waiting on the origin map",
-          step.waiting == 1u, true);
-}
-
-// A passenger's map flips under the transport's own teleport rather than under
-// anything the party did. Mid-ocean on the far map, still aboard, is still
-// Ride: it must not read as an arrival and must not read as a fresh walk.
-void APassengerWhoseMapHasFlippedIsStillRiding()
-{
-    // Every member is on the destination map by map id alone, and one of them
-    // is still standing on a deck. If `aboard` were read after the map, this
-    // would grade as Done and end the crossing over open water.
-    std::vector<CrossingMember> members = {Aboard(true, 1), At(false, 1)};
-    CrossingStep const step = ReadCrossing(GoodWorld(), members, Limits());
-    CheckAction("still aboard, still riding", step.action,
-                CrossingAction::Ride);
-    CheckCount("the passenger is not counted ashore", step.ashore, 1u);
-    CheckCount("it is counted aboard instead", step.aboard, 1u);
-    Check("and the crossing is not over", step.action == CrossingAction::Done,
-          false);
-}
-
-// Being aboard outranks the refusals, because once somebody is on a deck a
-// missing berth is no longer a reason to do anything, and the one thing that
-// must never happen is an order that walks a passenger off a moving boat.
-void AboardOutranksAMissingBerth()
-{
-    CrossingWorld w = GoodWorld();
-    w.berthKnown = false;
-    w.berthGuarded = true;
-    CrossingStep const step =
-        ReadCrossing(w, {Aboard(true, 0), At(false, 1)}, Limits());
-    CheckAction("aboard still rides", step.action, CrossingAction::Ride);
-}
-
-// The end. Every member read on the destination map, and it is asked before
-// the boat is, so a party that has landed does not care whether a boat could
-// still be found for a crossing it no longer needs.
-void EverybodyOnTheFarMapIsDone()
-{
-    std::vector<CrossingMember> members = {At(true, 1), At(false, 1),
-                                           At(false, 1), At(false, 1),
-                                           At(false, 1)};
-    CrossingWorld w = GoodWorld();
-    w.transportFound = false;
-    w.berthKnown = false;
-    CrossingStep const step = ReadCrossing(w, members, Limits());
-    CheckAction("every member ashore is done", step.action,
-                CrossingAction::Done);
-    CheckLeg("on the ashore leg", step.leg, CrossingLeg::Ashore);
-    CheckCount("five ashore", step.ashore, 5u);
-}
-
-// ----------------------------------------------------------------- the words
-
-// Every action says something, including the ones that do nothing. "Held" with
-// no reason is a line an operator learns to skip; "held because no stop frame
-// exists on this map" is one they can act on.
 void EveryActionSaysSomething()
 {
     CrossingWorld const w = GoodWorld();
-    struct Case { std::vector<CrossingMember> members; CrossingWorld world; };
-    std::vector<Case> const cases = {
-        {{Unread()}, w},
-        {{At(true, 0), At(false, 1)}, w},
-        {{Aboard(true, 0)}, w},
-        {{At(true, 1)}, w},
-        {{At(true, 0), At(false, 530)}, w},
+    std::vector<std::vector<CrossingMember>> const cases = {
+        {Unread()},
+        {At(true, 0, 400.f), At(false, 1)},
+        {At(true, 0, 1.f), At(false, 1)},
+        {Aboard(true, 0)},
+        {Aboard(true, 1)},
+        {At(true, 1)},
+        {At(true, 0, 400.f), At(false, 530)},
     };
-    for (Case const& c : cases)
+    for (std::vector<CrossingMember> const& members : cases)
     {
-        CrossingStep const step = ReadCrossing(c.world, c.members, Limits());
-        std::string const said = CrossingExplanation(step, c.world);
-        if (!said.empty())
+        CrossingStep const step = ReadCrossing(w, members, Limits());
+        if (!CrossingExplanation(step, w).empty())
             continue;
         std::printf("FAIL '%s' said nothing\n", CrossingActionName(step.action));
         ++failures;
     }
 }
 
-// Every leg and every action has its own name, so a log line can never say one
-// thing while the value says another.
 void EveryValueHasItsOwnName()
 {
     std::vector<CrossingLeg> const legs = {
         CrossingLeg::Unknown, CrossingLeg::OffRoute, CrossingLeg::WalkToBerth,
-        CrossingLeg::Aboard, CrossingLeg::Ashore};
+        CrossingLeg::WaitForTransport, CrossingLeg::Aboard,
+        CrossingLeg::Disembark, CrossingLeg::Ashore};
     for (std::size_t i = 0; i < legs.size(); ++i)
         for (std::size_t j = i + 1; j < legs.size(); ++j)
-            if (std::string(CrossingLegName(legs[i])) ==
-                CrossingLegName(legs[j]))
+            if (std::string(CrossingLegName(legs[i])) == CrossingLegName(legs[j]))
             {
                 std::printf("FAIL two legs share the name '%s'\n",
                             CrossingLegName(legs[i]));
@@ -447,7 +470,8 @@ void EveryValueHasItsOwnName()
 
     std::vector<CrossingAction> const actions = {
         CrossingAction::Wait, CrossingAction::Refuse, CrossingAction::Walk,
-        CrossingAction::Ride, CrossingAction::Done};
+        CrossingAction::Hold, CrossingAction::Ride, CrossingAction::Disembark,
+        CrossingAction::Done};
     for (std::size_t i = 0; i < actions.size(); ++i)
         for (std::size_t j = i + 1; j < actions.size(); ++j)
             if (std::string(CrossingActionName(actions[i])) ==
@@ -459,55 +483,77 @@ void EveryValueHasItsOwnName()
             }
 }
 
-// Being handed a better world never turns a blind reading into progress. The
-// unreadable branch is ahead of everything, and this is the test that keeps it
-// there when somebody reorders the function.
+// Being handed a better world never turns a blind reading into progress, and
+// being handed a worse one never turns a passenger into somebody to order
+// about. Both directions, because the ordering is the whole design.
 void MoreFactsNeverRescueABlindReading()
 {
-    std::vector<CrossingMember> members = {At(true, 0), Unread()};
+    std::vector<CrossingMember> blind = {At(true, 0, 400.f), Unread()};
     CrossingWorld w = GoodWorld();
-    CheckAction("blind with a full world", ReadCrossing(w, members, Limits()).action,
+    CheckAction("blind with a full world", ReadCrossing(w, blind, Limits()).action,
                 CrossingAction::Wait);
     w.berthGuarded = true;
-    CheckAction("blind with a guarded berth", ReadCrossing(w, members, Limits()).action,
-                CrossingAction::Wait);
+    w.overdue = true;
+    CheckAction("blind with a guarded, overdue crossing",
+                ReadCrossing(w, blind, Limits()).action, CrossingAction::Wait);
     w.transportFound = false;
-    CheckAction("blind with no boat", ReadCrossing(w, members, Limits()).action,
+    CheckAction("blind with no boat", ReadCrossing(w, blind, Limits()).action,
                 CrossingAction::Wait);
+}
+
+void FewerFactsNeverDisturbAPassenger()
+{
+    CrossingWorld w = GoodWorld();
+    w.transportFound = false;
+    w.berthKnown = false;
+    w.landingKnown = false;
+    w.berthGuarded = true;
+    w.overdue = true;
+    CheckAction("the leader aboard still rides",
+                ReadCrossing(w, {Aboard(true, 0), At(false, 1)}, Limits()).action,
+                CrossingAction::Ride);
+    CheckAction("a passenger at the far end still disembarks",
+                ReadCrossing(w, {Aboard(true, 1)}, Limits()).action,
+                CrossingAction::Disembark);
 }
 
 } // namespace
 
 int main()
 {
+    AFollowerAboardDoesNotStopTheLeaderWalking();
+    TheLeaderAboardIsWhatRideMeans();
+    APassengerOnTheDestinationMapNeedsToGetOff();
+    DoneNeedsEverybodyAshoreAndOffEveryTransport();
+    APassengerIsCountedAsAPassengerWhereverTheBoatIs();
+    AtTheBerthIsHoldingAndNotWalking();
+    JustOutsideTheBerthIsStillAWalk();
+    AnOverdueCrossingIsGivenUpOn();
+    AnOverdueCrossingStillDoesNotDisturbAPassenger();
+
     OneUnreadableMemberOutranksEveryOtherReading();
     FourAshoreAndOneUnreadableIsNotAnArrival();
     AnEmptyRosterIsNotAnArrival();
     ACrossingFromAMapToItselfIsRefused();
 
     NoTransportIsRefusedRatherThanWaitedOn();
-    ABoatWithNoBerthOnThisMapIsRefusedAndNothingIsInvented();
-    ABoatThatDoesNotStopAtTheFarEndIsRefused();
+    AMooringIsNotABerthAndABerthlessCrossingRefuses();
+    ACrossingThatCannotEndIsNotStarted();
     AGuardedBerthIsNotADestination();
     AMemberOnAThirdMapIsRefusedInItsOwnWords();
     ALeaderAlreadyAshoreLeavesNothingToAim();
 
-    AnAssembledLeaderWithABerthWalksToIt();
-    ArrivingAtTheBerthIsNotBoarding();
-    AboardMeansTheTransportOwnsItAndNothingIsAimed();
-    APassengerWhoseMapHasFlippedIsStillRiding();
-    AboardOutranksAMissingBerth();
-    EverybodyOnTheFarMapIsDone();
-
     EveryActionSaysSomething();
     EveryValueHasItsOwnName();
     MoreFactsNeverRescueABlindReading();
+    FewerFactsNeverDisturbAPassenger();
 
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
         return 1;
     }
-    std::printf("the family crosses a continent by boat, or says why it cannot\n");
+    std::printf("a crossing that cannot board anybody refuses, and says which "
+                "fact it is missing\n");
     return 0;
 }
