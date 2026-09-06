@@ -7044,6 +7044,77 @@ private:
     // declared end state can produce no plan at all, so a stray `learn_skill`
     // on a row nobody has decided about is not merely refused later - it is
     // never even loaded.
+    // WHAT `overseer_death` SAYS ABOUT ONE CHARACTER, ASKED THE WAY EVERY
+    // OTHER TABLE IN THIS FILE IS ASKED.
+    //
+    // These two exist because the drive that wants them may not have a query
+    // of its own. infra#2846 is the reason and test_schema_degrade.py is the
+    // rule: MySQL fails a SELECT naming a missing column or table WHOLE, error
+    // 1054/1146 with no partial rows, and CharacterDatabase.Query hands that
+    // back as a null QueryResult indistinguishable from "nothing matched". A
+    // bare query inside a drive therefore cannot tell "this world has not run
+    // the migration" from "this character has not died", and the drive that
+    // guesses wrong stops working for a reason no log line explains.
+    //
+    // `overseer_death` IS EXACTLY SUCH A TABLE. This module added it, its DDL
+    // is applied by the db-import image, and this file is compiled into the
+    // worldserver image; the two are pinned by separate digests in the same
+    // manifest and bumped independently, so a world that has not run the
+    // migration is a real case rather than a hypothetical one.
+    //
+    // So the absence lives here, once, and both answers below are the same
+    // answer a quiet table would give: nobody has died. That is the safe
+    // direction for a breaker - a missing table cannot call off an errand -
+    // and it is the only direction that lets the drive read them as values.
+    //
+    // NOW() AND NOT UTC_TIMESTAMP(), because `created_at` defaults to
+    // CURRENT_TIMESTAMP and the two have to be the same clock. The
+    // stuck-revival trap counts this table the same way for the same reason;
+    // if either ever has to change, both do.
+
+    // How many times this character has died inside the last `seconds`. A
+    // window of zero or less is an errand with no age yet, which is a poll
+    // with nothing to ask rather than a poll with nothing to find - so it
+    // never reaches the database at all.
+    uint32 RecentDeathCount(std::string const& name, int64 seconds)
+    {
+        if (seconds <= 0)
+            return 0;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND",
+            Esc(name), seconds);
+        if (!result)
+            return 0;  // no such table on this world, or no such deaths - same answer
+
+        return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
+    }
+
+    // Who did most of it, or '' when nothing creature-shaped did and when the
+    // table is not there to ask. Only the release path calls this, so the
+    // steady state still costs one COUNT per character per poll and nothing
+    // else: a release that says "three deaths" and a release that says "three
+    // deaths, all to one level 65 elite" are the same decision and very
+    // different bug reports, but only one of them is worth a GROUP BY.
+    std::string WorstRecentKiller(std::string const& name, int64 seconds)
+    {
+        if (seconds <= 0)
+            return std::string();
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT killer_name, COUNT(*) AS n FROM overseer_death "
+            "WHERE character_name = '{}' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND "
+            "AND killer_type = 'creature' "
+            "GROUP BY killer_name ORDER BY n DESC LIMIT 1",
+            Esc(name), seconds);
+        if (!result)
+            return std::string();
+
+        return result->Fetch()[0].Get<std::string>();
+    }
+
     std::map<std::string, ProfessionPlan> LoadProfessionPlans()
     {
         std::map<std::string, ProfessionPlan> plans;
@@ -10431,18 +10502,13 @@ private:
                 // to ask rather than a poll with nothing to find.
                 int64 const window = int64(OverseerDecisions::ErrandDeathWindow(
                     std::time(nullptr) - state.errandSince, ERRAND_DEATH_LIMITS));
-                if (window > 0)
-                {
-                    // NOW() and not UTC_TIMESTAMP(), because `created_at`
-                    // defaults to CURRENT_TIMESTAMP and the two have to be the
-                    // same clock. The stuck-revival trap counts the same table
-                    // the same way; if either ever has to change, both do.
-                    if (QueryResult tolled = CharacterDatabase.Query(
-                            "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
-                            "AND created_at >= NOW() - INTERVAL {} SECOND",
-                            Esc(name), window))
-                        toll.deaths = uint32(tolled->Fetch()[0].Get<uint64>());
-                }
+
+                // THROUGH THE LOADER, LIKE EVERY OTHER READ IN THIS DRIVE.
+                // `_travelAims.Load()` and LoadProfessionPlans() own their SQL
+                // and their absence, and this drive may not carry a query of
+                // its own - infra#2846, test_schema_degrade.py (#276). A zero window
+                // never reaches the database; RecentDeathCount owns that too.
+                toll.deaths = RecentDeathCount(name, window);
 
                 OverseerDecisions::ErrandDeathVerdict const verdict =
                     OverseerDecisions::ErrandDeathBreaker(toll, ERRAND_DEATH_LIMITS);
@@ -10454,23 +10520,11 @@ private:
 
                     case OverseerDecisions::ErrandDeathRemedy::Release:
                     {
-                        // WHO IS DOING IT, asked only on the path that fires so
-                        // the steady state costs one COUNT and nothing else. A
-                        // release that says "three deaths" and a release that
-                        // says "three deaths, all to one level 65 elite" are
-                        // the same decision and very different bug reports.
-                        std::string killer;
-                        if (QueryResult worst = CharacterDatabase.Query(
-                                "SELECT killer_name, COUNT(*) AS n FROM overseer_death "
-                                "WHERE character_name = '{}' "
-                                "AND created_at >= NOW() - INTERVAL {} SECOND "
-                                "AND killer_type = 'creature' "
-                                "GROUP BY killer_name ORDER BY n DESC LIMIT 1",
-                                Esc(name), window))
-                        {
-                            Field* f = worst->Fetch();
-                            killer = f[0].Get<std::string>();
-                        }
+                        // WHO IS DOING IT, asked only on the path that fires
+                        // so the steady state costs one COUNT and nothing
+                        // else, and asked through the loader for the same
+                        // reason the count is (infra#2846).
+                        std::string const killer = WorstRecentKiller(name, window);
 
                         LOG_WARN("module.overseer",
                                  // "releasing the errand" on ONE source line,
