@@ -4080,17 +4080,47 @@ struct ErrandDeathToll
     // Seconds since this character was last refused THIS target by this rule,
     // or -1 when it never was.
     int64_t sinceRefused{-1};
-    // A DUNGEON RUN ISSUED THIS AIM. TravelAimBook::Claim is the coordinator's
-    // only door into the column, so "claimed" is exactly this fact - and it is
-    // the one thing an escort check cannot supply, because a leader on a
-    // staging aim is not escorted, he is aimed.
+    // SOMETHING OTHER THAN THIS DRIVE ISSUED THIS AIM AND RE-ISSUES IT.
+    // TravelAimBook::Claim is the one door into the column that is not
+    // DriveTravel's own, so "claimed" is exactly this fact - and it is the one
+    // thing an escort check cannot supply, because a leader on a staging aim is
+    // not escorted, he is aimed.
     //
-    // It matters because a release here would be UNDONE within one
-    // DUNGEON_RUN_POLL_MS and would reset the errand's pin and backstop clock
-    // every five seconds while it lasted. Firing into that is not a breaker
-    // either, so this declines and says so. A run that keeps killing its party
-    // is the run's own stall to answer.
+    // It matters because a release here would be UNDONE within one poll of
+    // whatever holds the claim, and would reset the errand's pin and backstop
+    // clock every time while it lasted. Firing into that is not a breaker
+    // either, so a claim something answers for is declined and said out loud
+    // instead. A run that keeps killing its party is the run's own stall to
+    // answer, and it can be LEFT to answer it because every aim a run claims
+    // sits behind a timer that ends the run: DUNGEON_STAGING_BACKSTOP_SECONDS
+    // over RESETTING, GATHERING and BARRIER, DUNGEON_CROSSING_BACKSTOP_SECONDS
+    // over ENTER and EXIT, and CROSSING_BACKSTOP_SECONDS over a continent
+    // crossing - which exists BECAUSE of this deference and says so.
+    //
+    // THE NAME IS THE OLDER HALF OF THE TRUTH. The column fact it reads has not
+    // changed; what changed is that a dungeon run stopped being the only thing
+    // that writes it. See `catchUp`.
     bool runOwned{false};
+
+    // ...AND THE CLAIMANT IS THE CATCH-UP WALK, WHICH NOTHING ANSWERS FOR
+    // (#298). The paragraph above was true when it was written and #138 made it
+    // false: the follow drive walks a follower too far back to be following to
+    // its leader through the same lease a run uses, so that walk reads as
+    // run-owned here and is not a run.
+    //
+    // NOTHING ENDS IT. Its own end conditions are arriving and the party
+    // splitting across maps, which are both things going right; its sweep only
+    // fires when the party poll stops marking it, which is a leak guard and not
+    // a clock; and the errand's own twenty-minute unreachable backstop is
+    // restarted by every re-aim at a leader who has walked on, and is re-claimed
+    // by the next party poll on the occasions it does fire.
+    //
+    // MEASURED ON THE DEV REALM, 2026-09-07: a follower died three times in 153
+    // seconds on one catch-up aim, this rule fired, and it deferred to a dungeon
+    // run whose newest row had ended thirteen hours earlier with
+    // outcome='staging_failed'. The deference is right and its coverage was
+    // wrong. A claim nothing answers for is answered here instead.
+    bool catchUp{false};
 };
 
 enum class ErrandDeathRemedy
@@ -4099,6 +4129,8 @@ enum class ErrandDeathRemedy
     Release,          // the destination is not worth the crossing
     RefuseReissue,    // released already, and something has re-aimed it since
     DeclineRunOwned,  // it would fire, and a release here would be inert
+    EndCatchUp,       // it would fire, and the walk that re-aims it is the only
+                      // thing that can stop it
 };
 
 struct ErrandDeathVerdict

@@ -3503,17 +3503,27 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     bool const coolingOff =
         toll.sinceRefused >= 0 && toll.sinceRefused < limits.cooloffSeconds;
 
-    // 1. A RUN'S OWN AIM IS NEVER TAKEN OFF IT, whichever of the two things
-    //    below would otherwise happen. Answered first because it is the one
-    //    branch that is about who may act at all rather than about what the
-    //    table says, and because a coordinator that re-Claims a target this
-    //    rule refused is not a bridge re-arming a bad errand - it is the run
-    //    doing the job it was started for, and it would win the argument
+    // 1. A CLAIMED AIM IS NEVER SIMPLY TAKEN OFF ITS CLAIMANT, whichever of
+    //    the two things below would otherwise happen. Answered first because it
+    //    is the one branch that is about who may act at all rather than about
+    //    what the table says, and because a coordinator that re-Claims a target
+    //    this rule refused is not a bridge re-arming a bad errand - it is the
+    //    run doing the job it was started for, and it would win the argument
     //    every five seconds anyway.
+    //
+    //    WHICH IS AN ARGUMENT ABOUT BACKSTOPS AND NOT ABOUT RUNS, and it was
+    //    written when those were the same thing (#298). A run's claim is left
+    //    alone because a timer ends the run. The catch-up walk claims through
+    //    the same lease and has no timer at all, so declining to it is
+    //    declining to nobody - and its remedy cannot be a release either,
+    //    because the walk re-Claims from its own escort entry on the next party
+    //    poll. The caller is told to end the WALK, which is the only thing that
+    //    stops the aim coming back. See ErrandDeathToll::catchUp.
     if (toll.runOwned)
     {
         if (coolingOff || toll.deaths >= limits.deaths)
-            verdict.remedy = ErrandDeathRemedy::DeclineRunOwned;
+            verdict.remedy = toll.catchUp ? ErrandDeathRemedy::EndCatchUp
+                                          : ErrandDeathRemedy::DeclineRunOwned;
         return verdict;
     }
 

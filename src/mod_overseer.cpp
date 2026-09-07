@@ -1358,6 +1358,33 @@ constexpr OverseerDecisions::FollowGapLimits FOLLOW_GAP_LIMITS{
 // would leave the follower standing at a stale point forever.
 constexpr float FOLLOW_CATCH_UP_REAIM_YARDS = FOLLOW_CATCH_UP_DONE_YARDS / 2.0f;
 
+// HOW LONG A FOLLOWER IS LEFT ALONE AFTER A CATCH-UP WALK KILLED IT (#298).
+//
+// THE CATCH-UP WALK IS THE ONE CLAIMANT ON THIS COLUMN NOTHING ANSWERED FOR.
+// ErrandDeathBreaker declines to release an aim a dungeon run claimed, and that
+// is right, because every aim a run claims sits inside a phase with a timer on
+// it: DUNGEON_STAGING_BACKSTOP_SECONDS over RESETTING, GATHERING and BARRIER,
+// DUNGEON_CROSSING_BACKSTOP_SECONDS over ENTER and EXIT, and
+// CROSSING_BACKSTOP_SECONDS over a continent crossing - the last of which exists
+// precisely because that deference does. #138 gave the follow drive the same
+// lease and no timer at all. The walk ends on arriving or on the party splitting
+// across maps, which are both things going RIGHT; SweepCatchUps only fires when
+// the party poll stops marking it, which is a leak guard; and the errand's own
+// twenty-minute unreachable backstop is restarted by every re-aim at a leader
+// who has walked on, and re-claimed by the next party poll when it does fire.
+//
+// So the breaker is that missing backstop, and this is how long it holds.
+//
+// THE SAME NUMBER AS THE ERRAND COOL-OFF, READ FROM IT RATHER THAN WRITTEN
+// TWICE. The two answer one question - "this killed it, leave it alone for a
+// while" - about the two halves of a single decision, the aim column and the
+// walk that keeps writing it, and a walk that resumed while the target it walks
+// to was still refused would be a walk to a column cleared every poll. The
+// argument for fifteen minutes, and for it being bounded rather than permanent,
+// is on OverseerDecisions::ErrandDeathLimits::cooloffSeconds.
+constexpr time_t CATCH_UP_STANDDOWN_SECONDS =
+    static_cast<time_t>(ERRAND_DEATH_LIMITS.cooloffSeconds);
+
 // Upstream's own fuse on MoveFarTo's stuck teleport: `stuckTime`, 90 seconds
 // (NewRpgBaseAction.h:76). Named here so the log line that reports the
 // teleport being kept out of reach can say what it was kept from, and so a
@@ -9783,6 +9810,35 @@ private:
         return it != _dungeonEscorts.end() && it->second.catchUp;
     }
 
+    // WHICH FOLLOWERS MAY NOT BE WALKED TO THEIR LEADER YET, AND SINCE WHEN
+    // (#298). Written by the death breaker on the poll it ends a catch-up walk
+    // for killing its follower; read by DriveCatchUp before it starts another.
+    //
+    // THIS IS THE BACKSTOP, AND ENDING THE WALK IS ONLY HALF OF IT. DriveCatchUp
+    // decides to walk a follower from the gap and from the ground, and both of
+    // those are exactly as bad on the next party poll as they were on this one -
+    // so a walk that is ended and nothing else restarts within thirty seconds,
+    // at a new aim, with a fresh errand clock and therefore a toll of zero,
+    // forever. Measured 2026-09-07: one follower died four times in six minutes
+    // on a walk an operator had already cleared by hand once.
+    //
+    // ONE ENTRY PER CHARACTER AND IT SWEEPS ITSELF, the same shape as
+    // TravelAimBook::WithinHandbackGrace and for the same reason it gives: a
+    // refusal that outlives its reason is its own bug. World thread only, like
+    // everything else on this loop.
+    std::map<std::string, time_t> _catchUpStandDown;
+
+    bool WithinCatchUpStandDown(std::string const& name)
+    {
+        auto const it = _catchUpStandDown.find(name);
+        if (it == _catchUpStandDown.end())
+            return false;
+        if (std::time(nullptr) - it->second < CATCH_UP_STANDDOWN_SECONDS)
+            return true;
+        _catchUpStandDown.erase(it);
+        return false;
+    }
+
     // IS THIS FOLLOWER CUT OFF FROM ITS LEADER RIGHT NOW? (#289)
     //
     // `_partySplitSaid` was written to ration a log line and it is now the
@@ -10135,6 +10191,19 @@ private:
         // And a follower held after a revival is standing still on purpose,
         // for a few seconds - see HoldAfterRevival.
         if (HeldAfterRevival(name))
+            return;
+        // ...AND ONE WHOSE LAST CATCH-UP WALK KILLED IT IS NOT SENT ON ANOTHER
+        // ONE YET (#298). See CATCH_UP_STANDDOWN_SECONDS. This is the half of
+        // that backstop that makes the other half hold: everything below reads
+        // the gap and the ground, and neither of them has changed since the walk
+        // was called off, so without this the walk simply starts again.
+        //
+        // NOT SAID HERE, DELIBERATELY. The line worth reading was said once by
+        // the breaker on the poll it ended the walk, and it named this stand-down
+        // and its length; repeating it every party poll for fifteen minutes would
+        // bury it. `follow` has the follower in the meantime, which is exactly
+        // where it was before the walk began.
+        if (WithinCatchUpStandDown(name))
             return;
         if (!leader->IsAlive() || !OnTheGround(leader))
             return;
@@ -10788,6 +10857,13 @@ private:
             {
                 OverseerDecisions::ErrandDeathToll toll;
                 toll.runOwned = _travelAims.RunOwns(name, target);
+                // ...AND WHETHER THE CLAIMANT IS THE ONE NOTHING ANSWERS FOR
+                // (#298). `_claimed` says a claim exists and cannot say whose;
+                // a dungeon run was the only claimant when RunOwns was written
+                // and has not been since #138. Free, off a map this drive
+                // already reads fifty lines below for the re-aim log line. See
+                // OverseerDecisions::ErrandDeathToll::catchUp.
+                toll.catchUp = IsCatchingUp(name);
                 toll.sinceRefused = _travelAims.SecondsSinceRefused(name, target);
 
                 // THE ONLY STRETCH OF THE TABLE THIS ERRAND ANSWERS FOR. Zero
@@ -10864,6 +10940,13 @@ private:
                         // own stall handling is what answers this; the point of
                         // the line is that the deaths are on the record against
                         // the errand rather than nowhere.
+                        //
+                        // AND IT REALLY DOES ANSWER, which is the half of this
+                        // that was being taken on trust (#298). Every aim a run
+                        // claims sits inside a phase with a timer on it, so "the
+                        // run decides" names something that exists and will
+                        // finish. The one claimant for which that was never true
+                        // is the catch-up walk, and it has its own case below.
                         if (!state.deathSaid)
                         {
                             state.deathSaid = true;
@@ -10879,6 +10962,75 @@ private:
                                          ERRAND_DEATH_LIMITS.windowSeconds / 60));
                         }
                         break;
+
+                    case OverseerDecisions::ErrandDeathRemedy::EndCatchUp:
+                    {
+                        // THE WALK IS ENDED, NOT JUST THE AIM (#298), and that
+                        // is the whole difference between this and a Release.
+                        // DriveCatchUp re-Claims from its own escort entry on
+                        // every party poll, so a column cleared here is written
+                        // again within thirty seconds - the same inert mechanism
+                        // the case above exists to avoid - and in between it
+                        // leaves a follower holding `new rpg` with no aim under
+                        // it, which goes IDLE and then wherever
+                        // NewRpgStatusUpdateAction rolls.
+                        //
+                        // WHO IS DOING IT, asked only on the path that fires and
+                        // through the loader, for the reasons the Release path
+                        // above gives (infra#2846).
+                        std::string const killer = WorstRecentKiller(name, window);
+
+                        LOG_WARN("module.overseer",
+                                 // "ending the catch-up walk" on ONE source
+                                 // line, the same discipline every other release
+                                 // path in this function keeps.
+                                 "overseer: '{}' has died {} times in the last {}s on the "
+                                 "catch-up walk to '{}'{} - ending the catch-up walk, "
+                                 "because nothing else will: it is not a dungeon run, it "
+                                 "re-aims itself at the leader every poll, and clearing "
+                                 "the column alone is undone by the next party poll. "
+                                 "`follow` has it from here, and it is not walked to its "
+                                 "leader again for {} minutes",
+                                 name, toll.deaths, window, target,
+                                 killer.empty() ? std::string()
+                                                : ", mostly to '" + killer + "'",
+                                 static_cast<uint32>(CATCH_UP_STANDDOWN_SECONDS / 60));
+
+                        // REFUSED AS WELL AS ENDED. The walk is not the only
+                        // writer of this column, and only the refusal survives
+                        // the other one re-arming it; the argument is on
+                        // ErrandDeathLimits::cooloffSeconds and is unchanged.
+                        _travelAims.Refuse(name, target);
+                        // AND THE WALK ITSELF IS STOOD DOWN. See
+                        // CATCH_UP_STANDDOWN_SECONDS: without this the next
+                        // party poll reads the same gap over the same ground and
+                        // starts the walk again, at a new aim whose toll is zero.
+                        _catchUpStandDown[name] = std::time(nullptr);
+
+                        // THE LEASE AND THE ENTRY END TOGETHER. EndOneEscort
+                        // clears the column and hands `new rpg` back, which is
+                        // what stops the follower standing under no aim with the
+                        // strategy still on; erasing the entry is what stops
+                        // DriveCatchUp re-Claiming from it. The entry is there by
+                        // construction - `toll.catchUp` IS IsCatchingUp(name),
+                        // read this same poll - and asked for rather than
+                        // assumed, because a crash is not a better answer than a
+                        // release.
+                        //
+                        // `state` IS DEAD AFTER THIS LINE: Release erases the
+                        // errand memory that reference points into, exactly as it
+                        // does on the Release path above, which is why both of
+                        // them continue immediately rather than falling through.
+                        auto const walk = _dungeonEscorts.find(name);
+                        if (walk != _dungeonEscorts.end())
+                        {
+                            EndOneEscort(name, walk->second.granted);
+                            _dungeonEscorts.erase(walk);
+                        }
+                        else
+                            _travelAims.Release(name);
+                        continue;
+                    }
                 }
             }
 
