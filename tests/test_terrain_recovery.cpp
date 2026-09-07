@@ -17,7 +17,9 @@
 #include <cstdlib>
 
 using OverseerDecisions::BelowTerrainNeedsRecovery;
+using OverseerDecisions::FloorUnderfoot;
 using OverseerDecisions::LargeSurfaceMismatchNeedsRecovery;
+using OverseerDecisions::ReadingStandsOnTheGround;
 using OverseerDecisions::TerrainRecoveryMayInspect;
 using OverseerDecisions::TerrainReading;
 using OverseerDecisions::TerrainRecoveryState;
@@ -117,8 +119,32 @@ OverseerDecisions::TerrainRecoveryLimits const LIVE_LIMITS{
     25.f,   // overrideGap, as the adapter passes
     0.5f,   // liftClearance
     600,    // forgetSeconds
-    250.f   // episodeRadius
+    250.f,  // episodeRadius
+    2.f     // footingReach, as the adapter passes (#296)
 };
+
+// THE READING EVERY CASE BELOW USES UNLESS IT SAYS OTHERWISE: no floor was
+// found under the character. That is what the void, a hole in the terrain and
+// a drop of more than fifty yards all look like from the adapter probe, and it
+// is the reading under which every test written before #296 was measured. The
+// new guard declines nothing on it, so those cases still assert exactly what
+// they always asserted.
+TerrainReading Floorless(TerrainReading r)
+{
+    r.floorBelowValid = false;
+    return r;
+}
+
+// A floor at the character own feet, `drop` yards below them. A positive drop
+// puts it under the character; a negative one puts the reported surface just
+// above the reported position, which is what the adapter probe does on level
+// ground because it searches from the feet plus a collision height.
+TerrainReading OnAFloor(TerrainReading r, float drop)
+{
+    r.floorBelowValid = true;
+    r.floorBelowZ = r.z - drop;
+    return r;
+}
 
 // The live incidents all happened at real coordinates, and the episode rules
 // now read them, so the tests name a place. `Here` is one arbitrary spot that
@@ -550,6 +576,205 @@ void TheAbbeyRoofIsNotACharacterUnderStormwind()
     Check("a warning is not a remedy", state.attempts == 0u, true);
 }
 
+// ---------------------------------------------------------------------------
+// #296. THE DETECTOR ONLY EVER LOOKED UP.
+//
+// Every reading above is about the sixty yards over a character head or about
+// what Detour makes of the neighbourhood, and "no local navmesh" went straight
+// to the lift with no second opinion at all. Two lifts on 2026-09-07 prove
+// that branch wrong on its own terms, because the give-up on the very next
+// rung reports the position the lift started from:
+//
+//   03:50:29  'Grug' below the world at map 0 (-3827.9, -831.9, 10.1),
+//             surface z 26.1, no local navmesh; LIFTED to z 26.6
+//   03:50:36  'Grug' STILL below the world at map 0 (-3828.1, -831.9, 10.1),
+//             surface z 26.1
+//
+//   04:26:55  'Grug' below the world at map 0 (-4895.6, -1004.7, 503.9),
+//             surface z 515.0; LIFTED to z 515.5
+//   04:26:57  'Grug' STILL below the world at map 0 (-4895.4, -1004.7, 503.9),
+//             surface z 514.8
+//
+// Same x, same y, same z, to a tenth of a yard, seconds apart. The character
+// was lifted off a floor and fell back onto it. There is ground at its feet in
+// both, and nothing on the reading could see it.
+// ---------------------------------------------------------------------------
+
+void AFloorUnderTheFeetIsReadAsAFloorAndARoofIsNot()
+{
+    Check("a floor half a yard down", FloorUnderfoot(10.1f, 9.6f, true, 2.f),
+          true);
+    Check("a floor exactly at the feet",
+          FloorUnderfoot(10.1f, 10.1f, true, 2.f), true);
+    // The adapter probes from the feet PLUS a collision height, so on level
+    // ground it can answer slightly above the reported position. That is a
+    // floor underfoot and not an absence of one.
+    Check("a surface a foot ABOVE the feet, which the probe can return",
+          FloorUnderfoot(10.1f, 10.4f, true, 2.f), true);
+    // And the bound is on the magnitude for exactly this reason: a surface far
+    // overhead is the false positive this whole rule is about, and a predicate
+    // that accepted one would have re-implemented the bug it fixes.
+    Check("the Ironforge ceiling is not a floor",
+          FloorUnderfoot(503.9f, 551.6f, true, 2.f), false);
+    Check("ground thirty yards down is something it is falling toward",
+          FloorUnderfoot(60.f, 30.f, true, 2.f), false);
+    Check("no floor found is not a floor",
+          FloorUnderfoot(10.1f, 9.6f, false, 2.f), false);
+    Check("a reach of zero is a caller not asking",
+          FloorUnderfoot(10.1f, 9.6f, true, 0.f), false);
+}
+
+void EitherInstrumentIsEnoughAndNeitherIsRequired()
+{
+    TerrainReading const bare = Floorless(Here(10.1f, 26.1f, false));
+    Check("no polygon and no floor is not on the ground",
+          ReadingStandsOnTheGround(bare, 2.f), false);
+    Check("a floor alone is enough",
+          ReadingStandsOnTheGround(OnAFloor(bare, 0.1f), 2.f), true);
+
+    TerrainReading const meshed = Floorless(Here(88.6f, 116.8f, true));
+    Check("a walkable polygon alone is still enough",
+          ReadingStandsOnTheGround(meshed, 2.f), true);
+
+    // #262 stands: a polygon nobody can step off is not ground. With no floor
+    // under it this is still the pocket beside the Wailing Caverns ramp.
+    TerrainReading pocket = Floorless(Here(44.97f, 79.4f, true));
+    pocket.footingHolds = false;
+    Check("a polygon no direction can be walked off is not ground",
+          ReadingStandsOnTheGround(pocket, 2.f), false);
+}
+
+// 03:50:29. No local navmesh, sixteen yards under something, and a floor at
+// its feet. Before #296 this was a lift.
+//
+// AND THE ANSWER IS SILENCE, NOT A WARNING, which is not a weaker result. A
+// gap under the 25-yard override on a character that is on the ground has
+// never held the condition at all - that is what the Detour branch has always
+// done with the same reading, and the give-up sentence exists for the ones
+// large enough to be worth a person going to look. The property under test is
+// the one the deaths care about: nothing is moved.
+void TheLiftThatFellStraightBackOntoItsOwnFloorIsDeclined()
+{
+    TerrainReading const there =
+        Here(10.1f, 26.1f, false, 0, -3827.9f, -831.9f);
+    TerrainRecoveryState before;
+    CheckRemedy("03:50:29 as it was read, with no floor probe at all",
+                TerrainRecoveryStep(before, Floorless(there), LIVE_LIMITS, 0)
+                    .remedy,
+                TerrainRemedy::LiftToSurface);
+
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v =
+        TerrainRecoveryStep(state, OnAFloor(there, 0.1f), LIVE_LIMITS, 0);
+    Check("03:50:29, a floor at its feet: nothing is moved",
+          v.remedy != TerrainRemedy::LiftToSurface, true);
+    CheckRemedy("and a sixteen-yard gap on the ground is not worth a line",
+                v.remedy, TerrainRemedy::Nothing);
+    // A reading that does not hold spends no rung, so a character that really
+    // does fall through the world a minute later still gets the whole ladder.
+    Check("and it spends no rung", state.attempts == 0u, true);
+}
+
+// 04:26:55, inside Ironforge, eleven yards under the ceiling.
+void TheIronforgeFloorIsNotACharacterUnderIronforge()
+{
+    TerrainReading const there =
+        Here(503.9f, 515.0f, false, 0, -4895.6f, -1004.7f);
+    TerrainRecoveryState before;
+    CheckRemedy("04:26:55 as it was read",
+                TerrainRecoveryStep(before, Floorless(there), LIVE_LIMITS, 0)
+                    .remedy,
+                TerrainRemedy::LiftToSurface);
+
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v =
+        TerrainRecoveryStep(state, OnAFloor(there, 0.0f), LIVE_LIMITS, 0);
+    Check("04:26:55, standing on the Ironforge floor: nothing is moved",
+          v.remedy != TerrainRemedy::LiftToSurface, true);
+    Check("and it spends no rung", state.attempts == 0u, true);
+}
+
+// 04:05:19, a Stormwind street fifty-two yards under something. This one is
+// past the override, so it IS worth a line, and it is the case #262 could not
+// hold: Detour reported a polygon, no bearing out of it passed the footing
+// fan, and the override lifted the character anyway.
+//
+//   04:05:19  'Grog' below the world at map 0 (-8626.1, -143.9, 86.4),
+//             surface z 138.9 (52.5 up), a local polygon, but no direction out
+//             of here holds (#262); LIFTED straight up to z 139.4
+//
+// A floor at its feet settles it: the thing fifty-two yards up is a roof.
+void TheStormwindStreetUnderABridgeIsSaidOutLoudAndNotLifted()
+{
+    TerrainReading there = Here(86.4f, 138.9f, true, 0, -8626.1f, -143.9f);
+    there.footingHolds = false;
+
+    TerrainRecoveryState before;
+    CheckRemedy("04:05:19 as it was read, the override beating #262",
+                TerrainRecoveryStep(before, Floorless(there), LIVE_LIMITS, 0)
+                    .remedy,
+                TerrainRemedy::LiftToSurface);
+
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v =
+        TerrainRecoveryStep(state, OnAFloor(there, 0.2f), LIVE_LIMITS, 0);
+    CheckRemedy("04:05:19, a floor at its feet under a bridge", v.remedy,
+                TerrainRemedy::GiveUp);
+    Check("and nothing is moved", v.remedy != TerrainRemedy::LiftToSurface,
+          true);
+    // The same rule the Detour answer follows: a warning is not a remedy.
+    Check("a warning does not spend the lift rung", state.attempts == 0u, true);
+}
+
+// THE OTHER HALF, AND THE ONE THAT MATTERS MORE. This guard is only worth
+// having if it still lets a real fall be recovered, so the case it must NOT
+// take is a character genuinely under the world with nothing beneath it.
+//
+//   03:56:49  'Grug' below the world at map 0 (-4776.7, -901.7, 427.7),
+//             surface z 483.2 (55.4 up), no local navmesh; LIFTED to z 483.7
+//
+// 427.7 is seventy-five yards below the Ironforge floor. The probe finds no
+// floor in reach, so the reading declines nothing and the ladder runs.
+void ACharacterWithNothingUnderItStillGetsItsLift()
+{
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
+        state, Floorless(Here(427.7f, 483.2f, false, 0, -4776.7f, -901.7f)),
+        LIVE_LIMITS, 0);
+    CheckRemedy("03:56:49, genuinely below the world", v.remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckNear("lifted to the surface at its own x and y", v.liftZ, 483.7f);
+}
+
+// AND A FLOOR IT IS ALREADY FALLING PAST IS NOT A FLOOR IT IS STANDING ON.
+// The reach is a stride on purpose: a guard that reached far enough to find
+// the ground a falling character is heading for would decline every recovery
+// there has ever been.
+void GroundFarBelowDoesNotDeclineARecovery()
+{
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
+        state, OnAFloor(Here(60.f, 95.f, false, 0, -9058.3f, -45.4f), 30.f),
+        LIVE_LIMITS, 0);
+    CheckRemedy("the original city incident, with terrain thirty yards down",
+                v.remedy, TerrainRemedy::LiftToSurface);
+}
+
+// A ZERO REACH IS THE PRE-#296 BEHAVIOUR, and it has to be writable for the
+// same reason a zero forget window is: a caller turning the guard off should
+// have to say so rather than discover it.
+void AZeroFootingReachIsTheOldBehaviourAndSaysSo()
+{
+    OverseerDecisions::TerrainRecoveryLimits before = LIVE_LIMITS;
+    before.footingReach = 0.f;
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
+        state, OnAFloor(Here(10.1f, 26.1f, false, 0, -3827.9f, -831.9f), 0.1f),
+        before, 0);
+    CheckRemedy("with the guard off, the floor is invisible and it lifts",
+                v.remedy, TerrainRemedy::LiftToSurface);
+}
+
 // THE INVARIANT, ASKED THE WAY THE INCIDENT ASKS IT. The adapter turns a
 // verdict into a position: a lift keeps the map, the x and the y and changes
 // only z; anything else changes nothing. Drive the ladder through the whole
@@ -633,6 +858,15 @@ int main()
     TheBarrensLadderEndsInAGiveUpAndNotAnOcean();
     TheAbbeyRoofIsNotACharacterUnderStormwind();
     NoRecoveryMayEverChangeAMap();
+
+    AFloorUnderTheFeetIsReadAsAFloorAndARoofIsNot();
+    EitherInstrumentIsEnoughAndNeitherIsRequired();
+    TheLiftThatFellStraightBackOntoItsOwnFloorIsDeclined();
+    TheIronforgeFloorIsNotACharacterUnderIronforge();
+    TheStormwindStreetUnderABridgeIsSaidOutLoudAndNotLifted();
+    ACharacterWithNothingUnderItStillGetsItsLift();
+    GroundFarBelowDoesNotDeclineARecovery();
+    AZeroFootingReachIsTheOldBehaviourAndSaysSo();
 
     if (failures)
     {
