@@ -232,6 +232,38 @@ void ARateIsNeverMeasuredAcrossAGapItDidNotWatch()
     CheckZ("at the feet", back.z, 100.f);
 }
 
+// A GAP FORGETS WHERE, NOT ONLY THAT. `seen` alone is enough for the rule as
+// written; leaving a real height behind it is a loaded gun for the next reader,
+// because a stale pair is the one input that makes this rule lie and it lies by
+// inventing a fall. The sentinel is absurdly LOW on purpose: measured against
+// it any real position reads as an enormous climb, which is not a fall, so a
+// mistake here lets the guard run rather than standing it down.
+void AGapForgetsTheHeightAndNotOnlyTheFactOfIt()
+{
+    FallBaselineState state;
+    Poll(state, 900.f, 12000);
+    CheckZ("a real height is remembered while it is watching", state.lastSeenZ, 900.f);
+
+    FallBaselineStep(state, false, false, 900.f, 12001, LIMITS);
+    Check("the gap forgets that it knew", state.seen, false);
+    CheckZ("and forgets the height too", state.lastSeenZ,
+           OverseerDecisions::FALL_BASELINE_NO_POSITION);
+    Check("and the clock with it", state.seenAt == 0, true);
+
+    // The direction is the safety property. Even if some future reader trusted
+    // lastSeenZ without checking `seen`, this cannot be read as a fall.
+    float const wouldBeDropped =
+        OverseerDecisions::FALL_BASELINE_NO_POSITION - 100.f;
+    Check("the sentinel can only ever read as a climb, never a fall",
+          wouldBeDropped < 0.f, true);
+
+    // A fresh state carries the same sentinel, so a character's very first poll
+    // is in the same safe position as one after a gap.
+    FallBaselineState fresh;
+    CheckZ("a fresh state starts there too", fresh.lastSeenZ,
+           OverseerDecisions::FALL_BASELINE_NO_POSITION);
+}
+
 // The very first poll has nothing to measure against and must still act, or a
 // character would never get a baseline until its second poll.
 void TheFirstPollHasNoReferenceAndStillActs()
@@ -290,6 +322,7 @@ int main()
     TheAuraGateStandsItDown();
     TheStatesWithNoOpinionAreTheSixThatAreNotFlags();
     ARateIsNeverMeasuredAcrossAGapItDidNotWatch();
+    AGapForgetsTheHeightAndNotOnlyTheFactOfIt();
     TheFirstPollHasNoReferenceAndStillActs();
     TheServersOwnHeightGoesBackEvenWhenItRises();
     RecordingALiftDoesNotChangeTheVerdict();

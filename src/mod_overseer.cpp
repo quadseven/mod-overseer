@@ -12175,12 +12175,55 @@ private:
                 // it costs: the mask was 16, FALL_GUARD_FALLING, on every
                 // phantom death, age 0 or 1 second, while the character stood
                 // still at full health.
+                // THE TWO POINTER LOOKUPS ARE ASKED ONCE, HERE, AND
+                // CANNOT TAKE THE POLL WITH THEM. This is the poll that does
+                // the healing and the poll the production signal is read from,
+                // so a throw in it would put the guard out and leave the column
+                // quiet in a way that reads exactly like nothing happening.
+                //
+                // WIDER THAN THE LINE THE REVIEW NAMED, on purpose. The mask
+                // build below was the line cited, but these same two calls feed
+                // the GATE as well, and a throw there would stop the guard
+                // before it ever ran rather than merely stop it being recorded.
+                // Guarding only the mask would have left the worse half open.
+                //
+                // UNKNOWN READS AS "NOT ON ONE", so the guard RUNS. The failure
+                // this whole change exists to stop is the guard not running, so
+                // an unknown that stood it down would reproduce the bug rather
+                // than contain it. The worst this default can do is hand the
+                // core the character's own z while it stands on a boat, which
+                // is where the character is.
+                bool onTransport = false;
+                bool inVehicle = false;
+                try
+                {
+                    onTransport = bot->GetTransport() != nullptr;
+                    inVehicle = bot->GetVehicle() != nullptr;
+                    _fallBaselineReadFailed.erase(LowerName(name));
+                }
+                catch (std::exception const& e)
+                {
+                    // SAID ONCE PER OUTAGE, not once per poll: this runs every
+                    // second for every character, and a fault that repeats is
+                    // one line rather than five a second. Cleared when the
+                    // reading comes back, so a second episode says so again.
+                    bool& said = _fallBaselineReadFailed[LowerName(name)];
+                    if (!said)
+                        LOG_ERROR("module.overseer",
+                                  "overseer: '{}' - could not read transport or "
+                                  "vehicle state ({}); the fall baseline guard "
+                                  "is treating it as neither and carrying on, "
+                                  "because a guard that stands down on an "
+                                  "unknown is the bug it exists to fix (#291)",
+                                  name, e.what());
+                    said = true;
+                }
+
                 bool const guardMayInspect =
                     OverseerDecisions::FallBaselineMayInspect(
                         bot->IsAlive(), bot->IsBeingTeleported(),
-                        bot->IsInFlight(), bot->IsInWater(),
-                        bot->GetTransport() != nullptr,
-                        bot->GetVehicle() != nullptr);
+                        bot->IsInFlight(), bot->IsInWater(), onTransport,
+                        inVehicle);
 
                 // EXACTLY WHAT Player::HandleFall CONSULTS before it charges
                 // (Player.cpp:14187-14189). The core does not refuse to charge
@@ -12218,7 +12261,7 @@ private:
                 uint16 standDown = OverseerDecisions::FallGuardStandDownMask(
                     bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
                     bot->IsFlying(), bot->IsFalling(), bot->IsInWater(),
-                    bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr);
+                    onTransport, inVehicle);
                 if (coreWouldNotCharge)
                     standDown |= OverseerDecisions::FALL_GUARD_NO_CHARGE;
                 if (guardMayInspect && !coreWouldNotCharge && !held.rebase)
@@ -24664,6 +24707,13 @@ private:
     // feeds does not branch on what is in here. The rule is
     // OverseerDecisions::FallBaselineStep, tested without a world.
     std::map<std::string, OverseerDecisions::FallBaselineState> _fallBaseline;
+
+    // WHETHER THE TRANSPORT AND VEHICLE READS HAVE ALREADY BEEN REPORTED AS
+    // UNAVAILABLE for a character, so a fault that repeats every second costs
+    // one log line rather than five a second. Erased when the reading comes
+    // back, so a second outage says so again. Keyed, scoped and lost on a
+    // restart like the maps above it; losing it costs one repeated line.
+    std::map<std::string, bool> _fallBaselineReadFailed;
 
     uint32 _eventTimer = 0;
     uint32 _deathTimer = 0;

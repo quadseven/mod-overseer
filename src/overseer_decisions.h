@@ -3689,6 +3689,25 @@ KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
 // THAT MAKES THE CALLER'S POLL CADENCE PART OF THIS RULE. A poll slower than
 // 1.18 seconds could let a chargeable fall through, and that would be a change
 // to this decision and not only to a timer.
+// NO POSITION AT ALL, as a number no map can produce.
+//
+// The rule below measures a fall from two positions one second apart, so a
+// STALE pair is the one input that can make it lie, and it would lie in the
+// direction of inventing a fall and standing the guard down - which is the
+// exact failure the guard exists to fix. `seen` already gates that, and this
+// is the belt to its braces: when the guard has no opinion it forgets WHERE
+// the character was as well as THAT it knew, so a reader who someday trusts
+// `lastSeenZ` without checking `seen` gets an absurd answer rather than a
+// plausible one.
+//
+// ABSURDLY LOW RATHER THAN ZERO, and the direction is the point. Measured
+// against this, any real position reads as an enormous CLIMB, which is not a
+// fall, so the guard runs. A stale high reference would read as an enormous
+// drop, which is a fall, so the guard would stand down. Only one of those two
+// mistakes is safe, and this is it. Zero, which is a plausible height in most
+// maps, is neither.
+constexpr float FALL_BASELINE_NO_POSITION = -1000000.0f;
+
 struct FallBaselineState
 {
     // Whether this module has ever put a height under this character, and
@@ -3706,7 +3725,7 @@ struct FallBaselineState
     // because a fall spanning several polls has to be measurable across all of
     // them rather than only the first.
     bool seen{false};
-    float lastSeenZ{0.f};
+    float lastSeenZ{FALL_BASELINE_NO_POSITION};
     time_t seenAt{0};
 };
 

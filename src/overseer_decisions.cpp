@@ -3374,7 +3374,17 @@ FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
         // The next poll must not measure a rate across a gap it did not watch:
         // a character that spent ten seconds on a boat has not fallen the
         // difference. Forgetting the reference is the honest answer.
+        //
+        // AND FORGET THE POSITION TOO, not only the fact of having one. `seen`
+        // alone is enough for the rule as written, and leaving a real height
+        // behind it is a loaded gun for the next reader: a stale pair is the
+        // one input that makes this rule lie, and it lies by inventing a fall
+        // and standing the guard down, which is the failure the guard exists
+        // to fix. The sentinel reads as an enormous climb instead, which is
+        // not a fall, so the worst a mistake here can do is let the guard run.
         state.seen = false;
+        state.lastSeenZ = FALL_BASELINE_NO_POSITION;
+        state.seenAt = 0;
     }
 
     // NOTHING TO SAY. Kept rather than forgotten, so the poll after a landing
