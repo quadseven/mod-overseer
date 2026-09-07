@@ -3224,6 +3224,25 @@ public:
         return _state[name];
     }
 
+    // WHAT THIS CHARACTER'S ERRAND IS, READ WITHOUT CREATING ONE (#289). The
+    // same string as `_state[name].target`, which is the column as DriveTravel
+    // last saw it, and empty for a character with no errand in flight.
+    //
+    // CONST AND NON-CREATING ON PURPOSE. StateFor above default-constructs,
+    // which is right for the one caller that is about to fill the record in and
+    // wrong for every reader: the party poll asks this about every follower
+    // every time it runs, and a reader that left a state entry behind for each
+    // of them would quietly resurrect the errand memory Release exists to
+    // destroy, backstop clock and all.
+    //
+    // AT MOST ONE TRAVEL POLL BEHIND THE TABLE, exactly as Claim's own comment
+    // says of `_state`, and that is the trade this accepts.
+    std::string TargetFor(std::string const& name) const
+    {
+        auto const it = _state.find(name);
+        return it == _state.end() ? std::string() : it->second.target;
+    }
+
     // DID A DUNGEON RUN ISSUE THIS ERRAND? Asked of the target as well as the
     // name, so a run staging aim that has since been replaced by somebody
     // else's errand for the same character does not answer for it.
@@ -4681,13 +4700,23 @@ private:
             // crash, a leadership change or an unforeseen `return` can skip.
             // Also catches an old leader demoted mid-run, who carries it in his
             // own right until he stops being the leader.
+            //
+            // AND IT IS THE HAND-BACK FOR A CUT-OFF FOLLOWER'S OWN ERRAND
+            // (#289). A follower on a different map from its leader may hold
+            // the strategy for an errand that needs nobody but itself, and
+            // nothing sweeps that lease, because THIS is the sweep: the errand
+            // ends, the column clears, MaySteerItself goes false, and the next
+            // poll takes the strategy back through this exact path. The
+            // paragraph above is already the argument for a backstop on its own
+            // clock; this is one more thing it covers rather than a second
+            // mechanism to write and forget.
             if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
-                !IsEscorted(p->GetName()))
+                !MaySteerItself(p->GetName()))
             {
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' follows but carries `new rpg` with no escort "
-                         "asking for it - taking it back, because a follower that travels "
-                         "on its own is the scatter, not the family",
+                         "overseer: '{}' follows but carries `new rpg` with no escort and "
+                         "no errand of its own asking for it - taking it back, because a "
+                         "follower that travels on its own is the scatter, not the family",
                          p->GetName());
                 botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
                 if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
@@ -9686,6 +9715,48 @@ private:
         return it != _dungeonEscorts.end() && it->second.catchUp;
     }
 
+    // IS THIS FOLLOWER CUT OFF FROM ITS LEADER RIGHT NOW? (#289)
+    //
+    // `_partySplitSaid` was written to ration a log line and it is now the
+    // module's memory of the CONDITION as well, which is a promotion worth
+    // saying out loud rather than leaving a reader to infer from the name. It
+    // carries an entry for exactly the followers DriveCatchUp last read as
+    // split: SayPartySplit inserts one on the poll a split is first seen, and
+    // DriveCatchUp erases it before anything else it does the moment the two
+    // maps agree again. So membership IS "split", and the two readings cannot
+    // drift apart, because there is one writer.
+    //
+    // ONE PARTY POLL BEHIND AT WORST, AND ONLY IN THE SAFE DIRECTION. The strip
+    // in KeepRosterFollowing runs earlier in the same loop than that erase, so
+    // a family that has just reunited keeps its lease for one more poll. A
+    // lease held one poll too long ends by itself on the next one; a lease
+    // refused one poll too early is a follower that stops walking mid-errand.
+    bool SplitFromLeader(std::string const& name) const
+    {
+        return _partySplitSaid.find(name) != _partySplitSaid.end();
+    }
+
+    // MAY THIS CHARACTER STEER ITSELF? The one predicate the three gates that
+    // used to ask `IsEscorted` ask instead, so they cannot disagree about it -
+    // the same discipline CanBeSentToNpc already keeps for its own two callers,
+    // and for the same reason: a character granted by one gate and refused by
+    // another is a character holding `new rpg` that nothing will ever use.
+    //
+    // TWO WAYS IN, AND THEY ARE DIFFERENT THINGS. An ESCORT is somebody else
+    // asking for this character to be somewhere - a run's doorway, a staging
+    // point, a catch-up walk - and it is handed back by that somebody's sweep.
+    // The second is this character's OWN errand while it is cut off from its
+    // leader, and nothing sweeps that one because nothing has to: the errand
+    // ends, the column clears, this goes false, and the backstop in
+    // KeepRosterFollowing takes the strategy back on its next poll. See
+    // SplitErrand in overseer_decisions.h for which errands qualify and why.
+    bool MaySteerItself(std::string const& name) const
+    {
+        return IsEscorted(name) ||
+               (SplitFromLeader(name) &&
+                OverseerDecisions::ErrandRunsAlone(_travelAims.TargetFor(name)));
+    }
+
     // Ask for a member to be walked to `aim`, and say so once. Idempotent: a
     // re-ask while the same aim is in flight is what every poll of a crossing
     // does, and TravelAimBook::Claim already refuses to disturb a walk it is
@@ -9828,9 +9899,13 @@ private:
                   "PARTY IS SPLIT ACROSS TWO MAPS AND NOTHING IN THIS MODULE CAN REJOIN "
                   "IT. `follow` cannot cross a map, this catch-up walk has nowhere on "
                   "this map to aim at, and an `at:` aim cannot name a coordinate on "
-                  "another one, so this follower stands still until somebody moves it. "
-                  "Every errand that needs the family in one place is blocked for it "
-                  "until then (#241)",
+                  "another one, so nothing in this module can walk this follower to "
+                  "anybody until somebody moves it. Following, a catch-up walk, an "
+                  "escort and a dungeon run are blocked for it until then. AN ERRAND IT "
+                  "CAN RUN ALONE ON THIS MAP IS NOT: it may still be sent to an "
+                  "innkeeper, a vendor, a repairer or a trainer under its own aim, and "
+                  "binding at an innkeeper here is what stops the next death dragging "
+                  "it back across the ocean (#241, #289)",
                   name, here, leader->GetName(), there);
     }
 
@@ -10425,7 +10500,16 @@ private:
         //    cannot yet act on. A quest aim written over the top in that window
         //    would be a second drive steering a character a run is holding at a
         //    door.
-        if (!travelTarget.empty() && (CanBeSentToNpc(botAI) || IsEscorted(name)))
+        //
+        //    AND SO DOES A FOLLOWER CUT OFF FROM ITS LEADER (#289), for the
+        //    same reason and in the same window: its lease is granted by
+        //    DriveTravel at the instant it issues the walk too, so between the
+        //    errand being written and that walk there is a poll in which it
+        //    holds an aim it cannot yet act on. Letting the quest drive take
+        //    the wheel there would aim it at a quest objective instead of the
+        //    innkeeper it was sent to, which for a split follower is the one
+        //    errand that would end the split.
+        if (!travelTarget.empty() && (CanBeSentToNpc(botAI) || MaySteerItself(name)))
             return true;
 
         // 2. THE ERRAND HAS JUST ENDED, and the hand-back must not land on the
@@ -10603,6 +10687,19 @@ private:
             // section above for why those two things cannot be separated.
             bool const escorted = IsEscorted(name);
 
+            // ...AND UNLESS IT IS CUT OFF FROM ITS LEADER ON AN ERRAND IT CAN
+            // RUN ALONE (#289). A follower on a different map from its leader
+            // cannot arrive by following anybody, so the refusal below has no
+            // remedy to offer it, and the cohesion that refusal protects is
+            // already gone. See MaySteerItself and SplitErrand.
+            //
+            // KEPT AS A SECOND FLAG RATHER THAN FOLDED INTO `escorted`, because
+            // the two differ in exactly one place and that place matters: an
+            // escort HOLDS its character at the far end until a sweep releases
+            // it, and this errand ends on arrival like every other errand does.
+            // The arrival branch below therefore stays asked of `escorted`.
+            bool const steersItself = MaySteerItself(name);
+
             // THE DEATH-RATE BREAKER. AGENTS.md has asked for this in words
             // since #78 and nothing ever counted: "watch the death table while
             // it walks. If deaths exceed roughly three in five minutes, clear
@@ -10713,15 +10810,28 @@ private:
                 }
             }
 
-            if (!CanBeSentToNpc(botAI) && !escorted)
+            if (!CanBeSentToNpc(botAI) && !steersItself)
             {
                 if (!state.arrived)
                 {
                     state.arrived = true;  // "said already", not "got there"
+                    // AND THE ADVICE HAS TO BE TRUE OF THE CHARACTER IT IS
+                    // GIVEN TO (#289). "Aim the leader instead" is the whole
+                    // remedy for a follower in formation and a dead end for one
+                    // on another map, which will arrive by following nobody.
+                    // The only errand that still reaches this refusal while
+                    // split is a point aim, so the second half says what would
+                    // work instead of repeating what cannot.
                     LOG_INFO("module.overseer",
                              "overseer: '{}' was sent to '{}' but does not carry `new rpg` - "
-                             "nothing walks it anywhere. Followers travel by following the "
-                             "leader; aim the leader instead", name, target);
+                             "nothing walks it anywhere. {}", name, target,
+                             SplitFromLeader(name)
+                                 ? "It is cut off from its leader, so it will not arrive by "
+                                   "following either, and this aim names a place chosen for "
+                                   "a party it cannot reach. Send it to an NPC on its own "
+                                   "map instead (#289)"
+                                 : "Followers travel by following the leader; aim the "
+                                   "leader instead");
                 }
                 continue;
             }
@@ -11205,7 +11315,7 @@ private:
             // before the aim is written leaves a window in which a follower
             // wanders off instead of walking to the door. Granting it here
             // leaves no such window: the status is never IDLE for a tick.
-            if (escorted && !CanBeSentToNpc(botAI))
+            if (steersItself && !CanBeSentToNpc(botAI))
             {
                 botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
                 if (!CanBeSentToNpc(botAI))
@@ -11215,16 +11325,33 @@ private:
                     // it will never walk to, which is the state the whole run
                     // exists to stop mistaking for a working one.
                     LOG_ERROR("module.overseer",
-                              "overseer: '{}' is being escorted to '{}' but `new rpg` would "
-                              "not go on - nothing will walk it there",
+                              "overseer: '{}' is being walked to '{}' under its own aim but "
+                              "`new rpg` would not go on - nothing will walk it there",
                               name, target);
                     continue;
                 }
-                NoteEscortGranted(name);
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' takes the wheel from `follow` for its escort to "
-                         "'{}' - handed back when the run stops wanting it there",
-                         name, target);
+                // ONLY AN ESCORT IS RECORDED AS ONE (#289). NoteEscortGranted
+                // marks the lease EndOneEscort hands back, and a cut-off
+                // follower's own errand has no escort entry to mark: its
+                // hand-back is the backstop in KeepRosterFollowing, which fires
+                // the moment the errand clears. Two leases, two hand-backs, and
+                // each said in its own words so a reader of the log can tell
+                // which one is running.
+                if (escorted)
+                {
+                    NoteEscortGranted(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' takes the wheel from `follow` for its escort to "
+                             "'{}' - handed back when the run stops wanting it there",
+                             name, target);
+                }
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is cut off from its leader, so it takes the "
+                             "wheel from `follow` and walks to '{}' under its own aim - an "
+                             "errand on its own map needs nobody, and standing still was "
+                             "the only alternative. Handed back when the errand ends (#289)",
+                             name, target);
             }
 
             // patches/mod-playerbots/0005-wander-npc-can-be-aimed.patch adds this

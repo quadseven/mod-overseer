@@ -3087,6 +3087,95 @@ FollowGap ReadFollowGap(bool sameMap, float distance2d,
 // has not stopped walking, it has nowhere to walk.
 bool FollowGapIsBehind(FollowGap gap);
 
+// --------------------- what a follower cut off from its leader may do (#289) --
+//
+// THE BLOCK THAT WAS TOO WIDE. `follow` cannot cross a map, the catch-up walk
+// has nowhere on this map to aim at, and an `at:` aim cannot name a coordinate
+// on another one, so a follower on a different map from its leader stands still
+// until somebody moves it. All of that is true and none of it changes here.
+//
+// WHAT WAS ALSO TRUE AND SHOULD NOT HAVE BEEN: the same follower could not walk
+// to an innkeeper. Measured on the dev realm 2026-09-07, with three of five
+// characters on the continent their dungeon is on and the leader on the other:
+//
+//   00:16:28 INFO 'Grog' was sent to 'innkeeper' but does not carry `new rpg` -
+//                 nothing walks it anywhere. Followers travel by following the
+//                 leader; aim the leader instead
+//
+// and, on the polls where the strategy was put on by hand, granted at 00:18:04
+// and taken back nine seconds later:
+//
+//   00:18:13 WARN 'Grog' follows but carries `new rpg` with no escort asking
+//                 for it - taking it back
+//
+// The errand refused there is the one that ENDS the split. All five of them
+// bind at one point in the starting zone on the wrong continent, 0.68 yards
+// apart, so every death drags the three who are already in the right place back
+// across an ocean. A character walked to an innkeeper and bound there stops
+// being dragged. It was blocked precisely when it was most needed.
+//
+// AND THE REFUSAL'S OWN REMEDY DOES NOT EXIST FOR IT. "Aim the leader instead"
+// is true for a follower in formation, which arrives by following. Aiming the
+// leader of a SPLIT party moves the leader, on the other map, and `follow`
+// cannot cross a map (FollowActions.cpp:285). The advice names the one thing
+// that cannot work.
+//
+// THERE IS NOTHING LEFT TO PRESERVE. The reason a follower may not steer itself
+// is cohesion - five characters each free-roaming is the 937-yard scatter that
+// taking `new rpg` off the followers cured - and a follower on another map has
+// no cohesion to lose. It is not in formation, it is not healing or tanking for
+// anybody, and `follow` is not moving it. It is standing still.
+//
+// SO THE QUESTION IS ABOUT THE ERRAND AND NOT ABOUT THE CHARACTER, and it is
+// answered from the aim string alone, because that string already says which
+// kind it is. Reachability is not the discriminator and never was: every target
+// this module can resolve is on the character's own map by construction -
+// ResolveTravelTarget refuses an `at:` whose map is not the character's,
+// refuses a `trigger:` on another map, and skips every spawn with
+// `spawn.mapId != mapId`. What separates the two kinds is whether the
+// destination was chosen relative to the rest of the family.
+//
+//   * A POINT - `at:<map>:<x>,<y>,<z>` or `trigger:<id>` - is this module's own
+//     coordination vocabulary and nothing outside it writes one. The catch-up
+//     walk aims at where the LEADER stands, the dungeon approach aims at a
+//     doorway, the staging barrier aims at a point picked for the party. Every
+//     one of them is exactly what a split makes impossible.
+//   * ANYTHING ELSE is a role keyword ("innkeeper", "repair", "vendor",
+//     "banker", "profession trainer", ...) or a bare creature entry, and it
+//     names a thing this character deals with by itself.
+//
+// ARRIVING IS ALL A TRAVEL ERRAND DOES, which is what makes the second bullet
+// hold for the whole keyword list rather than most of it. The transaction at
+// the far end is a separate command every time, so the two keywords that sound
+// like they need other people do not: signing a guild charter at a `petitioner`
+// is its own command, and a `flight master` is resolved against this
+// character's own map and own team.
+//
+// FAIL CLOSED ON THE SHAPE IT CANNOT READ. An empty column is not an errand.
+// A point aim is refused even though SOME point aims would in fact be walkable,
+// an `at:` naming this character's own map being one: the narrower answer is
+// the one that cannot let a split follower walk off under an aim the run
+// coordinator meant for a party.
+enum class SplitErrand : std::uint8_t
+{
+    // No errand at all: the column is empty.
+    Nothing,
+    // A place chosen relative to the rest of the family, and so out of reach in
+    // the only sense that matters here.
+    NeedsTheFamily,
+    // An NPC on this character's own map, dealt with alone.
+    SelfContained,
+};
+
+char const* SplitErrandName(SplitErrand errand);
+
+SplitErrand ReadSplitErrand(std::string const& target);
+
+// The form the call sites ask, so "may this follower steer itself" reads as a
+// question about the errand rather than as a comparison against an enumerator.
+// Three of them ask it and they must never disagree.
+bool ErrandRunsAlone(std::string const& target);
+
 // ------------------------------------- crossing a map boundary (#241, #158) --
 //
 // THE FAMILY CANNOT WALK BETWEEN CONTINENTS, AND THAT IS CORRECT. Every aim
