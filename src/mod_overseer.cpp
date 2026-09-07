@@ -2499,6 +2499,42 @@ struct RecoveryMark
     uint8 prevRung = 0;   // and before it, so a repeat is visible as a climb
     time_t at = 0;        // 0 = this module has never moved this character
 };
+
+// WHY THE FALL BASELINE GUARD DECLINED, ON THE LAST POLL THAT LOOKED (#281).
+//
+// #266's invariant is deployed and phantom fall deaths continued. The guard
+// declines only on `!mayInspect || falling`, it is asked ABOVE the recovery's
+// own stand-down and outside the episode cooldown, and it polls once a second
+// - so a guard that ran cannot leave the core's baseline more than one second
+// of movement from the character's feet. The measured deaths need it 69 or
+// more yards away, two of them with a descent of exactly zero. Both cannot be
+// true, so it was not called. Correct and not running looks exactly like
+// called and wrong, and this is what tells them apart.
+//
+// SAMPLED EVERY POLL, INCLUDING THE POLLS THAT DECLINE NOTHING, because "the
+// guard ran and the baseline was still stale" would refute the whole diagnosis
+// and has to be able to appear. `at` of 0 means this module has never looked
+// at this character, which is not the same as looking and finding nothing -
+// see OverseerDecisions::FallGuardStandDownMask for why those are kept apart.
+//
+// This is a diagnostic. Nothing reads it back and no decision consults it.
+struct StandDownMark
+{
+    uint16 mask = 0;   // OverseerDecisions::FallGuardStandDown bits, 0 = it ran
+    time_t at = 0;     // 0 = never sampled, which the row carries as -1
+};
+std::mutex g_standDownMutex;
+std::map<std::string, StandDownMark> g_standDownMarks;  // key: lowercased name
+
+// Called from DriveBelowTerrainRecovery, world thread only, like
+// RememberRecovery beside it. Memory only; RecordDeath reads it.
+void RememberStandDown(std::string const& name, uint16 mask)
+{
+    std::lock_guard<std::mutex> guard(g_standDownMutex);
+    StandDownMark& m = g_standDownMarks[LowerName(name)];
+    m.mask = mask;
+    m.at = std::time(nullptr);
+}
 std::mutex g_recoveryMutex;
 std::map<std::string, RecoveryMark> g_recoveryMarks;  // key: lowercased name
 
@@ -2674,6 +2710,13 @@ struct PendingDeath
     int16 recoveryRung = -1;       // -1 = this module has never moved it
     int16 recoveryPrevRung = -1;
     int32 recoverySeconds = -1;
+    // WHY THE FALL BASELINE GUARD DECLINED on the last poll that looked at
+    // this character, and how long ago that poll was (#281). -1 in either is
+    // NOT SAMPLED and never a reading: a mask of 0 means the guard ran, which
+    // is a finding, and folding "never looked" into it is the mistake that
+    // left 223 kill-plane deaths unexplained.
+    int32 fallGuardStandDown = -1;
+    int32 fallGuardSeconds = -1;
 };
 std::mutex g_deathMutex;
 std::vector<PendingDeath> g_deathQueue;
@@ -2760,6 +2803,19 @@ void RecordDeath(Player* player)
             d.recoveryRung = static_cast<int16>(it->second.rung);
             d.recoveryPrevRung = static_cast<int16>(it->second.prevRung);
             d.recoverySeconds = static_cast<int32>(now - it->second.at);
+        }
+    }
+
+    // AND WHY THE FALL BASELINE GUARD DECLINED, beside it and read the same
+    // way (#281). `at` of 0 means the terrain drive has never looked at this
+    // character, which stays -1 rather than becoming a mask of zero.
+    {
+        std::lock_guard<std::mutex> guard(g_standDownMutex);
+        auto it = g_standDownMarks.find(lower);
+        if (it != g_standDownMarks.end() && it->second.at)
+        {
+            d.fallGuardStandDown = static_cast<int32>(it->second.mask);
+            d.fallGuardSeconds = static_cast<int32>(now - it->second.at);
         }
     }
 
@@ -11951,6 +12007,17 @@ private:
                 if (held.rebase)
                     bot->SetFallInformation(GameTime::GetGameTime().count(),
                                             held.z);
+
+                // AND WRITE DOWN WHY IT DECLINED, EVERY POLL (#281). Same
+                // eight answers, in the same order, so the mask and the
+                // stand-down above cannot drift apart. This changes no
+                // decision: it is recorded and nothing reads it back.
+                RememberStandDown(name, OverseerDecisions::FallGuardStandDownMask(
+                                            bot->IsAlive(), bot->IsBeingTeleported(),
+                                            bot->IsInFlight(), bot->IsFlying(),
+                                            bot->IsFalling(), bot->IsInWater(),
+                                            bot->GetTransport() != nullptr,
+                                            bot->GetVehicle() != nullptr));
             }
 
             if (!mayInspect)
@@ -18453,7 +18520,8 @@ private:
               "driver, movement_generator, in_combat, last_seen_seconds, "
               "last_pos_x, last_pos_y, last_pos_z, yards_fallen, "
               "leader_seen, leader_map, leader_pos_x, leader_pos_y, leader_pos_z, "
-              "recovery_rung, recovery_prev_rung, recovery_seconds) VALUES ";
+              "recovery_rung, recovery_prev_rung, recovery_seconds, "
+              "fall_guard_standdown, fall_guard_seconds) VALUES ";
         bool first = true;
         for (PendingDeath const& d : batch)
         {
@@ -18489,6 +18557,8 @@ private:
                << ',' << static_cast<int32>(d.recoveryRung)
                << ',' << static_cast<int32>(d.recoveryPrevRung)
                << ',' << d.recoverySeconds
+               << ',' << d.fallGuardStandDown
+               << ',' << d.fallGuardSeconds
                << ')';
         }
         CharacterDatabase.Execute(ss.str().c_str());
@@ -18506,7 +18576,7 @@ private:
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
                  "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
-                 "fell {:.1f} yards which is {}, in combat {})",
+                 "fell {:.1f} yards which is {}, in combat {}; fall guard {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
                  batch.back().killerType, batch.back().killerName,
@@ -18516,7 +18586,14 @@ private:
                      OverseerDecisions::AccountForFall(batch.back().yardsFallen)),
                  batch.back().inCombat < 0
                      ? "unsampled"
-                     : (batch.back().inCombat ? "yes" : "no"));
+                     : (batch.back().inCombat ? "yes" : "no"),
+                 // #281. The column keeps the number so it can be grouped and
+                 // counted; this is the same answer in words, so a reader
+                 // watching the log sees it without a lookup table.
+                 batch.back().fallGuardStandDown < 0
+                     ? std::string("unsampled")
+                     : OverseerDecisions::FallGuardStandDownNames(
+                           static_cast<uint16_t>(batch.back().fallGuardStandDown)));
     }
 
     // ------------------------------------------------------- outcome --
