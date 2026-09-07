@@ -129,6 +129,27 @@ bool StandingOnTheGround(bool hasLocalNavmesh, bool footingHolds)
     return hasLocalNavmesh && footingHolds;
 }
 
+bool FloorUnderfoot(float currentZ, float floorBelowZ, bool floorBelowValid,
+                    float reach)
+{
+    if (!floorBelowValid || reach <= 0.f)
+        return false;
+    // Folded by hand rather than with std::fabs, for the reason WithinRadius
+    // below squares its distance: this file includes its own header and
+    // nothing else, and that property is half of what the decisions workflow
+    // is testing.
+    float const separation = currentZ - floorBelowZ;
+    float const magnitude = separation < 0.f ? -separation : separation;
+    return magnitude <= reach;
+}
+
+bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach)
+{
+    return StandingOnTheGround(reading.hasLocalNavmesh, reading.footingHolds) ||
+           FloorUnderfoot(reading.z, reading.floorBelowZ,
+                          reading.floorBelowValid, footingReach);
+}
+
 namespace
 {
 
@@ -179,14 +200,20 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         state = TerrainRecoveryState{};
     }
 
-    // WHAT "IT HAS A POLYGON" IS WORTH, decided once and then read three
-    // times, because all three readings are the same question. A polygon
+    // WHETHER THIS CHARACTER IS ON THE GROUND, decided once and then read
+    // three times, because all three readings are the same question. A polygon
     // Detour found inside its search box is only evidence about this
     // character's feet while some direction out of here can be walked; see
     // StandingOnTheGround for the pocket beside the Wailing Caverns ramp where
     // it was not, and where believing it held four characters for 24 minutes.
+    //
+    // AND A FLOOR UNDER THE FEET IS THE OTHER WAY TO BE ON THE GROUND (#296).
+    // Detour saying nothing is not evidence a character is airborne - it is
+    // what Detour says inside a city interior and anywhere the mesh is thin -
+    // and until this second instrument existed that branch had no guard at all
+    // and went straight to the lift. See ReadingStandsOnTheGround.
     bool const onTheGround =
-        StandingOnTheGround(reading.hasLocalNavmesh, reading.footingHolds);
+        ReadingStandsOnTheGround(reading, limits.footingReach);
 
     // The condition is exactly what the adapter asked before: the two
     // predicates above, unchanged, in the same order. Only what happens next

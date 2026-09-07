@@ -386,13 +386,29 @@ constexpr float FALL_BASELINE_FALLING_YARDS_PER_SECOND = 7.0f;
 constexpr OverseerDecisions::FallBaselineLimits FALL_BASELINE_LIMITS{
     FALL_BASELINE_FALLING_YARDS_PER_SECOND};
 
+// HOW CLOSE THE GROUND HAS TO BE TO COUNT AS THE FLOOR THIS CHARACTER IS
+// STANDING ON (#296). Two yards, which is the same stride
+// TERRAIN_RECOVERY_PATH_YARDS uses and for the same reason: wide enough to
+// absorb the gap between a character's own z and the surface under it on any
+// ground it can walk, and far too short to reach a lower plane it is falling
+// toward. A guard that reached far enough to find the ground a falling
+// character is heading for would decline every recovery there has ever been.
+//
+// AND IT IS ASKED IN BOTH DIRECTIONS. Map::GetWaterOrGroundLevel searches
+// downward from the feet PLUS the character's collision height, so on level
+// ground it can answer a fraction ABOVE the reported position; the pure
+// predicate folds the sign, so that reads as a floor underfoot rather than as
+// no answer. Two yards is comfortably over any collision height in the game.
+constexpr float TERRAIN_RECOVERY_FOOTING_REACH_YARDS = 2.0f;
+
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
 constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_GAP_YARDS, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS,
     TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS,
-    TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS};
+    TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS,
+    TERRAIN_RECOVERY_FOOTING_REACH_YARDS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -12361,8 +12377,28 @@ private:
             // the case #262 is about.
             reading.footingHolds =
                 !reading.hasLocalNavmesh || AnyDirectionHolds(bot);
-            bool const onTheGround = OverseerDecisions::StandingOnTheGround(
-                reading.hasLocalNavmesh, reading.footingHolds);
+            // AND THE ONE READING THAT LOOKS DOWN (#296). Everything above
+            // this line is about the sixty yards over the character's head or
+            // about what Detour makes of the neighbourhood, and neither can
+            // tell a character standing under a roof from one falling through
+            // the void. SurfaceAt is the same probe GroundHolds already walks
+            // on four bearings, asked once about the character's own feet, and
+            // it already answers false for both invalid-height sentinels.
+            //
+            // BEHIND THE SAME gapCouldMatter GATE as the Detour probes, for
+            // the same reason: a reading that cannot possibly require recovery
+            // does not need a second opinion about why not.
+            reading.floorBelowValid =
+                gapCouldMatter &&
+                SurfaceAt(bot, reading.x, reading.y, reading.z,
+                          reading.floorBelowZ);
+            // ONE FOLD, READ IN TWO PLACES. The step below asks the same
+            // question to choose the remedy and this line asks it to choose
+            // which give-up sentence to log; before #296 each computed it
+            // separately from the same two arguments, which is one place too
+            // many the moment there is a third input.
+            bool const onTheGround = OverseerDecisions::ReadingStandsOnTheGround(
+                reading, TERRAIN_RECOVERY_LIMITS.footingReach);
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
@@ -12393,6 +12429,18 @@ private:
                 reading.hasLocalNavmesh
                     ? "a local polygon, but no direction out of here holds (#262)"
                     : "no local navmesh";
+
+            // WHICH INSTRUMENT SAID SO, in the words of the reading that said
+            // it (#296). "local navmesh PRESENT" was true of every one of
+            // these lines until the floor probe existed and is now true of
+            // only some, and a sentence that names the wrong instrument sends
+            // the next reader to the wrong file.
+            char const* const standing =
+                OverseerDecisions::StandingOnTheGround(reading.hasLocalNavmesh,
+                                                       reading.footingHolds)
+                    ? "Detour found walkable ground there, local navmesh PRESENT"
+                    : "Detour's answer did not carry this, but there is a floor "
+                      "within a stride of its own feet (#296)";
 
             uint16 const fromMap = static_cast<uint16>(bot->GetMapId());
             float const fromX = bot->GetPositionX();
@@ -12489,16 +12537,17 @@ private:
                 {
                     LOG_ERROR("module.overseer",
                               "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
-                              "reads {:.1f} yards under a surface at z {:.1f}, but Detour "
-                              "finds walkable ground at its own feet (local navmesh "
-                              "PRESENT), so it is STANDING ON THE GROUND and what the "
+                              "reads {:.1f} yards under a surface at z {:.1f}, but this "
+                              "module finds ground at its own feet ({}), so it is "
+                              "STANDING ON THE GROUND and what the "
                               "probe found overhead is a roof, a bridge or a tower floor. "
                               "NOTHING IS BEING MOVED: this is the detector being wrong "
                               "about this place, not a character below the world (#188). "
                               "Aim job='{}' quest={} travel='{}'. Staying quiet about this "
                               "character for {}s",
                               name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                              surface - fromZ, surface, job, questAim, travelTarget,
+                              surface - fromZ, surface, standing, job, questAim,
+                              travelTarget,
                               static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS));
                     continue;
                 }

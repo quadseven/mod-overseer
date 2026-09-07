@@ -299,6 +299,25 @@ struct TerrainReading
     // "on the ground" and never toward it. A caller that does not measure it
     // gets exactly the behaviour this drive had before #262.
     bool footingHolds{true};
+    // AND THE FLOOR, WHICH IS THE ONE THING NOTHING HERE EVER ASKED ABOUT
+    // (#296). Every other reading on this struct is about the neighbourhood or
+    // about the sixty yards OVERHEAD. `surfaceAboveZ` cannot be the floor a
+    // character fell through, because the adapter probes downward from sixty
+    // yards up and stops at the first thing it hits: a bridge deck, an abbey
+    // roof, an Ironforge ceiling. This is the ground level at the character's
+    // OWN x and y, looked for downward from its own feet, and it is the only
+    // reading that can tell a character standing under a roof apart from one
+    // falling through the void. They are identical in every other field.
+    float floorBelowZ{0.f};
+    // Separate from the number for the same reason `surfaceValid` is: the core
+    // has two invalid-height sentinels and neither is a position.
+    //
+    // FALSE BY DEFAULT, and that default preserves the old behaviour exactly.
+    // "No floor found" is what the edge of the world looks like from here, so
+    // an unmeasured reading declines nothing and the ladder runs as it did
+    // before #296. The asymmetry is the same one StandingOnTheGround argues
+    // for: this can only ever take a lift AWAY, never authorize one.
+    bool floorBelowValid{false};
 };
 
 struct TerrainRecoveryVerdict
@@ -341,6 +360,13 @@ struct TerrainRecoveryLimits
     // and leaves only the map check, which is a defensible choice and has to
     // be written.
     float episodeRadius{0.f};
+    // HOW CLOSE A FLOOR HAS TO BE TO COUNT AS THE ONE THIS CHARACTER IS
+    // STANDING ON (#296). A stride, not a search: the question is "are my feet
+    // on something", and a floor two yards down is something a character is
+    // standing on while one thirty yards down is something it is falling
+    // toward. ZERO DISABLES IT and restores the behaviour this drive had
+    // before #296, which is why it is a limit and not a literal.
+    float footingReach{0.f};
 };
 
 // What one character's terrain recovery remembers between polls. Kept inside
@@ -431,6 +457,58 @@ struct TerrainRecoveryState
 // one that carries weight, so the only correction worth making is to the true
 // answer.
 bool StandingOnTheGround(bool hasLocalNavmesh, bool footingHolds);
+
+// IS THERE A FLOOR UNDER THIS CHARACTER'S FEET?
+//
+// THE QUESTION THE DETECTOR NEVER ASKED (#296). Everything else this rule
+// reads is about what is over the character's head or what Detour thinks of
+// the neighbourhood, and neither can separate the two cases that matter: a
+// character standing on the Ironforge floor under a ceiling forty yards up
+// produces the same numbers as a character falling through the void with the
+// same ceiling above it. A floor at its feet separates them, and nothing else
+// on the reading does.
+//
+// MEASURED, TWICE, IN THE MODULE'S OWN LOG. On 2026-09-07 a character was
+// lifted from map 0 (-3827.9, -831.9, z 10.1) to z 26.6 and was back at
+// (-3828.1, -831.9, z 10.1) seven seconds later; and lifted from
+// (-4895.6, -1004.7, z 503.9) to z 515.5 and was back at
+// (-4895.4, -1004.7, z 503.9) two seconds later. Same x, same y, same z, to a
+// tenth of a yard. It fell back onto the floor it had been standing on the
+// whole time, and the module recorded that as "a lift at these coordinates did
+// not stick" and climbed its ladder.
+//
+// BOUNDED IN BOTH DIRECTIONS, and the upper bound is not paranoia. The
+// adapter's probe searches downward from slightly above the feet, so it can
+// return a surface a fraction ABOVE them; that is still a floor underfoot. It
+// must never be able to return one far above them, because "a surface a long
+// way over my head" is the exact false positive this whole issue is about, and
+// a predicate that accepted it would have re-implemented the bug it is here to
+// fix. So the test is on the magnitude of the separation and not on its sign.
+//
+// AND AN INVALID READING IS NOT A FLOOR. `floorBelowValid` false means the
+// probe found nothing in reach, which is what the edge of the world, a hole in
+// the terrain and a fall of more than fifty yards all look like from here.
+// Every one of those is a character this rule should still be allowed to help,
+// so an unanswered question declines nothing. A reach of zero says the caller
+// is not asking, which is the pre-#296 behaviour and has to be writable.
+bool FloorUnderfoot(float currentZ, float floorBelowZ, bool floorBelowValid,
+                    float reach);
+
+// THE WHOLE "IS IT ON THE GROUND" QUESTION, FROM ONE READING.
+//
+// Two independent instruments, folded once so they cannot be folded twice
+// differently. Detour's answer about the neighbourhood, corrected by the
+// footing fan (#262), OR a floor at the character's own feet (#296). Either is
+// sufficient; neither is necessary; and both can only ever say "on the
+// ground", never "not".
+//
+// IT EXISTS SO THE ADAPTER AND THE STEP CANNOT DRIFT. Both need this answer -
+// the step to choose the remedy, the adapter to choose which of the two
+// give-up sentences to log - and before #296 each computed it from the same
+// two arguments in two places. Two places is one place too many the moment
+// there is a third input, which is exactly how a guard ends up enforced on one
+// path and not the other.
+bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach);
 
 // One poll, for one character. Reads the two predicates above for the
 // condition and this character's own history for the remedy, and updates that
