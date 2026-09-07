@@ -2760,6 +2760,22 @@ bool ErrandRunsAlone(std::string const& target)
     return ReadSplitErrand(target) == SplitErrand::SelfContained;
 }
 
+bool WalkAlreadyInFlight(bool reissueForced, bool canAct, bool atSameDestination)
+{
+    // The watchdog's override first, because it is the one input that means
+    // "whatever you think you can see, issue it anyway".
+    if (reissueForced)
+        return false;
+    // Then the one this was written for. Asked BEFORE the destination, not
+    // because the order changes the answer but because it is the reading a
+    // future caller is most likely to forget it has to take: the destination
+    // comes out of the bot's own state, and that state outlives the strategy
+    // that was acting on it.
+    if (!canAct)
+        return false;
+    return atSameDestination;
+}
+
 char const* CrossingLegName(CrossingLeg leg)
 {
     switch (leg)

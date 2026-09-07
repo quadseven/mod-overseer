@@ -3043,6 +3043,17 @@ public:
         // reason: a refusal is about the journey being taken, not about the
         // character taking it.
         bool groundSaid{false};
+        // HAS THIS ERRAND EVER HELD THE WHEEL? Set the first time `new rpg` is
+        // granted for it, so a later poll that finds the strategy missing can
+        // tell "not started yet" from "something took it" (#293). Scoped to the
+        // errand like every flag above it: a new errand has held nothing.
+        bool heldTheWheel{false};
+        // ...AND HAS THAT THEFT BEEN REPORTED? Once per errand, not once per
+        // poll. The writer that takes the strategy runs on its own cycle and
+        // will take it again, and the drive will take it back again; a line
+        // every fifteen seconds would bury the one that matters, which is the
+        // first.
+        bool stolenSaid{false};
         // "RE-ISSUE THIS WALK EVEN THOUGH IT LOOKS LIKE THE ONE ALREADY IN
         // FLIGHT" (#164). Set by the staging watchdog's second rung and spent
         // by DriveTravel's re-issue guard, which otherwise does exactly the
@@ -10696,6 +10707,10 @@ private:
                 state.flightSaid = false;
                 state.stuckSaid = false;
                 state.groundSaid = false;
+                // A new errand has not held the wheel and has had nothing
+                // taken from it (#293).
+                state.heldTheWheel = false;
+                state.stolenSaid = false;
                 // A new errand is a new ratchet: nothing measured yet, and the
                 // clock starts now rather than carrying the last errand's over.
                 state.progress.best = 0.f;
@@ -11312,13 +11327,26 @@ private:
                 continue;
             }
 
-            // `!state.reissue` FIRST, because the staging watchdog's second
-            // rung is precisely the case this guard is wrong about (#164): a
-            // character whose `rpgInfo` still names a destination it has stopped
-            // walking to reads here as already walking to it, and the guard
-            // then refuses to hand it the walk again forever. The flag is spent
-            // below, at the instant the walk is issued.
-            if (!state.reissue && botAI->rpgInfo.GetStatus() == RPG_WANDER_NPC)  // NewRpgInfo.h:99
+            // IS THE WALK THIS POLL WOULD ISSUE ALREADY RUNNING? Three
+            // readings, taken here and weighed by OverseerDecisions::
+            // WalkAlreadyInFlight, which carries the argument for each.
+            //
+            // `state.reissue` is the staging watchdog's second rung, which is
+            // one case this guard is wrong about (#164): a character whose
+            // `rpgInfo` still names a destination it has stopped walking to
+            // reads here as already walking to it. The flag is spent below, at
+            // the instant the walk is issued.
+            //
+            // CanBeSentToNpc IS THE OTHER, AND IT IS THE SAME SHAPE (#293).
+            // Taking `new rpg` off a bot stops the walk and does not touch the
+            // rpg state that names it, so a character somebody else revoked
+            // mid-errand reads as walking and is skipped past the grant forty
+            // lines below - which is the only thing that could give the walk
+            // back. Measured: ten minutes of silence and three yards of
+            // movement, on a live errand, from one `nc -new rpg` written by
+            // something that does not know an errand exists.
+            bool atSameDestination = false;
+            if (botAI->rpgInfo.GetStatus() == RPG_WANDER_NPC)  // NewRpgInfo.h:99
             {
                 if (NewRpgInfo::WanderNpc const* wander =
                         std::get_if<NewRpgInfo::WanderNpc>(&botAI->rpgInfo.data))
@@ -11342,10 +11370,24 @@ private:
                     float const ddx = wander->pos.GetPositionX() - aimAt.GetPositionX();
                     float const ddy = wander->pos.GetPositionY() - aimAt.GetPositionY();
                     bool const samePlace = entry || (ddx * ddx + ddy * ddy) <= 1.0f;
-                    if (wander->npcEntry == entry && samePlace)
-                        continue;
+                    atSameDestination = wander->npcEntry == entry && samePlace;
                 }
             }
+            if (OverseerDecisions::WalkAlreadyInFlight(
+                    state.reissue, CanBeSentToNpc(botAI), atSameDestination))
+                continue;
+
+            // WHETHER THIS ERRAND HAS EVER HAD A CHARACTER ABLE TO ACT ON
+            // IT, however the strategy got there (#293). The supervisor
+            // outside this module GRANTS `new rpg` on its own cycle as well as
+            // revoking it, so an errand can run for minutes without this drive
+            // having granted anything - and a theft from that errand is the
+            // same theft and earns the same line. Read before the grant below
+            // rather than after it, so a first grant is not mistaken for a
+            // re-grant; the grant sets it too, for the theft that lands between
+            // this poll and the next.
+            if (CanBeSentToNpc(botAI))
+                state.heldTheWheel = true;
 
             // THE ESCORT'S GRANT, AND IT IS HERE FOR A REASON THAT WILL NOT
             // SURVIVE BEING MOVED (#122). A freshly granted `new rpg` starts at
@@ -11371,6 +11413,29 @@ private:
                               name, target);
                     continue;
                 }
+                // AND A RE-GRANT IS NOT A GRANT (#293). Reaching here with
+                // this errand having already held the wheel means something
+                // outside this drive took the strategy off a character that was
+                // walking under it. The drive takes it straight back, every
+                // poll, for as long as the errand lasts - the same standing
+                // assertion AssertTravelFocus above makes in the other
+                // direction, for the same reason and against the same writer.
+                // Said once per errand, and said with somewhere to look: the
+                // command queue records who asked and under what source.
+                if (state.heldTheWheel && !state.stolenSaid)
+                {
+                    state.stolenSaid = true;
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' lost `new rpg` in the middle of its errand to "
+                             "'{}' - this drive did not take it, so something outside it "
+                             "did, and without it nothing walks this character anywhere. "
+                             "Taken back, and it will be taken back every poll until the "
+                             "errand ends. Look for a row in overseer_command with this "
+                             "character as its target to see who asked (#293)",
+                             name, target);
+                }
+                state.heldTheWheel = true;
+
                 // ONLY AN ESCORT IS RECORDED AS ONE (#289). NoteEscortGranted
                 // marks the lease EndOneEscort hands back, and a cut-off
                 // follower's own errand has no escort entry to mark: its
