@@ -3338,32 +3338,89 @@ void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now)
     state.at = now;
 }
 
-FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
-                                     bool falling, float standingZ, time_t now)
+bool FallBaselineMayInspect(bool alive, bool teleporting, bool inFlight,
+                            bool inWater, bool onTransport, bool inVehicle)
 {
-    // A REAL FALL IS NOT THIS MODULE'S TO ERASE, and this line is the whole of
-    // what stands between the rule and a roster that cannot be hurt by a drop.
-    // Everything this exists to prevent is charged while the character is
-    // STANDING, so declining here costs the fix nothing. The header carries
-    // why one second of poll is enough to catch every fall that could ever be
-    // charged for.
-    //
-    // The other stood-down states go the same way and for the same reason. A
-    // taxi, a flying mount, a boat, a vehicle, a swimmer, a character mid
-    // teleport or a dead one is somewhere this module has no opinion about,
-    // and "I am not entitled to an opinion right now" is not grounds for
-    // rewriting anything.
-    //
-    // The state is deliberately KEPT rather than forgotten here, so that the
-    // poll after a landing resumes - by which time HandleFall has already
-    // charged for the drop it was owed.
-    if (!mayInspect || falling)
+    // A dead character cannot be charged for a fall, a character mid teleport
+    // has no settled position to write down, and a taxi, a boat, a vehicle or
+    // a swimmer is somewhere this module has no opinion about. None of these
+    // is a flag that has been observed lying.
+    return alive && !teleporting && !inFlight && !inWater && !onTransport &&
+           !inVehicle;
+}
+
+FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
+                                     bool coreWouldNotCharge, float standingZ,
+                                     time_t now, FallBaselineLimits const& limits)
+{
+    // THE MEASUREMENT IS TAKEN WHATEVER HAPPENS NEXT, and before any early
+    // return, because a fall that spans several polls has to stay measurable
+    // across all of them. Forgetting where the character was during the polls
+    // this declines would make the second poll of a fall look like the first.
+    bool const measurable = state.seen && now > state.seenAt;
+    float const dropped = measurable ? state.lastSeenZ - standingZ : 0.f;
+    float const seconds =
+        measurable ? static_cast<float>(now - state.seenAt) : 0.f;
+
+    bool const positionKnown = mayInspect;
+    if (positionKnown)
+    {
+        state.seen = true;
+        state.lastSeenZ = standingZ;
+        state.seenAt = now;
+    }
+    else
+    {
+        // The next poll must not measure a rate across a gap it did not watch:
+        // a character that spent ten seconds on a boat has not fallen the
+        // difference. Forgetting the reference is the honest answer.
+        //
+        // AND FORGET THE POSITION TOO, not only the fact of having one. `seen`
+        // alone is enough for the rule as written, and leaving a real height
+        // behind it is a loaded gun for the next reader: a stale pair is the
+        // one input that makes this rule lie, and it lies by inventing a fall
+        // and standing the guard down, which is the failure the guard exists
+        // to fix. The sentinel reads as an enormous climb instead, which is
+        // not a fall, so the worst a mistake here can do is let the guard run.
+        state.seen = false;
+        state.lastSeenZ = FALL_BASELINE_NO_POSITION;
+        state.seenAt = 0;
+    }
+
+    // NOTHING TO SAY. Kept rather than forgotten, so the poll after a landing
+    // resumes with the character's own history intact.
+    if (!mayInspect)
         return FallBaselineVerdict{};
 
-    // Standing. Whatever the core is holding, and whatever wrote it - this
-    // module's own lift, an errand's teleport, or a client packet from a
-    // hillside the character left four minutes ago - the truth is under this
-    // character's feet, and this is the one place that says so.
+    // THE CORE'S OWN GATE, ASKED THE WAY THE CORE ASKS IT. Player::HandleFall
+    // declines to charge on HasHoverAura, HasFeatherFallAura or HasFlyAura and
+    // on nothing else about how the character is moving. When it will not
+    // charge, there is no stale baseline to be afraid of and no reason to
+    // write one.
+    if (coreWouldNotCharge)
+        return FallBaselineVerdict{};
+
+    // A REAL FALL IS NOT THIS MODULE'S TO ERASE, and this is the whole of what
+    // stands between the rule and a roster that cannot be hurt by a drop.
+    //
+    // MEASURED, NOT ASKED. The flag that used to answer this was on while the
+    // character stood still at full health, every poll, on every phantom death
+    // sampled (#281). Two positions a second apart cannot be stuck. A body in
+    // free fall is losing height faster than a body on its feet can, and the
+    // limit sits between the two with margin at both ends - see
+    // FallBaselineLimits for the arithmetic.
+    //
+    // The comparison is written as `dropped > seconds * rate` rather than as a
+    // division so that a zero interval cannot divide, and `measurable` has
+    // already excluded that case anyway.
+    if (measurable && dropped > seconds * limits.fallingYardsPerSecond)
+        return FallBaselineVerdict{};
+
+    // Standing, or walking, or climbing. Whatever the core is holding, and
+    // whatever wrote it - this module's own lift, an errand's teleport, or a
+    // client packet from a hillside the character left four minutes ago - the
+    // truth is under this character's feet, and this is the one place that
+    // says so.
     state.held = true;
     state.z = standingZ;
     state.at = now;

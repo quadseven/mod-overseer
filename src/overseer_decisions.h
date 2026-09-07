@@ -3689,6 +3689,25 @@ KillerKind NameTheKiller(bool hookFired, std::string const& hookType,
 // THAT MAKES THE CALLER'S POLL CADENCE PART OF THIS RULE. A poll slower than
 // 1.18 seconds could let a chargeable fall through, and that would be a change
 // to this decision and not only to a timer.
+// NO POSITION AT ALL, as a number no map can produce.
+//
+// The rule below measures a fall from two positions one second apart, so a
+// STALE pair is the one input that can make it lie, and it would lie in the
+// direction of inventing a fall and standing the guard down - which is the
+// exact failure the guard exists to fix. `seen` already gates that, and this
+// is the belt to its braces: when the guard has no opinion it forgets WHERE
+// the character was as well as THAT it knew, so a reader who someday trusts
+// `lastSeenZ` without checking `seen` gets an absurd answer rather than a
+// plausible one.
+//
+// ABSURDLY LOW RATHER THAN ZERO, and the direction is the point. Measured
+// against this, any real position reads as an enormous CLIMB, which is not a
+// fall, so the guard runs. A stale high reference would read as an enormous
+// drop, which is a fall, so the guard would stand down. Only one of those two
+// mistakes is safe, and this is it. Zero, which is a plausible height in most
+// maps, is neither.
+constexpr float FALL_BASELINE_NO_POSITION = -1000000.0f;
+
 struct FallBaselineState
 {
     // Whether this module has ever put a height under this character, and
@@ -3699,6 +3718,38 @@ struct FallBaselineState
     bool held{false};
     float z{0.f};
     time_t at{0};
+
+    // WHERE THIS CHARACTER STOOD ON THE PREVIOUS POLL, which is how the rule
+    // below tells a fall from a walk without asking a flag. Updated on every
+    // poll that has a position, including the polls that decline to rebase,
+    // because a fall spanning several polls has to be measurable across all of
+    // them rather than only the first.
+    bool seen{false};
+    float lastSeenZ{FALL_BASELINE_NO_POSITION};
+    time_t seenAt{0};
+};
+
+// HOW FAST A CHARACTER HAS TO BE LOSING HEIGHT before this module treats it as
+// a fall in progress rather than a walk downhill.
+//
+// DERIVED, NOT PICKED. The core's gravity is 19.29110527
+// (Movement/Spline/MovementUtil.cpp:24), so a body in free fall covers
+// 0.5 * g * t^2 = 9.65 yards in its first second and more in every second
+// after. A character on its feet is bounded by its run speed, 7 yards per
+// second, times the sine of the steepest slope the navmesh will let it walk,
+// which puts its vertical rate under 5.4. Seven yards per second sits between
+// the two with margin on both sides.
+//
+// WHAT IT COSTS AT THE EDGES, said plainly. A mount at speed down a steep hill
+// can exceed seven, and this will read that as a fall and leave the baseline
+// alone for those polls; the guard resumes the moment the character slows,
+// so the cost is coverage rather than correctness. And a fall caught in its
+// first fraction of a second is below the rate, so the baseline is rebased
+// once at the very top of it: the charge that follows is short by that
+// fraction of a yard and by nothing else.
+struct FallBaselineLimits
+{
+    float fallingYardsPerSecond{0.f};
 };
 
 struct FallBaselineVerdict
@@ -3713,12 +3764,59 @@ struct FallBaselineVerdict
 // module writing down the one height it is certain it is answerable for.
 void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now);
 
+// THE STATES THIS MODULE HAS NO OPINION ABOUT AT ALL, which is
+// TerrainRecoveryMayInspect's list with the two untrustworthy flags removed.
+//
+// It is a separate predicate from TerrainRecoveryMayInspect rather than a
+// reuse of it, and the difference is the whole of #291: the RECOVERY may
+// reasonably decline to move a character whose flags say flying or falling,
+// because moving one is expensive and being wrong about it is worse. The
+// GUARD only ever writes down where the character already is, so the same
+// caution buys it nothing and costs it everything.
+bool FallBaselineMayInspect(bool alive, bool teleporting, bool inFlight,
+                            bool inWater, bool onTransport, bool inVehicle);
+
 // ONE POLL, FOR ONE CHARACTER.
 //
-// `mayInspect` is TerrainRecoveryMayInspect's answer and `falling` is the
-// character's own falling flag. Both are asked again here rather than assumed,
-// because declining in exactly those states is the entire safety of this rule,
-// and a caller that had already filtered them would leave that untested.
+// WHY THIS STOPPED ASKING WHETHER THE CHARACTER IS FALLING (#291). It used to,
+// and the instrument added in #281 caught it: on every phantom death sampled,
+// the stand-down mask was exactly 16, FALL_GUARD_FALLING, with an age of 0 or
+// 1 second. The guard was reached every single poll and declined every single
+// poll, on characters at full health whose measured descent was 1.63 and 1.88
+// yards. The flag was on while the character stood still.
+//
+// It is not merely never cleared, it is RE-SET, and that is measured rather
+// than assumed: `Player::TeleportTo` reduces the movement flags to
+// MOVEMENTFLAG_MASK_HAS_PLAYER_STATUS_OPCODE (UnitDefines.h:423), which drops
+// FALLING, so every graveyard revival clears it - and the recovery drive,
+// which cannot run at all while IsFalling is true, was observed running twice
+// between two masked deaths at 01:41:44 and 01:41:53. Clear then, set again by
+// the next death. A rule that clears the flag once would therefore fix
+// nothing.
+//
+// SO THE GUARD MEASURES THE FALL INSTEAD OF ASKING ABOUT IT. `Unit::IsFalling`
+// is `HasMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR)` or a
+// falling spline (Unit.cpp:15957), and on a roster driven by server-side
+// splines nothing clears the first of those: `EffectMovementGenerator::Finalize`,
+// the generator MoveFall installs, opens with `if (!unit->IsCreature()) return;`.
+// On a normal realm the client's own movement packets clear it. These send
+// none. A number this module takes itself, from two positions one second
+// apart, does not have that problem.
+//
+// AND THE OTHER STAND-DOWN IS NOW THE CORE'S OWN GATE. `coreWouldNotCharge` is
+// `HasHoverAura() || HasFeatherFallAura() || HasFlyAura()`, which is exactly
+// what `Player::HandleFall` consults before charging (Player.cpp:14187-14189).
+// The core does not refuse to charge because a flag says flying; it refuses on
+// those three auras. Asking the same question the charging gate asks is what
+// closes the hole, and it is narrower than what was there before rather than
+// wider: nothing that used to be charged stops being charged.
+//
+// NOTHING IS WEAKENED. A real fall is still left alone, because a real fall is
+// still losing height faster than a walk can and this declines on that
+// measurement. The flag is not consulted in either direction, which also
+// covers the case the flag is wrongly CLEAR during a real descent - and there
+// is a known path that clears it under a live MoveFall spline (#254), so that
+// is not hypothetical either.
 //
 // `standingZ` is where the SERVER believes this character's feet are, which is
 // the right number whichever way the server and the client disagree: if a
@@ -3727,7 +3825,8 @@ void FallBaselineHandedOver(FallBaselineState& state, float z, time_t now);
 // server's stale higher figure is the honest OLD baseline and handing it back
 // changes nothing.
 FallBaselineVerdict FallBaselineStep(FallBaselineState& state, bool mayInspect,
-                                     bool falling, float standingZ, time_t now);
+                                     bool coreWouldNotCharge, float standingZ,
+                                     time_t now, FallBaselineLimits const& limits);
 
 // ------------------------------------------------ the addon language (#269) --
 
@@ -4234,6 +4333,18 @@ enum FallGuardStandDown : uint16_t
     FALL_GUARD_IN_WATER    = 1u << 5,  // Unit::IsInWater
     FALL_GUARD_TRANSPORT   = 1u << 6,  // on a boat or a zeppelin
     FALL_GUARD_VEHICLE     = 1u << 7,  // in a vehicle
+
+    // THE GUARD'S OWN TWO, ADDED WHEN IT STOPPED TRUSTING THE FLAGS (#291).
+    //
+    // Bits 0 to 7 keep the exact meanings they were deployed with, so rows
+    // either side of that change can still be compared. What changed is which
+    // of them DECIDE anything: after #291 the guard declines on bits 0, 1, 2,
+    // 5, 6, 7 and on the two below. Bits 3 and 4, flying and falling, are
+    // still recorded and no longer decline it, because they are the two the
+    // measurement showed cannot be trusted. A reader wanting "did the guard
+    // run" asks whether any bit OTHER than 3 and 4 is set.
+    FALL_GUARD_NO_CHARGE   = 1u << 8,  // an aura the core itself checks: the fall is free
+    FALL_GUARD_DESCENDING  = 1u << 9,  // measured to be losing height fast enough to be a fall
 };
 
 // EVERY REASON THAT IS TRUE, not the first one found. The argument order is
