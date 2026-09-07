@@ -1539,6 +1539,29 @@ bool DungeonRunEnteredTheInstance(std::string const& outcome);
 // again from zero.
 unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst);
 
+// DOES THE CAMPAIGN STOP RATHER THAN OPEN ANOTHER ATTEMPT (#306)?
+//
+// WHY THIS IS A NAMED DECISION AND NOT A `>=` AT THE CALL SITE, WHICH IS THE
+// WHOLE POINT. The comparison was written once, inline, in the branch that
+// decides a campaign's FIRST attempt - and every attempt after the first is
+// decided somewhere else entirely, which never asked. Measured 2026-09-07 on a
+// live realm: seven consecutive attempts that never reached the instance,
+// against a threshold of three, and the stop's own log line absent from the
+// whole of that worldserver's history. The counting above was right and the
+// vocabulary beside it was right; nothing ever put the question. So the rule
+// gets a name and one home, and every gate that opens a run calls it.
+//
+// A ZERO LIMIT IS "DO NOT STOP", NOT "STOP IMMEDIATELY". Zero reaches here only
+// from a caller whose threshold could not be read, and reading an unreadable
+// bound as "every campaign is already over" would end every campaign on a
+// database that cannot answer - the opposite of the direction the run cap
+// already refuses to guess in.
+//
+// `>=` AND NOT `>`: three consecutive failures is the third failure, not the
+// fourth. The count comes from DungeonRunTrailingFailures above, so a streak
+// broken by any run that got inside is already zero by the time it arrives.
+bool DungeonCampaignStopsOnFailures(unsigned trailingFailures, unsigned failureLimit);
+
 // WHERE A CAMPAIGN STANDS ONCE A RUN HAS ENDED.
 //
 // This is arithmetic and it is the part that was got wrong, so it is here where

@@ -994,6 +994,17 @@ unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewe
     return failures;
 }
 
+bool DungeonCampaignStopsOnFailures(unsigned trailingFailures, unsigned failureLimit)
+{
+    // Said first and on its own, because it is the branch a reader doubts: a
+    // limit of zero is a bound that could not be read, and no campaign is
+    // stopped on one.
+    if (!failureLimit)
+        return false;
+
+    return trailingFailures >= failureLimit;
+}
+
 DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
                                                 uint32_t attemptedRunNumber,
                                                 uint32_t runsWanted,
