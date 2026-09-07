@@ -2722,6 +2722,44 @@ bool FollowGapIsBehind(FollowGap gap)
     return gap == FollowGap::Trailing || gap == FollowGap::Stranded;
 }
 
+char const* SplitErrandName(SplitErrand errand)
+{
+    switch (errand)
+    {
+        case SplitErrand::Nothing:        return "nothing";
+        case SplitErrand::NeedsTheFamily: return "needs the family";
+        case SplitErrand::SelfContained:  return "self-contained";
+    }
+    return "nothing";
+}
+
+SplitErrand ReadSplitErrand(std::string const& target)
+{
+    // An empty column is not an errand. Answered first so that neither test
+    // below has to think about the empty string.
+    if (target.empty())
+        return SplitErrand::Nothing;
+    // The two shapes this module writes for itself. `rfind(s, 0) == 0` is the
+    // starts-with this file already uses at every other aim-shape test, kept
+    // the same here so a reader comparing them does not have to check whether
+    // two spellings mean two things.
+    if (target.rfind("at:", 0) == 0 || target.rfind("trigger:", 0) == 0)
+        return SplitErrand::NeedsTheFamily;
+    // A role keyword or a bare creature entry. Deliberately NOT matched against
+    // the keyword table: that table lives in the module beside the NPC flags it
+    // maps onto and is duplicated in the Python bridge, and a third copy here
+    // would be a third thing to keep in step for no gain. An unknown keyword is
+    // already refused by ResolveTravelTarget, which is where "there is no such
+    // role" belongs; this decision is only about whether the destination was
+    // picked relative to the family.
+    return SplitErrand::SelfContained;
+}
+
+bool ErrandRunsAlone(std::string const& target)
+{
+    return ReadSplitErrand(target) == SplitErrand::SelfContained;
+}
+
 char const* CrossingLegName(CrossingLeg leg)
 {
     switch (leg)
