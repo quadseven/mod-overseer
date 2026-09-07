@@ -3176,6 +3176,58 @@ SplitErrand ReadSplitErrand(std::string const& target);
 // Three of them ask it and they must never disagree.
 bool ErrandRunsAlone(std::string const& target);
 
+// ------------------------- is the walk this drive would issue already running --
+//
+// THE GUARD THIS ANSWERS FOR, AND THE ONE THING IT USED TO GET WRONG (#293).
+// DriveTravel re-issues a character's walk every poll. It must not do so when
+// the character is already walking to exactly that destination, because
+// ChangeToWanderNpc resets `lastReach` and `startT` and a walk re-issued every
+// fifteen seconds never gets anywhere. So the drive asks the bot's own rpg
+// state whether the walk is in flight, and skips the re-issue when it is.
+//
+// A STRATEGY CAN BE TAKEN OFF A BOT WITHOUT ITS rpgInfo BEING TOUCHED, and that
+// is the hole. Only `new rpg` runs the action that walks a character to an NPC.
+// Take that strategy away and the walk stops instantly, while the rpg state
+// carries on naming the destination it was walking to. Read through that state
+// alone, a character standing perfectly still reads as one in mid-stride.
+//
+// SOMETHING DOES TAKE IT, ROUTINELY. Measured on the dev realm 2026-09-07: a
+// follower cut off from its leader was granted the strategy for its errand at
+// 02:06:49, and at 02:08:05 the goal supervisor, which runs outside this module
+// and writes a whole strategy set per character on its own cycle, wrote
+// `nc -new rpg` and `nc +follow` for it in one batch:
+//
+//   02:08:08 INFO command 92255 ('nc -new rpg' for 'Og') applied
+//   02:08:10 INFO command 92256 ('nc +follow' for 'Og') applied
+//
+// After which the travel drive said NOTHING about that character for ten
+// minutes. Not a refusal, not a re-aim, not a release. It was online, at full
+// health, on the errand's own map, with the errand column still set, three
+// yards from where it had stopped. The grant that would have fixed it sits
+// forty lines BELOW the guard, and the guard's silent skip never reached it.
+//
+// THE GRANT CANNOT MOVE, which is what makes the guard the thing that changes.
+// A freshly granted `new rpg` starts at RPG_IDLE and the next tick turns
+// RPG_IDLE into a randomly chosen status, two of which pick a point out of the
+// world and walk to it. The grant has to be the statement before the aim is
+// written or it opens a window for the character to wander off. So the drive
+// must reach the grant, and the guard must stop claiming there is a walk to
+// protect when there is not.
+//
+// HENCE THE THIRD INPUT, AND IT IS THE WHOLE FIX. "Already walking there" is
+// three facts and not two: the destination has to match, the walk must not have
+// been forced open by the staging watchdog, and the character has to be able to
+// act on the walk at all. A character that cannot act on it has no walk in
+// flight, whatever its own state says.
+//
+// FAIL OPEN, NOT CLOSED, WHICH IS THE OPPOSITE OF SplitErrand ABOVE, and the
+// asymmetry is deliberate. Getting this wrong in the "no walk in flight"
+// direction costs one redundant re-issue, which resets a clock. Getting it
+// wrong in the other direction costs a character that stands still until the
+// twenty-minute backstop gives up on it, and says nothing at all while it does.
+// Those are not the same mistake and the cheap one is the one to make.
+bool WalkAlreadyInFlight(bool reissueForced, bool canAct, bool atSameDestination);
+
 // ------------------------------------- crossing a map boundary (#241, #158) --
 //
 // THE FAMILY CANNOT WALK BETWEEN CONTINENTS, AND THAT IS CORRECT. Every aim
