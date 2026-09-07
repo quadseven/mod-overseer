@@ -366,6 +366,26 @@ constexpr time_t TERRAIN_RECOVERY_FORGET_SECONDS = 600;
 // 43, where it chose the bind point for a scripted fall and ejected the tank.
 constexpr float TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS = 250.0f;
 
+// HOW FAST A CHARACTER HAS TO BE LOSING HEIGHT before the fall baseline guard
+// treats it as a fall in progress and leaves the baseline alone (#291).
+//
+// DERIVED, NOT PICKED. The core's gravity is 19.29110527
+// (Movement/Spline/MovementUtil.cpp:24), so free fall covers 0.5 * g * t^2 =
+// 9.65 yards in its first second and more in every second after. A character
+// on its feet is bounded by its run speed, 7 yards per second, times the sine
+// of the steepest slope the navmesh will let it walk, which puts its vertical
+// rate under 5.4. Seven sits between the two with margin at both ends, and the
+// test computes both bounds rather than asserting them.
+//
+// THIS REPLACED A FLAG, and that is the point. Unit::IsFalling was the input
+// before, and #281's instrument caught it stuck on while characters stood
+// still at full health: mask 16 on every phantom death, age 0 or 1 second.
+// Two positions a second apart cannot be stuck.
+constexpr float FALL_BASELINE_FALLING_YARDS_PER_SECOND = 7.0f;
+
+constexpr OverseerDecisions::FallBaselineLimits FALL_BASELINE_LIMITS{
+    FALL_BASELINE_FALLING_YARDS_PER_SECOND};
+
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
@@ -12147,25 +12167,63 @@ private:
             // slower poll could let one through, so that constant is load
             // bearing for this and not only for the recovery.
             {
+                // THE GUARD ASKS ITS OWN QUESTION NOW, NOT THE RECOVERY'S
+                // (#291). The recovery may reasonably decline to MOVE a
+                // character whose flags say flying or falling. The guard only
+                // ever writes down where the character already is, so the same
+                // caution buys it nothing, and #281's instrument proved what
+                // it costs: the mask was 16, FALL_GUARD_FALLING, on every
+                // phantom death, age 0 or 1 second, while the character stood
+                // still at full health.
+                bool const guardMayInspect =
+                    OverseerDecisions::FallBaselineMayInspect(
+                        bot->IsAlive(), bot->IsBeingTeleported(),
+                        bot->IsInFlight(), bot->IsInWater(),
+                        bot->GetTransport() != nullptr,
+                        bot->GetVehicle() != nullptr);
+
+                // EXACTLY WHAT Player::HandleFall CONSULTS before it charges
+                // (Player.cpp:14187-14189). The core does not refuse to charge
+                // because a movement flag says flying; it refuses on these
+                // three auras. Asking the same question the charging gate asks
+                // is what closes the hole, and it is narrower than the flag it
+                // replaces rather than wider.
+                bool const coreWouldNotCharge = bot->HasHoverAura() ||
+                                                bot->HasFeatherFallAura() ||
+                                                bot->HasFlyAura();
+
                 OverseerDecisions::FallBaselineVerdict const held =
                     OverseerDecisions::FallBaselineStep(
-                        _fallBaseline[LowerName(name)], mayInspect,
-                        bot->IsFalling(), bot->GetPositionZ(),
-                        std::time(nullptr));
+                        _fallBaseline[LowerName(name)], guardMayInspect,
+                        coreWouldNotCharge, bot->GetPositionZ(),
+                        std::time(nullptr), FALL_BASELINE_LIMITS);
                 if (held.rebase)
                     bot->SetFallInformation(GameTime::GetGameTime().count(),
                                             held.z);
 
-                // AND WRITE DOWN WHY IT DECLINED, EVERY POLL (#281). Same
-                // eight answers, in the same order, so the mask and the
-                // stand-down above cannot drift apart. This changes no
-                // decision: it is recorded and nothing reads it back.
-                RememberStandDown(name, OverseerDecisions::FallGuardStandDownMask(
-                                            bot->IsAlive(), bot->IsBeingTeleported(),
-                                            bot->IsInFlight(), bot->IsFlying(),
-                                            bot->IsFalling(), bot->IsInWater(),
-                                            bot->GetTransport() != nullptr,
-                                            bot->GetVehicle() != nullptr));
+                // AND WRITE DOWN WHY IT DECLINED, EVERY POLL (#281, #291).
+                //
+                // Bits 0 to 7 keep the exact meanings they were deployed with,
+                // so rows either side of #291 can still be compared, and that
+                // is why the eight are still asked here in the same order.
+                // What changed is which of them DECIDE anything: flying and
+                // falling are now recorded and no longer decline the guard,
+                // because they are the two the measurement showed cannot be
+                // trusted. The two bits above them are the guard's own
+                // reasons, so "did the guard run" stays answerable from this
+                // one column: it ran unless a bit other than 3 or 4 is set.
+                //
+                // This changes no decision. It is recorded and nothing reads
+                // it back.
+                uint16 standDown = OverseerDecisions::FallGuardStandDownMask(
+                    bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
+                    bot->IsFlying(), bot->IsFalling(), bot->IsInWater(),
+                    bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr);
+                if (coreWouldNotCharge)
+                    standDown |= OverseerDecisions::FALL_GUARD_NO_CHARGE;
+                if (guardMayInspect && !coreWouldNotCharge && !held.rebase)
+                    standDown |= OverseerDecisions::FALL_GUARD_DESCENDING;
+                RememberStandDown(name, standDown);
             }
 
             if (!mayInspect)

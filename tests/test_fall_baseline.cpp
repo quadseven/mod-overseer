@@ -1,27 +1,27 @@
 /*
- * The fall baseline, and putting it back under a character's feet.
+ * The fall baseline, and measuring a fall instead of asking about one.
  *
- * THE LIVE FAILURE THIS PINS. The core charges m_lastFallZ - landingZ on the
- * next landing (Player::HandleFall). A teleport sets that baseline to its
- * destination (Player.cpp:1532, and again on the client's ack at
- * MovementHandler.cpp:321), and the only thing that walks it back down again
- * is UpdateFallInformationIfNeed, which runs on a client movement packet and
- * on nothing else. This roster is moved by server-side splines, which send no
- * packets, so a height written once stays written while the character walks
- * away from it - and HandleFall runs BEFORE UpdateFallInformationIfNeed in the
- * same handler, so the stale figure is spent before anything corrects it.
+ * WHERE THIS GOT TO. #266 deployed the invariant that a character which is not
+ * falling is standing somewhere, and a character that is standing somewhere
+ * owes nothing for having got there. Phantom fall deaths continued. #283 added
+ * an instrument to say why, and it answered on the first sample: the
+ * stand-down mask was 16, FALL_GUARD_FALLING, on every phantom death, with an
+ * age of 0 or 1 second. The guard was reached every poll and declined every
+ * poll, on characters at full health whose measured descent was 1.63 and 1.88
+ * yards. The flag said falling while the character stood still.
  *
- * FOUR DEATHS ON 2026-09-06, all at full health, out of combat, standing:
+ * AND IT IS RE-SET, NOT MERELY NEVER CLEARED. Player::TeleportTo reduces the
+ * movement flags to MOVEMENTFLAG_MASK_HAS_PLAYER_STATUS_OPCODE, which drops
+ * FALLING, so every graveyard revival clears it. The recovery drive, which
+ * cannot run at all while IsFalling is true, was observed running twice
+ * between two masked deaths. Clear then, set again by the next death. Clearing
+ * the flag once would fix nothing.
  *
- *   19:15:22  Bork  died z 65.7   lifted to 157.3   91.6 yards = 1.41x max hp
- *   20:10:13  Ugga  died z 93.37  NEVER LIFTED
- *   20:10:13  Grog  died z 93.47  lifted to 158.8, 52 hp short of killing him
- *   20:10:40  Grug  died z 91.67  lifted to 149.1, 297 hp short
- *
- * The last three each need a baseline near z 162.4, and the party's travel aim
- * was z 162.425. So the lift is one way to leave a stale height and not the
- * only one, and what the four have in common is that the character was
- * STANDING when the core charged it. That is what this rule keys on.
+ * SO THE GUARD MEASURES. Two positions a second apart cannot be stuck. The
+ * core's gravity is 19.29110527, so free fall covers 9.65 yards in its first
+ * second; a character on its feet is bounded by 7 yards per second of run
+ * speed times the sine of the steepest walkable slope, under 5.4. The limit
+ * sits between them.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else.
  */
@@ -32,6 +32,8 @@
 #include <cstdlib>
 
 using OverseerDecisions::FallBaselineHandedOver;
+using OverseerDecisions::FallBaselineLimits;
+using OverseerDecisions::FallBaselineMayInspect;
 using OverseerDecisions::FallBaselineState;
 using OverseerDecisions::FallBaselineStep;
 using OverseerDecisions::FallBaselineVerdict;
@@ -41,15 +43,16 @@ namespace
 
 int failures = 0;
 
+// What the adapter passes. Seven yards per second, between a walk and a fall.
+constexpr FallBaselineLimits LIMITS{7.0f};
+
 // The core's fall arithmetic, from Player.cpp:14173-14175, so this file can
-// price a drop without including anything. It is here to turn "the baseline
-// was wrong by this many yards" into "and this is what it cost".
+// price a drop without including anything.
 constexpr float FALL_DMG_EQU_SLOPE = 0.018f;
 constexpr float FALL_DMG_EQU_INTERCEPT = -0.2426f;
 constexpr float MIN_FALL_DMG_DIST = 13.48f;
 
-// The core's gravity, from Movement/Spline/MovementUtil.cpp:24. Used to show
-// that no chargeable fall fits between two one-second polls.
+// Movement/Spline/MovementUtil.cpp:24.
 constexpr float GRAVITY = 19.29110527f;
 
 float FractionOfMaxHealth(float zDiff)
@@ -78,209 +81,216 @@ void CheckZ(char const* what, float got, float want)
     ++failures;
 }
 
-// Walk a character down from `fromZ` to `toZ` over `polls` one-second polls,
-// standing the whole way, and return the last baseline handed over. This is
-// the shape of every one of the four deaths: driven downhill by a spline, never
-// falling, so the core never hears a packet and never re-bases.
-float WalkDownStanding(FallBaselineState& state, float fromZ, float toZ,
-                       int polls, time_t start)
+// One poll of an ordinary living character on the ground.
+FallBaselineVerdict Poll(FallBaselineState& state, float z, time_t now)
 {
-    float const step = (fromZ - toZ) / static_cast<float>(polls);
-    float standing = fromZ;
-    float handed = fromZ;
-    for (int i = 1; i <= polls; ++i)
-    {
-        standing -= step;
-        FallBaselineVerdict const v =
-            FallBaselineStep(state, true, false, standing, start + i);
-        if (!v.rebase)
-        {
-            std::printf("FAIL poll %d of a standing walk handed nothing over\n", i);
-            ++failures;
-            return handed;
-        }
-        handed = v.z;
-    }
-    return handed;
+    return FallBaselineStep(state, true, false, z, now, LIMITS);
 }
 
-// One case, priced both ways: what the core would have charged with the stale
-// height still standing, and what it charges once the guard has walked the
-// baseline down to the character's feet.
-//
-// `leastCost` is the share of the health bar the unguarded drop must account
-// for. It is 1.0 - a one-shot from full - for three of the four. For Grog it
-// is 0.99, and the missing hit point is real rather than slack: 162.425 down
-// to 93.47 is 68.955 yards, which prices at 785.9 of his 787, one short of
-// killing him outright. His row says seconds_since_full_health=5, so he was
-// last seen at full health five seconds before he died and had taken at least
-// a point of damage by the time the fall was charged. Asserting 1.0 there
-// would be asserting something the evidence does not carry.
-void OneMeasuredDeath(char const* who, float staleZ, float diedZ, float maxHp,
-                      int seconds, float leastCost)
+// THE ROW THAT MOTIVATED THE CHANGE. 01:40:12, Grug, full health 1221/1221,
+// measured descent 1.63 yards, stand-down mask 16, age 1 second. Before #291
+// the flag alone declined the guard and the baseline was never walked down.
+// The flag is not an input any more, so this rebases.
+void AStuckFallingFlagNoLongerDeclinesTheGuard()
 {
-    float const unguarded = staleZ - diedZ;
-    float const cost = FractionOfMaxHealth(unguarded);
-    if (cost < leastCost)
-    {
-        std::printf("FAIL %s: %.2f yards costs %.4f of the bar, wanted >= %.4f\n",
-                    who, unguarded, cost, leastCost);
-        ++failures;
-    }
-    (void)maxHp;
-
     FallBaselineState state;
-    FallBaselineHandedOver(state, staleZ, 1000);
-    float const handed = WalkDownStanding(state, staleZ, diedZ, seconds, 1000);
-    CheckZ(who, handed, diedZ);
-    Check("and the landing is charged nothing at all",
-          FractionOfMaxHealth(handed - diedZ) == 0.f, true);
+    Poll(state, 388.6f, 1000);                     // a first look, sets the reference
+    FallBaselineVerdict const v = Poll(state, 387.0f, 1001);   // 1.63 yards lower
+
+    Check("the guard runs even though the flag says falling", v.rebase, true);
+    CheckZ("and hands over the character's own feet", v.z, 387.0f);
+    Check("1.63 yards in a second is not a fall",
+          1.63f <= LIMITS.fallingYardsPerSecond, true);
 }
 
-// All four, including the one that was never lifted. A guard keyed on the lift
-// would have saved only Bork; this one keys on standing, so it saves all four.
-void TheFourMeasuredDeathsArePricedAtNothing()
+// The 01:40:09 row, the same shape on the other character: 1.88 yards.
+void TheOtherMeasuredRowIsTheSame()
 {
-    OneMeasuredDeath("Bork 19:15:22, lifted to 157.3", 157.3f, 65.7f, 695.f, 208, 1.0f);
-    OneMeasuredDeath("Ugga 20:10:13, never lifted", 162.425f, 93.37f, 832.f, 120, 1.0f);
-    OneMeasuredDeath("Grog 20:10:13, aim not lift", 162.425f, 93.47f, 787.f, 209, 0.99f);
-    OneMeasuredDeath("Grug 20:10:40, aim not lift", 162.425f, 91.67f, 1421.f, 352, 1.0f);
-
-    // Bork's is the one that is exact rather than merely sufficient, and it is
-    // also the only one of the four the lift alone accounts for. The other two
-    // lifts fall short, which is what stopped this being a fix keyed on lifts.
-    Check("the lift height alone one-shot Bork from full health",
-          FractionOfMaxHealth(157.3f - 65.7f) >= 1.f, true);
-    Check("but the lift height could not have killed Grog",
-          FractionOfMaxHealth(158.8f - 93.47f) * 787.f < 787.f, true);
-    Check("nor Grug",
-          FractionOfMaxHealth(149.1f - 91.67f) * 1421.f < 1421.f, true);
+    FallBaselineState state;
+    Poll(state, 398.4f, 2000);
+    FallBaselineVerdict const v = Poll(state, 396.5f, 2001);
+    Check("1.88 yards in a second is not a fall either", v.rebase, true);
+    CheckZ("feet again", v.z, 396.5f);
 }
 
-// The lesson of the 20:10:13 pair, as a rule rather than as a row: a character
-// this module never moved is guarded exactly as one it did. Ugga had no lift
-// behind her and died the same death, so `held` must not gate anything.
-void ACharacterThisModuleNeverMovedIsGuardedTheSame()
-{
-    FallBaselineState never;
-    Check("nothing has been handed over yet", never.held, false);
-
-    FallBaselineVerdict const v = FallBaselineStep(never, true, false, 93.37f, 500);
-    Check("and it is guarded anyway", v.rebase, true);
-    CheckZ("at its own feet", v.z, 93.37f);
-
-    // Priced: without this, the aim height would have killed her outright.
-    Check("which is what the unguarded aim height would have cost her",
-          FractionOfMaxHealth(162.425f - 93.37f) * 832.f >= 832.f, true);
-}
-
-// The exemption that keeps the fix honest. A character that really is falling
-// keeps the baseline it fell from, so the core still charges for the drop.
+// A REAL FALL IS STILL LEFT ALONE, and now for a reason that cannot be stuck.
 void AGenuineFallIsStillCharged()
 {
     FallBaselineState state;
-    FallBaselineStep(state, true, false, 150.f, 1000);   // standing at the top
+    Poll(state, 150.f, 1000);
     CheckZ("the baseline is the lip it walks off", state.z, 150.f);
 
-    for (int i = 1; i <= 4; ++i)
+    // Four seconds of free fall, sampled once a second. Every one of these is
+    // losing height far faster than a walk can.
+    float const during[] = {130.f, 105.f, 75.f, 40.f};
+    time_t t = 1000;
+    for (float z : during)
     {
-        FallBaselineVerdict const v = FallBaselineStep(
-            state, true, true, 150.f - 20.f * static_cast<float>(i), 1000 + i);
+        ++t;
+        FallBaselineVerdict const v = Poll(state, z, t);
         Check("nothing is handed over mid-fall", v.rebase, false);
     }
     CheckZ("the height the fall began from is untouched", state.z, 150.f);
     Check("so the core still prices it as a real fall",
-          FractionOfMaxHealth(150.f - 70.f) > 0.f, true);
+          FractionOfMaxHealth(150.f - 40.f) > 0.f, true);
 
-    FallBaselineVerdict const after = FallBaselineStep(state, true, false, 70.f, 1005);
+    // The poll after the landing resumes, by which time HandleFall has already
+    // charged for the drop it was owed.
+    FallBaselineVerdict const after = Poll(state, 40.f, t + 1);
     Check("and the poll after the landing resumes", after.rebase, true);
-    CheckZ("at the ground it landed on", after.z, 70.f);
+    CheckZ("at the ground it landed on", after.z, 40.f);
 }
 
-// THE SAFETY ARGUMENT, ARITHMETIC RATHER THAN ASSERTED. No fall the core would
-// charge for can begin and end inside one of the caller's one-second polls, so
-// none can be missed while `falling` is the only exemption.
-void NoChargeableFallFitsBetweenTwoPolls()
+// THE LIMIT SITS BETWEEN THE TWO THINGS IT HAS TO SEPARATE, computed rather
+// than asserted.
+void TheLimitSeparatesAWalkFromAFall()
 {
-    float const inOneSecond = 0.5f * GRAVITY * 1.f * 1.f;
-    Check("a body falls under 9.7 yards in its first second",
-          inOneSecond < 9.7f, true);
-    Check("which the core charges nothing for",
-          FractionOfMaxHealth(inOneSecond) == 0.f, true);
-    Check("indeed it is short of the charging floor",
-          inOneSecond < MIN_FALL_DMG_DIST, true);
+    float const freeFallFirstSecond = 0.5f * GRAVITY * 1.f * 1.f;
+    Check("free fall covers more than the limit in its first second",
+          freeFallFirstSecond > LIMITS.fallingYardsPerSecond, true);
+    Check("and that is 9.65 yards",
+          freeFallFirstSecond > 9.6f && freeFallFirstSecond < 9.7f, true);
 
-    // Falling the 13.48 yards the core starts charging for takes longer than
-    // one poll, so at least one poll lands inside any chargeable fall.
-    float t = 0.f;
-    while (0.5f * GRAVITY * t * t < MIN_FALL_DMG_DIST)
-        t += 0.001f;
-    Check("and reaching the charging floor takes more than a second",
-          t > 1.0f, true);
-    Check("just over 1.18 seconds of it", t > 1.17f && t < 1.19f, true);
+    // Run speed 7 yards per second on the steepest slope the navmesh allows,
+    // taken here as 50 degrees; sin(50) is a little under 0.766.
+    float const steepestWalk = 7.0f * 0.766f;
+    Check("the steepest walk is under the limit",
+          steepestWalk < LIMITS.fallingYardsPerSecond, true);
+    Check("and that is about 5.4 yards per second",
+          steepestWalk > 5.3f && steepestWalk < 5.4f, true);
 }
 
-// Every state the terrain drive stands down for stands this down too, and none
-// of them disturbs what is being held.
-void EveryStoodDownStateHandsNothingOver()
+// Walking downhill for a long way is exactly the case that used to go stale,
+// and it is the one a rate test has to get right rather than a flag.
+void ALongWalkDownhillKeepsTheBaselineUnderTheFeet()
 {
     FallBaselineState state;
-    FallBaselineHandedOver(state, 150.f, 1000);
-
-    FallBaselineVerdict const v = FallBaselineStep(state, false, false, 60.f, 1010);
-    Check("a character this module may not inspect is left alone", v.rebase, false);
-    CheckZ("and nothing it was holding is disturbed", state.z, 150.f);
-    Check("and it is still held for when that character is inspectable again",
-          state.held, true);
+    float z = 500.f;
+    time_t t = 5000;
+    Poll(state, z, t);
+    float handed = z;
+    for (int i = 0; i < 120; ++i)      // two minutes at 3 yards a second
+    {
+        z -= 3.f;
+        ++t;
+        FallBaselineVerdict const v = Poll(state, z, t);
+        if (!v.rebase)
+        {
+            std::printf("FAIL a 3 yard per second walk was read as a fall at poll %d\n", i);
+            ++failures;
+            return;
+        }
+        handed = v.z;
+    }
+    CheckZ("the baseline followed it all the way down", handed, 140.f);
+    Check("so the landing is charged nothing",
+          FractionOfMaxHealth(handed - 140.f) == 0.f, true);
 }
 
-// The server's own height goes back whichever way it has moved. A rule that
-// only ever lowered the baseline would leave a character that climbed unable
-// to be charged for a real drop afterwards.
+// THE CORE'S OWN GATE. When HandleFall will not charge, this does not write.
+void TheAuraGateStandsItDown()
+{
+    FallBaselineState state;
+    Poll(state, 200.f, 7000);
+    FallBaselineVerdict const v =
+        FallBaselineStep(state, true, true, 150.f, 7001, LIMITS);
+    Check("an aura the core itself checks stands the guard down", v.rebase, false);
+    CheckZ("and nothing it was holding is disturbed", state.z, 200.f);
+}
+
+// The six states this module has no opinion about, with the two untrustworthy
+// flags deliberately absent from the list.
+void TheStatesWithNoOpinionAreTheSixThatAreNotFlags()
+{
+    Check("an ordinary living character", FallBaselineMayInspect(true, false, false, false, false, false), true);
+    Check("dead", FallBaselineMayInspect(false, false, false, false, false, false), false);
+    Check("teleporting", FallBaselineMayInspect(true, true, false, false, false, false), false);
+    Check("on a taxi", FallBaselineMayInspect(true, false, true, false, false, false), false);
+    Check("in water", FallBaselineMayInspect(true, false, false, true, false, false), false);
+    Check("on a transport", FallBaselineMayInspect(true, false, false, false, true, false), false);
+    Check("in a vehicle", FallBaselineMayInspect(true, false, false, false, false, true), false);
+}
+
+// A GAP MUST NOT BE MEASURED ACROSS. A character that spent ten seconds on a
+// boat has not fallen the difference, and reading it as one would leave the
+// baseline stale for exactly the reason this whole change exists.
+void ARateIsNeverMeasuredAcrossAGapItDidNotWatch()
+{
+    FallBaselineState state;
+    Poll(state, 300.f, 9000);
+    Check("the reference is set", state.seen, true);
+
+    FallBaselineVerdict const away =
+        FallBaselineStep(state, false, false, 300.f, 9001, LIMITS);
+    Check("a state with no opinion hands nothing over", away.rebase, false);
+    Check("and forgets where the character was", state.seen, false);
+
+    // Back, 200 yards lower, which across one second would read as a fall.
+    FallBaselineVerdict const back = Poll(state, 100.f, 9002);
+    Check("the poll after the gap rebases rather than inventing a fall",
+          back.rebase, true);
+    CheckZ("at the feet", back.z, 100.f);
+}
+
+// The very first poll has nothing to measure against and must still act, or a
+// character would never get a baseline until its second poll.
+void TheFirstPollHasNoReferenceAndStillActs()
+{
+    FallBaselineState fresh;
+    Check("nothing is remembered yet", fresh.seen, false);
+    FallBaselineVerdict const v = Poll(fresh, 250.f, 11000);
+    Check("and it still hands the feet over", v.rebase, true);
+    CheckZ("at the feet", v.z, 250.f);
+}
+
+// The server's own height goes back whichever way it has moved: a rule that
+// only ever lowered would leave a character that climbed unable to be charged.
+//
+// The descent here is a WALK, three yards in a second. Writing it as a twenty
+// yard drop is what the first draft of this test did, carried over from the
+// version of the rule that had no rate in it, and the rule correctly called
+// that a fall and declined. The expectation was wrong, not the rule.
 void TheServersOwnHeightGoesBackEvenWhenItRises()
 {
     FallBaselineState state;
     FallBaselineHandedOver(state, 100.f, 1000);
-
-    CheckZ("walking down hands down",
-           FallBaselineStep(state, true, false, 80.f, 1001).z, 80.f);
-
-    FallBaselineVerdict const up = FallBaselineStep(state, true, false, 130.f, 1002);
+    Poll(state, 100.f, 1001);
+    CheckZ("walking down hands down", Poll(state, 97.f, 1002).z, 97.f);
+    FallBaselineVerdict const up = Poll(state, 130.f, 1003);
     Check("climbing hands over too", up.rebase, true);
     CheckZ("the height it climbed to", up.z, 130.f);
     Check("so a real drop from up there is still chargeable",
           FractionOfMaxHealth(up.z - 70.f) > 0.f, true);
 }
 
-// Recording a lift is bookkeeping about what this module did, and changes
-// nothing about what the rule decides. That is deliberate: the 20:10:13 pair
-// is the reason it must not become a gate again.
+// Recording a lift is bookkeeping about what this module did and must not
+// become a gate again, which is the lesson of the 20:10:13 pair.
 void RecordingALiftDoesNotChangeTheVerdict()
 {
     FallBaselineState lifted, plain;
     FallBaselineHandedOver(lifted, 158.8f, 1000);
+    Poll(lifted, 158.8f, 1001);
+    Poll(plain, 158.8f, 1001);
 
-    FallBaselineVerdict const a = FallBaselineStep(lifted, true, false, 93.5f, 1200);
-    FallBaselineVerdict const b = FallBaselineStep(plain, true, false, 93.5f, 1200);
+    FallBaselineVerdict const a = Poll(lifted, 157.0f, 1002);
+    FallBaselineVerdict const b = Poll(plain, 157.0f, 1002);
     Check("both are guarded", a.rebase && b.rebase, true);
     CheckZ("and both at the same feet", a.z, b.z);
-
-    // And both stand down in the same states, lifted or not.
-    Check("falling stands down the lifted one",
-          FallBaselineStep(lifted, true, true, 93.5f, 1201).rebase, false);
-    Check("falling stands down the other one too",
-          FallBaselineStep(plain, true, true, 93.5f, 1201).rebase, false);
 }
 
 }  // namespace
 
 int main()
 {
-    TheFourMeasuredDeathsArePricedAtNothing();
-    ACharacterThisModuleNeverMovedIsGuardedTheSame();
+    AStuckFallingFlagNoLongerDeclinesTheGuard();
+    TheOtherMeasuredRowIsTheSame();
     AGenuineFallIsStillCharged();
-    NoChargeableFallFitsBetweenTwoPolls();
-    EveryStoodDownStateHandsNothingOver();
+    TheLimitSeparatesAWalkFromAFall();
+    ALongWalkDownhillKeepsTheBaselineUnderTheFeet();
+    TheAuraGateStandsItDown();
+    TheStatesWithNoOpinionAreTheSixThatAreNotFlags();
+    ARateIsNeverMeasuredAcrossAGapItDidNotWatch();
+    TheFirstPollHasNoReferenceAndStillActs();
     TheServersOwnHeightGoesBackEvenWhenItRises();
     RecordingALiftDoesNotChangeTheVerdict();
 
@@ -289,6 +299,6 @@ int main()
         std::printf("%d failure(s)\n", failures);
         return EXIT_FAILURE;
     }
-    std::printf("a standing character owes nothing for having got there\n");
+    std::printf("the guard measures the fall instead of trusting a flag\n");
     return EXIT_SUCCESS;
 }
