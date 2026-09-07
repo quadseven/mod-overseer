@@ -2520,6 +2520,42 @@ struct RecoveryMark
     uint8 prevRung = 0;   // and before it, so a repeat is visible as a climb
     time_t at = 0;        // 0 = this module has never moved this character
 };
+
+// WHY THE FALL BASELINE GUARD DECLINED, ON THE LAST POLL THAT LOOKED (#281).
+//
+// #266's invariant is deployed and phantom fall deaths continued. The guard
+// declines only on `!mayInspect || falling`, it is asked ABOVE the recovery's
+// own stand-down and outside the episode cooldown, and it polls once a second
+// - so a guard that ran cannot leave the core's baseline more than one second
+// of movement from the character's feet. The measured deaths need it 69 or
+// more yards away, two of them with a descent of exactly zero. Both cannot be
+// true, so it was not called. Correct and not running looks exactly like
+// called and wrong, and this is what tells them apart.
+//
+// SAMPLED EVERY POLL, INCLUDING THE POLLS THAT DECLINE NOTHING, because "the
+// guard ran and the baseline was still stale" would refute the whole diagnosis
+// and has to be able to appear. `at` of 0 means this module has never looked
+// at this character, which is not the same as looking and finding nothing -
+// see OverseerDecisions::FallGuardStandDownMask for why those are kept apart.
+//
+// This is a diagnostic. Nothing reads it back and no decision consults it.
+struct StandDownMark
+{
+    uint16 mask = 0;   // OverseerDecisions::FallGuardStandDown bits, 0 = it ran
+    time_t at = 0;     // 0 = never sampled, which the row carries as -1
+};
+std::mutex g_standDownMutex;
+std::map<std::string, StandDownMark> g_standDownMarks;  // key: lowercased name
+
+// Called from DriveBelowTerrainRecovery, world thread only, like
+// RememberRecovery beside it. Memory only; RecordDeath reads it.
+void RememberStandDown(std::string const& name, uint16 mask)
+{
+    std::lock_guard<std::mutex> guard(g_standDownMutex);
+    StandDownMark& m = g_standDownMarks[LowerName(name)];
+    m.mask = mask;
+    m.at = std::time(nullptr);
+}
 std::mutex g_recoveryMutex;
 std::map<std::string, RecoveryMark> g_recoveryMarks;  // key: lowercased name
 
@@ -2695,6 +2731,13 @@ struct PendingDeath
     int16 recoveryRung = -1;       // -1 = this module has never moved it
     int16 recoveryPrevRung = -1;
     int32 recoverySeconds = -1;
+    // WHY THE FALL BASELINE GUARD DECLINED on the last poll that looked at
+    // this character, and how long ago that poll was (#281). -1 in either is
+    // NOT SAMPLED and never a reading: a mask of 0 means the guard ran, which
+    // is a finding, and folding "never looked" into it is the mistake that
+    // left 223 kill-plane deaths unexplained.
+    int32 fallGuardStandDown = -1;
+    int32 fallGuardSeconds = -1;
 };
 std::mutex g_deathMutex;
 std::vector<PendingDeath> g_deathQueue;
@@ -2781,6 +2824,19 @@ void RecordDeath(Player* player)
             d.recoveryRung = static_cast<int16>(it->second.rung);
             d.recoveryPrevRung = static_cast<int16>(it->second.prevRung);
             d.recoverySeconds = static_cast<int32>(now - it->second.at);
+        }
+    }
+
+    // AND WHY THE FALL BASELINE GUARD DECLINED, beside it and read the same
+    // way (#281). `at` of 0 means the terrain drive has never looked at this
+    // character, which stays -1 rather than becoming a mask of zero.
+    {
+        std::lock_guard<std::mutex> guard(g_standDownMutex);
+        auto it = g_standDownMarks.find(lower);
+        if (it != g_standDownMarks.end() && it->second.at)
+        {
+            d.fallGuardStandDown = static_cast<int32>(it->second.mask);
+            d.fallGuardSeconds = static_cast<int32>(now - it->second.at);
         }
     }
 
@@ -11972,6 +12028,17 @@ private:
                 if (held.rebase)
                     bot->SetFallInformation(GameTime::GetGameTime().count(),
                                             held.z);
+
+                // AND WRITE DOWN WHY IT DECLINED, EVERY POLL (#281). Same
+                // eight answers, in the same order, so the mask and the
+                // stand-down above cannot drift apart. This changes no
+                // decision: it is recorded and nothing reads it back.
+                RememberStandDown(name, OverseerDecisions::FallGuardStandDownMask(
+                                            bot->IsAlive(), bot->IsBeingTeleported(),
+                                            bot->IsInFlight(), bot->IsFlying(),
+                                            bot->IsFalling(), bot->IsInWater(),
+                                            bot->GetTransport() != nullptr,
+                                            bot->GetVehicle() != nullptr));
             }
 
             if (!mayInspect)
@@ -18474,7 +18541,8 @@ private:
               "driver, movement_generator, in_combat, last_seen_seconds, "
               "last_pos_x, last_pos_y, last_pos_z, yards_fallen, "
               "leader_seen, leader_map, leader_pos_x, leader_pos_y, leader_pos_z, "
-              "recovery_rung, recovery_prev_rung, recovery_seconds) VALUES ";
+              "recovery_rung, recovery_prev_rung, recovery_seconds, "
+              "fall_guard_standdown, fall_guard_seconds) VALUES ";
         bool first = true;
         for (PendingDeath const& d : batch)
         {
@@ -18510,6 +18578,8 @@ private:
                << ',' << static_cast<int32>(d.recoveryRung)
                << ',' << static_cast<int32>(d.recoveryPrevRung)
                << ',' << d.recoverySeconds
+               << ',' << d.fallGuardStandDown
+               << ',' << d.fallGuardSeconds
                << ')';
         }
         CharacterDatabase.Execute(ss.str().c_str());
@@ -18527,7 +18597,7 @@ private:
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
                  "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
-                 "fell {:.1f} yards which is {}, in combat {})",
+                 "fell {:.1f} yards which is {}, in combat {}; fall guard {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
                  batch.back().killerType, batch.back().killerName,
@@ -18537,7 +18607,14 @@ private:
                      OverseerDecisions::AccountForFall(batch.back().yardsFallen)),
                  batch.back().inCombat < 0
                      ? "unsampled"
-                     : (batch.back().inCombat ? "yes" : "no"));
+                     : (batch.back().inCombat ? "yes" : "no"),
+                 // #281. The column keeps the number so it can be grouped and
+                 // counted; this is the same answer in words, so a reader
+                 // watching the log sees it without a lookup table.
+                 batch.back().fallGuardStandDown < 0
+                     ? std::string("unsampled")
+                     : OverseerDecisions::FallGuardStandDownNames(
+                           static_cast<uint16_t>(batch.back().fallGuardStandDown)));
     }
 
     // ------------------------------------------------------- outcome --
@@ -19069,13 +19146,15 @@ private:
             char const* detail = "";
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share', 'job', 'sell', 'bank', 'auction' and 'mail' do not go
+            // 'share', 'job', 'sell', 'bank', 'auction', 'bind' and 'mail' do
+            // not go through
             // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
                 && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
-                && kind != "bank" && kind != "auction" && kind != "mail")
+                && kind != "bank" && kind != "auction" && kind != "bind"
+                && kind != "mail")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
                 // of the line says does not matter here; two commands with the
@@ -19195,6 +19274,8 @@ private:
                 detail = DoRepair(player, command, status, rowResult);
             else if (kind == "buy")
                 detail = DoBuy(player, command, status, rowResult);
+            else if (kind == "bind")
+                detail = DoBind(player, command, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -22765,6 +22846,310 @@ private:
                  req.auctionId, price, player->GetName(), cost);
         describe("bid", "", "");
         status = "delivered";
+        return "";
+    }
+
+
+    // ---------------------------------------------------------------- bind --
+    //
+    // Set this character's home at the innkeeper it is already standing beside.
+    //
+    // WHY THIS IS A MODULE JOB, and the whole argument is in
+    // overseer_decisions.h under "a home somebody chose". The short version:
+    // upstream's `home` command (SetHomeAction.cpp:12) reads
+    // `Player* master = GetMaster()` and then, when the selection did not come
+    // from an rpg target, takes `else return false` at SetHomeAction.cpp:24 -
+    // before the scan for a nearby innkeeper below it is ever reached. A roster
+    // character is masterless whenever no client holds the party leader
+    // (PlayerbotAI::FindNewMaster, PlayerbotAI.cpp:4410, returns nullptr unless
+    // the leader is a real player or a selfbot), so that early return is taken
+    // every single time. Nothing reports it: HandleCommands erases the command
+    // whatever ParseChatCommand answered (PlayerbotAI.cpp:587) and TellError
+    // returns false without sending anything when there is no master
+    // (PlayerbotAI.cpp:3013). The row reads `delivered`.
+    //
+    // THE PACKET GOES TO THE CORE'S OWN HANDLER, exactly the way
+    // StepThroughAreaTrigger hands CMSG_AREATRIGGER to HandleAreaTriggerOpcode,
+    // and for the same reason: the handler re-checks the world itself.
+    // HandleBinderActivateOpcode (NPCHandler.cpp:293) asks
+    // GetNPCIfCanInteractWith for an innkeeper-flagged creature, which refuses
+    // anything hostile (Player.cpp:2147) or further off than
+    // INTERACTION_DISTANCE (Player.cpp:2159). Nothing can be bound anywhere a
+    // character did not walk to and stand beside.
+    //
+    // EVERYTHING PAST THE HANDLER IS SERVER-SIDE, which is why this works for a
+    // character with no client at all: SendBindPoint casts spell 3286
+    // (NPCHandler.cpp:315), Spell::EffectBind calls Player::SetHomebind
+    // (SpellEffects.cpp:6331), and SetHomebind writes character_homebind itself
+    // (PlayerStorage.cpp:4993). The two packets that go out afterwards are for
+    // a client to draw and are dropped harmlessly by a bot's session.
+    //
+    // THE INSTANCE IS REFUSED HERE RATHER THAN READ BACK AS A MYSTERY.
+    // SendBindPoint opens with `if (GetPlayer()->GetMap()->Instanceable())
+    // return;` (NPCHandler.cpp:318) - no packet, no log, no failure. That is
+    // precisely the shape this module exists to stop reporting as success, so
+    // the one case where the core is known to do nothing silently is named on
+    // this side, before the packet, with the retry class that says standing
+    // somewhere else fixes it.
+    //
+    // THIS MOVES NOBODY. A character can only be bound where it can already
+    // stand, so a bind is never itself a crossing: it turns a crossing that has
+    // already been made into one that costs nothing to make again. Saying more
+    // than that would be #275's mistake in a new place.
+
+    struct InnkeeperNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_INNKEEPER)
+                && from->IsWithinDistInMap(creature, range);
+        }
+    };
+
+    // How far two homes may be apart and still be the same inn. Bigger than
+    // INTERACTION_DISTANCE, because a character that steps around the common
+    // room between two binds has not moved house; far smaller than the gap
+    // between any two inns in the game, so a real move can never read as one.
+    static constexpr float BIND_SAME_SPOT_YARDS = 10.f;
+
+    static OverseerDecisions::HomeBind ReadHomeBind(Player* who)
+    {
+        OverseerDecisions::HomeBind home;
+        home.known = true;
+        home.mapId = static_cast<uint32_t>(who->m_homebindMapId);
+        home.areaId = static_cast<uint32_t>(who->m_homebindAreaId);
+        home.x = who->m_homebindX;
+        home.y = who->m_homebindY;
+        home.z = who->m_homebindZ;
+        return home;
+    }
+
+    // Where the character is standing, in the same shape, so the read-back can
+    // ask whether a home that did not move was already here.
+    static OverseerDecisions::HomeBind ReadStandingPlace(Player* who)
+    {
+        OverseerDecisions::HomeBind here;
+        here.known = true;
+        here.mapId = who->GetMapId();
+        here.areaId = who->GetAreaId();
+        here.x = who->GetPositionX();
+        here.y = who->GetPositionY();
+        here.z = who->GetPositionZ();
+        return here;
+    }
+
+    static char const* DoBind(Player* who, std::string const& command, char const*& status,
+                              std::string& out)
+    {
+        using OverseerDecisions::BindOutcome;
+        using OverseerDecisions::BindOutcomeWord;
+        using OverseerDecisions::BindReadBack;
+        using OverseerDecisions::BindRefusalRetry;
+        using OverseerDecisions::BindRequest;
+        using OverseerDecisions::BindVerb;
+        using OverseerDecisions::ChooseInnkeeper;
+        using OverseerDecisions::HomeBind;
+        using OverseerDecisions::ParseBindRequest;
+        using OverseerDecisions::TownRetryWord;
+
+        BindRequest const request = ParseBindRequest(command);
+
+        // Everything a row can be answered with, gathered as it becomes known
+        // and written by EVERY exit, refusals included. An unmeasured distance
+        // stays -1 because 0 yards is a real distance, and an unread home says
+        // so through HomeBind::known because map 0 is a real map and 0.0 is a
+        // real coordinate.
+        struct Evidence
+        {
+            bool haveInnkeeper = false;
+            uint32 innkeeperEntry = 0;
+            std::string innkeeperName;
+            float innkeeperYards = -1.f;
+            float nearestYards = -1.f;
+            int32 innkeepersInReach = 0;
+            HomeBind before;
+            HomeBind after;
+            HomeBind standing;
+            BindOutcome outcome = BindOutcome::Unreadable;
+        } ev;
+
+        auto place = [](std::ostringstream& o, HomeBind const& home)
+        {
+            if (!home.known)
+            {
+                o << "null";
+                return;
+            }
+            o << "{\"map\":" << home.mapId << ",\"area\":" << home.areaId
+              << ",\"x\":" << home.x << ",\"y\":" << home.y << ",\"z\":" << home.z << "}";
+        };
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"retry\":" << J(*reason ? TownRetryWord(BindRefusalRetry(reason)) : "")
+              << ",\"character\":" << J(who->GetName())
+              << ",\"home_verdict\":" << J(BindOutcomeWord(ev.outcome));
+            o << ",\"home_before\":";
+            place(o, ev.before);
+            o << ",\"home_after\":";
+            place(o, ev.after);
+            o << ",\"standing\":";
+            place(o, ev.standing);
+            if (ev.haveInnkeeper)
+                o << ",\"innkeeper\":{\"entry\":" << ev.innkeeperEntry
+                  << ",\"name\":" << J(ev.innkeeperName)
+                  << ",\"yards\":" << ev.innkeeperYards << "}";
+            else
+                o << ",\"innkeeper\":null";
+            if (ev.nearestYards >= 0.f)
+                o << ",\"nearest_innkeeper_yards\":" << ev.nearestYards;
+            o << ",\"innkeepers_in_reach\":" << ev.innkeepersInReach
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        // The refusal literals go straight into the UPDATE, so none may carry
+        // a quote character - the same rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (request.verb == BindVerb::None)
+        {
+            // The parser's exact words are pinned in tests/test_bind.cpp and go
+            // into the JSON. `detail` has to outlive this call, so the column
+            // gets the literal the table keys on.
+            describe("refused", request.error.c_str());
+            return "malformed bind request";
+        }
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("character has no session");
+        if (!who->IsInWorld())
+            return refuse("character is not in the world");
+
+        // HandleBinderActivateOpcode asks IsAlive() before anything else and
+        // returns silently when it is false, so it is asked here instead.
+        if (!who->IsAlive())
+            return refuse("character is dead");
+        if (who->IsInFlight())
+            return refuse("character is in flight");
+
+        Map const* map = who->GetMap();
+        if (!map)
+            return refuse("character is not on a map");
+        if (map->Instanceable())
+            return refuse("character is inside an instance");
+
+        ev.standing = ReadStandingPlace(who);
+        ev.before = ReadHomeBind(who);
+
+        // ---- who is in reach -------------------------------------------------
+        //
+        // A sweep wider than the interaction distance on purpose, the same way
+        // DoRepair's is: the gate is the core's own GetNPCIfCanInteractWith and
+        // it decides who counts; the wider sweep exists only so a refusal can
+        // say how far the nearest innkeeper WAS. "innkeeper not in range" with
+        // "9.2 yards" beside it is an aim error the sender can correct, and
+        // without the number it is a mystery. It is also how the refusal this
+        // family cannot avoid gets named: the innkeeper nearest their dungeon
+        // belongs to the other faction, and GetNPCIfCanInteractWith turns that
+        // one down for being unfriendly however close the character stands.
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        InnkeeperNearbyCheck check{who, SWEEP_YARDS};
+        Acore::CreatureListSearcher<InnkeeperNearbyCheck> searcher(who, nearby, check);
+        Cell::VisitObjects(who, searcher, SWEEP_YARDS);
+
+        std::vector<float> yards;
+        std::vector<Creature*> reachable;
+        for (Creature* creature : nearby)
+        {
+            float const distance = who->GetDistance(creature);
+            if (ev.nearestYards < 0.f || distance < ev.nearestYards)
+                ev.nearestYards = distance;
+
+            // THE GATE. The same call HandleBinderActivateOpcode makes with the
+            // same flag, so a creature this accepts is one the handler will.
+            if (!who->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_INNKEEPER))
+                continue;
+
+            yards.push_back(distance);
+            reachable.push_back(creature);
+        }
+
+        ev.innkeepersInReach = static_cast<int32>(reachable.size());
+        if (reachable.empty())
+            return refuse("innkeeper not in range");
+
+        int const choice = ChooseInnkeeper(yards);
+        Creature* innkeeper = reachable[static_cast<size_t>(choice)];
+        ev.haveInnkeeper = true;
+        ev.innkeeperEntry = innkeeper->GetEntry();
+        ev.innkeeperName = innkeeper->GetName();
+        ev.innkeeperYards = yards[static_cast<size_t>(choice)];
+
+        // ---- drive the core's own handler ------------------------------------
+        //
+        // CMSG_BINDER_ACTIVATE is one guid and nothing else (NPCHandler.cpp).
+        // This handler takes a raw WorldPacket rather than a typed one, like the
+        // areatrigger and repair handlers and unlike the sell and bank ones, so
+        // there is no Read() to call - only the rpos(0) rewind, because the
+        // handler reads with >> from a packet this side has just written to.
+        {
+            WorldPacket raw(CMSG_BINDER_ACTIVATE, 8);
+            raw << innkeeper->GetGUID();
+            raw.rpos(0);
+            session->HandleBinderActivateOpcode(raw);
+        }
+
+        // ---- believe nothing; read the home back ------------------------------
+        ev.after = ReadHomeBind(who);
+        ev.outcome = BindReadBack(ev.before, ev.after, ev.standing, BIND_SAME_SPOT_YARDS);
+
+        switch (ev.outcome)
+        {
+            case BindOutcome::Unreadable:
+                // Cannot happen from here - all three readings are taken above
+                // and every one of them sets `known` - but a switch that
+                // silently fell through this would be inventing an outcome.
+                return refuse("the home could not be read back");
+
+            case BindOutcome::Unchanged:
+                // THE FAILURE THIS EXECUTOR EXISTS TO MAKE VISIBLE. The packet
+                // went to a handler that accepted an innkeeper in reach, and
+                // character_homebind still points where it pointed before.
+                return refuse("the core moved no home");
+
+            case BindOutcome::SameSpot:
+                // Bound here already. Nothing failed and nothing changed, which
+                // is exactly what `unchanged` means on this queue.
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was already bound at {} ({}), map {} - nothing to do",
+                         who->GetName(), ev.innkeeperName, ev.innkeeperEntry, ev.after.mapId);
+                describe("bound", "");
+                status = "unchanged";
+                return "";
+
+            case BindOutcome::Moved:
+                break;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is now bound at {} ({}) - home moved from map {} to map {}",
+                 who->GetName(), ev.innkeeperName, ev.innkeeperEntry, ev.before.mapId,
+                 ev.after.mapId);
+
+        describe("bound", "");
+        status = "applied";
         return "";
     }
 

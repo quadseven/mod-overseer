@@ -135,12 +135,16 @@
 -- THE UNION GREW AFTER THIS FILE WAS FIRST WRITTEN, and that is worth spelling
 -- out because getting it wrong is silent. This file was authored when the union
 -- was twelve values and the parallel branches were sell, bank, auction and
--- mail. 'repair' and 'buy' have been added to the column since, and both are
--- already dispatched in C++ on main. A twelve-value ALTER here would silently
--- truncate every existing 'repair' and 'buy' row and remove the two kinds from
--- the column on any database that has already run their migrations. So the list
--- below is the union as it stands today, not as it stood when the branch was
--- opened. Anything adding a kind after this must add it here too.
+-- mail. 'repair', 'buy' and 'bind' have all been added to the column since, and
+-- all three are already dispatched in C++ on main. An ALTER here that named only
+-- the old union would silently truncate every existing row of the kinds it left
+-- out and remove those kinds from the column, on any database that has already
+-- run their migrations. It only stays silent because this file sorts BEFORE
+-- theirs, so a FRESH database ends up correct either way and only a database
+-- that is already up to date is damaged. So the list below is the union as it
+-- stands today, not as it stood when the branch was opened, and it has already
+-- had to be widened twice while this branch waited. Anything adding a kind
+-- after this must add it here too.
 ALTER TABLE `overseer_command`
-    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy')
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind')
         NOT NULL DEFAULT 'bot';
