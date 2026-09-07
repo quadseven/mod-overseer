@@ -3591,6 +3591,164 @@ Reaction FactionStanceReaction(FactionStance const& npc, FactionStance const& ch
 // one place.
 bool MayInteractAt(Reaction reaction);
 
+// -------------------------------------------------- the ground on the way --
+//
+// #300, which is #234 item 2 reaching its third statement.
+//
+// WHETHER A CHARACTER CAN GET THERE ALIVE, WHICH IS A DIFFERENT QUESTION FROM
+// WHETHER IT CAN STAND THERE (#267 named this one, put it explicitly out of
+// scope, and said a correct destination can still have a bad route).
+//
+// THERE IS NO ROUTE TO READ, AND THAT IS THE FINDING THIS IS BUILT ON. Nothing
+// anywhere computes the path a long walk will take, so there is no polyline to
+// sample and no cheaper reading being passed over. Read at the pinned core and
+// the pinned mod-playerbots:
+//
+//   * PathGenerator is never even asked about a far destination. CalculatePath
+//     returns a TWO POINT straight line, typed PATHFIND_NORMAL |
+//     PATHFIND_NOT_USING_PATH, whenever the destination's navmesh tile is not
+//     already loaded (PathGenerator.cpp:173-179, HaveTile at :817-831), and a
+//     tile is loaded only when its 533 yard map grid is created
+//     (GridTerrainLoader.cpp:9-17, :74).
+//   * Even with both tiles loaded it cannot answer past about 296 yards: 74
+//     points at a 4 yard step (PathGenerator.h:32-38), and a smooth path that
+//     reaches that cap is DISCARDED rather than truncated, replaced by the same
+//     two point shortcut (PathGenerator.cpp:660-690, FindSmoothPath's return at
+//     :1065).
+//   * The mover treats that shortcut as no answer and falls back to sampling
+//     TWO RANDOM BEARINGS in a forward cone of plus or minus ninety degrees,
+//     35 to 70 yards out, walking to whichever came back nearest the bearing of
+//     the destination (NewRpgBaseAction.cpp:141-183). Then it does it again.
+//   * This module's own long `at:` walk is the same shape by construction: the
+//     navmesh refuses, so GroundedStep takes a TRAVEL_STEP_YARDS step along the
+//     bearing to the aim, and the next poll steps again.
+//
+// So what a party actually walks between two far points is a chain of short
+// hops aimed down the straight line, jittered by a forward cone and by local
+// ground. The straight line is not an approximation of the route. It is the
+// only structure the route has - and the followers, which are moved by a short
+// step toward their leader and route nothing at all, walk it more exactly than
+// the leader does. Sampling it is therefore honest rather than a heuristic.
+//
+// WHAT IS SAMPLED IS THEREFORE THE STRAIGHT LINE, AND THIS CAN ONLY EVER
+// REFUSE. A walk whose line is lethal is lethal; a walk whose line is clear may
+// still bend into something the line missed. That asymmetry is the honest limit
+// of the instrument and is why this gate may only take a candidate away, never
+// certify one. It is also what decides the rounding in PlanRouteSamples below,
+// so read the two together.
+
+// HOW A WALK IS CUT INTO SAMPLES. Arithmetic with a boundary in it, so it lives
+// here where a test can compile it rather than in the adapter where nothing
+// can.
+struct RouteSampling
+{
+    std::size_t samples{0};
+    // The spacing ACTUALLY used, not the nominal one asked for. It is at most
+    // the nominal spacing and it divides the read length exactly, so
+    // `samples * spacingYards == readYards` to the yard and the totals
+    // JudgeRoute reports are the real length of ground rather than a multiple
+    // of a round number that happens to be near it.
+    float spacingYards{0.f};
+    // How much of the line is read at all: the whole span, unless the span is
+    // longer than the cap, in which case the tail past it is deliberately left
+    // unjudged. Safe in exactly one direction, and only because this gate may
+    // only refuse: an unread tail can hide a danger and can never invent one.
+    float readYards{0.f};
+};
+
+// THE ROUNDING IS UP, AND IT IS UP FOR A REASON SPECIFIC TO THIS GATE.
+// Truncating leaves the last fraction of a spacing with no sample standing in
+// it, and that fraction is at the END of the line: the segment nearest the
+// destination, the one a character walks last, and the one an unbroken hostile
+// run beginning at the destination itself occupies. Because this gate may only
+// ever refuse, an error there cannot produce a false refusal; it can only
+// produce a MISSED one, which is the failure this whole rule exists to prevent.
+//
+// AND THE SAMPLES SIT AT THE MIDDLE OF THEIR SPACING, not at the far end of it,
+// which is what makes the count and the yardage agree. `samples` spacings laid
+// end to end are exactly `readYards` of ground, each with one sample in the
+// middle of it: nothing at the near end is unspoken for, nothing at the far end
+// is unspoken for, and no sample is ever placed BEYOND the destination, where
+// it would be reading ground the party does not walk.
+//
+// A span of zero, a spacing of zero, or a span under one spacing all come back
+// with no samples, which JudgeRoute reads as "not asked" rather than as "safe".
+RouteSampling PlanRouteSamples(float spanYards, float maxSpacingYards, float maxSpanYards);
+
+// Where sample `index` stands, in yards along the line from the character.
+// Zero-based, and always strictly inside (0, readYards).
+float RouteSampleAt(RouteSampling const& sampling, std::size_t index);
+
+struct RouteReading
+{
+    uint32_t characterLevel{0};
+    // How far apart the samples below stand, in yards, which is
+    // RouteSampling::spacingYards and not the nominal spacing the caller asked
+    // for. Each sample speaks for the spacing it sits in the middle of, so N
+    // lethal samples in a row are N spacings of ground rather than N-1: the
+    // question is how much ground the party has to survive, not how far apart
+    // two readings were taken.
+    float sampleSpacingYards{0.f};
+    // The level of the worst thing this character could be made to FIGHT within
+    // the threat radius of each sample, in order from where the character
+    // stands to the destination, and zero where there is nothing. Measured by
+    // the caller off spawn data rather than the live grid, for the reason
+    // GRAVEYARD_THREAT_RADIUS gives: a destination two grids away is not
+    // loaded, and an unloaded grid reads as "no creatures".
+    std::vector<uint32_t> worstLevelAtSample;
+};
+
+struct RouteLimits
+{
+    // THE SAME `??` RULE THE DESTINATION GATE USES, and named the same way so
+    // the two cannot drift: ground holding something this many levels above the
+    // character is ground the game's own con-colour maths would draw as unknown
+    // rather than as a number. See CON_COLOR_UNKNOWN_LEVEL_DIFF.
+    uint32_t unknownLevelDiff{10};
+    // HOW MUCH UNBROKEN `??` GROUND A WALK MAY CROSS. It is the one free number
+    // here, so it is measured rather than chosen. Corridors sampled against the
+    // dev realm's own world data on 2026-09-07, 60 yard radius, 30 yard
+    // spacing, at the family's real levels:
+    //
+    //     the walks the family died on
+    //       Searing Gorge -> the aim it was walking to   598 yards unbroken
+    //       Searing Gorge -> Burning Steppes             444
+    //       Burning Steppes -> the same aim              209
+    //       the vendor #267 refused, 502 yards off       118
+    //     the walks it made without a creature death
+    //       the 2,012 yard errand #267 endorsed            0
+    //       Kharanos -> the gates of Ironforge             0
+    //       Goldshire -> Stormwind, and -> Eastvale        0
+    //       Stormwind -> Kharanos, 3,562 yards             0
+    //
+    // THE GAP BETWEEN THOSE TWO POPULATIONS IS EMPTY, which is the whole reason
+    // this number is defensible rather than a guess, and it is asserted rather
+    // than only written down: see TheTwoPopulationsDoNotOverlap in
+    // tests/test_travel_route.cpp. Anyone re-tuning this by feel should move
+    // that test first and find out what it costs.
+    //
+    // So this sits inside the gap rather than on either edge. Over 120 origins
+    // drawn at random from the service spawns of both continents at level 27,
+    // two hundred releases one errand outright and moves two others to a
+    // destination a median 61 yards farther on; a hundred and fifty releases
+    // five. Like ErrandDeathLimits, this is a first reading, and the death
+    // table is what says whether it was right.
+    float lethalRunYards{200.f};
+};
+
+struct RouteVerdict
+{
+    bool survivable{true};
+    float lethalYards{0.f};             // how much of the line is `??` ground
+    float longestLethalRunYards{0.f};   // the longest unbroken stretch of it
+    uint32_t worstLevel{0};             // the worst thing standing along it
+};
+
+// One route, judged. An empty reading is survivable, which is the convention
+// the guard fields below already carry and for the same reason: a caller that
+// did not measure has not made a claim.
+RouteVerdict JudgeRoute(RouteReading const& reading, RouteLimits const& limits);
+
 // One spawn of the wanted role standing on the character's own map. The
 // caller has already asked whether this character may interact with it, the
 // same way the bank and repair candidate lists arrive already asked.
@@ -3615,6 +3773,15 @@ struct TravelTargetCandidate
     bool mayInteract{false};
     uint32_t guardCount{0};   // hostile spawns above this level within the radius
     uint32_t guardLevel{0};   // the highest level among them, for the log line
+    // AND WHETHER THE WALK TO IT CAN BE SURVIVED. False only where a caller has
+    // read the route and JudgeRoute refused it. An unmeasured candidate is
+    // survivable for exactly the reason an unmeasured one is unguarded, which is
+    // what lets the reading be taken on a shortlist in distance order rather
+    // than on every spawn of the role on the map. The two numbers beside it are
+    // for the log line and stay zero when nothing was measured.
+    bool routeSurvivable{true};
+    float routeRunYards{0.f};
+    uint32_t routeLevel{0};
 };
 
 enum class TravelTargetVerdict : uint8_t
@@ -3623,6 +3790,9 @@ enum class TravelTargetVerdict : uint8_t
     NothingOfThatKind,    // no spawn of the role is on this map at all
     NoneWillDealWithUs,   // there are spawns and this character may use none
     EveryOneIsGuarded,    // it may use some, and every one stands in hostile ground
+    // it may use some, none of those is guarded, and the ground on the way to
+    // every one of them is above this character (#267's out-of-scope half)
+    EveryRouteIsLethal,
 };
 
 struct TravelTargetChoice
@@ -3634,6 +3804,8 @@ struct TravelTargetChoice
     std::size_t refused{0};
     int nearestGuarded{-1}; // the nearest usable one standing in hostile ground
     std::size_t guarded{0}; // how many usable ones were refused for their guards
+    int nearestLethalRoute{-1}; // the nearest one the walk to was refused
+    std::size_t lethalRoutes{0}; // how many were refused for the ground on the way
 };
 
 // THE NEAREST SPAWN THIS CHARACTER CAN ACTUALLY USE, and nothing else about

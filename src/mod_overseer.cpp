@@ -546,6 +546,48 @@ struct NearbyThreat
     std::string name;
 };
 
+// WHETHER THIS SPAWN IS SOMETHING A CHARACTER COULD BE MADE TO FIGHT AT ALL
+// (#302, which is a live false refusal in the gate that already shipped and is
+// filed on its own because it stands without #300).
+//
+// Both sweeps above ask "is it hostile and is it above me", and both were
+// answering yes about things that cannot be fought by anybody. Twenty-four
+// "Headless Horseman Flame Bunny" (entry 23686, level 70, faction 14) stand in
+// Kharanos all year round carrying UNIT_FLAG_NOT_SELECTABLE; they are the
+// anchor a Hallow's End fire effect is played on. Measured on the dev realm's
+// own rows on 2026-09-07: of the 1,163 spawns on the two starting continents
+// this module can send a character to, 505 read as guarded by the #267 gate,
+// and 60 of those are guarded ONLY by something in this class. Sixty shops
+// refused, and a level 27 turned away from Kharanos, on grounds of a
+// decoration.
+//
+// THE THREE FLAGS ARE THE CORE'S OWN ANSWER TO THIS QUESTION and are read from
+// the same place `Unit::_IsValidAttackTarget` reads them, rather than from a
+// name pattern: `[DND]`, `Trigger`, `Bunny` and `Dummy` are conventions the
+// world database mostly follows and is not obliged to.
+//
+//   UNIT_FLAG_NON_ATTACKABLE   0x00000002   UnitDefines.h:258
+//   UNIT_FLAG_IMMUNE_TO_PC     0x00000100   UnitDefines.h:265
+//   UNIT_FLAG_NOT_SELECTABLE   0x02000000   UnitDefines.h:282
+//
+// AND THE SPAWN'S OWN FLAGS WIN WHERE IT HAS THEM, for the same reason and by
+// the same rule BuildTravelIndex already applies to `npcflag`: `creature`
+// carries a per-spawn override and zero means "use the template"
+// (CreatureData::unit_flags, CreatureData.h:384; CreatureTemplate::unit_flags,
+// CreatureData.h:214).
+//
+// THIS DELIBERATELY CHANGES THE GRAVEYARD ANSWER TOO, because it is the same
+// question and GraveyardRefusal is the other caller: a cemetery is not a
+// hostile camp because somebody parked a fire effect in it.
+static bool CanBeFought(CreatureData const& data, CreatureTemplate const* tmpl)
+{
+    static constexpr uint32 CANNOT_FIGHT =
+        UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_SELECTABLE;
+    uint32 const flags = data.unit_flags ? data.unit_flags
+                                         : (tmpl ? tmpl->unit_flags : 0);
+    return (flags & CANNOT_FIGHT) == 0;
+}
+
 static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float y,
                                       float radius, uint32 aboveLevel)
 {
@@ -566,6 +608,8 @@ static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float 
             continue;
         CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
         if (!tmpl || tmpl->maxlevel <= aboveLevel)
+            continue;
+        if (!CanBeFought(data, tmpl))
             continue;
         FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
         if (!theirs || !theirs->IsHostileTo(*mine))
@@ -619,6 +663,8 @@ static void HostileSpawnsNearEach(Player* bot, uint32 mapId,
             continue;
         CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
         if (!tmpl || tmpl->maxlevel <= aboveLevel)
+            continue;
+        if (!CanBeFought(data, tmpl))
             continue;
         FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
         if (!theirs || !theirs->IsHostileTo(*mine))
@@ -950,6 +996,54 @@ constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
 // Refusing less than that would strand a party in any contested zone, which is
 // a worse bug than the one being fixed.
 constexpr float TRAVEL_THREAT_RADIUS = GRAVEYARD_THREAT_RADIUS;
+
+// THE GROUND ON THE WAY TO ONE, WHICH #267 PUT OUT OF SCOPE (#300). Its own
+// argument for doing so was that aiming only the party leader bounds the risk.
+// It does not: the four followers walk the same ground behind it, and the night
+// after the destination gate went live a level 31 leader died in Burning
+// Steppes on the way to an innkeeper while a level 27 following it died four
+// times in eight minutes crossing Searing Gorge. The destination each of them
+// was walking to was clean. The ground between was not.
+//
+// THE WALK IS SAMPLED ALONG THE STRAIGHT LINE, and OverseerDecisions'
+// RouteReading carries the whole argument for why that is the honest reading
+// rather than an approximation of one: nothing anywhere computes a long route,
+// so there is no better polyline being passed over. Read it before changing
+// any of the three numbers below.
+//
+// EVERY THIRTY YARDS AT MOST, against a sixty yard radius, so consecutive
+// samples overlap and nothing standing on the line falls between two of them.
+// AT MOST, because PlanRouteSamples divides the line into a whole number of
+// spacings no longer than this and puts one sample in the middle of each: the
+// real spacing is this or a little under, never over, and never leaves the last
+// fraction of the line with no sample standing in it.
+constexpr float TRAVEL_WALK_SAMPLE_YARDS = TRAVEL_THREAT_RADIUS / 2.f;
+
+// HOW MANY OF THE CANDIDATES GET A WALK READ, nearest first, and it is
+// GRAVEYARD_CANDIDATES for the same reason the radius is the graveyard's: the
+// module already decided six was the right depth to search for somewhere a
+// character can stand, and this is that search one question further on.
+//
+// SIX RATHER THAN ONE because a shortlist of one releases an errand the moment
+// the nearest shop happens to be across a river of elites. Measured over 120
+// origins drawn at random from the service spawns of both continents at level
+// 27: with six, one origin releases and two re-aim; with three, four of the
+// twelve origins whose nearest candidate is refused would have released with a
+// perfectly good shop fifth in the list.
+constexpr std::size_t TRAVEL_WALK_CANDIDATES = GRAVEYARD_CANDIDATES;
+
+// AND THE LONGEST WALK THAT IS READ AT ALL, so one absurd aim cannot turn this
+// into a sweep with a thousand points in it. Past this the tail of the line is
+// simply not judged, which is safe in exactly one direction: this gate may only
+// REFUSE, so an unread tail can hide a danger and can never invent one.
+constexpr float TRAVEL_WALK_MAX_YARDS = 6000.0f;
+
+// HOW MUCH UNBROKEN `??` GROUND A WALK MAY CROSS BEFORE IT IS REFUSED. The
+// number and the corridors it was measured against live with the rule, in
+// OverseerDecisions::RouteLimits; it is named here so the adapter's three
+// numbers can be read together and so the default in that header is never
+// silently the operative value.
+constexpr float TRAVEL_WALK_LETHAL_YARDS = 200.0f;
 
 // How close counts as arrived. INTERACTION_DISTANCE is 5.0 yards and is what
 // the game uses to decide whether a player may talk to an NPC at all; this is
@@ -7097,6 +7191,96 @@ private:
             {
                 candidates[usableIndex[k]].guardCount = threats[k].count;
                 candidates[usableIndex[k]].guardLevel = threats[k].level;
+            }
+        }
+
+        // AND WHAT IS STANDING BETWEEN HERE AND EACH OF THE NEAREST FEW (#300).
+        //
+        // A SECOND SWEEP, AND IT IS SMALLER THAN THE FIRST. The sweep above
+        // asks about one point per usable spawn - 823 of them on the map this
+        // was measured on. This one asks about the LINE to at most
+        // TRAVEL_WALK_CANDIDATES of those, capped at TRAVEL_WALK_MAX_YARDS, so
+        // it is at most 6 x 200 points and is usually far fewer: the nearest
+        // six shops are rarely six thousand yards off. Both are one pass over
+        // the spawn table whose inner loop runs only for spawns already known
+        // to be hostile and above the `??` line, so the cost of each is the
+        // number of POINTS and this one is comparable to the gate that shipped.
+        //
+        // ONLY THE ONES STILL IN THE RUNNING. A candidate this character may
+        // not use, or one already refused for the guards standing on it, has no
+        // walk worth reading - the same restraint the guard sweep applies to
+        // the interaction gate, one gate further on.
+        //
+        // `aboveLevel` IS THE GATE'S OWN, so a sample reads zero for ground
+        // that holds nothing at or above the `??` line rather than for ground
+        // that holds nothing at all. JudgeRoute applies the same threshold
+        // again over the top, which is deliberate: the decision has to be
+        // correct for a full reading as well as for this pre-filtered one, and
+        // its test feeds it both.
+        std::vector<std::size_t> shortlist;
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+            if (candidates[i].mayInteract && !candidates[i].guardCount)
+                shortlist.push_back(i);
+        std::sort(shortlist.begin(), shortlist.end(),
+                  [&candidates](std::size_t a, std::size_t b)
+                  {
+                      if (candidates[a].distance != candidates[b].distance)
+                          return candidates[a].distance < candidates[b].distance;
+                      return a < b;   // so the answer never depends on sweep order
+                  });
+        if (shortlist.size() > TRAVEL_WALK_CANDIDATES)
+            shortlist.resize(TRAVEL_WALK_CANDIDATES);
+
+        // WHERE THE SAMPLES STAND IS OverseerDecisions' ARITHMETIC, not this
+        // loop's. It has a rounding boundary in it, the direction of the
+        // rounding is load-bearing for a gate that may only ever refuse, and
+        // nothing in this file can be compiled by a test - so it lives where
+        // one can. See PlanRouteSamples.
+        std::vector<std::pair<float, float>> alongTheWay;
+        std::vector<OverseerDecisions::RouteSampling> walkPlan(shortlist.size());
+        float const fromX = bot->GetPositionX();
+        float const fromY = bot->GetPositionY();
+        for (std::size_t k = 0; k < shortlist.size(); ++k)
+        {
+            TravelSpawn const& spawn = *spawns[shortlist[k]];
+            float const dx = spawn.x - fromX;
+            float const dy = spawn.y - fromY;
+            float const span = std::sqrt(dx * dx + dy * dy);
+            // A shop inside one spacing is not a walk, and the ground around it
+            // is already swept by the destination gate above at the same radius.
+            walkPlan[k] = OverseerDecisions::PlanRouteSamples(
+                span, TRAVEL_WALK_SAMPLE_YARDS, TRAVEL_WALK_MAX_YARDS);
+            for (std::size_t n = 0; n < walkPlan[k].samples; ++n)
+            {
+                float const t = OverseerDecisions::RouteSampleAt(walkPlan[k], n) / span;
+                alongTheWay.emplace_back(fromX + dx * t, fromY + dy * t);
+            }
+        }
+        if (!alongTheWay.empty())
+        {
+            std::vector<NearbyThreat> ground;
+            HostileSpawnsNearEach(bot, mapId, alongTheWay, TRAVEL_THREAT_RADIUS,
+                                  bot->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1,
+                                  ground);
+            std::size_t at = 0;
+            for (std::size_t k = 0; k < shortlist.size(); ++k)
+            {
+                OverseerDecisions::RouteReading reading;
+                reading.characterLevel = bot->GetLevel();
+                // The spacing the plan settled on, which divides the read
+                // length exactly, rather than the nominal thirty.
+                reading.sampleSpacingYards = walkPlan[k].spacingYards;
+                reading.worstLevelAtSample.reserve(walkPlan[k].samples);
+                for (std::size_t n = 0; n < walkPlan[k].samples; ++n)
+                    reading.worstLevelAtSample.push_back(ground[at + n].level);
+                at += walkPlan[k].samples;
+
+                OverseerDecisions::RouteVerdict const verdict = OverseerDecisions::JudgeRoute(
+                    reading, OverseerDecisions::RouteLimits{CON_COLOR_UNKNOWN_LEVEL_DIFF,
+                                                            TRAVEL_WALK_LETHAL_YARDS});
+                candidates[shortlist[k]].routeSurvivable = verdict.survivable;
+                candidates[shortlist[k]].routeRunYards = verdict.longestLethalRunYards;
+                candidates[shortlist[k]].routeLevel = verdict.worstLevel;
             }
         }
 
