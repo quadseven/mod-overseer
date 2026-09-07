@@ -3181,6 +3181,83 @@ bool MayInteractAt(Reaction reaction)
     return static_cast<int>(reaction) > static_cast<int>(Reaction::Unfriendly);
 }
 
+RouteSampling PlanRouteSamples(float spanYards, float maxSpacingYards, float maxSpanYards)
+{
+    RouteSampling sampling;
+    if (!(spanYards > 0.f) || !(maxSpacingYards > 0.f) || spanYards < maxSpacingYards)
+        return sampling;
+
+    float const read = (maxSpanYards > 0.f && spanYards > maxSpanYards) ? maxSpanYards : spanYards;
+
+    // THE DIVISION IS DONE IN DOUBLE ON PURPOSE. In float, 6000 / 30 can land a
+    // hair above 200 and a ceiling would then ask for 201 samples to cover a
+    // length 200 already covers exactly. The two values either side of this are
+    // both exactly representable, so in double the quotient of an exact
+    // multiple is exactly the integer and the ceiling does not move it. This is
+    // the boundary TheExactMultipleNeverLostASample pins.
+    double const wanted = double(read) / double(maxSpacingYards);
+    std::size_t count = std::size_t(wanted);
+    if (double(count) < wanted)
+        ++count;          // round UP; see the header for why the direction matters
+    if (!count)
+        count = 1;
+
+    sampling.samples = count;
+    sampling.spacingYards = read / float(count);
+    sampling.readYards = read;
+    return sampling;
+}
+
+float RouteSampleAt(RouteSampling const& sampling, std::size_t index)
+{
+    // The MIDDLE of the index-th spacing, which is what makes `samples`
+    // spacings add up to `readYards` with nothing unspoken for at either end
+    // and no sample standing past the destination.
+    return (float(index) + 0.5f) * sampling.spacingYards;
+}
+
+RouteVerdict JudgeRoute(RouteReading const& reading, RouteLimits const& limits)
+{
+    RouteVerdict verdict;
+    // NOT MEASURED IS NOT SAFE, IT IS UNCLAIMED. Both of these are what a
+    // caller that decided the route was not worth reading hands in - a
+    // candidate it never shortlisted, or one whose line is shorter than a
+    // single sample - and neither is evidence about the ground.
+    if (reading.worstLevelAtSample.empty() || reading.sampleSpacingYards <= 0.f)
+        return verdict;
+
+    uint32_t const unknownAt = reading.characterLevel + limits.unknownLevelDiff;
+    std::size_t lethal = 0;
+    std::size_t run = 0;
+    std::size_t longest = 0;
+    for (uint32_t level : reading.worstLevelAtSample)
+    {
+        if (level > verdict.worstLevel)
+            verdict.worstLevel = level;
+        if (level < unknownAt)
+        {
+            run = 0;
+            continue;
+        }
+        ++lethal;
+        ++run;
+        if (run > longest)
+            longest = run;
+    }
+
+    verdict.lethalYards = float(lethal) * reading.sampleSpacingYards;
+    verdict.longestLethalRunYards = float(longest) * reading.sampleSpacingYards;
+    // THE UNBROKEN STRETCH IS THE MEASURE, NOT THE TOTAL, and the difference is
+    // the whole judgement. A party can be chased past one camp; it cannot run
+    // six hundred yards through ground where everything reads `??`. Two hundred
+    // yards of trouble in ten separate twenty-yard pieces is an ordinary walk
+    // through a contested zone, and refusing that would strand a family
+    // anywhere worth being. The total is carried anyway, because it is what an
+    // operator wants beside the refusal.
+    verdict.survivable = verdict.longestLethalRunYards <= limits.lethalRunYards;
+    return verdict;
+}
+
 TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates)
 {
     TravelTargetChoice choice;
@@ -3210,6 +3287,20 @@ TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& 
                 choice.nearestGuarded = int(i);
             continue;
         }
+        // The third gate, and it is asked LAST for the same reason the second
+        // is asked after the first: it is the most expensive question, so it is
+        // never asked about a spawn that is already out. A destination this
+        // character can use and can stand at is still not an answer when the
+        // ground between here and it is above it - which is the half #267 named
+        // and scoped out, and the half that has been killing the family since.
+        if (!candidate.routeSurvivable)
+        {
+            ++choice.lethalRoutes;
+            if (choice.nearestLethalRoute < 0 ||
+                candidate.distance < candidates[std::size_t(choice.nearestLethalRoute)].distance)
+                choice.nearestLethalRoute = int(i);
+            continue;
+        }
         if (choice.index < 0 ||
             candidate.distance < candidates[std::size_t(choice.index)].distance)
             choice.index = int(i);
@@ -3217,8 +3308,16 @@ TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& 
 
     if (choice.index >= 0)
         choice.verdict = TravelTargetVerdict::Chosen;
+    // GUARDED OUTRANKS A LETHAL ROUTE, and the order is the same argument the two
+    // below it settle. A guarded destination is a place that will kill this
+    // character when it ARRIVES, which is a sharper fact and a smaller fix than
+    // ground it has to cross to get anywhere at all; and the two counts cannot
+    // overlap, because a candidate refused for its guards is never given a
+    // route to read.
     else if (choice.guarded)
         choice.verdict = TravelTargetVerdict::EveryOneIsGuarded;
+    else if (choice.lethalRoutes)
+        choice.verdict = TravelTargetVerdict::EveryRouteIsLethal;
     else
         choice.verdict = TravelTargetVerdict::NoneWillDealWithUs;
     return choice;
@@ -3251,10 +3350,24 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
                " hostile spawn(s) up to level " + std::to_string(candidate.guardLevel);
     };
 
+    // One refused for its route is named with the ground on the way, because "entry
+    // 3495 at 2013 yards" and "entry 3495 at 2013 yards, across 598 yards of
+    // unbroken ground held to level 65" are the difference between an errand
+    // that looks arbitrary and one an operator can act on.
+    auto const routeNameOf = [&](int index)
+    {
+        TravelTargetCandidate const& candidate = candidates[std::size_t(index)];
+        return nameOf(index) + ", across " + yards(candidate.routeRunYards) +
+               " yards of unbroken ground held to level " +
+               std::to_string(candidate.routeLevel);
+    };
+
     bool const haveRefused = choice.nearestRefused >= 0 &&
                              std::size_t(choice.nearestRefused) < candidates.size();
     bool const haveGuarded = choice.nearestGuarded >= 0 &&
                              std::size_t(choice.nearestGuarded) < candidates.size();
+    bool const haveLethalRoute = choice.nearestLethalRoute >= 0 &&
+                                 std::size_t(choice.nearestLethalRoute) < candidates.size();
 
     if (choice.verdict == TravelTargetVerdict::NoneWillDealWithUs)
     {
@@ -3282,6 +3395,22 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
         return said;
     }
 
+    // A FOURTH FACT, FOR THE SAME REASON THERE WERE THREE. "Every one of them
+    // stands in hostile ground" and "every one of them is across it" are
+    // answered differently: the first says pick a different shop, the second
+    // says this party is standing somewhere it cannot leave on foot, and only
+    // one of those is about the shops.
+    if (choice.verdict == TravelTargetVerdict::EveryRouteIsLethal)
+    {
+        std::string said = std::to_string(choice.lethalRoutes) +
+                           " of them on this map are ones this character may use and stand "
+                           "in safe ground, and the walk to every one of them crosses ground "
+                           "it cannot survive";
+        if (haveLethalRoute)
+            said += " - the nearest is " + routeNameOf(choice.nearestLethalRoute);
+        return said;
+    }
+
     if (choice.verdict != TravelTargetVerdict::Chosen)
         return {};
     if (std::size_t(choice.index) >= candidates.size())
@@ -3296,6 +3425,7 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
     float const chosen = candidates[std::size_t(choice.index)].distance;
     std::size_t nearer = 0;
     std::size_t nearerGuarded = 0;
+    std::size_t nearerLethalRoute = 0;
     for (TravelTargetCandidate const& candidate : candidates)
     {
         if (candidate.distance >= chosen)
@@ -3304,8 +3434,10 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
             ++nearer;
         else if (candidate.guardCount)
             ++nearerGuarded;
+        else if (!candidate.routeSurvivable)
+            ++nearerLethalRoute;
     }
-    if (!nearer && !nearerGuarded)
+    if (!nearer && !nearerGuarded && !nearerLethalRoute)
         return {};
 
     // The two halves are said separately and only when each one cost a walk,
@@ -3327,6 +3459,14 @@ std::string TravelTargetExplanation(TravelTargetChoice const& choice,
                 " nearer one(s) standing in hostile ground";
         if (haveGuarded)
             said += " - the nearest of those is " + guardedNameOf(choice.nearestGuarded);
+    }
+    if (nearerLethalRoute)
+    {
+        said += (nearer || nearerGuarded) ? "; and over " : " over ";
+        said += std::to_string(nearerLethalRoute) +
+                " nearer one(s) it cannot reach alive";
+        if (haveLethalRoute)
+            said += " - the nearest of those is " + routeNameOf(choice.nearestLethalRoute);
     }
     return said;
 }
