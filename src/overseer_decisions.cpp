@@ -4791,6 +4791,311 @@ TownRetry HearthRefusalRetry(std::string const& detail)
 }
 
 
+// -------------------------------------------------------- a way round (#316)
+
+char const* RoutePlanVerdictName(RoutePlanVerdict verdict)
+{
+    switch (verdict)
+    {
+        case RoutePlanVerdict::Planned:        return "planned";
+        case RoutePlanVerdict::NoGraph:        return "no travel nodes on this map";
+        case RoutePlanVerdict::NoEntryNode:    return "no travel node within reach";
+        case RoutePlanVerdict::NoNearerNode:   return "nothing reachable on foot is nearer";
+        case RoutePlanVerdict::BadLimits:      return "the limits asked for are not distances";
+    }
+    return "unknown";
+}
+
+namespace
+{
+
+// THE FILE ALREADY HAS A SQUARE ROOT AND THIS USES IT. `SquareRoot` above is
+// hand-rolled precisely so this translation unit keeps needing nothing but its
+// own header; a second one written here would spend that argument twice and
+// leave two things to get wrong instead of one. A NaN or a negative comes back
+// as zero from it, which reads here as "these two points are in the same place"
+// and is refused by the caller's own gain and reach tests rather than by a
+// separate branch.
+float PlaneDistance(float ax, float ay, float bx, float by)
+{
+    double const dx = static_cast<double>(ax) - static_cast<double>(bx);
+    double const dy = static_cast<double>(ay) - static_cast<double>(by);
+    return static_cast<float>(SquareRoot(dx * dx + dy * dy));
+}
+
+// A binary heap over (cost, node index), smallest first. Hand-rolled for the
+// same include reason: <queue> and <algorithm> are not on this file's list and
+// the whole of what is needed here is push and pop.
+struct CostHeap
+{
+    std::vector<float> cost;
+    std::vector<std::uint32_t> at;
+
+    bool Empty() const { return at.empty(); }
+
+    void Push(float c, std::uint32_t index)
+    {
+        cost.push_back(c);
+        at.push_back(index);
+        std::size_t child = at.size() - 1;
+        while (child > 0)
+        {
+            std::size_t const parent = (child - 1) / 2;
+            if (cost[parent] <= cost[child])
+                break;
+            float const tc = cost[parent];
+            cost[parent] = cost[child];
+            cost[child] = tc;
+            std::uint32_t const ta = at[parent];
+            at[parent] = at[child];
+            at[child] = ta;
+            child = parent;
+        }
+    }
+
+    void Pop(float& outCost, std::uint32_t& outIndex)
+    {
+        outCost = cost[0];
+        outIndex = at[0];
+        cost[0] = cost.back();
+        at[0] = at.back();
+        cost.pop_back();
+        at.pop_back();
+        std::size_t parent = 0;
+        while (true)
+        {
+            std::size_t const left = parent * 2 + 1;
+            std::size_t const right = left + 1;
+            std::size_t smallest = parent;
+            if (left < at.size() && cost[left] < cost[smallest])
+                smallest = left;
+            if (right < at.size() && cost[right] < cost[smallest])
+                smallest = right;
+            if (smallest == parent)
+                break;
+            float const tc = cost[parent];
+            cost[parent] = cost[smallest];
+            cost[smallest] = tc;
+            std::uint32_t const ta = at[parent];
+            at[parent] = at[smallest];
+            at[smallest] = ta;
+            parent = smallest;
+        }
+    }
+};
+
+}  // namespace
+
+RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
+                        std::vector<RouteLink> const& links,
+                        std::uint32_t mapId, float fromX, float fromY,
+                        float toX, float toY, RoutePlanLimits const& limits)
+{
+    RoutePlan plan;
+    if (!(limits.entryNodeYards > 0.f) || !(limits.minGainYards >= 0.f))
+    {
+        plan.verdict = RoutePlanVerdict::BadLimits;
+        return plan;
+    }
+
+    // ONE MAP, AND THE INDEX IS BUILT ONCE. `local` maps a node id to its slot
+    // in `here`, so the link pass below is a lookup rather than a scan.
+    std::vector<RouteNode> here;
+    std::map<std::uint32_t, std::uint32_t> local;
+    for (RouteNode const& node : nodes)
+    {
+        if (node.mapId != mapId)
+            continue;
+        // A DUPLICATE ID IS DROPPED AND NOT MERGED. The id is what the links
+        // name; two nodes claiming it would make every link about them
+        // ambiguous, and picking one silently is how a route ends up walking to
+        // a place nobody meant.
+        if (local.find(node.id) != local.end())
+            continue;
+        local.insert(std::make_pair(node.id, static_cast<std::uint32_t>(here.size())));
+        here.push_back(node);
+    }
+    if (here.empty())
+    {
+        plan.verdict = RoutePlanVerdict::NoGraph;
+        return plan;
+    }
+
+    // The way in: the nearest node, and it must be near. A route from a node
+    // the character cannot get to is not a route.
+    std::uint32_t entry = 0;
+    float entryDistance = -1.f;
+    for (std::uint32_t i = 0; i < here.size(); ++i)
+    {
+        float const d = PlaneDistance(here[i].x, here[i].y, fromX, fromY);
+        if (entryDistance < 0.f || d < entryDistance)
+        {
+            entryDistance = d;
+            entry = i;
+        }
+    }
+    if (entryDistance > limits.entryNodeYards)
+    {
+        plan.verdict = RoutePlanVerdict::NoEntryNode;
+        return plan;
+    }
+
+    // Walk links only, both endpoints on this map, laid out per node so the
+    // search below never scans the whole link list again.
+    std::vector<std::vector<std::uint32_t>> firstEdge(here.size());
+    std::vector<std::uint32_t> edgeTo;
+    std::vector<float> edgeCost;
+    for (RouteLink const& link : links)
+    {
+        if (!link.onFoot)
+            continue;
+        // A NEGATIVE OR ABSENT COST IS NOT A FREE LINK. Upstream prices a link
+        // it wants refused at less than zero; treated as a distance that would
+        // be a link the search prefers to every real one.
+        if (!(link.yards >= 0.f))
+            continue;
+        std::map<std::uint32_t, std::uint32_t>::const_iterator const from = local.find(link.from);
+        std::map<std::uint32_t, std::uint32_t>::const_iterator const to = local.find(link.to);
+        if (from == local.end() || to == local.end())
+            continue;
+        firstEdge[from->second].push_back(static_cast<std::uint32_t>(edgeTo.size()));
+        edgeTo.push_back(to->second);
+        edgeCost.push_back(link.yards);
+    }
+
+    std::vector<float> best(here.size(), -1.f);
+    std::vector<std::uint32_t> came(here.size(), 0);
+    std::vector<bool> reached(here.size(), false);
+    CostHeap open;
+    best[entry] = 0.f;
+    came[entry] = entry;
+    open.Push(0.f, entry);
+    while (!open.Empty())
+    {
+        float cost = 0.f;
+        std::uint32_t at = 0;
+        open.Pop(cost, at);
+        if (reached[at])
+            continue;
+        reached[at] = true;
+        for (std::uint32_t e : firstEdge[at])
+        {
+            std::uint32_t const next = edgeTo[e];
+            if (reached[next])
+                continue;
+            float const through = cost + edgeCost[e];
+            if (best[next] < 0.f || through < best[next])
+            {
+                best[next] = through;
+                came[next] = at;
+                open.Push(through, next);
+            }
+        }
+    }
+
+    // THE GOAL IS CHOSEN OUT OF WHAT WAS REACHED. See the header: choosing it
+    // by distance first and asking for a path second answers "no route" for
+    // every journey measured on this issue, all of which have one.
+    float const standing = PlaneDistance(fromX, fromY, toX, toY);
+    std::uint32_t goal = entry;
+    float goalDistance = -1.f;
+    for (std::uint32_t i = 0; i < here.size(); ++i)
+    {
+        if (!reached[i])
+            continue;
+        float const d = PlaneDistance(here[i].x, here[i].y, toX, toY);
+        if (goalDistance < 0.f || d < goalDistance)
+        {
+            goalDistance = d;
+            goal = i;
+        }
+    }
+    if (goalDistance < 0.f || goal == entry ||
+        standing - goalDistance < limits.minGainYards)
+    {
+        plan.verdict = RoutePlanVerdict::NoNearerNode;
+        return plan;
+    }
+
+    // Unwound from the goal, so the caller reads it entry first.
+    std::vector<std::uint32_t> backwards;
+    std::uint32_t at = goal;
+    while (true)
+    {
+        backwards.push_back(here[at].id);
+        if (at == entry)
+            break;
+        at = came[at];
+    }
+    plan.nodes.reserve(backwards.size());
+    for (std::size_t i = backwards.size(); i > 0; --i)
+        plan.nodes.push_back(backwards[i - 1]);
+    plan.verdict = RoutePlanVerdict::Planned;
+    plan.yards = best[goal];
+    plan.endsFromAimYards = goalDistance;
+    return plan;
+}
+
+RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
+                      float x, float y, RouteLegLimits const& limits)
+{
+    RouteAim aim;
+    if (route.empty())
+        return aim;
+    if (!(limits.lookaheadYards > 0.f) || !(limits.arrivedYards >= 0.f))
+        return aim;
+    if (cursor.at >= route.size())
+        cursor.at = static_cast<std::uint32_t>(route.size()) - 1;
+
+    // THE ROUTE IS SPENT WHEN ITS LAST POINT IS REACHED, and that is asked
+    // FIRST. A character standing on the end of the route has a nearest point
+    // and a lookahead like any other, and answering those before this one would
+    // hand it its own feet every poll for the rest of the errand.
+    RoutePoint const& last = route[route.size() - 1];
+    if (PlaneDistance(last.x, last.y, x, y) <= limits.arrivedYards)
+    {
+        cursor.at = static_cast<std::uint32_t>(route.size()) - 1;
+        aim.arrived = true;
+        return aim;
+    }
+
+    // FORWARD ONLY. The scan starts where the cursor already is and never looks
+    // behind it, so a route cannot be walked backwards however the stepper
+    // wanders.
+    std::uint32_t nearest = cursor.at;
+    float nearestDistance = PlaneDistance(route[cursor.at].x, route[cursor.at].y, x, y);
+    for (std::uint32_t i = cursor.at + 1; i < route.size(); ++i)
+    {
+        float const d = PlaneDistance(route[i].x, route[i].y, x, y);
+        if (d < nearestDistance)
+        {
+            nearest = i;
+            nearestDistance = d;
+            continue;
+        }
+        // Running away by more than a lookahead means the rest of the route is
+        // further off than anything this poll could aim at, so there is nothing
+        // left to find. A route that doubles back is the case this bounds.
+        if (d > nearestDistance + limits.lookaheadYards)
+            break;
+    }
+    cursor.at = nearest;
+
+    // ...and the aim is the furthest point still inside the lookahead.
+    std::uint32_t ahead = nearest;
+    while (ahead + 1 < route.size() &&
+           PlaneDistance(route[ahead + 1].x, route[ahead + 1].y, x, y) <= limits.lookaheadYards)
+        ++ahead;
+
+    aim.hasAim = true;
+    aim.index = ahead;
+    aim.x = route[ahead].x;
+    aim.y = route[ahead].y;
+    aim.z = route[ahead].z;
+    return aim;
+}
+
+
 char const* TeleportFlightWord(TeleportFlight flight)
 {
     switch (flight)
