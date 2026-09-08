@@ -5780,8 +5780,27 @@ ConjureOutcome ConjureReadBack(bool readable, uint32_t before, uint32_t after,
     return ConjureOutcome::Nothing;
 }
 
+char const* ConjureCastBlocker(ConjureCastGate const& gate)
+{
+    // THE ORDER IS THE BOT AI'S OWN. PlayerbotAI::CastSpell tests flying first,
+    // then the stand state, then movement, and only then builds a Spell whose
+    // prepare answers the cooldowns. Reporting them in a different order would
+    // name a wall the caster had not reached yet.
+    if (!gate.grounded)
+        return ConjureRefusal::InFlight;
+    if (!gate.standing)
+        return ConjureRefusal::NotStanding;
+    if (gate.moving)
+        return ConjureRefusal::Moving;
+    if (!gate.spellReady)
+        return ConjureRefusal::SpellOnCooldown;
+    if (!gate.globalReady)
+        return ConjureRefusal::GlobalCooldown;
+    return "";
+}
+
 uint32_t ConjureVerifyWindowMs(uint32_t castMs, uint32_t casts, uint32_t marginMs,
-                               uint32_t settleMs, uint32_t floorMs)
+                               uint32_t settleMs, uint32_t floorMs, uint32_t ceilingMs)
 {
     // Saturating throughout. Every input here comes from somewhere this module
     // does not own - a DBC, a plan, a config - and the one failure this
@@ -5789,7 +5808,11 @@ uint32_t ConjureVerifyWindowMs(uint32_t castMs, uint32_t casts, uint32_t marginM
     // that a working conjure is judged as having done nothing.
     uint64_t const perCast = uint64_t(castMs) + uint64_t(marginMs);
     uint64_t const total = perCast * uint64_t(casts == 0 ? 1u : casts) + uint64_t(settleMs);
-    uint64_t const floored = total < uint64_t(floorMs) ? uint64_t(floorMs) : total;
+    uint64_t floored = total < uint64_t(floorMs) ? uint64_t(floorMs) : total;
+    // THE CEILING WINS OVER THE FLOOR. A cap a floor can lift is not a cap, and
+    // what is being capped here is how long a character is held still.
+    if (ceilingMs != 0 && floored > uint64_t(ceilingMs))
+        floored = uint64_t(ceilingMs);
     return floored > 0xFFFFFFFFull ? 0xFFFFFFFFu : uint32_t(floored);
 }
 

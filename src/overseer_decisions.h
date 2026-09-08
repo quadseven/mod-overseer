@@ -6142,14 +6142,22 @@ TownRetry SummonRefusalRetry(std::string const& detail);
 // first version of this section proved it by writing one down and being wrong.
 // It said "two items per three second cast", which is what the DBC's base
 // points and die sides come to on paper. The running server reported TEN for
-// the same spell and the same character, through SpellEffectInfo::CalcValue,
-// which is what the executor actually asks and what the effect actually
-// creates. The difference is not reconciled here and is not pretended to be:
-// the number comes from the world at runtime, the read-back counts what really
-// landed in the bags, and a row that under-estimated ends as `short` and can
-// simply be sent again. The cast time is three seconds and the items stack to
-// twenty; those two are stable and are what the window and the target are
-// built on.
+// the same spell and the same character through SpellEffectInfo::CalcValue,
+// which is what the executor asks and what the effect actually creates.
+//
+// AND THEN IT REPORTED TWELVE, which is what settled it. Two live rows, same
+// spell, same character, ten and then twelve. The mage was level 26 for the
+// first and 27 for the second, and RealPointsPerLevel on every Conjure Food and
+// Conjure Water rank is 2.00. So the count scales with the caster's level, by
+// exactly that, and it changes under this module every time the mage levels.
+// There is no number to write down here, only a call to make. (The paper
+// arithmetic that gave two was wrong about a clamp; the running server is the
+// authority and it always was.)
+//
+// The read-back counts what really landed in the bags, and a row that
+// under-estimated ends as `short` and can simply be sent again. The cast time
+// is three seconds and the items stack to twenty; those two are stable and are
+// what the window and the target are built on.
 //
 // Column re-use, no new columns:
 //   target_name  the character that will cast
@@ -6412,6 +6420,35 @@ ConjureStep ConjureNextStep(ConjureProgress const& progress);
 // whether a row ended.
 ConjureGaveUp ConjureGiveUpReason(ConjureProgress const& progress);
 
+// WHAT THE BOT AI IS ABOUT TO REFUSE ON, ASKED BEFORE IT IS ASKED (#329).
+//
+// PlayerbotAI::CastSpell answers a bare bool. It returns false when the caster
+// is flying or on a taxi, when it is not standing (it stands the caster up and
+// gives up that attempt), when it is moving and the spell has a cast time, and
+// when Spell::prepare refuses - which for this spell is a cooldown or the
+// global cooldown far more often than anything else. All four look identical
+// from the other side of that bool, and #325 shipped a counter of them: a live
+// row read `casts_refused: 4, casts_spent: 0` and the world held no record of
+// which wall it was, four times over.
+//
+// So the executor reads these five facts off the character and asks this, and
+// the row carries the answer. That is the same discipline kind='hearth' keeps -
+// "every condition the handler would refuse on is named on this side first" -
+// applied to a call whose refusal is a bool instead of a packet.
+struct ConjureCastGate
+{
+    bool grounded{true};     // not flying and not on a taxi
+    bool standing{true};     // Unit::IsStandState
+    bool moving{false};      // Unit::isMoving, which refuses any timed cast
+    bool spellReady{true};   // the spell's own cooldown has finished
+    bool globalReady{true};  // ...and so has the global one
+};
+
+// "" when nothing here would refuse the cast, otherwise the literal for the
+// FIRST thing that would, in the order the bot AI checks them. First and not
+// all of them, because a row wants the wall it hit rather than a list.
+char const* ConjureCastBlocker(ConjureCastGate const& gate);
+
 // The refusal literal for each wall, so the word a row carries is decided here
 // and not in the executor. NotGivenUp has no literal and answers "".
 char const* ConjureGaveUpReasonWord(ConjureGaveUp reason);
@@ -6467,8 +6504,16 @@ ConjureOutcome ConjureReadBack(bool readable, uint32_t before, uint32_t after,
 // to take, the motion master has to run down, and this module only looks every
 // COMMAND_POLL_MS. A window that did not carry that allowance would judge a row
 // that spent its first ten seconds coming to a halt.
+//
+// `ceilingMs` was added by #329 and is the other half of the same thought. The
+// window is now the maximum length of time a character is HELD STILL, and a
+// hold is a cost the whole party pays: a follower stopped for a minute while
+// its leader walks on has to catch up afterwards. The arithmetic above can
+// reach a minute on a large target, so it is capped, and the cap wins over the
+// floor when the two disagree because a ceiling that a floor can lift is not a
+// ceiling. A ceiling of 0 means no cap.
 uint32_t ConjureVerifyWindowMs(uint32_t castMs, uint32_t casts, uint32_t marginMs,
-                               uint32_t settleMs, uint32_t floorMs);
+                               uint32_t settleMs, uint32_t floorMs, uint32_t ceilingMs);
 
 // The refusal literals, all of them, in one place because they are what both
 // sides of the queue read. None may carry a quote character: they go straight
@@ -6507,6 +6552,22 @@ constexpr char const* BudgetSpent     = "every allowed cast was sent";
 // One row per character at a time, because two would both hold it still and
 // the first to finish would let it walk away under the second.
 constexpr char const* AlreadyRunning  = "a conjure is already running for this character";
+
+// THE FOUR THE BOT AI REFUSES ON WITHOUT SAYING SO (#329).
+// PlayerbotAI::CastSpell returns a bare bool. Every one of these makes it
+// answer false, and #325 shipped a counter of those falses with no way to
+// tell them apart: a live row read `casts_refused: 4, casts_spent: 0` and
+// nothing in the world could say which wall it was. These are asked on this
+// side, before the call, in the order the bot AI asks them itself.
+constexpr char const* Moving          = "character is moving";
+constexpr char const* NotStanding     = "character is not standing";
+constexpr char const* SpellOnCooldown = "the spell is on cooldown";
+constexpr char const* GlobalCooldown  = "the global cooldown has not finished";
+// ...and the honest unknown, for the case where none of the four is true and
+// the bot AI declines anyway. Naming it as an unknown is the whole point: a
+// row that says this is a row that has ruled the other four out, which is a
+// far better place to start than a bare count of nothing.
+constexpr char const* CastDeclined    = "the bot ai declined the cast and named no reason";
 }  // namespace ConjureRefusal
 
 // WHETHER A REFUSAL IS WORTH ASKING AGAIN. Keyed on the `detail` literal, the

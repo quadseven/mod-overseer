@@ -33,6 +33,8 @@
 using OverseerDecisions::ClassRestoresManaByDrinking;
 using OverseerDecisions::CONJURE_UNITS_DEFAULT;
 using OverseerDecisions::CONJURE_UNITS_MAX;
+using OverseerDecisions::ConjureCastBlocker;
+using OverseerDecisions::ConjureCastGate;
 using OverseerDecisions::ConjureGaveUp;
 using OverseerDecisions::ConjureGaveUpReasonWord;
 using OverseerDecisions::ConjureGiveUpReason;
@@ -492,29 +494,29 @@ void TheWindowIsPerCastAndMultiplied()
     // Ten casts of three seconds, with a second of margin each: a hearth's
     // single-cast window would judge this one after three seconds and always
     // answer `nothing`.
-    CheckNum("ten three second casts", ConjureVerifyWindowMs(3000, 10, 1000, 0, 6000), 40000);
-    CheckNum("one cast", ConjureVerifyWindowMs(3000, 1, 1000, 0, 6000), 6000);
-    CheckNum("two casts clear the floor", ConjureVerifyWindowMs(3000, 2, 1000, 0, 6000),
+    CheckNum("ten three second casts", ConjureVerifyWindowMs(3000, 10, 1000, 0, 6000, 0), 40000);
+    CheckNum("one cast", ConjureVerifyWindowMs(3000, 1, 1000, 0, 6000, 0), 6000);
+    CheckNum("two casts clear the floor", ConjureVerifyWindowMs(3000, 2, 1000, 0, 6000, 0),
              8000);
 }
 
 void AZeroCastTimeCannotProduceAWindowThatJudgesInstantly()
 {
-    CheckNum("no cast time at all", ConjureVerifyWindowMs(0, 1, 0, 0, 6000), 6000);
-    CheckNum("and no margin either", ConjureVerifyWindowMs(0, 0, 0, 0, 6000), 6000);
+    CheckNum("no cast time at all", ConjureVerifyWindowMs(0, 1, 0, 0, 6000, 0), 6000);
+    CheckNum("and no margin either", ConjureVerifyWindowMs(0, 0, 0, 0, 6000, 0), 6000);
     // A count of zero is treated as one rather than as no window at all: a row
     // that got here with no casts planned still has to be answered.
     CheckNum("zero casts still gets one cast's window",
-             ConjureVerifyWindowMs(3000, 0, 1000, 0, 100), 4000);
+             ConjureVerifyWindowMs(3000, 0, 1000, 0, 100, 0), 4000);
 }
 
 void NonsenseInputsSaturateRatherThanWrap()
 {
     uint32_t const huge = 0xFFFFFFFFu;
-    CheckNum("a nonsense cast time", ConjureVerifyWindowMs(huge, 10, 1000, 0, 6000), huge);
-    CheckNum("a nonsense cast count", ConjureVerifyWindowMs(3000, huge, 1000, 0, 6000), huge);
-    CheckNum("a nonsense margin", ConjureVerifyWindowMs(3000, 10, huge, 0, 6000), huge);
-    CheckNum("a nonsense floor", ConjureVerifyWindowMs(1, 1, 1, 0, huge), huge);
+    CheckNum("a nonsense cast time", ConjureVerifyWindowMs(huge, 10, 1000, 0, 6000, 0), huge);
+    CheckNum("a nonsense cast count", ConjureVerifyWindowMs(3000, huge, 1000, 0, 6000, 0), huge);
+    CheckNum("a nonsense margin", ConjureVerifyWindowMs(3000, 10, huge, 0, 6000, 0), huge);
+    CheckNum("a nonsense floor", ConjureVerifyWindowMs(1, 1, 1, 0, huge, 0), huge);
 }
 
 // ---------------------------------------------------------------- retrying --
@@ -553,6 +555,15 @@ void EverythingTheCharacterIsDoingEndsOnItsOwn()
     CheckRetry("never stood still", ConjureRefusal::NeverStoodStill, TownRetry::Later);
     CheckRetry("budget spent", ConjureRefusal::BudgetSpent, TownRetry::Later);
     CheckRetry("already running", ConjureRefusal::AlreadyRunning, TownRetry::Later);
+    // The five #329 added. Every one of them is a fact about this second on this
+    // character: a stand state, a step, two cooldowns, and an unknown. All
+    // `later`, and none of them ever `never`: a cast declined once says nothing
+    // at all about the next one.
+    CheckRetry("moving", ConjureRefusal::Moving, TownRetry::Later);
+    CheckRetry("not standing", ConjureRefusal::NotStanding, TownRetry::Later);
+    CheckRetry("spell cooldown", ConjureRefusal::SpellOnCooldown, TownRetry::Later);
+    CheckRetry("global cooldown", ConjureRefusal::GlobalCooldown, TownRetry::Later);
+    CheckRetry("declined without a reason", ConjureRefusal::CastDeclined, TownRetry::Later);
 }
 
 // NO REFUSAL HERE IS EVER `Elsewhere`, and it is checked rather than left as an
@@ -575,6 +586,9 @@ void WalkingSomewhereElseFixesNoConjure()
         ConjureRefusal::EnoughAlready,  ConjureRefusal::NothingAppeared,
         ConjureRefusal::CastRefused,    ConjureRefusal::NeverStoodStill,
         ConjureRefusal::BudgetSpent,    ConjureRefusal::AlreadyRunning,
+        ConjureRefusal::Moving,         ConjureRefusal::NotStanding,
+        ConjureRefusal::SpellOnCooldown, ConjureRefusal::GlobalCooldown,
+        ConjureRefusal::CastDeclined,
     };
     for (char const* literal : every)
     {
@@ -741,12 +755,12 @@ void TheStepAndTheReasonNeverDisagree()
 void TheWindowCarriesTheSettleAllowance()
 {
     CheckNum("four casts plus a settle",
-             ConjureVerifyWindowMs(3000, 4, 1000, 12000, 6000), 4 * 4000 + 12000);
+             ConjureVerifyWindowMs(3000, 4, 1000, 12000, 6000, 0), 4 * 4000 + 12000);
     CheckNum("the settle alone can clear the floor",
-             ConjureVerifyWindowMs(0, 1, 0, 12000, 6000), 12000);
+             ConjureVerifyWindowMs(0, 1, 0, 12000, 6000, 0), 12000);
     uint32_t const huge = 0xFFFFFFFFu;
     CheckNum("a nonsense settle saturates",
-             ConjureVerifyWindowMs(3000, 4, 1000, huge, 6000), huge);
+             ConjureVerifyWindowMs(3000, 4, 1000, huge, 6000, 0), huge);
 }
 
 
@@ -846,6 +860,108 @@ void CastsDeclinedBeforeTheyStartAreNotCastsThatProducedNothing()
                 ConjureGaveUp::NeverStoodStill);
 }
 
+
+// ------------------------------------------- the wall the bot ai will not name --
+//
+// #329. `kind='conjure'` was fixed to hold the character still and shipped, and
+// a live row came back reading `casts_refused: 4, casts_spent: 0,
+// settle_polls: 0, blocked_polls: 0`. So: four casts declined, the character
+// standing still, out of combat, alive, holding the right spell, and NOTHING in
+// the world able to say which of the four things PlayerbotAI::CastSpell refuses
+// on had been true. That bare bool is the gap; these are the questions asked on
+// this side before it is asked, so the row carries an answer.
+
+void NothingInTheWayIsNoBlocker()
+{
+    ConjureCastGate clear;
+    CheckWord("all clear", ConjureCastBlocker(clear), "");
+}
+
+void EachWallIsNamedAndTheOrderIsTheBotAiSown()
+{
+    ConjureCastGate flying;
+    flying.grounded = false;
+    CheckWord("flying", ConjureCastBlocker(flying), ConjureRefusal::InFlight);
+
+    ConjureCastGate sitting;
+    sitting.standing = false;
+    CheckWord("sitting", ConjureCastBlocker(sitting), ConjureRefusal::NotStanding);
+
+    ConjureCastGate walking;
+    walking.moving = true;
+    CheckWord("walking", ConjureCastBlocker(walking), ConjureRefusal::Moving);
+
+    ConjureCastGate cooling;
+    cooling.spellReady = false;
+    CheckWord("spell cooldown", ConjureCastBlocker(cooling), ConjureRefusal::SpellOnCooldown);
+
+    ConjureCastGate global;
+    global.globalReady = false;
+    CheckWord("global cooldown", ConjureCastBlocker(global), ConjureRefusal::GlobalCooldown);
+}
+
+// THE ORDER MATTERS AND IS NOT ALPHABETICAL. PlayerbotAI::CastSpell tests
+// flying, then the stand state, then movement, and only then builds a Spell
+// whose prepare answers the cooldowns. A row that named a wall the caster had
+// not reached yet would send somebody to fix the wrong thing.
+void TheFirstWallWinsWhenSeveralAreTrue()
+{
+    ConjureCastGate all;
+    all.grounded = false;
+    all.standing = false;
+    all.moving = true;
+    all.spellReady = false;
+    all.globalReady = false;
+    CheckWord("everything wrong at once", ConjureCastBlocker(all), ConjureRefusal::InFlight);
+
+    ConjureCastGate grounded = all;
+    grounded.grounded = true;
+    CheckWord("standing beats moving", ConjureCastBlocker(grounded),
+              ConjureRefusal::NotStanding);
+
+    ConjureCastGate up = grounded;
+    up.standing = true;
+    CheckWord("moving beats the cooldowns", ConjureCastBlocker(up), ConjureRefusal::Moving);
+
+    ConjureCastGate still = up;
+    still.moving = false;
+    CheckWord("the spell's own cooldown beats the global one", ConjureCastBlocker(still),
+              ConjureRefusal::SpellOnCooldown);
+}
+
+// ---------------------------------------------------- the window has a ceiling --
+//
+// The window is now the maximum length of time a character is HELD STILL, and a
+// hold is a cost the whole party pays: the row that prompted this held a
+// follower for 61 seconds while its leader walked on.
+void TheWindowIsCapped()
+{
+    // Seven casts of three seconds with four of margin, plus twelve of settle,
+    // is the 61 seconds a live row actually carried.
+    CheckNum("uncapped, this is what it was",
+             ConjureVerifyWindowMs(3000, 7, 4000, 12000, 8000, 0), 61000);
+    CheckNum("and capped it is the cap",
+             ConjureVerifyWindowMs(3000, 7, 4000, 12000, 8000, 45000), 45000);
+    CheckNum("a window under the cap is left alone",
+             ConjureVerifyWindowMs(3000, 2, 1000, 0, 6000, 45000), 8000);
+}
+
+// A CAP A FLOOR CAN LIFT IS NOT A CAP. The floor exists so a zero cast time
+// cannot produce a window that judges instantly; the ceiling exists so a hold
+// cannot outlast what the party can afford. When they disagree the ceiling has
+// to win, because the thing it is protecting is a character standing still.
+void TheCeilingWinsOverTheFloor()
+{
+    CheckNum("floor above ceiling", ConjureVerifyWindowMs(0, 1, 0, 0, 30000, 10000), 10000);
+    CheckNum("a ceiling of zero is no ceiling",
+             ConjureVerifyWindowMs(3000, 7, 4000, 12000, 8000, 0), 61000);
+    uint32_t const huge = 0xFFFFFFFFu;
+    CheckNum("a nonsense window still saturates under no cap",
+             ConjureVerifyWindowMs(huge, 10, 1000, 0, 6000, 0), huge);
+    CheckNum("and is capped when there is a cap",
+             ConjureVerifyWindowMs(huge, 10, 1000, 0, 6000, 45000), 45000);
+}
+
 }  // namespace
 
 int main()
@@ -884,6 +1000,11 @@ int main()
     ArrivingBeatsEvenTheWindow();
     ARowThatTimedOutSaysWhichKindOfRowItWas();
     CastsDeclinedBeforeTheyStartAreNotCastsThatProducedNothing();
+    NothingInTheWayIsNoBlocker();
+    EachWallIsNamedAndTheOrderIsTheBotAiSown();
+    TheFirstWallWinsWhenSeveralAreTrue();
+    TheWindowIsCapped();
+    TheCeilingWinsOverTheFloor();
     ATargetOfZeroIsNotSilentlyDone();
 
     TheBagsDecideWhatTheRowMayClaim();
