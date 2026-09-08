@@ -25000,6 +25000,14 @@ private:
     static constexpr uint32 CONJURE_SETTLE_POLLS = 6;
     static constexpr uint32 CONJURE_SETTLE_MS = CONJURE_SETTLE_POLLS * COMMAND_POLL_MS;
 
+    // AND THE LONGEST A CHARACTER MAY BE HELD STILL FOR ONE ROW (#329). The
+    // window's arithmetic reached 61 seconds on a live row, which is a long time
+    // to stop a follower whose leader is walking a route: it has to catch that
+    // route up afterwards. Forty five seconds is still four or five casts plus
+    // the settle at this family's level, and it is a cost a party can absorb.
+    // The row that runs out of it says so and can simply be sent again.
+    static constexpr uint32 CONJURE_WINDOW_CEILING_MS = 45000;
+
     // WHAT A CONJURE ROW KNOWS, IN ONE PLACE, so every exit writes the same
     // shape and a row that ends says what it was judged on.
     struct ConjureEvidence
@@ -25027,10 +25035,25 @@ private:
         uint32 castMs{0};
         uint32 windowMs{0};
         uint32 waitedMs{0};
+        uint32 stoodUp{0};          // times this row had to stand the caster up
+        char const* castBlocker{""};  // why the last refused cast was refused
         bool roomLimited{false};
         bool movingAtStart{false};  // was it walking when the row was claimed
-        bool held{false};           // `+stay` is on and this row put it there
-        bool restoreNewRpg{false};  // ...and `new rpg` came off with it
+        bool held{false};           // the hold is on right now
+        // HELD IS NOT WHAT THE ROW SHOULD REPORT, AND #325 REPORTED IT (#329).
+        // ReleaseConjureHold clears `held` and the JSON is written after the
+        // release, so every finished row said `held_still: false` whatever had
+        // happened. It was not a measurement of anything. This one is sticky and
+        // says only that a hold was applied; the two read back off the engine
+        // below say what was actually true when the row ended.
+        bool heldEver{false};
+        bool stayAtEnd{false};    // `stay` present on the engine at the verdict
+        bool followAtEnd{false};  // ...and `follow`, which outranks it
+        // ONLY UNDO WHAT THIS ROW DID. A conjure that strips a `+stay` an
+        // operator put on by hand is a conjure that breaks the next thing.
+        bool addedStay{false};
+        bool removedFollow{false};
+        bool removedNewRpg{false};
         OverseerDecisions::ConjureOutcome verdict{OverseerDecisions::ConjureOutcome::Unreadable};
     };
 
@@ -25095,7 +25118,17 @@ private:
           << ",\"blocked_polls\":" << ev.blockedPolls
           << ",\"blocked_by\":" << J(ev.blockedBy)
           << ",\"moving_at_start\":" << (ev.movingAtStart ? "true" : "false")
-          << ",\"held_still\":" << (ev.held ? "true" : "false")
+          << ",\"stood_up\":" << ev.stoodUp
+          << ",\"cast_blocker\":" << J(ev.castBlocker)
+          // WHAT WAS ASKED FOR, AND WHAT THE ENGINE ACTUALLY HAD. The first is
+          // this module's own bookkeeping and the second is read back off the
+          // bot at the verdict, which is the difference #329 exists for.
+          << ",\"hold_applied\":" << (ev.heldEver ? "true" : "false")
+          << ",\"hold_took_stay\":" << (ev.addedStay ? "true" : "false")
+          << ",\"hold_took_follow\":" << (ev.removedFollow ? "true" : "false")
+          << ",\"hold_took_new_rpg\":" << (ev.removedNewRpg ? "true" : "false")
+          << ",\"stay_at_end\":" << (ev.stayAtEnd ? "true" : "false")
+          << ",\"follow_at_end\":" << (ev.followAtEnd ? "true" : "false")
           << ",\"cast_ms\":" << ev.castMs
           << ",\"window_ms\":" << ev.windowMs
           << ",\"waited_ms\":" << ev.waitedMs
@@ -25187,12 +25220,14 @@ private:
                 // #325 is why that sentence is emphatic. This section used to
                 // carry a comment saying every rank makes two per cast, which
                 // is what the DBC's base points and die sides come to on paper.
-                // The running server reported TEN for this spell and this
-                // character through the call below. The difference is not
-                // reconciled here and is not pretended to be: this is what the
-                // effect itself will use, the read-back counts what really
-                // landed, and a row that under-estimated ends as `short` and
-                // can simply be sent again.
+                // The running server reported TEN through the call below, and
+                // then TWELVE for the same spell and the same character a few
+                // hours later. That second reading is the one that settled it:
+                // the mage was level 26 and then 27, and RealPointsPerLevel on
+                // every conjure rank is 2.00, so the count scales with the
+                // caster's level and changes under this module every time the
+                // character levels. There is no number to write down, only this
+                // call to make.
                 int32 const made = info->Effects[i].CalcValue(who);
                 if (made <= 0)
                     continue;
@@ -25224,35 +25259,82 @@ private:
         return false;
     }
 
-    // ASK THE CHARACTER TO STAND STILL, the same way DriveStuckRevival does and
-    // for the same reason: `+stay` is a strategy, it is reversible, and it
-    // clears no errand. `new rpg` comes off beside it because it is the drive
-    // that walks a leader, and it goes back on in ReleaseConjureHold.
+    // ASK THE CHARACTER TO STAND STILL, and #329 is why this is longer than it
+    // was.
     //
-    // NOT StopMoving AND NOT A MOTION MASTER CLEAR, which is what upstream's
-    // own UseHearthStone does. kind='hearth' argued that one out and the
-    // argument holds here: clearing a character's movement is a side effect
-    // nobody asked this verb for, and mod-overseer#163 is what that costs.
-    static void HoldConjurerStill(PlayerbotAI* botAI, ConjureEvidence& ev)
+    // WHAT #325 GOT WRONG. It added `+stay` and dropped `new rpg`, copying
+    // DriveStuckRevival's hold, and it did not touch `follow`. Read off the live
+    // engine while a conjure was failing, the mage's non-combat strategies were:
+    // bmana, buff, chat, cure, default, dps assist, duel, emote, flee, FOLLOW,
+    // food, force rebuff, gather, loot, mount, nc, pvp, quest. No `new rpg` at
+    // all, so the one thing that hold removed was not even on, and `follow` -
+    // which moves a character by the party rather than by its own drive - was
+    // untouched. StayStrategy's own action carries relevance 1.0 and is a
+    // DEFAULT action, so anything else that wants to move the bot outranks it.
+    // The module's post-revival hold has the same gap; it has never had to hold
+    // a follower whose leader was walking, because a revival stops the party.
+    //
+    // WHAT IT DOES NOW. Records what was actually there, removes only what it
+    // finds, and does what StayActionBase::Stay would have done if the engine
+    // had ever selected it: StopMoving and clear the chase and follow unit
+    // states. That is not a new power - it is the exact body of the action this
+    // hold is switching on, and it is what makes the difference between asking
+    // for a hold and getting one.
+    //
+    // AND IT LEAVES `flee` ALONE, DELIBERATELY. A fleeing character moves, so
+    // `flee` will fight this hold, and removing it would be this verb holding a
+    // character still while something kills it. Combat is already a wall the
+    // loop waits on; being alive is not negotiable for a stack of bread.
+    //
+    // STILL NOT A MOTION MASTER CLEAR, which is the line kind='hearth' drew and
+    // it still holds: clearing a character's movement generators would cancel a
+    // travel errand nobody asked this verb to cancel (#163).
+    static void HoldConjurerStill(Player* who, PlayerbotAI* botAI, ConjureEvidence& ev)
     {
         if (ev.held)
             return;
-        ev.restoreNewRpg = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
-        botAI->ChangeStrategy("+stay", BOT_STATE_NON_COMBAT);
-        if (ev.restoreNewRpg)
-            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
         ev.held = true;
+        ev.heldEver = true;
+
+        if (!botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT))
+        {
+            botAI->ChangeStrategy("+stay", BOT_STATE_NON_COMBAT);
+            ev.addedStay = true;
+        }
+        if (botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+        {
+            botAI->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+            ev.removedFollow = true;
+        }
+        if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+        {
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+            ev.removedNewRpg = true;
+        }
+
+        // The body of StayActionBase::Stay, which is the action the strategy
+        // above would run if it ever won a tick. Done here because a default
+        // action with relevance 1.0 loses to everything, and because a strategy
+        // that is switched on and never selected is not a hold.
+        who->StopMoving();
+        who->ClearUnitState(UNIT_STATE_CHASE);
+        who->ClearUnitState(UNIT_STATE_FOLLOW);
+
         LOG_INFO("module.overseer",
-                 "overseer: '{}' is held still (`+stay`{}) to conjure; it walks again the "
-                 "moment the row ends, however it ends",
-                 ev.character, ev.restoreNewRpg ? ", `-new rpg`" : "");
+                 "overseer: '{}' is held still to conjure (stay {}, follow {}, new rpg {}); it "
+                 "walks again the moment the row ends, however it ends",
+                 ev.character, ev.addedStay ? "added" : "already on",
+                 ev.removedFollow ? "removed" : "was off",
+                 ev.removedNewRpg ? "removed" : "was off");
     }
 
-    // THE OTHER END, AND IT RUNS ON EVERY EXIT. A hold that is not released is
-    // a character this module stopped and forgot, which is a worse bug than the
-    // one this whole fix is about. Called from the verdict, from every give-up,
-    // from the window expiring, and from the bot AI going away underneath a
-    // running row.
+    // THE OTHER END, AND IT RUNS ON EVERY EXIT. A hold that is not released is a
+    // character this module stopped and forgot, which is a worse bug than the
+    // one this whole fix is about.
+    //
+    // IT UNDOES ONLY WHAT IT DID (#329). The previous version removed `stay`
+    // unconditionally, so a conjure row would strip a `+stay` an operator had
+    // put on by hand while trying to help - which is exactly what one did.
     static void ReleaseConjureHold(Player* who, ConjureEvidence& ev)
     {
         if (!ev.held)
@@ -25271,16 +25353,18 @@ private:
                      ev.character);
             return;
         }
-        botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
-        if (ev.restoreNewRpg)
-            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
-        else if (botAI->GetMaster())
+        if (ev.addedStay)
+            botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
+        if (ev.removedFollow)
             botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
-        LOG_INFO("module.overseer", "overseer: '{}' is released from its conjure hold ({})",
-                 ev.character,
-                 ev.restoreNewRpg ? "`new rpg` restored"
-                                  : botAI->GetMaster() ? "`follow` restored"
-                                                       : "nothing to restore");
+        if (ev.removedNewRpg)
+            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is released from its conjure hold (stay {}, follow {}, "
+                 "new rpg {})",
+                 ev.character, ev.addedStay ? "removed" : "left alone",
+                 ev.removedFollow ? "restored" : "not touched",
+                 ev.removedNewRpg ? "restored" : "not touched");
     }
 
     static char const* DoConjure(Player* who, std::string const& command, char const*& status,
@@ -25422,7 +25506,8 @@ private:
 
         ev.castsAllowed = plan.casts + CONJURE_EXTRA_CASTS;
         ev.windowMs = ConjureVerifyWindowMs(ev.castMs, ev.castsAllowed, CONJURE_MARGIN_MS,
-                                            CONJURE_SETTLE_MS, CONJURE_FLOOR_MS);
+                                            CONJURE_SETTLE_MS, CONJURE_FLOOR_MS,
+                                            CONJURE_WINDOW_CEILING_MS);
         ev.movingAtStart = who->isMoving();
 
         // ---- ask it to stand, and cast NOTHING yet ---------------------------
@@ -25434,7 +25519,7 @@ private:
         // the caster is moving. So this hands the row to the resolver with the
         // hold applied and zero casts spent, and the FIRST cast goes out on the
         // first poll that finds the character actually standing still.
-        HoldConjurerStill(botAI, ev);
+        HoldConjurerStill(who, botAI, ev);
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' will conjure {} (spell {} -> item {} x{} a cast); has {}, "
@@ -25617,23 +25702,55 @@ private:
 
                 if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
                 {
-                    // THE RETURN VALUE IS EVIDENCE AND THE FIRST VERSION THREW
-                    // IT AWAY. False means PlayerbotAI::CastSpell declined
-                    // before Spell::prepare - a moving caster, a stand state it
-                    // had to fix first, a spell the core would not build - and
-                    // none of that is a cast. Counted separately so a row that
-                    // made nothing can say which of the two it was, and charged
-                    // against the idle budget so a cast that is refused for ever
-                    // ends the row instead of running out the window.
+                    // ASK THE WALLS BEFORE ASKING THE BOT AI (#329). Every one
+                    // of these makes PlayerbotAI::CastSpell answer false, and it
+                    // answers false the same way for all of them, which is how
+                    // #325 shipped a row reading four refusals and no reason.
+                    OverseerDecisions::ConjureCastGate gate;
+                    gate.grounded = !bot->IsFlying()
+                                    && !bot->HasUnitState(UNIT_STATE_IN_FLIGHT);
+                    gate.standing = bot->IsStandState();
+                    gate.moving = bot->isMoving();
+                    gate.spellReady = !bot->HasSpellCooldown(check.ev.spellId);
+                    gate.globalReady = true;
+                    if (SpellInfo const* info = sSpellMgr->GetSpellInfo(check.ev.spellId))
+                        gate.globalReady =
+                            !bot->GetGlobalCooldownMgr().HasGlobalCooldown(info);
+
+                    // STAND IT UP RATHER THAN SPEND AN ATTEMPT ON IT. The bot AI
+                    // stands a sitting caster up and then gives up that cast, so
+                    // a character that sits between polls can burn the whole
+                    // budget one wasted attempt at a time. Standing up is what
+                    // the game does to a sitting player who casts; it is the
+                    // same call the bot AI is about to make, one attempt earlier.
+                    if (!gate.standing)
+                    {
+                        bot->SetStandState(UNIT_STAND_STATE_STAND);
+                        ++check.ev.stoodUp;
+                        gate.standing = bot->IsStandState();
+                    }
+
+                    char const* const blocker = OverseerDecisions::ConjureCastBlocker(gate);
+
+                    // THE RETURN VALUE IS EVIDENCE AND #320 THREW IT AWAY. False
+                    // means the bot AI declined before Spell::prepare, and none
+                    // of that is a cast. Counted separately so a row that made
+                    // nothing can say which of the two it was, charged against
+                    // the idle budget so a cast refused for ever ends the row,
+                    // and now NAMED, so the next row of this shape arrives with
+                    // its own diagnosis instead of a bare number.
                     if (botAI->CastSpell(check.ev.spellId, bot))
                     {
                         ++check.ev.castsSpent;
                         check.castPending = true;
+                        check.ev.castBlocker = "";
                     }
                     else
                     {
                         ++check.ev.castsRefused;
                         ++check.idlePolls;
+                        check.ev.castBlocker =
+                            *blocker ? blocker : OverseerDecisions::ConjureRefusal::CastDeclined;
                     }
                     stillRunning.push_back(check);
                     continue;
@@ -25657,7 +25774,18 @@ private:
 
             // ---- the verdict -------------------------------------------------
             //
-            // THE HOLD COMES OFF FIRST, before anything can return early. A
+            // READ THE ENGINE BACK BEFORE TOUCHING IT (#329). What the row wants
+            // to report is what was TRUE when it ended, and the release is about
+            // to change it. #325 wrote its hold flag after the release and so
+            // reported `held_still: false` on every finished row, which was not
+            // a measurement of anything.
+            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+            {
+                check.ev.stayAtEnd = botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
+                check.ev.followAtEnd = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
+            }
+
+            // THEN the hold comes off, before anything can return early. A
             // character this module stopped and then forgot would be a worse
             // bug than the one this fix is about.
             ReleaseConjureHold(bot, check.ev);
@@ -25684,11 +25812,17 @@ private:
             // should have taken: it applies only when nothing at all was tried,
             // and every literal it can produce is already in the refusal table
             // with a retry class of its own.
-            char const* const wallWord =
-                (check.ev.castsSpent == 0 && check.ev.castsRefused == 0
-                 && check.ev.blockedPolls != 0 && *check.ev.blockedBy)
-                    ? check.ev.blockedBy
-                    : ConjureGaveUpReasonWord(wall);
+            char const* wallWord = ConjureGaveUpReasonWord(wall);
+            if (check.ev.castsSpent == 0 && check.ev.castsRefused == 0
+                && check.ev.blockedPolls != 0 && *check.ev.blockedBy)
+                wallWord = check.ev.blockedBy;
+            // ...AND WHEN THE CASTS WERE REFUSED, SAY WHAT REFUSED THEM (#329).
+            // "The cast did not start" is a class of answer, not an answer. The
+            // gate above knows which wall it was, and that literal is already in
+            // the refusal table with a retry class of its own.
+            else if (check.ev.castsSpent == 0 && check.ev.castsRefused != 0
+                     && *check.ev.castBlocker)
+                wallWord = check.ev.castBlocker;
 
             switch (check.ev.verdict)
             {
@@ -25737,6 +25871,16 @@ private:
                              check.ev.blockedPolls,
                              *check.ev.blockedBy ? check.ev.blockedBy : "nothing blocking",
                              check.ev.spellId, detail);
+                    LOG_WARN("module.overseer",
+                             "overseer: conjure {} - '{}' held? {} (stay {}, follow {}); at the "
+                             "end stay was {} and follow was {}; stood up {} time(s); last cast "
+                             "refusal: {}",
+                             check.id, check.targetName, check.ev.heldEver ? "yes" : "no",
+                             check.ev.addedStay ? "added" : "untouched",
+                             check.ev.removedFollow ? "removed" : "untouched",
+                             check.ev.stayAtEnd ? "on" : "off",
+                             check.ev.followAtEnd ? "on" : "off", check.ev.stoodUp,
+                             *check.ev.castBlocker ? check.ev.castBlocker : "none recorded");
                     break;
 
                 case ConjureOutcome::Unreadable:
