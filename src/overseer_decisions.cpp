@@ -5374,6 +5374,90 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
 }
 
 
+char const* StagingCorridorVerdictName(StagingCorridorVerdict verdict)
+{
+    switch (verdict)
+    {
+        case StagingCorridorVerdict::Joined:       return "joined";
+        case StagingCorridorVerdict::NoCorridor:   return "no measured corridor for this door";
+        case StagingCorridorVerdict::NotThisAim:   return "the corridor ends somewhere else";
+        case StagingCorridorVerdict::TooFarToJoin: return "nothing on the corridor is near enough to walk to";
+        case StagingCorridorVerdict::LegTooLong:   return "two of its points stand more than one lookahead apart";
+        case StagingCorridorVerdict::BadLimits:    return "the limits asked for are not distances";
+    }
+    return "unknown";
+}
+
+StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
+                                        float aimX, float aimY,
+                                        float fromX, float fromY,
+                                        StagingCorridorLimits const& limits)
+{
+    StagingCorridorPlan plan;
+    if (!(limits.endsAtYards >= 0.f) || !(limits.joinYards >= 0.f) ||
+        !(limits.maxLegYards > 0.f))
+    {
+        plan.verdict = StagingCorridorVerdict::BadLimits;
+        return plan;
+    }
+    if (corridor.empty())
+    {
+        plan.verdict = StagingCorridorVerdict::NoCorridor;
+        return plan;
+    }
+
+    // WHOSE CORRIDOR IS THIS. Asked before anything else is measured, because
+    // every other answer below is about a corridor that has already been shown
+    // to belong to this walk.
+    RoutePoint const& last = corridor[corridor.size() - 1];
+    if (PlaneDistance(last.x, last.y, aimX, aimY) > limits.endsAtYards)
+    {
+        plan.verdict = StagingCorridorVerdict::NotThisAim;
+        return plan;
+    }
+
+    // The whole corridor, not only the part about to be walked. See the header:
+    // a malformed table is a fact worth failing on wherever a character happens
+    // to join it.
+    for (std::size_t i = 0; i + 1 < corridor.size(); ++i)
+    {
+        float const d = PlaneDistance(corridor[i].x, corridor[i].y,
+                                      corridor[i + 1].x, corridor[i + 1].y);
+        if (d > plan.longestLegYards)
+            plan.longestLegYards = d;
+    }
+    if (plan.longestLegYards > limits.maxLegYards)
+    {
+        plan.verdict = StagingCorridorVerdict::LegTooLong;
+        return plan;
+    }
+
+    std::size_t join = 0;
+    float joinDistance = -1.f;
+    for (std::size_t i = 0; i < corridor.size(); ++i)
+    {
+        float const d = PlaneDistance(corridor[i].x, corridor[i].y, fromX, fromY);
+        if (joinDistance < 0.f || d < joinDistance)
+        {
+            joinDistance = d;
+            join = i;
+        }
+    }
+    if (joinDistance > limits.joinYards)
+    {
+        plan.verdict = StagingCorridorVerdict::TooFarToJoin;
+        return plan;
+    }
+
+    plan.route.reserve(corridor.size() - join);
+    for (std::size_t i = join; i < corridor.size(); ++i)
+        plan.route.push_back(corridor[i]);
+    plan.verdict = StagingCorridorVerdict::Joined;
+    plan.joinIndex = join;
+    plan.joinYards = joinDistance;
+    return plan;
+}
+
 char const* TeleportFlightWord(TeleportFlight flight)
 {
     switch (flight)
