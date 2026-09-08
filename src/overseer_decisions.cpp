@@ -2814,6 +2814,57 @@ bool WalkAlreadyInFlight(bool reissueForced, bool canAct, bool atSameDestination
     return atSameDestination;
 }
 
+char const* AimedMoverName(AimedMover verdict)
+{
+    switch (verdict)
+    {
+        case AimedMover::Walks:             return "walks already";
+        case AimedMover::HeldOnPurpose:     return "held on purpose";
+        case AimedMover::GrantToLeader:     return "grant to the leader";
+        case AimedMover::GrantToSteerer:    return "grant to the steerer";
+        case AimedMover::RefuseInFormation: return "refuse, in formation";
+        case AimedMover::RefuseCutOff:      return "refuse, cut off";
+    }
+    return "refuse, in formation";
+}
+
+AimedMover ReadAimedMover(AimedMoverFacts const& facts)
+{
+    // Asked first because it is the one input that makes every other one
+    // irrelevant: a character that can already act on its aim is not a case
+    // this decision exists for.
+    if (facts.carriesStrategy)
+        return AimedMover::Walks;
+    // THEN THIS MODULE'S OWN HOLD, AHEAD OF EVERY ROLE BELOW. The hold is the
+    // one reason the strategy can be missing that is not a fault, and it
+    // outranks the roles rather than sitting beside them: a held LEADER is the
+    // measured case, and granting it back would override a hold this module
+    // placed three seconds earlier and still intends to lift itself.
+    if (facts.heldAfterRevival)
+        return AimedMover::HeldOnPurpose;
+    // The leader before the steerer, because the two are not exclusive and the
+    // leader is the stronger claim. A leader escorted by its own dungeon run is
+    // both, and the answer worth acting on for it names the reason that does not
+    // end when the escort does.
+    if (facts.leadsItsParty)
+        return AimedMover::GrantToLeader;
+    if (facts.steersItself)
+        return AimedMover::GrantToSteerer;
+    // Both remaining answers are refusals, and they differ only in the remedy
+    // they can offer, which is why they are two enumerators rather than one with
+    // a flag hung off it. See SplitErrand above for why "aim the leader instead"
+    // is the one thing that cannot work for a follower on another map.
+    if (facts.cutOffFromLeader)
+        return AimedMover::RefuseCutOff;
+    return AimedMover::RefuseInFormation;
+}
+
+bool AimedMoverGrants(AimedMover verdict)
+{
+    return verdict == AimedMover::GrantToLeader ||
+           verdict == AimedMover::GrantToSteerer;
+}
+
 char const* CrossingLegName(CrossingLeg leg)
 {
     switch (leg)

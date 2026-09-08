@@ -3169,6 +3169,12 @@ public:
         float y{0.f};
         float z{0.f};
         bool arrived{false};  // announced already
+        // Said once per HOLD, not once per errand, which is why it is not
+        // `arrived` (#311). The post-revival hold takes `new rpg` off on purpose
+        // for a few seconds and gives it back itself, so the line about it is
+        // not a refusal and must not latch for the rest of the errand: a
+        // character that is held now may still be owed a real refusal later.
+        bool heldSaid{false};
         // THE FLIGHT LEG (#68). Three fields, all scoped to ONE errand and all
         // cleared with it, for the same reason the ratchet below is: a flight
         // is a fact about the trip being taken, not about the character.
@@ -10138,6 +10144,51 @@ private:
                 OverseerDecisions::ErrandRunsAlone(_travelAims.TargetFor(name)));
     }
 
+    // DOES THIS CHARACTER LEAD, OR ANSWER TO NOBODY? Upstream's own test for who
+    // may carry `new rpg`, asked here rather than restated in different words.
+    // AiFactory adds the strategy behind `!GetGroup() || GetGroup()->
+    // GetLeaderGUID() == GetGUID()`, and the escort section above already quotes
+    // that gate as the reason a FOLLOWER can never hold it. The same sentence
+    // read the other way round is the reason a leader always may.
+    //
+    // THE GROUP'S LEADER, NOT THE ROSTER'S. The two disagree for one poll every
+    // time leadership drifts, and KeepRosterFollowing is careful about exactly
+    // that distinction for exactly this reason: a character handed the strategy
+    // because a table says it leads, while the group says somebody else does, is
+    // the second free-roamer this module exists to prevent.
+    //
+    // AND NO GROUP AT ALL IS A LEAD. A family reduced to one character by
+    // logouts follows nobody, and refusing it here would leave the last
+    // character standing unable to walk to its own errand.
+    static bool LeadsItsParty(Player* bot)
+    {
+        Group* const group = bot->GetGroup();
+        return !group || group->GetLeaderGUID() == bot->GetGUID();
+    }
+
+    // The five facts behind "who may be handed `new rpg` back", gathered in one
+    // place so the refusal and the grant far below it cannot ask different
+    // questions - which is exactly what they used to do, and what left the
+    // leader answering false to both (#311).
+    //
+    // READ AFRESH WHEREVER IT IS USED, AND DELIBERATELY NOT CACHED across the
+    // body of a travel poll. The whole reason #293 exists is that this strategy
+    // comes and goes mid-errand from writers that do not know an errand exists,
+    // and a verdict taken six hundred lines above the grant site is a reading
+    // of a world that has since moved. The call is five predicate reads and no
+    // query; there is nothing to save by holding it.
+    OverseerDecisions::AimedMover ReadAimedMoverFor(std::string const& name, Player* bot,
+                                                    PlayerbotAI* botAI, bool steersItself)
+    {
+        OverseerDecisions::AimedMoverFacts facts;
+        facts.carriesStrategy = CanBeSentToNpc(botAI);
+        facts.heldAfterRevival = HeldAfterRevival(name);
+        facts.leadsItsParty = LeadsItsParty(bot);
+        facts.steersItself = steersItself;
+        facts.cutOffFromLeader = SplitFromLeader(name);
+        return OverseerDecisions::ReadAimedMover(facts);
+    }
+
     // Ask for a member to be walked to `aim`, and say so once. Idempotent: a
     // re-ask while the same aim is in flight is what every poll of a crossing
     // does, and TravelAimBook::Claim already refuses to disturb a walk it is
@@ -11040,6 +11091,7 @@ private:
                 state.entry = 0;
                 state.pinned = false;
                 state.arrived = false;
+                state.heldSaid = false;
                 // A new errand is a new flight budget too, and a new leg. The
                 // old errand's flights are spent, its leg is over the moment
                 // its aim stops being the aim, and its refusal to fly was
@@ -11291,7 +11343,49 @@ private:
                 }
             }
 
-            if (!CanBeSentToNpc(botAI) && !steersItself)
+            // WHO MAY BE HANDED `new rpg` BACK, ASKED ONCE AND ASKED THE SAME
+            // WAY AT BOTH ENDS OF THIS LOOP (#311). This refusal used to test
+            // `!steersItself` and the grant six hundred lines below tested
+            // `steersItself`, and a LEADER answers false to both - it is not an
+            // escort and it is not cut off from itself - so the one character
+            // the whole family travels behind was refused here and could never
+            // reach the grant that would have fixed it. Measured on the dev
+            // realm 2026-09-08: the party leader, `overseer_roster.lead` = 1,
+            // aimed at a point 2,788 yards off, told that followers travel by
+            // following the leader.
+            //
+            // AND THE HOLD IS A THIRD ANSWER, not a fourth condition on this
+            // one. Three seconds before that line this module's own post-revival
+            // hold had taken the strategy off on purpose. See
+            // OverseerDecisions::ReadAimedMover for the measurement that ruled
+            // the outside supervisor out, and for why a held character is
+            // neither granted nor refused.
+            OverseerDecisions::AimedMover const mover =
+                ReadAimedMoverFor(name, bot, botAI, steersItself);
+
+            if (mover == OverseerDecisions::AimedMover::HeldOnPurpose)
+            {
+                // NOT LATCHED WITH THE REFUSAL, because it is not one. The hold
+                // is seconds long, this module lifts it itself, and the errand
+                // is not over - so `state.arrived` stays clear for the refusal
+                // that may still be owed, and this line is rationed by its own
+                // flag instead. Cleared below the moment the hold lifts.
+                if (!state.heldSaid)
+                {
+                    state.heldSaid = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is sent to '{}' and does not carry `new rpg` "
+                             "because this module took it off for the hold after its "
+                             "revival - not granted back and not refused either, since the "
+                             "hold restores it itself within {}s",
+                             name, target, REVIVAL_HOLD_SECONDS);
+                }
+                continue;
+            }
+            state.heldSaid = false;
+
+            if (mover == OverseerDecisions::AimedMover::RefuseInFormation ||
+                mover == OverseerDecisions::AimedMover::RefuseCutOff)
             {
                 if (!state.arrived)
                 {
@@ -11306,7 +11400,7 @@ private:
                     LOG_INFO("module.overseer",
                              "overseer: '{}' was sent to '{}' but does not carry `new rpg` - "
                              "nothing walks it anywhere. {}", name, target,
-                             SplitFromLeader(name)
+                             mover == OverseerDecisions::AimedMover::RefuseCutOff
                                  ? "It is cut off from its leader, so it will not arrive by "
                                    "following either, and this aim names a place chosen for "
                                    "a party it cannot reach. Send it to an NPC on its own "
@@ -11823,7 +11917,17 @@ private:
             // before the aim is written leaves a window in which a follower
             // wanders off instead of walking to the door. Granting it here
             // leaves no such window: the status is never IDLE for a tick.
-            if (steersItself && !CanBeSentToNpc(botAI))
+            //
+            // THE SAME QUESTION AS THE REFUSAL ABOVE, RE-ASKED HERE (#311).
+            // Re-asked rather than carried down, because the strategy comes and
+            // goes mid-poll from outside this drive - that is the whole of #293
+            // - and because this is the statement before the aim is written,
+            // which is the one place the grant may happen at all. A LEADER now
+            // reaches it: it used to be refused six hundred lines above and the
+            // family stood still behind it.
+            OverseerDecisions::AimedMover const granting =
+                ReadAimedMoverFor(name, bot, botAI, steersItself);
+            if (OverseerDecisions::AimedMoverGrants(granting))
             {
                 botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
                 if (!CanBeSentToNpc(botAI))
@@ -11847,7 +11951,17 @@ private:
                 // direction, for the same reason and against the same writer.
                 // Said once per errand, and said with somewhere to look: the
                 // command queue records who asked and under what source.
-                if (state.heldTheWheel && !state.stolenSaid)
+                //
+                // ...AND IT IS ONLY TRUE OF A STEERER NOW (#311). "Something
+                // outside it did" was printed without ever being checked, and
+                // when it was checked it was wrong: on the measured poll the
+                // thief was this module's own post-revival hold. That hold is
+                // excluded before execution can reach here, and a leader gets
+                // its own line below rather than this one, so what is left here
+                // is the writer #293 actually caught - a supervisor outside this
+                // repository, writing a whole strategy set per character.
+                if (state.heldTheWheel && !state.stolenSaid &&
+                    granting == OverseerDecisions::AimedMover::GrantToSteerer)
                 {
                     state.stolenSaid = true;
                     LOG_WARN("module.overseer",
@@ -11876,6 +11990,19 @@ private:
                              "'{}' - handed back when the run stops wanting it there",
                              name, target);
                 }
+                else if (granting == OverseerDecisions::AimedMover::GrantToLeader)
+                    // THE LEADER, AND IT TAKES THE WHEEL FROM NOBODY (#311).
+                    // There is no `follow` to displace and no lease to hand
+                    // back: a leader carries this strategy as its normal state,
+                    // and reaching here means it had stopped carrying it. Said
+                    // in its own words so a reader of the log is not told a
+                    // leader was cut off from itself.
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' leads and was not carrying `new rpg` while "
+                             "sent to '{}' - taking it back, and it will be taken back "
+                             "every poll until the errand ends, because a leader that "
+                             "cannot walk is a family that cannot follow",
+                             name, target);
                 else
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is cut off from its leader, so it takes the "

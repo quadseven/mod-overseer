@@ -3329,6 +3329,114 @@ bool ErrandRunsAlone(std::string const& target);
 // Those are not the same mistake and the cheap one is the one to make.
 bool WalkAlreadyInFlight(bool reissueForced, bool canAct, bool atSameDestination);
 
+// ------------------ who may be handed `new rpg` back on an errand (#311) --
+//
+// THE LEADER IS THE ONE CHARACTER THIS DRIVE WOULD NOT REPAIR.
+//
+// Only `new rpg` runs the action that walks a character to an aim, so a
+// character on an errand that does not carry it does not move, however correct
+// the row in `travel_npc` is. #295 taught the drive to notice exactly that and
+// to take the strategy back on every poll until the errand ends. It gated the
+// repair on "may this character steer itself", which is an escort or a follower
+// cut off from its leader on an errand it can run alone. A LEADER IS NEITHER OF
+// THOSE, by construction, so it fell through to a refusal written for
+// followers:
+//
+//   00:20:24 INFO 'Og' was sent to 'at:1:-705,-2045,66.45' but does not carry
+//                 `new rpg` - nothing walks it anywhere. Followers travel by
+//                 following the leader; aim the leader instead
+//
+// measured on the dev realm 2026-09-08 against the party LEADER, whose roster
+// row carries `lead` = 1. The remedy that line offers is the action that had
+// already been taken. It is latched once per errand, so the drive then said
+// nothing further about that character, and moved nobody.
+//
+// THE STRATEGY WAS NOT STOLEN. THIS MODULE TOOK IT, ON PURPOSE, THREE SECONDS
+// EARLIER. The post-revival hold parks a character where it revives so that it
+// does not walk straight back into whatever killed it, and a leader's `new rpg`
+// outranks the `stay` that does the parking, so the hold takes the strategy off
+// and gives it back itself:
+//
+//   00:20:21 INFO 'Og' is held where it revives for 20s (`+stay`, `-new rpg`)
+//   00:20:45 INFO 'Og' is released from its post-revival hold (`new rpg`
+//                 restored)
+//
+// The supervisor outside this module is ruled OUT rather than assumed innocent,
+// because #293 taught this file to name a thief and the line #295 added prints
+// "something outside it did" without ever checking. Over the three hours around
+// this incident that supervisor wrote `nc +new rpg` to the leader sixteen times
+// and `nc -new rpg` five times, and the last of the five landed more than two
+// hours BEFORE the refusal. A strategy probe once a minute over the same window
+// reports `new rpg` present on every one of fifty-six samples, including the one
+// taken twenty seconds after the refusal was printed. On the measured poll the
+// only writer that fits is this module's own hold.
+//
+// WHICH IS WHY A HELD CHARACTER IS ITS OWN ANSWER, and why this is a decision
+// rather than one more condition on the grant. A held character must not be
+// refused, because nothing is wrong with it and the refusal is a false alarm
+// that latches for the rest of the errand. It must not be granted either,
+// because a grant here is this module fighting its own hold: `stay` and
+// `new rpg` are not siblings in the engine, so adding the strategy back does not
+// lift the hold, it overrides it while leaving it standing. The third answer is
+// to wait, and to say which of the two things it is not.
+//
+// THE ANTI-SCATTER RULE IS UNTOUCHED, and it is the whole reason this cannot
+// simply grant to everybody. Five characters each carrying `new rpg` free-roam,
+// which is the 937-yard scatter that taking the strategy off the followers
+// cured. A follower in formation still gets the refusal and is still told to aim
+// the leader, because for a follower in formation that advice is true and is the
+// remedy that works.
+//
+// UPSTREAM ALREADY AGREES ABOUT WHO MAY CARRY IT. AiFactory adds `new rpg`
+// behind `!GetGroup() || GetGroup()->GetLeaderGUID() == GetGUID()`, so "leads
+// its party, or is in no party at all" is not a membership test invented here.
+// It is the core's own, asked by the one drive whose errand depends on it.
+enum class AimedMover : std::uint8_t
+{
+    // It carries the strategy already, so there is nothing to decide. Answered
+    // rather than asserted: a caller that asks about a walking character should
+    // get an answer back, not a crash.
+    Walks,
+    // This module is holding it still on purpose and will hand the strategy back
+    // itself. Neither granted nor refused, and that difference is the point.
+    HeldOnPurpose,
+    // It leads the party, or it is in no party. Take the strategy back, on this
+    // poll and on every poll for as long as the errand lasts.
+    GrantToLeader,
+    // An escort, or a follower cut off from its leader on an errand it can run
+    // alone. #122 and #289's case, reached through #295's repair, unchanged.
+    GrantToSteerer,
+    // A follower in formation. It arrives by following its leader, so aiming the
+    // leader is advice it can act on.
+    RefuseInFormation,
+    // A follower on another map, which cannot arrive by following anybody and
+    // whose aim names a place chosen for a party it is not standing with. #289's
+    // case, unchanged.
+    RefuseCutOff,
+};
+
+char const* AimedMoverName(AimedMover verdict);
+
+// Everything the answer turns on, read by the caller from the world and from
+// this module's own books. The defaults are the safe reading of "nothing is
+// known": a character that carries nothing, leads nobody and steers nothing is a
+// follower in formation, and that answer moves no one.
+struct AimedMoverFacts
+{
+    bool carriesStrategy = false;
+    bool heldAfterRevival = false;
+    bool leadsItsParty = false;
+    bool steersItself = false;
+    bool cutOffFromLeader = false;
+};
+
+AimedMover ReadAimedMover(AimedMoverFacts const& facts);
+
+// Does this verdict hand the strategy over? The form the grant site asks, so
+// that the two granting answers cannot drift apart from the single place that
+// acts on them - the same discipline ErrandRunsAlone keeps above.
+bool AimedMoverGrants(AimedMover verdict);
+
 // ------------------------------------- crossing a map boundary (#241, #158) --
 //
 // THE FAMILY CANNOT WALK BETWEEN CONTINENTS, AND THAT IS CORRECT. Every aim
