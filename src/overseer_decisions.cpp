@@ -1786,6 +1786,46 @@ std::string ArmourClassName(GearItem const& item)
 
 }  // namespace
 
+GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const& effects,
+                                            bool everyEnchantmentRead)
+{
+    GearResolvedProperty resolved;
+
+    // A SLOT THAT NAMED AN ENCHANTMENT NOBODY COULD LOOK UP is the one case
+    // where the caller knows there is something and knows nothing about it.
+    // Nothing to add, and the score stays a floor.
+    resolved.unresolved = !everyEnchantmentRead || effects.empty();
+
+    for (GearEnchantEffect const& effect : effects)
+    {
+        // NOT A STAT, SO NOT PRICED. An on-equip spell, a resistance, a damage
+        // bonus - all real, none of them something this file weighs, and the
+        // honest consequence is the same one an on-equip effect already has:
+        // the number is a lower bound rather than the whole story.
+        if (effect.type != ENCHANT_EFFECT_STAT)
+        {
+            resolved.unresolved = true;
+            continue;
+        }
+
+        // A STAT WITH NO SIZE IS A SUFFIX THE CALLER DID NOT SCALE. The core
+        // keeps a suffix's magnitude on the ITEM rather than in the
+        // enchantment, so a zero here means the amount was never worked out.
+        // Guessing one would be worse than saying so.
+        if (!effect.amount)
+        {
+            resolved.unresolved = true;
+            continue;
+        }
+
+        GearStat stat;
+        stat.type = effect.stat;
+        stat.value = effect.amount;
+        resolved.stats.push_back(stat);
+    }
+    return resolved;
+}
+
 GearVerdict GearScore(GearItem const& item, GearWearer const& who)
 {
     GearVerdict verdict;

@@ -2461,11 +2461,101 @@ struct GearItem
     // story about it. See GearVerdict::judged.
     bool hasEffect{false};
 
-    // The caller could not resolve a random suffix or property into stats, so
-    // some of this item's worth is missing from `stats` and the score is a
-    // floor rather than a figure.
+    // Some part of a random suffix or property could not be turned into a
+    // stat, so some of this item's worth is missing from `stats` and the
+    // score is a floor rather than a figure. GearReadRandomProperty below is
+    // what decides this, and the stats it DID manage to read are in `stats`
+    // either way - a floor with more of the item priced into it is a higher
+    // floor, and a higher floor settles more comparisons.
     bool unresolvedRandomProperty{false};
 };
+
+// ------------------------------------- what a random property is worth (#340) --
+//
+// A GREEN OFF A DUNGEON FLOOR CARRIES MOST OF ITS WORTH IN A NAME. "Scouting
+// Tunic" is a stat-less template; the "+10 agility" that makes it a rogue's
+// chest lives in a random property rolled onto the individual item, and the
+// template says nothing about it whatsoever. Nineteen of the family's sixty-odd
+// worn pieces were exactly that shape, and because nothing resolved them every
+// one of those slots was worth its armour and its item level and nothing else -
+// so `unresolvedRandomProperty` was set on all nineteen, the worn side of every
+// comparison was a Floor, and GearCompare could prove nothing about any of them
+// ever. Zero swaps in the log against fifty-three "cannot be settled".
+//
+// WHERE THE ANSWER ACTUALLY LIVES, and it is not a table lookup. When the core
+// rolls a property onto an item it writes the property's enchantment ids into
+// the item's own property enchantment slots (Item::SetItemRandomProperties),
+// and that is the same place the core reads them back from when it applies the
+// stats to the character (Player::ApplyEnchantment). So the caller does not
+// have to walk from a property id to a property row to an enchantment; it can
+// read the enchantments straight off the item it is already holding. Verified
+// against the live realm: for all 77 of the family's randomly enchanted items
+// the enchantment slots on the item match the property's own row exactly.
+//
+// WHAT THIS FILE THEREFORE NEEDS is not an item and not a DBC. It is the list
+// of effects the caller read, as plain numbers, and one honest answer about
+// whether it managed to read all of them.
+
+// ONE EFFECT OFF ONE ENCHANTMENT, in the shape the core's own
+// SpellItemEnchantmentEntry carries it: three parallel arrays of type, amount
+// and argument. Plain ints, so this file still includes no core header.
+struct GearEnchantEffect
+{
+    // ItemEnchantmentType. Only ITEM_ENCHANTMENT_TYPE_STAT, which is 5, is a
+    // stat line this file can price. Everything else - an on-equip spell, a
+    // resistance, a weapon damage bonus - is real worth that the score does not
+    // model, and its presence is what makes the answer a floor.
+    int type{0};
+
+    // The size of it. For a STAT effect this is the stat's value, and the
+    // caller has already done any scaling the core would do.
+    int amount{0};
+
+    // For a STAT effect, the core's ItemModType id - the same id
+    // GearStat::type carries. Not a stat id for any other kind of effect.
+    int stat{0};
+};
+
+// Only ITEM_ENCHANTMENT_TYPE_STAT can be turned into a GearStat, and the id is
+// the core's own (DBCEnums.h:365-374). Named here for the same reason every
+// other core id in this file is.
+constexpr int ENCHANT_EFFECT_STAT = 5;
+
+// What a random property turned out to be worth, and how much of it was read.
+struct GearResolvedProperty
+{
+    // The stats to add to GearItem::stats. Every one of these is priced by the
+    // ordinary weights; nothing about a stat is different for having arrived on
+    // an item by a roll rather than in its template.
+    std::vector<GearStat> stats;
+
+    // Was ANY part of the property left unpriced? Goes straight into
+    // GearItem::unresolvedRandomProperty, so the verdict is a Floor rather than
+    // a figure - see GearConfidence below.
+    bool unresolved{false};
+};
+
+// Fold what the caller read off an item's property enchantment slots into stats.
+//
+// `effects` is every effect on every one of those slots, in any order.
+// `everyEnchantmentRead` is false when one of the slots named an enchantment
+// the caller could not look up at all.
+//
+// THE STATS COME BACK EVEN WHEN SOMETHING IS UNRESOLVED, on purpose. A floor
+// with the readable half of the property priced into it is a HIGHER floor than
+// one without, and a higher floor is a lower bound that settles more
+// comparisons. Nothing here can ever lower a score: a stat's weight is never
+// negative and a rolled stat's value is never negative, so adding one can only
+// move the number up, which is exactly what "floor" has to mean for #221's
+// reasoning to hold.
+//
+// AN EMPTY READ IS NOT A FREE PASS. An item that claims a property and shows no
+// effect at all has not been proved worthless - it has failed to be read, and
+// 2011 of the 2012 property rows in the game's own data name at least one
+// enchantment. So an empty list is unresolved, and the slot stays blocked,
+// which is the right answer to "I could not tell".
+GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const& effects,
+                                            bool everyEnchantmentRead);
 
 // HOW MUCH OF THE ITEM THE NUMBER COVERS (#221).
 //
