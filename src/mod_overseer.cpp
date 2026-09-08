@@ -5748,6 +5748,59 @@ private:
         return OverseerDecisions::DungeonRunTrailingFailures(outcomes);
     }
 
+    // ----------------------------- the stop, at every gate that opens a run (#306) --
+    //
+    // WHAT WENT WRONG, WRITTEN DOWN SO THE SHAPE IS NOT UNDONE. This test used to
+    // be inline in DriveDungeonRun's IDLE branch, and that branch decides only a
+    // campaign's FIRST attempt. EndRunAndDecide re-arms the coordinator straight
+    // into RESETTING for every attempt after it, so a campaign passes through
+    // IDLE exactly once - at the one moment in its life when it has no failures
+    // to count - and the stop was unreachable from then on.
+    //
+    // Measured 2026-09-07 on the live realm, and the numbers are worth keeping
+    // because the arithmetic all looked right while this was happening: seven
+    // consecutive `staging_failed` rows in one campaign against a threshold of
+    // three, ONE "dungeon run requested" line in the 102 minutes that covered
+    // eight attempts, and zero occurrences of the ERROR below in the whole log.
+    //
+    // So it is a function, and every path that is about to open a run calls it.
+    // There are two of those today and both do; a third that forgets is this
+    // defect coming back.
+    //
+    // `sayIt` IS THE CALLER'S LATCH AND NOT A SECOND POLICY. The IDLE branch is
+    // polled every few seconds and must say this once rather than forever, and it
+    // already owns the flag that remembers (see loggedCampaignOver's own comment
+    // for why nothing clears it). The go-again gate is reached once per attempt
+    // and always speaks. Neither is a different rule about when to stop.
+    static bool CampaignStoppedByFailures(uint32 campaignId,
+                                          std::string const& leaderName, bool sayIt)
+    {
+        uint32 const failures = TrailingUnenteredRuns(campaignId);
+        if (!OverseerDecisions::DungeonCampaignStopsOnFailures(
+                failures, DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES))
+            return false;
+
+        if (sayIt)
+            // THE ESCAPE HAD TO CHANGE WITH THE RULE ABOVE (#225). "Set
+            // dungeon_runs_done to 0" used to clear this stop as a side effect:
+            // it made the next run allocate a fresh campaign, which orphaned the
+            // failing rows. That is exactly the behaviour #225 removed, so the
+            // gesture is named directly instead. Taking the attempts out of the
+            // campaign is what the module reads, and campaign_id 0 already means
+            // "a run this coordinator did not drive".
+            LOG_ERROR("module.overseer",
+                      "overseer: the dungeon campaign for '{}' is stopped - the "
+                      "last {} attempts of campaign {} all ended without the "
+                      "party ever reaching the instance, so a further one would "
+                      "fail the same way. The reasons are on those rows. Once "
+                      "the cause is fixed, take them out of the campaign to "
+                      "start again: UPDATE overseer_dungeon_run SET campaign_id "
+                      "= 0 WHERE campaign_id = {} AND outcome IN "
+                      "('reset_failed','staging_failed')",
+                      leaderName, failures, campaignId, campaignId);
+        return true;
+    }
+
     // IS THE NEWEST ATTEMPT ON THIS MAP ONE THAT NEVER GOT INSIDE? Asked only
     // when the roster counter reads zero, and asked because that counter can no
     // longer tell two different situations apart (#225).
@@ -16065,6 +16118,32 @@ private:
             return;
         }
 
+        // THE SECOND GATE, AND THE HALF THAT WAS MISSING (#306). Everything
+        // below opens another attempt, and until now nothing here asked whether
+        // the campaign should be opening one. The IDLE branch asks before a
+        // campaign's FIRST run; a campaign's second, third and eighth runs are
+        // opened from exactly here and never go back through IDLE, so the stop
+        // that bounds them was unreachable by construction. Seven consecutive
+        // attempts that never reached the instance, against a threshold of
+        // three, is what that cost on 2026-09-07.
+        //
+        // IT IS ASKED AFTER CloseRun AND NOT BEFORE, so that this attempt's own
+        // row is one of the rows counted. Every path into this function has
+        // written the attempt down by the time it arrives: FailStaging inserts a
+        // row for an attempt that never opened one, and CloseRun above stamps
+        // the outcome onto one that did.
+        //
+        // AND IT RETURNS TO IDLE RATHER THAN RE-ARMING, with the flag already
+        // latched, so the gate above reaches the same verdict on every poll from
+        // now on and says nothing further. One ERROR per campaign, which is the
+        // whole point of saying it at all.
+        if (CampaignStoppedByFailures(campaignId, leaderName, true))
+        {
+            coord = DungeonRunCoordinatorState();
+            coord.loggedCampaignOver = true;
+            return;
+        }
+
         coord = DungeonRunCoordinatorState();
         coord.phase = DungeonRunPhase::Resetting;
         coord.portalKeyword = keyword;
@@ -17239,32 +17318,16 @@ private:
                 if (!campaignId)
                     campaignId = AllocateCampaignId();
 
-                uint32 const failures = TrailingUnenteredRuns(campaignId);
-                if (failures >= DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES)
+                // THE FIRST OF THE TWO GATES (#306). This one is reached only
+                // for a campaign's FIRST attempt - see the other, at the end of
+                // EndRunAndDecide, which is reached for all the rest.
+                if (CampaignStoppedByFailures(campaignId, leaderName,
+                                              !coord.loggedCampaignOver))
                 {
-                    if (!coord.loggedCampaignOver)
-                    {
-                        coord.loggedCampaignOver = true;
-                        // THE ESCAPE HAD TO CHANGE WITH THE RULE ABOVE (#225).
-                        // "Set dungeon_runs_done to 0" used to clear this stop
-                        // as a side effect: it made the next run allocate a
-                        // fresh campaign, which orphaned the failing rows. That
-                        // is exactly the behaviour just removed, so the gesture
-                        // is named directly instead. Taking the attempts out of
-                        // the campaign is what the module reads, and
-                        // campaign_id 0 already means "a run this coordinator
-                        // did not drive".
-                        LOG_ERROR("module.overseer",
-                                  "overseer: the dungeon campaign for '{}' is stopped - the "
-                                  "last {} attempts of campaign {} all ended without the "
-                                  "party ever reaching the instance, so a further one would "
-                                  "fail the same way. The reasons are on those rows. Once "
-                                  "the cause is fixed, take them out of the campaign to "
-                                  "start again: UPDATE overseer_dungeon_run SET campaign_id "
-                                  "= 0 WHERE campaign_id = {} AND outcome IN "
-                                  "('reset_failed','staging_failed')",
-                                  leaderName, failures, campaignId, campaignId);
-                    }
+                    // Latched whether or not this poll was the one that spoke:
+                    // the question is asked again in a few seconds and the
+                    // answer will not have changed.
+                    coord.loggedCampaignOver = true;
                     return;
                 }
             }
