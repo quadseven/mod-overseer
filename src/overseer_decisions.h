@@ -5125,6 +5125,231 @@ uint32_t HearthVerifyWindowMs(uint32_t castMs, uint32_t marginMs, uint32_t floor
 // of is more likely a new transient than a new permanent.
 TownRetry HearthRefusalRetry(std::string const& detail);
 
+
+// ------------------------------- a far teleport still in flight (#310) --
+//
+// A CHARACTER IN THE MIDDLE OF A CROSS-MAP TELEPORT IS NOT A CHARACTER THAT
+// LEFT. This rule exists because kind='hearth' got it wrong on the first real
+// cross-continent hearth it ever ran. That hearth WORKED - the character
+// arrived on map 1 - and the row said:
+//
+//   status: error
+//   detail: left the world before the hearth could be read back
+//   result: {"outcome":"unreadable", ... "now":null}
+//
+// The mechanism, read out of the core rather than guessed. Player::TeleportTo
+// on a map change calls RemoveFromWorld and SetSemaphoreTeleportFar, so for the
+// length of the crossing IsInWorld() is false while the character is still very
+// much there. ObjectAccessor::FindPlayerByName takes `bool checkInWorld = true`
+// and DROPS exactly that character, so the read-back's own lookup returned null
+// and the verdict logic read null as gone.
+//
+// Leaving the world IS what a successful cross-map teleport looks like from the
+// world thread. So a lookup that misses is not evidence of anything on its own,
+// and the readings have to be separated:
+//
+//   `inNameMap`        the character is still in ObjectAccessor's name map,
+//                      which survives a teleport and does not survive a logout.
+//                      Ask with FindPlayerByName(name, false).
+//   `inWorld`          Player::IsInWorld(), false for the whole crossing.
+//   `stillTeleporting` Player::IsBeingTeleported(), near or far.
+//   `waitedMs`         how long this read-back has been waiting, in total.
+//   `ceilingMs`        how long it is willing to go on calling a crossing a
+//                      crossing. Not a guess at how long a teleport takes; a
+//                      backstop, so a teleport that never lands still ends as
+//                      an answer rather than waiting for ever.
+//
+// Pure, and shared by every read-back in this module that can outlive a
+// teleport, so the next verb does not have to rediscover it the same way.
+enum class TeleportFlight
+{
+    // Nothing is in flight and the character can be read where it stands.
+    Landed,
+    // Still crossing, and inside the ceiling. THE MIDDLE OF A SUCCESS. Ask
+    // again; do not read a position and do not write a verdict.
+    InFlight,
+    // Still crossing, and past the ceiling. Judged by where it ends up rather
+    // than waited on for ever - but named apart from Landed so a row can say
+    // that the reading it was judged on was taken during a teleport.
+    Stranded,
+    // Not in the name map, or in it and neither in the world nor teleporting.
+    // A logout, and the only one of the four that means what the hearth's
+    // "left the world before it could be read back" said.
+    Gone,
+};
+
+// "landed", "in-flight", "stranded", "gone". Here rather than in the executor
+// so the word a test pins is the word a row carries.
+char const* TeleportFlightWord(TeleportFlight flight);
+
+TeleportFlight ReadTeleportFlight(bool inNameMap, bool inWorld, bool stillTeleporting,
+                                  uint32_t waitedMs, uint32_t ceilingMs);
+
+// --------------------------------------------- the summoning stone (#313) --
+//
+// Summon one absent party member to a dungeon's summoning stone, across
+// continents, through the game's own mechanic.
+//
+// WHY THIS VERB EXISTS. This family is split across two maps, and #241, #274,
+// #279, #303, #304 and #305 are all the boat, none of which has landed. #308's
+// hearthstone cannot help the two members that need it: both are bound on the
+// continent they are already stranded on, so their hearthstone moves them
+// within the wrong one. The summoning stone is the only thing in 3.3.5a that
+// moves a character between continents on somebody else's initiative, and the
+// core already implements every step of it.
+//
+// THE CHAIN, read out of the pinned core and the live world database rather
+// than from memory. Every id is measured, and the file that records the
+// measurements is data/sql/characters/base/2026_09_08_00_overseer_summon.sql.
+//
+//   1. The stone is a GAMEOBJECT_TYPE_MEETINGSTONE (type 23), NOT a
+//      GAMEOBJECT_TYPE_SUMMONING_RITUAL. It carries minLevel, maxLevel and
+//      areaID and no participant count at all - that field belongs to type 18,
+//      and assuming otherwise would have built this verb against the wrong
+//      object.
+//   2. GameObject::Use's MEETINGSTONE case resolves who is being summoned from
+//      the CLICKER'S OWN SELECTION, through ObjectAccessor::FindPlayer, which
+//      is not map scoped. It refuses a target that is not in the same raid and
+//      refuses either party below the stone's minLevel. Then it casts the
+//      meeting stone summon.
+//   3. That spell triggers the summoning stone effect, which is a TRANS_DOOR
+//      creating the portal gameobject and is CHANNELED by the summoner for the
+//      portal's lifetime. The spell effect seeds the summoner as the ritual's
+//      first participant, so exactly ONE more party member has to click.
+//   4. The portal is a type 18 ritual whose castersGrouped is set, so the
+//      second clicker must be in the same raid and must not be the summoner.
+//      When the count is reached the ritual settles and then casts the summon.
+//   5. The summon is SPELL_EFFECT_SUMMON_PLAYER. Spell's implicit target
+//      selection for that effect reads the caster's selection AGAIN, live, at
+//      the moment the ritual completes - which is why this module re-asserts
+//      the summoner's selection on every poll while the ritual is pending,
+//      rather than setting it once and hoping.
+//   6. The effect sets a summon point on the absent character and sends it a
+//      request. IT DOES NOT MOVE ANYBODY. The character has to ACCEPT, and a
+//      bot has no client to press the button, so nothing in this fleet has ever
+//      answered a summon. The accept is driven the way the hearth drives its
+//      item use: the core's own handler, handed a packet it wrote itself.
+//   7. Accepting teleports across the map, which is a FAR teleport, which needs
+//      MSG_MOVE_WORLDPORT_ACK answered. PlayerbotAI::HandleTeleportAck is the
+//      only thing in this fleet that answers it, so a character with no bot AI
+//      is a hard refusal rather than a hopeful attempt.
+//
+// WHAT THIS IS NOT. It is not a teleport. Every step above is a packet handed
+// to a handler a client would have driven, and every gate the core keeps is
+// still kept: the level floor, the party check, the interaction distance, the
+// participant count, the accept. A GM summon would be one line and would be
+// exactly the admin shortcut AGENTS.md exists to forbid.
+//
+// Column re-use, no new columns:
+//   target_name  the SUMMONER: the character that stands at the stone and
+//                clicks it. The actor, as in every other verb here.
+//   command      `use <name>`, or bare `<name>`, naming the character to summon
+//   target_arg   optional: the second clicker. Empty means "pick an eligible
+//                party member already standing at the stone"
+//   detail       short refusal literal, or empty on success
+//   result       JSON: outcome (arrived|stayed|elsewhere|refused|unreadable),
+//                reason, retry (never|elsewhere|later - see
+//                SummonRefusalRetry), summoner, summoned, helper, stone,
+//                stone_entry, portal_entry, participants, required, flight (see
+//                TeleportFlightWord), accepts, settle_ms, window_ms, waited_ms,
+//                at, from and now each {map, area, x, y, z} or null, request
+//   status       'verifying' from the moment the portal is clicked, then
+//                'applied' when the summoned character reads back at the stone,
+//                'unchanged' when it never moved, 'error' otherwise. NOT
+//                'delivered', for the same reason kind='hearth' is not: a
+//                crossing that reports delivery and moves nobody is the bug.
+
+enum class SummonVerb
+{
+    None,  // not a summon request; `error` says why
+    Use,
+};
+
+struct SummonRequest
+{
+    SummonVerb verb{SummonVerb::None};
+    std::string who;    // the character to summon
+    std::string error;  // the refusal literal when verb is None, else empty
+};
+
+// `use <name>`, or bare `<name>`.
+//
+// AN EMPTY COMMAND IS A REFUSAL HERE AND NOT A DEFAULT, which is the one place
+// this parser deliberately differs from ParseHearthRequest. That verb has
+// exactly one form and no arguments, so an empty column is unambiguous. This
+// one has an argument, and a row that forgot it must not be answered by
+// guessing which of four party members was meant.
+SummonRequest ParseSummonRequest(std::string const& command);
+
+enum class SummonOutcome
+{
+    // Where the character was, where the summon point is, or where it is now
+    // could not all be read - or they could, and the first two are the same
+    // place, so no reading of the third could tell an arrival from having never
+    // moved. Says nothing about whether anything happened.
+    Unreadable,
+    // The summoned character reads back at the summon point. The only outcome
+    // worth `applied`.
+    Arrived,
+    // The character is still standing exactly where it was when the portal was
+    // clicked. THE FAILURE THIS EXECUTOR EXISTS TO MAKE VISIBLE, and there are
+    // five ways to reach it that look identical from the queue: the second
+    // clicker never channelled, the summoner's selection was lost before the
+    // ritual settled, the request was never sent, the accept was refused
+    // because the character was dead or in combat, or the far teleport was
+    // never acknowledged. Not one of them is `applied`.
+    Stayed,
+    // The character moved and is not at the summon point. A summon went out and
+    // something else decided where it ended up: it died and released, or its
+    // own drive kept walking it. Kept apart from Stayed for the reason
+    // HearthOutcome keeps them apart - "it did not work" and "it went somewhere
+    // nobody asked for" want different answers from the sender.
+    Elsewhere,
+};
+
+// "arrived", "stayed", "elsewhere", "unreadable".
+char const* SummonOutcomeWord(SummonOutcome outcome);
+
+// A SUMMON THAT WOULD MOVE NOBODY CANNOT BE JUDGED. When the character to
+// summon is already standing at the summon point, `Arrived` and `Stayed` are
+// the same reading and no post-condition can separate them. Refused before the
+// packet for the reason HearthWouldMoveNobody is, minus the cooldown argument:
+// a summoning stone has no cooldown, so the only cost of finding out the hard
+// way is a wasted ritual and two characters' time.
+bool SummonWouldMoveNobody(HomeBind const& summoned, HomeBind const& at,
+                           float arrivedYards);
+
+// `from` is where the summoned character stood when the portal was clicked,
+// `at` is the summon point - which is the SUMMONER'S position and not the
+// stone's, because the spell effect reads the caster's own coordinates - and
+// `now` is where the character is once the wait is over.
+//
+// Three readings and the same two tolerances as HearthReadBack, for the same
+// reasons: the wide one absorbs a bot that landed and took four steps, the
+// narrow one answers whether the character went anywhere at all. Compared in
+// three dimensions and only within one map, which is the whole point here - the
+// two continents share a coordinate space, so a comparison that forgot the map
+// would report a summon as done with the character still on the far side of the
+// ocean.
+SummonOutcome SummonReadBack(HomeBind const& from, HomeBind const& at, HomeBind const& now,
+                             float arrivedYards, float movedYards);
+
+// HOW LONG TO WAIT BEFORE JUDGING. `settleMs` is the ritual's own settle time,
+// read off the core rather than invented, and `marginMs` is what the world
+// needs after it: the summon request goes out on the tick the ritual completes,
+// the accept is driven on the poll after that, and the teleport lands on a tick
+// after THAT, while this module only looks every COMMAND_POLL_MS. `floorMs`
+// answers a settle time that reads as zero, which would judge instantly and
+// therefore always answer `Stayed`.
+//
+// Saturating, not wrapping, for the reason HearthVerifyWindowMs saturates.
+uint32_t SummonVerifyWindowMs(uint32_t settleMs, uint32_t marginMs, uint32_t floorMs);
+
+// Keyed on the `detail` literal DoSummon returns, grouped by what would have to
+// change for the SAME row to succeed. Unknown is `Later`, the same call the
+// bind, hearth, sell and repair tables make.
+TownRetry SummonRefusalRetry(std::string const& detail);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

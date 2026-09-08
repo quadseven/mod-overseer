@@ -4682,4 +4682,227 @@ TownRetry HearthRefusalRetry(std::string const& detail)
     return TownRetry::Later;
 }
 
+
+char const* TeleportFlightWord(TeleportFlight flight)
+{
+    switch (flight)
+    {
+        case TeleportFlight::Landed:
+            return "landed";
+        case TeleportFlight::InFlight:
+            return "in-flight";
+        case TeleportFlight::Stranded:
+            return "stranded";
+        case TeleportFlight::Gone:
+            break;
+    }
+    return "gone";
+}
+
+TeleportFlight ReadTeleportFlight(bool inNameMap, bool inWorld, bool stillTeleporting,
+                                  uint32_t waitedMs, uint32_t ceilingMs)
+{
+    // THE NAME MAP IS THE ONLY THING THAT ANSWERS "IS IT STILL LOGGED IN".
+    // ObjectAccessor's name map outlives a teleport and does not outlive a
+    // logout, which is exactly the distinction the hearth's read-back could not
+    // make - it asked with checkInWorld defaulted to true and got null for both.
+    if (!inNameMap)
+        return TeleportFlight::Gone;
+
+    // ASKED BEFORE `inWorld`, AND THAT ORDER IS THE WHOLE FIX. A character in
+    // the middle of a far teleport is not in the world and is not gone, and
+    // reading the world for it produces the position it is LEAVING. Every
+    // caller has to be told to wait rather than handed a stale coordinate.
+    if (stillTeleporting)
+        return waitedMs < ceilingMs ? TeleportFlight::InFlight : TeleportFlight::Stranded;
+
+    // In the name map, not teleporting, and not in the world: a logout that has
+    // begun. Nothing to read and nothing to wait for.
+    if (!inWorld)
+        return TeleportFlight::Gone;
+
+    return TeleportFlight::Landed;
+}
+
+SummonRequest ParseSummonRequest(std::string const& command)
+{
+    SummonRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    // EMPTY IS A REFUSAL WITH WORDS. See the header: this verb takes an
+    // argument, and there is no safe default for "which member of the party".
+    if (words.empty())
+    {
+        request.error = "malformed summon: name the character to summon";
+        return request;
+    }
+
+    if (words[0] == "use")
+    {
+        if (words.size() == 2)
+        {
+            request.verb = SummonVerb::Use;
+            request.who = words[1];
+            return request;
+        }
+        if (words.size() < 2)
+        {
+            request.error = "malformed summon: use wants the character to summon";
+            return request;
+        }
+        request.error = "malformed summon: use takes one name and no more";
+        return request;
+    }
+
+    // A BARE NAME IS THE SAME REQUEST. The verb has one form, so requiring the
+    // word `use` in front of it would only be ceremony - and a character called
+    // `use` is not a thing this realm can produce, because the branch above
+    // claims that word first and a one-word `use` is refused by name.
+    if (words.size() == 1)
+    {
+        request.verb = SummonVerb::Use;
+        request.who = words[0];
+        return request;
+    }
+
+    request.error = "malformed summon: want one name, or use and one name";
+    return request;
+}
+
+char const* SummonOutcomeWord(SummonOutcome outcome)
+{
+    switch (outcome)
+    {
+        case SummonOutcome::Arrived:
+            return "arrived";
+        case SummonOutcome::Stayed:
+            return "stayed";
+        case SummonOutcome::Elsewhere:
+            return "elsewhere";
+        case SummonOutcome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
+bool SummonWouldMoveNobody(HomeBind const& summoned, HomeBind const& at,
+                           float arrivedYards)
+{
+    // A reading nobody took is not a reason to refuse, exactly as in
+    // HearthWouldMoveNobody: the executor asks about the readings themselves
+    // first, and answering `true` here for an unread position would refuse
+    // every character whose position could not be read.
+    if (!summoned.known || !at.known)
+        return false;
+    // HearthWithin, and not a second copy of it. It is the anonymous-namespace
+    // helper above in this same translation unit, it compares three dimensions
+    // within one map, and that is the comparison this verb needs too. Copying
+    // it to give it a summon-shaped name would be two places to get the map
+    // check wrong instead of one.
+    return HearthWithin(summoned, at, arrivedYards);
+}
+
+SummonOutcome SummonReadBack(HomeBind const& from, HomeBind const& at, HomeBind const& now,
+                             float arrivedYards, float movedYards)
+{
+    // ALL THREE OR NOTHING, the rule HearthReadBack and BindReadBack keep for
+    // the same reason: a verdict built out of two readings and a guess at the
+    // third is the half that was missing, invented.
+    if (!from.known || !at.known || !now.known)
+        return SummonOutcome::Unreadable;
+
+    // AND THE START LINE MUST NOT BE THE FINISH LINE. When the character was
+    // already at the summon point, `Arrived` and `Stayed` are the same reading.
+    // The executor refuses that row before the packet
+    // (SummonWouldMoveNobody), so reaching here means the summoner moved while
+    // the ritual was settling - which it may, because the summon point is the
+    // summoner's own position and a bot walks. Saying so is honest; picking one
+    // of the two would be a coin toss reported as a measurement.
+    if (HearthWithin(from, at, arrivedYards))
+        return SummonOutcome::Unreadable;
+
+    // THE SUMMON POINT FIRST. It is the only outcome that is the thing that was
+    // asked for, and after the guard above it cannot also be the start line.
+    if (HearthWithin(now, at, arrivedYards))
+        return SummonOutcome::Arrived;
+
+    // Still on the start line, on a tolerance of its own and a tighter one than
+    // the arrival's, for the reason HearthReadBack gives: the width that has to
+    // absorb a bot walking away from where it landed is not the width that
+    // decides whether anybody moved at all.
+    if (HearthWithin(now, from, movedYards))
+        return SummonOutcome::Stayed;
+
+    return SummonOutcome::Elsewhere;
+}
+
+uint32_t SummonVerifyWindowMs(uint32_t settleMs, uint32_t marginMs, uint32_t floorMs)
+{
+    // Saturating, for the reason HearthVerifyWindowMs saturates: an addition
+    // that wraps turns an absurd settle time into a window shorter than the
+    // floor, which is precisely the reading that judges a summon as `Stayed`
+    // while the ritual is still running.
+    uint32_t const wanted = settleMs > UINT32_MAX - marginMs ? UINT32_MAX : settleMs + marginMs;
+    return wanted < floorMs ? floorMs : wanted;
+}
+
+TownRetry SummonRefusalRetry(std::string const& detail)
+{
+    // The literals mod_overseer.cpp's DoSummon returns, grouped by what would
+    // have to change for the SAME row to succeed.
+    static char const* const NEVER[] = {
+        "malformed summon: name the character to summon",
+        "malformed summon: use wants the character to summon",
+        "malformed summon: use takes one name and no more",
+        "malformed summon: want one name, or use and one name",
+        "malformed summon request",
+        // A row that names its own summoner is not a request that becomes valid
+        // later, anywhere, under any state. Neither is one whose helper is the
+        // summoner: GameObject::Use refuses the ritual's owner by name, because
+        // the spell effect already counted it.
+        "a character cannot summon itself",
+        "the second clicker cannot be the summoner",
+        // The world database is the wall. Waiting does not add a meeting stone
+        // to a map and neither does walking to another one, because there is
+        // only ever one stone per dungeon and this refusal means the module
+        // could not find the template at all.
+        "the core does not know that meeting stone",
+        "the core does not know that summoning portal",
+    };
+    static char const* const ELSEWHERE[] = {
+        // The stone is a place. Every one of these is answered by standing
+        // somewhere else, and by nothing else: the sweep found no stone, the
+        // character is outside the interaction distance the handler itself
+        // enforces, or there is no second party member standing close enough to
+        // the portal to be the clicker the ritual needs.
+        "no meeting stone within reach of the summoner",
+        "no meeting stone within reach of the second clicker",
+        "no second party member is at the stone",
+        // Being on the other side of the ocean is the point of this verb, so
+        // "already here" is not a failure of the character's state - it is a
+        // statement about where it is standing, and it stops being true the
+        // moment anything moves.
+        "the character to summon is already at the summon point",
+        // The core's own SPELL_EFFECT_SUMMON_PLAYER check: a summoner inside a
+        // dungeon may only summon somebody the instance would let in. Another
+        // stone, outside, answers differently.
+        "the character to summon cannot enter the summoner's instance",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return TownRetry::Elsewhere;
+
+    // Everything left is somebody's own state, and every one of them ends on
+    // its own: a fight, a corpse, a flight, a walk, a cast already in progress,
+    // a party that has not formed yet, a level that is still climbing, a summon
+    // already pending, a mind control, a session going away, a bot AI that has
+    // not attached. `Later` is also what an unrecognised literal gets, which is
+    // the same call the bind, hearth, sell and repair tables make.
+    return TownRetry::Later;
+}
+
 }  // namespace OverseerDecisions
