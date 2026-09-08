@@ -4766,9 +4766,11 @@ private:
     //
     // SO THE HOLD IS A REGISTER AND NOT A PAIR OF CALLS. What makes a hold hold
     // is that everything else in this module which hands a mover back asks
-    // first. There are four such places and all four now ask: the leader's
+    // first. There are six such places and all six now ask: the leader's
     // `new rpg` grant, the follower's `follow` grant, the cut-off follower's
-    // `new rpg` grant, and ReadAimedMoverFor, which is the travel drive's own.
+    // `new rpg` grant, ReadAimedMoverFor which is the travel drive's own, the
+    // follow-gap catch-up, and ReleaseRevivalHold - which is one hold lifting
+    // another and was the easiest of the six to miss.
     //
     // ONE RECORD, IN ONE PLACE. The register is the single copy of what a hold
     // changed; a verb holds a NAME. Two copies of that record is how a release
