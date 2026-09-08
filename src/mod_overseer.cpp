@@ -5168,6 +5168,57 @@ private:
                               p->GetName());
             }
 
+            // ...AND IT GOES ON A FOLLOWER THAT IS CUT OFF WITH NOWHERE TO BE
+            // (#331).
+            //
+            // The strip above is the only thing that ever touched `new rpg` on
+            // a follower, and the only grants anywhere are the leader's, an
+            // escort's and an errand's. So a follower stranded on the other map
+            // from its leader with an empty errand column is handed the
+            // strategy by nobody and stripped of it by the poll above: it
+            // stands still for as long as the split lasts, which measured
+            // 2026-09-08 was hours. Three characters held position to the yard
+            // and gained nothing while the two on the leader's map levelled.
+            //
+            // GRANTED ONLY WITH AN EMPTY COLUMN, WHICH IS NARROWER THAN
+            // MaySteerItself ON PURPOSE. A freshly granted `new rpg` starts at
+            // RPG_IDLE and NewRpgStatusUpdateAction turns that into a random
+            // status on its next tick, two of the eight walking the character
+            // somewhere of its own choosing - which is why the escort's grant
+            // lives at the statement before its aim is written and may not be
+            // hoisted anywhere earlier (#122). Granting here for a character
+            // that HAS an errand would reopen exactly that window and send it
+            // wandering instead of to its vendor. With no errand there is no
+            // walk to spoil, and wandering off to quest is the entire point.
+            //
+            // AN ESCORT IS LEFT TO ITS OWN GRANT for the same reason, and a
+            // character held after a revival is left alone because that hold
+            // took the strategy off deliberately and gives it back itself.
+            //
+            // READ BACK, like every other grant on this path: a strategy that
+            // silently failed to take is a character standing in a field, and
+            // a confident log line about it is worse than no line at all.
+            if (!botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
+                SplitFromLeader(p->GetName()) && !IsEscorted(p->GetName()) &&
+                !HeldAfterRevival(p->GetName()) &&
+                OverseerDecisions::ReadSplitErrand(
+                    _travelAims.TargetFor(p->GetName())) ==
+                    OverseerDecisions::SplitErrand::Nothing)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is cut off from its leader with no errand of its "
+                         "own - granting `new rpg`, because `follow` cannot cross a map "
+                         "and a follower that cannot follow and cannot steer is a "
+                         "character standing in a field until somebody moves it",
+                         p->GetName());
+                botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+                if (!botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' was granted `new rpg` while cut off and "
+                              "still does not carry it - it will not move at all",
+                              p->GetName());
+            }
+
             // A FOLLOWER THAT HAS STOPPED, AND NEVER CLOSES THE GAP (#70).
             //
             // Everything above this checks that `follow` and the master are
@@ -10849,16 +10900,24 @@ private:
     // TWO WAYS IN, AND THEY ARE DIFFERENT THINGS. An ESCORT is somebody else
     // asking for this character to be somewhere - a run's doorway, a staging
     // point, a catch-up walk - and it is handed back by that somebody's sweep.
-    // The second is this character's OWN errand while it is cut off from its
-    // leader, and nothing sweeps that one because nothing has to: the errand
-    // ends, the column clears, this goes false, and the backstop in
-    // KeepRosterFollowing takes the strategy back on its next poll. See
-    // SplitErrand in overseer_decisions.h for which errands qualify and why.
+    // The second is BEING CUT OFF FROM THE LEADER AT ALL, whether or not an
+    // errand is running: `follow` cannot cross a map, so a character in that
+    // state has nothing else that would ever move it, and the cohesion the
+    // refusal protects is already gone. See SplitFollowerDrivesItself in
+    // overseer_decisions.h for the measurement and for the one target shape
+    // that is still refused.
+    //
+    // THE SWEEP STILL ENDS IT, and on the condition rather than on the errand.
+    // DriveCatchUp erases the split the moment the two maps agree, this goes
+    // false, and the backstop in KeepRosterFollowing takes the strategy back on
+    // its next poll - so a family that reunites is a family whose followers
+    // stop steering themselves, exactly as before.
     bool MaySteerItself(std::string const& name) const
     {
         return IsEscorted(name) ||
                (SplitFromLeader(name) &&
-                OverseerDecisions::ErrandRunsAlone(_travelAims.TargetFor(name)));
+                OverseerDecisions::SplitFollowerDrivesItself(
+                    _travelAims.TargetFor(name)));
     }
 
     // DOES THIS CHARACTER LEAD, OR ANSWER TO NOBODY? Upstream's own test for who
