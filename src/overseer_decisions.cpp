@@ -5359,11 +5359,24 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
     }
     cursor.at = nearest;
 
-    // ...and the aim is the furthest point still inside the lookahead.
+    // ...and the aim is the furthest point still inside the lookahead, and no
+    // further ahead than the caller allows. See RouteLegLimits::maxPointsAhead:
+    // a measured corridor's points are each written down because the line past
+    // them does not work, so its caller passes one and gets the next point
+    // rather than the furthest one it could see.
     std::uint32_t ahead = nearest;
     while (ahead + 1 < route.size() &&
            PlaneDistance(route[ahead + 1].x, route[ahead + 1].y, x, y) <= limits.lookaheadYards)
+    {
+        // Counted from the cursor, and the test is on how far `ahead` has
+        // ALREADY come rather than on where it is about to go: a bound of one
+        // has to permit the first step or it would aim at the point the
+        // character is standing on, which is the deadlock this whole limit
+        // exists to avoid.
+        if (limits.maxPointsAhead && ahead - nearest >= limits.maxPointsAhead)
+            break;
         ++ahead;
+    }
 
     aim.hasAim = true;
     aim.index = ahead;
@@ -5380,7 +5393,8 @@ char const* StagingCorridorVerdictName(StagingCorridorVerdict verdict)
     {
         case StagingCorridorVerdict::Joined:       return "joined";
         case StagingCorridorVerdict::NoCorridor:   return "no measured corridor for this door";
-        case StagingCorridorVerdict::NotThisAim:   return "the corridor ends somewhere else";
+        case StagingCorridorVerdict::NotThisAim:   return "this walk does not go anywhere on that corridor";
+        case StagingCorridorVerdict::AimIsBehind:  return "the aim is behind where this character would join it";
         case StagingCorridorVerdict::TooFarToJoin: return "nothing on the corridor is near enough to walk to";
         case StagingCorridorVerdict::LegTooLong:   return "two of its points stand more than one lookahead apart";
         case StagingCorridorVerdict::BadLimits:    return "the limits asked for are not distances";
@@ -5408,9 +5422,21 @@ StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
 
     // WHOSE CORRIDOR IS THIS. Asked before anything else is measured, because
     // every other answer below is about a corridor that has already been shown
-    // to belong to this walk.
-    RoutePoint const& last = corridor[corridor.size() - 1];
-    if (PlaneDistance(last.x, last.y, aimX, aimY) > limits.endsAtYards)
+    // to belong to this walk. The aim has to stand on ONE of its points, and
+    // which one is where the route will stop; see the header for why that is
+    // any point rather than only the last.
+    std::size_t end = 0;
+    float endDistance = -1.f;
+    for (std::size_t i = 0; i < corridor.size(); ++i)
+    {
+        float const d = PlaneDistance(corridor[i].x, corridor[i].y, aimX, aimY);
+        if (endDistance < 0.f || d < endDistance)
+        {
+            endDistance = d;
+            end = i;
+        }
+    }
+    if (endDistance > limits.endsAtYards)
     {
         plan.verdict = StagingCorridorVerdict::NotThisAim;
         return plan;
@@ -5449,11 +5475,22 @@ StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
         return plan;
     }
 
-    plan.route.reserve(corridor.size() - join);
-    for (std::size_t i = join; i < corridor.size(); ++i)
+    // WALKING FORWARD OR NOT AT ALL. A join past the aim would hand back the
+    // corridor reversed, which is a second claim about the ground that nobody
+    // measured. Equal is fine and means "standing at the aim already": the
+    // route is the one point, and RouteLegStep answers `arrived` for it.
+    if (join > end)
+    {
+        plan.verdict = StagingCorridorVerdict::AimIsBehind;
+        return plan;
+    }
+
+    plan.route.reserve(end - join + 1);
+    for (std::size_t i = join; i <= end; ++i)
         plan.route.push_back(corridor[i]);
     plan.verdict = StagingCorridorVerdict::Joined;
     plan.joinIndex = join;
+    plan.endIndex = end;
     plan.joinYards = joinDistance;
     return plan;
 }
