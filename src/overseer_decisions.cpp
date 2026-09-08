@@ -5087,11 +5087,15 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     // continent short of its errand, and comparing only the leftover would
     // never adopt one at all.
     FootReach const* chosen = &straight;
+    // `round` OUTLIVES THE BRANCH BELOW ON PURPOSE, because `chosen` may end up
+    // pointing at it and the unwind that reads it is past the closing brace.
+    // Declared inside, this compiled and ran correctly on one compiler and
+    // segfaulted on another, which is what a dangling pointer is entitled to do.
+    FootReach round;
     std::uint32_t guardedOnPlan = GuardedLegsOn(straight, edgeGuarded, entry, goal);
     if (anyGuarded && guardedOnPlan > 0)
     {
         float const reach = straight.best[goal] + goalDistance;
-        FootReach round;
         WalkOnFoot(firstEdge, edgeTo, edgeCost, edgeGuarded, true, entry, round);
         std::uint32_t roundGoal = entry;
         float roundDistance = -1.f;
