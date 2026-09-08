@@ -1321,6 +1321,23 @@ constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
 // turned that sentence into code, is on OverseerDecisions::ErrandDeathLimits.
 constexpr OverseerDecisions::ErrandDeathLimits ERRAND_DEATH_LIMITS{};
 
+// WHAT ECONOMY ERRANDS ARE ALLOWED TO COST WHEN NOTHING IS GOING WRONG. The
+// breaker above answers an errand that kills; this answers one that simply
+// never stops. Measured on 2026-09-08, thirty minutes of one character's log:
+// nine errands, all of them arriving cleanly, holding the quest drive down for
+// 66.3% of the wall clock while his quest count sat still for twelve hours and
+// four siblings with no errands at all gained levels. The whole argument, and
+// why this is a budget rather than a cooldown, is on
+// OverseerDecisions::ErrandBudgetLimits.
+constexpr OverseerDecisions::ErrandBudgetLimits ERRAND_BUDGET_LIMITS{};
+
+// WHAT ONE POLL OF AN OUTSTANDING ERRAND COSTS THE BUDGET. The drive's own
+// cadence, because the budget is charged on the poll and not on the errand: an
+// errand billed only when it ends could spend the whole allowance before
+// anything looked, and the log has a 460 second errand in it. Seconds, because
+// every other clock in this rule is.
+constexpr int64 ERRAND_BUDGET_POLL_SECONDS = static_cast<int64>(TRAVEL_POLL_MS / 1000);
+
 // HOW OFTEN A REFUSED RE-ISSUE IS WORTH SAYING AGAIN. The refusal itself acts
 // on every poll - it must, or the column stays armed - but a line every
 // TRAVEL_POLL_MS for fifteen minutes buries the release that caused it. Long
@@ -3704,12 +3721,46 @@ public:
     // one is the one that matters; a second lethal target simply replaces the
     // first, and by then the first has stopped being what anybody is walking
     // to. That also bounds this map at the size of the roster forever.
-    void Refuse(std::string const& name, std::string const& target)
+    // AND IT CARRIES WHY. There are two rules that refuse an errand now - it is
+    // killing this character, or economy errands have had more than their share
+    // of it - and they end at the same cool-off and the same log line. A line
+    // that named only the older of the two would be a mechanism reporting
+    // something it did not observe, which is the one thing this drive's comments
+    // have been unanimous about since the backstop.
+    void Refuse(std::string const& name, std::string const& target,
+                std::string const& reason)
     {
         Refusal& refusal = _refused[name];
         refusal.target = target;
+        refusal.reason = reason;
         refusal.at = std::time(nullptr);
         refusal.said = 0;
+    }
+
+    // Why this character's errand was called off, for the line that says it was.
+    // Empty when nothing is refused, which no caller reaches: every reader of
+    // this asks after SecondsSinceRefused has already said there is one.
+    std::string RefusedReason(std::string const& name) const
+    {
+        auto const it = _refused.find(name);
+        return it == _refused.end() ? std::string() : it->second.reason;
+    }
+
+    // CHARGE ONE POLL OF ECONOMY ERRAND TO THIS CHARACTER, and say whether it
+    // has now had its share. See OverseerDecisions::ErrandBudgetLimits.
+    //
+    // THE DRAIN NEEDS NO POLL OF ITS OWN, which is why this is called only while
+    // an errand is outstanding and is still correct for the time in between:
+    // ErrandSpendAfter drains from the last mark to now, so a character that
+    // spent twenty minutes questing arrives at its next errand poll with those
+    // twenty minutes already credited. A sweep over idle characters would buy
+    // nothing and would be one more thing to keep in step with the roster.
+    bool NoteEconomySpend(std::string const& name, int64_t heldSeconds)
+    {
+        OverseerDecisions::ErrandSpend& spend = _spend[name];
+        spend = OverseerDecisions::ErrandSpendAfter(spend, std::time(nullptr),
+                                                    heldSeconds, ERRAND_BUDGET_LIMITS);
+        return OverseerDecisions::ErrandOverspent(spend, ERRAND_BUDGET_LIMITS);
     }
 
     // Seconds since Refuse last named THIS target for this character, or -1
@@ -3739,10 +3790,11 @@ public:
     }
 
 private:
-    // One errand a character was sent on and died on, and when.
+    // One errand a character was called off, why, and when.
     struct Refusal
     {
         std::string target;
+        std::string reason;
         time_t at{0};
         time_t said{0};  // when the re-issue was last reported, 0 = never
     };
@@ -3752,10 +3804,16 @@ private:
     // by Claim, which is its only door into the column, and erased by Release
     // and PruneVanished - every way an errand can end.
     std::map<std::string, std::string> _claimed;
-    // Which errand last killed each character, so a re-aim at it is refused
-    // rather than walked. Deliberately outlives the errand it ended; see
+    // Which errand each character was last called off, so a re-aim at it is
+    // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
     std::map<std::string, Refusal> _refused;
+    // What economy errands have cost each character lately. Beside `_refused`
+    // and for the same reason: it has to outlive the errands it is counting, or
+    // it counts one errand at a time and never reaches a share of anything. Its
+    // own drain keeps it honest across the gaps, so nothing sweeps it, and it is
+    // bounded at the size of the roster.
+    std::map<std::string, OverseerDecisions::ErrandSpend> _spend;
     // When travel last let go of a character, so the quest drive does not pick
     // it up on the same tick the errand ended. Written by Release and by
     // PruneVanished - every way an errand can end - and read only by
@@ -11953,6 +12011,45 @@ private:
                 // already reads fifty lines below for the re-aim log line. See
                 // OverseerDecisions::ErrandDeathToll::catchUp.
                 toll.catchUp = IsCatchingUp(name);
+
+                // THE SECOND REASON TO CALL AN ERRAND OFF, CHARGED HERE AND
+                // ANSWERED BY THE RULE BELOW (#333). The breaker asks whether an
+                // errand is killing this character. This asks the other question
+                // that was never asked: whether errands that are all going
+                // PERFECTLY WELL are nonetheless the whole of what it does.
+                //
+                // NOT A SECOND MECHANISM. It ends in the same refusal memory,
+                // the same cool-off and the same release, because the thing that
+                // has to happen is identical - clear the column and keep
+                // clearing it while something outside this module re-arms it -
+                // and a parallel path that did the same three things would be
+                // the eight-place duplication TravelAimBook exists to have
+                // ended. All this does is write the refusal; the switch below
+                // reads it on this very poll, since `sinceRefused` is taken
+                // after this line and not before it.
+                //
+                // ECONOMY ERRANDS ONLY, and never one a run is answering for. A
+                // dungeon staging aim, an escort and a catch-up walk all cost
+                // time too, and every one of them has something that ends it -
+                // which is exactly what these three do not.
+                //
+                // THE ALREADY-REFUSED TEST COMES BEFORE THE CHARGE, and the
+                // order is the rule rather than tidiness. Through a cool-off the
+                // bridge keeps re-arming the column and the switch below keeps
+                // clearing it, so the character is NOT walking anywhere - and
+                // charging it for those polls would bill it for an errand it was
+                // refused, filling the bucket for the whole cool-off and turning
+                // a fifteen minute pause into an hour. Short-circuiting here
+                // skips the charge entirely; the drain still covers that stretch
+                // on the next poll that does charge, because it runs from the
+                // last mark and not from the last call.
+                if (!toll.runOwned && OverseerDecisions::IsMaintenanceErrand(target) &&
+                    _travelAims.SecondsSinceRefused(name, target) < 0 &&
+                    _travelAims.NoteEconomySpend(name, ERRAND_BUDGET_POLL_SECONDS))
+                    _travelAims.Refuse(name, target,
+                                       "economy errands had taken more than their share "
+                                       "of this character's time");
+
                 toll.sinceRefused = _travelAims.SecondsSinceRefused(name, target);
 
                 // THE ONLY STRETCH OF THE TABLE THIS ERRAND ANSWERS FOR. Zero
@@ -12000,7 +12097,8 @@ private:
                                  killer.empty() ? std::string()
                                                 : ", mostly to '" + killer + "'",
                                  static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60));
-                        _travelAims.Refuse(name, target);
+                        _travelAims.Refuse(name, target,
+                                           "it was killing this character");
                         _travelAims.Release(name);
                         continue;
                     }
@@ -12010,13 +12108,25 @@ private:
                         // column has been written again by somebody, so it has
                         // to be cleared again; that is the whole point of the
                         // memory. Only the log line is rationed.
+                        //
+                        // AND IT NAMES THE RULE THAT CALLED IT OFF, because
+                        // there are two of them now and they arrive here
+                        // identically: an errand that was killing this character
+                        // and one that was eating its questing. The reason is
+                        // carried on the refusal itself rather than re-derived,
+                        // so the line cannot drift from the decision that wrote
+                        // it. It is also true on the FIRST firing, which is why
+                        // this no longer says "has been re-aimed": the budget
+                        // rule above refuses and is answered on the same poll,
+                        // where nothing has re-aimed anything yet.
                         if (_travelAims.SayRefusalAgain(name))
                             LOG_WARN("module.overseer",
-                                     "overseer: '{}' has been re-aimed at '{}', the errand "
-                                     "that was called off for killing it - clearing it "
-                                     "again, and refusing it for another {}s. Something "
-                                     "outside this drive keeps writing this column",
-                                     name, target, verdict.coolOffRemaining);
+                                     "overseer: '{}' is aimed at '{}', an errand called "
+                                     "off because {} - clearing it, and refusing it for "
+                                     "another {}s. Something outside this drive keeps "
+                                     "writing this column",
+                                     name, target, _travelAims.RefusedReason(name),
+                                     verdict.coolOffRemaining);
                         _travelAims.Release(name);
                         continue;
 
@@ -12089,7 +12199,8 @@ private:
                         // writer of this column, and only the refusal survives
                         // the other one re-arming it; the argument is on
                         // ErrandDeathLimits::cooloffSeconds and is unchanged.
-                        _travelAims.Refuse(name, target);
+                        _travelAims.Refuse(name, target,
+                                           "it was killing this character");
                         // AND THE WALK ITSELF IS STOOD DOWN. See
                         // CATCH_UP_STANDDOWN_SECONDS: without this the next
                         // party poll reads the same gap over the same ground and

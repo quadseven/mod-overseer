@@ -3861,6 +3861,76 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     return verdict;
 }
 
+// ------------------------------- an errand that is eating the questing --
+
+ErrandSpend ErrandSpendAfter(ErrandSpend const& before, time_t now, int64_t heldSeconds,
+                             ErrandBudgetLimits const& limits)
+{
+    ErrandSpend after;
+    after.markedAt = now;
+    after.seconds = before.seconds;
+
+    // A WINDOW THAT IS NOT A WINDOW MEASURES NOTHING, and a division by it is
+    // worse than the rule being off. Answered before anything divides.
+    if (limits.windowSeconds <= 0 || limits.spendSeconds <= 0)
+    {
+        after.seconds = 0;
+        return after;
+    }
+
+    // FIRST SIGHT OF THIS CHARACTER IS NOT A GAP TO DRAIN. `markedAt` of zero
+    // means this rule has never looked at it, and reading that as "1970" would
+    // drain a bucket that is already empty by several decades of credit - and,
+    // once the clamp below is reversed, hand out that much spending. So the
+    // first mark only starts the clock.
+    if (before.markedAt > 0 && now > before.markedAt)
+    {
+        int64_t const elapsed = static_cast<int64_t>(now - before.markedAt);
+        // The drain, and the whole of the rule: `spendSeconds` of allowance per
+        // `windowSeconds` of wall clock. Integer division rounds the drain
+        // DOWN, which errs towards holding a character off rather than towards
+        // letting the loop run, and is the direction to err in for a rule whose
+        // failure mode on the other side is the bug it was written for.
+        after.seconds -= elapsed * limits.spendSeconds / limits.windowSeconds;
+    }
+
+    // ONLY REAL TIME IS ADDED. A negative or zero hold is a caller whose two
+    // clock reads came back out of order, not an errand that ran for less than
+    // no time, and crediting it would let a bucket be emptied by asking often
+    // enough.
+    if (heldSeconds > 0)
+        after.seconds += heldSeconds;
+
+    if (after.seconds < 0)
+        after.seconds = 0;
+    // ONE BUCKET OF DEBT, AND NOT A SECOND ONE.
+    //
+    // Clamping at the line itself looks tidier and quietly hands out time. The
+    // rule is asked once per poll, so an errand already running when the budget
+    // is reached still costs the rest of that poll; if the total cannot go past
+    // the line, that overshoot is discarded instead of repaid, and the
+    // character is handed it again on every saturation. Measured over a
+    // six-hour replay of the observed loop that leak was 600 seconds, taking a
+    // 23.3% allowance out at 26.1%.
+    //
+    // Letting it run to twice the budget makes the overshoot a debt that the
+    // next quiet stretch pays off, which is what makes the share hold. Bounded
+    // there rather than unbounded for the reason the clamp existed at all: from
+    // twice the budget one window of drain brings it exactly back to the line, so
+    // a single bad stretch can never cost more than one window of hold-off.
+    if (after.seconds > 2 * limits.spendSeconds)
+        after.seconds = 2 * limits.spendSeconds;
+
+    return after;
+}
+
+bool ErrandOverspent(ErrandSpend const& spend, ErrandBudgetLimits const& limits)
+{
+    if (limits.spendSeconds <= 0)
+        return false;
+    return spend.seconds >= limits.spendSeconds;
+}
+
 // ----------------------------------------------------------------- auction --
 
 namespace
