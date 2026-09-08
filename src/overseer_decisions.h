@@ -6815,6 +6815,81 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts);
 // mechanism with no caller and a test pinning nothing.
 
 
+// ------------------ what stopped a cast this module drove at the core (#337) --
+//
+// THE HOLD WORKS AND THE CAST STILL DOES NOT GO OUT, WHICH IS A DIFFERENT
+// DEFECT WEARING THE SAME CLOTHES. Measured on the dev realm 2026-09-08, eight
+// consecutive hearths on the party leader alternated: one row refused
+// `character is moving` and placed a hold, the next found the character
+// standing, drove the cast, and ended `stayed`. The log has the hold going on
+// at 17:08:51 and coming off at 17:09:31, and the cast being driven at 17:09:15
+// squarely between them. So the character was held, and the cast did not start:
+// `casting_after_call` false, the hearthstone cooldown still clear at the
+// verdict, and the character 1,596 yards from a home it never reached.
+//
+// AND THE ROW COULD NOT SAY WHY, WHICH IS #329 ALL OVER AGAIN. `conjure` drives
+// its cast through PlayerbotAI::CastSpell and #330 taught it to name the wall
+// it hit. `hearth` and `summon` drive theirs by handing a packet to the core's
+// own handler, which answers a client that a bot does not have, and they record
+// one bit: whether a cast was running immediately afterwards. When that bit is
+// false the row has nothing at all to say.
+//
+// SO THESE ARE THE CORE'S WALLS RATHER THAN THE BOT AI'S, and they are asked in
+// the order Spell::CheckCast reaches them. Same idea as ConjureCastGate, a
+// different list, because a different thing is refusing.
+//
+// SITTING IS ON THE LIST AND IT IS THE ONE WORTH EXPLAINING. A real player's
+// client stands them up before it sends CMSG_USE_ITEM; the packet this module
+// hands the handler comes from no client at all, so nothing stands anybody up.
+// That is the same shape as the areatrigger this module already had to send by
+// hand: walking in like a player depends on a part of the player a bot does not
+// have. And the hold makes it MORE likely rather than less, because a character
+// that has stopped moving and is out of combat is a character its own `food`
+// strategy will sit down and eat.
+struct CastWallGate
+{
+    bool grounded{true};  // not flying and not on a taxi
+    bool standing{true};  // Unit::IsStandState - a bot has no client to stand it
+    bool still{true};     // not moving, which cancels any cast with the flag
+    bool ready{true};     // the spell's own cooldown has finished
+    bool free{true};      // not already casting something else
+};
+
+// Which wall, or "" when the gate is clear. A cast refused with none of them
+// true gets NoneNamed rather than a shrug: an honest unknown that has ruled the
+// other five out is a far better place to start than a bare false.
+char const* CastWallBlocker(CastWallGate const& gate);
+
+// THE LITERALS GO STRAIGHT INTO AN UPDATE, so none may carry a quote character.
+// They are worded as readings taken AT THE MOMENT THE CAST WAS DRIVEN, and
+// deliberately not as the pre-flight refusals of the same name: a row that says
+// `character is moving` was refused before anything was sent, and one that says
+// `the character was moving when the cast was driven` sent the packet and
+// watched it come to nothing.
+namespace CastWall
+{
+constexpr char const* InFlight = "the character was in flight when the cast was driven";
+constexpr char const* NotStanding = "the character was sitting when the cast was driven";
+constexpr char const* Moving = "the character was moving when the cast was driven";
+constexpr char const* OnCooldown = "the spell was on cooldown when the cast was driven";
+constexpr char const* AlreadyCasting = "the character was already casting when the cast was driven";
+constexpr char const* NoneNamed = "the cast did not start and nothing in front of it was true";
+}  // namespace CastWall
+
+// THE `stayed` VERDICT HAS TWO CAUSES AND THE ROW ASSERTED ONLY ONE OF THEM.
+// `the cast went out and the character never left` was written into every
+// `stayed` row whatever happened, including the eight above, where no cast went
+// out at all. A sentence a row cannot have checked is worse than no sentence:
+// it sent the operator looking for a failed teleport when the failure was that
+// nothing was ever cast.
+constexpr char const* HEARTH_STAYED_CAST_SEEN =
+    "the cast went out and the character never left";
+constexpr char const* HEARTH_STAYED_NO_CAST =
+    "the cast never started and the character never left";
+
+char const* HearthStayedDetail(bool castWasSeen);
+
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

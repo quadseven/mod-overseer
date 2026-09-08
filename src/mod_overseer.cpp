@@ -4785,6 +4785,7 @@ private:
         bool addedStay{false};
         bool removedFollow{false};
         bool removedNewRpg{false};
+        bool stoodItUp{false};
         time_t until{0};
         std::string verb;
     };
@@ -4835,11 +4836,15 @@ private:
     // `flee` fights this hold, and removing it would be a casting verb holding a
     // character still while something kills it. Every one of these verbs already
     // treats combat as a wall it waits on.
-    static void HoldCharacterStill(Player* who, PlayerbotAI* botAI, std::string const& name,
+    // Answers whether this call PLACED the hold, as opposed to re-asserting one
+    // that was already standing. A row needs to be able to tell those apart:
+    // reporting "no hold" for a cast that a previous row's hold was covering is
+    // what sent the operator looking for a hold that was working (#337).
+    static bool HoldCharacterStill(Player* who, PlayerbotAI* botAI, std::string const& name,
                                    char const* verb)
     {
         if (!who || !botAI)
-            return;
+            return false;
 
         auto& holds = CastHoldsInForce();
         auto const existing = holds.find(name);
@@ -4873,6 +4878,21 @@ private:
         who->ClearUnitState(UNIT_STATE_CHASE);
         who->ClearUnitState(UNIT_STATE_FOLLOW);
 
+        // AND IT STANDS THE CHARACTER UP, WHICH IS PART OF HOLDING IT (#337).
+        // A sitting character is not held, it is parked: it cannot cast, and
+        // every verb using this hold is about to try. A real player's client
+        // stands them up before it sends the cast; the packets this module hands
+        // the core's handlers come from no client at all, so nothing does it.
+        // Same shape as the areatrigger this module already has to send by hand.
+        //
+        // AND THE HOLD IS WHAT MAKES IT LIKELY. A character that has just been
+        // stopped, out of combat, is a character its own `food` strategy sits
+        // down to eat, so the hold's own success creates this wall. Doing it here
+        // rather than in each verb is the point of there being one hold.
+        bool const wasSitting = !who->IsStandState();
+        if (wasSitting)
+            who->SetStandState(UNIT_STAND_STATE_STAND);
+
         if (fresh)
         {
             CastHoldRecord record;
@@ -4881,16 +4901,23 @@ private:
             record.removedNewRpg = plan.dropNewRpg;
             record.until = time(nullptr) + CAST_HOLD_CEILING_SECONDS;
             record.verb = verb ? verb : "";
+            record.stoodItUp = wasSitting;
             holds[name] = record;
             LOG_INFO("module.overseer",
                      "overseer: '{}' is held still to {} for at most {}s (stay {}, follow {}, "
-                     "new rpg {}); it walks again the moment the row ends, however it ends",
+                     "new rpg {}, {}); it walks again the moment the row ends, however it ends",
                      name, record.verb, uint32(CAST_HOLD_CEILING_SECONDS),
                      plan.addStay ? "added" : "already on",
                      plan.dropFollow ? "removed" : "was off",
-                     plan.dropNewRpg ? "removed" : "was off");
-            return;
+                     plan.dropNewRpg ? "removed" : "was off",
+                     wasSitting ? "stood up from sitting" : "already standing");
+            return true;
         }
+
+        // A re-assertion that had to stand it up again is worth the record
+        // carrying, because it is the `food` strategy winning between polls.
+        if (wasSitting)
+            existing->second.stoodItUp = true;
 
         // AN EXTENDED HOLD IS STILL BOUNDED BY THE CEILING FROM WHEN IT STARTED.
         // The deadline is not pushed out by re-assertion, or a verb that polls
@@ -4902,6 +4929,12 @@ private:
                      "(follow {}, new rpg {})",
                      name, existing->second.verb, plan.dropFollow ? "removed" : "was off",
                      plan.dropNewRpg ? "removed" : "was off");
+        if (wasSitting)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' had sat down mid-{} and is stood up again - a held "
+                     "character out of combat is one its own `food` strategy will feed",
+                     name, existing->second.verb);
+        return false;
     }
 
     // THE OTHER END, AND EVERY EXIT RUNS IT. A hold that is not released is a
@@ -4980,10 +5013,20 @@ private:
     // to write to.
     struct CastHoldReport
     {
+        // A HOLD IS IN FORCE FOR THIS ROW. Not "this row placed one", which is
+        // the reading that cost an afternoon (#337): a row that found the
+        // character already standing placed nothing, published
+        // `hold_applied: false`, and was read as proof the hold had never gone
+        // on - while the log had it going on 23 seconds earlier and coming off
+        // 16 seconds later. `placed` below is the field that answers the
+        // narrower question, and it is the narrower question that is nobody's
+        // first one.
         bool applied{false};
+        bool placed{false};  // ...and THIS row is the one that put it there
         bool tookStay{false};
         bool tookFollow{false};
         bool tookNewRpg{false};
+        bool stoodItUp{false};
     };
 
     // Hold, and tell the row what the hold in force actually took. The two
@@ -4996,15 +5039,17 @@ private:
         PlayerbotAI* botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
         if (!botAI)
             return;
-        HoldCharacterStill(who, botAI, name, verb);
+        bool const placed = HoldCharacterStill(who, botAI, name, verb);
         auto const& holds = CastHoldsInForce();
         auto const record = holds.find(name);
         if (record == holds.end())
             return;
         report.applied = true;
+        report.placed = report.placed || placed;
         report.tookStay = record->second.addedStay;
         report.tookFollow = record->second.removedFollow;
         report.tookNewRpg = record->second.removedNewRpg;
+        report.stoodItUp = record->second.stoodItUp;
     }
 
     // THE BACKSTOP UNDER EVERY VERB'S OWN RELEASE, on its own clock.
@@ -25658,6 +25703,7 @@ private:
           // this module's own bookkeeping and the second is read back off the
           // bot at the verdict, which is the difference #329 exists for.
           << ",\"hold_applied\":" << (ev.heldEver ? "true" : "false")
+          << ",\"hold_placed_by_this_row\":" << (ev.heldEver ? "true" : "false")
           << ",\"hold_took_stay\":" << (ev.addedStay ? "true" : "false")
           << ",\"hold_took_follow\":" << (ev.removedFollow ? "true" : "false")
           << ",\"hold_took_new_rpg\":" << (ev.removedNewRpg ? "true" : "false")
@@ -26555,6 +26601,10 @@ private:
         // observed, and it measured fourteen consecutive asks on one character
         // to land a single cast.
         CastHoldReport hold;
+        // WHY THE CAST DID NOT START, when it did not (#337). Empty on a row
+        // that saw one start, which is the only case where the old row's
+        // sentence about a cast going out was ever true.
+        char const* castBlocker{""};
         OverseerDecisions::HomeBind home;
         OverseerDecisions::HomeBind from;
         OverseerDecisions::HomeBind now;
@@ -26633,9 +26683,12 @@ private:
         else
             o << (ev.teleportWasStillInFlight ? "true" : "false");
         o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
           << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
           << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
-          << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false");
+          << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
+          << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
+          << ",\"cast_blocker\":" << J(ev.castBlocker);
         o << ",\"home\":";
         HearthPlace(o, ev.home);
         o << ",\"from\":";
@@ -26812,6 +26865,23 @@ private:
         // moment it sees it (Spell.cpp:130), and a hearthstone targets nothing.
         // The glyph index must stay under MAX_GLYPH_SLOT_INDEX or the handler
         // refuses the whole thing as a missing item.
+        // ---- hold it for the CAST, not only as a remedy for a refusal (#337) --
+        //
+        // The refusal above places a hold so the sender's next ask finds a
+        // character standing. That left the ask which actually casts covered by
+        // a hold it did not place, does not know about, and will release at its
+        // own verdict - and covered by nothing at all whenever the previous ask
+        // was longer ago than the ceiling, or never happened. A ten second cast
+        // driven at a character nothing is holding is the failure this verb has
+        // always had.
+        //
+        // So the hold goes on HERE too, immediately before the packet, where it
+        // also stands a sitting character up. Placed this late rather than at the
+        // top of the executor so the refusals in between - no hearthstone, on
+        // cooldown, already home - do not stop a character for 45 seconds over
+        // something standing still cannot fix.
+        HoldStillAndReport(who, ev.character, "hearth", ev.hold);
+
         {
             WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
             raw << uint8(stone->GetBagSlot());
@@ -26837,11 +26907,35 @@ private:
         // the window is up.
         ev.castingAfterCall = who->IsNonMeleeSpellCast(false) ? 1 : 0;
 
+        // AND WHEN NOTHING IS CASTING, THE ROW SAYS WHICH WALL (#337). Read
+        // immediately after the packet, in the core's own order. This is the
+        // reading that was missing: eight rows in a row reported a cast that
+        // went out, when what actually happened is that one never started and
+        // nothing anywhere could say why.
+        //
+        // A CAST IN FLIGHT IS STILL NOT A SUCCESS and an absent one is still not
+        // a failure, which is the rule the paragraph above already sets: the
+        // handler may have parked the packet on the spell queue for the global
+        // cooldown. So this NAMES a wall rather than judging on one, and the
+        // verdict still comes from where the character is when the window is up.
+        if (!ev.castingAfterCall)
+        {
+            OverseerDecisions::CastWallGate gate;
+            gate.grounded = !who->IsInFlight();
+            gate.standing = who->IsStandState();
+            gate.still = !who->isMoving();
+            gate.ready = !who->HasSpellCooldown(ev.spellId);
+            gate.free = !who->IsNonMeleeSpellCast(false);
+            char const* const wall = OverseerDecisions::CastWallBlocker(gate);
+            ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+        }
+
         LOG_INFO("module.overseer",
                  "overseer: '{}' is using its hearthstone ({}, spell {}) - a {}ms cast for "
-                 "map {}; judging in {}ms, not now",
+                 "map {}; judging in {}ms, not now. {}",
                  ev.character, ev.itemEntry, ev.spellId, ev.castMs, ev.home.mapId,
-                 ev.windowMs);
+                 ev.windowMs,
+                 ev.castingAfterCall ? "A cast is running." : ev.castBlocker);
 
         HearthCheck check;
         check.id = id;
@@ -26868,6 +26962,7 @@ private:
     {
         using OverseerDecisions::HearthOutcome;
         using OverseerDecisions::HearthOutcomeWord;
+        using OverseerDecisions::HearthStayedDetail;
         using OverseerDecisions::HearthReadBack;
         using OverseerDecisions::ReadTeleportFlight;
         using OverseerDecisions::TeleportFlight;
@@ -26983,15 +27078,26 @@ private:
                     // SUCCESS. WARN and not INFO, for the reason
                     // ResolveStrategyChecks gives: INFO is where the absence of
                     // this line was invisible the first time.
+                    //
+                    // AND IT NO LONGER ASSERTS A CAST NOBODY SAW (#337). This
+                    // detail was the literal `the cast went out and the character
+                    // never left` on every `stayed` row, including eight in a row
+                    // where no cast went out at all. A sentence a row cannot have
+                    // checked is worse than no sentence: it sends the reader
+                    // looking for a failed teleport when the failure is that
+                    // nothing was ever cast.
                     status = "unchanged";
-                    detail = "the cast went out and the character never left";
+                    detail = HearthStayedDetail(check.ev.castingAfterCall == 1);
                     LOG_WARN("module.overseer",
                              "overseer: hearth {} - '{}' NEVER LEFT: still on map {} after "
-                             "{}ms, and its hearthstone cooldown reads {}; see "
+                             "{}ms, its hearthstone cooldown reads {}, and {}; see "
                              "overseer_command.result",
                              check.id, check.targetName, check.ev.now.mapId,
                              check.ev.waitedMs,
-                             check.ev.cooldownAtVerdict == 1 ? "set" : "clear");
+                             check.ev.cooldownAtVerdict == 1 ? "set" : "clear",
+                             check.ev.castingAfterCall == 1
+                                 ? "a cast was seen to start"
+                                 : check.ev.castBlocker);
                     break;
 
                 case HearthOutcome::Elsewhere:
@@ -27284,9 +27390,11 @@ private:
         else
             o << (ev.inCombatAtVerdict ? "true" : "false");
         o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
           << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
           << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
           << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
+          << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
           << ",\"held_helper\":" << J(ev.heldHelper)
           << ",\"helper_hold_applied\":" << (ev.helperHold.applied ? "true" : "false")
           << ",\"helper_hold_took_stay\":" << (ev.helperHold.tookStay ? "true" : "false")
@@ -27794,6 +27902,24 @@ private:
             return refuse("no second party member is at the stone");
         }
         ev.helper = helper->GetName();
+
+        // ---- hold BOTH for the ritual, before a packet goes out (#337) ---
+        //
+        // Every hold this verb placed until now was a remedy for a refusal:
+        // it stopped the characters so that the NEXT ask would find them
+        // standing, and then the next ask drove the whole ritual with no hold
+        // of its own. That ritual is a channel the summoner has to keep for
+        // five seconds while CheckRitualList re-counts the participants, so
+        // the one attempt that gets this far is exactly the attempt that
+        // needs holding, and it was the only one that never was.
+        //
+        // Both, and the summoner first, because the portal is its channel.
+        // This also stands either of them up: the hold does that now, and a
+        // sitting character cannot click a stone any more than it can cast.
+        HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
+        HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
+        if (ev.helperHold.applied)
+            ev.heldHelper = helper->GetName();
 
         // ---- drive the core's own handlers -----------------------------------
         //
