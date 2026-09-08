@@ -5318,4 +5318,269 @@ TownRetry SummonRefusalRetry(std::string const& detail)
     return TownRetry::Later;
 }
 
+bool ClassRestoresManaByDrinking(uint32_t classId)
+{
+    switch (classId)
+    {
+        case 2:   // paladin
+        case 3:   // hunter, whose shots cost mana in this expansion
+        case 5:   // priest
+        case 7:   // shaman
+        case 8:   // mage
+        case 9:   // warlock
+        case 11:  // druid
+            return true;
+        default:
+            // warrior (1), rogue (4), death knight (6), and anything this
+            // module has never heard of.
+            return false;
+    }
+}
+
+char const* ConjureWhatWord(ConjureWhat what)
+{
+    switch (what)
+    {
+        case ConjureWhat::Food:
+            return "food";
+        case ConjureWhat::Water:
+            return "water";
+        case ConjureWhat::None:
+            break;
+    }
+    return "none";
+}
+
+ConjureRequest ParseConjureRequest(std::string const& command)
+{
+    ConjureRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    if (words.empty())
+    {
+        // NO EMPTY FORM, unlike the hearth's. A hearthstone has exactly one
+        // thing it can do, so an empty command can only mean that one thing.
+        // This verb has two, and guessing which of food and water an empty row
+        // meant would be this module choosing what a family eats.
+        request.error = ConjureRefusal::Malformed;
+        return request;
+    }
+
+    ConjureWhat what = ConjureWhat::None;
+    if (words[0] == "food")
+        what = ConjureWhat::Food;
+    else if (words[0] == "water")
+        what = ConjureWhat::Water;
+    else
+    {
+        request.error = ConjureRefusal::Malformed;
+        return request;
+    }
+
+    bool haveUpTo = false;
+    uint32_t upTo = 0;
+    for (size_t i = 1; i < words.size(); ++i)
+    {
+        uint32_t value = 0;
+        if (!TownKeyed(words[i], "up_to", value))
+        {
+            request.error = ConjureRefusal::Malformed;
+            return request;
+        }
+        // Twice is a row that disagrees with itself, zero is a row that asks
+        // for nothing, and over the ceiling is almost always a typed extra
+        // zero. None of the three is guessed at.
+        if (haveUpTo || value == 0 || value > CONJURE_UNITS_MAX)
+        {
+            request.error = ConjureRefusal::Malformed;
+            return request;
+        }
+        haveUpTo = true;
+        upTo = value;
+    }
+
+    request.what = what;
+    request.capped = haveUpTo;
+    request.upTo = haveUpTo ? upTo : CONJURE_UNITS_DEFAULT;
+    return request;
+}
+
+ConjurePlan PlanConjure(uint32_t carried, uint32_t wanted, uint32_t perCast,
+                        uint32_t roomUnits)
+{
+    ConjurePlan plan;
+    plan.carried = carried;
+    plan.perCast = perCast;
+    plan.wanted = wanted;
+
+    if (carried >= wanted)
+    {
+        plan.wanted = carried;
+        plan.nothingToDo = true;
+        return plan;
+    }
+
+    // THE BAGS CLAMP THE TARGET, NOT THE OTHER WAY ROUND. Asking for twenty
+    // when there is room for six is a request for six, said out loud, rather
+    // than a refusal: six is worth having and the row reports what it aimed
+    // for. A refusal here would leave a party with nothing over a bag that was
+    // merely nearly full.
+    uint32_t const missing = wanted - carried;
+    if (roomUnits < missing)
+    {
+        plan.roomLimited = true;
+        plan.wanted = carried + roomUnits;
+    }
+
+    if (plan.wanted <= carried)
+    {
+        // No room at all. Named as nothing to do rather than as a plan of zero
+        // casts that a caller could mistake for "already stocked".
+        plan.nothingToDo = true;
+        return plan;
+    }
+
+    if (perCast == 0)
+    {
+        // A spell whose effect could not be read. Zero casts, and the executor
+        // says why rather than dividing by this.
+        return plan;
+    }
+
+    uint32_t const stillMissing = plan.wanted - carried;
+    plan.casts = (stillMissing + perCast - 1) / perCast;
+    return plan;
+}
+
+char const* ConjureStepWord(ConjureStep step)
+{
+    switch (step)
+    {
+        case ConjureStep::Cast:
+            return "cast";
+        case ConjureStep::Wait:
+            return "wait";
+        case ConjureStep::Done:
+            return "done";
+        case ConjureStep::GaveUp:
+            break;
+    }
+    return "gave up";
+}
+
+ConjureStep ConjureNextStep(ConjureProgress const& progress)
+{
+    // Done first, before anything about a cast in flight: a character that has
+    // already reached the target is finished whatever it happens to be doing.
+    if (progress.wanted != 0 && progress.carried >= progress.wanted)
+        return ConjureStep::Done;
+
+    // A cast in flight is progress, so it beats both give-up tests. Charging a
+    // three second cast against a budget counted in polls is how a working loop
+    // gets killed for being slow.
+    if (progress.castInFlight)
+        return ConjureStep::Wait;
+
+    if (progress.castsSpent >= progress.castsAllowed)
+        return ConjureStep::GaveUp;
+
+    // The test that matters. Out of mana, interrupted, bags filled by something
+    // else, a product this character may not use: from here all four look the
+    // same, which is a cast that goes out and produces nothing. An idleLimit of
+    // 0 disables the test rather than giving up before the first cast.
+    if (progress.idleLimit != 0 && progress.idlePolls >= progress.idleLimit)
+        return ConjureStep::GaveUp;
+
+    return ConjureStep::Cast;
+}
+
+char const* ConjureOutcomeWord(ConjureOutcome outcome)
+{
+    switch (outcome)
+    {
+        case ConjureOutcome::Filled:
+            return "filled";
+        case ConjureOutcome::Short:
+            return "short";
+        case ConjureOutcome::Nothing:
+            return "nothing";
+        case ConjureOutcome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
+ConjureOutcome ConjureReadBack(bool readable, uint32_t before, uint32_t after,
+                               uint32_t wanted)
+{
+    if (!readable)
+        return ConjureOutcome::Unreadable;
+    // A row that asked for nothing has no target to be judged against, and
+    // answering `Filled` to it would report a success nobody asked for. The
+    // parse refuses `up_to:0`, so this is only reachable through a caller that
+    // built a request by hand.
+    if (wanted == 0)
+        return ConjureOutcome::Unreadable;
+    if (after >= wanted)
+        return ConjureOutcome::Filled;
+    if (after > before)
+        return ConjureOutcome::Short;
+    return ConjureOutcome::Nothing;
+}
+
+uint32_t ConjureVerifyWindowMs(uint32_t castMs, uint32_t casts, uint32_t marginMs,
+                               uint32_t floorMs)
+{
+    // Saturating throughout. Every input here comes from somewhere this module
+    // does not own - a DBC, a plan, a config - and the one failure this
+    // function must not have is a huge input wrapping into a window so short
+    // that a working conjure is judged as having done nothing.
+    uint64_t const perCast = uint64_t(castMs) + uint64_t(marginMs);
+    uint64_t const total = perCast * uint64_t(casts == 0 ? 1u : casts);
+    uint64_t const floored = total < uint64_t(floorMs) ? uint64_t(floorMs) : total;
+    return floored > 0xFFFFFFFFull ? 0xFFFFFFFFu : uint32_t(floored);
+}
+
+TownRetry ConjureRefusalRetry(std::string const& detail)
+{
+    static char const* const NEVER[] = {
+        // The row itself. Every vendor, every field, every hour: the same
+        // answer.
+        ConjureRefusal::Malformed,
+        // The spellbook. A character that has not learned a conjure will not
+        // learn one by being asked again, and a rank whose product it may not
+        // use is a mismatch between two pieces of the world's own data. Both
+        // are `Never` rather than `Later` because the thing that would change
+        // them is a training session or a data fix, neither of which happens
+        // by waiting, and a row retried for ever costs a row for ever.
+        ConjureRefusal::CannotConjure,
+        ConjureRefusal::NoSpellInfo,
+        ConjureRefusal::NoItemTemplate,
+        ConjureRefusal::CannotUseItem,
+        // A spell that says it creates nothing is the world's own data
+        // disagreeing with itself. Waiting does not settle that argument.
+        ConjureRefusal::MakesNothing,
+    };
+
+    // THERE IS NO `Elsewhere` LIST, and its absence is the point rather than an
+    // oversight. Every other errand in this module's town trip is refused
+    // somewhere and allowed somewhere else, because each needs an NPC: a
+    // vendor, a repairer, a banker, an auctioneer, an innkeeper, a mailbox.
+    // A conjure needs nobody. Walking changes nothing about whether it works,
+    // so no refusal here can honestly be classed as one that walking fixes.
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+
+    // Everything left is the character's own state and every one of them ends
+    // on its own: a fight, a corpse, a flight, a stun, a trade, a cast already
+    // running, a bag that gets emptied, a session that comes back, a stack that
+    // gets eaten or handed out. `Later` is also what an unrecognised literal
+    // gets, which is the same call the sell, repair, buy, bind and hearth
+    // tables make: a refusal this table has never heard of is more likely a new
+    // transient than a new permanent.
+    return TownRetry::Later;
+}
+
 }  // namespace OverseerDecisions

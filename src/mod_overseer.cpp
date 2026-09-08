@@ -78,12 +78,14 @@
  *                     exists in this file four times, on revival paths that
  *                     each argued for themselves, and a fifth with nothing in
  *                     front of it would be an admin shortcut wearing a game
- *                     mechanic's name. THE ONLY ROW IN THIS QUEUE THAT CANNOT
- *                     BE ANSWERED BY THE POLL THAT SENT IT: a hearthstone has
- *                     a cast time, so nothing has happened when the handler
- *                     returns and the row parks in `verifying` until
- *                     ResolveHearthChecks reads back where the character
- *                     actually is. See 2026_09_07_01_overseer_hearth.sql.
+ *                     mechanic's name. THE FIRST OF THREE ROWS IN THIS QUEUE
+ *                     THAT CANNOT BE ANSWERED BY THE POLL THAT SENT THEM (the
+ *                     others are kind='summon' and kind='conjure'): a
+ *                     hearthstone has a cast time, so nothing has happened
+ *                     when the handler returns and the row parks in
+ *                     `verifying` until ResolveHearthChecks reads back where
+ *                     the character actually is. See
+ *                     2026_09_07_01_overseer_hearth.sql.
  *       kind='summon' - summon one absent party member to a dungeon's
  *                     summoning stone, across continents, through the game's
  *                     own mechanic: select, click the stone, click the portal
@@ -105,6 +107,25 @@
  *                     packet nothing in this fleet has ever sent, and the
  *                     teleport that follows crosses a map. See
  *                     2026_09_08_00_overseer_summon.sql.
+ *      kind='conjure' - have a character make its own food or water with a
+ *                     spell it already knows, and count what actually landed
+ *                     in the bags. The family carried zero food and zero drink
+ *                     across all five characters while its party leader was a
+ *                     mage who had known how to conjure both since level 6 and
+ *                     had never once done it; upstream registers the triggers
+ *                     ("no food", "no drink") AND the actions ("conjure food",
+ *                     "conjure water") and never wires one to the other, which
+ *                     patches/mod-playerbots/0013 fixes. That patch keeps a
+ *                     mage supplied; this verb is how a PARTY gets stocked,
+ *                     because upstream's trigger only fires on an empty stack.
+ *                     THE THIRD ROW THAT OUTLIVES ITS OWN POLL, and the only
+ *                     one of the three that also ACTS more than once: a
+ *                     stack is twenty
+ *                     units, a cast makes two of them, so one row is ten three
+ *                     second casts and ResolveConjureChecks reads the bags
+ *                     back between every one. `up_to:<n>` is a total and not
+ *                     an amount to add, so a row that stopped short can simply
+ *                     be sent again. See 2026_09_08_01_overseer_conjure.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -2155,15 +2176,31 @@ constexpr uint32 CHAT_FLUSH_MS = 1000;
 constexpr uint32 COMMANDS_PER_POLL = 20;
 // How long a row may sit in `claimed` or `verifying` under a run token that is
 // not this one before the drain ends it (mod-overseer#230). A claim is taken and
-// executed inside a single poll; a `verifying` row from a strategy command
-// resolves within VERIFY_GRACE_MS, and the slowest `verifying` row this module
-// can produce is a kind='summon' waiting out a ritual, an accept and a
-// cross-map teleport - its own window plus SUMMON_SETTLE_CEILING_MS at the very
-// worst, which is 30 seconds with today's constants, with kind='hearth' a
-// little under it. Seconds, and not minutes. So two minutes is still far past anything
-// legitimate. What is left after that is a row held by a worldserver that went
-// away, which `WHERE status = 'pending'` can never select again and nothing else
-// will end.
+// executed inside a single poll, and a `verifying` row from a strategy command
+// resolves within VERIFY_GRACE_MS.
+//
+// THIS IS NOT A CEILING ON HOW LONG A ROW MAY LEGITIMATELY RUN, and this
+// comment has now been wrong about that twice. It first said the slowest
+// `verifying` row was a kind='hearth' waiting out one cast time; #313 corrected
+// that to a kind='summon' waiting out a ritual, an accept and a cross-map
+// teleport, its own window plus SUMMON_SETTLE_CEILING_MS, about 30 seconds with
+// today's constants. Both said "seconds, and not minutes", and kind='conjure'
+// (#147) makes that false: a conjure is a LOOP of three second casts, ten of
+// them for one stack and up to fifty at the grammar's ceiling, so its window is
+// about ninety seconds at the default target and can approach six minutes at
+// the largest one. That is past this lease.
+//
+// It is still safe, and the reason is the run token rather than the duration.
+// ClaimIsAbandoned only ends a row whose claimed_by is NOT this run, so nothing
+// here can reach a row this worldserver is actively driving, however long it
+// takes. What this lease ends is a row held by a worldserver that went away,
+// which `WHERE status = 'pending'` can never select again and nothing else will
+// end - including a conjure that was mid-loop when the process died, which is
+// exactly the row that should end as an error rather than sit for ever.
+//
+// THE LESSON, since this is the second correction: do not write a duration here
+// as if it were a property of the queue. It is a reading off whatever the
+// slowest verb happens to be on the day, and a new verb changes it.
 constexpr time_t COMMAND_CLAIM_LEASE_SECONDS = 120;
 // A waiting row untouched for longer than this is not being REACHED, as opposed
 // to merely queued behind honest work: at COMMANDS_PER_POLL rows every
@@ -20480,6 +20517,11 @@ private:
         // and the teleport that follows crosses a map (#313).
         ResolveSummonChecks(sincePollMs);
 
+        // ...and the conjures, which wait longest of all four and are the only
+        // ones this poll also DRIVES: a stack is ten three second casts and no
+        // single call can wait that out (#147).
+        ResolveConjureChecks(sincePollMs);
+
         // Then collect any row a run that is no longer here is still holding,
         // because nothing below this line can ever see one.
         ExpireAbandonedClaims();
@@ -20560,15 +20602,15 @@ private:
             char const* detail = "";
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth' and
-            // 'mail' do not go through
+            // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth',
+            // 'summon', 'conjure' and 'mail' do not go through
             // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
                 && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
                 && kind != "bank" && kind != "auction" && kind != "bind"
-                && kind != "hearth"
+                && kind != "hearth" && kind != "conjure"
                 && kind != "summon"
                 && kind != "mail")
             {
@@ -20697,6 +20739,8 @@ private:
             else if (kind == "summon")
                 detail = DoSummon(player, command, targetArg, status, rowResult,
                                   _pendingSummons, id);
+            else if (kind == "conjure")
+                detail = DoConjure(player, command, status, rowResult, _pendingConjures, id);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -24574,6 +24618,641 @@ private:
         return "";
     }
 
+
+    // --------------------------------------------------------------- conjure --
+    //
+    // Make the family's food and water out of nothing, with the spell the
+    // character already knows (#147).
+    //
+    // THE HOLE THIS FILLS. Five characters, a hundred planned dungeon runs, and
+    // between them zero items of food and zero of drink - counted with the
+    // game's own classification (ItemTemplate::Spells[0].SpellCategory, 11 for
+    // food and 59 for drink) rather than with a list of remembered item ids.
+    // Two of the five are mana users who cannot restore mana between pulls
+    // without a drink, and over one measured evening the party died seven times
+    // in twenty one minutes.
+    //
+    // AND THE FIRST ANSWER IS NOT TO GO SHOPPING. They carry about 160 gold
+    // each, so kind='buy' looks like the fix; it is the second fix. The party
+    // leader is a mage who has known how to conjure food since level 6 and
+    // water since level 4 and has never once done either. Conjured food and
+    // water are free, unlimited, always level appropriate, and one mage
+    // supplies five characters.
+    //
+    // WHY HE NEVER DOES IT, read in upstream's source rather than guessed:
+    // mod-playerbots registers the triggers ("no food", "no drink"), registers
+    // the actions ("conjure food", "conjure water"), and never pushes a
+    // TriggerNode connecting any of the four. The only NextAction("conjure ...")
+    // in the whole tree is "conjure mana gem".
+    // patches/mod-playerbots/0013-a-mage-never-conjures-food-or-water.patch is
+    // that missing wire, and it is the half that needs no row at all.
+    //
+    // SO WHY THIS EXECUTOR AS WELL. Upstream's trigger fires when the conjured
+    // stack is EMPTY, which keeps one character supplied and can never feed
+    // five. Stocking a party is a decision about a party and a bot's appetite
+    // cannot take it. This is how the side that knows the party asks, and the
+    // conjured items are BIND_NONE, so kind='give' and kind='trade' hand them
+    // out afterwards with nothing new built.
+    //
+    // WHY IT LOOKS LIKE kind='hearth' AND NOT LIKE kind='buy'. A conjure is a
+    // three second cast, so nothing has happened when the call that started it
+    // returns, and reading the bags back inside it would count a stack that
+    // does not exist yet. Worse, one row is TEN of those casts: a stack is
+    // twenty units, every rank below level 60 makes two at a time, and the
+    // character can die, be pulled into a fight, run out of mana or be handed a
+    // travel errand between any two of them. So the row parks in `verifying`
+    // and ResolveConjureChecks drives the rest of the loop, reading the bags
+    // between every cast. It is the only executor in this file that acts more
+    // than once for one row, and the reason is that a loop which cannot see
+    // what it is producing is exactly the "delivered is not done" failure
+    // AGENTS.md is about.
+    //
+    // WHAT IT DOES NOT DECIDE. It does not choose a rank by name and it does
+    // not carry an item id. The spell is found by asking what the character
+    // knows, what each known spell CREATES, and whether the character may use
+    // what comes out; the best usable product wins. A mage that outgrows a rank
+    // starts conjuring the next one on its own, and a family on a realm whose
+    // item data differs is not holding a list this module wrote down in 2026.
+
+    // WHAT ONE CAST NEEDS BEYOND ITS OWN CAST TIME: the tick the item lands on
+    // and the poll that notices it. Two COMMAND_POLL_MS, which is the same
+    // shape of number HEARTH_MARGIN_MS is and for the same reason.
+    static constexpr uint32 CONJURE_MARGIN_MS = 4000;
+
+    // A cast time that reads as zero must not produce a window that judges
+    // instantly, because an instant judgement always answers `nothing`.
+    static constexpr uint32 CONJURE_FLOOR_MS = 8000;
+
+    // SLACK ON THE CAST BUDGET. The plan's cast count is exact arithmetic; the
+    // world is not. A cast interrupted by a stray hit produced nothing and has
+    // to be repeated, and refusing to repeat it would report `short` for a row
+    // that was one interruption away from finishing. Three is roughly a third
+    // of a stack's casts, which is enough to absorb the ordinary and not enough
+    // to hide a spell that never works.
+    static constexpr uint32 CONJURE_EXTRA_CASTS = 3;
+
+    // HOW MANY POLLS OF CASTING INTO THE VOID BEFORE GIVING UP. A poll counts
+    // as idle only when a cast was sent, is no longer running, and the bags did
+    // not move. Four of those in a row is not bad luck; it is a spell that is
+    // not working, and the row should say so rather than spend its whole budget
+    // three seconds at a time.
+    static constexpr uint32 CONJURE_IDLE_POLLS = 4;
+
+    // WHAT A CONJURE ROW KNOWS, IN ONE PLACE, so every exit writes the same
+    // shape and a row that ends says what it was judged on.
+    struct ConjureEvidence
+    {
+        std::string character;
+        std::string request;
+        char const* what{"none"};
+        uint32 spellId{0};
+        uint32 itemEntry{0};
+        std::string itemName;
+        uint32 perCast{0};
+        uint32 wanted{0};
+        int32 carriedBefore{-1};
+        int32 carriedAfter{-1};
+        uint32 castsAllowed{0};
+        uint32 castsSpent{0};
+        uint32 castMs{0};
+        uint32 windowMs{0};
+        uint32 waitedMs{0};
+        bool roomLimited{false};
+        OverseerDecisions::ConjureOutcome verdict{OverseerDecisions::ConjureOutcome::Unreadable};
+    };
+
+    struct ConjureCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        ConjureEvidence ev;
+        // The count at the previous poll, which is what "did anything appear"
+        // is measured against. Not derivable from carriedBefore: the character
+        // eats out of the same stack while this runs.
+        uint32 lastSeen{0};
+        uint32 idlePolls{0};
+        // A cast has gone out and has not yet been accounted for. Cleared the
+        // moment it either produces something or finishes producing nothing.
+        bool castPending{false};
+    };
+
+    // CONJURES STILL CASTING. World thread only, exactly like _pendingChecks
+    // and _pendingHearths, and bounded the same way: at most COMMANDS_PER_POLL
+    // are added per poll and every one ends inside its own window.
+    //
+    // DECLARED HERE AND NOT BESIDE _pendingChecks for the reason the hearth's
+    // vector gives: a member's type has to be complete where the member is
+    // declared, and ConjureCheck is defined in this section.
+    std::vector<ConjureCheck> _pendingConjures;
+
+    // ONE SHAPE FOR EVERY EXIT, refusals and verdicts alike.
+    static std::string ConjureJson(ConjureEvidence const& ev, char const* outcome,
+                                   char const* reason)
+    {
+        using OverseerDecisions::ConjureOutcomeWord;
+        using OverseerDecisions::ConjureRefusalRetry;
+        using OverseerDecisions::TownRetryWord;
+
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(*reason ? TownRetryWord(ConjureRefusalRetry(reason)) : "")
+          << ",\"character\":" << J(ev.character)
+          << ",\"what\":" << J(ev.what)
+          << ",\"verdict\":" << J(ConjureOutcomeWord(ev.verdict))
+          << ",\"spell\":" << ev.spellId
+          << ",\"item\":{\"entry\":" << ev.itemEntry
+          << ",\"name\":" << J(ev.itemName)
+          << ",\"per_cast\":" << ev.perCast << "}"
+          << ",\"wanted\":" << ev.wanted
+          << ",\"room_limited\":" << (ev.roomLimited ? "true" : "false")
+          << ",\"carried_before\":" << ev.carriedBefore
+          << ",\"carried_after\":" << ev.carriedAfter
+          << ",\"casts_allowed\":" << ev.castsAllowed
+          << ",\"casts_spent\":" << ev.castsSpent
+          << ",\"cast_ms\":" << ev.castMs
+          << ",\"window_ms\":" << ev.windowMs
+          << ",\"waited_ms\":" << ev.waitedMs
+          << ",\"request\":" << J(ev.request) << "}";
+        return o.str();
+    }
+
+    // WHICH SPELL, AND IT IS FOUND RATHER THAN NAMED.
+    //
+    // Every spell the character knows and may still cast is asked what it
+    // CREATES. A spell whose product is a consumable in the wanted category
+    // (11 eaten, 59 drunk) and which the character may use is a candidate, and
+    // the best product wins: highest RequiredLevel first, then highest spell
+    // id, so the answer never depends on the order an unordered_map happened to
+    // iterate in.
+    //
+    // WHY NOT MATCH THE SPELL'S NAME, which is what upstream's own conjure
+    // branch does. Because a name is a localisation and a rank suffix, and
+    // because it says nothing about whether the thing that comes out is usable.
+    // This module has to know the item anyway to count it afterwards, so
+    // selecting on the item is one fact instead of two.
+    struct ConjureSource
+    {
+        uint32 spellId{0};
+        uint32 itemEntry{0};
+        std::string itemName;
+        uint32 perCast{0};
+        uint32 castMs{0};
+        uint32 productLevel{0};
+    };
+
+    static bool FindConjureSource(Player* who, uint32 category, ConjureSource& found,
+                                  char const*& why)
+    {
+        namespace Refusal = OverseerDecisions::ConjureRefusal;
+
+        bool sawSpell = false;   // a spell that creates something in the category
+        bool sawUsable = false;  // ...and whose product this character may use
+
+        for (auto const& known : who->GetSpellMap())
+        {
+            PlayerSpell const* entry = known.second;
+            if (!entry || entry->State == PLAYERSPELL_REMOVED || !entry->Active)
+                continue;
+
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(known.first);
+            if (!info || info->IsPassive())
+                continue;
+
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            {
+                if (info->Effects[i].Effect != SPELL_EFFECT_CREATE_ITEM)
+                    continue;
+                uint32 const itemId = uint32(info->Effects[i].ItemType);
+                if (!itemId)
+                    continue;
+
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+                if (!proto)
+                    continue;
+
+                // THE CONJURED FLAG IS NOT DECORATION HERE, IT IS THE FENCE.
+                // "A spell that creates food" is also a cooking recipe: Herb
+                // Baked Egg is a consumable in spell category 11 made by a
+                // spell a character can know. Casting one of those needs
+                // reagents and a fire, so a loop that picked it would cast ten
+                // times, produce nothing, and report the spell as broken.
+                // ItemTemplate::IsConjuredConsumable is the core's own test and
+                // is the same one upstream's "conjured food" inventory
+                // qualifier uses, so this executor and the trigger
+                // patches/mod-playerbots/0013 wires are looking for the same
+                // items.
+                if (!proto->IsConjuredConsumable())
+                    continue;
+                if (uint32(proto->Spells[0].SpellCategory) != category)
+                    continue;
+
+                sawSpell = true;
+
+                // The core's own gate, and the same one upstream's conjure
+                // branch uses: a rank whose product this character may not use
+                // is a rank worth skipping rather than casting.
+                if (who->CanUseItem(proto) != EQUIP_ERR_OK)
+                    continue;
+
+                sawUsable = true;
+
+                // SPELL_EFFECT_CREATE_ITEM stores its count in the effect's
+                // value, so the number of items a cast produces is read off the
+                // spell rather than written down here. Measured at the pinned
+                // build: two for every Conjure Food and Conjure Water rank
+                // below level 60, ten at 60, twenty for Conjure Refreshment.
+                int32 const made = info->Effects[i].CalcValue(who);
+                if (made <= 0)
+                    continue;
+
+                uint32 const level = uint32(proto->RequiredLevel);
+                bool const better = found.spellId == 0 || level > found.productLevel
+                                    || (level == found.productLevel
+                                        && known.first > found.spellId);
+                if (!better)
+                    continue;
+
+                found.spellId = known.first;
+                found.itemEntry = itemId;
+                found.itemName = proto->Name1;
+                found.perCast = uint32(made);
+                found.castMs = info->CalcCastTime(who);
+                found.productLevel = level;
+            }
+        }
+
+        if (found.spellId)
+            return true;
+
+        // THE TWO WAYS OF HAVING NOTHING ARE DIFFERENT ANSWERS. "This character
+        // cannot conjure that at all" is about the spellbook; "it knows how and
+        // may not use what comes out" is about a level or a class restriction
+        // on the product. A sender can act on the second and not on the first.
+        why = (sawSpell && !sawUsable) ? Refusal::CannotUseItem : Refusal::CannotConjure;
+        return false;
+    }
+
+    static char const* DoConjure(Player* who, std::string const& command, char const*& status,
+                                 std::string& out, std::vector<ConjureCheck>& parked, uint32 id)
+    {
+        using OverseerDecisions::ConjurePlan;
+        using OverseerDecisions::ConjureRequest;
+        using OverseerDecisions::ConjureVerifyWindowMs;
+        using OverseerDecisions::ConjureWhat;
+        using OverseerDecisions::ConjureWhatWord;
+        using OverseerDecisions::ParseConjureRequest;
+        using OverseerDecisions::PlanConjure;
+        namespace Refusal = OverseerDecisions::ConjureRefusal;
+
+        ConjureEvidence ev;
+        ev.character = who->GetName();
+        ev.request = command;
+
+        // The refusal literals go straight into the UPDATE, so none may carry a
+        // quote character - the rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = ConjureJson(ev, "refused", reason);
+            return reason;
+        };
+
+        ConjureRequest const request = ParseConjureRequest(command);
+        if (request.what == ConjureWhat::None)
+        {
+            out = ConjureJson(ev, "refused", request.error.c_str());
+            return Refusal::Malformed;
+        }
+        ev.what = ConjureWhatWord(request.what);
+        ev.wanted = request.upTo;
+
+        uint32 const category = request.what == ConjureWhat::Food
+                                    ? OverseerDecisions::CONSUMABLE_CATEGORY_FOOD
+                                    : OverseerDecisions::CONSUMABLE_CATEGORY_DRINK;
+
+        if (!who->GetSession())
+            return refuse(Refusal::NoSession);
+        if (!who->IsInWorld())
+            return refuse(Refusal::NotInWorld);
+
+        // WHY A BOT AI IS REQUIRED. The cast below goes out through
+        // PlayerbotAI::CastSpell, which is the same call upstream's own
+        // CastConjureFoodAction ends in. That is deliberate: with
+        // patches/mod-playerbots/0013 applied there are two ways this family
+        // conjures, one driven by a row and one driven by the bot's own
+        // trigger, and they should exercise ONE cast path rather than two that
+        // can drift apart. The price is that a character with no bot AI is
+        // refused rather than cast for, which costs this family nothing: every
+        // character this module steers is a bot.
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(who);
+        if (!botAI)
+            return refuse(Refusal::NoBotAI);
+
+        if (!who->IsAlive())
+            return refuse(Refusal::Dead);
+        if (who->IsInFlight())
+            return refuse(Refusal::InFlight);
+        // Conjuring is a peaceful spell with a cast bar; a fight either refuses
+        // it or interrupts it, and either way the row would burn its budget.
+        if (who->IsInCombat())
+            return refuse(Refusal::InCombat);
+        if (who->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse(Refusal::Stunned);
+        if (who->GetSession()->isLogingOut())
+            return refuse(Refusal::LoggingOut);
+        if (who->GetTradeData())
+            return refuse(Refusal::Trading);
+        if (who->IsNonMeleeSpellCast(false))
+            return refuse(Refusal::AlreadyCasting);
+
+        ConjureSource source;
+        char const* why = Refusal::CannotConjure;
+        if (!FindConjureSource(who, category, source, why))
+            return refuse(why);
+
+        ev.spellId = source.spellId;
+        ev.itemEntry = source.itemEntry;
+        ev.itemName = source.itemName;
+        ev.perCast = source.perCast;
+        ev.castMs = source.castMs;
+
+        uint32 const carried = who->GetItemCount(ev.itemEntry, false);
+        ev.carriedBefore = int32(carried);
+
+        // HOW MUCH MORE THE BAGS WILL ACTUALLY TAKE, asked with the core's own
+        // call and with the exact count so the answer is the core's answer. The
+        // out-parameter is what makes this one question rather than a search:
+        // CanStoreNewItem reports how many of the asked-for count did NOT fit,
+        // and an existing part-stack absorbs some of them for no slot at all.
+        uint32 roomUnits = 0;
+        if (carried < request.upTo)
+        {
+            uint32 const missing = request.upTo - carried;
+            ItemPosCountVec dest;
+            uint32 noSpace = 0;
+            who->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, ev.itemEntry, missing, &noSpace);
+            roomUnits = noSpace >= missing ? 0u : missing - noSpace;
+        }
+
+        ConjurePlan const plan = PlanConjure(carried, request.upTo, ev.perCast, roomUnits);
+        ev.wanted = plan.wanted;
+        ev.roomLimited = plan.roomLimited;
+
+        if (plan.nothingToDo)
+        {
+            // TWO DIFFERENT ROWS END HERE and they are named apart. Already
+            // stocked is a row that had nothing to do; a full bag is a row that
+            // could not do it. Both are `later` - one is answered by eating or
+            // handing the stack out, the other by emptying a bag - but only one
+            // of them is a problem.
+            ev.carriedAfter = int32(carried);
+            char const* const reason = plan.roomLimited ? Refusal::NoRoom
+                                                        : Refusal::EnoughAlready;
+            status = "unchanged";
+            out = ConjureJson(ev, "refused", reason);
+            return reason;
+        }
+        if (plan.casts == 0)
+        {
+            // PlanConjure only reaches this with a per-cast of zero, and
+            // FindConjureSource already skips a candidate whose effect value is
+            // not positive, so this is unreachable through the path above. It
+            // is here because the alternative to naming it is a loop that plans
+            // no casts and then waits out a window to report that nothing
+            // appeared, which would be a true statement and a useless one.
+            return refuse(Refusal::MakesNothing);
+        }
+
+        ev.castsAllowed = plan.casts + CONJURE_EXTRA_CASTS;
+        ev.windowMs = ConjureVerifyWindowMs(ev.castMs, ev.castsAllowed, CONJURE_MARGIN_MS,
+                                            CONJURE_FLOOR_MS);
+
+        // ---- the first cast, then park ---------------------------------------
+        //
+        // EVIDENCE, NOT A VERDICT. CastSpell returning false is not a failure
+        // this row may report: it means this attempt did not start, and the
+        // loop below has a budget for exactly that. What decides the row is the
+        // count in the bags when the window is up.
+        botAI->CastSpell(ev.spellId, who);
+        ev.castsSpent = 1;
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is conjuring {} (spell {} -> item {} x{} a cast); has {}, "
+                 "wants {}, up to {} casts, judging in {}ms, not now",
+                 ev.character, ev.what, ev.spellId, ev.itemEntry, ev.perCast, carried,
+                 ev.wanted, ev.castsAllowed, ev.windowMs);
+
+        ConjureCheck check;
+        check.id = id;
+        check.targetName = who->GetName();
+        check.ev = ev;
+        check.lastSeen = carried;
+        check.castPending = true;
+        parked.push_back(check);
+
+        // THE ONE HONEST STATUS FOR A CAST LOOP THAT HAS NOT FINISHED. Not
+        // 'delivered', which would be the claim AGENTS.md warns about, and not
+        // 'applied', which nothing has earned. The result written now says what
+        // is being made and how long it will take, so a row read mid-loop is
+        // readable rather than mysterious.
+        status = "verifying";
+        out = ConjureJson(ev, "casting", "");
+        return "";
+    }
+
+    // WHERE A CONJURE IS ACTUALLY DRIVEN AND ANSWERED. Runs from the same poll
+    // as ResolveHearthChecks and for the same reason, and does one thing more
+    // than that one: it sends the remaining casts. A stack is ten of them and
+    // no single call can wait that out.
+    void ResolveConjureChecks(uint32 elapsedMs)
+    {
+        using OverseerDecisions::ConjureNextStep;
+        using OverseerDecisions::ConjureOutcome;
+        using OverseerDecisions::ConjureOutcomeWord;
+        using OverseerDecisions::ConjureProgress;
+        using OverseerDecisions::ConjureReadBack;
+        using OverseerDecisions::ConjureStep;
+        namespace Refusal = OverseerDecisions::ConjureRefusal;
+
+        std::vector<ConjureCheck> stillRunning;
+        stillRunning.reserve(_pendingConjures.size());
+
+        for (ConjureCheck& check : _pendingConjures)
+        {
+            check.ev.waitedMs += elapsedMs;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
+            if (!bot)
+            {
+                // A character that logged out mid-loop is a perfectly good
+                // explanation, and an explanation is the thing that would
+                // otherwise be missing.
+                LOG_WARN("module.overseer",
+                         "overseer: conjure {} for '{}' cannot be judged - the character is no "
+                         "longer in the world",
+                         check.id, check.targetName);
+                check.ev.verdict = ConjureOutcome::Unreadable;
+                char const* const gone = "left the world before the conjure could be read back";
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    gone, EscLong(ConjureJson(check.ev, "unreadable", gone)), check.id,
+                    g_runToken);
+                continue;
+            }
+
+            bool const casting = bot->IsNonMeleeSpellCast(false);
+            uint32 const carried = bot->GetItemCount(check.ev.itemEntry, false);
+            check.ev.carriedAfter = int32(carried);
+
+            // THE IDLE ACCOUNTING, and the ordering in it is the whole point. A
+            // cast that is still running has not failed to produce anything
+            // yet, so a poll spent inside one is not idle: polls are two
+            // seconds and a cast is three, so counting those would call every
+            // working loop a failure. Only a cast that has FINISHED and left
+            // the count where it was counts against the budget.
+            if (carried > check.lastSeen)
+            {
+                check.idlePolls = 0;
+                check.castPending = false;
+            }
+            else if (check.castPending && !casting)
+            {
+                ++check.idlePolls;
+                check.castPending = false;
+            }
+            check.lastSeen = carried;
+
+            ConjureProgress progress;
+            progress.carried = carried;
+            progress.wanted = check.ev.wanted;
+            progress.castsSpent = check.ev.castsSpent;
+            progress.castsAllowed = check.ev.castsAllowed;
+            progress.idlePolls = check.idlePolls;
+            progress.idleLimit = CONJURE_IDLE_POLLS;
+            progress.castInFlight = casting;
+
+            ConjureStep const step = ConjureNextStep(progress);
+
+            // THE WINDOW IS THE BACKSTOP AND NOT THE RULE. A loop that is
+            // getting somewhere ends on its own the moment the bags read back
+            // at the target; this is what ends one that is not, so a row can
+            // never sit in `verifying` for ever because a character walked off
+            // mid-cast and stayed in combat.
+            bool const outOfTime = check.ev.waitedMs >= check.ev.windowMs;
+
+            if (step == ConjureStep::Wait && !outOfTime)
+            {
+                stillRunning.push_back(check);
+                continue;
+            }
+
+            if (step == ConjureStep::Cast && !outOfTime)
+            {
+                // WHY THESE FOUR ARE ASKED AGAIN HERE. DoConjure asked them
+                // once, about a character that has since been standing still
+                // casting for up to half a minute. A fight, a corpse, a flight
+                // path or a travel errand can all arrive in the middle, and
+                // casting into one of them spends a cast to produce nothing and
+                // then charges the row for it. None of them ends the row: they
+                // end on their own, and the window is what ends the row.
+                if (!bot->IsAlive() || bot->IsInCombat() || bot->IsInFlight()
+                    || bot->isMoving())
+                {
+                    stillRunning.push_back(check);
+                    continue;
+                }
+
+                if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+                {
+                    botAI->CastSpell(check.ev.spellId, bot);
+                    ++check.ev.castsSpent;
+                    check.castPending = true;
+                    stillRunning.push_back(check);
+                    continue;
+                }
+
+                // The bot AI went away under a row that was already running.
+                // Ends here rather than looping on a cast path that no longer
+                // exists.
+                check.ev.verdict = ConjureReadBack(true, uint32(check.ev.carriedBefore),
+                                                   carried, check.ev.wanted);
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    Refusal::NoBotAI,
+                    EscLong(ConjureJson(check.ev, ConjureOutcomeWord(check.ev.verdict),
+                                        Refusal::NoBotAI)),
+                    check.id, g_runToken);
+                continue;
+            }
+
+            // ---- the verdict -------------------------------------------------
+            check.ev.verdict = ConjureReadBack(check.ev.itemEntry != 0,
+                                               uint32(check.ev.carriedBefore), carried,
+                                               check.ev.wanted);
+
+            char const* status = "error";
+            char const* detail = "";
+            char const* outcome = ConjureOutcomeWord(check.ev.verdict);
+
+            switch (check.ev.verdict)
+            {
+                case ConjureOutcome::Filled:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: conjure {} - '{}' now carries {} {} (wanted {}) after "
+                             "{} cast(s) in {}ms",
+                             check.id, check.targetName, carried, check.ev.what,
+                             check.ev.wanted, check.ev.castsSpent, check.ev.waitedMs);
+                    break;
+
+                case ConjureOutcome::Short:
+                    // Something was made and something stopped it. `unchanged`
+                    // would be a lie and `applied` would be a bigger one, so
+                    // this is an error the sender can act on: send the same row
+                    // again. It is idempotent by design, because `up_to` is a
+                    // total and not an amount to add.
+                    detail = "the casts stopped short of the target";
+                    LOG_WARN("module.overseer",
+                             "overseer: conjure {} - '{}' reached {} of {} {} after {} cast(s); "
+                             "see overseer_command.result",
+                             check.id, check.targetName, carried, check.ev.wanted,
+                             check.ev.what, check.ev.castsSpent);
+                    break;
+
+                case ConjureOutcome::Nothing:
+                    // THE ROW THIS WHOLE EXECUTOR EXISTS TO STOP REPORTING AS A
+                    // SUCCESS. WARN and not INFO, for the reason
+                    // ResolveStrategyChecks gives: INFO is where the absence of
+                    // this line was invisible the first time.
+                    status = "unchanged";
+                    detail = Refusal::NothingAppeared;
+                    LOG_WARN("module.overseer",
+                             "overseer: conjure {} - '{}' sent {} cast(s) of spell {} and NOT "
+                             "ONE {} appeared; see overseer_command.result",
+                             check.id, check.targetName, check.ev.castsSpent,
+                             check.ev.spellId, check.ev.what);
+                    break;
+
+                case ConjureOutcome::Unreadable:
+                    detail = "the conjure could not be read back";
+                    LOG_WARN("module.overseer",
+                             "overseer: conjure {} - '{}' cannot be judged; see "
+                             "overseer_command.result",
+                             check.id, check.targetName);
+                    break;
+            }
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(ConjureJson(check.ev, outcome, detail)), check.id,
+                g_runToken);
+        }
+
+        _pendingConjures.swap(stillRunning);
+    }
 
     // -------------------------------------------------------------- hearth --
     //

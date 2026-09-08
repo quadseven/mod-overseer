@@ -5821,6 +5821,350 @@ uint32_t SummonVerifyWindowMs(uint32_t settleMs, uint32_t marginMs, uint32_t flo
 // change for the SAME row to succeed. Unknown is `Later`, the same call the
 // bind, hearth, sell and repair tables make.
 TownRetry SummonRefusalRetry(std::string const& detail);
+// ---------------------------------------------------- conjure (#147, #18) --
+//
+// WHAT A kind='conjure' ROW MAY SAY, AND WHY THIS VERB EXISTS AT ALL.
+//
+// THE MEASUREMENT. Read off the live realm on 2026-09-07, before any of this
+// was written. Five characters, a hundred planned dungeon runs, zero of them
+// run:
+//
+//   character  class    level  bag items  food  drink  money
+//   ---------  -------  -----  ---------  ----  -----  ------
+//   Bork       rogue      27      71        0     0    146 g
+//   Grog       paladin    28      49        0     0    173 g
+//   Grug       warrior    32      69        0     0    168 g
+//   Og (lead)  mage       26      69        0     0    160 g
+//   Ugga       priest     27      54        0     0    167 g
+//
+// Not one item of food or drink between them, and roughly 160 gold each. The
+// zeroes are counted with the game's own classification and not with a list of
+// item ids: item_template.spellcategory_1 is 11 for anything eaten and 59 for
+// anything drunk, which is the same test upstream's own FindFoodVisitor makes
+// (InventoryAction.cpp builds one on 11 and one on 59). Over the same evening
+// the party died seven times in twenty one minutes, and two of the five are
+// mana users who cannot restore mana between pulls with nothing to drink.
+//
+// THE OBVIOUS ANSWER IS THE WRONG ONE. They are not poor, so kind='buy' at a
+// vendor looks like the fix. It is not the FIRST fix, because the party leader
+// is a MAGE who has known how to conjure food since level 6 and water since
+// level 4 and has never once done either. Conjured food and water are free,
+// infinite, always level appropriate, and one mage supplies five characters.
+// Every axis beats buying.
+//
+// WHY HE NEVER DOES IT, MEASURED IN UPSTREAM'S SOURCE RATHER THAN GUESSED.
+// Both ends of the mechanism are already in mod-playerbots and neither is
+// wired to the other:
+//
+//   * NoFoodTrigger and NoDrinkTrigger exist, are registered as "no food" and
+//     "no drink", and their condition is written specifically for a conjurer:
+//     "does this character carry any CONJURED food".
+//   * CastConjureFoodAction and CastConjureWaterAction exist and are
+//     registered as "conjure food" and "conjure water". There is even a branch
+//     in CastSpellAction::Execute that exists only for those two names.
+//   * No strategy in the whole tree ever pushes a TriggerNode naming any of
+//     the four. The only NextAction("conjure ...") upstream carries is
+//     "conjure mana gem".
+//
+// patches/mod-playerbots/0013-a-mage-never-conjures-food-or-water.patch is
+// that missing wire, and it is the half of this fix that needs no row at all:
+// with it a mage keeps ITSELF supplied, unprompted, for ever.
+//
+// SO WHY A VERB AS WELL. Because the trigger upstream wrote fires when the
+// conjured stack is EMPTY, which keeps one character fed and cannot feed five.
+// A party's worth of stock is a decision about a party: how many members, how
+// many of them drink, how long the run is. That is not a bot's to take from
+// inside its own appetite, and the numbers below are what taking it needs. A
+// kind='conjure' row is how the side that knows those things asks, and the
+// conjured items are BIND_NONE (measured: `bonding` is 0 on every Conjured *
+// row in item_template), so kind='give' and kind='trade' can hand them out
+// afterwards without anything new being built.
+//
+// WHAT ONE CAST ACTUALLY PRODUCES, off Spell.dbc at the pinned build rather
+// than remembered: every Conjure Food and Conjure Water rank below level 60
+// creates TWO items per three second cast, and the items stack to twenty. So
+// one stack is ten casts and thirty seconds of standing still. That is the
+// cost this verb spends, and it is why the executor reads the bags back
+// between every cast rather than firing a fixed number and reporting.
+//
+// Column re-use, no new columns:
+//   target_name  the character that will cast
+//   command      `food` or `water`, optionally ` up_to:<units>`
+//   target_arg   unused
+//   detail       short refusal literal, or empty
+//   result       JSON: outcome (casting|filled|short|nothing|refused|
+//                unreadable), reason, retry (never|elsewhere|later - see
+//                ConjureRefusalRetry), character, what, spell, item, per_cast,
+//                wanted, carried_before, carried_after, casts_allowed,
+//                casts_spent, window_ms, waited_ms, request
+//   status       'verifying' from the moment the first cast goes out, then
+//                'applied' when the bags read back at the target, 'unchanged'
+//                when nothing was made, 'error' otherwise. NOT 'delivered':
+//                a three second cast cannot be answered by the poll that
+//                started it, which is the same reason kind='hearth' is not.
+
+// THE GAME'S OWN TWO CATEGORIES FOR A CONSUMABLE THAT IS EATEN OR DRUNK.
+// item_template.spellcategory_1 (ItemTemplate::Spells[0].SpellCategory), 11 for
+// food and 59 for drink. Named here rather than written as literals at each use
+// because they are the one pair of magic numbers this whole subject turns on,
+// and because they are the reason no item id appears anywhere in this section:
+// "what is food" is a question the world's own data answers, and a list of
+// remembered ids would be a second answer that goes stale silently.
+//
+// This is not this module's invention. mod-playerbots asks exactly these two
+// numbers of exactly this field in InventoryAction.cpp and again in
+// PlayerbotFactory, and UseItemAction reads them to decide whether it is
+// feasting or drinking.
+constexpr uint32_t CONSUMABLE_CATEGORY_FOOD = 11;
+constexpr uint32_t CONSUMABLE_CATEGORY_DRINK = 59;
+
+// DOES THIS CLASS GET ANYTHING OUT OF A DRINK. A drink restores mana and
+// nothing else, so it is worth exactly nothing to a class whose resource is
+// rage or energy, and conjuring one for a warrior is a bag slot spent on a
+// decoration.
+//
+// Taken from the class ids in the characters table (`characters`.`class`), the
+// same numbers the class masks use. Mana: paladin (2), hunter (3), priest (5),
+// shaman (7), mage (8), warlock (9), druid (11). Not mana: warrior (1), rogue
+// (4), death knight (6). An unknown id answers false, because provisioning a
+// class this module has never heard of is the case where doing nothing is
+// right.
+//
+// THE HUNTER IS THE ONE WORTH SAYING OUT LOUD. In this expansion a hunter's
+// shots cost mana rather than focus, so a hunter drinks. Carrying a later
+// expansion's rule across is the obvious way to write this function wrong.
+bool ClassRestoresManaByDrinking(uint32_t classId);
+
+enum class ConjureWhat : uint8_t
+{
+    None,  // not a conjure request; `error` says why
+    Food,
+    Water,
+};
+
+// "food", "water", "none". Here rather than in the executor so the word a test
+// pins is the word a row carries.
+char const* ConjureWhatWord(ConjureWhat what);
+
+struct ConjureRequest
+{
+    ConjureWhat what{ConjureWhat::None};
+    bool capped{false};  // whether `up_to:` was given
+    uint32_t upTo{0};    // units to END UP carrying; meaningful only when capped
+    std::string error;   // the refusal literal when what is None, else empty
+};
+
+// ONE OF TWO WORDS, AND A TARGET THAT IS A TOTAL RATHER THAN A COUNT.
+//
+//     food [up_to:<units>]
+//     water [up_to:<units>]
+//
+// `up_to` is what the character should END UP carrying, not how many casts to
+// make and not how many to add. That is deliberate and it is the difference
+// between a row that can be retried and one that cannot: a row saying "add 20"
+// doubles the stock if it is sent twice, and this executor's whole design is
+// that it may be interrupted part way and asked again. A row saying "have 20"
+// is idempotent, and a repeat of it after a partial run finishes the job
+// instead of overshooting it.
+//
+// Absent, the target is CONJURE_UNITS_DEFAULT.
+//
+// THERE IS NO WAY TO NAME A SPELL OR AN ITEM, for the same reason the hearth
+// grammar has no way to name a destination. Which rank a character casts is
+// decided by what it knows and what it may use, and a grammar that could ask
+// for a particular one would be a grammar for casting a rank the character has
+// outgrown or has not learned. The executor finds it by asking every spell the
+// character knows what it CREATES and keeping the conjured consumables in the
+// wanted category, which is also why a cooking recipe cannot be picked by
+// mistake.
+ConjureRequest ParseConjureRequest(std::string const& command);
+
+// ONE STACK. Conjured food and water stack to twenty (measured: `stackable` is
+// 20 on every Conjured * row in item_template), so twenty units is exactly one
+// bag slot, and the bag slot is the binding constraint here rather than the
+// gold: the roster's backpacks are full and the free space that exists is 8 to
+// 13 slots in the equipped bags.
+//
+// TWENTY IS ALSO ABOUT THE RIGHT AMOUNT OF DRINKING. A conjured water at this
+// family's level restores most of a level 26 caster's mana bar in one sitting,
+// so twenty is roughly one drink every other pull across a dungeon run. It is
+// not a precise number and does not pretend to be; it is one slot's worth,
+// which is the smallest amount that is not obviously too little.
+constexpr uint32_t CONJURE_UNITS_DEFAULT = 20;
+
+// AND A CEILING ON WHAT A ROW MAY ASK FOR. Five stacks. Each unit costs half a
+// three second cast, so a hundred units is two and a half minutes of a
+// character standing still and casting, which is already longer than anything
+// else this module asks of anybody. A row asking for more is refused as
+// malformed rather than obeyed, because the likeliest reason for it is a typed
+// extra zero and there is no way to interrupt a cast loop from the queue.
+constexpr uint32_t CONJURE_UNITS_MAX = 100;
+
+// WHAT ONE ROW IS ABOUT TO SPEND, worked out before the first cast goes out.
+//
+// `perCast` is what the spell's own effect creates, read off SpellInfo at
+// runtime rather than written down here. `roomUnits` is how many more units the
+// bags can actually take, which is not the same question as how many slots are
+// free: an existing part-stack absorbs some for nothing.
+struct ConjurePlan
+{
+    uint32_t wanted{0};       // units to end up with, after every clamp below
+    uint32_t carried{0};      // units already in the bags
+    uint32_t perCast{0};      // units one cast creates
+    uint32_t casts{0};        // casts needed to get there; 0 means do nothing
+    bool nothingToDo{false};  // already at or above the target
+    bool roomLimited{false};  // the bags, not the request, set `wanted`
+};
+
+// Rounds UP: a target of 21 with two units a cast is eleven casts ending at 22,
+// not ten casts ending at 20. Overshooting by less than one cast is free (the
+// stack absorbs it) and undershooting means the row reports `short` for a
+// remainder nobody could ever reach.
+//
+// A `perCast` of 0 is a spell whose effect this module could not read, and it
+// produces a plan of zero casts rather than a division by zero or a loop that
+// never ends. The executor names that case rather than casting into it.
+ConjurePlan PlanConjure(uint32_t carried, uint32_t wanted, uint32_t perCast,
+                        uint32_t roomUnits);
+
+// WHAT TO DO ON THIS POLL, asked once per poll for as long as a row is parked.
+//
+// A conjure is not one cast. Ten of them, three seconds each, and the character
+// can die, be pulled into a fight, be handed a travel errand or run out of mana
+// at any point in the middle. So the resolver does not fire a fixed number of
+// casts and hope: it reads the bags, asks this, and does exactly what it says.
+enum class ConjureStep : uint8_t
+{
+    Cast,    // nothing in flight, target not reached, budget left: cast again
+    Wait,    // a cast is already in progress; do nothing this poll
+    Done,    // the bags hold the target
+    GaveUp,  // the budget is spent, or casts go out and nothing appears
+};
+
+// "cast", "wait", "done", "gave up". Here rather than in the executor so the
+// word a test pins is the word a row carries.
+char const* ConjureStepWord(ConjureStep step);
+
+struct ConjureProgress
+{
+    uint32_t carried{0};       // units in the bags right now
+    uint32_t wanted{0};        // units the row asked to end up with
+    uint32_t castsSpent{0};    // casts this row has already sent
+    uint32_t castsAllowed{0};  // ConjurePlan::casts, plus whatever slack
+    uint32_t idlePolls{0};     // consecutive polls that cast and gained nothing
+    uint32_t idleLimit{0};     // how many of those before giving up
+    bool castInFlight{false};  // the character is casting something right now
+};
+
+// THE ORDER OF THESE FOUR TESTS IS THE DECISION.
+//
+// `Done` is asked FIRST, before `castInFlight`. A character that reached its
+// target on the cast currently finishing is done, and asking about the cast
+// first would park the row for one more poll to learn nothing.
+//
+// `Wait` is asked SECOND, before either give-up test, because a cast in flight
+// is progress. Counting a three second cast against an idle budget measured in
+// polls is how a working loop gets killed for being slow.
+//
+// THE IDLE TEST IS THE ONE THAT MATTERS, and it exists because every reason a
+// conjure silently fails looks identical from here. Out of mana, interrupted by
+// a fight, bags filled by something else, a rank whose product this character
+// may not use: in all four the cast goes out, the handler returns, and no item
+// appears. AGENTS.md's standing rule is that `delivered` is not `done` and the
+// world has to be read back. This is that rule as a loop: casts that produce
+// nothing, repeatedly, end the row and say so, rather than spending the whole
+// budget three seconds at a time.
+ConjureStep ConjureNextStep(ConjureProgress const& progress);
+
+enum class ConjureOutcome : uint8_t
+{
+    // The count in the bags could not be read at all, so no comparison means
+    // anything. Says nothing about whether anything was made, and must never be
+    // reported as any of the other three.
+    Unreadable,
+    // The bags hold what the row asked for. The only outcome worth `applied`.
+    Filled,
+    // More than before, less than asked. Something was made and something
+    // stopped it: a fight, a corpse run, an empty mana bar, a full bag. Kept
+    // apart from Nothing because "it half worked" and "the cast does nothing at
+    // all" want different answers from the sender.
+    Short,
+    // No more than before. Every cast this row sent produced nothing, which is
+    // the failure this whole executor exists to make visible.
+    Nothing,
+};
+
+// "unreadable", "filled", "short", "nothing".
+char const* ConjureOutcomeWord(ConjureOutcome outcome);
+
+// `readable` is false when the item's template could not be read, which is the
+// only way the count is genuinely unknown; an honest zero is a reading.
+//
+// A LOWER COUNT AFTER THAN BEFORE IS `Nothing`, NOT A NEGATIVE. The character
+// is a bot with a strategy that eats, so it can consume the stack while the row
+// is still running. Nothing was gained, which is what the word means.
+ConjureOutcome ConjureReadBack(bool readable, uint32_t before, uint32_t after,
+                               uint32_t wanted);
+
+// HOW LONG TO LET A ROW RUN BEFORE JUDGING IT, and why it is not the hearth's
+// window. A hearth is one cast; a conjure is `casts` of them, back to back,
+// each landing on a later tick than the last, with this module's own poll
+// interval between the end of one and the start of the next. So the window is
+// per-cast and multiplied, not a constant.
+//
+// `marginMs` is what one cast needs beyond its own cast time: the tick the item
+// lands on, and the poll that notices it. `floorMs` answers a cast time that
+// reads as zero, which is what a haste effect and a DBC this core resolved
+// nothing from both look like from here; a zero window judges instantly and
+// therefore always answers `Nothing`.
+//
+// Saturating, not wrapping. A nonsense cast time or a nonsense cast count must
+// not come out of here as a short window.
+uint32_t ConjureVerifyWindowMs(uint32_t castMs, uint32_t casts, uint32_t marginMs,
+                               uint32_t floorMs);
+
+// The refusal literals, all of them, in one place because they are what both
+// sides of the queue read. None may carry a quote character: they go straight
+// into the UPDATE.
+namespace ConjureRefusal
+{
+// The row, or the character's spellbook.
+constexpr char const* Malformed      = "malformed conjure command";
+constexpr char const* CannotConjure  = "character knows no spell that conjures that";
+constexpr char const* NoSpellInfo    = "the core does not know that spell";
+constexpr char const* NoItemTemplate = "the conjured item has no template";
+constexpr char const* CannotUseItem  = "character may not use what that spell conjures";
+constexpr char const* MakesNothing   = "that spell creates no items";
+
+// The character's own state, every one of which ends on its own.
+constexpr char const* NoSession      = "character has no session";
+constexpr char const* NotInWorld     = "character is not in the world";
+constexpr char const* Dead           = "character is dead";
+constexpr char const* InCombat       = "character is in combat";
+constexpr char const* InFlight       = "character is on a flight path";
+constexpr char const* Stunned        = "character is stunned";
+constexpr char const* LoggingOut     = "character is logging out";
+constexpr char const* Trading        = "character is in a trade";
+constexpr char const* AlreadyCasting = "character is already casting";
+constexpr char const* NoBotAI        = "character has no bot AI";
+constexpr char const* NoRoom         = "no room in the bags";
+constexpr char const* EnoughAlready  = "character already carries enough";
+
+// After the casts went out and the bags did not move.
+constexpr char const* NothingAppeared = "the casts produced nothing";
+}  // namespace ConjureRefusal
+
+// WHETHER A REFUSAL IS WORTH ASKING AGAIN. Keyed on the `detail` literal, the
+// same three classes the sell, repair, buy, bind and hearth tables use, and an
+// unknown literal is `Later` for the same reason they give.
+//
+// NOTHING HERE IS EVER `Elsewhere`, and that is worth saying rather than
+// leaving as an empty list somebody later reads as an oversight. Every other
+// errand in this module's town trip has a place in it: a vendor, a repairer, a
+// banker, an auctioneer, an innkeeper, a mailbox. A conjure has none. It is the
+// one provisioning verb that works in the middle of a field, which is most of
+// why it is worth having for a family that cannot reliably walk to a town.
+TownRetry ConjureRefusalRetry(std::string const& detail);
 
 }  // namespace OverseerDecisions
 
