@@ -33,6 +33,9 @@
 using OverseerDecisions::ClassRestoresManaByDrinking;
 using OverseerDecisions::CONJURE_UNITS_DEFAULT;
 using OverseerDecisions::CONJURE_UNITS_MAX;
+using OverseerDecisions::ConjureGaveUp;
+using OverseerDecisions::ConjureGaveUpReasonWord;
+using OverseerDecisions::ConjureGiveUpReason;
 using OverseerDecisions::ConjureNextStep;
 using OverseerDecisions::ConjureOutcome;
 using OverseerDecisions::ConjureOutcomeWord;
@@ -201,6 +204,7 @@ void TheWordsAreTheWordsARowCarries()
     CheckWord("none", ConjureWhatWord(ConjureWhat::None), "none");
     CheckWord("cast", ConjureStepWord(ConjureStep::Cast), "cast");
     CheckWord("wait", ConjureStepWord(ConjureStep::Wait), "wait");
+    CheckWord("settle", ConjureStepWord(ConjureStep::Settle), "settle");
     CheckWord("done", ConjureStepWord(ConjureStep::Done), "done");
     CheckWord("gave up", ConjureStepWord(ConjureStep::GaveUp), "gave up");
     CheckWord("filled", ConjureOutcomeWord(ConjureOutcome::Filled), "filled");
@@ -336,8 +340,26 @@ ConjureProgress Running(uint32_t carried, uint32_t spent)
     p.castsAllowed = 12;  // ten casts plus a little slack
     p.idlePolls = 0;
     p.idleLimit = 3;
+    p.movingPolls = 0;
+    p.movingLimit = 6;
+    p.castsRefused = 0;
+    p.outOfTime = false;
     p.castInFlight = false;
+    // STANDING STILL IS THE DEFAULT HERE AND IT IS NOT THE DEFAULT ON THE
+    // REALM. Every case below that does not say otherwise is about a character
+    // that has already come to a halt; the moving cases are their own section.
+    p.moving = false;
     return p;
+}
+
+void CheckGaveUp(char const* what, ConjureProgress const& p, ConjureGaveUp want)
+{
+    ConjureGaveUp const got = ConjureGiveUpReason(p);
+    if (got == want)
+        return;
+    std::printf("FAIL %s: got %s, wanted %s\n", what, ConjureGaveUpReasonWord(got),
+                ConjureGaveUpReasonWord(want));
+    ++failures;
 }
 
 void AFreshRowCasts()
@@ -470,29 +492,29 @@ void TheWindowIsPerCastAndMultiplied()
     // Ten casts of three seconds, with a second of margin each: a hearth's
     // single-cast window would judge this one after three seconds and always
     // answer `nothing`.
-    CheckNum("ten three second casts", ConjureVerifyWindowMs(3000, 10, 1000, 6000), 40000);
-    CheckNum("one cast", ConjureVerifyWindowMs(3000, 1, 1000, 6000), 6000);
-    CheckNum("two casts clear the floor", ConjureVerifyWindowMs(3000, 2, 1000, 6000),
+    CheckNum("ten three second casts", ConjureVerifyWindowMs(3000, 10, 1000, 0, 6000), 40000);
+    CheckNum("one cast", ConjureVerifyWindowMs(3000, 1, 1000, 0, 6000), 6000);
+    CheckNum("two casts clear the floor", ConjureVerifyWindowMs(3000, 2, 1000, 0, 6000),
              8000);
 }
 
 void AZeroCastTimeCannotProduceAWindowThatJudgesInstantly()
 {
-    CheckNum("no cast time at all", ConjureVerifyWindowMs(0, 1, 0, 6000), 6000);
-    CheckNum("and no margin either", ConjureVerifyWindowMs(0, 0, 0, 6000), 6000);
+    CheckNum("no cast time at all", ConjureVerifyWindowMs(0, 1, 0, 0, 6000), 6000);
+    CheckNum("and no margin either", ConjureVerifyWindowMs(0, 0, 0, 0, 6000), 6000);
     // A count of zero is treated as one rather than as no window at all: a row
     // that got here with no casts planned still has to be answered.
     CheckNum("zero casts still gets one cast's window",
-             ConjureVerifyWindowMs(3000, 0, 1000, 100), 4000);
+             ConjureVerifyWindowMs(3000, 0, 1000, 0, 100), 4000);
 }
 
 void NonsenseInputsSaturateRatherThanWrap()
 {
     uint32_t const huge = 0xFFFFFFFFu;
-    CheckNum("a nonsense cast time", ConjureVerifyWindowMs(huge, 10, 1000, 6000), huge);
-    CheckNum("a nonsense cast count", ConjureVerifyWindowMs(3000, huge, 1000, 6000), huge);
-    CheckNum("a nonsense margin", ConjureVerifyWindowMs(3000, 10, huge, 6000), huge);
-    CheckNum("a nonsense floor", ConjureVerifyWindowMs(1, 1, 1, huge), huge);
+    CheckNum("a nonsense cast time", ConjureVerifyWindowMs(huge, 10, 1000, 0, 6000), huge);
+    CheckNum("a nonsense cast count", ConjureVerifyWindowMs(3000, huge, 1000, 0, 6000), huge);
+    CheckNum("a nonsense margin", ConjureVerifyWindowMs(3000, 10, huge, 0, 6000), huge);
+    CheckNum("a nonsense floor", ConjureVerifyWindowMs(1, 1, 1, 0, huge), huge);
 }
 
 // ---------------------------------------------------------------- retrying --
@@ -525,6 +547,12 @@ void EverythingTheCharacterIsDoingEndsOnItsOwn()
     CheckRetry("enough already", ConjureRefusal::EnoughAlready, TownRetry::Later);
     CheckRetry("the casts produced nothing", ConjureRefusal::NothingAppeared,
                TownRetry::Later);
+    // All three added by #325: every one is about where the character was and
+    // what it was doing inside one window, so every one is `later`.
+    CheckRetry("the cast did not start", ConjureRefusal::CastRefused, TownRetry::Later);
+    CheckRetry("never stood still", ConjureRefusal::NeverStoodStill, TownRetry::Later);
+    CheckRetry("budget spent", ConjureRefusal::BudgetSpent, TownRetry::Later);
+    CheckRetry("already running", ConjureRefusal::AlreadyRunning, TownRetry::Later);
 }
 
 // NO REFUSAL HERE IS EVER `Elsewhere`, and it is checked rather than left as an
@@ -545,6 +573,8 @@ void WalkingSomewhereElseFixesNoConjure()
         ConjureRefusal::Trading,        ConjureRefusal::AlreadyCasting,
         ConjureRefusal::NoBotAI,        ConjureRefusal::NoRoom,
         ConjureRefusal::EnoughAlready,  ConjureRefusal::NothingAppeared,
+        ConjureRefusal::CastRefused,    ConjureRefusal::NeverStoodStill,
+        ConjureRefusal::BudgetSpent,    ConjureRefusal::AlreadyRunning,
     };
     for (char const* literal : every)
     {
@@ -569,6 +599,251 @@ void AnUnknownRefusalIsWorthOneMoreTry()
 {
     CheckRetry("never heard of it", "the sky turned green", TownRetry::Later);
     CheckRetry("empty", "", TownRetry::Later);
+}
+
+
+// ------------------------------------------------- a character that walks --
+//
+// THE DEFECT THIS SECTION EXISTS FOR (#325). The first version of this loop
+// shipped, ran on the realm and produced nothing at all, six times, while
+// reporting "the casts produced nothing" every time. That sentence was true and
+// was the least useful true thing available. The reason, measured rather than
+// guessed:
+//
+//   * Every Conjure Food and Conjure Water rank carries InterruptFlags 0x0F out
+//     of Spell.dbc, and bit 0x01 is SPELL_INTERRUPT_FLAG_MOVEMENT.
+//   * PlayerbotAI::CastSpell refuses a moving bot any spell with a cast time
+//     before it ever reaches Spell::prepare, and returns false.
+//   * The characters move nearly all the time. Off overseer_snapshot in one
+//     five second sample, the party leader moved 2.8 yards and another member
+//     moved 15.9.
+//
+// So the loop has to ask the character to stand, WAIT for it to actually stop,
+// and say so when it never does.
+
+void AWalkingCharacterIsWaitedForRatherThanCastAt()
+{
+    ConjureProgress p = Running(0, 0);
+    p.moving = true;
+    CheckStep("still walking", ConjureNextStep(p), ConjureStep::Settle);
+    CheckGaveUp("and it has not given up", p, ConjureGaveUp::NotGivenUp);
+
+    ConjureProgress stopped = Running(0, 0);
+    CheckStep("stopped, so cast", ConjureNextStep(stopped), ConjureStep::Cast);
+}
+
+// A CAST IN FLIGHT BEATS THE MOVING TEST TOO. The core cancels a cast when the
+// caster moves, so this pair can be true together for one poll; what the loop
+// must not do is send a SECOND cast into that, which is what asking about
+// movement first would have produced.
+void ACastInFlightIsWaitedForEvenWhileMoving()
+{
+    ConjureProgress p = Running(0, 2);
+    p.moving = true;
+    p.castInFlight = true;
+    CheckStep("casting and moving", ConjureNextStep(p), ConjureStep::Wait);
+}
+
+void ACharacterThatNeverStopsEndsTheRowAndIsNamedForIt()
+{
+    ConjureProgress p = Running(0, 0);
+    p.moving = true;
+    p.movingPolls = 6;
+    CheckStep("never stood still", ConjureNextStep(p), ConjureStep::GaveUp);
+    CheckGaveUp("and it is named", p, ConjureGaveUp::NeverStoodStill);
+    CheckWord("the literal", ConjureGaveUpReasonWord(ConjureGaveUp::NeverStoodStill),
+              ConjureRefusal::NeverStoodStill);
+
+    ConjureProgress nearly = Running(0, 0);
+    nearly.moving = true;
+    nearly.movingPolls = 5;
+    CheckStep("one under the limit is still settling", ConjureNextStep(nearly),
+              ConjureStep::Settle);
+}
+
+void AMovingLimitOfZeroTurnsTheTestOffRatherThanGivingUpFirstThing()
+{
+    ConjureProgress p = Running(0, 0);
+    p.moving = true;
+    p.movingLimit = 0;
+    p.movingPolls = 99;
+    CheckStep("disabled, not tripped", ConjureNextStep(p), ConjureStep::Settle);
+    CheckGaveUp("and no give-up reason", p, ConjureGaveUp::NotGivenUp);
+}
+
+// THE THREE WALLS ARE THREE SENTENCES, and the order they are asked in is the
+// decision. A row that got casts off and then found the character walking again
+// has learned something about the spell; a row that never got to try has not.
+void TheThreeWallsAreToldApart()
+{
+    ConjureProgress budget = Running(4, 12);
+    CheckStep("budget", ConjureNextStep(budget), ConjureStep::GaveUp);
+    CheckGaveUp("budget spent", budget, ConjureGaveUp::BudgetSpent);
+    CheckWord("budget literal", ConjureGaveUpReasonWord(ConjureGaveUp::BudgetSpent),
+              ConjureRefusal::BudgetSpent);
+
+    ConjureProgress idle = Running(0, 3);
+    idle.idlePolls = 3;
+    CheckGaveUp("nothing appeared", idle, ConjureGaveUp::NothingAppeared);
+    CheckWord("idle literal", ConjureGaveUpReasonWord(ConjureGaveUp::NothingAppeared),
+              ConjureRefusal::NothingAppeared);
+
+    // Casts that produced nothing beat a character that has also been walking:
+    // the spell is the more informative half.
+    ConjureProgress both = Running(0, 3);
+    both.idlePolls = 3;
+    both.moving = true;
+    both.movingPolls = 9;
+    CheckGaveUp("the spell wins over the feet", both, ConjureGaveUp::NothingAppeared);
+
+    CheckWord("no wall, no literal", ConjureGaveUpReasonWord(ConjureGaveUp::NotGivenUp), "");
+}
+
+// A PROPERTY RATHER THAN A CASE, AND IT HOLDS BY CONSTRUCTION TODAY, which is
+// said plainly rather than left to look like a stronger check than it is:
+// ConjureNextStep asks ConjureGiveUpReason, so the two cannot currently
+// disagree. This sweep exists to keep that true. The day somebody gives the
+// step its own copy of a wall - which is exactly how the first version ended up
+// reporting three different failures with one sentence - this is what says so.
+void TheStepAndTheReasonNeverDisagree()
+{
+    for (uint32_t carried = 0; carried <= 21; carried += 7)
+        for (uint32_t spent = 0; spent <= 13; spent += 4)
+            for (uint32_t idle = 0; idle <= 4; ++idle)
+                for (uint32_t movingPolls = 0; movingPolls <= 7; ++movingPolls)
+                    for (int flight = 0; flight < 2; ++flight)
+                        for (int walk = 0; walk < 4; ++walk)
+                        {
+                            ConjureProgress p = Running(carried, spent);
+                            p.idlePolls = idle;
+                            p.movingPolls = movingPolls;
+                            p.castInFlight = flight != 0;
+                            p.moving = (walk & 1) != 0;
+                            p.outOfTime = (walk & 2) != 0;
+                            p.castsRefused = idle;
+
+                            bool const ended = ConjureNextStep(p) == ConjureStep::GaveUp;
+                            bool const named =
+                                ConjureGiveUpReason(p) != ConjureGaveUp::NotGivenUp;
+                            if (ended == named)
+                                continue;
+                            std::printf(
+                                "FAIL step and reason disagree: carried=%u spent=%u idle=%u "
+                                "movingPolls=%u flight=%d moving=%d\n",
+                                unsigned(carried), unsigned(spent), unsigned(idle),
+                                unsigned(movingPolls), flight, walk);
+                            ++failures;
+                        }
+}
+
+// The settle allowance is part of the window, because the first seconds of a
+// row are now a character coming to a halt rather than a character casting.
+void TheWindowCarriesTheSettleAllowance()
+{
+    CheckNum("four casts plus a settle",
+             ConjureVerifyWindowMs(3000, 4, 1000, 12000, 6000), 4 * 4000 + 12000);
+    CheckNum("the settle alone can clear the floor",
+             ConjureVerifyWindowMs(0, 1, 0, 12000, 6000), 12000);
+    uint32_t const huge = 0xFFFFFFFFu;
+    CheckNum("a nonsense settle saturates",
+             ConjureVerifyWindowMs(3000, 4, 1000, huge, 6000), huge);
+}
+
+
+// ---------------------------------------------------------- the backstop --
+//
+// THE WINDOW BEATS EVERYTHING EXCEPT ARRIVING, and it has to, because on the
+// other side of this decision is a character that has been asked to stand still
+// and is waiting to be let go. A hold that outlives its window would be this
+// module stopping a character and forgetting it.
+
+void RunningOutOfTimeEndsARowEvenMidCast()
+{
+    ConjureProgress p = Running(4, 2);
+    p.castInFlight = true;
+    CheckStep("mid-cast but in time", ConjureNextStep(p), ConjureStep::Wait);
+
+    p.outOfTime = true;
+    CheckStep("mid-cast and out of time", ConjureNextStep(p), ConjureStep::GaveUp);
+}
+
+void ArrivingBeatsEvenTheWindow()
+{
+    ConjureProgress p = Running(STACK, 4);
+    p.outOfTime = true;
+    p.castInFlight = true;
+    p.moving = true;
+    CheckStep("the bags are full on the last poll", ConjureNextStep(p), ConjureStep::Done);
+    CheckGaveUp("and nothing gave up", p, ConjureGaveUp::NotGivenUp);
+}
+
+// THE SENTENCE A TIMED-OUT ROW CARRIES IS THE POINT OF PASSING THE WINDOW IN.
+// A row that never got one cast away, on a character that has been walking,
+// timed out for exactly one reason and it is not the spell. That distinction is
+// the whole of #325: the shipped version had one sentence for both and used the
+// wrong one six times out of six.
+void ARowThatTimedOutSaysWhichKindOfRowItWas()
+{
+    ConjureProgress never = Running(0, 0);
+    never.outOfTime = true;
+    never.moving = true;
+    never.movingPolls = 3;  // under the limit; the window is what ended it
+    CheckGaveUp("never got a cast away", never, ConjureGaveUp::NeverStoodStill);
+
+    ConjureProgress alsoNever = Running(0, 0);
+    alsoNever.outOfTime = true;
+    alsoNever.moving = false;
+    alsoNever.movingPolls = 2;  // it walked earlier even if it is still now
+    CheckGaveUp("walked earlier and never cast", alsoNever, ConjureGaveUp::NeverStoodStill);
+
+    ConjureProgress tried = Running(0, 5);
+    tried.outOfTime = true;
+    tried.moving = true;
+    tried.movingPolls = 3;
+    CheckGaveUp("cast five times and got nothing", tried, ConjureGaveUp::NothingAppeared);
+
+    ConjureProgress still = Running(0, 0);
+    still.outOfTime = true;
+    still.moving = false;
+    still.movingPolls = 0;
+    CheckGaveUp("never cast and never walked either", still,
+                ConjureGaveUp::NothingAppeared);
+}
+
+// THE FOURTH WALL, AND THE ONE THAT MAKES THE REFUSED COUNTER LOAD-BEARING.
+// PlayerbotAI::CastSpell answering false is not a cast: it never reaches
+// Spell::prepare. A row where every attempt was declined and none was ever
+// accepted is a row about the character's state, not about the spell.
+void CastsDeclinedBeforeTheyStartAreNotCastsThatProducedNothing()
+{
+    ConjureProgress refused = Running(0, 0);
+    refused.castsRefused = 4;
+    refused.idlePolls = 3;
+    CheckGaveUp("every attempt declined", refused, ConjureGaveUp::CastRefused);
+    CheckWord("the literal", ConjureGaveUpReasonWord(ConjureGaveUp::CastRefused),
+              ConjureRefusal::CastRefused);
+
+    // One accepted cast is enough to make it a question about the spell again.
+    ConjureProgress mixed = Running(0, 1);
+    mixed.castsRefused = 3;
+    mixed.idlePolls = 3;
+    CheckGaveUp("one got through", mixed, ConjureGaveUp::NothingAppeared);
+
+    // And the same rule on the way out through the window, because a row must
+    // not describe itself one way when it gives up and another when it expires.
+    ConjureProgress timedOut = Running(0, 0);
+    timedOut.castsRefused = 2;
+    timedOut.outOfTime = true;
+    CheckGaveUp("declined, then ran out of time", timedOut, ConjureGaveUp::CastRefused);
+
+    // Movement still wins when the character never stood still: that is the
+    // more specific answer and the one a sender can act on.
+    ConjureProgress walking = Running(0, 0);
+    walking.castsRefused = 2;
+    walking.outOfTime = true;
+    walking.moving = true;
+    CheckGaveUp("declined because it was walking", walking,
+                ConjureGaveUp::NeverStoodStill);
 }
 
 }  // namespace
@@ -598,6 +873,17 @@ int main()
     TheBudgetEndsARowThatIsNotGettingThere();
     CastsThatProduceNothingEndTheRow();
     AnIdleLimitOfZeroTurnsTheTestOffRatherThanGivingUpFirstThing();
+    AWalkingCharacterIsWaitedForRatherThanCastAt();
+    ACastInFlightIsWaitedForEvenWhileMoving();
+    ACharacterThatNeverStopsEndsTheRowAndIsNamedForIt();
+    AMovingLimitOfZeroTurnsTheTestOffRatherThanGivingUpFirstThing();
+    TheThreeWallsAreToldApart();
+    TheStepAndTheReasonNeverDisagree();
+    TheWindowCarriesTheSettleAllowance();
+    RunningOutOfTimeEndsARowEvenMidCast();
+    ArrivingBeatsEvenTheWindow();
+    ARowThatTimedOutSaysWhichKindOfRowItWas();
+    CastsDeclinedBeforeTheyStartAreNotCastsThatProducedNothing();
     ATargetOfZeroIsNotSilentlyDone();
 
     TheBagsDecideWhatTheRowMayClaim();
