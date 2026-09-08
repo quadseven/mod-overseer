@@ -312,6 +312,63 @@ bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise)
     return (change < 0.f ? -change : change) <= bound;
 }
 
+bool ProvenStepIsWorthTaking(bool wholeBearingHeld, float provedYards,
+                             float minYards)
+{
+    // Nothing was truncated, so there is nothing for the floor to judge. See
+    // the header: this is what keeps the rule strictly narrowing.
+    if (wholeBearingHeld)
+        return true;
+    // A negative floor is refused rather than folded to its magnitude, for the
+    // reason TravelEndpointWithinTolerance below refuses one: reading a
+    // nonsense bound charitably would LOOSEN this rule, and every mistake this
+    // predicate can make has to be the tight one.
+    if (minYards < 0.f)
+        return false;
+    return provedYards >= minYards;
+}
+
+FootingRefusalVerdict FootingRefused(FootingRefusalState& state, uint32_t mapId,
+                                     float x, float y, float episodeRadius,
+                                     unsigned limit)
+{
+    // SOMEWHERE ELSE IS A NEW EPISODE. A character that has moved is asking a
+    // different question about different ground, and the count that says "this
+    // one is not getting out of here" has to be about one place or it means
+    // nothing. Same shape as TerrainRecoveryStep's own anchor, including the
+    // zero radius that turns the distance test off.
+    bool const elsewhere =
+        !state.anchored || state.mapId != mapId ||
+        (episodeRadius > 0.f &&
+         !WithinRadius(state.x, state.y, x, y, episodeRadius));
+    if (elsewhere)
+    {
+        state.anchored = true;
+        state.mapId = mapId;
+        state.x = x;
+        state.y = y;
+        state.consecutive = 0;
+    }
+    ++state.consecutive;
+
+    FootingRefusalVerdict out;
+    out.consecutive = state.consecutive;
+    // The FIRST poll of an episode is the one worth reading. Every poll after
+    // it says the same thing about the same feet on the same ground.
+    out.sayIt = state.consecutive == 1;
+    out.giveUp = limit != 0 && state.consecutive >= limit;
+    return out;
+}
+
+void FootingHeld(FootingRefusalState& state)
+{
+    // Unanchored as well as uncounted: a character that got a step is about to
+    // be somewhere else, so keeping the old anchor would measure the next
+    // episode from a place this character has left.
+    state.consecutive = 0;
+    state.anchored = false;
+}
+
 bool TravelEndpointWithinTolerance(float routedEndZ, float requestedZ,
                                    float toleranceYards)
 {

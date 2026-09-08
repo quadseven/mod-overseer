@@ -1329,6 +1329,40 @@ constexpr float TRAVEL_GROUND_UPHILL_YARDS = 50.0f;
 // exactly ON it and is rejected. See the fan in GroundedStep.
 constexpr float TRAVEL_STEP_SIDE_FRACTION = 0.6f;
 
+// THE SHORTEST PROVED PREFIX WORTH WALKING when a bearing was refused part of
+// the way along it (#312). Two samples, which is the same two strides
+// AnyDirectionHolds already calls the shortest reach that asks anything, for
+// the same reason: GroundHolds returns true without looking for a step under
+// one sample, so a prefix of one stride is answered by rounding rather than
+// measured. Written against TRAVEL_GROUND_SAMPLE_YARDS rather than as a number
+// of its own, because it IS that quantity and not an independent one.
+constexpr float TRAVEL_STEP_MIN_YARDS = TRAVEL_GROUND_SAMPLE_YARDS * 2.f;
+
+// HOW FAR A CHARACTER MAY MOVE BEFORE A REFUSAL EPISODE IS A NEW ONE (#312).
+// Ten yards: more than the jitter a standing character shows, and more than
+// nothing, which is what a character this drive has actually held is covering.
+// A character that MOVED is standing on different ground and its footing is a
+// fresh question, whoever moved it.
+constexpr float TRAVEL_GROUND_REFUSAL_RADIUS = 10.0f;
+
+// HOW MANY CONSECUTIVE POLLS EVERY BEARING MAY BE REFUSED, at one spot,
+// without moving, before the errand is given up (#312).
+//
+// Eight, which is two minutes at TRAVEL_POLL_MS and forty seconds at the
+// DUNGEON_RUN_POLL_MS cadence an escorted character is polled on. Long enough
+// that a refusal taken while a walk is already in flight rides itself out -
+// the walk moves the character, the anchor re-anchors, the count restarts -
+// and short enough that nothing spends the errand's whole twenty minute clock
+// standing on one spot.
+//
+// IT REPLACES A BOUND THAT COULD NOT FIRE. The line this drive used to print
+// promised that "the errand's own 20-minute backstop still bounds this", and
+// it did not: the backstop is scoped to the errand's target, the target is
+// rewritten from outside this module, and a rewrite restarts the clock. See
+// OverseerDecisions::FootingRefusalState for the six polls in six minutes
+// against five targets that this was measured on.
+constexpr unsigned TRAVEL_GROUND_REFUSAL_LIMIT = 8;
+
 // How much height a single fallback step may bridge when the aim is the step
 // itself (#203). Only consulted for an aim within TRAVEL_STEP_YARDS; see
 // StepMayBridgeGap for why a far aim's height is not this step's business.
@@ -3199,13 +3233,21 @@ public:
         // rather than every poll it is held on the ground (#138). See the
         // stuck-teleport block in DriveTravel.
         bool stuckSaid{false};
-        // "Already said that there was nowhere safe to step", so a character
-        // held at the top of a cliff by GroundedStep says so once per errand
-        // rather than every fifteen seconds (#138). Held to the same discipline
-        // as `flightSaid` above and cleared with the errand for the same
-        // reason: a refusal is about the journey being taken, not about the
-        // character taking it.
-        bool groundSaid{false};
+        // WHERE THIS CHARACTER HAS BEEN REFUSED EVERY BEARING, AND FOR HOW
+        // MANY POLLS RUNNING (#312).
+        //
+        // DELIBERATELY NOT CLEARED WITH THE ERRAND, unlike every flag around
+        // it. This used to be a `groundSaid` bool held "to the same discipline
+        // as `flightSaid`", on the grounds that a refusal is about the journey
+        // being taken - and that is the half of it that was wrong. A flight is
+        // a fact about a trip; the ground under a character's feet is not. The
+        // target column is rewritten from outside this module, and for a
+        // catch-up walk it is rewritten every poll with the leader's own live
+        // position, so scoping this to the errand printed the same warning six
+        // times in six minutes and restarted its bound five of those times.
+        // Anchored to a PLACE instead, and reset by movement rather than by a
+        // target rewrite. See OverseerDecisions::FootingRefusalState.
+        OverseerDecisions::FootingRefusalState footing{};
         // HAS THIS ERRAND EVER HELD THE WHEEL? Set the first time `new rpg` is
         // granted for it, so a later poll that finds the strategy missing can
         // tell "not started yet" from "something took it" (#293). Scoped to the
@@ -9658,7 +9700,16 @@ private:
     // to (toX, toY)? `footing` comes back as the surface at the far end, which
     // is the Z the step should be aimed at: an aim's own Z is what put a
     // character in the air in the first place.
-    static bool GroundHolds(Player* bot, float toX, float toY, float& footing)
+    //
+    // `provedYards`, when asked for, comes back as how much of that straight
+    // line the check actually WALKED before it answered - the whole span on a
+    // true, and the prefix that held on a false. It is the one number a caller
+    // needs to take the ground that was proved instead of throwing it away
+    // with the stride that was not (#312); see ProvenStepIsWorthTaking. On a
+    // false, `footing` is left holding the surface at that proved prefix,
+    // which is the Z that prefix should be aimed at.
+    static bool GroundHolds(Player* bot, float toX, float toY, float& footing,
+                            float* provedYards = nullptr)
     {
         float const fromX = bot->GetPositionX();
         float const fromY = bot->GetPositionY();
@@ -9666,8 +9717,14 @@ private:
         float const dy = toY - fromY;
         float const span = std::sqrt(dx * dx + dy * dy);
         footing = bot->GetPositionZ();
+        if (provedYards)
+            *provedYards = 0.f;
         if (span < TRAVEL_GROUND_SAMPLE_YARDS)
+        {
+            if (provedYards)
+                *provedYards = span;
             return true;   // one stride, with nothing between to fall into
+        }
 
         uint32 const samples =
             static_cast<uint32>(span / TRAVEL_GROUND_SAMPLE_YARDS) + 1;
@@ -9718,6 +9775,11 @@ private:
                     TRAVEL_GROUND_RISE_YARDS))
                 return false;
             footing = next;
+            // Recorded only AFTER the sample held, so the proved prefix always
+            // ends on a stride that passed and never on the one that did not.
+            if (provedYards)
+                *provedYards =
+                    span * static_cast<float>(i) / static_cast<float>(samples);
         }
         return true;
     }
@@ -9935,14 +9997,36 @@ private:
             float const ddy = wy - sy;
             if (delta != 0.f && std::sqrt(ddx * ddx + ddy * ddy) >= span)
                 continue;
+            //
+            // The skip above is still asked of the FULL reach, and stays sound
+            // for the truncated step below: for any walk shorter than the
+            // remaining span at a bearing of sixty degrees or less, the landing
+            // point is nearer the aim than the full-reach one is, so shortening
+            // a step can never turn a forward one into a backward one.
             float footing = 0.f;
-            if (!GroundHolds(bot, sx, sy, footing))
+            float proved = 0.f;
+            bool const holds = GroundHolds(bot, sx, sy, footing, &proved);
+            // TAKE THE GROUND THAT WAS PROVED (#312). A bearing that broke on
+            // its twelfth stride still walked eleven, and this used to answer
+            // that bearing exactly as it answered one that broke on its first.
+            // The step now ends at the last stride that HELD - strictly before
+            // the one that did not - so it is shorter than the old rule's step
+            // and never longer, and every yard of it was sampled from this
+            // character's own feet. See ProvenStepIsWorthTaking for the four
+            // measured refusals that threw 16, 24, 44 and 48 proved yards away.
+            float const walk = holds ? reach : proved;
+            if (!OverseerDecisions::ProvenStepIsWorthTaking(
+                    holds, proved, TRAVEL_STEP_MIN_YARDS))
                 continue;
+            float const tx = bot->GetPositionX() + std::cos(angle) * walk;
+            float const ty = bot->GetPositionY() + std::sin(angle) * walk;
             // The ground holding is not enough on its own: it says nothing
-            // about what stands on that ground. See NothingInTheWay.
-            if (!NothingInTheWay(bot, sx, sy, footing))
+            // about what stands on that ground. See NothingInTheWay. Asked of
+            // the point actually taken rather than of the one asked for, so a
+            // truncated step asks the shorter question it has earned.
+            if (!NothingInTheWay(bot, tx, ty, footing))
                 continue;
-            step = WorldPosition(want.GetMapId(), sx, sy, footing);
+            step = WorldPosition(want.GetMapId(), tx, ty, footing);
             return true;
         }
         return false;
@@ -11100,7 +11184,6 @@ private:
                 state.flightSince = 0;
                 state.flightSaid = false;
                 state.stuckSaid = false;
-                state.groundSaid = false;
                 // A new errand has not held the wheel and has had nothing
                 // taken from it (#293).
                 state.heldTheWheel = false;
@@ -11832,19 +11915,65 @@ private:
             WorldPosition aimAt = pos;
             if (!entry && !GroundedStep(bot, pos, aimAt))
             {
-                if (!state.groundSaid)
-                {
-                    state.groundSaid = true;
+                // WHAT WAS MEASURED, AND NOT WHAT IT FELT LIKE (#312). This
+                // line used to say "there is no direction out of where it
+                // stands", and that is not the question GroundedStep asks. It
+                // asks a five-bearing cone TOWARD THE AIM, thirty and sixty
+                // degrees either side of it. At the coordinates these lines
+                // were rewritten from, 21 of 36 bearings around the character
+                // held at two strides and none of the five in the forward cone
+                // did, because the aim was on the far side of a 74 yard wall.
+                // A character at the foot of a hill and a character sealed in a
+                // pocket produced the same sentence, and #262 was sent looking
+                // for a pocket by it.
+                //
+                // AND IT USED TO SAY IT WAS HOLDING THE CHARACTER. It is not.
+                // The `continue` below skips the re-aim and nothing else: a
+                // walk already in flight keeps running and `new rpg` stays
+                // granted, so upstream's own status update is free to move the
+                // character wherever it likes. Measured the same night: one
+                // refused character covered 2,335 yards at run speed across six
+                // consecutive polls that each printed this warning.
+                OverseerDecisions::FootingRefusalVerdict const refusal =
+                    OverseerDecisions::FootingRefused(
+                        state.footing, bot->GetMapId(), bot->GetPositionX(),
+                        bot->GetPositionY(), TRAVEL_GROUND_REFUSAL_RADIUS,
+                        TRAVEL_GROUND_REFUSAL_LIMIT);
+                if (refusal.sayIt)
                     LOG_WARN("module.overseer",
-                             "overseer: '{}' is sent to '{}', {} yards off, and there is no "
-                             "direction out of where it stands that does not step off "
-                             "something - holding it there rather than walking it off a "
-                             "cliff. The errand's own {}-minute backstop still bounds this",
+                             "overseer: '{}' is sent to '{}', {} yards off, and every "
+                             "bearing in the forward cone toward it - the aim, and 30 and "
+                             "60 degrees either side - was refused before {} yards of "
+                             "ground could be proved under it. That is a cone TOWARD THE "
+                             "AIM and not every direction out of here: a character at the "
+                             "foot of a hill reads exactly like one sealed in a pocket "
+                             "from this line alone, so measure the ground before believing "
+                             "either. Nothing is holding it, either - its walk and its "
+                             "`new rpg` are untouched - so if it moves, something else "
+                             "moved it. Giving the errand up if {} consecutive polls are "
+                             "refused without it moving (#312)",
                              name, target, static_cast<uint32>(distance),
-                             static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
+                             static_cast<uint32>(TRAVEL_STEP_MIN_YARDS),
+                             TRAVEL_GROUND_REFUSAL_LIMIT);
+                if (refusal.giveUp)
+                {
+                    LOG_WARN("module.overseer",
+                             // Kept on ONE source line for the same reason the
+                             // ratchet's own release above is: infra's guard
+                             // test greps this function for the phrase to prove
+                             // every release path says why it fired.
+                             "overseer: '{}' was sent to '{}' and has been refused every "
+                             "bearing out of one spot for {} polls running without moving "
+                             "a yard - releasing the errand as unreachable",
+                             name, target, refusal.consecutive);
+                    _travelAims.Release(name);
                 }
                 continue;
             }
+            // A poll that found a step ends any refusal episode this character
+            // was in, so the bound above counts CONSECUTIVE refusals and never
+            // a total (#312).
+            OverseerDecisions::FootingHeld(state.footing);
 
             // IS THE WALK THIS POLL WOULD ISSUE ALREADY RUNNING? Three
             // readings, taken here and weighed by OverseerDecisions::
