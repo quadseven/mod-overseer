@@ -3526,6 +3526,52 @@ SplitErrand ReadSplitErrand(std::string const& target);
 // Three of them ask it and they must never disagree.
 bool ErrandRunsAlone(std::string const& target);
 
+// ---------------- and with NO errand at all, a cut-off follower still drives --
+//
+// #289 ASKED THE WRONG HALF OF THE QUESTION (#331), and the half it left out
+// is the
+// one the family spends its day in. That issue let a split follower keep
+// `new rpg` WHILE it ran an errand it could finish alone, so the innkeeper trip
+// that would end the split stopped being blocked by the split. Correct, and it
+// only covers a character that has somewhere to be. The steady state of a split
+// follower is an EMPTY errand column, and `ErrandRunsAlone("")` is false, so
+// the backstop in KeepRosterFollowing takes the strategy straight back off.
+//
+// WHAT THAT COSTS, MEASURED ON THE DEV REALM 2026-09-08. Three of five roster
+// characters sat on map 0 while their leader was on map 1. Sampled every three
+// minutes with a forced save before each read, they did not move one yard and
+// did not gain one point of experience in nineteen minutes:
+//
+//     10:06  Bork 26632  Grug 20498      (-10538,-44,43) / (-4914,-998,502)
+//     10:25  Bork 26632  Grug 20498      the same two coordinates, to the yard
+//
+// The third, a priest frozen in a zone where mobs wander onto her, gained 180 a
+// kill and nothing else - which is what "standing still" looks like when the
+// world happens to walk into you, and is the only reason the number was not a
+// clean five-way zero.
+//
+// THE REFUSAL HAS NO REMEDY TO OFFER, WHICH IS THE WHOLE ARGUMENT. `new rpg`
+// comes off a follower because a follower that travels on its own outranks its
+// own `follow` and wanders off - the scatter this module exists to prevent.
+// That reasoning needs `follow` to be capable of doing something, and for a
+// character on the other map from its leader it is not: this module says so
+// itself, in capitals, once per split ("`follow` cannot cross a map ... nothing
+// in this module can walk this follower to anybody until somebody moves it").
+// Taking the strategy off such a character does not hold the family together,
+// because the family is already apart and nothing here can rejoin it (#241,
+// #274, #308). It only decides whether the character spends the wait levelling
+// where it stands or standing motionless in a field.
+//
+// STILL REFUSED FOR AN AIM THE FAMILY OWNS, and that is the one property worth
+// keeping from #289. An `at:` or `trigger:` target was chosen relative to the
+// rest of the party - a catch-up walk, a doorway, a staging point - and a
+// character that wanders off under `new rpg` while a run coordinator believes
+// it is walking to a door is the failure the refusal was written for. So the
+// verdict is the same one SplitErrand already draws, read the other way round:
+// anything but NeedsTheFamily drives itself, and an empty column now falls on
+// the driving side of that line instead of the frozen one.
+bool SplitFollowerDrivesItself(std::string const& target);
+
 // ------------------------- is the walk this drive would issue already running --
 //
 // THE GUARD THIS ANSWERS FOR, AND THE ONE THING IT USED TO GET WRONG (#293).

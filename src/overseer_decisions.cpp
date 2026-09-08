@@ -2894,6 +2894,18 @@ bool ErrandRunsAlone(std::string const& target)
     return ReadSplitErrand(target) == SplitErrand::SelfContained;
 }
 
+bool SplitFollowerDrivesItself(std::string const& target)
+{
+    // Written against the enumerator this REFUSES rather than the two it
+    // allows, on purpose. The refusal is the whole safety property - an aim the
+    // family owns must not be walked away from - and a new SplitErrand shape
+    // added later is far more likely to be another thing a character deals with
+    // alone than another thing the party picked for it. Spelled the other way
+    // round, a new enumerator would silently freeze a character again, which is
+    // exactly the failure this exists to end.
+    return ReadSplitErrand(target) != SplitErrand::NeedsTheFamily;
+}
+
 bool WalkAlreadyInFlight(bool reissueForced, bool canAct, bool atSameDestination)
 {
     // The watchdog's override first, because it is the one input that means

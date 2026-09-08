@@ -38,6 +38,7 @@ using OverseerDecisions::ErrandRunsAlone;
 using OverseerDecisions::ReadSplitErrand;
 using OverseerDecisions::SplitErrand;
 using OverseerDecisions::SplitErrandName;
+using OverseerDecisions::SplitFollowerDrivesItself;
 
 namespace
 {
@@ -217,6 +218,79 @@ void TheShorthandNeverDisagreesWithTheVerdict()
               ReadSplitErrand(target) == SplitErrand::SelfContained);
 }
 
+// ---------------------------------------------------------------------------
+// AND WITH NO ERRAND AT ALL, A CUT-OFF FOLLOWER STILL DRIVES ITSELF.
+//
+// The case above is deliberately the OTHER answer to the same string, and the
+// two do not contradict each other because they are asked of different
+// characters. `ErrandRunsAlone("")` is asked of the errand: an empty column is
+// not an errand, and a follower STANDING WITH ITS FAMILY that was handed
+// `new rpg` for one it does not have is the 937-yard scatter. `Split
+// FollowerDrivesItself("")` is only ever reached behind `SplitFromLeader`, of a
+// character on the other map from its leader, and there is no formation left
+// for it to scatter out of.
+//
+// Measured 2026-09-08: three characters in that state held position to the yard
+// and gained zero experience for nineteen minutes, because nothing grants the
+// strategy without an errand and the backstop takes it off again every poll.
+void ASplitFollowerWithNoErrandStillDrivesItself()
+{
+    Check("no errand still drives", SplitFollowerDrivesItself(""), true);
+    // ...and the errand reading of the same string is UNCHANGED. If this ever
+    // flips, the scatter guard above has gone with it.
+    Check("no errand is still not an errand", ErrandRunsAlone(""), false);
+}
+
+// AN ERRAND IT CAN RUN ALONE DRIVES IT TOO, which is #289 preserved rather than
+// replaced: every target that used to grant still grants.
+void EverySelfContainedErrandStillDrives()
+{
+    for (std::string const& role : EveryRole())
+        Check("a role errand still drives", SplitFollowerDrivesItself(role), true);
+    Check("a bare entry still drives", SplitFollowerDrivesItself("3934"), true);
+}
+
+// AND THE FAMILY'S OWN AIM IS STILL REFUSED. This is the one property carried
+// over unchanged, and the reason the verdict is written against the enumerator
+// it refuses: a character that wanders off under `new rpg` while a run
+// coordinator believes it is walking to a door is what the refusal is for.
+void TheFamilysOwnAimIsStillRefused()
+{
+    Check("a point aim does not drive",
+          SplitFollowerDrivesItself("at:1:298,-2243.9,95.5"), false);
+    Check("a doorway does not drive",
+          SplitFollowerDrivesItself("trigger:4247"), false);
+    Check("a malformed point does not drive",
+          SplitFollowerDrivesItself("at:banana"), false);
+    // Including one this character could in fact walk to. Same narrower answer
+    // as EvenAWalkablePointAimIsRefused, and for the same reason.
+    Check("a walkable point aim does not drive",
+          SplitFollowerDrivesItself("at:1:-407.1,-2645.2,95.0"), false);
+}
+
+// THE TWO VERDICTS DIFFER IN EXACTLY ONE PLACE, and it is the empty column.
+// Stated as a sweep rather than as four separate cases so that a later
+// SplitErrand shape cannot quietly open a second gap between them.
+void TheTwoVerdictsDifferOnlyOnTheEmptyColumn()
+{
+    std::vector<std::string> everything = EveryRole();
+    everything.push_back("");
+    everything.push_back("3934");
+    everything.push_back("at:0:1,2,3");
+    everything.push_back("trigger:9");
+    everything.push_back("at:");
+    everything.push_back("atrium");
+    for (std::string const& target : everything)
+    {
+        bool const drives = SplitFollowerDrivesItself(target);
+        bool const errand = ErrandRunsAlone(target);
+        if (target.empty())
+            Check("the empty column is the one difference", drives && !errand, true);
+        else
+            Check("everything else agrees", drives, errand);
+    }
+}
+
 }  // namespace
 
 int main()
@@ -231,6 +305,10 @@ int main()
     AMalformedPointIsStillAPoint();
     EveryVerdictHasItsOwnName();
     TheShorthandNeverDisagreesWithTheVerdict();
+    ASplitFollowerWithNoErrandStillDrivesItself();
+    EverySelfContainedErrandStillDrives();
+    TheFamilysOwnAimIsStillRefused();
+    TheTwoVerdictsDifferOnlyOnTheEmptyColumn();
 
     if (failures)
     {
