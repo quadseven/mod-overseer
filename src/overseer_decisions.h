@@ -4932,6 +4932,199 @@ constexpr char const* NotReadBack       = "the mail did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool MailRefusalRetryable(std::string const& reason);
 
+// ----------------------------------------------------------- hearth (#308) --
+//
+// WHAT A kind='hearth' ROW MAY SAY, AND WHY THE VERB IS THE ITEM.
+//
+// #286 gave this module the first half of the game's own cross-continent
+// return: an innkeeper can now be asked to set a character's home, through the
+// core's own binder handler, and the home is read back out of
+// character_homebind rather than believed. This is the second half. A home is
+// only worth having if something can go to it, and nothing here could.
+//
+// THE RETURN TRIP DID NOT EXIST. AGENTS.md records "sending a character home"
+// as one of exactly two verbs seen returning `delivered` with a null result
+// while changing nothing. That reading has been wrong about which verb it was
+// for as long as it has been written down: upstream's `home` command is
+// SetHomeAction, and SetHomeAction sets a home AT an innkeeper. It is the verb
+// #286 replaced. It was never a way to travel to one. So this module has never
+// had a "go home" of any kind, working or broken, and the count of things in it
+// that can rejoin a family split across two continents has been zero.
+//
+// WHY NOT TeleportTo(m_homebind...). Because the module can already do that, in
+// four places, and every one of them is a revival exit that had to argue for
+// itself first. #286's migration named the rule this verb keeps: SetHomebind is
+// public and would have worked, "and that is exactly the problem". The same
+// sentence is true one step along. A teleport to the homebind asks nothing,
+// costs nothing, cannot fail, and is an admin shortcut wearing the name of a
+// game mechanic. AGENTS.md's standing instruction is to always fix the code and
+// never reach for one. So this verb is the ITEM: the hearthstone in the
+// character's own bags, its own spell, its own cast time, its own hour of
+// cooldown and its own interrupts. A character in combat fails the way a player
+// would, because it is the same code refusing.
+//
+// AND A BOT CAN ACTUALLY CAST ONE, WHICH WAS THE QUESTION THIS TURNED ON.
+// Read at the pinned SHAs rather than assumed. WorldSession::HandleUseItemOpcode
+// takes a raw WorldPacket, the same shape as the binder and areatrigger
+// handlers this module already drives, and every client-facing thing it does
+// funnels through WorldSession::SendPacket, which returns at `if (!m_Socket)`.
+// A bot's session is constructed with a null socket, so those sends are no-ops
+// and only the control flow matters. mod-playerbots already ships this exact
+// call - UseItemAction::UseItem builds a CMSG_USE_ITEM by hand and hands it to
+// bot->GetSession()->HandleUseItemOpcode - and it already has a hearthstone
+// action on top of it. So the packet path is not novel; what is novel is
+// judging it.
+//
+// THE ONE CLIENT-SHAPED PIECE, AND WHY IT IS ALREADY THERE. A cross-map
+// teleport sets a far-teleport semaphore and then waits for the client to send
+// MSG_MOVE_WORLDPORT_ACK. A bot has no client to send one. mod-playerbots fills
+// that gap itself in PlayerbotAI::HandleTeleportAck, pumped every tick from
+// PlayerbotHolder::UpdateSessions for any bot that reads IsBeingTeleported. So
+// nothing has to be built here - but it is exactly why this executor refuses a
+// character with no bot AI rather than casting anyway. Without one, a
+// hearthstone across the ocean would leave the character wedged mid-teleport
+// with nothing in the world to finish it, which is a worse outcome than any
+// refusal.
+//
+// WHAT THAT COSTS, AND IT IS THE WHOLE DESIGN. A hearthstone is not instant.
+// The cast time is the spell's, read off SpellInfo at runtime rather than
+// written down here, and it is far longer than the poll that sent the row. So
+// this executor cannot do what every other one in this module does, which is
+// read the world back inside its own call and answer immediately. Pretending
+// otherwise would produce exactly the status AGENTS.md warns about: a success
+// reported before anything has happened, about a character that has not moved
+// yet and may never. A hearth therefore parks in `verifying`, the same status a
+// strategy command uses while its post-condition is read back, and the
+// judgement below is what ends it.
+//
+// Column re-use, no new columns:
+//   target_name  the character to send home
+//   command      `use`, or empty, which means the same thing
+//   target_arg   unused
+//   detail       short refusal literal, or empty on success
+//   result       JSON: outcome (arrived|stayed|elsewhere|refused|unreadable),
+//                reason, retry (never|elsewhere|later - see
+//                HearthRefusalRetry), character, item, spell, cast_ms,
+//                window_ms, waited_ms, home, from and now each
+//                {map, area, x, y, z} or null, request
+//   status       'verifying' from the moment the cast starts, then 'applied'
+//                when the character reads back at its home, 'unchanged' when it
+//                never left, 'error' otherwise. NOT 'delivered', for the same
+//                reason kind='bind' is not: a return trip that reports delivery
+//                and moves nobody is the bug.
+enum class HearthVerb
+{
+    None,  // not a hearth request; `error` says why
+    Use,
+};
+
+struct HearthRequest
+{
+    HearthVerb verb{HearthVerb::None};
+    std::string error;  // the refusal literal when verb is None, else empty
+};
+
+// ONE FORM, AND NO DESTINATION. Whitespace-tolerant, otherwise literal: the
+// single lower-case word `use`, or an empty command meaning the same thing.
+// There is deliberately no way to name a map, a coordinate or a town. The
+// destination of a hearthstone is the home a previous kind='bind' wrote into
+// character_homebind and nothing else, and a grammar that could ask for
+// somewhere else would be a grammar for the teleport this verb exists in order
+// not to be.
+HearthRequest ParseHearthRequest(std::string const& command);
+
+enum class HearthOutcome
+{
+    // The place the character started from, the home it was bound to, or where
+    // it is now could not all be read. Or they could, and the first two are the
+    // same place, so no reading of the third could tell an arrival from having
+    // never moved. Says nothing about whether anything happened, and must never
+    // be reported as any of the other three.
+    Unreadable,
+    // The character reads back at the home it was bound to. The cast finished
+    // and the game moved it. The only outcome worth `applied`.
+    Arrived,
+    // The character is still standing where the cast began. THE FAILURE THIS
+    // WHOLE EXECUTOR EXISTS TO MAKE VISIBLE: an interrupt, a refusal that
+    // reported itself to a client that is not there, or a cast that never
+    // started at all. From the queue those look identical, and not one of them
+    // is `applied`.
+    Stayed,
+    // The character moved and is not at its home. A hearth went out and
+    // something else decided where the character ended up: it died mid-cast and
+    // released to a graveyard, or it was walking and kept walking. Kept apart
+    // from Stayed because "it did not work" and "it went somewhere nobody asked
+    // for" want different answers from the sender.
+    Elsewhere,
+};
+
+// "arrived", "stayed", "elsewhere", "unreadable". Here rather than in the
+// executor so the word a test pins is the word a row carries.
+char const* HearthOutcomeWord(HearthOutcome outcome);
+
+// A HEARTH THAT WOULD MOVE NOBODY CANNOT BE JUDGED, AND COSTS AN HOUR TO FIND
+// THAT OUT. When the home is already where the character stands, `Arrived` and
+// `Stayed` are the same reading and no post-condition can separate them. That
+// alone would be reason to refuse. The cooldown is the other reason: a
+// hearthstone that goes off spends an hour of the only cross-continent return
+// this family has, and spending it to travel zero yards is the one use of it
+// that can never be worth making. So the executor asks this BEFORE the packet
+// and refuses, rather than casting and then reporting a verdict it already knew
+// it could not reach.
+bool HearthWouldMoveNobody(HomeBind const& standing, HomeBind const& home,
+                           float arrivedYards);
+
+// `from` is where the character stood when the cast began, `home` is that
+// character's own bind read at the same moment, and `now` is where it is once
+// the wait is over. Three readings, because "it is not at home" is only half an
+// answer: whether it is still on the start line or somewhere else entirely is
+// the half that says what went wrong. Distances are compared in three
+// dimensions and only within one map, so a different map that is not the home
+// map is `Elsewhere` however close the coordinates happen to land. That last
+// clause is not pedantry: this family is split across exactly two continents
+// which share a coordinate space, so a comparison that forgot the map would
+// report the crossing as done while the character stood on the wrong side of
+// the ocean.
+//
+// THE TWO TOLERANCES ARE DIFFERENT SIZES ON PURPOSE. `arrivedYards` is the
+// wider one, and not because the spell is imprecise: Spell::EffectTeleportUnits
+// puts the character on m_homebindX/Y/Z exactly. It is wide because nothing
+// stands still afterwards. The judgement happens a margin after the cast ends,
+// the character is a bot with a drive of its own, and a bot walks. Measuring
+// arrival to the yard would report a character that landed at its inn and took
+// four steps as having gone `elsewhere`. `movedYards` is the narrow one and
+// answers a different question - did this character go anywhere at all - where
+// a pace of drift is all that has to be absorbed.
+HearthOutcome HearthReadBack(HomeBind const& from, HomeBind const& home,
+                             HomeBind const& now, float arrivedYards,
+                             float movedYards);
+
+// HOW LONG TO WAIT BEFORE JUDGING, AND WHY IT IS NOT A CONSTANT.
+//
+// VERIFY_GRACE_MS is 6000, and a hearthstone's cast is longer than that, so
+// reusing the strategy checks' window would judge every hearth this family ever
+// casts as `Stayed` while the character was still standing there casting it.
+// The window has to come from the spell.
+//
+// `castMs` is SpellInfo's own, read at runtime. `marginMs` is what the world
+// needs after the cast ends: the teleport lands on a later tick than the one
+// the cast completes on, a map change is not instant, and this module only
+// looks every COMMAND_POLL_MS, so a window equal to the cast time would race
+// the arrival it exists to see. `floorMs` answers a cast time that reads as
+// zero, which is what a haste effect, a rank the DBC does not carry, and a core
+// that resolved nothing all look like from here: a zero window judges instantly
+// and therefore always answers `Stayed`.
+//
+// Saturating, not wrapping. A nonsense cast time out of the DBC must not become
+// a short window by overflowing.
+uint32_t HearthVerifyWindowMs(uint32_t castMs, uint32_t marginMs, uint32_t floorMs);
+
+// Keyed on the `detail` literal the executor returns, grouped by what would
+// have to change for the same row to succeed. Unknown is `Later`, the same call
+// the bind, sell and repair tables make: a refusal this table has never heard
+// of is more likely a new transient than a new permanent.
+TownRetry HearthRefusalRetry(std::string const& detail);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

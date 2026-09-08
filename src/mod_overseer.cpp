@@ -67,6 +67,23 @@
  *                     on delivery is refused, and so is deleting a letter that
  *                     still carries something, because that destroys it. See
  *                     2026_09_05_03_overseer_mail.sql.
+ *       kind='hearth' - send a character home on the hearthstone in its own
+ *                     bags, through the core's own CMSG_USE_ITEM handler, with
+ *                     the cast time, the hour of cooldown and the interrupts a
+ *                     player would get. The destination is not this module's
+ *                     to pick: TARGET_DEST_HOME resolves to the character's own
+ *                     m_homebind*, which is what kind='bind' writes, so this is
+ *                     the second half of that verb rather than a new power. It
+ *                     is deliberately NOT a teleport to m_homebind - that call
+ *                     exists in this file four times, on revival paths that
+ *                     each argued for themselves, and a fifth with nothing in
+ *                     front of it would be an admin shortcut wearing a game
+ *                     mechanic's name. THE ONLY ROW IN THIS QUEUE THAT CANNOT
+ *                     BE ANSWERED BY THE POLL THAT SENT IT: a hearthstone has
+ *                     a cast time, so nothing has happened when the handler
+ *                     returns and the row parks in `verifying` until
+ *                     ResolveHearthChecks reads back where the character
+ *                     actually is. See 2026_09_07_01_overseer_hearth.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -2027,10 +2044,13 @@ constexpr uint32 CHAT_FLUSH_MS = 1000;
 constexpr uint32 COMMANDS_PER_POLL = 20;
 // How long a row may sit in `claimed` or `verifying` under a run token that is
 // not this one before the drain ends it (mod-overseer#230). A claim is taken and
-// executed inside a single poll and a `verifying` row resolves within
-// VERIFY_GRACE_MS, so two minutes is far past anything legitimate. What is left
-// after that is a row held by a worldserver that went away, which
-// `WHERE status = 'pending'` can never select again and nothing else will end.
+// executed inside a single poll; a `verifying` row from a strategy command
+// resolves within VERIFY_GRACE_MS, and the slowest `verifying` row this module
+// can produce is a kind='hearth' waiting out a cast time plus HEARTH_MARGIN_MS,
+// which is seconds and not minutes. So two minutes is still far past anything
+// legitimate. What is left after that is a row held by a worldserver that went
+// away, which `WHERE status = 'pending'` can never select again and nothing else
+// will end.
 constexpr time_t COMMAND_CLAIM_LEASE_SECONDS = 120;
 // A waiting row untouched for longer than this is not being REACHED, as opposed
 // to merely queued behind honest work: at COMMANDS_PER_POLL rows every
@@ -19807,6 +19827,10 @@ private:
         // answer by a whole poll.
         ResolveStrategyChecks(sincePollMs);
 
+        // ...and the hearths, which wait longer because a hearthstone has a
+        // cast time and a strategy command does not.
+        ResolveHearthChecks(sincePollMs);
+
         // Then collect any row a run that is no longer here is still holding,
         // because nothing below this line can ever see one.
         ExpireAbandonedClaims();
@@ -19887,14 +19911,15 @@ private:
             char const* detail = "";
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share', 'job', 'sell', 'bank', 'auction', 'bind' and 'mail' do
-            // not go through
+            // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth' and
+            // 'mail' do not go through
             // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
                 && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
                 && kind != "bank" && kind != "auction" && kind != "bind"
+                && kind != "hearth"
                 && kind != "mail")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
@@ -20017,6 +20042,8 @@ private:
                 detail = DoBuy(player, command, status, rowResult);
             else if (kind == "bind")
                 detail = DoBind(player, command, status, rowResult);
+            else if (kind == "hearth")
+                detail = DoHearth(player, command, status, rowResult, _pendingHearths, id);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -23892,6 +23919,592 @@ private:
         describe("bound", "");
         status = "applied";
         return "";
+    }
+
+
+    // -------------------------------------------------------------- hearth --
+    //
+    // Send a family member home on the game's own hearthstone: the item in its
+    // own bags, through the core's own CMSG_USE_ITEM handler, with the cast
+    // time, the cooldown and the interrupts a player would get.
+    //
+    // WHY THIS EXISTS. #286 gave this module a way to CHANGE a home. Nothing
+    // could then go to one, so a home was a fact about a character rather than
+    // a destination. The family this module steers is split across two
+    // continents, the boat cannot board anybody (#279), and the count of things
+    // in here that could rejoin them was zero.
+    //
+    // WHY NOT TeleportTo(m_homebind...). Four revival exits in this file
+    // already do exactly that, and every one of them had to argue for itself as
+    // a revival. A fifth call with nothing in front of it would be an admin
+    // teleport wearing a game mechanic's name, and AGENTS.md's standing
+    // instruction is to always fix the code and never reach for one. The
+    // hearthstone is not a shortcut to the same place; it is the same place
+    // reached by paying what the game charges for it.
+    //
+    // WHAT THE CORE ACTUALLY DOES, read at the pinned SHAs rather than
+    // remembered:
+    //
+    //   * WorldSession::HandleUseItemOpcode (SpellHandler.cpp:58) takes a raw
+    //     WorldPacket, like the binder and areatrigger handlers this module
+    //     already drives and unlike the typed sell and bank ones. Its wire
+    //     format is bagIndex, slot, castCount, spellId, item guid, glyphIndex,
+    //     castFlags, then SpellCastTargets::Read, which returns immediately on
+    //     TARGET_FLAG_NONE (Spell.cpp:130).
+    //
+    //   * It does not cast the spellId in the packet. That is used only for a
+    //     sanity lookup and the spell queue's category. The spell that runs is
+    //     whichever of the ITEM'S OWN proto->Spells[] carries
+    //     ITEM_SPELLTRIGGER_ON_USE (Player::CastItemUseSpell, Player.cpp:7615).
+    //     So this executor reads the spell off the item rather than writing a
+    //     spell id down, and the id it puts in the packet is the one it read.
+    //
+    //   * The destination is not this module's to choose. TARGET_DEST_HOME
+    //     resolves to playerCaster->m_homebindX/Y/Z/MapId, straight off the
+    //     Player (Spell::SelectImplicitCasterDestTargets, Spell.cpp:1394).
+    //     Those are the exact four fields HandleBinderActivateOpcode writes,
+    //     which is what makes this the second half of #286 and not a new power.
+    //
+    //   * A BOT CAN DO THIS. Every client-facing thing on the path funnels
+    //     through WorldSession::SendPacket, which returns at `if (!m_Socket)`
+    //     (WorldSession.cpp:308), and a bot's session is built with a null
+    //     socket. mod-playerbots already ships this call - UseItemAction::UseItem
+    //     hand-builds a CMSG_USE_ITEM and passes it to
+    //     bot->GetSession()->HandleUseItemOpcode - and already has a hearthstone
+    //     action on top of it. The packet path is not the new thing here.
+    //
+    // WHAT IS NEW IS THE JUDGEMENT, and it is the whole reason this executor is
+    // shaped differently from every other one in this file. A hearthstone has a
+    // cast time. Nothing has happened when the handler returns. Reading the
+    // world back inside this call, which is what kind='bind', kind='repair' and
+    // kind='mail' all do, would read a character standing exactly where it was
+    // and be right, ten seconds too early. So this one parks in `verifying` and
+    // is judged later by ResolveHearthChecks, on a window derived from the
+    // spell's own cast time.
+    //
+    // WHAT IT REFUSES, AND WHAT IT DELIBERATELY DOES NOT:
+    //
+    //   * IT DOES NOT REFUSE AN INSTANCE. #286 refuses a bind inside one
+    //     because SendBindPoint returns silently there. Nothing on this path
+    //     does: SPELL_EFFECT_TELEPORT_UNITS has no case in Spell::CheckCast's
+    //     effect switch and SpellInfo::CheckLocation only bars
+    //     SPELL_ATTR6_NOT_IN_RAID_INSTANCES, which this spell does not carry.
+    //     Hearthing out of a dungeon is how a player leaves one, and copying
+    //     bind's refusal across would be inventing a rule the game lacks.
+    //
+    //   * IT DOES NOT STOP A WALKING CHARACTER IN ORDER TO CAST.
+    //     mod-playerbots' UseHearthStone does exactly that - StopMoving, clear
+    //     the motion master, then use - and it is the right call for an AI
+    //     deciding for itself. It is the wrong call here. Cancelling a travel
+    //     errand as a side effect of a queued command would make this verb
+    //     reach past what it was asked to do, and this module has a rule about
+    //     an errand nobody meant to clear (#163). So a moving character is
+    //     refused with `later`, and clearing the aim first is the sender's job,
+    //     which is where aiming already lives.
+    //
+    //   * IT DOES REFUSE A CHARACTER WITH NO BOT AI, which is not a taste
+    //     decision. A cross-map teleport waits on MSG_MOVE_WORLDPORT_ACK, a
+    //     packet a client sends. mod-playerbots answers it for bots in
+    //     PlayerbotAI::HandleTeleportAck, pumped every tick from
+    //     PlayerbotHolder::UpdateSessions. With no bot AI there is nothing in
+    //     the world to finish the teleport and the character would hang
+    //     mid-crossing, which is worse than any refusal.
+    //
+    //   * IT DOES REFUSE A TRANSPORT, and that one is this module's own. The
+    //     core declares SPELL_FAILED_NOT_ON_TRANSPORT and never uses it. It is
+    //     refused because the READ-BACK cannot survive a start line that moves
+    //     on its own. See HearthRefusalRetry in overseer_decisions.h.
+    //
+    //   * IT DOES REFUSE A CHARACTER ALREADY STANDING AT ITS OWN HOME. An
+    //     arrival and a failure are the same reading there, and finding that
+    //     out costs an hour of the only cross-continent return this family has.
+    //
+    // WHAT THIS EXECUTOR NEVER DECIDES: whether going home is a good idea. It
+    // does not look at the party, the dungeon's map, or which continent anybody
+    // wants to be on. A hearth is only a crossing for a character whose home is
+    // on the other side, and for a character bound where it already stands it
+    // is a round trip to nowhere. Choosing which of those a row is belongs to
+    // the side outside the worldserver, which is the same seam #286 drew for
+    // deciding which inn is worth binding at.
+
+    // The Hearthstone. Verified against item_template on the live realm rather
+    // than trusted: entry 6948, class 15, and spellid_1 = 8690 with
+    // spelltrigger_1 = 0, which is ITEM_SPELLTRIGGER_ON_USE. The ITEM is named
+    // here and the SPELL is not, because Player::CastItemUseSpell casts
+    // whatever the item's own template carries and reading it back off the item
+    // is the only way to be casting the same thing the core is.
+    static constexpr uint32 HEARTHSTONE_ITEM_ENTRY = 6948;
+
+    // How close to the home a character has to read back before it has
+    // arrived. Wide, and not because the spell is imprecise:
+    // Spell::EffectTeleportUnits lands the character on m_homebindX/Y/Z
+    // exactly. It is wide because nothing stands still afterwards. The
+    // judgement is taken a margin after the cast ends and the thing being
+    // judged is a bot with a drive of its own, so a character that landed at
+    // its inn and took a few steps must not read as having gone elsewhere.
+    static constexpr float HEARTH_ARRIVED_YARDS = 40.f;
+
+    // ...and how far a character may drift and still count as never having
+    // left. Narrower, because this answers a different question: not "is it
+    // there" but "did it go anywhere at all".
+    static constexpr float HEARTH_MOVED_YARDS = 10.f;
+
+    // What the world needs AFTER the cast time is up: the teleport is applied
+    // at the end of the tick the cast completes on (Player::Update wraps itself
+    // in SetMustDelayTeleport), a far teleport then waits for the ack
+    // mod-playerbots supplies on a later tick, and this module only looks every
+    // COMMAND_POLL_MS. Two and a half poll intervals, so a hearth is never
+    // judged by the poll that is racing its own arrival.
+    static constexpr uint32 HEARTH_MARGIN_MS = 5000;
+
+    // HOW MUCH LONGER A ROW MAY WAIT WHEN THE TELEPORT ITSELF IS STILL IN
+    // FLIGHT. A cross-map hearth sets a far-teleport semaphore and is not
+    // finished until MSG_MOVE_WORLDPORT_ACK comes back, which for a bot arrives
+    // on a later tick from PlayerbotAI::HandleTeleportAck. Reading a position
+    // in that gap gives the position the character is leaving, which would be
+    // judged `stayed` - a false failure, about the one verb whose entire job is
+    // to not report those. So a character still mid-teleport when its window is
+    // up is given more time rather than judged.
+    //
+    // CEILING, NOT AN OPEN WAIT. A teleport that never completes is a real
+    // failure and has to end as one, so this is five COMMAND_POLL_MS on top of
+    // the window and then the verdict is taken regardless.
+    static constexpr uint32 HEARTH_SETTLE_CEILING_MS = 10000;
+
+    // The shortest window that may ever be waited, whatever the spell says. A
+    // cast time of zero is what a haste effect, a rank the DBC does not carry,
+    // and a core that resolved nothing all look like from here, and a zero
+    // window judges instantly, which always answers `stayed`.
+    static constexpr uint32 HEARTH_FLOOR_MS = 8000;
+
+    // Everything a hearth row can be answered with, gathered as it becomes
+    // known and carried across the wait. Numbers that were never taken stay
+    // negative, because 0ms is a real reading and `false` is a real answer.
+    struct HearthEvidence
+    {
+        std::string character;
+        std::string request;
+        uint32 itemEntry{0};
+        uint32 spellId{0};
+        uint32 castMs{0};
+        uint32 windowMs{0};
+        uint32 waitedMs{0};
+        int32 castingAfterCall{-1};   // -1 never asked, 0 no, 1 yes
+        int32 cooldownAtVerdict{-1};  // -1 never asked, 0 ready, 1 on cooldown
+        int32 teleportWasStillInFlight{-1};  // -1 never asked, 0 no, 1 yes
+        OverseerDecisions::HomeBind home;
+        OverseerDecisions::HomeBind from;
+        OverseerDecisions::HomeBind now;
+        OverseerDecisions::HearthOutcome verdict{OverseerDecisions::HearthOutcome::Unreadable};
+    };
+
+    // A hearth waiting out its own cast. Held on the world thread beside
+    // _pendingChecks and bounded the same way.
+    struct HearthCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        HearthEvidence ev;
+    };
+
+    // HEARTHS WAITING OUT THEIR OWN CAST. World thread only, exactly like
+    // _pendingChecks and for the same reason, and bounded the same way: at most
+    // COMMANDS_PER_POLL are added per poll and every one is resolved within its
+    // own window, which is the spell's cast time plus a margin rather than
+    // VERIFY_GRACE_MS. See DoHearth for why a hearth cannot be judged by the
+    // call that sent it.
+    //
+    // DECLARED HERE AND NOT BESIDE _pendingChecks, which is where it belongs by
+    // subject. A member's TYPE has to be complete where the member is declared -
+    // only function bodies are compiled as if the class were finished - and
+    // HearthCheck is defined in this section. Putting the vector up there
+    // compiles nowhere, and no pull request in this repository compiles this
+    // file (#288), so it would have been found on main.
+    std::vector<HearthCheck> _pendingHearths;
+
+    static void HearthPlace(std::ostringstream& o, OverseerDecisions::HomeBind const& p)
+    {
+        if (!p.known)
+        {
+            o << "null";
+            return;
+        }
+        o << "{\"map\":" << p.mapId << ",\"area\":" << p.areaId << ",\"x\":" << p.x
+          << ",\"y\":" << p.y << ",\"z\":" << p.z << "}";
+    }
+
+    // ONE SHAPE FOR EVERY EXIT, refusals and verdicts alike, and written by all
+    // of them. A row that ends without saying what it was judged on is the
+    // thing this whole verb exists to stop producing.
+    static std::string HearthJson(HearthEvidence const& ev, char const* outcome,
+                                  char const* reason)
+    {
+        using OverseerDecisions::HearthOutcomeWord;
+        using OverseerDecisions::HearthRefusalRetry;
+        using OverseerDecisions::TownRetryWord;
+
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(*reason ? TownRetryWord(HearthRefusalRetry(reason)) : "")
+          << ",\"character\":" << J(ev.character)
+          << ",\"verdict\":" << J(HearthOutcomeWord(ev.verdict))
+          << ",\"item\":" << ev.itemEntry
+          << ",\"spell\":" << ev.spellId
+          << ",\"cast_ms\":" << ev.castMs
+          << ",\"window_ms\":" << ev.windowMs
+          << ",\"waited_ms\":" << ev.waitedMs;
+        o << ",\"casting_after_call\":";
+        if (ev.castingAfterCall < 0)
+            o << "null";
+        else
+            o << (ev.castingAfterCall ? "true" : "false");
+        o << ",\"cooldown_at_verdict\":";
+        if (ev.cooldownAtVerdict < 0)
+            o << "null";
+        else
+            o << (ev.cooldownAtVerdict ? "true" : "false");
+        o << ",\"teleport_still_in_flight\":";
+        if (ev.teleportWasStillInFlight < 0)
+            o << "null";
+        else
+            o << (ev.teleportWasStillInFlight ? "true" : "false");
+        o << ",\"home\":";
+        HearthPlace(o, ev.home);
+        o << ",\"from\":";
+        HearthPlace(o, ev.from);
+        o << ",\"now\":";
+        HearthPlace(o, ev.now);
+        o << ",\"request\":" << J(ev.request) << "}";
+        return o.str();
+    }
+
+    static char const* DoHearth(Player* who, std::string const& command, char const*& status,
+                                std::string& out, std::vector<HearthCheck>& parked, uint32 id)
+    {
+        using OverseerDecisions::HearthOutcome;
+        using OverseerDecisions::HearthRequest;
+        using OverseerDecisions::HearthVerb;
+        using OverseerDecisions::HearthVerifyWindowMs;
+        using OverseerDecisions::HearthWouldMoveNobody;
+        using OverseerDecisions::ParseHearthRequest;
+
+        HearthEvidence ev;
+        ev.character = who->GetName();
+        ev.request = command;
+
+        // The refusal literals go straight into the UPDATE, so none may carry a
+        // quote character - the rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = HearthJson(ev, "refused", reason);
+            return reason;
+        };
+
+        HearthRequest const request = ParseHearthRequest(command);
+        if (request.verb == HearthVerb::None)
+        {
+            // The parser's exact words are pinned in tests/test_hearth.cpp and
+            // go into the JSON. `detail` has to outlive this call, so the
+            // column gets the literal the retry table keys on.
+            out = HearthJson(ev, "refused", request.error.c_str());
+            return "malformed hearth request";
+        }
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("character has no session");
+        if (!who->IsInWorld())
+            return refuse("character is not in the world");
+
+        // THE REFUSAL THAT IS ABOUT THE TELEPORT AND NOT THE CAST. Without a
+        // bot AI there is nothing in the world to answer MSG_MOVE_WORLDPORT_ACK
+        // and a cross-map hearth would wedge the character mid-crossing.
+        if (!GET_PLAYERBOT_AI(who))
+            return refuse("character has no bot AI to acknowledge the teleport");
+
+        // HandleUseItemOpcode's first branch, and the only one in it that
+        // returns with no feedback of any kind (SpellHandler.cpp:64). Asked
+        // here so a mind-controlled character gets a reason instead of a
+        // fifteen second wait and a `stayed`.
+        if (who->m_mover != who)
+            return refuse("character is not its own mover");
+
+        // Player::CanUseItem returns EQUIP_ERR_YOU_ARE_DEAD before anything
+        // else, and a released ghost is not alive either, so this one literal
+        // covers both (PlayerStorage.cpp:2326).
+        if (!who->IsAlive())
+            return refuse("character is dead");
+
+        // Spell::EffectTeleportUnits returns without doing anything when the
+        // target IsInFlight (SpellEffects.cpp:1186): the cast would run, the
+        // cooldown would be spent, and nothing would move.
+        if (who->IsInFlight())
+            return refuse("character is in flight");
+
+        // The handler refuses an on-use item in combat when its spell carries
+        // SPELL_ATTR0_NOT_IN_COMBAT_ONLY_PEACEFUL, which the hearthstone does
+        // (SpellHandler.cpp:167-180). Named here rather than left to a silent
+        // SendEquipError that a bot's session drops.
+        if (who->IsInCombat())
+            return refuse("character is in combat");
+
+        if (who->InArena())
+            return refuse("character is in an arena");
+
+        // Spell::update cancels a cast with SPELL_INTERRUPT_FLAG_MOVEMENT on
+        // the next tick that finds the caster moving (Spell.cpp:4410), and
+        // Spell::prepare refuses one outright (Spell.cpp:3560). This executor
+        // does NOT stop the character to get around that; see the note above.
+        if (who->isMoving())
+            return refuse("character is moving");
+
+        if (who->IsNonMeleeSpellCast(false))
+            return refuse("character is already casting");
+
+        if (who->GetTransport())
+            return refuse("character is on a transport");
+
+        Item* stone = who->GetItemByEntry(HEARTHSTONE_ITEM_ENTRY);
+        if (!stone)
+            return refuse("character carries no hearthstone");
+        ev.itemEntry = stone->GetEntry();
+
+        ItemTemplate const* proto = stone->GetTemplate();
+        if (!proto)
+            return refuse("the hearthstone has no template");
+
+        // THE SPELL COMES OFF THE ITEM. Player::CastItemUseSpell casts whatever
+        // proto->Spells[] carries with ITEM_SPELLTRIGGER_ON_USE, so reading the
+        // same field is the only way this module is asking for the same spell
+        // the core is going to run.
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        {
+            if (proto->Spells[i].SpellId > 0
+                && proto->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
+            {
+                ev.spellId = static_cast<uint32>(proto->Spells[i].SpellId);
+                break;
+            }
+        }
+        if (!ev.spellId)
+            return refuse("the hearthstone has no on-use spell");
+
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(ev.spellId);
+        if (!spell)
+            return refuse("the core does not know that spell");
+
+        // Two independent gates in the core answer this with
+        // SPELL_FAILED_NOT_READY, and both of them report it to a client
+        // (Player.cpp:7635 and Spell.cpp:5688). Asked here so the row says
+        // `later` instead of `stayed`.
+        if (who->HasSpellCooldown(ev.spellId))
+            return refuse("hearthstone is on cooldown");
+
+        ev.home = ReadHomeBind(who);
+        ev.from = ReadStandingPlace(who);
+
+        // NOWHERE TO GO. Refused before the packet because no reading taken
+        // afterwards could tell an arrival from a failure, and because finding
+        // that out would spend an hour of cooldown to travel zero yards.
+        if (HearthWouldMoveNobody(ev.from, ev.home, HEARTH_ARRIVED_YARDS))
+            return refuse("home is where the character already stands");
+
+        ev.castMs = spell->CalcCastTime(who);
+        ev.windowMs = HearthVerifyWindowMs(ev.castMs, HEARTH_MARGIN_MS, HEARTH_FLOOR_MS);
+
+        // ---- drive the core's own handler ------------------------------------
+        //
+        // CMSG_USE_ITEM is bagIndex, slot, castCount, spellId, item guid,
+        // glyphIndex, castFlags, and then a target block
+        // (SpellHandler.cpp:73). Like the binder, areatrigger and repair
+        // handlers and unlike the sell and bank ones, it takes a raw
+        // WorldPacket, so there is no Read() to call - only the rpos(0) rewind,
+        // because the handler reads with >> from a packet this side has just
+        // written to.
+        //
+        // TARGET_FLAG_NONE ends the packet: SpellCastTargets::Read returns the
+        // moment it sees it (Spell.cpp:130), and a hearthstone targets nothing.
+        // The glyph index must stay under MAX_GLYPH_SLOT_INDEX or the handler
+        // refuses the whole thing as a missing item.
+        {
+            WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
+            raw << uint8(stone->GetBagSlot());
+            raw << uint8(stone->GetSlot());
+            raw << uint8(1);  // castCount
+            raw << uint32(ev.spellId);
+            raw << stone->GetGUID();
+            raw << uint32(0);  // glyphIndex
+            raw << uint8(0);   // castFlags; 0 keeps HandleClientCastFlags a no-op
+            raw << uint32(TARGET_FLAG_NONE);
+            raw.rpos(0);
+            session->HandleUseItemOpcode(raw);
+        }
+
+        // ---- believe nothing, and do not judge yet ---------------------------
+        //
+        // EVIDENCE, NOT A VERDICT. A cast in progress here is a good sign and
+        // not a success, and its absence is not a failure either: the handler
+        // may have parked the packet on Player::SpellQueue to replay on a later
+        // tick when the global cooldown clears (SpellHandler.cpp:109), which is
+        // indistinguishable from here and ends in the same place. So this is
+        // recorded and the verdict still comes from where the character is when
+        // the window is up.
+        ev.castingAfterCall = who->IsNonMeleeSpellCast(false) ? 1 : 0;
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is using its hearthstone ({}, spell {}) - a {}ms cast for "
+                 "map {}; judging in {}ms, not now",
+                 ev.character, ev.itemEntry, ev.spellId, ev.castMs, ev.home.mapId,
+                 ev.windowMs);
+
+        HearthCheck check;
+        check.id = id;
+        check.targetName = who->GetName();
+        check.ev = ev;
+        parked.push_back(check);
+
+        // THE ONE HONEST STATUS FOR A CAST THAT HAS NOT FINISHED. Not
+        // 'delivered', which would be the exact claim AGENTS.md warns about,
+        // and not 'applied', which nothing has earned yet. The result written
+        // now says what is in flight and how long it will be, so a row read
+        // mid-cast is readable rather than mysterious, and ResolveHearthChecks
+        // overwrites it with the verdict.
+        status = "verifying";
+        ev.verdict = HearthOutcome::Unreadable;
+        out = HearthJson(ev, "casting", "");
+        return "";
+    }
+
+    // WHERE A HEARTH IS ACTUALLY ANSWERED. Runs from the same poll as
+    // ResolveStrategyChecks and for the same reason: the thing being judged
+    // happens on the world's clock, not on the queue's.
+    void ResolveHearthChecks(uint32 elapsedMs)
+    {
+        using OverseerDecisions::HearthOutcome;
+        using OverseerDecisions::HearthOutcomeWord;
+        using OverseerDecisions::HearthReadBack;
+
+        std::vector<HearthCheck> stillCasting;
+        stillCasting.reserve(_pendingHearths.size());
+
+        for (HearthCheck& check : _pendingHearths)
+        {
+            check.ev.waitedMs += elapsedMs;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
+            if (!bot)
+            {
+                // A character that logged out mid-cast is a perfectly good
+                // explanation, and an explanation is the thing that would
+                // otherwise be missing. Said out loud rather than dropped.
+                LOG_WARN("module.overseer",
+                         "overseer: hearth {} for '{}' cannot be judged - the character is no "
+                         "longer in the world",
+                         check.id, check.targetName);
+                check.ev.verdict = HearthOutcome::Unreadable;
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    "left the world before the hearth could be read back",
+                    EscLong(HearthJson(check.ev, "unreadable",
+                                       "left the world before the hearth could be read back")),
+                    check.id, g_runToken);
+                continue;
+            }
+
+            // NOT JUDGED WHILE IT IS STILL WORKING. A cast still in progress is
+            // the one reading that means "ask again", and answering `stayed`
+            // about a character that is standing there casting is precisely the
+            // wrong answer. The window is the backstop rather than the rule, so
+            // a hearth interrupted at second nine is still judged at second
+            // fifteen instead of waiting forever.
+            if (check.ev.waitedMs < check.ev.windowMs)
+            {
+                stillCasting.push_back(check);
+                continue;
+            }
+
+            // STILL ARRIVING IS NOT STILL STANDING THERE. The window is up,
+            // but a far teleport that has not been acknowledged yet would read
+            // back at the position the character is leaving. Given more time,
+            // up to a ceiling, so a teleport that never completes still ends as
+            // a real answer rather than waiting for ever.
+            check.ev.teleportWasStillInFlight = bot->IsBeingTeleported() ? 1 : 0;
+            if (check.ev.teleportWasStillInFlight == 1
+                && check.ev.waitedMs < check.ev.windowMs + HEARTH_SETTLE_CEILING_MS)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: hearth {} for '{}' is past its {}ms window but the teleport "
+                         "has not landed yet; waiting rather than calling it a failure",
+                         check.id, check.targetName, check.ev.windowMs);
+                stillCasting.push_back(check);
+                continue;
+            }
+
+            check.ev.now = ReadStandingPlace(bot);
+            check.ev.cooldownAtVerdict =
+                check.ev.spellId && bot->HasSpellCooldown(check.ev.spellId) ? 1 : 0;
+            check.ev.verdict = HearthReadBack(check.ev.from, check.ev.home, check.ev.now,
+                                              HEARTH_ARRIVED_YARDS, HEARTH_MOVED_YARDS);
+
+            char const* status = "error";
+            char const* detail = "";
+            char const* outcome = HearthOutcomeWord(check.ev.verdict);
+
+            switch (check.ev.verdict)
+            {
+                case HearthOutcome::Arrived:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: hearth {} - '{}' went home: map {} to map {}, read back "
+                             "after {}ms",
+                             check.id, check.targetName, check.ev.from.mapId,
+                             check.ev.now.mapId, check.ev.waitedMs);
+                    break;
+
+                case HearthOutcome::Stayed:
+                    // THE ROW THIS WHOLE VERB EXISTS TO STOP REPORTING AS A
+                    // SUCCESS. WARN and not INFO, for the reason
+                    // ResolveStrategyChecks gives: INFO is where the absence of
+                    // this line was invisible the first time.
+                    status = "unchanged";
+                    detail = "the cast went out and the character never left";
+                    LOG_WARN("module.overseer",
+                             "overseer: hearth {} - '{}' NEVER LEFT: still on map {} after "
+                             "{}ms, and its hearthstone cooldown reads {}; see "
+                             "overseer_command.result",
+                             check.id, check.targetName, check.ev.now.mapId,
+                             check.ev.waitedMs,
+                             check.ev.cooldownAtVerdict == 1 ? "set" : "clear");
+                    break;
+
+                case HearthOutcome::Elsewhere:
+                    detail = "the character moved, and not to its home";
+                    LOG_WARN("module.overseer",
+                             "overseer: hearth {} - '{}' ended up on map {} and its home is map "
+                             "{}; something other than the hearthstone moved it",
+                             check.id, check.targetName, check.ev.now.mapId,
+                             check.ev.home.mapId);
+                    break;
+
+                case HearthOutcome::Unreadable:
+                    detail = "the hearth could not be read back";
+                    LOG_WARN("module.overseer",
+                             "overseer: hearth {} - '{}' cannot be judged; see "
+                             "overseer_command.result for the three readings",
+                             check.id, check.targetName);
+                    break;
+            }
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(HearthJson(check.ev, outcome, detail)), check.id,
+                g_runToken);
+        }
+
+        _pendingHearths.swap(stillCasting);
     }
 
 
