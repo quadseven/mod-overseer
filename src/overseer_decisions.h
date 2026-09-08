@@ -6080,6 +6080,34 @@ struct RouteLegLimits
     float lookaheadYards{250.f};
     // Near enough to the last point to call the route walked.
     float arrivedYards{12.f};
+    // HOW MANY POINTS AHEAD THE AIM MAY BE, and zero means "as many as the
+    // lookahead allows", which is what every caller had before this existed and
+    // is still what a SURVEYED route wants (#344).
+    //
+    // THE TWO KINDS OF ROUTE WANT OPPOSITE THINGS HERE, which is why this is a
+    // number and not a constant. A surveyed leg is a point list about five
+    // yards apart - 162 of them for one 1029 yard leg - laid along a road that
+    // is broadly straight, so aiming at the furthest point inside 250 yards is
+    // aiming fifty points down a road and is exactly the corner-cutting that
+    // makes the stepper efficient. A MEASURED corridor is the opposite: its
+    // points stand a hundred and ninety yards apart and each one is written
+    // down BECAUSE the straight line past it does not work. Aiming past one is
+    // the mistake the corridor exists to prevent.
+    //
+    // AND ON ONE MEASURED WALK IT IS NOT A PREFERENCE BUT THE WHOLE DEFECT. The
+    // descent into the ravine at the Wailing Caverns door is 465 yards of
+    // walking that covers 172 yards of straight line: it leaves the terrace
+    // EAST, loops south, and comes back WEST along the ravine floor. Every
+    // polygon of it is within 220 yards of where it starts, so the entire
+    // switchback fits inside one lookahead, and the existing rule aims at the
+    // last point of it - straight across the ravine. That aim is 465 yards of
+    // navmesh, which is over the 296 yards PathGenerator will smooth
+    // (MAX_POINT_PATH_LENGTH 74 at SMOOTH_PATH_STEP_SIZE 4.0 under
+    // MOD_PLAYERBOTS), so it comes back PATHFIND_SHORT as a two point shortcut,
+    // NavmeshRoutes refuses it, and the party stands on the rim until the run
+    // is closed. One point at a time, every leg is about 91 yards of navmesh
+    // and every one of them answers.
+    std::uint32_t maxPointsAhead{0};
 };
 
 // WHICH POINT TO AIM AT THIS POLL, AND THE TWO RULES THAT ARE THE WHOLE OF IT.
@@ -6162,6 +6190,45 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
 // unchanged and for the same cost. Nor does it invent a general planner that
 // leaves the survey graph, which would need a walkability oracle at runtime -
 // exactly the thing #242 declined to invent, and for the same reason.
+//
+// ------------------------------- AND A CORRIDOR HAS TO REACH THE END (#344) --
+//
+// THE FIRST VERSION OF THIS RULE STOPPED AT THE TOP OF THE RAVINE, and the
+// party stood there. It got the leader across the Barrens alive, which is what
+// it was written for, and then two rules that are each right on their own threw
+// away the part that gets DOWN:
+//
+//   * THE MINIMUM ROUTE LENGTH. RouteLeg drops a route once the character is
+//     within TRAVEL_ROUTE_MIN_YARDS of its aim, because under that distance the
+//     navmesh can answer and a survey adds nothing. The descent is 172 yards of
+//     straight line. Every point of it was inside the circle, so the route was
+//     dropped at the terrace and the staging point was handed over as a
+//     bearing. A short leg is not a pointless leg when it is a descent, and the
+//     minimum is now asked of the SURVEYED planner rather than of the layer.
+//
+//   * THE LOOKAHEAD. RouteLegStep aims at the furthest point inside 250 yards,
+//     which is right for a surveyed leg whose points are five yards apart and
+//     wrong for this one: the descent's whole switchback lies within 220 yards
+//     of its own start, so the aim jumped straight across the ravine. See
+//     RouteLegLimits::maxPointsAhead.
+//
+// WHAT THE GROUND ACTUALLY SAYS, because "the footing check refuses every
+// bearing there" had to be answered rather than argued with. The way down is
+// real and it is not a bearing: 465 yards of walking to cover 172 of straight
+// line, leaving the terrace EAST, looping south, and returning WEST along the
+// ravine floor. Judged against this module's own approach rule at every one of
+// the 82 polygons of that walk, not one reads Overhead. The tightest stands 379
+// yards along, 63 yards out and 17.8 up where the rule allows 21.0: 3.2 yards
+// of margin, 15 per cent of the allowance. So the ramp passes, and it passes
+// narrowly, and a leader who wanders off it is correctly refused.
+//
+// AND THE REASON A BEARING NEVER FOUND IT IS A BUDGET, not a gradient.
+// PathGenerator smooths at most MAX_POINT_PATH_LENGTH (74 under MOD_PLAYERBOTS)
+// points at SMOOTH_PATH_STEP_SIZE (4.0), which is 296 yards; past that it
+// answers BuildShortcut() with PATHFIND_SHORT, a two point line through the
+// wall, which NavmeshRoutes already refuses. The descent is 465 yards. Split
+// into legs of about 91, every one of them answers. That budget is why a
+// measured descent needs POINTS rather than one aim at the bottom of it.
 
 // Why a corridor was not used. Kept apart rather than collapsed into a bool for
 // the reason RoutePlanVerdict already is: "no corridor is written for this
@@ -6175,10 +6242,16 @@ enum class StagingCorridorVerdict : std::uint8_t
     // that must cost nothing: three of the four doors in this module's own
     // portal table carry no corridor and need none.
     NoCorridor,
-    // A corridor was offered and it does not end where this walk is going, so
-    // it is somebody else's corridor. Measured ground is only ever measured
-    // ground for the walk it was measured FOR.
+    // A corridor was offered and this walk is not going anywhere ON it, so it
+    // is somebody else's corridor. Measured ground is only ever measured ground
+    // for the walk it was measured FOR.
     NotThisAim,
+    // The aim IS on the corridor, and it is behind where this character would
+    // join. A corridor is a walk in one direction; the ground it crosses was
+    // measured being walked that way, and handing back its points reversed
+    // would be claiming a second thing that was never measured. Refused, and
+    // today's routing stands.
+    AimIsBehind,
     // The corridor is real and this character is not near it. The join hop is
     // the one stretch of a corridor walk that is NOT measured ground, so it is
     // bounded rather than trusted; past the bound there is nothing honest to
@@ -6198,11 +6271,21 @@ char const* StagingCorridorVerdictName(StagingCorridorVerdict verdict);
 
 struct StagingCorridorLimits
 {
-    // HOW NEAR THE CORRIDOR'S LAST POINT MUST BE TO THE AIM. This is what binds
-    // a written-down corridor to the walk it was measured for, and it is tight
-    // on purpose: the aim for a staging walk is formatted from the very floats
-    // the corridor ends at, so the two agree exactly or somebody has changed
-    // one of them without the other.
+    // HOW NEAR A POINT OF THE CORRIDOR MUST BE TO THE AIM FOR THE CORRIDOR TO
+    // BE ABOUT THIS WALK. This is what binds a written-down corridor to the
+    // walk it was measured for, and it is tight on purpose: a staging aim is
+    // formatted from floats that are either written in the same table row or
+    // derived from two areatrigger rows, so it lands on its point exactly or
+    // somebody has changed one of them without the other.
+    //
+    // ANY POINT AND NOT ONLY THE LAST, which is what lets one written corridor
+    // serve the two legs of one approach (#344). A door with a measured descent
+    // is walked at in two aims - the top of the descent first, the staging
+    // point second - and they are the same walk with a stop in the middle. Two
+    // corridors would be two chances to disagree about where that stop is; one
+    // corridor with the stop ON it cannot disagree with itself. The route
+    // handed back still ENDS at the aim, so nothing downstream can tell the
+    // difference.
     float endsAtYards{5.f};
     // HOW FAR A CHARACTER MAY STAND FROM THE CORRIDOR AND STILL JOIN IT, and
     // this is the one number here that bounds unmeasured ground, so it is taken
@@ -6252,25 +6335,33 @@ struct StagingCorridorPlan
     // joined - the same "no reading" convention ApproachDistance already
     // returns, and a value no caller can mistake for having arrived.
     float joinYards{-1.f};
+    // Which point of the corridor the aim itself stands on, and therefore the
+    // last point of the route below. Zero and meaningless unless the verdict is
+    // Joined.
+    std::size_t endIndex{0};
     // The widest gap between two consecutive points of the whole corridor,
     // which is the number LegTooLong was decided on and is worth having in the
     // line an operator reads either way.
     float longestLegYards{0.f};
-    // The corridor from the join point onward, join point first. Empty unless
-    // the verdict is Joined, and handed straight to RouteLegStep, which is the
-    // whole point: a corridor IS a route, so it is walked by the thing that
-    // already walks routes.
+    // The corridor from the join point to the aim's point, join point first.
+    // Empty unless the verdict is Joined, and handed straight to RouteLegStep,
+    // which is the whole point: a corridor IS a route, so it is walked by the
+    // thing that already walks routes - one point at a time, because
+    // RouteLegLimits::maxPointsAhead says why.
     std::vector<RoutePoint> route;
 };
 
 // THE CORRIDOR FOR THIS WALK, IF THIS WALK HAS ONE.
 //
-// `corridor` is the written-down points in walking order, ending at the place
-// the walk is going. `aimX`/`aimY` is that place as the errand names it, and
-// the two are checked against each other rather than assumed to agree: a
-// corridor is indexed by its own destination, so it can only ever be used for
-// the walk it was measured for, and no caller has to carry a second name for
-// it.
+// `corridor` is the written-down points in walking order. `aimX`/`aimY` is the
+// place the errand is walking to, and the two are checked against each other
+// rather than assumed to agree: the aim has to STAND ON the corridor, so a
+// corridor can only ever be used for a walk it was measured for, and no caller
+// has to carry a second name for it.
+//
+// THE ROUTE RUNS FROM THE JOIN TO THE AIM AND STOPS THERE, so one written
+// corridor serves every aim along its own length. Points past the aim are not
+// handed back: they are measured ground, but they are not this walk.
 //
 // THE JOIN IS THE NEAREST POINT, AND THE ROUTE IS EVERYTHING FROM THERE ON.
 // Nearest rather than first, because a character halfway along its corridor -

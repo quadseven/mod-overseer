@@ -3501,6 +3501,13 @@ public:
         // flag it would be re-asked, and re-queried, on every poll of an errand
         // that has already been told there is nothing to find.
         bool routePlanned{false};
+        // WHETHER THAT ROUTE WAS MEASURED OR SURVEYED (#344), which decides two
+        // things RouteLeg would otherwise get wrong: whether the minimum route
+        // length may throw it away in the last yards, and whether the aim may
+        // skip past its points. Both answers are the right one for a surveyed
+        // route and the wrong one for a written-down corridor, so the fact has
+        // to travel with the route rather than be guessed from it.
+        bool routeIsMeasured{false};
         std::vector<OverseerDecisions::RoutePoint> route;
         OverseerDecisions::RouteCursor routeCursor{};
     };
@@ -11102,11 +11109,30 @@ private:
     // what it keeps doing for every journey a survey cannot improve on.
     static std::vector<OverseerDecisions::RoutePoint> PlanRoute(
         Player* bot, WorldPosition const& want, std::string const& name,
-        std::string const& target)
+        std::string const& target, bool& measured)
     {
         std::vector<OverseerDecisions::RoutePoint> route;
+        measured = false;
         if (StagingCorridorRoute(bot, want, name, target, route))
+        {
+            measured = true;
             return route;
+        }
+
+        // AND THE MINIMUM LENGTH IS THE SURVEYED PLANNER'S ALONE (#344). It used
+        // to be asked of the whole layer, one poll at a time, in RouteLeg. Its
+        // argument is sound and unchanged - under this distance the navmesh can
+        // still answer, so there is nothing a survey could add - but it is an
+        // argument about the SURVEY, and applying it to a measured corridor
+        // threw away the descent, which is 172 yards of straight line with 49
+        // of height in it and 465 yards of walking. Asked here, after the
+        // corridor and before the survey, it keeps every word of its own
+        // reasoning and stops making a claim about a route it knows nothing
+        // about.
+        if (bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
+            TRAVEL_ROUTE_MIN_YARDS)
+            return route;
+
         ReadTheSurvey();
         TravelSurvey& survey = Survey();
         if (survey.nodes.empty())
@@ -11232,21 +11258,40 @@ private:
                                   std::string const& name,
                                   std::string const& target)
     {
-        if (bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
-            TRAVEL_ROUTE_MIN_YARDS)
-            return want;
         if (!state.routePlanned)
         {
             state.routePlanned = true;
-            state.route = PlanRoute(bot, want, name, target);
+            state.route =
+                PlanRoute(bot, want, name, target, state.routeIsMeasured);
             state.routeCursor = OverseerDecisions::RouteCursor{};
         }
         if (state.route.empty())
             return want;
 
+        // A SURVEYED ROUTE IS STILL DROPPED IN THE LAST YARDS, exactly as it
+        // has been since #316 and for its own unchanged reason: its last node
+        // is routinely hundreds of yards from the aim, and the ordinary step
+        // covers that better than a spent route can. A MEASURED one is not
+        // dropped, because on the walk this rule was written for the last yards
+        // are a ravine and the points are the way down it (#344).
+        if (!state.routeIsMeasured &&
+            bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
+                TRAVEL_ROUTE_MIN_YARDS)
+        {
+            state.route.clear();
+            return want;
+        }
+
         OverseerDecisions::RouteLegLimits limits;
         limits.lookaheadYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
         limits.arrivedYards = TRAVEL_ROUTE_ARRIVED_YARDS;
+        // ONE POINT AT A TIME FOR A MEASURED CORRIDOR. See
+        // RouteLegLimits::maxPointsAhead: the descent's whole switchback fits
+        // inside one lookahead, so the ordinary rule aims across the ravine at
+        // a point 465 navmesh yards away, which comes back as a refused
+        // shortcut. A surveyed route keeps the lookahead it has always had.
+        if (state.routeIsMeasured)
+            limits.maxPointsAhead = 1;
         OverseerDecisions::RouteAim const aim = OverseerDecisions::RouteLegStep(
             state.routeCursor, state.route, bot->GetPositionX(),
             bot->GetPositionY(), limits);
@@ -15975,18 +16020,15 @@ private:
             // PlanStagingCorridor will not use a corridor that ends anywhere
             // other than the aim it is offered against.
             //
-            // AND THE LAST THREE POINTS ARE NEVER ACTUALLY AIMED AT, which is
-            // worth saying rather than leaving to be discovered. RouteLeg drops
-            // a route once the character is within TRAVEL_ROUTE_MIN_YARDS of its
-            // aim and walks straight at it, and points 9, 10 and 11 all stand
-            // inside that circle - 230, 142 and 0 yards out. They are here
-            // because the corridor has to END at the aim to be matched to it,
-            // and because a walk is not measured until it is measured to the
-            // end. That handover was measured too: from the 400 yard crossing
-            // the straight line to the terrace is 1.45x its own length on the
-            // navmesh and stays 307 yards clear of anything of the other side,
-            // which is the same ordinary last stretch every route in this
-            // module already ends with.
+            // AND THE MINIMUM ROUTE LENGTH DOES NOT APPLY TO ANY OF IT (#344).
+            // The first draft of this row said the last three points were never
+            // aimed at, because RouteLeg drops a route once the character is
+            // inside TRAVEL_ROUTE_MIN_YARDS of its aim, and left it there. That
+            // was the defect: those points ARE the descent, the rule threw away
+            // the only part that gets down the ravine, and the party stood on
+            // the rim. A short leg is not a pointless leg when it is a descent.
+            // See RouteLeg, where the minimum is now asked of the surveyed
+            // planner rather than of the whole layer.
             {"wailing", 1, 228, 43, 226, -705.0f, -2045.0f, 66.45f,
              {
                  {-1050.0f, -3664.8f,  24.36f},
@@ -16001,6 +16043,58 @@ private:
                  { -842.7f, -2229.3f,  92.12f},
                  { -847.2f, -2050.8f,  83.75f},
                  { -705.0f, -2045.0f,  66.45f},
+                 // AND THE DESCENT, WHICH IS THE HALF THE FIRST DRAFT LEFT OUT
+                 // (#344). Everything above reaches the terrace. Nothing above
+                 // gets DOWN, and the party stood on the rim until the run was
+                 // closed, which is the failure #242 named and this corridor
+                 // was written to end.
+                 //
+                 // The five points below are the same navmesh walk, resampled
+                 // to about 91 yards of walking each. The shape is #242's own
+                 // sentence in coordinates: EAST off the terrace, SOUTH down
+                 // the outside of the ravine, then WEST along y about -2186 to
+                 // the floor. 465 yards of walking to cover 172 of straight
+                 // line, which is why no bearing has ever found it.
+                 //
+                 //     leg      walk   clear   h->stage  v->stage  allowed
+                 //     11 -> 12    90     549       213     +47.7     71.0
+                 //     12 -> 13    96     474       201     +34.2     67.0
+                 //     13 -> 14    91     424       140     +35.3     46.7
+                 //     14 -> 15    91     439        75     +21.5     25.0
+                 //     15 -> 16    97     445         0       0.0      ---
+                 //
+                 // EVERY LEG IS UNDER THE 296 YARDS PathGenerator WILL SMOOTH,
+                 // and that bound is the whole reason the descent needs points
+                 // at all rather than one aim at the bottom of it.
+                 // MAX_POINT_PATH_LENGTH is 74 under MOD_PLAYERBOTS and
+                 // SMOOTH_PATH_STEP_SIZE is 4.0 (PathGenerator.h:42-46), so a
+                 // path over 296 yards is answered with BuildShortcut() and
+                 // PATHFIND_SHORT (PathGenerator.cpp:689-693) - a two point
+                 // line through the wall, which NavmeshRoutes already refuses.
+                 // The whole descent is 465. Each of these legs is about 91.
+                 //
+                 // AND NOT ONE POINT OF IT READS AS OVERHEAD. All 82 polygons
+                 // of the walk were judged against this module's own approach
+                 // rule at the staging point, and every one is Closing. The
+                 // tightest is 379 yards along, at (-674.8, -2192.3, 35.1): 63
+                 // yards out and 17.8 up, where the rule allows 21.0. That is
+                 // 3.2 yards of margin, 15 per cent of the allowance, and it is
+                 // the honest state of this ramp rather than a comfortable one.
+                 // A leader who wanders off it reads Overhead and the run is
+                 // closed, which is the correct outcome and is why the points
+                 // are here to keep him on it.
+                 { -627.4f, -2030.2f,  64.96f},
+                 { -577.5f, -2088.4f,  51.50f},
+                 { -603.8f, -2162.3f,  52.61f},
+                 { -665.2f, -2184.3f,  38.82f},
+                 // The staging point, and it is DERIVED rather than chosen:
+                 // DungeonStagingPoint stands 20 yards off areatrigger 228
+                 // along the bearing to where areatrigger 226 lands, which is
+                 // (-733.7098, -2214.9101) to four decimals. Written here so
+                 // the corridor's last point and the aim the coordinator
+                 // formats are the same place; endsAtYards is what checks that
+                 // they still are.
+                 { -733.7f, -2214.9f,  17.30f},
              }},
         };
         return portals;
