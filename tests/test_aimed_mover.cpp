@@ -136,6 +136,54 @@ void AHeldSteererAndAHeldFollowerWaitTheSameWay()
                  Facts(false, true, false, false, true), AimedMover::HeldOnPurpose);
 }
 
+// THE SECOND HOLD, AND IT IS THE ONE THAT WAS MISSING (#335). A casting verb
+// holds a character still for the length of a conjure, a hearth or a summon
+// channel, and until this fact existed the grant site could not see one: it
+// asked only about the post-revival hold, because that was the only hold this
+// module had when this decision was written. Measured on the dev realm
+// 2026-09-08, that is how 29 summons in a row were refused `summoner is moving`
+// while the sweep handed `follow` back to the summoner on every poll.
+void ACastHoldWaitsExactlyLikeARevivalHold()
+{
+    AimedMoverFacts leader = Facts(false, false, true, false, false);
+    leader.heldToCast = true;
+    CheckVerdict("a leader mid-cast", leader, AimedMover::HeldOnPurpose);
+    Check("and a cast hold does not grant", AimedMoverGrants(ReadAimedMover(leader)), false);
+
+    AimedMoverFacts follower = Facts(false, false, false, false, false);
+    follower.heldToCast = true;
+    CheckVerdict("a follower mid-cast", follower, AimedMover::HeldOnPurpose);
+
+    AimedMoverFacts cutOff = Facts(false, false, false, false, true);
+    cutOff.heldToCast = true;
+    CheckVerdict("a cut-off follower mid-cast", cutOff, AimedMover::HeldOnPurpose);
+}
+
+// EITHER HOLD ALONE IS ENOUGH, AND BOTH AT ONCE IS ONE ANSWER. A character that
+// hearths the moment it is released from a revival hold carries both, and the
+// verdict must not depend on which was asked first.
+void EitherHoldIsAHoldAndBothIsStillOne()
+{
+    AimedMoverFacts both = Facts(false, true, true, false, false);
+    both.heldToCast = true;
+    CheckVerdict("held twice", both, AimedMover::HeldOnPurpose);
+
+    AimedMoverFacts neither = Facts(false, false, true, false, false);
+    neither.heldToCast = false;
+    CheckVerdict("held by neither", neither, AimedMover::GrantToLeader);
+}
+
+// AND A CHARACTER THAT ALREADY CARRIES THE STRATEGY IS STILL NOT A DECISION,
+// even mid-cast. `carriesStrategy` is asked before either hold on purpose: the
+// caller is asking whether to HAND ONE BACK, and there is nothing to hand back
+// to a character that has it.
+void CarryingItStillOutranksACastHold()
+{
+    AimedMoverFacts walking = Facts(true, false, true, false, false);
+    walking.heldToCast = true;
+    CheckVerdict("walking and held", walking, AimedMover::Walks);
+}
+
 // AND LIFTING THE HOLD IS ALL IT TAKES. The pair matters more than either case
 // alone: it is what makes "wait" a pause rather than a refusal, so the leader
 // that was held becomes a grant on the very next poll with nothing else changed.
@@ -269,6 +317,9 @@ int main()
     ACharacterInNoPartyIsGrantedToo();
     AHeldLeaderIsNeitherGrantedNorRefused();
     AHeldSteererAndAHeldFollowerWaitTheSameWay();
+    ACastHoldWaitsExactlyLikeARevivalHold();
+    EitherHoldIsAHoldAndBothIsStillOne();
+    CarryingItStillOutranksACastHold();
     TheHoldIsAPauseAndNotARefusal();
     TheSteererIsStillGranted();
     AFollowerInFormationIsStillRefused();

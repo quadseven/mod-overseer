@@ -3694,6 +3694,8 @@ enum class AimedMover : std::uint8_t
     Walks,
     // This module is holding it still on purpose and will hand the strategy back
     // itself. Neither granted nor refused, and that difference is the point.
+    // Answered for either hold this module has: the post-revival one and, since
+    // #335, a casting verb's.
     HeldOnPurpose,
     // It leads the party, or it is in no party. Take the strategy back, on this
     // poll and on every poll for as long as the errand lasts.
@@ -3720,6 +3722,13 @@ struct AimedMoverFacts
 {
     bool carriesStrategy = false;
     bool heldAfterRevival = false;
+    // A CASTING VERB IS HOLDING IT STILL RIGHT NOW (#335). The second of this
+    // module's two holds, and it is read here for the same reason the first one
+    // is: the grant below hands back a mover, and handing one back to a
+    // character that is three seconds into a summon channel is how 29 summons
+    // in a row were refused `summoner is moving`. Both holds lift themselves,
+    // and both are asked before any role is.
+    bool heldToCast = false;
     bool leadsItsParty = false;
     bool steersItself = false;
     bool cutOffFromLeader = false;
@@ -6736,6 +6745,104 @@ constexpr char const* CastDeclined    = "the bot ai declined the cast and named 
 // one provisioning verb that works in the middle of a field, which is most of
 // why it is worth having for a family that cannot reliably walk to a town.
 TownRetry ConjureRefusalRetry(std::string const& detail);
+
+// ------------------------------- holding a character still to cast (#335) --
+//
+// THREE VERBS NEED THE SAME THING AND ONLY ONE OF THEM EVER ASKED FOR IT.
+// `conjure`, `hearth` and `summon` all cast something a movement interrupt
+// cancels, and PlayerbotAI::CastSpell refuses a moving bot before the core is
+// ever asked. #330 taught `conjure` to hold its caster still. `hearth` and
+// `summon` were left observing `Unit::isMoving` and refusing, which for
+// `summon` measured 29 refusals in three hours, every one `summoner is moving`.
+//
+// WHAT #330 STILL GOT WRONG, AND IT IS NOT THE PART THAT LOOKS WRONG. The hold
+// removes `follow`, which is right - a follower is moved by its party rather
+// than by its own drive. It is undone one poll later by this module's own
+// roster sweep, which re-adds `follow` to any character that has a master and
+// does not carry it, and grants `new rpg` to a leader that has lost it. That
+// sweep exempts exactly one thing, the post-revival hold, because that was the
+// only hold this module had when it was written. A cast hold was registered
+// nowhere, so the sweep could not see one and handed the mover straight back.
+// Two finished conjure rows say it in their own fields: `hold_took_stay` true
+// and `hold_took_follow` false going in, `stay_at_end` false and
+// `follow_at_end` true coming out, with nothing in the conjure executor having
+// touched either.
+//
+// SO THE HOLD IS TWO THINGS AND THIS IS THE FIRST. What to change is a decision
+// about three booleans and belongs here, where it can be pinned. Whether the
+// sweep may hand a mover back is the other half, and it is ReadAimedMover's
+// `heldToCast` below.
+
+// What a hold found on a character's non-combat strategy list. All three are
+// read from the live engine immediately before the hold acts, never remembered
+// from an earlier poll: this strategy set comes and goes from writers that do
+// not know a cast is in flight, which is the whole reason this decision exists.
+struct CastHoldFacts
+{
+    bool hasStay{false};    // the strategy whose action stands a bot still
+    bool hasFollow{false};  // moved by the party rather than by its own drive
+    bool hasNewRpg{false};  // the self-drive: relevance 11, outranks everything
+};
+
+// What the hold changes, and therefore exactly what the release owes back. A
+// hold that removes what it did not add, or restores what was never there, is a
+// verb quietly rewriting a strategy set an operator was holding by hand - which
+// is a thing that happened during #329's diagnosis and is why this is a record
+// rather than a fixed list of calls.
+struct CastHoldPlan
+{
+    bool addStay{false};
+    bool dropFollow{false};
+    bool dropNewRpg{false};
+};
+
+// The plan, given what is there.
+//
+// `flee` IS DELIBERATELY NOT IN THIS STRUCT AT ALL, rather than being a fourth
+// false. A fleeing character moves, so `flee` fights any hold, and removing it
+// would be a casting verb holding a character still while something kills it.
+// #330 argued this for `conjure` and nothing about `hearth` or `summon` changes
+// it. Leaving it out of the inputs is how that argument survives somebody
+// reading only this struct.
+CastHoldPlan PlanCastHold(CastHoldFacts const& facts);
+
+// Did the hold change anything at all? A hold that found the character already
+// standing with no mover on it has still taken hold - the caller has still
+// called StopMoving - but it owes nothing back, and a release that logs
+// "restored" about a strategy it never touched is the same lie in the other
+// direction.
+bool CastHoldChangedAnything(CastHoldPlan const& plan);
+
+// WHAT A CHARACTER THAT WAS ASKED TO STAND STILL IS DOING NOW.
+//
+// A hold is not instant and the row has to survive that. `Unit::StopMoving`
+// stops the spline, but the movement flags `Unit::isMoving` reads clear on a
+// later tick, and a live conjure row that started moving needed one settle poll
+// before it could cast. So every verb that holds has to be able to wait, and to
+// give up with a name rather than sitting in `verifying` for ever.
+enum class CastHoldStep : std::uint8_t
+{
+    // Standing. Go and cast.
+    Ready,
+    // Still moving, and there is budget left to wait for it to stop.
+    Settle,
+    // It never stopped. The one honest end for a hold that did not take, and a
+    // far better row than a bare count of refused casts.
+    NeverStoodStill,
+};
+
+char const* CastHoldStepWord(CastHoldStep step);
+
+struct CastHoldProgress
+{
+    bool moving{false};
+    std::uint32_t settlePolls{0};   // consecutive polls that found it moving
+    std::uint32_t settleLimit{0};   // 0 means no limit but the window
+    bool outOfTime{false};          // the verb's own window has run out
+};
+
+CastHoldStep NextCastHoldStep(CastHoldProgress const& progress);
+
 
 }  // namespace OverseerDecisions
 

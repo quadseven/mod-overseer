@@ -2948,7 +2948,7 @@ AimedMover ReadAimedMover(AimedMoverFacts const& facts)
     // outranks the roles rather than sitting beside them: a held LEADER is the
     // measured case, and granting it back would override a hold this module
     // placed three seconds earlier and still intends to lift itself.
-    if (facts.heldAfterRevival)
+    if (facts.heldAfterRevival || facts.heldToCast)
         return AimedMover::HeldOnPurpose;
     // The leader before the steerer, because the two are not exclusive and the
     // leader is the stronger claim. A leader escorted by its own dungeon run is
@@ -5945,6 +5945,64 @@ TownRetry ConjureRefusalRetry(std::string const& detail)
     // tables make: a refusal this table has never heard of is more likely a new
     // transient than a new permanent.
     return TownRetry::Later;
+}
+
+// ------------------------------- holding a character still to cast (#335) --
+
+CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
+{
+    CastHoldPlan plan;
+    // ADD `stay` ONLY IF IT IS ABSENT, so the release can tell "this hold put it
+    // there" from "an operator did, and it is not mine to take away".
+    plan.addStay = !facts.hasStay;
+    // AND REMOVE THE TWO MOVERS ONLY IF THEY ARE PRESENT, for the same reason
+    // read the other way round. `follow` is the one that matters for the case
+    // this was written for: these characters are one permanent party, and a
+    // follower is moved by the party rather than by anything of its own, so a
+    // hold that leaves `follow` on has stopped nothing.
+    plan.dropFollow = facts.hasFollow;
+    plan.dropNewRpg = facts.hasNewRpg;
+    return plan;
+}
+
+bool CastHoldChangedAnything(CastHoldPlan const& plan)
+{
+    return plan.addStay || plan.dropFollow || plan.dropNewRpg;
+}
+
+char const* CastHoldStepWord(CastHoldStep step)
+{
+    switch (step)
+    {
+        case CastHoldStep::Ready:
+            return "ready";
+        case CastHoldStep::Settle:
+            return "settle";
+        case CastHoldStep::NeverStoodStill:
+            return "never stood still";
+    }
+    return "never stood still";
+}
+
+CastHoldStep NextCastHoldStep(CastHoldProgress const& progress)
+{
+    // STANDING WINS OVER EVERY BUDGET, and it is asked first on purpose. A
+    // character that has come to a halt on the very poll its window ran out has
+    // stood still, and a row that answered `NeverStoodStill` about it would be
+    // false about the one fact it exists to report.
+    if (!progress.moving)
+        return CastHoldStep::Ready;
+    // THE WINDOW IS THE BACKSTOP AND THE POLL COUNT IS THE RULE. Both are here
+    // rather than only one, because they bound different failures: a settle
+    // limit ends a character that is being dragged somewhere on a spline the
+    // hold cannot stop, and the window ends a row whose polls stopped arriving
+    // at all. Either one alone leaves the other case holding a character still
+    // for ever, which is the worse half of this whole defect.
+    if (progress.outOfTime)
+        return CastHoldStep::NeverStoodStill;
+    if (progress.settleLimit != 0 && progress.settlePolls >= progress.settleLimit)
+        return CastHoldStep::NeverStoodStill;
+    return CastHoldStep::Settle;
 }
 
 }  // namespace OverseerDecisions

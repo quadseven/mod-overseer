@@ -4743,6 +4743,267 @@ private:
         KeepRosterFollowing(group, present);
     }
 
+    // ---------------------- one hold, for every verb that has to cast (#335) --
+    //
+    // THREE VERBS NEED A CHARACTER TO STAND STILL AND ONLY ONE EVER ASKED.
+    // `conjure`, `hearth` and `summon` all cast something a movement interrupt
+    // cancels. #330 taught `conjure` to hold its caster; `hearth` and `summon`
+    // were left reading `Unit::isMoving` and refusing, which for `summon`
+    // measured 29 refusals in three hours, every one `summoner is moving`, with
+    // three that got past it and hit `no meeting stone within reach` - a
+    // summoner drifting in and out of the stone rather than standing anywhere.
+    //
+    // AND THE ONE HOLD THERE WAS DID NOT SURVIVE ITS OWN ROW. HoldConjurerStill
+    // removed `follow` and KeepRosterFollowing, one screen below this, put it
+    // straight back: it re-adds `follow` to any character with a master that
+    // does not carry it, and it exempts exactly one thing, HeldAfterRevival,
+    // because that was the only hold this module had when it was written. A
+    // cast hold was recorded nowhere, so the sweep could not see one. Two
+    // finished conjure rows say it in their own fields - `hold_took_stay` true
+    // and `hold_took_follow` false going in, `stay_at_end` false and
+    // `follow_at_end` true coming out - with nothing in the conjure executor
+    // having touched either.
+    //
+    // SO THE HOLD IS A REGISTER AND NOT A PAIR OF CALLS. What makes a hold hold
+    // is that everything else in this module which hands a mover back asks
+    // first. There are four such places and all four now ask: the leader's
+    // `new rpg` grant, the follower's `follow` grant, the cut-off follower's
+    // `new rpg` grant, and ReadAimedMoverFor, which is the travel drive's own.
+    //
+    // ONE RECORD, IN ONE PLACE. The register is the single copy of what a hold
+    // changed; a verb holds a NAME. Two copies of that record is how a release
+    // gives back a strategy it never took, and #329 has already been bitten
+    // once by a field that teardown wrote.
+    //
+    // WORLD THREAD ONLY, unguarded, exactly like _revivalHoldUntil and
+    // _pendingChecks and for the same reason: every writer here is a poll or a
+    // command executor and both run on it.
+    struct CastHoldRecord
+    {
+        bool addedStay{false};
+        bool removedFollow{false};
+        bool removedNewRpg{false};
+        time_t until{0};
+        std::string verb;
+    };
+
+    // THE CEILING, AND IT IS THE ONE #330 ARGUED FOR. 45 seconds is how long
+    // this module will hold a character still for any cast, and it is a ceiling
+    // rather than a target: every verb releases the moment it has a verdict.
+    // What it actually bounds is the hold nobody comes back for - a `hearth` or
+    // `summon` row that placed one on its way to a refusal and ended there.
+    static constexpr uint32 CAST_HOLD_CEILING_SECONDS = 45;
+
+    static std::map<std::string, CastHoldRecord>& CastHoldsInForce()
+    {
+        static std::map<std::string, CastHoldRecord> holds;
+        return holds;
+    }
+
+    // Is this module holding this character still to cast right now? Asked by
+    // everything that hands a mover back. Past its deadline the answer is false
+    // even though the record is still there, so a sweep that has not run yet can
+    // never keep a character held one poll longer than the ceiling says.
+    static bool HeldStillToCast(std::string const& name)
+    {
+        auto const hold = CastHoldsInForce().find(name);
+        return hold != CastHoldsInForce().end() && time(nullptr) < hold->second.until;
+    }
+
+    // ASK THE CHARACTER TO STAND STILL, and re-assert if it is already held.
+    //
+    // RE-ASSERTION IS THE POINT OF CALLING THIS TWICE. A strategy set is not
+    // this module's private property and the register does not stop anything
+    // writing to it - it only stops this module's own sweeps. So a verb that
+    // waits calls this on every poll it waits, and the plan RECORDED is the
+    // first one: what the hold owes back is what it found the first time, not
+    // what it found after something else had a turn.
+    //
+    // IT DOES WHAT StayActionBase::Stay WOULD DO, which is #330's finding and
+    // still the load-bearing half. StayStrategy::getDefaultActions returns
+    // NextAction("stay", 1.0f) - a DEFAULT action at relevance 1.0, so anything
+    // that wants to move the bot outranks it and the action never runs. A
+    // strategy that is switched on and never selected is not a hold.
+    //
+    // STILL NOT A MOTION MASTER CLEAR, which is the line #308 drew and #330
+    // kept: discarding a character's movement generators would cancel a travel
+    // errand nobody asked this verb to cancel (#163).
+    //
+    // AND `flee` IS LEFT ALONE, DELIBERATELY. A fleeing character moves, so
+    // `flee` fights this hold, and removing it would be a casting verb holding a
+    // character still while something kills it. Every one of these verbs already
+    // treats combat as a wall it waits on.
+    static void HoldCharacterStill(Player* who, PlayerbotAI* botAI, std::string const& name,
+                                   char const* verb)
+    {
+        if (!who || !botAI)
+            return;
+
+        auto& holds = CastHoldsInForce();
+        auto const existing = holds.find(name);
+        bool const fresh = existing == holds.end();
+
+        OverseerDecisions::CastHoldFacts facts;
+        facts.hasStay = botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
+        facts.hasFollow = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
+        facts.hasNewRpg = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+        OverseerDecisions::CastHoldPlan const plan = OverseerDecisions::PlanCastHold(facts);
+
+        // THE CALLS ARE MADE OFF WHAT IS THERE NOW; THE DEBT IS WHAT WAS THERE
+        // FIRST. Re-asserting has to be able to take `follow` off again - that
+        // is the entire reason this function is called twice - but it must not
+        // then claim to owe a `follow` back that the character did not have when
+        // the hold started.
+        if (plan.addStay)
+            botAI->ChangeStrategy("+stay", BOT_STATE_NON_COMBAT);
+        if (plan.dropFollow)
+            botAI->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+        if (plan.dropNewRpg)
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+
+        who->StopMoving();
+        who->ClearUnitState(UNIT_STATE_CHASE);
+        who->ClearUnitState(UNIT_STATE_FOLLOW);
+
+        if (fresh)
+        {
+            CastHoldRecord record;
+            record.addedStay = plan.addStay;
+            record.removedFollow = plan.dropFollow;
+            record.removedNewRpg = plan.dropNewRpg;
+            record.until = time(nullptr) + CAST_HOLD_CEILING_SECONDS;
+            record.verb = verb ? verb : "";
+            holds[name] = record;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is held still to {} for at most {}s (stay {}, follow {}, "
+                     "new rpg {}); it walks again the moment the row ends, however it ends",
+                     name, record.verb, uint32(CAST_HOLD_CEILING_SECONDS),
+                     plan.addStay ? "added" : "already on",
+                     plan.dropFollow ? "removed" : "was off",
+                     plan.dropNewRpg ? "removed" : "was off");
+            return;
+        }
+
+        // AN EXTENDED HOLD IS STILL BOUNDED BY THE CEILING FROM WHEN IT STARTED.
+        // The deadline is not pushed out by re-assertion, or a verb that polls
+        // would hold a character for ever one poll at a time - which is the
+        // failure this ceiling exists to make impossible.
+        if (plan.dropFollow || plan.dropNewRpg)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' had a mover handed back mid-{} and it is taken off again "
+                     "(follow {}, new rpg {})",
+                     name, existing->second.verb, plan.dropFollow ? "removed" : "was off",
+                     plan.dropNewRpg ? "removed" : "was off");
+    }
+
+    // THE OTHER END, AND EVERY EXIT RUNS IT. A hold that is not released is a
+    // character this module stopped and forgot, which is a worse bug than the
+    // one this whole change is about.
+    //
+    // IT UNDOES ONLY WHAT IT DID. An earlier version of the conjure hold removed
+    // `stay` unconditionally, so a row stripped a `+stay` an operator had put on
+    // by hand while trying to help - which is what one did, during #329's own
+    // diagnosis.
+    //
+    // A MISSING CHARACTER IS SAID OUT LOUD RATHER THAN DROPPED. The strategy set
+    // of a character with no bot AI is not this module's to reason about, and a
+    // silent skip here would look exactly like a successful release.
+    static void ReleaseCastHold(std::string const& name, Player* who, char const* why)
+    {
+        auto& holds = CastHoldsInForce();
+        auto const hold = holds.find(name);
+        if (hold == holds.end())
+            return;
+        CastHoldRecord const record = hold->second;
+        holds.erase(hold);
+
+        PlayerbotAI* botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
+        if (!botAI)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' cannot be released from its {} hold ({}) - it has no bot "
+                     "AI any more; a relog rebuilds its strategies",
+                     name, record.verb, why ? why : "");
+            return;
+        }
+        if (record.addedStay)
+            botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
+        if (record.removedFollow)
+            botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+        if (record.removedNewRpg)
+            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is released from its {} hold - {} (stay {}, follow {}, "
+                 "new rpg {})",
+                 name, record.verb, why ? why : "", record.addedStay ? "removed" : "left alone",
+                 record.removedFollow ? "restored" : "not touched",
+                 record.removedNewRpg ? "restored" : "not touched");
+    }
+
+    // WHAT A ROW REPORTS ABOUT ITS HOLD, and the same four fields for all three
+    // verbs so one reader answers `summon`, `hearth` and `conjure` alike.
+    //
+    // READ OFF THE REGISTER AND NEVER WRITTEN BY TEARDOWN. #329's trap was a
+    // field the release set false with the result built afterwards, so every
+    // finished row reported the hold had not worked whatever had happened. A
+    // field written by teardown is not a measurement, and the way to make that
+    // impossible rather than merely avoided is for the release to have nothing
+    // to write to.
+    struct CastHoldReport
+    {
+        bool applied{false};
+        bool tookStay{false};
+        bool tookFollow{false};
+        bool tookNewRpg{false};
+    };
+
+    // Hold, and tell the row what the hold in force actually took. The two
+    // halves are one call because every caller wants both, and a caller that
+    // held and forgot to read would publish `hold_applied: false` about a
+    // character it had just stopped.
+    static void HoldStillAndReport(Player* who, std::string const& name, char const* verb,
+                                   CastHoldReport& report)
+    {
+        PlayerbotAI* botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
+        if (!botAI)
+            return;
+        HoldCharacterStill(who, botAI, name, verb);
+        auto const& holds = CastHoldsInForce();
+        auto const record = holds.find(name);
+        if (record == holds.end())
+            return;
+        report.applied = true;
+        report.tookStay = record->second.addedStay;
+        report.tookFollow = record->second.removedFollow;
+        report.tookNewRpg = record->second.removedNewRpg;
+    }
+
+    // THE BACKSTOP UNDER EVERY VERB'S OWN RELEASE, on its own clock.
+    //
+    // `conjure` releases on its verdict, on every give-up and on its window
+    // running out. `hearth` and `summon` release on their verdicts too - but
+    // both of them also place a hold on the way OUT of a refusal, so that the
+    // next ask finds a character standing rather than the same walking one, and
+    // a row that has already ended cannot release anything. This is what ends
+    // those, and it is a whole separate mechanism on a separate clock for the
+    // same reason KeepRosterFollowing's strategy backstop is: a hand-back that
+    // only ever happens on the path that took it is one a crash, an early
+    // `return` or a logout can skip.
+    void ReleaseExpiredCastHolds()
+    {
+        auto& holds = CastHoldsInForce();
+        if (holds.empty())
+            return;
+        time_t const now = time(nullptr);
+        std::vector<std::string> due;
+        for (auto const& hold : holds)
+            if (now >= hold.second.until)
+                due.push_back(hold.first);
+        for (std::string const& name : due)
+            ReleaseCastHold(name, ObjectAccessor::FindPlayerByName(name, false),
+                            "its hold reached the ceiling and nothing came back for it");
+    }
+
     // Give the followers somebody to follow (infra#2818).
     //
     // WHY `follow` HAS NEVER MOVED ANYBODY. It is on all five and it is not
@@ -5047,8 +5308,16 @@ private:
             // leaderAI and this whole block is skipped.
             // Unless it is held after a revival, which took `new rpg` off on
             // purpose and gives it back itself - see HoldAfterRevival.
+            //
+            // OR HELD TO CAST (#335). `new rpg` is relevance 11 and outranks
+            // everything, so handing it back to a leader three seconds into a
+            // summon channel walks it off the meeting stone mid-ritual. Measured
+            // on the dev realm 2026-09-08, the leader standing at the stone
+            // carried `stay` AND `new rpg` and drifted anyway, which is what
+            // that relevance means in practice.
             if (!leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
-                !HeldAfterRevival(leader->GetName()))
+                !HeldAfterRevival(leader->GetName()) &&
+                !HeldStillToCast(leader->GetName()))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' leads but did not carry `new rpg` - granting it, "
@@ -5170,8 +5439,16 @@ private:
             // it is not solved by removing the only cohesion this party has.
             // A character held after a revival has `follow` off ON PURPOSE -
             // see HoldAfterRevival - and gets it back when the hold ends.
+            //
+            // AND A CHARACTER HELD TO CAST IS THE OTHER EXEMPTION (#335), and
+            // this line is the one that undid #330 entirely. The conjure hold
+            // removed `follow`; this ran on the very next poll, found a follower
+            // with a master and no `follow`, and granted it back - every poll,
+            // for the whole length of the row. The hold was never wrong about
+            // what to remove. It was removing it into a sweep that could not see
+            // a hold existed.
             if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT) &&
-                !HeldAfterRevival(p->GetName()))
+                !HeldAfterRevival(p->GetName()) && !HeldStillToCast(p->GetName()))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' had a master but no follow strategy - granting "
@@ -5258,7 +5535,7 @@ private:
             // a confident log line about it is worse than no line at all.
             if (!botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 SplitFromLeader(p->GetName()) && !IsEscorted(p->GetName()) &&
-                !HeldAfterRevival(p->GetName()) &&
+                !HeldAfterRevival(p->GetName()) && !HeldStillToCast(p->GetName()) &&
                 OverseerDecisions::ReadSplitErrand(
                     _travelAims.TargetFor(p->GetName())) ==
                     OverseerDecisions::SplitErrand::Nothing)
@@ -11017,6 +11294,7 @@ private:
         OverseerDecisions::AimedMoverFacts facts;
         facts.carriesStrategy = CanBeSentToNpc(botAI);
         facts.heldAfterRevival = HeldAfterRevival(name);
+        facts.heldToCast = HeldStillToCast(name);
         facts.leadsItsParty = LeadsItsParty(bot);
         facts.steersItself = steersItself;
         facts.cutOffFromLeader = SplitFromLeader(name);
@@ -20950,6 +21228,12 @@ private:
         // single call can wait that out (#147).
         ResolveConjureChecks(sincePollMs);
 
+        // Then end any cast hold that outlived the row that placed it (#335).
+        // AFTER the four above, so a hold a resolver is about to release itself
+        // is released by the resolver with the reason its row can report, and
+        // this only ever picks up the ones nothing came back for.
+        ReleaseExpiredCastHolds();
+
         // Then collect any row a run that is no longer here is still holding,
         // because nothing below this line can ever see one.
         ExpireAbandonedClaims();
@@ -25429,112 +25713,45 @@ private:
         return false;
     }
 
-    // ASK THE CHARACTER TO STAND STILL, and #329 is why this is longer than it
-    // was.
+    // THE CONJURE END OF THE SHARED HOLD (#335).
     //
-    // WHAT #325 GOT WRONG. It added `+stay` and dropped `new rpg`, copying
-    // DriveStuckRevival's hold, and it did not touch `follow`. Read off the live
-    // engine while a conjure was failing, the mage's non-combat strategies were:
-    // bmana, buff, chat, cure, default, dps assist, duel, emote, flee, FOLLOW,
-    // food, force rebuff, gather, loot, mount, nc, pvp, quest. No `new rpg` at
-    // all, so the one thing that hold removed was not even on, and `follow` -
-    // which moves a character by the party rather than by its own drive - was
-    // untouched. StayStrategy's own action carries relevance 1.0 and is a
-    // DEFAULT action, so anything else that wants to move the bot outranks it.
-    // The module's post-revival hold has the same gap; it has never had to hold
-    // a follower whose leader was walking, because a revival stops the party.
+    // The hold itself is HoldCharacterStill, far above, and it is the same one
+    // `hearth` and `summon` use. What is left here is the row's own bookkeeping:
+    // the six fields #330 added to the JSON have to keep meaning what they said,
+    // and the register is the only place that knows what the hold actually
+    // changed.
     //
-    // WHAT IT DOES NOW. Records what was actually there, removes only what it
-    // finds, and does what StayActionBase::Stay would have done if the engine
-    // had ever selected it: StopMoving and clear the chase and follow unit
-    // states. That is not a new power - it is the exact body of the action this
-    // hold is switching on, and it is what makes the difference between asking
-    // for a hold and getting one.
-    //
-    // AND IT LEAVES `flee` ALONE, DELIBERATELY. A fleeing character moves, so
-    // `flee` will fight this hold, and removing it would be this verb holding a
-    // character still while something kills it. Combat is already a wall the
-    // loop waits on; being alive is not negotiable for a stack of bread.
-    //
-    // STILL NOT A MOTION MASTER CLEAR, which is the line kind='hearth' drew and
-    // it still holds: clearing a character's movement generators would cancel a
-    // travel errand nobody asked this verb to cancel (#163).
+    // WHAT MOVED OUT OF HERE, and it is worth naming because it is what this
+    // whole issue is: removing `follow` was always right and it was undone one
+    // poll later by KeepRosterFollowing, which could not see that a hold
+    // existed. The register is what it can see.
     static void HoldConjurerStill(Player* who, PlayerbotAI* botAI, ConjureEvidence& ev)
     {
-        if (ev.held)
+        HoldCharacterStill(who, botAI, ev.character, "conjure");
+
+        // READ THE RECORD BACK RATHER THAN ASSUMING THE PLAN. A re-assertion on
+        // a later poll must not overwrite what the FIRST one found, and the
+        // register is the side that knows which call this was.
+        auto const& holds = CastHoldsInForce();
+        auto const record = holds.find(ev.character);
+        if (record == holds.end())
             return;
         ev.held = true;
         ev.heldEver = true;
-
-        if (!botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT))
-        {
-            botAI->ChangeStrategy("+stay", BOT_STATE_NON_COMBAT);
-            ev.addedStay = true;
-        }
-        if (botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
-        {
-            botAI->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
-            ev.removedFollow = true;
-        }
-        if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
-        {
-            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
-            ev.removedNewRpg = true;
-        }
-
-        // The body of StayActionBase::Stay, which is the action the strategy
-        // above would run if it ever won a tick. Done here because a default
-        // action with relevance 1.0 loses to everything, and because a strategy
-        // that is switched on and never selected is not a hold.
-        who->StopMoving();
-        who->ClearUnitState(UNIT_STATE_CHASE);
-        who->ClearUnitState(UNIT_STATE_FOLLOW);
-
-        LOG_INFO("module.overseer",
-                 "overseer: '{}' is held still to conjure (stay {}, follow {}, new rpg {}); it "
-                 "walks again the moment the row ends, however it ends",
-                 ev.character, ev.addedStay ? "added" : "already on",
-                 ev.removedFollow ? "removed" : "was off",
-                 ev.removedNewRpg ? "removed" : "was off");
+        ev.addedStay = record->second.addedStay;
+        ev.removedFollow = record->second.removedFollow;
+        ev.removedNewRpg = record->second.removedNewRpg;
     }
 
-    // THE OTHER END, AND IT RUNS ON EVERY EXIT. A hold that is not released is a
-    // character this module stopped and forgot, which is a worse bug than the
-    // one this whole fix is about.
-    //
-    // IT UNDOES ONLY WHAT IT DID (#329). The previous version removed `stay`
-    // unconditionally, so a conjure row would strip a `+stay` an operator had
-    // put on by hand while trying to help - which is exactly what one did.
+    // Runs on every exit this row has, exactly as before. `who` may be null: a
+    // character that logged out mid-loop cannot be released on, the register
+    // entry still has to go, and ReleaseCastHold says so rather than pretending.
     static void ReleaseConjureHold(Player* who, ConjureEvidence& ev)
     {
         if (!ev.held)
             return;
         ev.held = false;
-        PlayerbotAI* botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
-        if (!botAI)
-        {
-            // Nothing to release it on. Said out loud rather than dropped,
-            // because the strategy set of a character with no AI is not this
-            // module's to reason about and a silent skip here would look
-            // exactly like a successful release.
-            LOG_WARN("module.overseer",
-                     "overseer: '{}' cannot be released from its conjure hold - it has no bot "
-                     "AI any more; a relog rebuilds its strategies",
-                     ev.character);
-            return;
-        }
-        if (ev.addedStay)
-            botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
-        if (ev.removedFollow)
-            botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
-        if (ev.removedNewRpg)
-            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
-        LOG_INFO("module.overseer",
-                 "overseer: '{}' is released from its conjure hold (stay {}, follow {}, "
-                 "new rpg {})",
-                 ev.character, ev.addedStay ? "removed" : "left alone",
-                 ev.removedFollow ? "restored" : "not touched",
-                 ev.removedNewRpg ? "restored" : "not touched");
+        ReleaseCastHold(ev.character, who, "the conjure row ended");
     }
 
     static char const* DoConjure(Player* who, std::string const& command, char const*& status,
@@ -25831,16 +26048,20 @@ private:
             {
                 ++check.movingPolls;
                 ++check.ev.settlePolls;
-                // The hold is re-asserted rather than assumed. A strategy set
-                // is not this module's private property: anything else in the
-                // module or in the bot's own engine may have changed it since,
-                // and re-adding `+stay` costs one call and closes the case
-                // where it did.
-                if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
-                {
-                    if (!botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT))
-                        botAI->ChangeStrategy("+stay", BOT_STATE_NON_COMBAT);
-                }
+                // THE WHOLE HOLD IS RE-ASSERTED, NOT HALF OF IT (#335). This
+                // branch already said it was re-asserting the hold and then
+                // re-added `+stay` alone - which is the one strategy nothing was
+                // taking away. The two that were being handed back every poll,
+                // by this module's own roster sweep, were `follow` and
+                // `new rpg`, and neither was ever re-removed. So a row could
+                // count six settle polls, log a re-assertion on every one of
+                // them, and finish with `follow_at_end: true`.
+                //
+                // Re-asserting also calls StopMoving again, which is the point:
+                // a character that was handed `follow` back between polls has
+                // been given a new spline, and taking the strategy off does not
+                // stop the one already running.
+                HoldCharacterStill(bot, GET_PLAYERBOT_AI(bot), check.targetName, "conjure");
                 stillRunning.push_back(check);
                 continue;
             }
@@ -26142,15 +26363,21 @@ private:
     //     Hearthing out of a dungeon is how a player leaves one, and copying
     //     bind's refusal across would be inventing a rule the game lacks.
     //
-    //   * IT DOES NOT STOP A WALKING CHARACTER IN ORDER TO CAST.
-    //     mod-playerbots' UseHearthStone does exactly that - StopMoving, clear
-    //     the motion master, then use - and it is the right call for an AI
-    //     deciding for itself. It is the wrong call here. Cancelling a travel
-    //     errand as a side effect of a queued command would make this verb
-    //     reach past what it was asked to do, and this module has a rule about
-    //     an errand nobody meant to clear (#163). So a moving character is
-    //     refused with `later`, and clearing the aim first is the sender's job,
-    //     which is where aiming already lives.
+    //   * IT DOES ASK A WALKING CHARACTER TO STAND STILL, AND IT STILL DOES
+    //     NOT CLEAR THE MOTION MASTER (#335). This bullet used to say the verb
+    //     did neither, and the half of that argument which was right is the
+    //     half about movement generators: mod-playerbots' UseHearthStone does
+    //     StopMoving AND clears the motion master, and discarding a character's
+    //     movement generators as a side effect of a queued command would cancel
+    //     an errand nobody meant to clear (#163). That line still holds.
+    //
+    //     The other half was wrong, and it was measured wrong: refusing a
+    //     walking character and changing nothing took fourteen consecutive asks
+    //     on one character to land a single cast. So this verb now places the
+    //     shared hold - `+stay`, `-follow`, `-new rpg`, StopMoving, clear the
+    //     chase and follow unit states, nothing else - and still refuses the
+    //     row with `later`. The hold outlives the row by its own ceiling, so
+    //     the sender's next ask arrives at a character that is standing.
     //
     //   * IT DOES REFUSE A CHARACTER WITH NO BOT AI, which is not a taste
     //     decision. A cross-map teleport waits on MSG_MOVE_WORLDPORT_ACK, a
@@ -26242,6 +26469,12 @@ private:
         int32 castingAfterCall{-1};   // -1 never asked, 0 no, 1 yes
         int32 cooldownAtVerdict{-1};  // -1 never asked, 0 ready, 1 on cooldown
         int32 teleportWasStillInFlight{-1};  // -1 never asked, 0 no, 1 yes
+        // WHAT THE HOLD TOOK, IF THIS ROW PLACED ONE (#335). A hearth that finds
+        // its character walking now asks it to stop on the way out, so the next
+        // ask has something to work with; before this the verb only ever
+        // observed, and it measured fourteen consecutive asks on one character
+        // to land a single cast.
+        CastHoldReport hold;
         OverseerDecisions::HomeBind home;
         OverseerDecisions::HomeBind from;
         OverseerDecisions::HomeBind now;
@@ -26319,6 +26552,10 @@ private:
             o << "null";
         else
             o << (ev.teleportWasStillInFlight ? "true" : "false");
+        o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
+          << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
+          << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false");
         o << ",\"home\":";
         HearthPlace(o, ev.home);
         o << ",\"from\":";
@@ -26404,10 +26641,28 @@ private:
 
         // Spell::update cancels a cast with SPELL_INTERRUPT_FLAG_MOVEMENT on
         // the next tick that finds the caster moving (Spell.cpp:4410), and
-        // Spell::prepare refuses one outright (Spell.cpp:3560). This executor
-        // does NOT stop the character to get around that; see the note above.
+        // Spell::prepare refuses one outright (Spell.cpp:3560).
+        //
+        // AND THIS EXECUTOR NOW DOES SOMETHING ABOUT IT (#335). It used to say
+        // out loud that it did not stop the character, on the grounds that
+        // stopping one was a power a hearth should not take. What that cost,
+        // measured by hand: fourteen consecutive asks on one character to land a
+        // single cast, because nothing between them ever changed and the
+        // fifteenth only worked when the character happened to stop by itself.
+        //
+        // THE ROW STILL REFUSES, AND THAT IS DELIBERATE. It does not grow a
+        // settle loop of its own. #230 is the rule it is keeping: a row that
+        // recycles in place holds the head of a FIFO against everything behind
+        // it, so a verb carries its retry class out and the SENDER re-asks with
+        // a fresh row at the tail. What changes here is that the re-ask now
+        // arrives at a character that is standing, because the hold outlives
+        // this row by its own ceiling and this module's roster sweep will not
+        // undo it.
         if (who->isMoving())
+        {
+            HoldStillAndReport(who, ev.character, "hearth", ev.hold);
             return refuse("character is moving");
+        }
 
         if (who->IsNonMeleeSpellCast(false))
             return refuse("character is already casting");
@@ -26572,6 +26827,12 @@ private:
                          "longer in the world and is not crossing one",
                          check.id, check.targetName);
                 check.ev.verdict = HearthOutcome::Unreadable;
+                // The register entry goes even though there is nobody to
+                // release it on: a relog rebuilds a character's strategies, and
+                // a record left standing would keep this module's own sweeps off
+                // a character that is no longer being held by anything (#335).
+                ReleaseCastHold(check.targetName, bot,
+                                "the character left the world mid-hearth");
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
@@ -26615,6 +26876,12 @@ private:
                 check.ev.spellId && bot->HasSpellCooldown(check.ev.spellId) ? 1 : 0;
             check.ev.verdict = HearthReadBack(check.ev.from, check.ev.home, check.ev.now,
                                               HEARTH_ARRIVED_YARDS, HEARTH_MOVED_YARDS);
+
+            // The hold this row may have placed comes off before the verdict
+            // is written, so a character that hearthed does not stand at its
+            // destination waiting out a ceiling (#335). A no-op for the rows
+            // that never placed one, which is most of them.
+            ReleaseCastHold(check.targetName, bot, "the hearth row ended");
 
             char const* status = "error";
             char const* detail = "";
@@ -26833,6 +27100,15 @@ private:
         // about is the kind of confident nonsense this verb's whole result
         // column exists to avoid.
         bool flightRead{false};
+        // WHAT THE HOLD TOOK, ON BOTH CHARACTERS THE RITUAL NEEDS (#335). A
+        // summoning stone needs a second clicker, and a drifting helper fails
+        // the ritual exactly as surely as a drifting summoner: the helper's
+        // click starts a channelled anim spell, and CheckRitualList runs again
+        // when the ritual settles and erases any participant that stopped
+        // channelling. So there are two of these and not one.
+        CastHoldReport hold;
+        CastHoldReport helperHold;
+        std::string heldHelper;  // who the helper hold was placed on, if anyone
         OverseerDecisions::TeleportFlight flight{OverseerDecisions::TeleportFlight::Landed};
         OverseerDecisions::HomeBind at;    // the summon point: where the summoner stood
         OverseerDecisions::HomeBind from;  // where the summoned character stood
@@ -26927,6 +27203,16 @@ private:
             o << "null";
         else
             o << (ev.inCombatAtVerdict ? "true" : "false");
+        o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
+          << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
+          << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
+          << ",\"held_helper\":" << J(ev.heldHelper)
+          << ",\"helper_hold_applied\":" << (ev.helperHold.applied ? "true" : "false")
+          << ",\"helper_hold_took_stay\":" << (ev.helperHold.tookStay ? "true" : "false")
+          << ",\"helper_hold_took_follow\":" << (ev.helperHold.tookFollow ? "true" : "false")
+          << ",\"helper_hold_took_new_rpg\":"
+          << (ev.helperHold.tookNewRpg ? "true" : "false");
         o << ",\"at\":";
         SummonPlace(o, ev.at);
         o << ",\"from\":";
@@ -27057,6 +27343,88 @@ private:
         session->HandleSummonResponseOpcode(raw);
     }
 
+    // THE OTHER END OF HoldSummonRitualStill, and it lets go of both.
+    //
+    // The clicker a finished row actually used and the one an earlier refused
+    // row held are not always the same character, so both names are asked for
+    // and a name nothing is holding costs one lookup that finds nothing. The
+    // summoned character is never held: it is somewhere else entirely, which is
+    // the whole reason the verb exists.
+    static void ReleaseSummonRitualHold(SummonEvidence const& ev, std::string const& summoner,
+                                        char const* why)
+    {
+        for (std::string const& name : {summoner, ev.helper, ev.heldHelper})
+        {
+            if (name.empty())
+                continue;
+            ReleaseCastHold(name, ObjectAccessor::FindPlayerByName(name, false), why);
+        }
+    }
+
+    // HOLD THE WHOLE RITUAL, AND THAT IS WHY THIS EXISTS AT ALL (#335).
+    //
+    // A summon is the one verb here that needs TWO characters standing still at
+    // the same time for the same five seconds. Holding the summoner alone buys
+    // nothing: the portal settles, CheckRitualList runs again, the helper that
+    // walked off is erased from the participant list, and the count drops back
+    // below the one the ritual needs. Measured on the dev realm 2026-09-08, the
+    // two characters at the stone were 8 and 39 yards from it, so BOTH of them
+    // were moving and neither was being asked to stop.
+    //
+    // THE HELPER IS CHOSEN THE SAME WAY THE RITUAL WOULD CHOOSE IT, minus the
+    // filters that movement itself causes: the named one if the sender named
+    // one, otherwise the first party member standing close enough to be picked.
+    // Skipping a moving candidate here - which the ritual's own scan does, and
+    // correctly - would mean the one refusal that movement caused held nobody
+    // and the next ask found the same walking party.
+    //
+    // A CHARACTER HELD IN VAIN COSTS 45 SECONDS OF STANDING BESIDE A MEETING
+    // STONE ITS PARTY IS TRYING TO USE, and buys the ritual a clicker that is
+    // standing when the next ask arrives. That is the trade, and it is only
+    // ever made on the way out of a refusal that movement caused.
+    static void HoldSummonRitualStill(Player* who, std::string const& targetArg,
+                                      std::string const& summonedName, SummonEvidence& ev)
+    {
+        if (!who)
+            return;
+        HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
+
+        if (!targetArg.empty())
+        {
+            Player* named = ObjectAccessor::FindPlayerByName(targetArg, false);
+            if (named && named != who && named->IsInWorld())
+            {
+                HoldStillAndReport(named, named->GetName(), "summon", ev.helperHold);
+                if (ev.helperHold.applied)
+                    ev.heldHelper = named->GetName();
+            }
+            return;
+        }
+
+        Group* group = who->GetGroup();
+        if (!group)
+            return;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == who || member->GetName() == summonedName)
+                continue;
+            if (!member->GetSession() || !member->IsInWorld() || !member->IsAlive())
+                continue;
+            // Combat is left alone on purpose, here as everywhere else in this
+            // hold: a character held still through a fight is a character
+            // killed by the hold.
+            if (member->IsInCombat() || member->IsBeingTeleported())
+                continue;
+            if (!member->IsWithinDistInMap(who, INTERACTION_DISTANCE))
+                continue;
+            HoldStillAndReport(member, member->GetName(), "summon", ev.helperHold);
+            if (ev.helperHold.applied)
+                ev.heldHelper = member->GetName();
+            return;
+        }
+    }
+
     static char const* DoSummon(Player* who, std::string const& command,
                                 std::string const& targetArg, char const*& status,
                                 std::string& out, std::vector<SummonCheck>& parked, uint32 id)
@@ -27123,8 +27491,20 @@ private:
         // Spell::update cancels a channel with a movement interrupt flag on the
         // next tick that finds the caster moving, and a character already
         // casting cannot start this one.
+        //
+        // AND THE ROW NOW STOPS THE RITUAL RATHER THAN ONLY NAMING IT (#335).
+        // This refusal fired 29 times in three hours and changed nothing each
+        // time, because the summoner is a follower dragged behind a leader that
+        // `new rpg` was walking around. Both are held here, so the sender's next
+        // ask arrives at a stone with two characters standing at it. The row
+        // still refuses with `later` rather than growing a settle loop of its
+        // own - see the hearth's note for the #230 argument that keeps a retry
+        // off the head of the queue.
         if (who->isMoving())
+        {
+            HoldSummonRitualStill(who, targetArg, request.who, ev);
             return refuse("summoner is moving");
+        }
         if (who->IsNonMeleeSpellCast(false))
             return refuse("summoner is already casting");
         if (who->GetTransport())
@@ -27269,7 +27649,16 @@ private:
             // after everything looked fine. Refused for the same reason, and
             // with the same words, as a summoner that is moving.
             if (helper->isMoving())
+            {
+                // BOTH, NOT JUST THE ONE THAT MOVED. The summoner passed its own
+                // movement check on this poll and may be walking again by the
+                // next ask; a ritual with one held character is a ritual that
+                // still fails (#335).
+                HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
+                HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
+                ev.heldHelper = helper->GetName();
                 return refuse("the second clicker is moving");
+            }
             if (helper->IsNonMeleeSpellCast(false))
                 return refuse("the second clicker is already casting");
         }
@@ -27294,7 +27683,18 @@ private:
             }
         }
         if (!helper)
+        {
+            // THE SCAN ABOVE SKIPS A MOVING CANDIDATE, AND IT IS RIGHT TO -
+            // it cannot click. But that turns "everybody at the stone is
+            // walking" into a refusal about PLACE, which SummonRefusalRetry
+            // classes `elsewhere` and which tells the sender to go and stand
+            // somewhere else. Movement is the actual wall, and it is one this
+            // module can take down: hold whoever is standing near enough to be
+            // chosen next time, and the same literal then means what it says
+            // (#335).
+            HoldSummonRitualStill(who, targetArg, request.who, ev);
             return refuse("no second party member is at the stone");
+        }
         ev.helper = helper->GetName();
 
         // ---- drive the core's own handlers -----------------------------------
@@ -27433,6 +27833,8 @@ private:
                          "longer in the world and is not crossing",
                          check.id, check.summonedName);
                 check.ev.verdict = SummonOutcome::Unreadable;
+                ReleaseSummonRitualHold(check.ev, check.summonerName,
+                                        "the character to summon left the world mid-summon");
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
@@ -27606,6 +28008,11 @@ private:
                              check.ev.from.known, check.ev.at.known, check.ev.now.known);
                     break;
             }
+
+            // Both ends of the ritual walk again, before the verdict is
+            // written and after every reading that goes into it has been taken
+            // (#335). A no-op for the rows that never held anybody.
+            ReleaseSummonRitualHold(check.ev, check.summonerName, "the summon row ended");
 
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
