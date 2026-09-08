@@ -1336,6 +1336,57 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
                                       ApproachLimits const& limits);
 
+// SHOULD THIS MEMBER BE HELD WHERE IT STANDS UNTIL THE BARRIER OPENS (#346)?
+//
+// WHAT ARRIVING AT A STAGING POINT ACTUALLY DOES TODAY. Nothing in this module
+// releases an escorted member's errand when it arrives - that was fixed, and
+// the branch that does it says so. Upstream ends the walk anyway: patch 0012's
+// arrived place-aim calls ChangeToIdle, and NewRpgStatusUpdateAction turns
+// RPG_IDLE into a randomly chosen status on the bot's next AI tick, two of the
+// eight of which walk the character somewhere of its own choosing. So the only
+// thing holding a party on a doorstep is the coordinator re-issuing the walk
+// every five seconds, and what that produces is not a party standing still. It
+// is a party orbiting. Measured on the dev realm 2026-09-08, four members
+// sampled every fifty seconds while their barrier waited:
+//
+//     42, 47, 44, 45 -> 142, 142, 139, 139 -> 173, 171, 175, 178 -> 103, 100,
+//     102, 104 -> 214, 215, 215, 214 -> 99, 95, 100, 100 -> 90, 89, 92, 91
+//
+// All four move together, which is correct - they follow the leader and the
+// leader is the one wandering - and none of them ever settles. Three runs in a
+// row spent their whole twelve-minute staging window that way.
+//
+// SO ARRIVING HAS TO STOP BEING A WALK THAT KEEPS BEING RE-ISSUED AND START
+// BEING A HOLD. The caller has a hold register already (two reasons live in it
+// as of #335) and this is the predicate that says when to put a member into it.
+//
+// IT IS DELIBERATELY THE BARRIER'S OWN READING OF THE SAME MEMBER, NARROWED.
+// Every member this returns true for is one DungeonRunBarrierMet is no longer
+// waiting on, and that is the invariant worth having: a hold that could fire
+// for a member the barrier still wants moving would be this module stopping a
+// character on its way somewhere it is needed. The converse is not true, and
+// the one member it is false for is the whole reason this is a separate
+// function rather than a reuse:
+//
+//   AN `inside` MEMBER SATISFIES THE BARRIER AND IS NEVER HELD. It is through
+//   the door, on another map, and past the point entirely. Holding it would
+//   mean this module pinning a character inside an instance to make a barrier
+//   outside that instance open faster, which is not a trade anything here is
+//   allowed to make.
+//
+//   AND IN COMBAT IS NEVER HELD EITHER, which is the same line #335 drew when
+//   it left `flee` alone. A character held still in a fight is a character
+//   killed by the hold. The barrier already refuses to open for a member in
+//   combat, so nothing is lost by declining to hold one - and because the
+//   caller re-asks this every poll, a held member that is pulled into a fight
+//   stops being wanted and gets its movement back on the next one.
+//
+// UNMEASURED FAILS TO false, like every other reading in this file: a member
+// this poll could not place is a member nothing should be pinning to a spot it
+// has not confirmed the character is standing on.
+bool DungeonRunHoldsAtStage(DungeonRunMemberState const& member,
+                            ApproachLimits const& limits);
+
 // CAN THIS PORTAL BE APPROACHED AT ALL, ASKED BEFORE A RUN IS OPENED.
 //
 // THE RULE IS THE TRAVEL LAYER'S, NOT THIS ONE'S, and writing it down here is
@@ -3784,8 +3835,12 @@ enum class AimedMover : std::uint8_t
     Walks,
     // This module is holding it still on purpose and will hand the strategy back
     // itself. Neither granted nor refused, and that difference is the point.
-    // Answered for either hold this module has: the post-revival one and, since
-    // #335, a casting verb's.
+    // Answered for EVERY hold this module has, and there are three: the
+    // post-revival one, a casting verb's (#335), and the one that keeps a party
+    // standing on a staging point until its barrier opens (#346). One
+    // enumerator rather than three because the answer a caller acts on is the
+    // same for all of them - do nothing, the hold lifts itself - and a verdict
+    // that named the reason would be a second place for the reason to drift.
     HeldOnPurpose,
     // It leads the party, or it is in no party. Take the strategy back, on this
     // poll and on every poll for as long as the errand lasts.
@@ -3812,13 +3867,20 @@ struct AimedMoverFacts
 {
     bool carriesStrategy = false;
     bool heldAfterRevival = false;
-    // A CASTING VERB IS HOLDING IT STILL RIGHT NOW (#335). The second of this
-    // module's two holds, and it is read here for the same reason the first one
-    // is: the grant below hands back a mover, and handing one back to a
-    // character that is three seconds into a summon channel is how 29 summons
-    // in a row were refused `summoner is moving`. Both holds lift themselves,
-    // and both are asked before any role is.
-    bool heldToCast = false;
+    // THIS MODULE'S OTHER HOLD REGISTER IS HOLDING IT STILL RIGHT NOW (#335,
+    // #346), whatever put it there. It is read here for the same reason the
+    // first one is: the grant below hands back a mover, and handing one back to
+    // a character that is three seconds into a summon channel is how 29 summons
+    // in a row were refused `summoner is moving`. Every hold lifts itself, and
+    // all of them are asked before any role is.
+    //
+    // NOT `heldToCast`, WHICH IS WHAT THIS WAS CALLED UNTIL #346. The register
+    // behind it took a second reason that day - a member standing on a staging
+    // point while its barrier waits for the rest of the party - and a fact
+    // named after one of the reasons it reports is a fact the next reader
+    // believes covers only that one. It never did: the caller has always
+    // passed whatever the register said, and the register has never cared why.
+    bool heldStill = false;
     bool leadsItsParty = false;
     bool steersItself = false;
     bool cutOffFromLeader = false;

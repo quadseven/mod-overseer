@@ -146,16 +146,16 @@ void AHeldSteererAndAHeldFollowerWaitTheSameWay()
 void ACastHoldWaitsExactlyLikeARevivalHold()
 {
     AimedMoverFacts leader = Facts(false, false, true, false, false);
-    leader.heldToCast = true;
+    leader.heldStill = true;
     CheckVerdict("a leader mid-cast", leader, AimedMover::HeldOnPurpose);
     Check("and a cast hold does not grant", AimedMoverGrants(ReadAimedMover(leader)), false);
 
     AimedMoverFacts follower = Facts(false, false, false, false, false);
-    follower.heldToCast = true;
+    follower.heldStill = true;
     CheckVerdict("a follower mid-cast", follower, AimedMover::HeldOnPurpose);
 
     AimedMoverFacts cutOff = Facts(false, false, false, false, true);
-    cutOff.heldToCast = true;
+    cutOff.heldStill = true;
     CheckVerdict("a cut-off follower mid-cast", cutOff, AimedMover::HeldOnPurpose);
 }
 
@@ -165,11 +165,11 @@ void ACastHoldWaitsExactlyLikeARevivalHold()
 void EitherHoldIsAHoldAndBothIsStillOne()
 {
     AimedMoverFacts both = Facts(false, true, true, false, false);
-    both.heldToCast = true;
+    both.heldStill = true;
     CheckVerdict("held twice", both, AimedMover::HeldOnPurpose);
 
     AimedMoverFacts neither = Facts(false, false, true, false, false);
-    neither.heldToCast = false;
+    neither.heldStill = false;
     CheckVerdict("held by neither", neither, AimedMover::GrantToLeader);
 }
 
@@ -180,7 +180,7 @@ void EitherHoldIsAHoldAndBothIsStillOne()
 void CarryingItStillOutranksACastHold()
 {
     AimedMoverFacts walking = Facts(true, false, true, false, false);
-    walking.heldToCast = true;
+    walking.heldStill = true;
     CheckVerdict("walking and held", walking, AimedMover::Walks);
 }
 
