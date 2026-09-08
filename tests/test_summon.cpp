@@ -395,7 +395,7 @@ void EveryRefusalCarriesWhereToTryAgain()
     elsewhere("no meeting stone within reach of the second clicker");
     elsewhere("no second party member is at the stone");
     elsewhere("the character to summon is already at the summon point");
-    elsewhere("the character to summon cannot enter the summoner's instance");
+    elsewhere("the character to summon cannot enter the instance the summoner is in");
 
     // Somebody's own state, and every one of these ends on its own.
     later("summoner has no session");
@@ -407,20 +407,30 @@ void EveryRefusalCarriesWhereToTryAgain()
     later("summoner is already casting");
     later("summoner is on a transport");
     later("summoner is not its own mover");
-    later("summoner is below the stone's minimum level");
+    later("summoner is below the minimum level of the stone");
     later("the character to summon is not online");
     later("the second clicker is not online");
-    later("the character to summon is not in the summoner's party");
-    later("the character to summon is below the stone's minimum level");
+    later("the character to summon is not in the same party");
+    later("the character to summon is below the minimum level of the stone");
     later("the character to summon has no bot AI to acknowledge the teleport");
     later("the character to summon is dead");
     later("the character to summon is in combat");
     later("the character to summon is in flight");
+    later("the character to summon is not in the world");
     later("the character to summon is already being teleported");
     later("the character to summon already has a summon pending");
-    later("the second clicker is not in the summoner's party");
+    later("the second clicker is not in the same party");
     later("the second clicker is dead");
     later("the second clicker is in combat");
+    later("the second clicker is not in the world");
+    // THE TWO THAT A REVIEW ADDED. The second clicker holds a channel for the
+    // whole settle window exactly as the summoner does, and nothing said so
+    // until somebody asked: its click starts the portal's anim spell, which is
+    // channelled with movement among its interrupt flags, so a helper that
+    // walks is erased by CheckRitualList when the ritual settles and the summon
+    // dies silently five seconds after everything looked fine.
+    later("the second clicker is moving");
+    later("the second clicker is already casting");
     later("the second clicker has no session");
     later("the summoner did not begin channelling the portal");
     later("the ritual did not reach the participants it needs");

@@ -4886,7 +4886,7 @@ TownRetry SummonRefusalRetry(std::string const& detail)
         // The core's own SPELL_EFFECT_SUMMON_PLAYER check: a summoner inside a
         // dungeon may only summon somebody the instance would let in. Another
         // stone, outside, answers differently.
-        "the character to summon cannot enter the summoner's instance",
+        "the character to summon cannot enter the instance the summoner is in",
     };
 
     for (char const* literal : NEVER)

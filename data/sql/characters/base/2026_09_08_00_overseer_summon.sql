@@ -184,14 +184,31 @@
 -- the queue instead: no session, not in the world, summoning itself, not its
 -- own mover, dead, in flight, in combat, moving, already casting, on a
 -- transport, no stone within reach, an unknown stone template, below the
--- stone's minimum level; the character to summon not online, not in the party,
--- below the minimum level, WITH NO BOT AI TO ACKNOWLEDGE THE TELEPORT, dead, in
--- combat, in flight, already being teleported, already carrying a summon,
--- unable to enter the summoner's instance, already at the summon point; the
--- second clicker not online, being the summoner, not in the party, with no
--- session, dead, in combat, out of reach, or absent entirely; and the two
--- readings that say the mechanism did not start - the summoner never began
--- channelling, and the ritual never reached its participant count.
+-- minimum level of the stone; the character to summon not online, not in the
+-- world, not in the party, below the minimum level, WITH NO BOT AI TO
+-- ACKNOWLEDGE THE TELEPORT, dead, in combat, in flight, already being
+-- teleported, already carrying a summon, unable to enter the instance the
+-- summoner is in, already at the summon point; the second clicker not online,
+-- not in the world, being the summoner, not in the party, with no session,
+-- dead, in combat, MOVING, ALREADY CASTING, out of reach of the portal, or
+-- absent entirely; and the two readings that say the mechanism did not start -
+-- the summoner never began channelling, and the ritual never reached its
+-- participant count.
+--
+-- NOT ONE OF THOSE LITERALS MAY CARRY AN APOSTROPHE. `detail` is interpolated
+-- into the UPDATE unescaped, the way every executor in mod_overseer.cpp writes
+-- it, so a quote character inside one fails the statement, leaves the row
+-- `claimed` under this run's own token, and strands it until the worldserver
+-- restarts. Five of these literals were phrased with one and were caught in
+-- review; the wording is deliberately clumsy where avoiding the apostrophe made
+-- it so.
+--
+-- THE SECOND CLICKER IS REFUSED FOR MOVING, and that is not obvious. Its click
+-- starts the portal's anim spell, which is channelled with movement among its
+-- interrupt flags, and GameObject::Update runs CheckRitualList a SECOND time
+-- when the ritual settles - erasing any participant that stopped channelling
+-- and dropping the count back under what the ritual needs. A helper that walks
+-- kills the summon silently, five seconds after everything looked fine.
 --
 -- The retry class of each is decided by OverseerDecisions::SummonRefusalRetry
 -- and pinned literal by literal in tests/test_summon.cpp.
