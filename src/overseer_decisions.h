@@ -590,6 +590,102 @@ bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
 // are.
 bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise);
 
+// WHAT A REFUSED BEARING STILL PROVED (#312).
+//
+// THE FOOTING CHECK WALKS A BEARING IN STRIDES AND THREW AWAY EVERY STRIDE
+// THAT HELD. It refuses the whole bearing the moment one stride fails, so a
+// sixty yard probe that held for eleven strides and broke on the twelfth
+// returned exactly what a probe that broke on its very first stride returns:
+// nothing at all.
+//
+// MEASURED OFF THE SHIPPED TERRAIN, at the coordinates of four consecutive
+// refusals on 2026-09-08. A character on open hillside had its straight
+// bearing refused at stride 5 of 15, with sixteen yards already sampled and
+// held behind it, and its other three bearings refused at strides 7, 12 and
+// 13 - 24, 44 and 48 yards proved and thrown away. Every failing stride in
+// all four refusals was a RISE, between 8.8 and 16.9 yards; not one was a
+// drop, and not one was ground the probe failed to find. The check had proved
+// walkable ground in every direction it looked and reported that there was
+// none.
+//
+// SO A REFUSED BEARING IS TRUNCATED RATHER THAN DISCARDED. The step ends at
+// the last stride that HELD, which is strictly before the stride that did
+// not, so nothing is approved that this check did not walk in software from
+// the character's own feet. It can only ever SHORTEN a step. It approves no
+// stride the old rule refused, widens no tolerance, and cannot give back a
+// fall the old rule caught: the failing stride is still refused, it has
+// merely stopped condemning the eleven that passed.
+//
+// AND A TRUNCATED STEP HAS TO BE WORTH TAKING. One stride of proved ground is
+// not a walk. It is a character being edged toward the very thing this check
+// exists to keep it off, and at a fifteen second poll it buys nothing. Two
+// strides is the shortest reach the footing fan asks anything at - see the
+// adapter's own AnyDirectionHolds, which gives that reason for that number -
+// so two strides is the floor here as well.
+bool ProvenStepIsWorthTaking(float provedYards, float minYards);
+
+// A FOOTING REFUSAL IS A FACT ABOUT WHERE A CHARACTER STANDS (#312).
+//
+// WHAT THE OLD BOUND WAS, AND WHY IT WAS NOT ONE. The refusal was announced
+// once per ERRAND, and the line promised that the errand's own twenty minute
+// stall clock still bounded it. Both halves are scoped to the errand, and the
+// errand's target is rewritten from OUTSIDE this module: by an aim writer on
+// its own cadence, and, for a catch-up walk, by the leader's own position,
+// which moves every poll. A changed target is a new errand here - it clears
+// the "already said" flag and restarts the stall clock at zero.
+//
+// MEASURED. One character was refused on six consecutive polls across six
+// minutes against five different targets: the same warning printed six times,
+// and the twenty minute clock restarted five of those times. A bound that is
+// re-armed faster than it can elapse is not a bound, and a line that promises
+// one is worse than a line that promises nothing.
+//
+// SO THIS ONE IS ANCHORED TO A PLACE, which is what a footing refusal is
+// actually about - the ground under this character's feet, not the errand it
+// happens to be carrying. The episode survives every target change and ends
+// the moment the character is somewhere else: the same discipline, and the
+// same argument, as TerrainRecoveryState's anchor above. What it counts is
+// consecutive polls refused WITHOUT MOVING, which is the only reading that
+// means "this character is not getting out of here".
+struct FootingRefusalState
+{
+    // Consecutive polls refused at this anchor. This is the bound.
+    unsigned consecutive{0};
+    // Where the episode started, and whether one has started at all.
+    bool anchored{false};
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+struct FootingRefusalVerdict
+{
+    // Say it: once per episode, which is neither once per errand (the old
+    // rule, which a target rewrite reset) nor once per poll (a stream).
+    bool sayIt{false};
+    // Give the errand up. This character has been refused `limit` polls
+    // running without moving a yard, so the next poll reads the same terrain
+    // from the same feet and there is nothing left for this errand to do.
+    bool giveUp{false};
+    // How many polls this episode has refused, for the line that says so.
+    unsigned consecutive{0};
+};
+
+// One refused poll. Re-anchors and restarts the count when the character has
+// moved further than `episodeRadius` from where the episode began, or onto
+// another map. A zero `episodeRadius` never re-anchors on distance and a zero
+// `limit` never gives up, which is what a caller that wants only the counting
+// asks for.
+FootingRefusalVerdict FootingRefused(FootingRefusalState& state, uint32_t mapId,
+                                     float x, float y, float episodeRadius,
+                                     unsigned limit);
+
+// A poll that was NOT refused ends the episode. Called wherever a step was
+// found, so a character that gets a step and later stops getting one starts
+// its count afresh rather than carrying half of an old episode into a new
+// place.
+void FootingHeld(FootingRefusalState& state);
+
 // A VERTICAL GAP AT SHORT RANGE MEANS "ABOVE IT", NOT "NEAR IT" (#217).
 //
 // WHAT WAS MEASURED. Every distance this module has ever taken against a PLACE
