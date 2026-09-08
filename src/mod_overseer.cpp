@@ -84,6 +84,27 @@
  *                     returns and the row parks in `verifying` until
  *                     ResolveHearthChecks reads back where the character
  *                     actually is. See 2026_09_07_01_overseer_hearth.sql.
+ *       kind='summon' - summon one absent party member to a dungeon's
+ *                     summoning stone, across continents, through the game's
+ *                     own mechanic: select, click the stone, click the portal
+ *                     the stone's spell creates, and press accept on the
+ *                     character being summoned. Four packets, four of the
+ *                     core's own handlers, and not one of them decides where
+ *                     anybody goes - GameObject::Use reads the destination off
+ *                     the clicker's selection and the core does the rest. THE
+ *                     ONLY THING IN THIS MODULE THAT CAN REJOIN A FAMILY SPLIT
+ *                     ACROSS TWO CONTINENTS: the boat cannot board anybody
+ *                     (#279), the crossing is never consulted for a leader
+ *                     already across (#304), and a hearthstone only moves a
+ *                     character to a home that is on the wrong continent
+ *                     already (#308). It is deliberately NOT a teleport, and
+ *                     it is deliberately not mod-playerbots' own SummonAction,
+ *                     which is a teleport with a stone-shaped gate in front of
+ *                     it. Parks in `verifying` like the hearth, and for longer:
+ *                     a ritual settles on the world's clock, the accept is a
+ *                     packet nothing in this fleet has ever sent, and the
+ *                     teleport that follows crosses a map. See
+ *                     2026_09_08_00_overseer_summon.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -2080,8 +2101,10 @@ constexpr uint32 COMMANDS_PER_POLL = 20;
 // not this one before the drain ends it (mod-overseer#230). A claim is taken and
 // executed inside a single poll; a `verifying` row from a strategy command
 // resolves within VERIFY_GRACE_MS, and the slowest `verifying` row this module
-// can produce is a kind='hearth' waiting out a cast time plus HEARTH_MARGIN_MS,
-// which is seconds and not minutes. So two minutes is still far past anything
+// can produce is a kind='summon' waiting out a ritual, an accept and a
+// cross-map teleport - its own window plus SUMMON_SETTLE_CEILING_MS at the very
+// worst, which is 30 seconds with today's constants, with kind='hearth' a
+// little under it. Seconds, and not minutes. So two minutes is still far past anything
 // legitimate. What is left after that is a row held by a worldserver that went
 // away, which `WHERE status = 'pending'` can never select again and nothing else
 // will end.
@@ -20087,6 +20110,11 @@ private:
         // cast time and a strategy command does not.
         ResolveHearthChecks(sincePollMs);
 
+        // ...and the summons, which wait longer still: a ritual settles on the
+        // world's clock, the summoned character then has to be handed an accept,
+        // and the teleport that follows crosses a map (#313).
+        ResolveSummonChecks(sincePollMs);
+
         // Then collect any row a run that is no longer here is still holding,
         // because nothing below this line can ever see one.
         ExpireAbandonedClaims();
@@ -20176,6 +20204,7 @@ private:
                 && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
                 && kind != "bank" && kind != "auction" && kind != "bind"
                 && kind != "hearth"
+                && kind != "summon"
                 && kind != "mail")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
@@ -20300,6 +20329,9 @@ private:
                 detail = DoBind(player, command, status, rowResult);
             else if (kind == "hearth")
                 detail = DoHearth(player, command, status, rowResult, _pendingHearths, id);
+            else if (kind == "summon")
+                detail = DoSummon(player, command, targetArg, status, rowResult,
+                                  _pendingSummons, id);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -24640,6 +24672,8 @@ private:
         using OverseerDecisions::HearthOutcome;
         using OverseerDecisions::HearthOutcomeWord;
         using OverseerDecisions::HearthReadBack;
+        using OverseerDecisions::ReadTeleportFlight;
+        using OverseerDecisions::TeleportFlight;
 
         std::vector<HearthCheck> stillCasting;
         stillCasting.reserve(_pendingHearths.size());
@@ -24648,15 +24682,32 @@ private:
         {
             check.ev.waitedMs += elapsedMs;
 
-            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
-            if (!bot)
+            // ASKED WITH checkInWorld FALSE, AND THAT SINGLE ARGUMENT IS #310.
+            // ObjectAccessor::FindPlayerByName defaults it to true and
+            // Player::TeleportTo takes a character OUT OF THE WORLD for the
+            // whole length of a map change, so the default answered null for a
+            // hearth that was working, and the block below wrote `error` about
+            // a character that arrived. Leaving the world is what a successful
+            // cross-map teleport looks like from the world thread; only the
+            // name map can tell that apart from a logout.
+            uint32 const ceilingMs = check.ev.windowMs + HEARTH_SETTLE_CEILING_MS;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+            TeleportFlight const flight =
+                ReadTeleportFlight(bot != nullptr, bot && bot->IsInWorld(),
+                                   bot && bot->IsBeingTeleported(), check.ev.waitedMs,
+                                   ceilingMs);
+            check.ev.teleportWasStillInFlight =
+                (flight == TeleportFlight::InFlight || flight == TeleportFlight::Stranded) ? 1 : 0;
+
+            if (flight == TeleportFlight::Gone)
             {
                 // A character that logged out mid-cast is a perfectly good
                 // explanation, and an explanation is the thing that would
                 // otherwise be missing. Said out loud rather than dropped.
+                // THIS IS NOW THE ONLY READING THAT MEANS IT.
                 LOG_WARN("module.overseer",
                          "overseer: hearth {} for '{}' cannot be judged - the character is no "
-                         "longer in the world",
+                         "longer in the world and is not crossing one",
                          check.id, check.targetName);
                 check.ev.verdict = HearthOutcome::Unreadable;
                 CharacterDatabase.Execute(
@@ -24685,10 +24736,9 @@ private:
             // but a far teleport that has not been acknowledged yet would read
             // back at the position the character is leaving. Given more time,
             // up to a ceiling, so a teleport that never completes still ends as
-            // a real answer rather than waiting for ever.
-            check.ev.teleportWasStillInFlight = bot->IsBeingTeleported() ? 1 : 0;
-            if (check.ev.teleportWasStillInFlight == 1
-                && check.ev.waitedMs < check.ev.windowMs + HEARTH_SETTLE_CEILING_MS)
+            // a real answer rather than waiting for ever. `Stranded` is that
+            // ceiling being reached, and it is judged rather than waited on.
+            if (flight == TeleportFlight::InFlight)
             {
                 LOG_INFO("module.overseer",
                          "overseer: hearth {} for '{}' is past its {}ms window but the teleport "
@@ -24761,6 +24811,948 @@ private:
         }
 
         _pendingHearths.swap(stillCasting);
+    }
+
+
+    // -------------------------------------------------------------- summon --
+    //
+    // Summon one absent party member to a dungeon's summoning stone, across
+    // continents, through the game's own mechanic (#313).
+    //
+    // WHY THIS EXISTS. This family is split across two maps and the module says
+    // so on every poll: "THE PARTY IS SPLIT ACROSS TWO MAPS AND NOTHING IN THIS
+    // MODULE CAN REJOIN IT." The boat is filed six ways (#241, #274, #279,
+    // #303, #304, #305) and none of them has landed; #304 is the one that bites
+    // here, because the crossing is only consulted when the LEADER is on the
+    // wrong map and this leader is already across. #308's hearthstone cannot
+    // help the two members that need it either: both are bound on the continent
+    // they are stranded on, so their hearthstone moves them within the wrong
+    // one.
+    //
+    // THE CHAIN, and every id in it was read out of the pinned core and the
+    // live world database rather than remembered. The measurements and their
+    // file:line are written down in
+    // data/sql/characters/base/2026_09_08_00_overseer_summon.sql; the short
+    // version is:
+    //
+    //   1. The stone is a GAMEOBJECT_TYPE_MEETINGSTONE (type 23). It is NOT a
+    //      GAMEOBJECT_TYPE_SUMMONING_RITUAL, and that distinction is the whole
+    //      difference between this verb working and this verb being written
+    //      against a field that does not exist: reqParticipants belongs to type
+    //      18, and a type 23 stone has minLevel, maxLevel and areaID instead.
+    //   2. GameObject::Use's MEETINGSTONE case reads WHO IS BEING SUMMONED OFF
+    //      THE CLICKER'S OWN SELECTION, through ObjectAccessor::FindPlayer,
+    //      which is not map scoped. So the only thing this module has to say
+    //      about the destination is which character to select - it does not
+    //      name a map, a coordinate or a target list anywhere.
+    //   3. That click casts the meeting stone summon, which triggers the
+    //      summoning stone effect, which is a TRANS_DOOR creating the portal
+    //      and is CHANNELED by the summoner for the portal's lifetime. The
+    //      spell effect seeds the summoner as the ritual's first participant,
+    //      so exactly ONE more party member has to click.
+    //   4. The portal is a type 18 ritual with castersGrouped set. When the
+    //      participant count is reached it settles and then casts the summon.
+    //   5. The summon is SPELL_EFFECT_SUMMON_PLAYER, and Spell's implicit
+    //      target selection for that effect READS THE CASTER'S SELECTION AGAIN,
+    //      LIVE, at the moment the ritual completes. That is why
+    //      ResolveSummonChecks re-asserts the summoner's selection on every
+    //      poll while the ritual is pending instead of setting it once: a bot
+    //      that retargets in the five seconds in between would summon nobody
+    //      and nothing would say why.
+    //   6. The effect sets a summon point on the absent character and sends it
+    //      a request. IT MOVES NOBODY. The character has to ACCEPT, and a bot
+    //      has no client to press the button with, so nothing in this fleet has
+    //      ever answered a summon. The accept is driven the way kind='hearth'
+    //      drives its item use: the core's own handler, handed a packet.
+    //   7. Accepting is a FAR teleport, which needs MSG_MOVE_WORLDPORT_ACK
+    //      answered, and PlayerbotAI::HandleTeleportAck is the only thing in
+    //      this fleet that answers it. A character with no bot AI is therefore
+    //      a hard refusal here and not a hopeful attempt, exactly as it is on
+    //      the hearth.
+    //
+    // WHAT THIS IS NOT, AND THE RULE IT IS KEEPING. It is not a teleport.
+    // Player::TeleportTo appears in this file on revival paths that each
+    // argued for themselves; a call to it with nothing in front of it, to move
+    // a character across an ocean because a queue asked, would be a GM summon
+    // wearing a game mechanic's name, which is the thing AGENTS.md exists to
+    // forbid. Every step above is a packet handed to a handler a client would
+    // have driven, and every gate the core keeps is still kept: the level
+    // floor on both characters, the same-raid check, the interaction distance,
+    // the participant count, the channel, and the accept.
+    //
+    // IT IS ALSO NOT mod-playerbots' own SummonAction. That exists
+    // (UseMeetingStoneAction.cpp) and it was read before this was written. It
+    // checks that a meeting stone is somewhere within sight distance of the
+    // summoner and then calls Player::TeleportTo directly - no selection, no
+    // portal, no second clicker, no summon request and no accept. It is the
+    // admin shortcut with a stone-shaped gate in front of it, and its
+    // Execute() path does not even keep the gate. Reusing it would have been
+    // one line and would have reported success for a mechanism the game never
+    // ran.
+    //
+    // WHY THE ROW PARKS. Nothing has happened when the stone click returns: the
+    // ritual settles on a later world tick and the teleport lands on a later
+    // one still. So the row goes to `verifying` and ResolveSummonChecks reads
+    // back where the summoned character actually is, exactly as the hearth
+    // does. `delivered` here would be the claim AGENTS.md warns about.
+
+    // The portal the meeting stone's spell creates, and the only gameobject
+    // this executor ever clicks that it did not find by sweeping. Named as a
+    // constant because the sweep for it has to be exact: a type 18 ritual that
+    // is not this one is somebody's Ritual of Summoning or Ritual of Doom, and
+    // clicking a warlock's closet because it was nearby is not a summon.
+    static constexpr uint32 SUMMON_PORTAL_ENTRY = 179944;
+
+    // GameObject::Use sets the ritual's completion five seconds out when the
+    // last participant clicks, and GameObject::Update casts the summon when
+    // that time is reached. The core's number, read rather than guessed.
+    static constexpr uint32 SUMMON_RITUAL_SETTLE_MS = 5000;
+
+    // What the world needs after the ritual settles: the request goes out on
+    // the tick the ritual completes, the accept is driven on the poll after
+    // that, the teleport starts on the tick after THAT, and this module only
+    // looks every COMMAND_POLL_MS. A window equal to the settle time would race
+    // every one of those.
+    static constexpr uint32 SUMMON_MARGIN_MS = 5000;
+
+    // A settle time that reads as zero judges instantly and therefore always
+    // answers `stayed`. Same floor, and the same argument, as HEARTH_FLOOR_MS.
+    static constexpr uint32 SUMMON_FLOOR_MS = 8000;
+
+    // How much longer than its own window a summon may take before it is judged
+    // anyway. It covers the two slow parts that are not the ritual: a summon
+    // request the character has up to two minutes to accept but which this
+    // module answers on its next poll, and a cross-continent teleport that has
+    // to load a map. Deliberately well inside COMMAND_CLAIM_LEASE_SECONDS, so a
+    // parked summon is always resolved by this code and never reaped by the
+    // claim sweep with nothing to say.
+    static constexpr uint32 SUMMON_SETTLE_CEILING_MS = 20000;
+
+    // ARRIVAL IS WIDE AND MOVEMENT IS NARROW, for the reasons HEARTH_*_YARDS
+    // gives. Wider than the hearth's forty because the summon point is the
+    // SUMMONER'S position rather than a fixed bind point, and the summoner is
+    // itself a bot that may have taken a few steps between the click and the
+    // verdict - so the tolerance has to absorb two walkers, not one.
+    static constexpr float SUMMON_ARRIVED_YARDS = 60.f;
+    static constexpr float SUMMON_MOVED_YARDS = 10.f;
+
+    // How far this executor looks for a stone before saying there is none. The
+    // GATE is not this number: the gate is GameObject::GetInteractionDistance,
+    // which is what WorldSession::HandleGameObjectUseOpcode itself enforces.
+    // The sweep is wider on purpose so a refusal can say how far the nearest
+    // stone WAS - "no meeting stone within reach" with "18.4 yards" beside it
+    // is an aim error somebody can correct, and without the number it is a
+    // mystery.
+    static constexpr float SUMMON_SWEEP_YARDS = 40.f;
+
+    struct SummonEvidence
+    {
+        std::string summoner;
+        std::string summoned;
+        std::string helper;
+        std::string request;
+        uint32 stoneEntry{0};
+        uint32 portalEntry{0};
+        uint32 minLevel{0};
+        uint32 participants{0};
+        uint32 required{0};
+        uint32 accepts{0};
+        uint32 settleMs{0};
+        uint32 windowMs{0};
+        uint32 waitedMs{0};
+        float stoneYards{-1.f};
+        float nearestStoneYards{-1.f};
+        int32 channellingAfterClick{-1};  // -1 never asked, 0 no, 1 yes
+        int32 requestSeen{-1};            // -1 never asked, 0 never pending, 1 pending
+        int32 deadAtVerdict{-1};
+        int32 inCombatAtVerdict{-1};
+        // NOT A READING UNTIL SOMEBODY TAKES ONE. A refusal row never looks at
+        // a teleport, and publishing "landed" about a character nobody asked
+        // about is the kind of confident nonsense this verb's whole result
+        // column exists to avoid.
+        bool flightRead{false};
+        OverseerDecisions::TeleportFlight flight{OverseerDecisions::TeleportFlight::Landed};
+        OverseerDecisions::HomeBind at;    // the summon point: where the summoner stood
+        OverseerDecisions::HomeBind from;  // where the summoned character stood
+        OverseerDecisions::HomeBind now;   // where it reads back
+        OverseerDecisions::SummonOutcome verdict{OverseerDecisions::SummonOutcome::Unreadable};
+    };
+
+    // A summon waiting out its own ritual, request, accept and teleport. Held
+    // on the world thread beside _pendingChecks and _pendingHearths, and
+    // bounded the same way.
+    struct SummonCheck
+    {
+        uint32 id{0};
+        std::string summonerName;
+        std::string summonedName;
+        ObjectGuid summonerGuid;
+        ObjectGuid summonedGuid;
+        SummonEvidence ev;
+    };
+
+    // SUMMONS WAITING OUT THEIR OWN RITUAL. World thread only, exactly like
+    // _pendingHearths and for the same reason.
+    //
+    // DECLARED HERE AND NOT BESIDE _pendingHearths. A member's TYPE has to be
+    // complete where the member is declared - only function bodies are compiled
+    // as if the class were finished - and SummonCheck is defined in this
+    // section. The hearth section says the same thing about its own vector, and
+    // it says it because no pull request in this repository compiles this file
+    // (#288), so getting it wrong is found on main and not in review.
+    std::vector<SummonCheck> _pendingSummons;
+
+    static void SummonPlace(std::ostringstream& o, OverseerDecisions::HomeBind const& p)
+    {
+        if (!p.known)
+        {
+            o << "null";
+            return;
+        }
+        o << "{\"map\":" << p.mapId << ",\"area\":" << p.areaId << ",\"x\":" << p.x
+          << ",\"y\":" << p.y << ",\"z\":" << p.z << "}";
+    }
+
+    // ONE SHAPE FOR EVERY EXIT, refusals and verdicts alike, and written by all
+    // of them. A row that ends without saying what it was judged on is the
+    // thing this whole verb exists to stop producing.
+    static std::string SummonJson(SummonEvidence const& ev, char const* outcome,
+                                  char const* reason)
+    {
+        using OverseerDecisions::SummonOutcomeWord;
+        using OverseerDecisions::SummonRefusalRetry;
+        using OverseerDecisions::TeleportFlightWord;
+        using OverseerDecisions::TownRetryWord;
+
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(*reason ? TownRetryWord(SummonRefusalRetry(reason)) : "")
+          << ",\"summoner\":" << J(ev.summoner)
+          << ",\"summoned\":" << J(ev.summoned)
+          << ",\"helper\":" << J(ev.helper)
+          << ",\"verdict\":" << J(SummonOutcomeWord(ev.verdict))
+          << ",\"flight\":"
+          << (ev.flightRead ? J(TeleportFlightWord(ev.flight)) : std::string("null"))
+          << ",\"stone_entry\":" << ev.stoneEntry
+          << ",\"portal_entry\":" << ev.portalEntry
+          << ",\"min_level\":" << ev.minLevel
+          << ",\"participants\":" << ev.participants
+          << ",\"required\":" << ev.required
+          << ",\"accepts\":" << ev.accepts
+          << ",\"settle_ms\":" << ev.settleMs
+          << ",\"window_ms\":" << ev.windowMs
+          << ",\"waited_ms\":" << ev.waitedMs
+          << ",\"stone_yards\":" << ev.stoneYards
+          << ",\"nearest_stone_yards\":" << ev.nearestStoneYards;
+        o << ",\"channelling_after_click\":";
+        if (ev.channellingAfterClick < 0)
+            o << "null";
+        else
+            o << (ev.channellingAfterClick ? "true" : "false");
+        o << ",\"request_seen\":";
+        if (ev.requestSeen < 0)
+            o << "null";
+        else
+            o << (ev.requestSeen ? "true" : "false");
+        o << ",\"dead_at_verdict\":";
+        if (ev.deadAtVerdict < 0)
+            o << "null";
+        else
+            o << (ev.deadAtVerdict ? "true" : "false");
+        o << ",\"in_combat_at_verdict\":";
+        if (ev.inCombatAtVerdict < 0)
+            o << "null";
+        else
+            o << (ev.inCombatAtVerdict ? "true" : "false");
+        o << ",\"at\":";
+        SummonPlace(o, ev.at);
+        o << ",\"from\":";
+        SummonPlace(o, ev.from);
+        o << ",\"now\":";
+        SummonPlace(o, ev.now);
+        o << ",\"request\":" << J(ev.request) << "}";
+        return o.str();
+    }
+
+    // The predicate the stone sweep runs over each gameobject in the visited
+    // cells - the shape Acore::GameObjectListSearcher wants, narrowed to
+    // spawned, selectable meeting stones. GO_FLAG_NOT_SELECTABLE is checked
+    // here because GameObject::Use returns on it before it looks at anything
+    // else, so a stone carrying it is not a stone this module could use even
+    // standing on top of it.
+    struct MeetingStoneNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(GameObject* go) const
+        {
+            return go->GetGoType() == GAMEOBJECT_TYPE_MEETINGSTONE
+                && go->isSpawned()
+                && !go->HasGameObjectFlag(GO_FLAG_NOT_SELECTABLE)
+                && from->IsWithinDistInMap(go, range);
+        }
+    };
+
+    // The portal the summoner's own click just created. Matched on entry AND on
+    // owner: two summons at the same stone in the same minute would otherwise
+    // hand one summoner the other's portal, and the ritual would then complete
+    // against the wrong caster's selection.
+    struct SummonPortalCheck
+    {
+        ObjectGuid owner;
+        bool operator()(GameObject* go) const
+        {
+            return go->GetEntry() == SUMMON_PORTAL_ENTRY && go->GetOwnerGUID() == owner;
+        }
+    };
+
+    // The meeting stone this character could click from where it stands, or
+    // nullptr. `nearestYards` is left at -1 when nothing stone-shaped was found
+    // at all, and otherwise carries the distance to the closest one even when
+    // none of them passed the gate - which is the difference between "walk to a
+    // dungeon that has a stone" and "walk four more yards".
+    static GameObject* FindMeetingStoneInReach(Player* who, float& nearestYards,
+                                               float& chosenYards)
+    {
+        nearestYards = -1.f;
+        chosenYards = -1.f;
+
+        std::list<GameObject*> stones;
+        MeetingStoneNearbyCheck check{who, SUMMON_SWEEP_YARDS};
+        Acore::GameObjectListSearcher<MeetingStoneNearbyCheck> searcher(who, stones, check);
+        Cell::VisitObjects(who, searcher, SUMMON_SWEEP_YARDS);
+
+        GameObject* found = nullptr;
+        for (GameObject* go : stones)
+        {
+            float const yards = who->GetDistance(go);
+            if (nearestYards < 0.f || yards < nearestYards)
+                nearestYards = yards;
+
+            // THE GATE, AND IT IS THE CORE'S OWN. This is the exact test
+            // WorldSession::HandleGameObjectUseOpcode makes on the guid a
+            // client sends, so a stone this accepts is a stone that handler
+            // will accept.
+            if (found || !go->IsWithinDistInMap(who, go->GetInteractionDistance()))
+                continue;
+            found = go;
+            chosenYards = yards;
+        }
+        return found;
+    }
+
+    static GameObject* FindSummonPortal(Player* summoner)
+    {
+        std::list<GameObject*> portals;
+        SummonPortalCheck check{summoner->GetGUID()};
+        Acore::GameObjectListSearcher<SummonPortalCheck> searcher(summoner, portals, check);
+        Cell::VisitObjects(summoner, searcher, SUMMON_SWEEP_YARDS);
+        return portals.empty() ? nullptr : portals.front();
+    }
+
+    // CMSG_SET_SELECTION is one guid and nothing else
+    // (WorldSession::HandleSetSelectionOpcode), and the handler does no
+    // validation at all - it writes UNIT_FIELD_TARGET and retargets an
+    // autoshoot if there is one. Driven rather than calling SetSelection
+    // directly for the reason the hearth drives CMSG_USE_ITEM: the handler is
+    // what a client would have reached, and anything it does besides the
+    // obvious is something this module would otherwise have to know about and
+    // keep in step.
+    static void DriveSelection(WorldSession* session, ObjectGuid target)
+    {
+        WorldPacket raw(CMSG_SET_SELECTION, 8);
+        raw << target;
+        raw.rpos(0);
+        session->HandleSetSelectionOpcode(raw);
+    }
+
+    // CMSG_GAMEOBJ_USE is one guid. The handler re-checks the interaction
+    // distance itself against the object's own model, so nothing can be clicked
+    // that the character did not walk to.
+    static void DriveGameObjectUse(WorldSession* session, ObjectGuid go)
+    {
+        WorldPacket raw(CMSG_GAMEOBJ_USE, 8);
+        raw << go;
+        raw.rpos(0);
+        session->HandleGameObjectUseOpcode(raw);
+    }
+
+    // CMSG_SUMMON_RESPONSE is the summoner's guid and one byte of agreement
+    // (WorldSession::HandleSummonResponseOpcode). THIS IS THE BUTTON NOBODY IN
+    // THIS FLEET HAS EVER PRESSED: mod-playerbots has no handler for
+    // SMSG_SUMMON_REQUEST and no path to SummonIfPossible anywhere, so a bot
+    // sent a summon request has always simply let it expire. The handler
+    // refuses a dead or in-combat character with no feedback of any kind, which
+    // is why both of those are refused up front and read back again at the
+    // verdict.
+    static void DriveSummonAccept(WorldSession* session, ObjectGuid summoner)
+    {
+        WorldPacket raw(CMSG_SUMMON_RESPONSE, 8 + 1);
+        raw << summoner;
+        raw << uint8(1);  // agree
+        raw.rpos(0);
+        session->HandleSummonResponseOpcode(raw);
+    }
+
+    static char const* DoSummon(Player* who, std::string const& command,
+                                std::string const& targetArg, char const*& status,
+                                std::string& out, std::vector<SummonCheck>& parked, uint32 id)
+    {
+        using OverseerDecisions::ParseSummonRequest;
+        using OverseerDecisions::SummonOutcome;
+        using OverseerDecisions::SummonRequest;
+        using OverseerDecisions::SummonVerb;
+        using OverseerDecisions::SummonVerifyWindowMs;
+        using OverseerDecisions::SummonWouldMoveNobody;
+
+        SummonEvidence ev;
+        ev.summoner = who->GetName();
+        ev.request = command;
+
+        // The refusal literals go straight into the UPDATE, so none may carry a
+        // quote character - the rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = SummonJson(ev, "refused", reason);
+            return reason;
+        };
+
+        SummonRequest const request = ParseSummonRequest(command);
+        if (request.verb == SummonVerb::None)
+        {
+            // The parser's exact words are pinned in tests/test_summon.cpp and
+            // go into the JSON. `detail` has to outlive this call, so the
+            // column gets the literal the retry table keys on.
+            out = SummonJson(ev, "refused", request.error.c_str());
+            return "malformed summon request";
+        }
+        ev.summoned = request.who;
+
+        // ---- the summoner ----------------------------------------------------
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("summoner has no session");
+        if (!who->IsInWorld())
+            return refuse("summoner is not in the world");
+        if (who->GetName() == request.who)
+            return refuse("a character cannot summon itself");
+
+        // HandleGameObjectUseOpcode's remote-control branch: a mind-controlled
+        // character's click is dropped with no feedback at all.
+        if (who->m_mover != who)
+            return refuse("summoner is not its own mover");
+        if (!who->IsAlive())
+            return refuse("summoner is dead");
+        if (who->IsInFlight())
+            return refuse("summoner is in flight");
+
+        // COMBAT IS REFUSED FOR A REASON THAT IS NOT THE CORE'S. The stone does
+        // not check it. The RITUAL does, five seconds later, by reading the
+        // summoner's selection again - and a bot in combat retargets, so the
+        // selection this executor sets would be gone by the time the thing that
+        // reads it runs. Refusing here is the difference between a named
+        // refusal and a `stayed` nobody can explain.
+        if (who->IsInCombat())
+            return refuse("summoner is in combat");
+
+        // The summoner has to hold a channel for the portal's whole life.
+        // Spell::update cancels a channel with a movement interrupt flag on the
+        // next tick that finds the caster moving, and a character already
+        // casting cannot start this one.
+        if (who->isMoving())
+            return refuse("summoner is moving");
+        if (who->IsNonMeleeSpellCast(false))
+            return refuse("summoner is already casting");
+        if (who->GetTransport())
+            return refuse("summoner is on a transport");
+
+        // ---- the stone -------------------------------------------------------
+
+        GameObject* stone = FindMeetingStoneInReach(who, ev.nearestStoneYards, ev.stoneYards);
+        if (!stone)
+            return refuse("no meeting stone within reach of the summoner");
+
+        GameObjectTemplate const* stoneInfo = stone->GetGOInfo();
+        if (!stoneInfo)
+            return refuse("the core does not know that meeting stone");
+        ev.stoneEntry = stone->GetEntry();
+        ev.minLevel = stoneInfo->meetingstone.minLevel;
+
+        // GameObject::Use's MEETINGSTONE case refuses both parties below the
+        // stone's own minimum and says nothing to anybody. Asked here so the
+        // row carries the number.
+        if (who->GetLevel() < ev.minLevel)
+            return refuse("summoner is below the minimum level of the stone");
+
+        // ---- the character to summon -----------------------------------------
+
+        // ASKED WITH checkInWorld FALSE, WHICH IS #310'S OWN LESSON APPLIED
+        // ONE STEP EARLIER. The default drops a character that is mid
+        // far-teleport, and this executor would then have refused it as "not
+        // online" - which is false, is classed as a transient, and would have
+        // made the refusal below that names a teleport in progress unreachable
+        // for the only kind of teleport that matters here.
+        Player* summoned = ObjectAccessor::FindPlayerByName(request.who, false);
+        if (!summoned)
+            return refuse("the character to summon is not online");
+        ev.summoned = summoned->GetName();
+        // Asked again on the pointer, because the name comparison above cannot
+        // survive a lookup that normalises case and this one cannot be fooled.
+        if (summoned == who)
+            return refuse("a character cannot summon itself");
+
+        // The core's own check, in GameObject::Use and again in
+        // Spell::CheckCast: ObjectAccessor::FindPlayer is not map scoped, and
+        // IsInSameRaidWith is what makes a cross-map target legitimate rather
+        // than a way to move a stranger.
+        if (!summoned->IsInSameRaidWith(who))
+            return refuse("the character to summon is not in the same party");
+        if (summoned->GetLevel() < ev.minLevel)
+            return refuse("the character to summon is below the minimum level of the stone");
+
+        // THE REFUSAL THAT IS ABOUT THE TELEPORT AND NOT THE SUMMON. A
+        // cross-map summon ends in a far teleport, and without a bot AI there
+        // is nothing in the world to answer MSG_MOVE_WORLDPORT_ACK: the
+        // character would leave one map and never arrive on the other. Same
+        // refusal, same reason, as the hearth's.
+        if (!GET_PLAYERBOT_AI(summoned))
+            return refuse("the character to summon has no bot AI to acknowledge the teleport");
+
+        // WorldSession::HandleSummonResponseOpcode returns on either of these
+        // before it reads a byte, and tells nobody. A summon driven at a
+        // character in that state would sit unanswered for its whole two
+        // minutes and end as an unexplained `stayed`.
+        if (!summoned->IsAlive())
+            return refuse("the character to summon is dead");
+        if (summoned->IsInCombat())
+            return refuse("the character to summon is in combat");
+        if (summoned->IsInFlight())
+            return refuse("the character to summon is in flight");
+        if (summoned->IsBeingTeleported())
+            return refuse("the character to summon is already being teleported");
+        // Asked AFTER the teleport, so a crossing is named as a crossing and
+        // only a real logout reaches this one.
+        if (!summoned->IsInWorld())
+            return refuse("the character to summon is not in the world");
+
+        // Spell::CheckCast answers a second summon with SPELL_FAILED_SUMMON_PENDING
+        // while the first one's two minutes are still running.
+        if (summoned->GetSummonExpireTimer() > GameTime::GetGameTime().count())
+            return refuse("the character to summon already has a summon pending");
+
+        // Spell::CheckCast's dungeon branch. A stone inside an instance is not
+        // a thing this realm spawns, so this is a guard rather than a case that
+        // happens - but a summon that drags somebody to an instance they are
+        // not allowed into would fail inside the core with a message no bot
+        // reads, and that is the failure mode this whole verb exists to stop.
+        if (Map* map = who->GetMap())
+        {
+            if (map->IsDungeon())
+            {
+                uint32 const mapId = map->GetId();
+                if (!sObjectMgr->GetInstanceTemplate(mapId)
+                    || !summoned->Satisfy(
+                           sObjectMgr->GetAccessRequirement(mapId, map->GetDifficulty()), mapId))
+                    return refuse("the character to summon cannot enter the instance the summoner is in");
+            }
+        }
+
+        // THE SUMMON POINT IS THE SUMMONER, NOT THE STONE.
+        // Spell::EffectSummonPlayer calls SetSummonPoint with the CASTER's own
+        // coordinates, so this is the place the verdict has to be measured
+        // against - reading it off the stone would be off by however far the
+        // summoner is standing from it, every time.
+        ev.at = ReadStandingPlace(who);
+        ev.from = ReadStandingPlace(summoned);
+
+        // NOWHERE TO GO. Refused before the packet because no reading taken
+        // afterwards could tell an arrival from having never moved.
+        if (SummonWouldMoveNobody(ev.from, ev.at, SUMMON_ARRIVED_YARDS))
+            return refuse("the character to summon is already at the summon point");
+
+        // ---- the second clicker ----------------------------------------------
+        //
+        // The portal needs one more participant than itself: the spell effect
+        // that creates it counts the summoner already. Named in target_arg when
+        // the sender knows who should do it, and otherwise the nearest party
+        // member that could.
+
+        Player* helper = nullptr;
+        if (!targetArg.empty())
+        {
+            helper = ObjectAccessor::FindPlayerByName(targetArg, false);
+            if (!helper)
+                return refuse("the second clicker is not online");
+            if (helper == who)
+                return refuse("the second clicker cannot be the summoner");
+            if (helper->IsBeingTeleported() || !helper->IsInWorld())
+                return refuse("the second clicker is not in the world");
+            if (!helper->IsInSameRaidWith(who))
+                return refuse("the second clicker is not in the same party");
+            if (!helper->GetSession())
+                return refuse("the second clicker has no session");
+            if (!helper->IsAlive())
+                return refuse("the second clicker is dead");
+            if (helper->IsInCombat())
+                return refuse("the second clicker is in combat");
+            // THE SECOND CLICKER HAS TO HOLD A CHANNEL TOO, and nothing said so
+            // until a review asked. Its click starts the portal's anim spell,
+            // which is channelled with movement among its interrupt flags, and
+            // GameObject::Update runs CheckRitualList AGAIN when the ritual
+            // settles - erasing any participant that stopped channelling and
+            // dropping the count back below the one the ritual needs. A helper
+            // that walks therefore kills the summon silently, five seconds
+            // after everything looked fine. Refused for the same reason, and
+            // with the same words, as a summoner that is moving.
+            if (helper->isMoving())
+                return refuse("the second clicker is moving");
+            if (helper->IsNonMeleeSpellCast(false))
+                return refuse("the second clicker is already casting");
+        }
+        else if (Group* group = who->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member || member == who || member == summoned)
+                    continue;
+                if (!member->GetSession() || !member->IsInWorld() || !member->IsAlive())
+                    continue;
+                if (member->IsInCombat() || member->IsBeingTeleported())
+                    continue;
+                // Same channel requirement as the named path above.
+                if (member->isMoving() || member->IsNonMeleeSpellCast(false))
+                    continue;
+                if (!member->IsWithinDistInMap(who, INTERACTION_DISTANCE))
+                    continue;
+                helper = member;
+                break;
+            }
+        }
+        if (!helper)
+            return refuse("no second party member is at the stone");
+        ev.helper = helper->GetName();
+
+        // ---- drive the core's own handlers -----------------------------------
+        //
+        // Selection first, because GameObject::Use reads it to decide who is
+        // being summoned, then the stone, then the portal. Three packets, three
+        // handlers, and not one line of this decides where anybody goes.
+
+        DriveSelection(session, summoned->GetGUID());
+        DriveGameObjectUse(session, stone->GetGUID());
+
+        // EVIDENCE, NOT A VERDICT. The summoner should now be channelling the
+        // portal spell. Recorded rather than believed: the click may have been
+        // refused inside GameObject::Use for a reason it reports to a client
+        // that is not there, and this module finds that out by reading the
+        // world, not by trusting a void call.
+        ev.channellingAfterClick = who->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0;
+
+        GameObject* portal = FindSummonPortal(who);
+        if (!portal)
+            return refuse("the summoner did not begin channelling the portal");
+        ev.portalEntry = portal->GetEntry();
+
+        GameObjectTemplate const* portalInfo = portal->GetGOInfo();
+        if (!portalInfo)
+            return refuse("the core does not know that summoning portal");
+        ev.required = portalInfo->summoningRitual.reqParticipants;
+
+        // THE GATE, AND IT IS THE CORE'S OWN, on the object that is actually
+        // being clicked. The cheap check above measured the helper against the
+        // SUMMONER at a bare INTERACTION_DISTANCE; this is the exact test
+        // WorldSession::HandleGameObjectUseOpcode makes, against the portal's
+        // own model and its own interaction distance. Without it a helper right
+        // on the boundary passes this module and is dropped by the handler, and
+        // the row then blames the participant count - which says `later` when
+        // the actual remedy is to stand closer.
+        if (!portal->IsWithinDistInMap(helper, portal->GetInteractionDistance()))
+            return refuse("no meeting stone within reach of the second clicker");
+
+        DriveGameObjectUse(helper->GetSession(), portal->GetGUID());
+        ev.participants = portal->GetUniqueUseCount();
+
+        // The ritual only settles when the count is reached. Below it, nothing
+        // is going to happen at all and there is no point parking a row to
+        // watch nothing happen for twenty seconds.
+        //
+        // THE WORLD HAS CHANGED BY THE TIME THIS REFUSAL IS WRITTEN, and the
+        // row says so rather than pretending otherwise: the portal exists and
+        // the summoner is channelling it. Nothing is torn down here, because
+        // that is exactly the state a player is left in when the friend they
+        // were waiting for does not click - the channel ends on its own, or the
+        // moment the character moves. `channelling_after_click`,
+        // `portal_entry`, `participants` and `required` are all in the JSON so
+        // a reader can see which of those it is.
+        if (ev.participants < ev.required)
+            return refuse("the ritual did not reach the participants it needs");
+
+        ev.settleMs = SUMMON_RITUAL_SETTLE_MS;
+        ev.windowMs = SummonVerifyWindowMs(ev.settleMs, SUMMON_MARGIN_MS, SUMMON_FLOOR_MS);
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is summoning '{}' to the meeting stone ({}) with '{}' as the "
+                 "second clicker - {} of {} participants, map {} to map {}; judging in {}ms, "
+                 "not now",
+                 ev.summoner, ev.summoned, ev.stoneEntry, ev.helper, ev.participants,
+                 ev.required, ev.from.mapId, ev.at.mapId, ev.windowMs);
+
+        SummonCheck check;
+        check.id = id;
+        check.summonerName = who->GetName();
+        check.summonedName = summoned->GetName();
+        check.summonerGuid = who->GetGUID();
+        check.summonedGuid = summoned->GetGUID();
+        check.ev = ev;
+        parked.push_back(check);
+
+        // THE ONE HONEST STATUS FOR A RITUAL THAT HAS NOT SETTLED. Not
+        // 'delivered', which would be the exact claim AGENTS.md warns about,
+        // and not 'applied', which nothing has earned yet.
+        status = "verifying";
+        ev.verdict = SummonOutcome::Unreadable;
+        out = SummonJson(ev, "summoning", "");
+        return "";
+    }
+
+    // WHERE A SUMMON IS ACTUALLY ANSWERED. Runs from the same poll as
+    // ResolveHearthChecks and for the same reason: the thing being judged
+    // happens on the world's clock, not on the queue's.
+    //
+    // It does three things a read-back does not usually do, and each of them is
+    // a packet a client would have sent:
+    //
+    //   * RE-ASSERTS THE SUMMONER'S SELECTION every poll while the ritual is
+    //     pending, because Spell::SelectEffectTypeImplicitTargets reads it live
+    //     when the ritual completes rather than remembering it from the click.
+    //   * PRESSES ACCEPT the moment a request exists, because nothing else in
+    //     this fleet ever will.
+    //   * WAITS OUT THE TELEPORT instead of reading a position through it. See
+    //     OverseerDecisions::ReadTeleportFlight and #310: leaving the world is
+    //     what a successful cross-map teleport looks like from here.
+    void ResolveSummonChecks(uint32 elapsedMs)
+    {
+        using OverseerDecisions::ReadTeleportFlight;
+        using OverseerDecisions::SummonOutcome;
+        using OverseerDecisions::SummonOutcomeWord;
+        using OverseerDecisions::SummonReadBack;
+        using OverseerDecisions::TeleportFlight;
+        using OverseerDecisions::TeleportFlightWord;
+
+        std::vector<SummonCheck> stillSummoning;
+        stillSummoning.reserve(_pendingSummons.size());
+
+        for (SummonCheck& check : _pendingSummons)
+        {
+            check.ev.waitedMs += elapsedMs;
+
+            uint32 const ceilingMs = check.ev.windowMs + SUMMON_SETTLE_CEILING_MS;
+
+            // ASKED WITH checkInWorld FALSE, WHICH IS THE #310 FIX. The default
+            // drops a character that is mid far-teleport, and mid far-teleport
+            // is what this verb is trying to produce.
+            Player* summoned = ObjectAccessor::FindPlayerByName(check.summonedName, false);
+            check.ev.flightRead = true;
+            check.ev.flight = ReadTeleportFlight(
+                summoned != nullptr, summoned && summoned->IsInWorld(),
+                summoned && summoned->IsBeingTeleported(), check.ev.waitedMs, ceilingMs);
+
+            if (check.ev.flight == TeleportFlight::Gone)
+            {
+                // A character that logged out mid-ritual is a perfectly good
+                // explanation, and an explanation is the thing that would
+                // otherwise be missing. This is the ONLY reading that means it,
+                // now that a crossing is told apart from a departure.
+                LOG_WARN("module.overseer",
+                         "overseer: summon {} of '{}' cannot be judged - the character is no "
+                         "longer in the world and is not crossing",
+                         check.id, check.summonedName);
+                check.ev.verdict = SummonOutcome::Unreadable;
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    "the character to summon logged out before the summon could be read back",
+                    EscLong(SummonJson(check.ev, "unreadable",
+                                       "the character to summon logged out before the summon "
+                                       "could be read back")),
+                    check.id, g_runToken);
+                continue;
+            }
+
+            // STILL CROSSING IS NOT STILL STANDING THERE, AND IT IS NOT AN
+            // ERROR. It is the middle of the success this row asked for. Read
+            // nothing and write nothing; ask again next poll.
+            if (check.ev.flight == TeleportFlight::InFlight)
+            {
+                stillSummoning.push_back(check);
+                continue;
+            }
+
+            // WHILE THE RITUAL HAS NOT FIRED YET, three things have to be kept
+            // true, and all three are read off the summoner.
+            if (check.ev.requestSeen < 1)
+            {
+                Player* summoner =
+                    ObjectAccessor::FindPlayerByName(check.summonerName, false);
+                if (summoner && summoner->IsInWorld() && summoner->GetSession())
+                {
+                    // THE SUMMON POINT IS WHEREVER THE SUMMONER IS WHEN THE
+                    // RITUAL COMPLETES, and not where it stood when the portal
+                    // was clicked: Spell::EffectSummonPlayer calls
+                    // SetSummonPoint with the caster's own coordinates at that
+                    // moment. A summoner that takes four steps in the settle
+                    // window would otherwise turn an arrival into `elsewhere`,
+                    // and the guard in SummonReadBack that names exactly that
+                    // case could never fire, because DoSummon had already
+                    // refused this pair of readings before the packet.
+                    check.ev.at = ReadStandingPlace(summoner);
+
+                    // KEEP THE SELECTION ALIVE. The ritual reads it again when
+                    // it completes; a summoner that retargets in between
+                    // summons nobody, and nothing anywhere would say why.
+                    if (summoner->GetTarget() != check.summonedGuid)
+                        DriveSelection(summoner->GetSession(), check.summonedGuid);
+
+                    // AND THE PARTICIPANT COUNT IS NOT THE ONE TAKEN AT THE
+                    // CLICK. GameObject::Update runs CheckRitualList a second
+                    // time when the ritual settles and erases anybody who has
+                    // stopped channelling the anim spell - a second clicker
+                    // that walked, most likely, since that spell's channel
+                    // interrupt flags include movement. Recording the count at
+                    // the click would report "2 of 2" for a ritual that never
+                    // fired at all.
+                    if (GameObject* portal = FindSummonPortal(summoner))
+                        check.ev.participants = portal->GetUniqueUseCount();
+                }
+            }
+
+            // PRESS THE BUTTON. Every poll on which a request is actually
+            // pending, because the request appears on the tick the ritual
+            // settles and this module only looks every COMMAND_POLL_MS.
+            bool acceptedThisPoll = false;
+            if (summoned && summoned->GetSession()
+                && summoned->GetSummonExpireTimer() > GameTime::GetGameTime().count())
+            {
+                check.ev.requestSeen = 1;
+                DriveSummonAccept(summoned->GetSession(), check.summonerGuid);
+                ++check.ev.accepts;
+                acceptedThisPoll = true;
+            }
+            else if (check.ev.requestSeen < 0)
+                check.ev.requestSeen = 0;
+
+            // AN ACCEPT THAT WORKED STARTED A TELEPORT INSIDE THE CALL ABOVE,
+            // AND THE TIMER THAT WOULD SAY SO IS ALREADY GONE.
+            // Player::SummonIfPossible sets m_summon_expire to zero and THEN
+            // calls TeleportTo, so asking GetSummonExpireTimer again after
+            // driving the accept always answers "nothing pending" - whether the
+            // summon worked or was refused for combat. The reading that can
+            // still tell them apart is the flight, taken again now, because the
+            // one before the accept was taken before there was anything to see.
+            //
+            // This is #310 in its second disguise: a position read on the poll
+            // that pressed the button is the position the character is LEAVING,
+            // and judging it says `stayed` about a character mid-ocean. So no
+            // verdict is ever written on a poll that drove an accept.
+            if (acceptedThisPoll)
+            {
+                check.ev.flight = ReadTeleportFlight(true, summoned->IsInWorld(),
+                                                     summoned->IsBeingTeleported(),
+                                                     check.ev.waitedMs, ceilingMs);
+                if (check.ev.waitedMs < ceilingMs)
+                {
+                    stillSummoning.push_back(check);
+                    continue;
+                }
+            }
+
+            if (check.ev.waitedMs < check.ev.windowMs)
+            {
+                stillSummoning.push_back(check);
+                continue;
+            }
+
+            // The window is up and a request is STILL open, which after the
+            // block above means the accept could not be driven at all - the
+            // character has no session to hand a packet to. Given more time, up
+            // to the ceiling, so a summon that never lands still ends as a real
+            // answer rather than waiting for ever.
+            if (check.ev.waitedMs < ceilingMs && summoned
+                && summoned->GetSummonExpireTimer() > GameTime::GetGameTime().count())
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: summon {} of '{}' is past its {}ms window but the request "
+                         "is still open; waiting rather than calling it a failure",
+                         check.id, check.summonedName, check.ev.windowMs);
+                stillSummoning.push_back(check);
+                continue;
+            }
+
+            if (summoned)
+            {
+                check.ev.now = ReadStandingPlace(summoned);
+                check.ev.deadAtVerdict = summoned->IsAlive() ? 0 : 1;
+                check.ev.inCombatAtVerdict = summoned->IsInCombat() ? 1 : 0;
+            }
+            check.ev.verdict = SummonReadBack(check.ev.from, check.ev.at, check.ev.now,
+                                              SUMMON_ARRIVED_YARDS, SUMMON_MOVED_YARDS);
+
+            char const* status = "error";
+            char const* detail = "";
+            char const* outcome = SummonOutcomeWord(check.ev.verdict);
+
+            switch (check.ev.verdict)
+            {
+                case SummonOutcome::Arrived:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' was summoned to '{}' at the meeting stone and "
+                             "reads back on map {} - the party is together again after {}ms",
+                             check.ev.summoned, check.ev.summoner, check.ev.now.mapId,
+                             check.ev.waitedMs);
+                    break;
+                case SummonOutcome::Stayed:
+                    status = "unchanged";
+                    detail = "the ritual went out and the character never left";
+                    LOG_WARN("module.overseer",
+                             "overseer: summon {} of '{}' moved nobody - {} of {} participants, "
+                             "request seen {}, {} accept(s) driven, flight {}. It is still on "
+                             "map {}",
+                             check.id, check.ev.summoned, check.ev.participants,
+                             check.ev.required, check.ev.requestSeen == 1 ? "yes" : "no",
+                             check.ev.accepts, TeleportFlightWord(check.ev.flight),
+                             check.ev.now.mapId);
+                    break;
+                case SummonOutcome::Elsewhere:
+                    detail = "the character moved, and not to the summon point";
+                    LOG_WARN("module.overseer",
+                             "overseer: summon {} of '{}' ended on map {} and not at the summon "
+                             "point on map {} - dead {}, in combat {}",
+                             check.id, check.ev.summoned, check.ev.now.mapId, check.ev.at.mapId,
+                             check.ev.deadAtVerdict == 1 ? "yes" : "no",
+                             check.ev.inCombatAtVerdict == 1 ? "yes" : "no");
+                    break;
+                case SummonOutcome::Unreadable:
+                    detail = "the summon could not be read back";
+                    LOG_WARN("module.overseer",
+                             "overseer: summon {} of '{}' cannot be judged - flight {}, from "
+                             "known {}, summon point known {}, now known {}",
+                             check.id, check.ev.summoned, TeleportFlightWord(check.ev.flight),
+                             check.ev.from.known, check.ev.at.known, check.ev.now.known);
+                    break;
+            }
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(SummonJson(check.ev, outcome, detail)), check.id,
+                g_runToken);
+        }
+
+        _pendingSummons.swap(stillSummoning);
     }
 
 

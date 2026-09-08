@@ -1,0 +1,251 @@
+-- kind='summon': summon one absent party member to a dungeon's summoning stone,
+-- across continents, through the game's own mechanic (part of #313).
+--
+-- WHY THIS EXISTS.
+--
+-- This family is split across two continents and, before this, nothing in this
+-- module could rejoin it. Read off the live realm at 2026-09-08 00:40 UTC:
+--
+--   name  level race   class    map zone  where
+--   Og    26    Human  Mage     1   406   Stonetalon, party leader
+--   Bork  27    Gnome  Rogue    1   406   Stonetalon
+--   Grog  28    Dwarf  Paladin  1   17    The Barrens
+--   Grug  32    Human  Warrior  0   1     Dun Morogh
+--   Ugga  27    Human  Priest   0   11    Wetlands
+--
+-- All five are one group (acore_characters.group_member, group 2). Wailing
+-- Caverns is on map 1, so the campaign the family exists to run is blocked on
+-- two characters, and the module says so on every poll:
+--
+--   overseer: 'Grug' is on map 0 and its leader 'Og' is on map 1 - THE PARTY IS
+--   SPLIT ACROSS TWO MAPS AND NOTHING IN THIS MODULE CAN REJOIN IT.
+--
+-- The three filed answers are all the boat and none of them has landed (#274,
+-- #279, #303, #304, #305). #304 is the one that bites here: the crossing is
+-- only consulted when the LEADER is off the outside map, and this leader is
+-- already across, so the code path is never entered at all. #308's hearthstone
+-- cannot help either, because Grug and Ugga are both bound in Elwynn Forest on
+-- map 0 - their hearthstone moves them within the wrong continent.
+--
+-- THE MECHANISM, MEASURED. Every id below was read out of the pinned core's
+-- source, the live acore_world database, or the server's own Spell.dbc, on
+-- 2026-09-08. Nothing here is from memory, and one thing that a memory would
+-- have got wrong is called out where it matters.
+--
+-- The stone. acore_world.gameobject_template:
+--
+--   entry  type  name           Data0     Data1     Data2
+--   178884 23    Meeting Stone  15        255       718
+--                               minLevel  maxLevel  areaID (Wailing Caverns)
+--
+-- THE STONE IS TYPE 23, GAMEOBJECT_TYPE_MEETINGSTONE. It is NOT type 18
+-- GAMEOBJECT_TYPE_SUMMONING_RITUAL, and that is the single fact this verb would
+-- have been built wrong without: reqParticipants is a type 18 field and a type
+-- 23 stone does not have one. A verb written against "how many clickers does
+-- the stone need" would have been reading maxLevel.
+--
+-- It has exactly one spawn in acore_world.gameobject:
+--
+--   guid   id     map zoneId areaId x        y         z        spawntimesecs
+--   15686  178884 1   17     17     -793.299 -2135.61  92.3452  900
+--
+-- The chain, with file:line at CORE_SHA efe123fab543c5faf3c477674ec17a18fd59f09f:
+--
+--   1. GameObject::Use, case GAMEOBJECT_TYPE_MEETINGSTONE
+--      (GameObject.cpp:1902-1929). It resolves WHO IS BEING SUMMONED from the
+--      clicker's own selection - ObjectAccessor::FindPlayer(player->GetTarget()),
+--      which is NOT map scoped - refuses a target that is not
+--      IsInSameRaidWith, refuses either party below meetingstone.minLevel, and
+--      sets spellId = 23598 (GameObject.cpp:1925). The tail casts it on the
+--      clicker (GameObject.cpp:2074-2077).
+--   2. Spell 23598 'Meeting Stone Summon'. Spell.dbc: Effect[0] = 151
+--      SPELL_EFFECT_TRIGGER_SPELL_2, EffectTriggerSpell = 59782. Handled by
+--      Spell::EffectTriggerRitualOfSummoning (SpellEffects.cpp:1051-1068),
+--      which finishes and casts the trigger.
+--   3. Spell 59782 'Summoning Stone Effect'. Spell.dbc: Effect[0] = 50
+--      SPELL_EFFECT_TRANS_DOOR, TargetA = 18 TARGET_DEST_CASTER,
+--      EffectMiscValue = 179944; AttributesEx carries 0x4
+--      SPELL_ATTR1_IS_CHANNELED and DurationIndex 4 = 120000 ms. So the
+--      summoner CHANNELS for two minutes and the portal exists for two minutes.
+--      Spell::EffectTransmitted creates it, and for a
+--      GAMEOBJECT_TYPE_SUMMONING_RITUAL it seeds the caster as the ritual's
+--      first participant (SpellEffects.cpp:5465-5473).
+--   4. The portal. acore_world.gameobject_template:
+--
+--        entry  type name                            Data0 Data1 Data2 Data6
+--        179944 18   Meeting Stone Summoning Portal  2     7720  32783 1
+--                                       reqParticipants spellId animSpell
+--                                                                   castersGrouped
+--
+--      reqParticipants is 2 and the summoner is already one of them, SO
+--      EXACTLY ONE MORE PARTY MEMBER HAS TO CLICK. castersGrouped is 1, so that
+--      clicker must be IsInSameRaidWith the owner; GameObject::Use refuses the
+--      owner itself by name, because the spell effect already counted it
+--      (GameObject.cpp:1810-1873). animSpell 32783 'Arcane Channeling' carries
+--      0x40 SPELL_ATTR1_IS_SELF_CHANNELED with DurationIndex 21 = -1, so the
+--      second clicker channels until the ritual ends;
+--      GameObject::CheckRitualList (GameObject.cpp:217-244) drops any
+--      participant that stops.
+--   5. On the second click the count is reached and the ritual is set to
+--      complete five seconds later (GameObject.cpp:1863-1872). GameObject::Update
+--      then casts spellId at the summoner (GameObject.cpp:524-583).
+--   6. Spell 7720 'Ritual of Summoning'. Spell.dbc: Effect[0] = 85
+--      SPELL_EFFECT_SUMMON_PLAYER, AttributesEx2 = 0x4
+--      SPELL_ATTR2_IGNORE_LINE_OF_SIGHT.
+--
+--      THAT ATTRIBUTE IS WHAT MAKES THE CROSSING LEGAL, and it is worth
+--      spelling out because without it this verb cannot work at all.
+--      Spell::SelectEffectTypeImplicitTargets special-cases
+--      SPELL_EFFECT_SUMMON_PLAYER (Spell.cpp:2001-2020): it ignores the
+--      explicit victim and reads m_caster->ToPlayer()->GetTarget() AGAIN, LIVE,
+--      then finds it with ObjectAccessor::FindPlayer, which is global. It adds
+--      that target through Spell::AddUnitTarget, whose first act is
+--      Spell::CheckEffectTarget - and that function's default case ends in
+--      IsWithinLOSInMap, which returns false for anything on another map.
+--      SPELL_ATTR2_IGNORE_LINE_OF_SIGHT is the early return above it
+--      (Spell.cpp:8024) that lets a cross-map target survive. The far effect is
+--      then run by the explicit "only players may be targeted across maps"
+--      branch in Spell::DoAllEffectOnTarget (Spell.cpp:2582-2608).
+--
+--      BECAUSE THE SELECTION IS READ LIVE AT STEP 6 AND NOT AT STEP 1, this
+--      module re-asserts the summoner's selection on every poll while the
+--      ritual is pending. A bot that retargets in those five seconds summons
+--      nobody and nothing anywhere says why.
+--   7. Spell::EffectSummonPlayer (SpellEffects.cpp:4221-4251) calls
+--      Player::SetSummonPoint with the CASTER'S OWN COORDINATES - so the summon
+--      point is the summoner, not the stone - and sends SMSG_SUMMON_REQUEST.
+--      IT MOVES NOBODY. SetSummonPoint (Player.cpp:16691-16699) gives the
+--      character MAX_PLAYER_SUMMON_DELAY to answer, which is 2*MINUTE
+--      (Player.h:923).
+--   8. The character has to accept. WorldSession::HandleSummonResponseOpcode
+--      (MovementHandler.cpp:870-891) returns without a word if the character is
+--      dead or in combat, and otherwise calls Player::SummonIfPossible
+--      (Player.cpp:12681-12703), which teleports.
+--
+--      A BOT HAS NO CLIENT TO PRESS THAT BUTTON. mod-playerbots at
+--      MODULE_SHA 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312 has no handler for
+--      SMSG_SUMMON_REQUEST, no reference to CMSG_SUMMON_RESPONSE and no path to
+--      SummonIfPossible anywhere in its source. Nothing in this fleet has ever
+--      answered a summon; every one that was ever sent expired.
+--   9. Accepting across maps is a FAR teleport, and Player::TeleportTo
+--      (Player.cpp:1575, :1640) removes the character from the world and sets
+--      the far semaphore until MSG_MOVE_WORLDPORT_ACK comes back.
+--      PlayerbotHolder::UpdateSessions (PlayerbotMgr.cpp:241-250) is the only
+--      thing that sends it, through PlayerbotAI::HandleTeleportAck
+--      (PlayerbotAI.cpp:774-820). A character with no bot AI would leave one
+--      map and never arrive on the other, so that is a hard refusal here.
+--
+-- WHAT IT COSTS, MEASURED. Five seconds of ritual settle (GameObject.cpp:1871),
+-- a two minute portal (Spell.dbc DurationIndex 4), and a two minute accept
+-- window (Player.h:923). The executor's own wait is the settle plus a margin,
+-- floored, plus a ceiling for the teleport - seconds, not minutes, and well
+-- inside COMMAND_CLAIM_LEASE_SECONDS.
+--
+-- WHY NOT A TELEPORT, AND WHY NOT mod-playerbots' OWN SummonAction.
+--
+-- Player::TeleportTo appears in mod_overseer.cpp on revival paths that each
+-- argued for themselves. A call to it with nothing in front of it, to move a
+-- character across an ocean because a queue asked, would be a GM summon wearing
+-- a game mechanic's name - the exact admin shortcut AGENTS.md exists to forbid.
+--
+-- mod-playerbots' SummonAction was read before this was written, not assumed
+-- away. UseMeetingStoneAction.cpp:93-111 checks that a meeting stone is
+-- somewhere within sight distance of the summoner and then calls
+-- SummonAction::Teleport (:164-262), which is a plain Player::TeleportTo at a
+-- follow-distance offset. No selection, no portal, no second clicker, no summon
+-- request, no accept. Its Execute() path (:60-91) does not even keep the stone
+-- gate: the branch it takes first is `GetSecurity() >= SEC_PLAYER`, and
+-- SEC_PLAYER is 0, so that condition is always true. Reusing it would have been
+-- one line and would have reported success for a mechanism the game never ran.
+--
+-- WHY THE ROW IS BELIEVED ONLY AFTER THE WORLD IS READ BACK.
+--
+-- Nothing has happened when the portal click returns. The ritual settles on a
+-- later world tick, the request goes out on the tick after that, the accept is
+-- a packet this module sends on its next poll, and the teleport lands later
+-- still. So the row parks in `verifying` and ResolveSummonChecks reads back
+-- where the summoned character actually is, exactly as kind='hearth' does.
+-- `delivered` here would be the claim AGENTS.md warns about, and the verdict
+-- comes from a position and not from a call that returned.
+--
+-- ONE THING THE HEARTH GOT WRONG, FIXED IN THE SAME CHANGE (#310). Its
+-- read-back asked ObjectAccessor::FindPlayerByName with checkInWorld left at
+-- its default of true (ObjectAccessor.h:81). A character mid far-teleport is
+-- out of the world, so the lookup answered null and the row said `error` about
+-- a cross-continent hearth that had WORKED. Leaving the world is what a
+-- successful cross-map teleport looks like from the world thread. Both
+-- read-backs now go through OverseerDecisions::ReadTeleportFlight, which tells
+-- a crossing apart from a logout, and only the name map answers "gone".
+--
+-- THE REFUSALS. Every one is a named literal in the `detail` column with its
+-- retry class in the `result` JSON, and none of them is a silence. The core's
+-- own gates are asked in this module's words before the packet goes out, so a
+-- refusal the core would report to a client that is not there is reported to
+-- the queue instead: no session, not in the world, summoning itself, not its
+-- own mover, dead, in flight, in combat, moving, already casting, on a
+-- transport, no stone within reach, an unknown stone template, below the
+-- minimum level of the stone; the character to summon not online, not in the
+-- world, not in the party, below the minimum level, WITH NO BOT AI TO
+-- ACKNOWLEDGE THE TELEPORT, dead, in combat, in flight, already being
+-- teleported, already carrying a summon, unable to enter the instance the
+-- summoner is in, already at the summon point; the second clicker not online,
+-- not in the world, being the summoner, not in the party, with no session,
+-- dead, in combat, MOVING, ALREADY CASTING, out of reach of the portal, or
+-- absent entirely; and the two readings that say the mechanism did not start -
+-- the summoner never began channelling, and the ritual never reached its
+-- participant count.
+--
+-- NOT ONE OF THOSE LITERALS MAY CARRY AN APOSTROPHE. `detail` is interpolated
+-- into the UPDATE unescaped, the way every executor in mod_overseer.cpp writes
+-- it, so a quote character inside one fails the statement, leaves the row
+-- `claimed` under this run's own token, and strands it until the worldserver
+-- restarts. Five of these literals were phrased with one and were caught in
+-- review; the wording is deliberately clumsy where avoiding the apostrophe made
+-- it so.
+--
+-- THE SECOND CLICKER IS REFUSED FOR MOVING, and that is not obvious. Its click
+-- starts the portal's anim spell, which is channelled with movement among its
+-- interrupt flags, and GameObject::Update runs CheckRitualList a SECOND time
+-- when the ritual settles - erasing any participant that stopped channelling
+-- and dropping the count back under what the ritual needs. A helper that walks
+-- kills the summon silently, five seconds after everything looked fine.
+--
+-- The retry class of each is decided by OverseerDecisions::SummonRefusalRetry
+-- and pinned literal by literal in tests/test_summon.cpp.
+--
+-- Column re-use, no new columns:
+--   target_name  the SUMMONER: the character that stands at the stone and
+--                clicks it. The actor, as in every other verb here.
+--   command      `use <name>`, or bare `<name>`, naming the character to
+--                summon. Unlike kind='hearth', AN EMPTY COMMAND IS A REFUSAL:
+--                this verb has an argument and four party members it could
+--                mean, so there is no safe default.
+--   target_arg   optional: the second clicker. Empty means "pick an eligible
+--                party member already standing at the stone".
+--   detail       short refusal literal, or empty on success
+--   result       JSON: outcome (arrived|stayed|elsewhere|refused|unreadable),
+--                reason, retry (never|elsewhere|later), summoner, summoned,
+--                helper, verdict, flight (landed|in-flight|stranded|gone),
+--                stone_entry, portal_entry, min_level, participants, required,
+--                accepts, settle_ms, window_ms, waited_ms, stone_yards,
+--                nearest_stone_yards, channelling_after_click, request_seen,
+--                dead_at_verdict, in_combat_at_verdict, at, from and now each
+--                {map, area, x, y, z} or null, request
+--   status       'verifying' from the moment the portal is clicked, then
+--                'applied' when the summoned character reads back at the summon
+--                point, 'unchanged' when it never left, 'error' otherwise.
+--
+-- NO STATUS VALUES ARE ADDED. 'verifying', 'applied' and 'unchanged' are
+-- already in the status enum, added by 2026_08_24_04_overseer_outcome.sql for
+-- the strategy read-back, and they mean here exactly what they mean there. This
+-- migration therefore touches one column.
+--
+-- THE ENUM LISTS THE FULL UNION, for the reason spelled out on the bind, hearth,
+-- repair and buy migrations: parallel branches are adding values, each ALTER
+-- names every one of them, and the base CREATE TABLE is `IF NOT EXISTS` so it
+-- can never add one. 'summon' is APPENDED and nothing is inserted in the
+-- middle, because MySQL stores an ENUM as the ordinal of its value and moving
+-- one would silently relabel every row already written.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon')
+        NOT NULL DEFAULT 'bot';
