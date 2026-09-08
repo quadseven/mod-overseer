@@ -622,7 +622,18 @@ bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise);
 // strides is the shortest reach the footing fan asks anything at - see the
 // adapter's own AnyDirectionHolds, which gives that reason for that number -
 // so two strides is the floor here as well.
-bool ProvenStepIsWorthTaking(float provedYards, float minYards);
+//
+// THE FLOOR IS ON THE TRUNCATION AND ON NOTHING ELSE, which is why
+// `wholeBearingHeld` is an argument rather than something the caller folds in
+// for itself. A bearing that held all the way is taken however short it is,
+// byte for byte as before: the reach for a near aim is the remaining distance,
+// so an aim seven yards off in open country asks for a seven yard step, and a
+// floor applied to THAT would refuse the exact case GroundHolds' uphill retry
+// was added for. This predicate may only ever refuse a step the old rule would
+// have refused too, and the short-circuit is what makes that true rather than
+// nearly true.
+bool ProvenStepIsWorthTaking(bool wholeBearingHeld, float provedYards,
+                             float minYards);
 
 // A FOOTING REFUSAL IS A FACT ABOUT WHERE A CHARACTER STANDS (#312).
 //

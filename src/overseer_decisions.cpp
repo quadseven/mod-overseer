@@ -312,8 +312,13 @@ bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise)
     return (change < 0.f ? -change : change) <= bound;
 }
 
-bool ProvenStepIsWorthTaking(float provedYards, float minYards)
+bool ProvenStepIsWorthTaking(bool wholeBearingHeld, float provedYards,
+                             float minYards)
 {
+    // Nothing was truncated, so there is nothing for the floor to judge. See
+    // the header: this is what keeps the rule strictly narrowing.
+    if (wholeBearingHeld)
+        return true;
     // A negative floor is refused rather than folded to its magnitude, for the
     // reason TravelEndpointWithinTolerance below refuses one: reading a
     // nonsense bound charitably would LOOSEN this rule, and every mistake this

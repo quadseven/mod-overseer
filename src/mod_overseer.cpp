@@ -10010,7 +10010,7 @@ private:
             // measured refusals that threw 16, 24, 44 and 48 proved yards away.
             float const walk = holds ? reach : proved;
             if (!OverseerDecisions::ProvenStepIsWorthTaking(
-                    walk, TRAVEL_STEP_MIN_YARDS))
+                    holds, proved, TRAVEL_STEP_MIN_YARDS))
                 continue;
             float const tx = bot->GetPositionX() + std::cos(angle) * walk;
             float const ty = bot->GetPositionY() + std::sin(angle) * walk;

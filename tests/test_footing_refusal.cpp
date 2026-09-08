@@ -69,13 +69,13 @@ void TheFourMeasuredRefusalsAreAllWorthWalking()
 {
     // Stride 5 of 15 on a 60 yard probe: four strides held, sixteen yards.
     Check("straight bearing, 16 proved yards",
-          ProvenStepIsWorthTaking(16.f, MIN_STEP), true);
+          ProvenStepIsWorthTaking(false, 16.f, MIN_STEP), true);
     Check("second bearing, 24 proved yards",
-          ProvenStepIsWorthTaking(24.f, MIN_STEP), true);
+          ProvenStepIsWorthTaking(false, 24.f, MIN_STEP), true);
     Check("third bearing, 44 proved yards",
-          ProvenStepIsWorthTaking(44.f, MIN_STEP), true);
+          ProvenStepIsWorthTaking(false, 44.f, MIN_STEP), true);
     Check("fourth bearing, 48 proved yards",
-          ProvenStepIsWorthTaking(48.f, MIN_STEP), true);
+          ProvenStepIsWorthTaking(false, 48.f, MIN_STEP), true);
 }
 
 void AProbeThatBrokeAtItsFirstStrideStillGetsNothing()
@@ -83,28 +83,49 @@ void AProbeThatBrokeAtItsFirstStrideStillGetsNothing()
     // The other character measured that night stood at the foot of a 74 yard
     // wall: its straight bearing broke on stride ONE, so nothing was proved
     // and nothing may be walked. A cliff is still a cliff.
-    Check("nothing proved", ProvenStepIsWorthTaking(0.f, MIN_STEP), false);
-    Check("one stride proved", ProvenStepIsWorthTaking(4.f, MIN_STEP), false);
+    Check("nothing proved", ProvenStepIsWorthTaking(false, 0.f, MIN_STEP), false);
+    Check("one stride proved",
+          ProvenStepIsWorthTaking(false, 4.f, MIN_STEP), false);
     Check("just under two strides",
-          ProvenStepIsWorthTaking(7.99f, MIN_STEP), false);
-    Check("exactly two strides", ProvenStepIsWorthTaking(8.f, MIN_STEP), true);
+          ProvenStepIsWorthTaking(false, 7.99f, MIN_STEP), false);
+    Check("exactly two strides",
+          ProvenStepIsWorthTaking(false, 8.f, MIN_STEP), true);
 }
 
-void AFullReachIsUnchanged()
+void AWholeBearingThatHeldIsNeverRefusedByTheFloor()
 {
-    // A bearing that held all the way still walks all the way: this rule can
-    // only ever shorten a step, never lengthen one.
-    Check("the whole sixty yards", ProvenStepIsWorthTaking(60.f, MIN_STEP), true);
+    // THE REGRESSION THIS PREDICATE WOULD OTHERWISE HAVE SHIPPED. The fan's
+    // reach for a near aim is the remaining distance, so an aim seven yards
+    // off asks for a seven yard step - which is under the floor, and which
+    // the old rule took without complaint. That is the exact case GroundHolds'
+    // uphill retry was added for: 'Bork' refused an aim SEVEN yards away in
+    // open Duskwood. A floor that refused it would have traded one false
+    // refusal for another.
+    Check("a seven yard aim that held all the way",
+          ProvenStepIsWorthTaking(true, 7.f, MIN_STEP), true);
+    Check("a two yard aim that held all the way",
+          ProvenStepIsWorthTaking(true, 2.f, MIN_STEP), true);
+    Check("the whole sixty yards",
+          ProvenStepIsWorthTaking(true, 60.f, MIN_STEP), true);
+    // ...and a bearing that did NOT hold the whole way is judged, at the same
+    // distances. This is the only difference the flag makes.
+    Check("seven truncated yards is still under the floor",
+          ProvenStepIsWorthTaking(false, 7.f, MIN_STEP), false);
 }
 
 void ANonsenseFloorIsRefusedRatherThanFolded()
 {
     // Reading a negative bound charitably would LOOSEN the rule, and every
     // mistake this predicate can make has to be the tight one.
-    Check("negative floor, ample ground",
-          ProvenStepIsWorthTaking(60.f, -1.f), false);
+    Check("negative floor, ample truncated ground",
+          ProvenStepIsWorthTaking(false, 60.f, -1.f), false);
     Check("a floor of zero still admits a zero step",
-          ProvenStepIsWorthTaking(0.f, 0.f), true);
+          ProvenStepIsWorthTaking(false, 0.f, 0.f), true);
+    // A whole bearing is not judged at all, so a nonsense floor cannot reach
+    // it either. That is the short-circuit and not an oversight: the argument
+    // is that the old rule took this step, and it did.
+    Check("a whole bearing is taken even under a nonsense floor",
+          ProvenStepIsWorthTaking(true, 60.f, -1.f), true);
 }
 
 // ------------------------------------------------------------------------
@@ -243,7 +264,7 @@ int main()
 {
     TheFourMeasuredRefusalsAreAllWorthWalking();
     AProbeThatBrokeAtItsFirstStrideStillGetsNothing();
-    AFullReachIsUnchanged();
+    AWholeBearingThatHeldIsNeverRefusedByTheFloor();
     ANonsenseFloorIsRefusedRatherThanFolded();
 
     TheFirstRefusalOfAnEpisodeIsTheOneThatSpeaks();
