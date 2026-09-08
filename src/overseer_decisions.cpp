@@ -5965,4 +5965,30 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
     return plan;
 }
 
+// ------------------ what stopped a cast this module drove at the core (#337) --
+
+char const* CastWallBlocker(CastWallGate const& gate)
+{
+    // IN THE ORDER THE CORE REACHES THEM, so a row never names a wall the cast
+    // had not got to yet. Flight first because it is checked before the spell is
+    // looked at, then the stand state, then movement, then the two that are
+    // about the spell rather than the caster.
+    if (!gate.grounded)
+        return CastWall::InFlight;
+    if (!gate.standing)
+        return CastWall::NotStanding;
+    if (!gate.still)
+        return CastWall::Moving;
+    if (!gate.ready)
+        return CastWall::OnCooldown;
+    if (!gate.free)
+        return CastWall::AlreadyCasting;
+    return "";
+}
+
+char const* HearthStayedDetail(bool castWasSeen)
+{
+    return castWasSeen ? HEARTH_STAYED_CAST_SEEN : HEARTH_STAYED_NO_CAST;
+}
+
 }  // namespace OverseerDecisions
