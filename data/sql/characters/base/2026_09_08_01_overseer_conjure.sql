@@ -1,0 +1,184 @@
+-- Make the family's food and water out of nothing, with the spell a character
+-- already knows, through the game's own cast (part of #147, slice of #18).
+--
+-- THE MEASUREMENT THAT MADE THIS THE FIRST THING TO BUILD. Read off the live
+-- realm on 2026-09-07, before a line of it was written:
+--
+--   character  class    level  bag items  food  drink  money
+--   ---------  -------  -----  ---------  ----  -----  ------
+--   Bork       rogue      27      71        0     0    146 g
+--   Grog       paladin    28      49        0     0    173 g
+--   Grug       warrior    32      69        0     0    168 g
+--   Og (lead)  mage       26      69        0     0    160 g
+--   Ugga       priest     27      54        0     0    167 g
+--
+-- Not one item of food and not one of drink across the whole family, and about
+-- 160 gold each. The two zero columns are counted with the game's own
+-- classification and not with a list of item ids somebody remembered:
+-- item_template.spellcategory_1 is 11 for anything eaten and 59 for anything
+-- drunk. mod-playerbots asks exactly those two numbers of exactly that field,
+-- so this is the world's own answer to "what is food" rather than a second one
+-- that can go stale.
+--
+-- Over the same evening the party died seven times in twenty one minutes to
+-- creatures a few levels above them. Two of the five are mana users who cannot
+-- restore mana between pulls with nothing to drink.
+--
+-- WHY THIS IS NOT A SHOPPING TRIP. They are not poor, so kind='buy' at a vendor
+-- looks like the answer, and it is the SECOND answer. The party leader is a
+-- MAGE who has known how to conjure food since level 6 and water since level 4
+-- and has never once done either. His spell rows carry 587, 597 and 990
+-- (Conjure Food ranks 1 to 3) and 5504, 5505 and 5506 (Conjure Water ranks 1 to
+-- 3), all active, and nothing conjured exists anywhere in the family's bags:
+-- zero consumables carrying ITEM_FLAG_CONJURED, which is the flag every
+-- Conjured * item has and the one upstream's "conjured food" qualifier tests.
+-- Conjured food and water are free, unlimited, always level appropriate, and
+-- one mage supplies five characters; buying loses on every axis.
+--
+-- THE TABLE ABOVE IS A READING FROM ONE DAY, not a property of the family, and
+-- it had already drifted by the time this was written: one member looted six
+-- units of vendor food. The zero that matters has not moved. Nobody has a
+-- drink, nothing conjured exists, and the reason for both is below.
+--
+-- WHY HE NEVER DOES IT, ESTABLISHED IN UPSTREAM'S SOURCE AND NOT INFERRED FROM
+-- THE SYMPTOM. Both ends of the mechanism are already in mod-playerbots and
+-- nothing connects them:
+--
+--   * NoFoodTrigger and NoDrinkTrigger exist and are registered as "no food"
+--     and "no drink". Their condition is written specifically for a conjurer:
+--     "does this character carry any CONJURED food".
+--   * CastConjureFoodAction and CastConjureWaterAction exist and are registered
+--     as "conjure food" and "conjure water". There is even a branch in
+--     CastSpellAction::Execute that exists only for those two names.
+--   * No strategy in the whole tree ever pushes a TriggerNode naming any of the
+--     four. The only NextAction("conjure ...") upstream carries is "conjure
+--     mana gem".
+--
+-- It was not this module's strategy stand-downs, not a trigger whose condition
+-- is never met, and not a missing rank. It was never asked.
+-- patches/mod-playerbots/0013-a-mage-never-conjures-food-or-water.patch is that
+-- missing wire, and it is the half of the fix that needs no row at all.
+--
+-- SO WHY A VERB AS WELL, when a two line patch makes the mage self-sufficient.
+-- Because the trigger upstream wrote fires when the conjured stack is EMPTY,
+-- which keeps ONE character supplied and can never feed five. Stocking a party
+-- is a decision about a party - how many members, how many of them drink, how
+-- long the run is - and a bot's own appetite cannot take it. This is how the
+-- side that knows those things asks. The conjured items are BIND_NONE
+-- (measured: `bonding` is 0 on every Conjured * row in item_template), so
+-- kind='give' and kind='trade' hand them out afterwards and nothing new had to
+-- be built for that.
+--
+-- WHAT ONE CAST COSTS AND PRODUCES, off Spell.dbc at the pinned build rather
+-- than remembered. Every Conjure Food and Conjure Water rank below level 60
+-- creates TWO items per three second cast, and the items stack to twenty. One
+-- stack is therefore ten casts and thirty seconds of a character standing
+-- still. That number is the whole reason this executor is shaped the way it is.
+--
+-- WHY A CONJURE CANNOT BE ANSWERED BY THE POLL THAT SENT IT. Nothing has
+-- happened when the call returns: the spell is preparing, with a timer the
+-- world tick decrements. Reading the bags back inside the call, which is what
+-- kind='sell', kind='repair' and kind='mail' all do, would count a stack that
+-- does not exist yet and be right, three seconds too early. So the row parks in
+-- `verifying`, the status a strategy command already uses while its
+-- post-condition is read back, exactly as kind='hearth' does.
+--
+-- AND IT IS THE ONE EXECUTOR THAT ACTS MORE THAN ONCE FOR ONE ROW. Ten casts,
+-- with a character that can die, be pulled into a fight, run out of mana or be
+-- handed a travel errand between any two of them. So the resolver reads the
+-- bags between every cast and decides again. A loop that could not see what it
+-- was producing would be the "delivered is not done" failure AGENTS.md is
+-- about, one that keeps casting for half a minute while producing nothing and
+-- then reports success.
+--
+-- WHAT ENDS A ROW, and there are four of them:
+--   * the bags reach the target                        -> applied,   `filled`
+--   * some appeared but fewer than asked               -> error,     `short`
+--   * casts went out and NOT ONE item appeared         -> unchanged, `nothing`
+--   * the count could not be read at all               -> error,     `unreadable`
+--
+-- `short` is an error and not a partial success on purpose, and it is safe to
+-- act on because the grammar is idempotent: `up_to:<n>` is what the character
+-- should END UP carrying, not how many to add, so sending the same row again
+-- finishes the job instead of doubling the stock.
+--
+-- THE IDLE TEST IS THE PART WORTH READING TWICE. Out of mana, interrupted by a
+-- stray hit, bags filled by something else, a rank whose product the character
+-- may not use: from the queue all four look identical, which is a cast that
+-- goes out and produces nothing. So a poll counts as idle only when a cast has
+-- FINISHED and left the count where it was, and four of those in a row end the
+-- row. Polls are two seconds and a cast is three, so counting a poll spent
+-- inside a running cast would have called every working loop a failure.
+--
+-- WHICH SPELL, AND WHY THERE IS NO SPELL ID OR ITEM ID ANYWHERE IN THIS VERB.
+-- Every spell the character knows and may still cast is asked what it CREATES;
+-- a product that is a CONJURED consumable in the wanted category and that the
+-- character may use makes the spell a candidate, and the best product wins. So
+-- a mage that outgrows a rank starts conjuring the next one with no change
+-- here, and a realm whose item data differs is not being held to a list this
+-- module wrote down. Upstream's own conjure branch matches the spell's NAME
+-- instead, which is a localisation and says nothing about whether the product
+-- is usable.
+--
+-- THE WORD "CONJURED" IN THAT SENTENCE IS THE FENCE, not decoration. "A spell
+-- that creates food" is also a cooking recipe - Herb Baked Egg is a consumable
+-- in spell category 11, made by a spell a character can know - and casting one
+-- needs reagents and a fire. A loop that picked one would cast ten times,
+-- produce nothing and report the spell as broken. ItemTemplate::
+-- IsConjuredConsumable is the core's own test and is the same one upstream's
+-- "conjured food" inventory qualifier uses, so this verb and the trigger the
+-- patch wires look for the same items.
+--
+-- WHY THE CAST GOES OUT THROUGH PlayerbotAI::CastSpell rather than through a
+-- hand-built CMSG_CAST_SPELL, which is what this module does everywhere else.
+-- It is the same call upstream's own CastConjureFoodAction ends in. With the
+-- patch applied there are two ways this family conjures, one driven by a row
+-- and one by the bot's own trigger, and they should exercise ONE cast path
+-- rather than two that can drift apart. The price is that a character with no
+-- bot AI is refused, which costs this family nothing: every character this
+-- module steers is a bot.
+--
+-- Column re-use, no new columns:
+--   target_name  the character that will cast
+--   command      `food` or `water`, optionally ` up_to:<units>`. There is no
+--                way to name a spell, a rank or an item, deliberately, and no
+--                empty form: this verb can do two things and guessing which one
+--                an empty row meant would be this module choosing what a family
+--                eats.
+--   target_arg   unused
+--   detail       short refusal literal, or empty
+--   result       JSON: outcome (casting|filled|short|nothing|refused|
+--                unreadable), reason, retry (never|elsewhere|later - see
+--                ConjureRefusalRetry in overseer_decisions.h), character, what,
+--                verdict, spell, item {entry, name, per_cast}, wanted,
+--                room_limited, carried_before, carried_after, casts_allowed,
+--                casts_spent, cast_ms, window_ms, waited_ms, request
+--   status       'verifying' from the moment the first cast goes out, then
+--                'applied', 'unchanged' or 'error'. NOT 'delivered', for the
+--                reason kind='hearth' is not: a row that reports delivery about
+--                a cast that has not finished is the bug this module keeps
+--                being bitten by.
+--
+-- NO STATUS VALUES ARE ADDED. 'verifying', 'applied' and 'unchanged' have been
+-- in the status enum since 2026_08_24_04_overseer_outcome.sql and mean here
+-- exactly what they mean there. This migration touches one column.
+--
+-- THE ENUM LISTS THE FULL UNION, for the reason the bind, repair, buy and
+-- hearth migrations spell out: parallel branches are adding values, an ALTER
+-- that MODIFYs an ENUM replaces the whole list rather than adding to it, and
+-- the base CREATE TABLE is `IF NOT EXISTS` so it can never add one. So the
+-- migration that runs LAST owns naming every value that exists by then, and one
+-- that lands later and forgets a value DELETES that verb from the schema
+-- silently, after which every row of that kind fails to insert.
+--
+-- THIS FILE WAS DATED 2026_09_07_02 AND HAD TO BE MOVED, which is worth
+-- recording rather than quietly fixing. kind='summon' (#313) merged while this
+-- branch was open, carrying 2026_09_08_00_overseer_summon.sql, whose ALTER
+-- names every value except 'conjure' - correctly, because 'conjure' did not
+-- exist when it was written. Applied in filename order that migration would
+-- have run AFTER this one and dropped this verb on the way past. Renaming this
+-- file to sort last, and naming 'summon' in the list below, is the whole fix.
+-- There is nothing clever available here: an ENUM cannot be added to.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon','conjure')
+        NOT NULL DEFAULT 'bot';

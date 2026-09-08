@@ -1,0 +1,102 @@
+Subject: [PATCH] a mage never conjures food or water, because nothing ever asks it to
+
+WHY THIS PATCH EXISTS
+
+The roster's mage has known how to conjure food since level 6 and water since
+level 4. He is level 26. He has never done it once. Measured, not inferred:
+
+  * The five roster characters carry, between them, ZERO items whose
+    item_template.spellcategory_1 is 11 (food) or 59 (drink). That is the
+    game's own classification and it is the same one this module's upstream
+    uses (InventoryAction.cpp:243 and :250 build a FindFoodVisitor on
+    categories 11 and 59). Not "not much". None.
+  * Nothing conjured exists anywhere in those bags either: zero consumables
+    carrying ITEM_FLAG_CONJURED, which is the flag every Conjured * item has
+    and the one the "conjured food" inventory qualifier tests.
+  * The mage's own spell rows carry 587, 597, 990 (Conjure Food ranks 1 to 3)
+    and 5504, 5505, 5506 (Conjure Water ranks 1 to 3), all active.
+  * His live non-combat strategy set contains "food", so the strategy that
+    would EAT food is on. There has simply never been any food.
+
+Over one measured evening the party died seven times in twenty one minutes.
+Two of the five are mana users who cannot restore mana between pulls without
+something to drink, and the mage who would supply it is one of them.
+
+WHERE IT ACTUALLY BREAKS, AND IT IS ONE LINE OF ABSENCE
+
+Both ends of this feature are already in this tree. Neither end is wired to
+the other.
+
+  * The TRIGGERS exist. NoFoodTrigger and NoDrinkTrigger are declared in
+    src/Ai/Base/Trigger/GenericTriggers.h:276 and :284, defined in
+    GenericTriggers.cpp:257 and :266, and registered by name as "no food" and
+    "no drink" in src/Ai/Base/TriggerContext.h:144-145. Their condition is
+    specifically written for a conjurer: `AI_VALUE2(std::vector<Item*>,
+    "inventory items", "conjured food").empty()`. They ask "do you have any
+    CONJURED food", which is a question only a class that can conjure has any
+    reason to be asked.
+
+  * The ACTIONS exist. CastConjureFoodAction and CastConjureWaterAction are
+    declared in src/Ai/Class/Mage/MageActions.h:167 and :173 and registered as
+    "conjure food" and "conjure water" in MageAiObjectContext.cpp:197-198.
+    There is even a bespoke branch in CastSpellAction::Execute
+    (GenericSpellActions.cpp:141) that exists only for these two names and
+    picks the highest known rank whose product the bot can actually use.
+
+  * NOTHING PUSHES A TriggerNode FOR EITHER. Grepping the whole tree for
+    `NextAction("conjure` returns exactly one hit, and it is "conjure mana
+    gem" in this file. Grepping for a TriggerNode naming "no food" or "no
+    drink" returns none at all. Both triggers and both actions are reachable
+    only by name, and no strategy in the tree ever names them.
+
+So the mage does not conjure because it is never asked, and this file is where
+the asking would go: GenericMageNonCombatStrategy is the mage's non-combat
+strategy and already wires the third conjure ("no mana gem" -> "conjure mana
+gem", one line above the two added here). The two added lines are the same
+shape as that one, using triggers and actions this tree already ships and
+already registers.
+
+WHY THESE RELEVANCE NUMBERS. Below the three buffs this strategy already
+carries (arcane intellect 21, conjure mana gem 20, focus magic 19) and above
+the oil (1). A mage with no armour buff and no food should put the armour up
+first; the food is worth doing before nothing at all. Water is one below food
+because a mage out of both wants the thing that also restores health first.
+
+WHAT THIS PATCH DELIBERATELY DOES NOT DO
+
+  * It does not change the trigger's threshold. NoFoodTrigger fires when the
+    conjured stack is EMPTY, so this makes a mage keep itself supplied and
+    nothing more. Conjuring a surplus for four other characters is a decision
+    about a party, taken from outside, and mod-overseer's kind='conjure' row
+    is where that decision lives. A trigger that tried to hold a party's worth
+    of stock would be this module guessing at a party size it is not told.
+
+  * It does not touch the dead branch it found. CastConjureFoodAction derives
+    from CastBuffSpellAction, whose Execute override (GenericSpellActions.cpp:
+    287) calls botAI->CastSpell(spell, target) directly, so the conjure branch
+    in CastSpellAction::Execute is unreachable from these two actions. The
+    name path resolves to the highest known rank anyway (SpellIdValue), so the
+    behaviour is right; the branch is simply dead code. Noted rather than
+    changed, because a base-class change here would alter GetTargetName for
+    both actions and is a second, separable fix.
+
+  * It adds no new trigger, action, value or strategy. Two lines, both of the
+    form this file already uses, naming four things that were already here.
+
+WHEN THIS PATCH SHOULD BE DELETED. The moment upstream pushes either
+TriggerNode into any mage strategy. apply-patches.sh will fail the build the
+day that happens, which is the intended way to find out.
+
+diff --git a/src/Ai/Class/Mage/Strategy/GenericMageNonCombatStrategy.cpp b/src/Ai/Class/Mage/Strategy/GenericMageNonCombatStrategy.cpp
+index 574302fb..14faf1a5 100644
+--- a/src/Ai/Class/Mage/Strategy/GenericMageNonCombatStrategy.cpp
++++ b/src/Ai/Class/Mage/Strategy/GenericMageNonCombatStrategy.cpp
+@@ -39,6 +39,8 @@ void GenericMageNonCombatStrategy::InitTriggers(std::vector<TriggerNode*>& trigg
+     triggers.push_back(new TriggerNode("no focus magic", { NextAction("focus magic on party", 19.0f) }));
+     triggers.push_back(new TriggerNode("often", { NextAction("apply oil", 1.0f) }));
+     triggers.push_back(new TriggerNode("no mana gem", { NextAction("conjure mana gem", 20.0f) }));
++    triggers.push_back(new TriggerNode("no food", { NextAction("conjure food", 18.0f) }));
++    triggers.push_back(new TriggerNode("no drink", { NextAction("conjure water", 17.0f) }));
+ }
+ 
+ void MageBuffManaStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
