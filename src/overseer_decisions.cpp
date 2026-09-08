@@ -5499,6 +5499,8 @@ char const* ConjureStepWord(ConjureStep step)
             return "cast";
         case ConjureStep::Wait:
             return "wait";
+        case ConjureStep::Settle:
+            return "settle";
         case ConjureStep::Done:
             return "done";
         case ConjureStep::GaveUp:
@@ -5507,28 +5509,122 @@ char const* ConjureStepWord(ConjureStep step)
     return "gave up";
 }
 
+char const* ConjureGaveUpReasonWord(ConjureGaveUp reason)
+{
+    switch (reason)
+    {
+        case ConjureGaveUp::NeverStoodStill:
+            return ConjureRefusal::NeverStoodStill;
+        case ConjureGaveUp::CastRefused:
+            return ConjureRefusal::CastRefused;
+        case ConjureGaveUp::NothingAppeared:
+            return ConjureRefusal::NothingAppeared;
+        case ConjureGaveUp::BudgetSpent:
+            return ConjureRefusal::BudgetSpent;
+        case ConjureGaveUp::NotGivenUp:
+            break;
+    }
+    return "";
+}
+
+namespace
+{
+
+// "NOT ONE OF THEM PRODUCED ANYTHING" AND "NOT ONE OF THEM EVER STARTED" ARE
+// DIFFERENT SENTENCES, and this is the one line that tells them apart. A row
+// that never had a single cast accepted, and had at least one declined, hit the
+// bot AI's own refusal rather than the spell; anything else really did cast.
+//
+// Shared by both places a row can end on this pair so the two cannot answer
+// differently, which is the mistake the whole of #325 is.
+OverseerDecisions::ConjureGaveUp NothingOrRefused(
+    OverseerDecisions::ConjureProgress const& progress)
+{
+    if (progress.castsSpent == 0 && progress.castsRefused != 0)
+        return OverseerDecisions::ConjureGaveUp::CastRefused;
+    return OverseerDecisions::ConjureGaveUp::NothingAppeared;
+}
+
+}  // namespace
+
+ConjureGaveUp ConjureGiveUpReason(ConjureProgress const& progress)
+{
+    // Arriving is not giving up, and it is asked first for the same reason
+    // ConjureNextStep asks it first: a character that reached its target on the
+    // cast that is finishing right now has finished, whatever else is true.
+    if (progress.wanted != 0 && progress.carried >= progress.wanted)
+        return ConjureGaveUp::NotGivenUp;
+
+    // THE WINDOW, AND IT BEATS A CAST IN FLIGHT. Everything below this line is
+    // a reason to stop early; this is the reason a row cannot run for ever, and
+    // a row that has run out of time has to end even mid-cast because a
+    // character is being held still on the other side of it.
+    //
+    // Which sentence it ends with is the interesting part. A row that never got
+    // a single cast away, on a character that has been walking, timed out for
+    // exactly one reason and it is not the spell.
+    if (progress.outOfTime)
+    {
+        if (progress.castsSpent == 0 && (progress.moving || progress.movingPolls != 0))
+            return ConjureGaveUp::NeverStoodStill;
+        return NothingOrRefused(progress);
+    }
+
+    // A cast in flight is progress, so it beats every remaining test. Charging
+    // a three second cast against a budget counted in two second polls is how a
+    // working loop gets killed for being slow.
+    if (progress.castInFlight)
+        return ConjureGaveUp::NotGivenUp;
+
+    if (progress.castsSpent >= progress.castsAllowed)
+        return ConjureGaveUp::BudgetSpent;
+
+    // The test that catches a spell that does not work. Out of mana,
+    // interrupted, bags filled by something else, a product this character may
+    // not use, a bot AI that declines the cast before it starts: from here all
+    // of those look the same, which is a cast that goes out and produces
+    // nothing. An idleLimit of 0 disables it rather than giving up before the
+    // first cast.
+    if (progress.idleLimit != 0 && progress.idlePolls >= progress.idleLimit)
+        return NothingOrRefused(progress);
+
+    // ASKED LAST OF THE FOUR, AND THAT ORDER IS DELIBERATE. A row that got
+    // casts off and then found the character walking again has already learned
+    // something about the spell, and "the casts produced nothing" is the more
+    // useful sentence for it. `NeverStoodStill` is for the row that never got
+    // to try at all, which is the failure that shipped in #320.
+    if (progress.movingLimit != 0 && progress.movingPolls >= progress.movingLimit)
+        return ConjureGaveUp::NeverStoodStill;
+
+    return ConjureGaveUp::NotGivenUp;
+}
+
 ConjureStep ConjureNextStep(ConjureProgress const& progress)
 {
-    // Done first, before anything about a cast in flight: a character that has
-    // already reached the target is finished whatever it happens to be doing.
+    // Done first, before anything else at all: a character that has already
+    // reached the target is finished whatever it happens to be doing, and even
+    // if the window ran out on the poll that got it there.
     if (progress.wanted != 0 && progress.carried >= progress.wanted)
         return ConjureStep::Done;
 
-    // A cast in flight is progress, so it beats both give-up tests. Charging a
-    // three second cast against a budget counted in polls is how a working loop
-    // gets killed for being slow.
+    // EVERY WALL, IN ONE QUESTION, and asked before `Wait` rather than after it
+    // so that the window can end a row that is mid-cast. ConjureGiveUpReason
+    // answers NotGivenUp for a cast in flight that still has time, so a working
+    // loop is not cut short by moving this line up.
+    if (ConjureGiveUpReason(progress) != ConjureGaveUp::NotGivenUp)
+        return ConjureStep::GaveUp;
+
     if (progress.castInFlight)
         return ConjureStep::Wait;
 
-    if (progress.castsSpent >= progress.castsAllowed)
-        return ConjureStep::GaveUp;
-
-    // The test that matters. Out of mana, interrupted, bags filled by something
-    // else, a product this character may not use: from here all four look the
-    // same, which is a cast that goes out and produces nothing. An idleLimit of
-    // 0 disables the test rather than giving up before the first cast.
-    if (progress.idleLimit != 0 && progress.idlePolls >= progress.idleLimit)
-        return ConjureStep::GaveUp;
+    // STILL WALKING IS NOT STILL CASTING, and telling those two apart is the
+    // whole of #325. PlayerbotAI::CastSpell refuses a moving bot any spell with
+    // a cast time outright, and the core cancels one already preparing the
+    // moment the caster moves, so a cast sent now is a cast thrown away and an
+    // idle poll charged for nothing that was ever tried. The character has been
+    // asked to stand; this is waiting for it to actually stop.
+    if (progress.moving)
+        return ConjureStep::Settle;
 
     return ConjureStep::Cast;
 }
@@ -5568,14 +5664,14 @@ ConjureOutcome ConjureReadBack(bool readable, uint32_t before, uint32_t after,
 }
 
 uint32_t ConjureVerifyWindowMs(uint32_t castMs, uint32_t casts, uint32_t marginMs,
-                               uint32_t floorMs)
+                               uint32_t settleMs, uint32_t floorMs)
 {
     // Saturating throughout. Every input here comes from somewhere this module
     // does not own - a DBC, a plan, a config - and the one failure this
     // function must not have is a huge input wrapping into a window so short
     // that a working conjure is judged as having done nothing.
     uint64_t const perCast = uint64_t(castMs) + uint64_t(marginMs);
-    uint64_t const total = perCast * uint64_t(casts == 0 ? 1u : casts);
+    uint64_t const total = perCast * uint64_t(casts == 0 ? 1u : casts) + uint64_t(settleMs);
     uint64_t const floored = total < uint64_t(floorMs) ? uint64_t(floorMs) : total;
     return floored > 0xFFFFFFFFull ? 0xFFFFFFFFu : uint32_t(floored);
 }
@@ -5600,6 +5696,13 @@ TownRetry ConjureRefusalRetry(std::string const& detail)
         // disagreeing with itself. Waiting does not settle that argument.
         ConjureRefusal::MakesNothing,
     };
+
+    // The three added by #325 are all `Later` and fall through to the default
+    // below, which is worth saying out loud rather than leaving to inference. A
+    // cast that did not start, a character that would not stand still, and a
+    // budget spent are every one of them about where the character was and what
+    // it was doing in one 49 second window. Ask again in a minute and any of
+    // them can answer differently, which is exactly what `Later` means.
 
     // THERE IS NO `Elsewhere` LIST, and its absence is the point rather than an
     // oversight. Every other errand in this module's town trip is refused

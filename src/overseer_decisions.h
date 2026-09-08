@@ -6022,12 +6022,18 @@ TownRetry SummonRefusalRetry(std::string const& detail);
 // row in item_template), so kind='give' and kind='trade' can hand them out
 // afterwards without anything new being built.
 //
-// WHAT ONE CAST ACTUALLY PRODUCES, off Spell.dbc at the pinned build rather
-// than remembered: every Conjure Food and Conjure Water rank below level 60
-// creates TWO items per three second cast, and the items stack to twenty. So
-// one stack is ten casts and thirty seconds of standing still. That is the
-// cost this verb spends, and it is why the executor reads the bags back
-// between every cast rather than firing a fixed number and reporting.
+// WHAT ONE CAST PRODUCES IS NOT A NUMBER THIS FILE MAY WRITE DOWN, and the
+// first version of this section proved it by writing one down and being wrong.
+// It said "two items per three second cast", which is what the DBC's base
+// points and die sides come to on paper. The running server reported TEN for
+// the same spell and the same character, through SpellEffectInfo::CalcValue,
+// which is what the executor actually asks and what the effect actually
+// creates. The difference is not reconciled here and is not pretended to be:
+// the number comes from the world at runtime, the read-back counts what really
+// landed in the bags, and a row that under-estimated ends as `short` and can
+// simply be sent again. The cast time is three seconds and the items stack to
+// twenty; those two are stable and are what the window and the target are
+// built on.
 //
 // Column re-use, no new columns:
 //   target_name  the character that will cast
@@ -6175,16 +6181,40 @@ ConjurePlan PlanConjure(uint32_t carried, uint32_t wanted, uint32_t perCast,
 // can die, be pulled into a fight, be handed a travel errand or run out of mana
 // at any point in the middle. So the resolver does not fire a fixed number of
 // casts and hope: it reads the bags, asks this, and does exactly what it says.
+// A WALKING CHARACTER CANNOT CAST THIS, AND THAT IS WHAT BROKE IT (#325).
+//
+// The first version of this loop shipped, ran on the realm, and made nothing.
+// Six rows, honestly reported as `nothing`, no food. The reason is one this
+// decision now has to know about, and it is not subtle once it is written down:
+//
+//   * Every Conjure Food and Conjure Water rank carries InterruptFlags 0x0F,
+//     read out of Spell.dbc at the pinned build. Bit 0x01 is
+//     SPELL_INTERRUPT_FLAG_MOVEMENT. Spell::prepare refuses a player with a
+//     cast time who is moving (SPELL_FAILED_MOVING), and Spell::update cancels
+//     a cast already preparing the moment the caster moves.
+//   * mod-playerbots refuses it one layer earlier still: PlayerbotAI::CastSpell
+//     opens with `if (bot->isMoving() && spell->GetCastTime())`, cancels the
+//     spell, and returns false without ever calling prepare.
+//   * These characters move nearly all the time. Measured off overseer_snapshot
+//     on 2026-09-08: in one five second sample the party leader moved 2.8 yards
+//     and another member moved 15.9. A three second cast has no chance.
+//
+// So the loop cannot simply try again and hope. Something has to make the
+// character STAND STILL, and then the loop has to know the difference between
+// "waiting for it to stop" and "casting and getting nothing", because those two
+// want completely different answers and the first version reported both as the
+// second.
 enum class ConjureStep : uint8_t
 {
-    Cast,    // nothing in flight, target not reached, budget left: cast again
+    Cast,    // standing still, target not reached, budget left: cast again
     Wait,    // a cast is already in progress; do nothing this poll
+    Settle,  // the character has been asked to stand and has not stopped yet
     Done,    // the bags hold the target
-    GaveUp,  // the budget is spent, or casts go out and nothing appears
+    GaveUp,  // see ConjureGiveUpReason for which of the three walls it hit
 };
 
-// "cast", "wait", "done", "gave up". Here rather than in the executor so the
-// word a test pins is the word a row carries.
+// "cast", "wait", "settle", "done", "gave up". Here rather than in the executor
+// so the word a test pins is the word a row carries.
 char const* ConjureStepWord(ConjureStep step);
 
 struct ConjureProgress
@@ -6195,28 +6225,80 @@ struct ConjureProgress
     uint32_t castsAllowed{0};  // ConjurePlan::casts, plus whatever slack
     uint32_t idlePolls{0};     // consecutive polls that cast and gained nothing
     uint32_t idleLimit{0};     // how many of those before giving up
+    uint32_t movingPolls{0};   // consecutive polls the character has not stopped
+    uint32_t movingLimit{0};   // how many of those before giving up
+    uint32_t castsRefused{0};  // casts the bot AI declined before preparing one
     bool castInFlight{false};  // the character is casting something right now
+    bool moving{false};        // Unit::isMoving, which is what refuses the cast
+    // THE WINDOW, ASKED HERE RATHER THAN AROUND THE OUTSIDE. The executor used
+    // to hold this one itself and wrap every branch below in it, which meant
+    // the window could end a row and have no say in what the row was allowed to
+    // call it. A row that times out while it is still trying to stand still and
+    // a row that times out having cast ten times are different sentences, and
+    // only the side that knows both facts can pick between them.
+    bool outOfTime{false};
 };
 
-// THE ORDER OF THESE FOUR TESTS IS THE DECISION.
+// WHY A ROW STOPPED, when it stopped for a reason rather than by arriving.
+// Four walls, and they are four different sentences to whoever sent the row:
+// one is about the plan, one is about the spell, one is about the character's
+// feet, and one is about a cast that was declined before it ever started. The
+// first version of this verb had only "the casts produced nothing", and used it
+// for all four - true every time, and the least useful true thing available.
+//
+// THE TWO THAT LOOK ALIKE AND ARE NOT. `CastRefused` is
+// PlayerbotAI::CastSpell answering false, which it does without ever reaching
+// Spell::prepare. `NothingAppeared` is a cast that really did start and really
+// did finish and left the bags where they were. A sender can act on the first
+// by changing what the character is doing; the second is about the spell.
+enum class ConjureGaveUp : uint8_t
+{
+    NotGivenUp,       // the loop is still running or has finished properly
+    NeverStoodStill,  // asked to stand, never did, so no cast was ever possible
+    CastRefused,      // the bot AI declined every cast before one ever started
+    NothingAppeared,  // casts went out, finished, and produced nothing
+    BudgetSpent,      // every allowed cast was sent and the target is not met
+};
+
+// THE ORDER OF THESE TESTS IS THE DECISION.
 //
 // `Done` is asked FIRST, before `castInFlight`. A character that reached its
 // target on the cast currently finishing is done, and asking about the cast
 // first would park the row for one more poll to learn nothing.
 //
-// `Wait` is asked SECOND, before either give-up test, because a cast in flight
-// is progress. Counting a three second cast against an idle budget measured in
-// polls is how a working loop gets killed for being slow.
+// `Wait` is asked SECOND, before every give-up test, because a cast in flight
+// is progress. Counting a three second cast against a budget measured in two
+// second polls is how a working loop gets killed for being slow.
 //
-// THE IDLE TEST IS THE ONE THAT MATTERS, and it exists because every reason a
-// conjure silently fails looks identical from here. Out of mana, interrupted by
-// a fight, bags filled by something else, a rank whose product this character
-// may not use: in all four the cast goes out, the handler returns, and no item
-// appears. AGENTS.md's standing rule is that `delivered` is not `done` and the
-// world has to be read back. This is that rule as a loop: casts that produce
-// nothing, repeatedly, end the row and say so, rather than spending the whole
-// budget three seconds at a time.
+// THE IDLE TEST is the one that catches a spell that does not work. Out of
+// mana, interrupted, bags filled by something else, a rank whose product this
+// character may not use: from here all four look like a cast that goes out and
+// produces nothing. AGENTS.md's standing rule is that `delivered` is not `done`
+// and the world has to be read back; this is that rule as a loop.
+//
+// THE MOVING TEST is the one that catches a character that was never able to
+// start. It is asked BEFORE `Settle` so that a character which has been asked
+// to stand and has kept walking for the whole allowance ends the row rather
+// than holding it open, and it is counted separately from the idle test so the
+// two never get confused again. A `movingLimit` of 0 disables it, the same way
+// `idleLimit` of 0 disables the other.
+//
+// AND `outOfTime` BEATS EVERYTHING INCLUDING A CAST IN FLIGHT. It is the
+// backstop rather than the rule, and it has to be able to end a row whatever
+// the character happens to be doing, because on the other side of this decision
+// is a character being held still. A hold that outlives its window is this
+// module stopping a character and forgetting it, which is a worse defect than
+// the one that made this loop necessary.
 ConjureStep ConjureNextStep(ConjureProgress const& progress);
+
+// Which wall, for the same facts. Answers NotGivenUp whenever ConjureNextStep
+// answers anything other than GaveUp, so the two can never disagree about
+// whether a row ended.
+ConjureGaveUp ConjureGiveUpReason(ConjureProgress const& progress);
+
+// The refusal literal for each wall, so the word a row carries is decided here
+// and not in the executor. NotGivenUp has no literal and answers "".
+char const* ConjureGaveUpReasonWord(ConjureGaveUp reason);
 
 enum class ConjureOutcome : uint8_t
 {
@@ -6262,8 +6344,15 @@ ConjureOutcome ConjureReadBack(bool readable, uint32_t before, uint32_t after,
 //
 // Saturating, not wrapping. A nonsense cast time or a nonsense cast count must
 // not come out of here as a short window.
+//
+// `settleMs` was added by #325 and is the allowance for the character actually
+// STOPPING. A conjure now asks the character to stand still first, and a bot
+// under its own drive does not stop on the tick it is asked: the strategy has
+// to take, the motion master has to run down, and this module only looks every
+// COMMAND_POLL_MS. A window that did not carry that allowance would judge a row
+// that spent its first ten seconds coming to a halt.
 uint32_t ConjureVerifyWindowMs(uint32_t castMs, uint32_t casts, uint32_t marginMs,
-                               uint32_t floorMs);
+                               uint32_t settleMs, uint32_t floorMs);
 
 // The refusal literals, all of them, in one place because they are what both
 // sides of the queue read. None may carry a quote character: they go straight
@@ -6294,6 +6383,14 @@ constexpr char const* EnoughAlready  = "character already carries enough";
 
 // After the casts went out and the bags did not move.
 constexpr char const* NothingAppeared = "the casts produced nothing";
+// ...and the three the first version of this verb was missing, every one of
+// which it reported as the line above (#325).
+constexpr char const* CastRefused     = "the cast did not start";
+constexpr char const* NeverStoodStill = "character never stopped moving to cast";
+constexpr char const* BudgetSpent     = "every allowed cast was sent";
+// One row per character at a time, because two would both hold it still and
+// the first to finish would let it walk away under the second.
+constexpr char const* AlreadyRunning  = "a conjure is already running for this character";
 }  // namespace ConjureRefusal
 
 // WHETHER A REFUSAL IS WORTH ASKING AGAIN. Keyed on the `detail` literal, the

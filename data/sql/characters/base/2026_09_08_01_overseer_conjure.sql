@@ -69,11 +69,25 @@
 -- kind='give' and kind='trade' hand them out afterwards and nothing new had to
 -- be built for that.
 --
--- WHAT ONE CAST COSTS AND PRODUCES, off Spell.dbc at the pinned build rather
--- than remembered. Every Conjure Food and Conjure Water rank below level 60
--- creates TWO items per three second cast, and the items stack to twenty. One
--- stack is therefore ten casts and thirty seconds of a character standing
--- still. That number is the whole reason this executor is shaped the way it is.
+-- WHAT ONE CAST COSTS AND PRODUCES. The cast is three seconds and the items
+-- stack to twenty; both are stable and both are what the window and the target
+-- are built on.
+--
+-- CORRECTION, WRITTEN IN AFTER THIS FILE SHIPPED (#325). This paragraph used to
+-- say every rank below level 60 creates TWO items per cast, which is what the
+-- DBC's base points and die sides come to on paper. The running server reported
+-- TEN for the same spell and the same character, through the
+-- SpellEffectInfo::CalcValue call the executor actually makes and the effect
+-- actually uses. The difference is not reconciled and is not pretended to be.
+-- What matters is that the number is read from the world at runtime and was
+-- never this file's to write down: the read-back counts what really landed in
+-- the bags, and a row that under-estimated ends as `short` and can be sent
+-- again. The lesson is the one AGENTS.md already records about a build duration
+-- that went stale twice - a number in a document is a reading from one day.
+--
+-- The statement at the bottom of this file is unchanged by that correction and
+-- is idempotent, so re-applying it against a database that already has it is a
+-- no-op.
 --
 -- WHY A CONJURE CANNOT BE ANSWERED BY THE POLL THAT SENT IT. Nothing has
 -- happened when the call returns: the spell is preparing, with a timer the
