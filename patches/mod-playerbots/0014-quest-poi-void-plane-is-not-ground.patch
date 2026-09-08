@@ -1,0 +1,180 @@
+Subject: [PATCH] quest POI: the void plane is not ground
+
+The party leader died every five minutes for weeks, always self inflicted,
+always in Ashenvale, and five previous fixes went at fall arithmetic because
+the core reports the kill as fall damage. It is not a fall. Something teleports
+the character to one fixed point below the world, and that point is a quest
+POI whose height resolved to the plane the core kills at.
+
+MEASURED, NOT REASONED
+
+44 deaths in six and a half hours, at one coordinate, identical to the last
+decimal every time:
+
+    pos            2384.000000, -3422.000000, -502.411011   map 1, zone 331
+    killer         self, 44 of 44
+    last seen      seven different places, 200 yards apart, all at z 122 to 154
+
+x and y are EXACT INTEGERS. Nothing that walks or falls lands on 2384.000000.
+They were written, and `quest_poi_points` holds exactly one row carrying them:
+
+    QuestID 9518  Idx1 0  Idx2 0  X 2384  Y -3422     (Agents of Destruction)
+
+Objective 0's POI is a SINGLE point, so the weighted centroid the lookup builds
+over `qPoi.points` is that point unchanged, integers and all. The leader holds
+9518 at QUEST_STATUS_INCOMPLETE, which is why this runs through the incomplete
+branch and DoIncompleteQuest.
+
+Three of the 44 rows caught the character mid-arrival, one second or less
+before it died:
+
+    last seen      2384.000000, -3422.000000, -500.000000
+
+Exactly MIN_HEIGHT. Not near it. The character is PLACED on the void plane,
+falls 2.411 yards in the following tick, and the core deals full health as
+DAMAGE_FALL_TO_VOID.
+
+WHY THE HEIGHT COMES OUT AT -500
+
+The shipped grid was read back out of the running image and a `getHeight` /
+`getLiquidLevel` reader validated against stored positions before any of this
+was believed. It reproduces them to three decimals:
+
+    gameobject 181686   stored z 110.442      computed 110.4429
+    gameobject 181687   stored z 110.416      computed 110.4173
+    sampled character   stored z 109.795998   computed 109.7955
+
+At the POI, on map 1 tile 27/38:
+
+    getHeight(2384, -3422)        = -100000.0   the cell is a TERRAIN HOLE
+    getLiquidLevel(2384, -3422)   =    -500.0   the liquid map's filler
+    std::max of the two           =    -500.0
+
+Only 28 of that tile's 16384 cells are holes, 0.17%, and the POI's integer
+coordinate sits inside one. Eight yards north the ground is at 110.22, which is
+where the quest objects actually stand.
+
+The second number is the one that matters. Where there is no liquid the map
+carries a filler, and on this tile that filler is -500.0f in 14357 of 16641
+cells, 86%. It is numerically MIN_HEIGHT. So `std::max(GetHeight, GetWaterLevel)`
+over a hole does not return a sentinel; it returns the void plane, dressed as a
+height, on 86% of the tile.
+
+WHY THE EXISTING GUARD DOES NOT CATCH IT
+
+    if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
+
+-500.0f is neither. It is not -100000.0f and it is not -200000.0f, so the test
+passes and dz is treated as ground. `DoIncompleteQuest` writes
+`WorldPosition(mapId, 2384, -3422, -500)` into `data.pos`, and `MoveFarTo`
+teleports the bot onto it once the walk has failed to close the gap five times:
+
+    return bot->TeleportTo(dest);        NewRpgBaseAction.cpp
+
+That teleport is why the driver column reads idle, errand and unattributed
+across the deaths, and why the last sampled position is anywhere within 200
+yards. The bot wanders normally for thirty to seventy seconds accumulating
+stuck attempts against a destination 600 yards underground, then is moved to it
+from wherever it happens to be standing. No drive of the module's is involved
+at all.
+
+WHAT THIS CHANGES
+
+`dz <= MIN_HEIGHT` is refused at all four sites that compute this value: both
+branches of GetQuestPOIPosAndObjectiveIdx, which offer the candidate, and
+DoIncompleteQuest and DoCompletedQuest, which build the destination that gets
+teleported to. The two sites patch 0010 already touches take it as an `else`,
+so the unloaded-grid forgiveness there is untouched: that branch leaves dz at a
+sentinel on purpose, and a sentinel is below MIN_HEIGHT too.
+
+Refusing is safe by construction rather than by judgement. The core kills at
+`z < GetMinHeight(x, y)`, and GetMinHeight returns MIN_HEIGHT wherever a tile
+carries no flight bounds, which is every tile on maps 0 and 1. A destination at
+or below that plane is one the core would kill a character for reaching, so
+there is no legitimate destination being lost.
+
+WHAT IS NOT FIXED, DELIBERATELY
+
+The bot no longer dies, and it also no longer walks to objective 0 of quest
+9518: that objective's only POI point is refused, so the lookup falls through to
+the quest's other incomplete objectives, or to ChangeToIdle when none is left.
+Resolving a real height NEAR a holed POI instead of refusing it would be the
+better answer and is not attempted here, because it cannot be measured from
+outside a running image and this patch is the half that stops the killing.
+
+WHAT WOULD LET THIS PATCH BE DELETED: upstream refusing a destination below
+MIN_HEIGHT at either site, or `GetWaterLevel`'s no-liquid filler ceasing to
+collide with the void plane constant.
+
+APPLIES TO: mod-playerbots @ 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312,
+NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx (both branches),
+NewRpgDoQuestAction::DoIncompleteQuest and NewRpgDoQuestAction::DoCompletedQuest,
+on top of patch 0010.
+diff --git a/src/Ai/World/Rpg/Action/NewRpgAction.cpp b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
+index 26d49f1a..f2f9c940 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
+@@ -570,6 +570,16 @@ bool NewRpgDoQuestAction::DoIncompleteQuest(NewRpgInfo::DoQuest& data)
+         if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
+             return false;
+ 
++        // infra: THE VOID PLANE IS NOT A DESTINATION, AND THIS IS THE SITE
++        // THAT KILLS. The WorldPosition built below is stored in data.pos and
++        // handed to MoveFarTo, which teleports the bot straight onto it once
++        // the walk has failed to close the gap five times. A dz of -500.0f
++        // therefore lands the character under the world, where the core deals
++        // full health as a void kill and reports it as fall damage. Refuse
++        // instead: there is no height here worth walking to.
++        if (dz <= MIN_HEIGHT)
++            return false;
++
+         WorldPosition pos(bot->GetMapId(), dx, dy, dz);
+         data.lastReachPOI = 0;
+         data.pos = pos;
+@@ -673,6 +683,11 @@ bool NewRpgDoQuestAction::DoCompletedQuest(NewRpgInfo::DoQuest& data)
+                 return false;
+             dz = bot->GetPositionZ();
+         }
++        // infra: THE VOID PLANE IS NOT A DESTINATION. Same teleport, same
++        // death, on the turn-in half. `else` so the substitution above keeps
++        // its provisional z.
++        else if (dz <= MIN_HEIGHT)
++            return false;
+ 
+         WorldPosition pos(bot->GetMapId(), dx, dy, dz);
+         data.lastReachPOI = 0;
+diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+index 9f4df925..17edeb72 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+@@ -942,6 +942,13 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
+                 if (bot->GetMap()->IsGridLoaded(dx, dy))
+                     continue;
+             }
++            // infra: THE VOID PLANE IS NOT GROUND. Checked as an `else` so the
++            // unloaded-grid forgiveness above is untouched: that branch leaves
++            // dz at a sentinel deliberately, and a sentinel is below
++            // MIN_HEIGHT too. See the incomplete branch below for the full
++            // note.
++            else if (dz <= MIN_HEIGHT)
++                continue;
+ 
+             // THE SAME-ZONE FILTER IS GONE. It is what stranded every bot with
+             // an out-of-zone turn-in: the POI was discarded, poiInfo came back
+@@ -1024,6 +1031,16 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
+         if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
+             continue;
+ 
++        // infra: THE VOID PLANE IS NOT GROUND. `GetWaterLevel` returns the
++        // liquid map's filler where there is no liquid, and on a shipped
++        // tile that filler is -500.0f - numerically MIN_HEIGHT, the plane
++        // the core kills at. So where `GetHeight` fails over a terrain
++        // hole, `std::max` of the two hands back exactly -500.0f, which is
++        // neither sentinel above and passes the test as if it were ground.
++        // Measured: 86% of tile 0012738's liquid cells hold -500.0f.
++        if (dz <= MIN_HEIGHT)
++            continue;
++
+         if (bot->GetZoneId() != bot->GetMap()->GetZoneId(bot->GetPhaseMask(), dx, dy, dz))
+             continue;
+ 
