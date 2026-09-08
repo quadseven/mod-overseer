@@ -9576,10 +9576,125 @@ private:
         return who;
     }
 
+    // WHAT A RANDOM PROPERTY IS ACTUALLY WORTH, READ OFF THE ITEM (#340).
+    //
+    // A green off a dungeon floor keeps most of its worth in its name. The
+    // "+10 agility" that makes a Scouting Tunic a rogue's chest is rolled onto
+    // the individual item; the template says nothing about it, so an adapter
+    // that reads only the template scores such a piece as its armour and its
+    // item level and nothing at all besides. Nineteen of the family's worn
+    // pieces were exactly that, which made the worn side of nineteen slots a
+    // Floor and left every one of them unprovable forever - zero swaps in a
+    // whole log against fifty-three "cannot be settled".
+    //
+    // AND IT NEEDS NO TABLE WALK. When the core rolls a property onto an item
+    // it writes that property's enchantment ids into the item's OWN property
+    // enchantment slots (Item::SetItemRandomProperties), and reads them back
+    // from exactly there when it applies the stats to the character
+    // (Player::ApplyEnchantment). So the item already carries the answer, and
+    // the only lookup left is the enchantment row itself. Checked against the
+    // live realm rather than assumed: for all 77 of the family's randomly
+    // enchanted items, the enchantment ids on the item match the property row
+    // the item names, exactly.
+    //
+    // A SUFFIX IS THE ONE CASE THAT IS NOT SELF-CONTAINED. A negative property
+    // id is a random SUFFIX, and a suffix's stat sizes are not in the
+    // enchantment - the enchantment carries a zero, and the real size is a
+    // percentage in the suffix row scaled by a factor kept on the item. That is
+    // the same fallback Player::ApplyEnchantment makes for
+    // ITEM_ENCHANTMENT_TYPE_STAT, and it is made here the same way, so the
+    // score sees what the character will actually get.
+    //
+    // EVERYTHING ELSE IS LEFT UNPRICED ON PURPOSE. An on-equip spell, a
+    // resistance, a weapon damage bonus - the scorer weighs none of them, so
+    // GearReadRandomProperty reports them as unread and the verdict stays a
+    // floor. That is the answer #221 already built the machinery for: a floor
+    // that clears the margin still settles the slot, and one that does not is
+    // said out loud rather than acted on.
+    static OverseerDecisions::GearResolvedProperty GearRandomPropertyOf(Item const* item)
+    {
+        int32 const randomPropertyId = item ? item->GetItemRandomPropertyId() : 0;
+        if (!randomPropertyId)
+            return OverseerDecisions::GearResolvedProperty{};
+
+        // Only a suffix needs this, and only to size its stats. A positive id
+        // is an ItemRandomProperties roll whose enchantments carry their own
+        // amounts, and it never reaches the lookup below.
+        ItemRandomSuffixEntry const* const suffix =
+            randomPropertyId < 0
+                ? sItemRandomSuffixStore.LookupEntry(static_cast<uint32>(-randomPropertyId))
+                : nullptr;
+
+        std::vector<OverseerDecisions::GearEnchantEffect> effects;
+        bool everyEnchantmentRead = true;
+
+        for (uint32 slot = PROP_ENCHANTMENT_SLOT_0; slot < MAX_ENCHANTMENT_SLOT; ++slot)
+        {
+            uint32 const enchantId = item->GetEnchantmentId(EnchantmentSlot(slot));
+            if (!enchantId)
+                continue;
+
+            SpellItemEnchantmentEntry const* const enchant =
+                sSpellItemEnchantmentStore.LookupEntry(enchantId);
+            if (!enchant)
+            {
+                // The item names an enchantment the world does not have. Rare,
+                // and not a thing to quietly score as zero.
+                everyEnchantmentRead = false;
+                continue;
+            }
+
+            for (uint32 i = 0; i < MAX_SPELL_ITEM_ENCHANTMENT_EFFECTS; ++i)
+            {
+                if (!enchant->type[i])
+                    continue;
+
+                OverseerDecisions::GearEnchantEffect effect;
+                effect.type = static_cast<int>(enchant->type[i]);
+                effect.amount = static_cast<int>(enchant->amount[i]);
+                // For a stat effect this field is the ItemModType, which is
+                // what makes it foldable into GearItem::stats. For every other
+                // kind of effect it is a spell or a resistance index, and the
+                // pure file never reads it.
+                effect.stat = static_cast<int>(enchant->spellid[i]);
+
+                if (!effect.amount && suffix)
+                {
+                    for (uint32 k = 0; k < MAX_ITEM_ENCHANTMENT_EFFECTS; ++k)
+                    {
+                        if (suffix->Enchantment[k] != enchantId)
+                            continue;
+                        effect.amount = static_cast<int>(
+                            (suffix->AllocationPct[k] * item->GetItemSuffixFactor()) / 10000);
+                        break;
+                    }
+                }
+
+                effects.push_back(effect);
+            }
+        }
+
+        return OverseerDecisions::GearReadRandomProperty(effects, everyEnchantmentRead);
+    }
+
+    // A DROP THAT DOES NOT EXIST YET HAS NOTHING TO READ. A loot roll names a
+    // property id, but the Item it will become has not been created, so there
+    // are no enchantment slots to walk and no honest way to price it. The
+    // answer is the one this drive gave everything before #340: there is
+    // something here and it has not been read, so the score is a floor. That is
+    // deliberately unchanged for the Need vote, which reads `judged` and wants
+    // the strict answer.
+    static OverseerDecisions::GearResolvedProperty GearRandomPropertyUnread(bool present)
+    {
+        OverseerDecisions::GearResolvedProperty unread;
+        unread.unresolved = present;
+        return unread;
+    }
+
     // An item template flattened into the plain facts the scorer reads. The
     // scorer includes no core header, so this is where a core type stops.
-    static OverseerDecisions::GearItem GearItemFor(ItemTemplate const* proto,
-                                                   bool unresolvedRandomProperty)
+    static OverseerDecisions::GearItem GearItemFor(
+        ItemTemplate const* proto, OverseerDecisions::GearResolvedProperty const& random)
     {
         OverseerDecisions::GearItem item;
         item.name = proto->Name1;
@@ -9615,7 +9730,12 @@ private:
             if (proto->Spells[i].SpellId > 0)
                 item.hasEffect = true;
 
-        item.unresolvedRandomProperty = unresolvedRandomProperty;
+        // A ROLLED STAT IS A STAT, and nothing about one is different for
+        // having arrived on the item by a roll rather than in its template -
+        // so it joins the same list and is weighed by the same weights.
+        for (OverseerDecisions::GearStat const& stat : random.stats)
+            item.stats.push_back(stat);
+        item.unresolvedRandomProperty = random.unresolved;
         return item;
     }
 
@@ -9633,12 +9753,12 @@ private:
     static OverseerDecisions::GearVerdict GearScoreFor(Player* bot,
                                                        OverseerDecisions::GearWearer who,
                                                        ItemTemplate const* proto,
-                                                       bool unresolvedRandomProperty)
+                                                       OverseerDecisions::GearResolvedProperty const& random)
     {
         who.classAllowed = bot->CanUseItem(proto) == EQUIP_ERR_OK;
         who.weaponProficient = proto->Class != ITEM_CLASS_WEAPON || proto->GetSkill() == 0 ||
                                bot->HasSkill(proto->GetSkill());
-        return OverseerDecisions::GearScore(GearItemFor(proto, unresolvedRandomProperty), who);
+        return OverseerDecisions::GearScore(GearItemFor(proto, random), who);
     }
 
     // What is worn in one slot, scored, AND how much of that score the file can
@@ -9654,7 +9774,7 @@ private:
         if (!proto)
             return OverseerDecisions::GearWorn(OverseerDecisions::GearVerdict{});
         return OverseerDecisions::GearWorn(
-            GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0));
+            GearScoreFor(bot, who, proto, GearRandomPropertyOf(item)));
     }
 
     // The same thing as a bare number, which is all the Need vote wants: what
@@ -9758,7 +9878,7 @@ private:
                 continue;
 
             OverseerDecisions::GearVerdict const candidate =
-                GearScoreFor(bot, who, proto, item->GetItemRandomPropertyId() != 0);
+                GearScoreFor(bot, who, proto, GearRandomPropertyOf(item));
 
             // Not wearable is not news. It is the ordinary state of most of
             // what a party carries out of a dungeon, and saying so once per
@@ -10024,7 +10144,8 @@ private:
                 GearBallot ballot;
                 ballot.bot = member.bot;
                 ballot.name = member.who.name;
-                ballot.verdict = GearScoreFor(member.bot, member.who, proto, randomProperty);
+                ballot.verdict = GearScoreFor(member.bot, member.who, proto,
+                                              GearRandomPropertyUnread(randomProperty));
 
                 // AN UNJUDGED VERDICT CASTS NO VOTE AT ALL. Not a Greed: a
                 // Greed is an opinion, and the whole content of `judged ==
