@@ -5424,6 +5424,24 @@ struct RouteLink
     // so a caller may price a link it would rather avoid without deleting it.
     float yards{0.f};
     bool onFoot{false};
+    // WHETHER THIS LEG CROSSES GROUND THE OTHER SIDE GUARDS (#326). The caller
+    // has measured it; the search only reads it, exactly as it does `onFoot`.
+    //
+    // "GUARDED" IS A FACTION WORD AND NOT A LEVEL ONE, and this module already
+    // asks those as two separate questions. #300 asks whether the ground is
+    // too high for the character, off spawn levels. This asks whether the
+    // people standing on it attack the character for being the wrong faction:
+    // the FactionStanceHostileTo test above, narrowed to a spawn whose own
+    // faction group carries the OPPOSING player faction's bit, so a wild beast
+    // hostile to everybody is not mistaken for a town that is hostile to one
+    // side.
+    //
+    // Measured on the shipped world data for an Alliance party at the family's
+    // own levels, 60 yard threat radius: of the 2478 walk legs on Kalimdor the
+    // broad "anything lethal" reading marks 1592 and this faction reading marks
+    // 647, and the leg the party actually died on twice is in both. The
+    // narrower one is used because it is the question the deaths asked.
+    bool guardedGround{false};
 };
 
 // One point along a leg. No id and no map: a route is walked on one map by
@@ -5485,6 +5503,17 @@ struct RoutePlan
     // precisely the kind of last stretch the greedy stepper already crosses
     // unaided, and does in the Ratchet replay.
     float endsFromAimYards{-1.f};
+    // HOW MANY LEGS OF THE PLAN STILL CROSS GUARDED GROUND (#326), and it is
+    // not always zero. Going round is only taken when going round is not
+    // farther, so a party whose only way to its errand runs through a guarded
+    // place still gets that way, with this saying so, rather than getting
+    // nothing. A caller that wants to refuse such an errand has the number to
+    // refuse it on.
+    std::uint32_t guardedLegs{0};
+    // A way round was found AND taken. Not the negation of `guardedLegs`:
+    // false also means "there was nothing to go round", which is the common
+    // case and the one that must cost nothing.
+    bool wentRound{false};
 };
 
 struct RoutePlanLimits
@@ -5494,6 +5523,35 @@ struct RoutePlanLimits
     // entries were 3, 107 and 129 yards out - and bounded so a character on the
     // wrong side of water does not adopt a node across it.
     float entryNodeYards{600.f};
+    // THE MOST GROUND A WAY ROUND MAY HAND THE GREEDY STEPPER (#326), and the
+    // one number in this rule, so it is measured rather than chosen.
+    //
+    // WHY IT HAS TO EXIST AT ALL. The rule above compares a way round with the
+    // route it replaces on LEGS PLUS LEFTOVER, and that comparison treats a
+    // yard of surveyed leg and a yard of greedy stepping as the same yard. They
+    // are not: #316 exists because the greedy cone fails on terrain, which is
+    // the whole reason legs are worth walking. Without a ceiling the comparison
+    // will trade a route that ARRIVES for one that stops short of the aim, and
+    // it does: replayed against the shipped survey, the Razorfen Kraul approach
+    // reaches its door in 7415 yards through three guarded legs, and the
+    // unbounded rule swaps it for 2095 yards of legs plus 4209 yards of greedy
+    // walk, because 6304 is the smaller number. Less total ground is not a
+    // shorter walk when the leftover is the part that does not work.
+    //
+    // AND WHY IT IS A THOUSAND. The measured population, all from #316's own
+    // replays over the shipped heightmaps: the three routes it planned hand
+    // over 343 yards and the stepper covers them; the Ratchet approach covers
+    // 1465 yards of flat Barrens and arrives; the way round this issue needs is
+    // 812 yards, and the last of those 812 holds nothing hostile at all.
+    // Replayed across the five journeys this issue measured, every ceiling from
+    // 1000 to 2000 gives the identical answer on all five, and every ceiling
+    // under 812 gives up the fix. A thousand is the low end of the band that
+    // works, so it leans toward keeping today's route - which is the direction
+    // that cannot introduce a failure this module did not already have.
+    //
+    // Like RouteLimits::lethalRunYards, this is a first reading and the death
+    // table is what says whether it was right.
+    float roundHandoverYards{1000.f};
     // A route has to be worth walking. The last node must be at least this much
     // nearer the aim than the character already is, or there is nothing here it
     // could not do for itself, and aiming BACKWARDS is the greedy stepper's own
@@ -5519,7 +5577,65 @@ struct RoutePlanLimits
 //
 // WHAT IT COSTS TO ASK. One search over one map's nodes - 616 of them on
 // Kalimdor - run when an errand's aim changes and then kept for that errand,
-// not run per poll.
+// not run per poll. Two searches when, and only when, some leg is marked
+// guarded; see the next paragraph for why the second one is skipped otherwise.
+//
+// ------------------------- AND IT MAY NOT WALK INTO THE OTHER SIDE (#326) --
+//
+// THE ROUTE WORKED AND IT KILLED THE PARTY, which is why this rule is about
+// the route rather than about the walk. Watched live, an Alliance family of
+// 26 to 32 converged on the Wailing Caverns door for the first time - 2236,
+// 2071, 892, 749, 723, 683, 674 yards - and then walked back out to 2451 and
+// into the next zone. The death table says why: `Barrens Guard` and `Horde
+// Guard`, both level 40, both on the same two spots, twice each. The party
+// revived at a graveyard behind the guards, walked the same route, and died
+// in the same place. Zero runs in a night.
+//
+// THE SURVEY IS FACTION AGNOSTIC AND THAT IS NOT A BUG IN IT. It records where
+// a character can physically walk, and its legs follow ROADS, because a road
+// is where somebody walked. Roads are patrolled. Measured on the shipped data:
+// the leg the family died on passes within 5 yards of a level 40 guard spawn,
+// and the survey's own waypoints for it bend up to 274 yards off the straight
+// line between its two nodes, so the guarded ground is in the MIDDLE of the
+// leg and neither endpoint reads as guarded at any radius under 200 yards.
+// The unit that can be marked is therefore the leg, which is why the flag is
+// on RouteLink and not on RouteNode.
+//
+// WHAT WAS TRIED FIRST AND MEASURED WRONG, so nobody re-treads it:
+//
+//   * REFUSING EVERY GUARDED LEG. The only remaining way to that door is 24685
+//     yards instead of 3594 - 58.8 minutes at 7 yards a second against a
+//     staging window of twelve - and it goes through level 48 to 55 ground.
+//     Avoiding a level 40 guard by walking past a level 55 elemental is not
+//     avoiding anything.
+//   * PRICING THE GUARDED LEGS INSTEAD. Flat: every surcharge from 100 to
+//     10000 yards returns the identical route, because the alternative is not
+//     a longer path to the same goal, it is a different continent's worth of
+//     coastline. Pricing cannot move a search whose GOAL is fixed by distance.
+//   * MARKING NODES RATHER THAN LEGS. Reproduces the leg reading for 579 of
+//     647 legs but misses the one that mattered, and at the radius wide enough
+//     to catch it (200 yards) it starts changing routes that already arrive.
+//
+// SO THE RULE IS ABOUT THE GOAL, AND IT HAS NO TUNING NUMBER IN IT.
+//
+//     A route may go round guarded ground only when going round is NOT
+//     FARTHER, counting the legs it walks PLUS the stretch it leaves for the
+//     greedy stepper.
+//
+// The second measure is the one that makes this work. The nearest node to that
+// door is 343 yards out and can only be reached through the guards; a node 812
+// yards out is reached with none, and the whole journey to it is 2993 yards
+// against 3594. Legs plus leftover: 3805 against 3937. It is not a detour. It
+// is shorter, and the last 812 yards hold nothing hostile at all.
+//
+// AND THE RULE CANNOT LENGTHEN A WALK, which is the whole of why it is safe to
+// ship against routing that already works. `reach` is measured on the plan
+// this module produces today, and a way round is adopted only when its own
+// reach is no greater. A journey with no guarded leg anywhere skips the second
+// search entirely and returns today's answer, unchanged and for the same cost.
+// Replayed against the shipped survey and the dev realm's own world data: the
+// Ratchet approach that #316 records as ARRIVING is unchanged, and so is the
+// Blackfathom Deeps approach, which crosses no guarded ground at all.
 RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                         std::vector<RouteLink> const& links,
                         std::uint32_t mapId, float fromX, float fromY,

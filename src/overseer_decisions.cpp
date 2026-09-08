@@ -4884,6 +4884,83 @@ struct CostHeap
     }
 };
 
+// ONE DIJKSTRA OVER ONE MAP'S WALK LINKS, AND WHAT IT REACHED. Factored out of
+// PlanFootRoute only because #326 runs it twice for the same journey - once
+// allowed to cross guarded ground and once refusing to - and two hand-copied
+// searches is how the two would come to disagree.
+struct FootReach
+{
+    std::vector<float> best;
+    std::vector<std::uint32_t> came;
+    // The edge each node was reached BY, so the legs of a path can be read back
+    // without a second lookup from a pair of node indices to a link.
+    std::vector<std::uint32_t> cameEdge;
+    std::vector<bool> reached;
+};
+
+void WalkOnFoot(std::vector<std::vector<std::uint32_t>> const& firstEdge,
+                std::vector<std::uint32_t> const& edgeTo,
+                std::vector<float> const& edgeCost,
+                std::vector<bool> const& edgeGuarded, bool avoidGuarded,
+                std::uint32_t entry, FootReach& out)
+{
+    std::size_t const count = firstEdge.size();
+    out.best.assign(count, -1.f);
+    out.came.assign(count, 0);
+    out.cameEdge.assign(count, 0);
+    out.reached.assign(count, false);
+    CostHeap open;
+    out.best[entry] = 0.f;
+    out.came[entry] = entry;
+    open.Push(0.f, entry);
+    while (!open.Empty())
+    {
+        float cost = 0.f;
+        std::uint32_t at = 0;
+        open.Pop(cost, at);
+        if (out.reached[at])
+            continue;
+        out.reached[at] = true;
+        for (std::uint32_t e : firstEdge[at])
+        {
+            // A GUARDED LEG DOES NOT EXIST TO THIS PASS, which is how this
+            // search has always treated a link that is not a walk: refused
+            // rather than priced. Pricing was measured on the journey that
+            // prompted #326 and moves nothing; see the header.
+            if (avoidGuarded && edgeGuarded[e])
+                continue;
+            std::uint32_t const next = edgeTo[e];
+            if (out.reached[next])
+                continue;
+            float const through = cost + edgeCost[e];
+            if (out.best[next] < 0.f || through < out.best[next])
+            {
+                out.best[next] = through;
+                out.came[next] = at;
+                out.cameEdge[next] = e;
+                open.Push(through, next);
+            }
+        }
+    }
+}
+
+// How many legs of one reached path cross guarded ground. Walks the same chain
+// the caller unwinds, so the count and the node list cannot disagree.
+std::uint32_t GuardedLegsOn(FootReach const& reach,
+                            std::vector<bool> const& edgeGuarded,
+                            std::uint32_t entry, std::uint32_t goal)
+{
+    std::uint32_t guarded = 0;
+    std::uint32_t at = goal;
+    while (at != entry)
+    {
+        if (edgeGuarded[reach.cameEdge[at]])
+            ++guarded;
+        at = reach.came[at];
+    }
+    return guarded;
+}
+
 }  // namespace
 
 RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
@@ -4892,7 +4969,8 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                         float toX, float toY, RoutePlanLimits const& limits)
 {
     RoutePlan plan;
-    if (!(limits.entryNodeYards > 0.f) || !(limits.minGainYards >= 0.f))
+    if (!(limits.entryNodeYards > 0.f) || !(limits.minGainYards >= 0.f) ||
+        !(limits.roundHandoverYards >= 0.f))
     {
         plan.verdict = RoutePlanVerdict::BadLimits;
         return plan;
@@ -4945,6 +5023,12 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     std::vector<std::vector<std::uint32_t>> firstEdge(here.size());
     std::vector<std::uint32_t> edgeTo;
     std::vector<float> edgeCost;
+    std::vector<bool> edgeGuarded;
+    // Nothing marked means nothing to go round, and then the second search
+    // below is not run at all. That is not only an economy: it is what makes
+    // "a journey with no guarded leg gets today's answer, for today's cost"
+    // a property of the code rather than a claim about it.
+    bool anyGuarded = false;
     for (RouteLink const& link : links)
     {
         if (!link.onFoot)
@@ -4961,37 +5045,12 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
         firstEdge[from->second].push_back(static_cast<std::uint32_t>(edgeTo.size()));
         edgeTo.push_back(to->second);
         edgeCost.push_back(link.yards);
+        edgeGuarded.push_back(link.guardedGround);
+        anyGuarded = anyGuarded || link.guardedGround;
     }
 
-    std::vector<float> best(here.size(), -1.f);
-    std::vector<std::uint32_t> came(here.size(), 0);
-    std::vector<bool> reached(here.size(), false);
-    CostHeap open;
-    best[entry] = 0.f;
-    came[entry] = entry;
-    open.Push(0.f, entry);
-    while (!open.Empty())
-    {
-        float cost = 0.f;
-        std::uint32_t at = 0;
-        open.Pop(cost, at);
-        if (reached[at])
-            continue;
-        reached[at] = true;
-        for (std::uint32_t e : firstEdge[at])
-        {
-            std::uint32_t const next = edgeTo[e];
-            if (reached[next])
-                continue;
-            float const through = cost + edgeCost[e];
-            if (best[next] < 0.f || through < best[next])
-            {
-                best[next] = through;
-                came[next] = at;
-                open.Push(through, next);
-            }
-        }
-    }
+    FootReach straight;
+    WalkOnFoot(firstEdge, edgeTo, edgeCost, edgeGuarded, false, entry, straight);
 
     // THE GOAL IS CHOSEN OUT OF WHAT WAS REACHED. See the header: choosing it
     // by distance first and asking for a path second answers "no route" for
@@ -5001,7 +5060,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     float goalDistance = -1.f;
     for (std::uint32_t i = 0; i < here.size(); ++i)
     {
-        if (!reached[i])
+        if (!straight.reached[i])
             continue;
         float const d = PlaneDistance(here[i].x, here[i].y, toX, toY);
         if (goalDistance < 0.f || d < goalDistance)
@@ -5017,6 +5076,59 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
         return plan;
     }
 
+    // AND NOW THE ONE RULE #326 ADDS. Everything above is what this planner has
+    // always done, `chosen` is that answer, and it stays that answer unless a
+    // way round is found that is NOT FARTHER.
+    //
+    // REACH IS LEGS PLUS LEFTOVER, and the second half is not a refinement. The
+    // nearest node to the Wailing Caverns door can only be reached through the
+    // guards; the nearest one that cannot is 469 yards further out. Comparing
+    // only the legs walked would adopt a way round that leaves the party a
+    // continent short of its errand, and comparing only the leftover would
+    // never adopt one at all.
+    FootReach const* chosen = &straight;
+    std::uint32_t guardedOnPlan = GuardedLegsOn(straight, edgeGuarded, entry, goal);
+    if (anyGuarded && guardedOnPlan > 0)
+    {
+        float const reach = straight.best[goal] + goalDistance;
+        FootReach round;
+        WalkOnFoot(firstEdge, edgeTo, edgeCost, edgeGuarded, true, entry, round);
+        std::uint32_t roundGoal = entry;
+        float roundDistance = -1.f;
+        for (std::uint32_t i = 0; i < here.size(); ++i)
+        {
+            if (!round.reached[i] || i == entry)
+                continue;
+            float const d = PlaneDistance(here[i].x, here[i].y, toX, toY);
+            if (standing - d < limits.minGainYards)
+                continue;
+            // AND IT MAY NOT DUMP THE JOURNEY ON THE GREEDY STEPPER. See
+            // RoutePlanLimits::roundHandoverYards: without this the reach
+            // comparison below will take fewer total yards by leaving four
+            // thousand of them to a cone that cannot walk them.
+            if (d > limits.roundHandoverYards)
+                continue;
+            // NOT FARTHER, written as a refusal of the ones that ARE, so a way
+            // round that is exactly as far as today's plan is kept rather than
+            // dropped by the rounding of a sum.
+            if (round.best[i] + d > reach)
+                continue;
+            if (roundDistance < 0.f || d < roundDistance)
+            {
+                roundDistance = d;
+                roundGoal = i;
+            }
+        }
+        if (roundDistance >= 0.f)
+        {
+            chosen = &round;
+            goal = roundGoal;
+            goalDistance = roundDistance;
+            guardedOnPlan = 0;
+            plan.wentRound = true;
+        }
+    }
+
     // Unwound from the goal, so the caller reads it entry first.
     std::vector<std::uint32_t> backwards;
     std::uint32_t at = goal;
@@ -5025,14 +5137,15 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
         backwards.push_back(here[at].id);
         if (at == entry)
             break;
-        at = came[at];
+        at = chosen->came[at];
     }
     plan.nodes.reserve(backwards.size());
     for (std::size_t i = backwards.size(); i > 0; --i)
         plan.nodes.push_back(backwards[i - 1]);
     plan.verdict = RoutePlanVerdict::Planned;
-    plan.yards = best[goal];
+    plan.yards = chosen->best[goal];
     plan.endsFromAimYards = goalDistance;
+    plan.guardedLegs = guardedOnPlan;
     return plan;
 }
 
