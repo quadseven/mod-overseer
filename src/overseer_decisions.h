@@ -6109,6 +6109,184 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
                       float x, float y, RouteLegLimits const& limits);
 
 
+// ------------------ a staging walk that is measured rather than routed (#342) --
+//
+// THE ROUTE PLANNER ABOVE IS RIGHT ABOUT ITS GRAPH AND WRONG ABOUT THE WORLD,
+// and #326 says so in its own words: a survey leg follows a ROAD, because a
+// road is where somebody walked, and roads are patrolled. When every way to a
+// door runs down a patrolled road, PlanFootRoute reports the guarded legs and
+// walks them, which is the only honest answer a search confined to those nodes
+// can give. It is also, for one particular walk, fatal.
+//
+// WHAT IT COST. Six dungeon runs in a row ended `staging_failed` with the
+// leader still more than a thousand yards from the door, and the death table
+// says why: the leader was killed by level 40 guards of the other side, at
+// level 30, on the road the route chose. A leader death is the expensive one -
+// reviving the party sends all five to the LEADER's bind - so every one of
+// those deaths reset the whole family and the next run walked the same road.
+//
+// AND THE LEVEL GAP IS ALREADY IN THE MARK. `RouteLink::guardedGround` is set
+// off a reading whose level floor is the character's own level plus
+// CON_COLOR_UNKNOWN_LEVEL_DIFF - 1, narrowed to the opposing player faction. A
+// marked leg therefore already means "the other side, and in the `??` band",
+// not merely "hostile". There is no sharper question left to ask the graph:
+// what is missing is a way that is not on it.
+//
+// ---------------------------------------------- SO THE CORRIDOR IS WRITTEN --
+//
+// A DOOR MAY CARRY A MEASURED WALK TO ITS APPROACH, AND THAT WALK IS WALKED
+// RATHER THAN ROUTED. It is the same instrument #242 already uses one point of:
+// where walkable ground is cannot be derived from any table in the world
+// database, so the only honest way to have it is to measure the terrain, and a
+// corridor that has NOT been measured must never be invented. This one was, and
+// the measurement is quoted at the table itself so a reader can check it
+// without believing this comment.
+//
+// WHY A BETTER AIM IS NOT ENOUGH, which is the part that decides the shape.
+// Aimed by hand at a point in the middle of the safe ground, the travel layer
+// still planned its way there through the guard post - "3 of its 4 legs cross
+// ground the other side guards ... It walks it" - and turned a 408 yard hop
+// into 2238 yards of surveyed leg by way of the road. The graph is not a
+// suggestion the aim can steer; it is the whole route. So a corridor has to
+// REPLACE the planned route, not feed it.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO. It does not widen the footing check, it
+// does not soften the faction reading, and it holds no opinion about any walk
+// that has no corridor written for it: PlanFootRoute keeps every one of those,
+// unchanged and for the same cost. Nor does it invent a general planner that
+// leaves the survey graph, which would need a walkability oracle at runtime -
+// exactly the thing #242 declined to invent, and for the same reason.
+
+// Why a corridor was not used. Kept apart rather than collapsed into a bool for
+// the reason RoutePlanVerdict already is: "no corridor is written for this
+// door" and "one is written and this character is nowhere near it" want
+// completely different things said about them.
+enum class StagingCorridorVerdict : std::uint8_t
+{
+    // The corridor is this walk's route. `route` holds it, join point first.
+    Joined,
+    // Nothing is written down for this walk. The common answer, and the one
+    // that must cost nothing: three of the four doors in this module's own
+    // portal table carry no corridor and need none.
+    NoCorridor,
+    // A corridor was offered and it does not end where this walk is going, so
+    // it is somebody else's corridor. Measured ground is only ever measured
+    // ground for the walk it was measured FOR.
+    NotThisAim,
+    // The corridor is real and this character is not near it. The join hop is
+    // the one stretch of a corridor walk that is NOT measured ground, so it is
+    // bounded rather than trusted; past the bound there is nothing honest to
+    // say and today's routing stands.
+    TooFarToJoin,
+    // Two points of it stand further apart than one lookahead. That is a
+    // deadlock and not a detour - see StagingCorridorLimits::maxLegYards - so
+    // it is refused with a name rather than walked into.
+    LegTooLong,
+    // The limits themselves were nonsense, so nothing was judged. Refused
+    // rather than clamped, the same way PlanFootRoute refuses BadLimits: a sign
+    // typo must not quietly become a rule LOOSER than the one written.
+    BadLimits,
+};
+
+char const* StagingCorridorVerdictName(StagingCorridorVerdict verdict);
+
+struct StagingCorridorLimits
+{
+    // HOW NEAR THE CORRIDOR'S LAST POINT MUST BE TO THE AIM. This is what binds
+    // a written-down corridor to the walk it was measured for, and it is tight
+    // on purpose: the aim for a staging walk is formatted from the very floats
+    // the corridor ends at, so the two agree exactly or somebody has changed
+    // one of them without the other.
+    float endsAtYards{5.f};
+    // HOW FAR A CHARACTER MAY STAND FROM THE CORRIDOR AND STILL JOIN IT, and
+    // this is the one number here that bounds unmeasured ground, so it is taken
+    // from a measurement this module already made rather than chosen.
+    //
+    // It is the distance under which the travel layer already declines to plan
+    // a route at all and walks straight at the aim (TRAVEL_ROUTE_MIN_YARDS).
+    // The join hop is exactly that walk: unsurveyed ground crossed by bearing.
+    // Bounding it by the module's own existing statement about how far a
+    // bearing may be trusted means the two cannot drift apart, and it keeps the
+    // hop shorter than the corridor's own narrowest clearance from a guard.
+    //
+    // Measured against the case this exists for: the leader's bind IS the
+    // corridor's own first point, so the real join hop is nought yards.
+    float joinYards{400.f};
+    // NO TWO POINTS MAY STAND FURTHER APART THAN ONE LOOKAHEAD, and this is a
+    // correctness bound rather than a preference.
+    //
+    // RouteLegStep aims at "the furthest point still inside the lookahead",
+    // counted from the character. A character standing ON a route point whose
+    // successor is beyond the lookahead is therefore handed its own feet, every
+    // poll, forever: the cursor cannot advance because nothing ahead is near
+    // enough to aim at, and nothing gets nearer because it is not being aimed
+    // anywhere. That is the mirror image of the sticky cursor RouteLegStep's
+    // own comment records walking a hundred and eighty thousand yards in
+    // circles.
+    //
+    // A planned route never meets this, because the survey stores its legs as
+    // point lists about five yards apart. A hand-written corridor easily could,
+    // so it is asked rather than assumed, and the answer is a refusal with a
+    // name on it rather than a run that stalls for twelve minutes and reports a
+    // distance.
+    //
+    // The default is RouteLegLimits::lookaheadYards. A caller that walks its
+    // routes with a different lookahead must pass its own; the corridor this
+    // module ships stands 193 yards apart at its widest.
+    float maxLegYards{250.f};
+};
+
+struct StagingCorridorPlan
+{
+    StagingCorridorVerdict verdict{StagingCorridorVerdict::NoCorridor};
+    // Which point of the corridor the character joins at. Zero and meaningless
+    // unless the verdict is Joined.
+    std::size_t joinIndex{0};
+    // How far the character stands from that point. Negative when nothing was
+    // joined - the same "no reading" convention ApproachDistance already
+    // returns, and a value no caller can mistake for having arrived.
+    float joinYards{-1.f};
+    // The widest gap between two consecutive points of the whole corridor,
+    // which is the number LegTooLong was decided on and is worth having in the
+    // line an operator reads either way.
+    float longestLegYards{0.f};
+    // The corridor from the join point onward, join point first. Empty unless
+    // the verdict is Joined, and handed straight to RouteLegStep, which is the
+    // whole point: a corridor IS a route, so it is walked by the thing that
+    // already walks routes.
+    std::vector<RoutePoint> route;
+};
+
+// THE CORRIDOR FOR THIS WALK, IF THIS WALK HAS ONE.
+//
+// `corridor` is the written-down points in walking order, ending at the place
+// the walk is going. `aimX`/`aimY` is that place as the errand names it, and
+// the two are checked against each other rather than assumed to agree: a
+// corridor is indexed by its own destination, so it can only ever be used for
+// the walk it was measured for, and no caller has to carry a second name for
+// it.
+//
+// THE JOIN IS THE NEAREST POINT, AND THE ROUTE IS EVERYTHING FROM THERE ON.
+// Nearest rather than first, because a character halfway along its corridor -
+// one that set out, was interrupted, and set out again - must not be sent back
+// to the mouth. Everything from there on rather than the nearest point alone,
+// because the cursor in RouteLegStep only ever moves FORWARD, so a route handed
+// to it has to begin where the walking begins.
+//
+// THE WHOLE CORRIDOR IS MEASURED FOR LegTooLong, NOT ONLY THE PART WALKED. A
+// corridor is a written-down fact about the world; if any of it is malformed
+// the table is wrong, and answering with the half that happens to be well
+// formed would hide that until the day somebody joins at the other end.
+//
+// AN EMPTY CORRIDOR IS NoCorridor AND NOT AN ERROR. It is what three of the
+// four rows in this module's portal table say, and it is the right answer for
+// them.
+StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
+                                        float aimX, float aimY,
+                                        float fromX, float fromY,
+                                        StagingCorridorLimits const& limits);
+
+
 // ------------------------------- a far teleport still in flight (#310) --
 //
 // A CHARACTER IN THE MIDDLE OF A CROSS-MAP TELEPORT IS NOT A CHARACTER THAT

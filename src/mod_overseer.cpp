@@ -11018,6 +11018,84 @@ private:
         return learnedSomethingGuarded;
     }
 
+    // A MEASURED STAGING CORRIDOR IS WALKED INSTEAD OF A ROUTE (#342).
+    //
+    // Asked BEFORE the survey is read, and that order is the whole of it. The
+    // planner below is not wrong about its graph; it is confined to it, and for
+    // this one walk every node on it stands on a road the other side patrols.
+    // Consulting it first and overriding it afterwards would be two answers
+    // where there is one question.
+    //
+    // A corridor is matched by its own last point against the place being walked
+    // to, so a corridor can only ever be used for the walk it was measured for
+    // and nothing has to carry a second name for it. Every door with no measured
+    // corridor - three of the four rows in the table - falls straight through
+    // this for the cost of one distance per row, and gets exactly the route it
+    // gets today.
+    //
+    // ONE MAP, like everything else in this layer: a corridor belongs to the map
+    // its door is approached from, and a character standing on another one is
+    // not on it.
+    static bool StagingCorridorRoute(Player* bot, WorldPosition const& want,
+                                     std::string const& name,
+                                     std::string const& target,
+                                     std::vector<OverseerDecisions::RoutePoint>& route)
+    {
+        OverseerDecisions::StagingCorridorLimits limits;
+        // THE TWO NUMBERS ARE THIS MODULE'S OWN, READ FROM WHERE THEY ALREADY
+        // LIVE. The join hop is unsurveyed ground crossed by bearing, which is
+        // exactly what TRAVEL_ROUTE_MIN_YARDS already says may be crossed that
+        // way; and a corridor walked with this lookahead has to be spaced under
+        // it or RouteLegStep cannot advance. Passing them rather than leaning on
+        // the header's defaults means a change to either cannot leave the
+        // corridor rule reading a stale copy.
+        limits.joinYards = TRAVEL_ROUTE_MIN_YARDS;
+        limits.maxLegYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
+
+        for (DungeonPortal const& portal : DungeonPortals())
+        {
+            if (portal.approach.empty() || portal.outsideMapId != bot->GetMapId())
+                continue;
+            OverseerDecisions::StagingCorridorPlan const plan =
+                OverseerDecisions::PlanStagingCorridor(
+                    portal.approach, want.GetPositionX(), want.GetPositionY(),
+                    bot->GetPositionX(), bot->GetPositionY(), limits);
+            if (plan.verdict == OverseerDecisions::StagingCorridorVerdict::NotThisAim)
+                continue;
+
+            if (plan.verdict != OverseerDecisions::StagingCorridorVerdict::Joined)
+            {
+                // SAID, AND SAID ONCE PER ERRAND rather than per poll, because
+                // PlanRoute is called once for an aim and then kept. A corridor
+                // that exists for this walk and was not used is the one case an
+                // operator has to be able to see, since what happens instead is
+                // the route that killed the leader.
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is sent to '{}', which is the '{}' approach, and its "
+                         "measured corridor is not used - {}. It falls back to the surveyed "
+                         "route, which for this door crosses ground the other side guards (#342)",
+                         name, target, portal.keyword,
+                         OverseerDecisions::StagingCorridorVerdictName(plan.verdict));
+                return false;
+            }
+
+            route = plan.route;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' and walks the measured '{}' corridor "
+                     "instead of a surveyed route - joined at point {} of {}, {:.0f} yards "
+                     "away, {} points left to walk, widest leg {:.0f} yards. The survey graph "
+                     "is not consulted for this walk, because its nodes follow the road the "
+                     "other side patrols (#342)",
+                     name, target, portal.keyword,
+                     static_cast<uint32>(plan.joinIndex),
+                     static_cast<uint32>(portal.approach.size()),
+                     plan.joinYards, static_cast<uint32>(route.size()),
+                     plan.longestLegYards);
+            return true;
+        }
+        return false;
+    }
+
     // THE WHOLE ROUTE FOR ONE ERRAND, planned once and then walked. Empty means
     // "there is no route to plan", which every caller must read as "aim at the
     // errand", never as an error: that is what this module did before #316 and
@@ -11027,6 +11105,8 @@ private:
         std::string const& target)
     {
         std::vector<OverseerDecisions::RoutePoint> route;
+        if (StagingCorridorRoute(bot, want, name, target, route))
+            return route;
         ReadTheSurvey();
         TravelSurvey& survey = Survey();
         if (survey.nodes.empty())
@@ -15722,6 +15802,29 @@ private:
         float approachX;
         float approachY;
         float approachZ;
+
+        // AND HOW TO GET THERE WITHOUT BEING KILLED ON THE WAY (#342). The
+        // three floats above say where the last stretch of an approach begins.
+        // They say nothing about the walk that reaches them, and for this door
+        // that walk is the whole defect: every surveyed way to it runs down a
+        // road the other side patrols, so PlanFootRoute reports the guarded
+        // legs, walks them, and the leader dies at level 30 to level 40 guards.
+        // Six runs in a row ended `staging_failed` that way.
+        //
+        // WHAT THIS IS. The points of a measured walk from where a run opens to
+        // `approachX/Y/Z`, in walking order, ending ON it. Empty means "no
+        // corridor was measured for this door", which is three of the four rows
+        // here and is the right answer for them: they stage successfully today
+        // and a corridor that has not been measured must not be invented, which
+        // is the same rule the three zeros above are written on.
+        //
+        // IT IS A ROUTE AND NOT AN AIM, which is what makes it different from
+        // the three floats above rather than more of them. A better aim does
+        // not help: aimed by hand at a point in the middle of the safe ground,
+        // the travel layer still planned its way there through the guard post
+        // and turned a 408 yard hop into 2238 yards of surveyed leg. So this
+        // REPLACES the planned route for that one walk; see PlanRoute.
+        std::vector<OverseerDecisions::RoutePoint> approach;
     };
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
@@ -15826,7 +15929,79 @@ private:
             // why the runtime probe is started just above this z rather than
             // from the terrain, exactly as DUNGEON_STAGING_Z_PROBE_LIFT_YARDS
             // already does for the door.
-            {"wailing", 1, 228, 43, 226, -705.0f, -2045.0f, 66.45f},
+            // AND THE CORRIDOR THAT REACHES IT (#342). Twelve points, and every
+            // one of them measured rather than chosen. Read off the same navmesh
+            // tiles the core's own pathfinder reads - map 1, grids 33/34 through
+            // 33/39 - by walking their polygon adjacency from the run's opening
+            // position to the terrace above and then resampling that walk under
+            // one route lookahead.
+            //
+            // WHAT EACH LEG IS WORTH, so a future reader can check this without
+            // believing the comment. `clear` is the distance from the leg's own
+            // straight line to the nearest of the 458 spawns on this map between
+            // x -2000..3000 and y -5000..-1500 whose template faction is hostile
+            // to this family; `walk` is what the navmesh says that leg really
+            // costs against its straight line, which is what decides whether the
+            // ordinary step can cross it:
+            //
+            //     leg      length   walk    clear
+            //      0 -> 1     125   1.22x     489
+            //      1 -> 2     174   1.17x     348
+            //      2 -> 3     155   1.20x     237
+            //      3 -> 4     192   1.00x     225
+            //      4 -> 5     192   1.00x     230
+            //      5 -> 6     172   1.08x     327
+            //      6 -> 7     155   1.17x     274
+            //      7 -> 8     193   1.00x     274
+            //      8 -> 9     192   1.01x     307
+            //      9 -> 10    179   1.08x     404
+            //     10 -> 11    142   1.34x     540
+            //
+            // 1871 yards in all, no leg over 193 - which is under the 250 yard
+            // route lookahead, and PlanStagingCorridor refuses the table if it
+            // ever stops being true - and 225 yards is the closest the whole
+            // corridor comes to anything of the other side. Aggro radius for a
+            // level 40 on a level 30 is about 25, so the tightest point on it
+            // has nine times that margin. The road the planner chooses instead
+            // passes within 5 yards of a level 40 guard spawn.
+            //
+            // AND IT IS NOT A DETOUR ROUND A DOOR THE PARTY COULD REACH ANYWAY.
+            // End to end this walk is 166 navmesh polygons against the 148
+            // MAX_PATH_LENGTH the core will return, which is precisely why it
+            // has to be walked in pieces rather than asked for as one path.
+            //
+            // THE LAST POINT IS `approachX/Y/Z` ITSELF, because that is what
+            // binds this corridor to the walk it was measured for:
+            // PlanStagingCorridor will not use a corridor that ends anywhere
+            // other than the aim it is offered against.
+            //
+            // AND THE LAST THREE POINTS ARE NEVER ACTUALLY AIMED AT, which is
+            // worth saying rather than leaving to be discovered. RouteLeg drops
+            // a route once the character is within TRAVEL_ROUTE_MIN_YARDS of its
+            // aim and walks straight at it, and points 9, 10 and 11 all stand
+            // inside that circle - 230, 142 and 0 yards out. They are here
+            // because the corridor has to END at the aim to be matched to it,
+            // and because a walk is not measured until it is measured to the
+            // end. That handover was measured too: from the 400 yard crossing
+            // the straight line to the terrace is 1.45x its own length on the
+            // navmesh and stays 307 yards clear of anything of the other side,
+            // which is the same ordinary last stretch every route in this
+            // module already ends with.
+            {"wailing", 1, 228, 43, 226, -705.0f, -2045.0f, 66.45f,
+             {
+                 {-1050.0f, -3664.8f,  24.36f},
+                 { -927.3f, -3639.4f,  14.85f},
+                 { -906.7f, -3466.7f,  68.27f},
+                 { -864.0f, -3317.3f,  91.87f},
+                 { -864.0f, -3125.3f,  93.91f},
+                 { -864.0f, -2933.3f,  92.05f},
+                 { -885.3f, -2762.7f,  93.96f},
+                 { -840.6f, -2613.8f,  91.77f},
+                 { -842.7f, -2421.3f,  92.21f},
+                 { -842.7f, -2229.3f,  92.12f},
+                 { -847.2f, -2050.8f,  83.75f},
+                 { -705.0f, -2045.0f,  66.45f},
+             }},
         };
         return portals;
     }
