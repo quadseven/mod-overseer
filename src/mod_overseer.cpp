@@ -1427,6 +1427,62 @@ constexpr float TRAVEL_STEP_VERTICAL_YARDS = 20.0f;
 // from Redridge roads near z 100 on 2026-09-05, walked, and fallen off.
 constexpr float TRAVEL_ROUTE_ENDPOINT_YARDS = 5.0f;
 
+// HOW FAR AN AIM HAS TO BE BEFORE A SURVEYED ROUTE IS WORTH ASKING FOR (#316).
+//
+// THIS IS THE NAVMESH'S OWN REACH AND NOT A TASTE. PathGenerator cannot return
+// a corridor longer than MAX_POINT_PATH_LENGTH points at SMOOTH_PATH_STEP_SIZE
+// yards each - 74 by 4, so 296 (PathGenerator.h:32-42) - and past that it sets
+// PATHFIND_SHORT and substitutes a two-point shortcut (PathGenerator.cpp:
+// 685-690), which NavmeshRoutes already refuses on its `size() <= 2` test. So
+// under about three hundred yards the mesh can answer and this module's
+// ordinary path is byte for byte what it was; over it the mesh NEVER can, and
+// what happens instead is the five-bearing fan pointed at a place it cannot see
+// round. Four hundred leaves margin for a winding corridor, whose point count
+// runs ahead of its straight-line length.
+constexpr float TRAVEL_ROUTE_MIN_YARDS = 400.0f;
+
+// HOW FAR ALONG THE ROUTE TO AIM EACH POLL, and the number has two independent
+// ceilings that agree.
+//
+// Replaying GroundedStep stride for stride over the shipped heightmap grids: a
+// lookahead of 120 and one of 250 both ARRIVE on all three measured routes; one
+// of 400 is refused after 2812 yards on the longest, because a point that far
+// ahead is once again a straight line drawn across terrain and the cone is once
+// again pointing at a hill. And separately, 250 is under the 296-yard corridor
+// cap above, so an aim at this range is one the mesh can still route to when the
+// ground allows - which is what turns a stepped walk into a routed one and is
+// worth six minutes on the longest journey measured.
+constexpr float TRAVEL_ROUTE_LOOKAHEAD_YARDS = 250.0f;
+
+// Near enough to the last point of a route to call it walked, after which the
+// errand's own aim takes over. More than one ground sample, so a character that
+// is standing on the end is not still being sent to it; far less than a step,
+// so the handover happens where the greedy stepper has something to do.
+constexpr float TRAVEL_ROUTE_ARRIVED_YARDS = 12.0f;
+
+// How far from a character a surveyed node may be and still be its way onto the
+// network. The three journeys measured for #316 entered 3, 107 and 129 yards
+// from a node; six hundred is wide enough for anywhere this family walks and
+// narrow enough that a character on the wrong side of water does not adopt a
+// node across it.
+constexpr float TRAVEL_ROUTE_ENTRY_YARDS = 600.0f;
+
+// ...and how much nearer the aim the route has to finish before it is worth
+// walking. Under this the character is already as close as the survey gets and
+// the greedy stepper is the right tool, which is exactly the Ratchet case: 1465
+// yards of flat Barrens that the stepper crosses unaided in the same replay
+// where it is refused after 84 yards in Stonetalon.
+constexpr float TRAVEL_ROUTE_GAIN_YARDS = 200.0f;
+
+// UPSTREAM'S OWN LINK TYPE, AND ONLY ONE OF THEM KEEPS A PARTY TOGETHER.
+// TravelNodePathType (TravelNode.h:55-63) is none 0, walk 1, portal 2,
+// transport 3, flightPath 4, teleportSpell 5. A flight carries one passenger
+// and leaves the other four standing, which is why the flight leg was declined
+// and still is; a transport is a boat on a timetable this module refuses to
+// board (#279); a portal changes maps and nothing here can rejoin a party split
+// across two of them (#241). Of the 15041 links shipped, 13885 are walks.
+constexpr uint32 TRAVEL_ROUTE_LINK_WALK = 1;
+
 // A follower that has stopped, and never closes the gap (#70).
 //
 // Two followers stopped at a zone border on the dev world 2026-08-30 and
@@ -3324,6 +3380,21 @@ public:
         // discipline as `flightSaid`, and cleared with the errand for the same
         // reason.
         bool deathSaid{false};
+        // THE SURVEYED ROUTE ROUND WHATEVER IS IN THE WAY, AND HOW FAR ALONG
+        // IT THIS CHARACTER IS (#316).
+        //
+        // Scoped to the errand and cleared with it, like `flights` and unlike
+        // `footing`: a route is a fact about the journey being taken, and the
+        // moment the aim changes the old route goes somewhere nobody is going.
+        //
+        // `routePlanned` is separate from `route` being non-empty on purpose.
+        // A planned route that came back EMPTY - no survey, no way round, or a
+        // journey the survey cannot improve on - is an answer, and without the
+        // flag it would be re-asked, and re-queried, on every poll of an errand
+        // that has already been told there is nothing to find.
+        bool routePlanned{false};
+        std::vector<OverseerDecisions::RoutePoint> route;
+        OverseerDecisions::RouteCursor routeCursor{};
     };
 
     // Every enabled character with an outstanding errand, name -> target.
@@ -9920,6 +9991,286 @@ private:
             actualEnd.z, z, TRAVEL_ROUTE_ENDPOINT_YARDS);
     }
 
+    // ------------------------------------ THE WAY ROUND AN OBSTACLE (#316) --
+    //
+    // Everything above this line is about ONE step. GroundedStep asks whether
+    // the point the mover is about to be handed is one this character can walk
+    // to from where it stands, and answers well. What it cannot do is decide to
+    // walk AWAY from a destination in order to reach it, because it is greedy:
+    // five bearings in a cone toward the aim, take the best, repeat. Going round
+    // a mountain is exactly that decision, so no cone of any width makes it.
+    //
+    // Measured by replaying GroundedStep stride for stride against the shipped
+    // heightmap grids. A character at Sishir Canyon aimed at the Wailing Caverns
+    // door is refused every bearing after EIGHTY-FOUR YARDS; one starting where
+    // the family actually stood is refused after 825. Three live runs ended the
+    // same way at 2577, 2788 and 3022 yards out, over 36 minutes of walking.
+    // And the contrast that acquits the step chooser: the same replay starting
+    // at Ratchet, 1465 yards of flat Barrens from the same aim, ARRIVES.
+    //
+    // WHAT IS DONE ABOUT IT. The errand's own destination stops being the point
+    // GroundedStep is asked about. It is asked about a point a couple of hundred
+    // yards along a surveyed route instead, and the errand's destination goes
+    // back to being the aim once the route is walked. Arrival, the ratchet and
+    // the backstop all still measure against the errand, because the errand is
+    // still where the character is going; only the point handed to the mover
+    // this poll changes. Nothing about the footing check moves, and it must not:
+    // its refusals are reading real terrain (#312).
+    //
+    // WHERE THE ROUTE COMES FROM, AND WHY IT IS NOT A SECOND GRAPH.
+    // mod-playerbots ships a surveyed travel node network as BASE data - 3781
+    // nodes, 15041 links and 1.4 million navmesh-walked waypoints, in
+    // playerbots_travelnode, _link and _path, installed by its own SQL on any
+    // realm that runs it. Somebody already walked these roads and wrote down
+    // where they go. This reads those rows. It does not survey anything.
+    //
+    // AND WHY IT READS THE ROWS RATHER THAN ASKING sTravelNodeMap, WHICH HOLDS
+    // THEM. Because at the pinned revision it does not hold them.
+    // TravelNodeMap::loadNodeStore() is called from exactly one non-debug place,
+    // TravelMgr::LoadQuestTravelTable (TravelMgr.cpp:2381), and that function
+    // has no callers anywhere in the tree - grep it and you get its definition
+    // and its declaration. What startup runs is TravelMgr::Init
+    // (TravelMgr.cpp:4354), which builds the taxi graph and the destination
+    // cache and never touches the node map; the one consumer that would have
+    // used it, MovementActions.cpp:381's getFullPath, is commented out.
+    // Confirmed on the dev realm, which logs "Playerbots Taxi graph and
+    // destination cache built." and not one line mentioning travelNodes. The
+    // survey is real and complete; the object that would serve it is empty, and
+    // calling loadNodeStore() from here would also set hasToGen and hand a
+    // running world to generateAll(), which is an offline job measured in hours.
+    //
+    // WHY THE ANSWER IS CACHED WHERE NavmeshRoutes' IS NOT. That one depends on
+    // where the character is STANDING, which is the thing that changes between
+    // polls. This one is a property of the world: the roads do not move. It is
+    // read once per process and planned once per errand.
+    struct TravelSurvey
+    {
+        bool read{false};
+        // Said once for the whole process, not once per errand. A realm whose
+        // node tables were never populated is a fact about the install, and a
+        // line about it every fifteen seconds would bury everything else.
+        bool said{false};
+        std::vector<OverseerDecisions::RouteNode> nodes;
+        std::vector<OverseerDecisions::RouteLink> links;
+    };
+
+    // World thread only - DriveTravel runs from OnUpdate - so unguarded, in the
+    // same way TravelAimBook is.
+    static TravelSurvey& Survey()
+    {
+        static TravelSurvey survey;
+        return survey;
+    }
+
+    // READ ONCE, AND `read` IS SET BEFORE THE QUERIES RUN. A realm without these
+    // tables answers null, and retrying that every errand would be two failing
+    // queries per errand forever. One attempt is the whole budget.
+    static void ReadTheSurvey()
+    {
+        TravelSurvey& survey = Survey();
+        if (survey.read)
+            return;
+        survey.read = true;
+
+        // The playerbots database, because that is where mod-playerbots' own
+        // SQL puts these. Declared in the core's DatabaseEnv.h alongside
+        // CharacterDatabase, which this file already includes, so this costs no
+        // new dependency on an upstream header.
+        if (QueryResult result = PlayerbotsDatabase.Query(
+                "SELECT id, map_id, x, y, z FROM playerbots_travelnode"))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                OverseerDecisions::RouteNode node;
+                node.id = fields[0].Get<uint32>();
+                node.mapId = fields[1].Get<uint32>();
+                node.x = fields[2].Get<float>();
+                node.y = fields[3].Get<float>();
+                node.z = fields[4].Get<float>();
+                survey.nodes.push_back(node);
+            } while (result->NextRow());
+        }
+
+        if (QueryResult result = PlayerbotsDatabase.Query(
+                "SELECT node_id, to_node_id, type, distance, extra_cost "
+                "FROM playerbots_travelnode_link"))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                OverseerDecisions::RouteLink link;
+                link.from = fields[0].Get<uint32>();
+                link.to = fields[1].Get<uint32>();
+                link.yards = fields[3].Get<float>() + fields[4].Get<float>();
+                link.onFoot =
+                    fields[2].Get<uint32>() == TRAVEL_ROUTE_LINK_WALK;
+                survey.links.push_back(link);
+            } while (result->NextRow());
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: the shipped travel survey holds {} nodes and {} links, "
+                 "{} of them walks - read once for this process (#316)",
+                 static_cast<uint32>(survey.nodes.size()),
+                 static_cast<uint32>(survey.links.size()),
+                 static_cast<uint32>(std::count_if(
+                     survey.links.begin(), survey.links.end(),
+                     [](OverseerDecisions::RouteLink const& l) { return l.onFoot; })));
+    }
+
+    // THE POINTS OF ONE LEG, IN ORDER. The survey stores a navmesh-walked point
+    // list per link, about five yards apart - median 4.2 to 5.2 and maximum 8.6
+    // over the three routes measured for this issue - which is what makes a leg
+    // something the greedy stepper can walk rather than another straight line.
+    //
+    // A LEG WITH NO POINTS IS STILL A LEG. 72 of the 15041 shipped links carry
+    // none, and upstream's own route builder answers that case by aiming at the
+    // far node and moving on (TravelNode.cpp:972-977). So does this: the node's
+    // own position goes in as the single point for that leg, and the stepper
+    // gets a long aim for one leg instead of no route at all.
+    static void AppendLeg(uint32 from, uint32 to,
+                          OverseerDecisions::RouteNode const& toNode,
+                          std::vector<OverseerDecisions::RoutePoint>& out)
+    {
+        std::size_t const before = out.size();
+        if (QueryResult result = PlayerbotsDatabase.Query(
+                "SELECT x, y, z FROM playerbots_travelnode_path "
+                "WHERE node_id = {} AND to_node_id = {} ORDER BY nr",
+                from, to))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                OverseerDecisions::RoutePoint point;
+                point.x = fields[0].Get<float>();
+                point.y = fields[1].Get<float>();
+                point.z = fields[2].Get<float>();
+                out.push_back(point);
+            } while (result->NextRow());
+        }
+        if (out.size() != before)
+            return;
+        OverseerDecisions::RoutePoint point;
+        point.x = toNode.x;
+        point.y = toNode.y;
+        point.z = toNode.z;
+        out.push_back(point);
+    }
+
+    // THE WHOLE ROUTE FOR ONE ERRAND, planned once and then walked. Empty means
+    // "there is no route to plan", which every caller must read as "aim at the
+    // errand", never as an error: that is what this module did before #316 and
+    // what it keeps doing for every journey a survey cannot improve on.
+    static std::vector<OverseerDecisions::RoutePoint> PlanRoute(
+        Player* bot, WorldPosition const& want, std::string const& name,
+        std::string const& target)
+    {
+        std::vector<OverseerDecisions::RoutePoint> route;
+        ReadTheSurvey();
+        TravelSurvey& survey = Survey();
+        if (survey.nodes.empty())
+        {
+            if (!survey.said)
+            {
+                survey.said = true;
+                LOG_WARN("module.overseer",
+                         // Kept on ONE source line for the same reason the
+                         // release paths above are: infra's guard test greps
+                         // this function for the phrase.
+                         "overseer: there is no travel survey on this realm - playerbots_travelnode is empty or absent - so no errand can be routed round terrain and every far walk is a greedy step at whatever is in front of it (#316). mod-playerbots ships this table as base data; a realm missing it has not had that SQL applied");
+            }
+            return route;
+        }
+
+        // A ROUTE IS WALKED ON ONE MAP. An aim on another map is a crossing,
+        // which this module does elsewhere and deliberately (#279), and a route
+        // is no part of it.
+        if (want.GetMapId() != bot->GetMapId())
+            return route;
+
+        OverseerDecisions::RoutePlanLimits limits;
+        limits.entryNodeYards = TRAVEL_ROUTE_ENTRY_YARDS;
+        limits.minGainYards = TRAVEL_ROUTE_GAIN_YARDS;
+        OverseerDecisions::RoutePlan const plan = OverseerDecisions::PlanFootRoute(
+            survey.nodes, survey.links, bot->GetMapId(), bot->GetPositionX(),
+            bot->GetPositionY(), want.GetPositionX(), want.GetPositionY(), limits);
+        if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' and the shipped travel survey has no "
+                     "way round for it - {}. It walks at the aim as before, which is only "
+                     "a problem if terrain is in the way (#316)",
+                     name, target,
+                     OverseerDecisions::RoutePlanVerdictName(plan.verdict));
+            return route;
+        }
+
+        std::map<uint32, OverseerDecisions::RouteNode const*> byId;
+        for (OverseerDecisions::RouteNode const& node : survey.nodes)
+            if (node.mapId == bot->GetMapId())
+                byId.emplace(node.id, &node);
+        for (std::size_t i = 0; i + 1 < plan.nodes.size(); ++i)
+        {
+            auto const to = byId.find(plan.nodes[i + 1]);
+            if (to == byId.end())
+                continue;
+            AppendLeg(plan.nodes[i], plan.nodes[i + 1], *to->second, route);
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is sent to '{}' and is routed round it - {} surveyed nodes, "
+                 "{:.0f} yards of walking legs and {} waypoints, finishing {:.0f} yards from "
+                 "the aim where the ordinary step takes over. No leg of it is a flight, a "
+                 "boat or a portal, because the party walks together (#316)",
+                 name, target, static_cast<uint32>(plan.nodes.size()), plan.yards,
+                 static_cast<uint32>(route.size()), plan.endsFromAimYards);
+        return route;
+    }
+
+    // WHERE TO SEND THIS CHARACTER THIS POLL, given the errand it is on. `want`
+    // is the errand and never moves; the answer is a point on the route while
+    // there is one and `want` itself otherwise.
+    //
+    // A ROUTE IS ONLY PLANNED FOR AN AIM THE NAVMESH CANNOT REACH ANYWAY. Under
+    // TRAVEL_ROUTE_MIN_YARDS the mesh can still answer and this module's
+    // ordinary path is byte for byte what it was before this existed; over it
+    // the mesh never can, and what happens instead is the fan pointed at a place
+    // it cannot see round.
+    static WorldPosition RouteLeg(Player* bot, WorldPosition const& want,
+                                  TravelAimBook::TravelState& state,
+                                  std::string const& name,
+                                  std::string const& target)
+    {
+        if (bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
+            TRAVEL_ROUTE_MIN_YARDS)
+            return want;
+        if (!state.routePlanned)
+        {
+            state.routePlanned = true;
+            state.route = PlanRoute(bot, want, name, target);
+            state.routeCursor = OverseerDecisions::RouteCursor{};
+        }
+        if (state.route.empty())
+            return want;
+
+        OverseerDecisions::RouteLegLimits limits;
+        limits.lookaheadYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
+        limits.arrivedYards = TRAVEL_ROUTE_ARRIVED_YARDS;
+        OverseerDecisions::RouteAim const aim = OverseerDecisions::RouteLegStep(
+            state.routeCursor, state.route, bot->GetPositionX(),
+            bot->GetPositionY(), limits);
+        if (!aim.hasAim)
+        {
+            // Walked, or nothing left to offer. THE ROUTE IS DROPPED RATHER
+            // THAN KEPT AND SKIPPED, so the rest of this errand costs nothing
+            // and re-reads nothing.
+            state.route.clear();
+            return want;
+        }
+        return WorldPosition(want.GetMapId(), aim.x, aim.y, aim.z);
+    }
+
     // The point to hand the mover THIS POLL for a character wanted at `want`.
     // False when every direction was refused, which the caller must read as "do
     // not re-aim this poll" rather than as an error: standing still at the top
@@ -11219,6 +11570,11 @@ private:
                 // else's - see TravelState::errandSince.
                 state.errandSince = std::time(nullptr);
                 state.deathSaid = false;
+                // A new errand is a new route. The old one was a way round
+                // something on the way to somewhere else (#316).
+                state.routePlanned = false;
+                state.route.clear();
+                state.routeCursor = OverseerDecisions::RouteCursor{};
             }
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -11935,8 +12291,17 @@ private:
             // creature stands on ground by construction: a spawn point is
             // somewhere the world put something. Every death this answers was
             // at an `at:` or a `trigger:`.
-            WorldPosition aimAt = pos;
-            if (!entry && !GroundedStep(bot, pos, aimAt))
+            //
+            // AND THE POINT THE STEP IS AIMED AT IS NOT ALWAYS THE ERRAND
+            // (#316). GroundedStep is greedy and cannot walk away from a
+            // destination in order to reach it, so for a far aim it is given a
+            // point a couple of hundred yards along a surveyed route instead.
+            // `pos` is untouched and stays the errand: arrival, the ratchet and
+            // the backstop all still measure against it, because it is still
+            // where this character is going. See RouteLeg.
+            WorldPosition const leg = entry ? pos : RouteLeg(bot, pos, state, name, target);
+            WorldPosition aimAt = leg;
+            if (!entry && !GroundedStep(bot, leg, aimAt))
             {
                 // WHAT WAS MEASURED, AND NOT WHAT IT FELT LIKE (#312). This
                 // line used to say "there is no direction out of where it

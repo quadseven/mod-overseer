@@ -5341,6 +5341,263 @@ uint32_t HearthVerifyWindowMs(uint32_t castMs, uint32_t marginMs, uint32_t floor
 TownRetry HearthRefusalRetry(std::string const& detail);
 
 
+// ------------------------------------------------------ A WAY ROUND (#316) --
+//
+// WHAT A GREEDY CONE CANNOT DO, AND WHY NO WIDER ONE WOULD HELP.
+//
+// GroundedStep picks a bearing out of a five-wide cone toward the aim and takes
+// the best one it can prove ground under. It has no memory and no notion that a
+// detour exists, so it cannot decide to walk AWAY from a destination in order
+// to reach it - and walking away is exactly what going round a mountain is.
+// Widening the cone does not add the missing idea; it only lets a character
+// wander off its aim.
+//
+// Measured by replaying that same step chooser stride for stride over the
+// SHIPPED heightmap grids: a character starting at Sishir Canyon and aimed at
+// the Wailing Caverns door is refused every bearing after EIGHTY-FOUR YARDS,
+// and one starting where the family actually stood is refused after 825. Three
+// live runs ended the same way, at 2577, 2788 and 3022 yards out.
+//
+// AND THE CONTRAST THAT SAYS THE STEP CHOOSER ITSELF IS FINE. The same replay
+// starting at Ratchet, 1465 yards of flat Barrens from the same aim, ARRIVES.
+// Greedy is not broken. It is being asked a question a greedy search cannot
+// answer.
+//
+// SO IT IS HANDED A NEARER QUESTION. A route is a sequence of points the greedy
+// stepper can walk BETWEEN, each leg short enough and clear enough for it to
+// succeed. Nothing about GroundedStep changes and nothing about the footing
+// check changes: #312's refusals are reading real terrain and must keep doing
+// it. The one thing that changes is that the cone is never again pointed at a
+// destination on the far side of a mountain.
+//
+// WHERE THE POINTS COME FROM, AND WHY THIS MODULE DOES NOT INVENT THEM.
+// mod-playerbots ships a surveyed travel node network as BASE DATA - 3781
+// nodes, 15041 links and 1.4 million navmesh-walked waypoints, installed by its
+// own SQL on any realm that runs it - and the waypoints inside a link sit about
+// five yards apart. Somebody already walked these roads. These two decisions do
+// the only two things reading that survey requires: choose a sequence of nodes,
+// and choose which of the chosen legs' points to aim at this poll. Both are
+// pure, so both are testable, and neither knows where the rows came from.
+//
+// WHY THE MODULE READS THE ROWS RATHER THAN ASKING THE OBJECT THAT HOLDS THEM.
+// Upstream's own TravelNodeMap would answer this if it were populated, and at
+// the pinned revision it is not: loadNodeStore() is called from exactly one
+// non-debug place, TravelMgr::LoadQuestTravelTable, and that function has no
+// callers anywhere in the tree. What startup actually runs is TravelMgr::Init,
+// which builds the taxi graph and the destination cache and never touches the
+// node map. Confirmed on the running realm, which logs "Playerbots Taxi graph
+// and destination cache built." and has not one line mentioning travelNodes.
+// The survey is real; the object that would serve it is empty.
+
+// One node of the travel graph, as a caller read it out of wherever it keeps
+// them. Plain floats and a plain id: these two files know nothing about the
+// core's geometry classes and must not start now.
+struct RouteNode
+{
+    std::uint32_t id{0};
+    std::uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// One ONE-WAY link between two nodes. The graph really is directed, so a caller
+// with both directions must hand in both.
+//
+// `onFoot` IS THE WHOLE OF THE PARTY-TOGETHER RULE. Upstream types its links
+// walk, portal, transport, flightPath and teleportSpell, and only a walk keeps
+// five characters in one place. A flightPath carries one passenger and leaves
+// the other four standing, which is exactly why the flight leg was declined and
+// is still a good reason. A transport is a boat on a timetable. A portal changes
+// maps, and nothing in this module can rejoin a party split across two of them
+// (#241). The caller sets this flag and the search never second-guesses it: a
+// link that is not walkable does not exist to it.
+//
+// Measured, so the cost of that rule is known rather than feared: on the shipped
+// data 13885 of the 15041 links are walks, and all three routes replayed for
+// this issue are walks end to end.
+struct RouteLink
+{
+    std::uint32_t from{0};
+    std::uint32_t to{0};
+    // What walking it costs. Distance plus whatever the survey charges on top,
+    // so a caller may price a link it would rather avoid without deleting it.
+    float yards{0.f};
+    bool onFoot{false};
+};
+
+// One point along a leg. No id and no map: a route is walked on one map by
+// construction, and these are only ever compared with a character's position.
+struct RoutePoint
+{
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// Why a route was not planned. Kept apart rather than collapsed into a bool,
+// because they call for completely different things: NoGraph is a realm whose
+// node tables were never populated and wants saying once for the whole process;
+// NoNearerNode is about one aim and wants saying about that aim.
+enum class RoutePlanVerdict : std::uint8_t
+{
+    // A node sequence was found. `nodes` holds it, entry node first.
+    Planned,
+    // No nodes on this map at all.
+    NoGraph,
+    // There are nodes, but none within `entryNodeYards` of where the character
+    // stands. A character deep inside an instance, or out on a spit of coast
+    // nobody surveyed, reads like this.
+    NoEntryNode,
+    // There is a way in, and nothing reachable ON FOOT from it is enough nearer
+    // the aim to be worth walking to. Two different worlds arrive here and this
+    // verdict alone does not separate them: a destination across an ocean, and
+    // a character already standing at its errand.
+    NoNearerNode,
+    // The limits themselves were nonsense, so nothing was searched. Refused
+    // rather than clamped, for the same reason TravelEndpointWithinTolerance
+    // refuses a negative tolerance: a sign typo must not quietly become a rule
+    // LOOSER than the one written.
+    BadLimits,
+};
+
+char const* RoutePlanVerdictName(RoutePlanVerdict verdict);
+
+struct RoutePlan
+{
+    RoutePlanVerdict verdict{RoutePlanVerdict::NoGraph};
+    // Node ids, entry node first. Empty unless the verdict is Planned.
+    std::vector<std::uint32_t> nodes;
+    // What the planned legs cost, summed. A GRAPH COST AND NOT THE YARDS A
+    // CHARACTER WILL WALK: the points inside a leg wander, and over the three
+    // replayed routes the walk came out 8 to 21 per cent UNDER the summed link
+    // distance, because the stepper cuts corners the survey did not.
+    float yards{0.f};
+    // How far the LAST node is from the aim, so a caller can say whether the
+    // route finishes the journey or only most of it. Negative when nothing was
+    // planned.
+    //
+    // IT IS ROUTINELY NOT ZERO, AND THAT IS THE HONEST ANSWER RATHER THAN A
+    // SHORTFALL. The two nodes nearest the Wailing Caverns door are the
+    // instance portal's own pair, and they sit in a ten-node island with no
+    // walk link to the overland network at all. The nearest node a character
+    // can actually WALK to is 343 yards out on open Barrens ground - which is
+    // precisely the kind of last stretch the greedy stepper already crosses
+    // unaided, and does in the Ratchet replay.
+    float endsFromAimYards{-1.f};
+};
+
+struct RoutePlanLimits
+{
+    // How far from the character a node may be and still be its way in. Wide
+    // enough to find one from anywhere this family walks - the three measured
+    // entries were 3, 107 and 129 yards out - and bounded so a character on the
+    // wrong side of water does not adopt a node across it.
+    float entryNodeYards{600.f};
+    // A route has to be worth walking. The last node must be at least this much
+    // nearer the aim than the character already is, or there is nothing here it
+    // could not do for itself, and aiming BACKWARDS is the greedy stepper's own
+    // failure mode wearing a route's clothes.
+    float minGainYards{200.f};
+};
+
+// THE NODE SEQUENCE, AND THE ONE CHOICE THAT MAKES IT WORK.
+//
+// Dijkstra over `onFoot` links only, from the node nearest the character to the
+// node nearest the aim - except that "nearest the aim" is resolved AMONG THE
+// NODES ACTUALLY REACHED, and that is not a detail. Measured: the nearest node
+// to the Wailing Caverns door is 173 yards from it and is not reachable on foot
+// from anywhere this family has ever stood, because it is an instance portal
+// node in its own island. A planner that picks the goal by distance and then
+// asks for a path answers "no route" for all three of the journeys measured
+// here, and all three HAVE one. Picking the goal out of the reached set answers
+// all three.
+//
+// ONE MAP. Nodes on another map are not read and links leaving it are not
+// followed. A route that changes continents is a crossing, which this module
+// does elsewhere and deliberately (#279).
+//
+// WHAT IT COSTS TO ASK. One search over one map's nodes - 616 of them on
+// Kalimdor - run when an errand's aim changes and then kept for that errand,
+// not run per poll.
+RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
+                        std::vector<RouteLink> const& links,
+                        std::uint32_t mapId, float fromX, float fromY,
+                        float toX, float toY, RoutePlanLimits const& limits);
+
+// How far along its route a character has got. Held by the caller beside the
+// route itself, and thrown away with it.
+struct RouteCursor
+{
+    std::uint32_t at{0};
+};
+
+struct RouteAim
+{
+    // False means "this poll has no route point to offer", which the caller
+    // must read as "aim at the errand itself" and never as an error.
+    bool hasAim{false};
+    // Within `arrivedYards` of the LAST point. The route is spent, and whatever
+    // is left between here and the errand belongs to the greedy stepper, which
+    // is the thing it is good at.
+    bool arrived{false};
+    std::uint32_t index{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+struct RouteLegLimits
+{
+    // How far ahead along the route to aim. THIS NUMBER HAS A MEASURED CEILING
+    // AND A SECOND ONE READ OUT OF THE CORE, AND THEY AGREE.
+    //
+    // Replayed over the shipped heightmap grids, a lookahead of 120 and one of
+    // 250 both arrive on all three routes; a lookahead of 400 is REFUSED after
+    // 2812 yards on the longest of them, because a point that far ahead is once
+    // again a straight line drawn across terrain and the cone is once again
+    // pointing at a hill.
+    //
+    // Independently: PathGenerator cannot return a corridor longer than
+    // MAX_POINT_PATH_LENGTH (74) points at SMOOTH_PATH_STEP_SIZE (4.0), which
+    // is 296 yards (PathGenerator.h:32-42). Past that it sets PATHFIND_SHORT
+    // and hands back a two-point shortcut (PathGenerator.cpp:685-690), which
+    // NavmeshRoutes already refuses. So an aim beyond roughly 296 yards can
+    // never come back as a route no matter how good the ground is. 250 sits
+    // under both bounds.
+    float lookaheadYards{250.f};
+    // Near enough to the last point to call the route walked.
+    float arrivedYards{12.f};
+};
+
+// WHICH POINT TO AIM AT THIS POLL, AND THE TWO RULES THAT ARE THE WHOLE OF IT.
+//
+// THE CURSOR ONLY EVER MOVES FORWARD. A route walked backwards is not a route,
+// and a character that drifts off the line - which it does, because the stepper
+// is allowed to go round things - must not be sent back to the start by a point
+// that happens to be near it.
+//
+// AND IT IS THE NEAREST POINT AHEAD, NOT THE LAST POINT ARRIVED AT. This is the
+// rule that was got wrong first, and it failed loudly enough to be worth
+// writing down: advancing the cursor only on "came within N yards of point i"
+// STICKS, because a sixty-yard step steps clean over a point five yards wide
+// and the cursor then never moves again. In the replay that version walked a
+// hundred and eighty THOUSAND yards in circles and finished seventy yards from
+// where it began. The cursor is a scan FORWARD from where it already is for the
+// point nearest the character; the aim is then the furthest point still inside
+// the lookahead.
+//
+// The forward scan gives up once points are running away by more than one
+// lookahead, so a route that doubles back on itself does not cost a full pass
+// every poll.
+//
+// NONSENSE LIMITS REFUSE rather than clamp, and a refusal here is `hasAim`
+// false, which every caller already handles as "aim at the errand".
+RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
+                      float x, float y, RouteLegLimits const& limits);
+
+
+
 // ------------------------------- a far teleport still in flight (#310) --
 //
 // A CHARACTER IN THE MIDDLE OF A CROSS-MAP TELEPORT IS NOT A CHARACTER THAT
