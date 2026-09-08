@@ -13295,10 +13295,21 @@ private:
             // stand-down deliberately leaves this character's memory alone -
             // "I am not entitled to an opinion right now" is not evidence that
             // anything is either wrong or fine.
-            bool const mayInspect = OverseerDecisions::TerrainRecoveryMayInspect(
-                bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
-                bot->IsFlying(), bot->IsFalling(), bot->IsInWater(),
-                bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr);
+            //
+            // BUT IT IS THE MEASUREMENT THAT ANSWERS IT NOW, NOT THE FLAG
+            // (#323). The raw flag is never cleared server-side on a player
+            // and this roster sends no client packet that would clear it, so a
+            // stand-down taken on it can last forever - and on 48 of the 50
+            // sampled void deaths it did, which is 48 characters this drive
+            // did not look at on the last poll of their lives. The fall
+            // baseline guard below already measures the descent every poll for
+            // every character, so the answer is taken from there and the flag
+            // is recorded raw in the stand-down mask, exactly as before, so
+            // rows either side of this change still compare.
+            //
+            // WHICH IS WHY THE GATE IS BUILT AFTER THE GUARD RUNS and not
+            // here. Nothing between this point and there reads it.
+            bool descending = false;
 
             // PUT THE FALL BASELINE BACK UNDER THIS CHARACTER'S FEET (#265).
             //
@@ -13435,11 +13446,26 @@ private:
                     onTransport, inVehicle);
                 if (coreWouldNotCharge)
                     standDown |= OverseerDecisions::FALL_GUARD_NO_CHARGE;
-                if (guardMayInspect && !coreWouldNotCharge && !held.rebase)
+                // ONE FOLD, READ IN TWO PLACES (#323). This bit and the
+                // terrain recovery's stand-down are the same question about
+                // the same three answers, and until this was a named rule each
+                // wrote the expression out separately.
+                descending = OverseerDecisions::MeasuredToBeFalling(
+                    guardMayInspect, coreWouldNotCharge, held.rebase);
+                if (descending)
                     standDown |= OverseerDecisions::FALL_GUARD_DESCENDING;
                 RememberStandDown(name, standDown);
             }
 
+            // AND NOW THE STAND-DOWN, WITH THE MEASUREMENT IN IT (#323). The
+            // eight arguments and their order are unchanged; the fifth is the
+            // measured descent rather than Unit::IsFalling, for the reasons on
+            // OverseerDecisions::MeasuredToBeFalling. Everything else this
+            // declines on is a flag nobody has caught lying.
+            bool const mayInspect = OverseerDecisions::TerrainRecoveryMayInspect(
+                bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
+                bot->IsFlying(), descending, bot->IsInWater(),
+                bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr);
             if (!mayInspect)
                 continue;
 
@@ -20036,6 +20062,14 @@ private:
         // arithmetic was not written down anywhere a reader could reach.
         // Now the line says which, and says "unsampled" rather than nothing
         // when there was no sample to draw the distance from.
+        //
+        // AND IT SAYS WHEN THE DISTANCE IS NOT A DROP AT ALL (#323). The
+        // death's own z goes in beside the distance, so a body below the void
+        // plane is named as one rather than described as a fall of whatever
+        // slice of its descent happened to fall between the last two samples.
+        // "fell 136.9 yards which is enough to kill it" was the sentence that
+        // sent five separate fixes at the fall arithmetic for a death the fall
+        // arithmetic has nothing to do with.
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
                  "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
@@ -20046,7 +20080,9 @@ private:
                  batch.back().driver, batch.back().movement,
                  batch.back().yardsFallen,
                  OverseerDecisions::FallAccountName(
-                     OverseerDecisions::AccountForFall(batch.back().yardsFallen)),
+                     OverseerDecisions::AccountForFall(
+                         batch.back().yardsFallen, 0.f, 1.f, batch.back().z,
+                         OverseerDecisions::VOID_PLANE_Z)),
                  batch.back().inCombat < 0
                      ? "unsampled"
                      : (batch.back().inCombat ? "yes" : "no"),

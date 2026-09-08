@@ -104,6 +104,31 @@ bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
            !inWater && !onTransport && !onVehicle;
 }
 
+bool MeasuredToBeFalling(bool guardMayInspect, bool coreWouldNotCharge,
+                         bool baselineRebased)
+{
+    // A GUARD THAT DID NOT LOOK MEASURED NOTHING, and an unmeasured character
+    // is not a falling one. The states that stop the guard looking - dead,
+    // teleporting, on a taxi, in water, on a transport, in a vehicle - are
+    // every one of them already a stand-down of TerrainRecoveryMayInspect's
+    // own, so answering false here cannot open a gate those keep shut. It only
+    // stops an absence of evidence being read as evidence, which is the
+    // asymmetry #291 chose for the guard and the same one this needs.
+    if (!guardMayInspect)
+        return false;
+
+    // The core will not charge this character for a fall, so the guard wrote
+    // nothing and there is no measurement behind `baselineRebased` to read.
+    if (coreWouldNotCharge)
+        return false;
+
+    // The guard put the baseline back under the character's feet, which it
+    // does for everything that is not descending faster than a body on its
+    // feet can. So a rebase is the measurement saying "not falling", and its
+    // absence is the measurement saying "falling".
+    return !baselineRebased;
+}
+
 bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
                                bool surfaceValid, bool hasLocalNavmesh,
                                float minimumGap)
@@ -2707,8 +2732,16 @@ float LethalFallYards(float safeFallYards, float rate)
 }
 
 FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards,
-                           float rate)
+                           float rate, float deathZ, float voidPlaneZ)
 {
+    // THE PLANE FIRST, BEFORE THE UNSAMPLED MARKER EVEN. A body below the kill
+    // plane is the one answer that does not need the distance to be true, and
+    // 9 of the 59 measured void deaths carried no sample at all - calling
+    // those "unsampled" would hide the only fact about them anybody needs.
+    // A plane at or above zero is the caller saying it is not asking.
+    if (voidPlaneZ < 0.f && deathZ < voidPlaneZ)
+        return FallAccount::VoidPlane;
+
     // Negative is YardsFallen's unsampled marker, and it is not zero: see the
     // header. Saying "it did not fall" about a row nobody sampled is exactly
     // the mistake this whole function exists to stop.
@@ -2733,6 +2766,12 @@ char const* FallAccountName(FallAccount account)
         case FallAccount::TooShortToHurt: return "too short to hurt it";
         case FallAccount::Survivable:     return "could not have killed it";
         case FallAccount::EnoughToKill:   return "enough to kill it";
+        // Deliberately not a distance and deliberately not the word "fall".
+        // The reader this sentence is for is the one about to go and look at
+        // the fall guard again.
+        case FallAccount::VoidPlane:
+            return "not a fall at all: it crossed the void plane and the core "
+                   "killed it outright";
     }
     return "unsampled";
 }

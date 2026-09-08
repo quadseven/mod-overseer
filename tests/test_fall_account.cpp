@@ -28,6 +28,7 @@ using OverseerDecisions::FallAccount;
 using OverseerDecisions::FallAccountName;
 using OverseerDecisions::FallDamageShare;
 using OverseerDecisions::LethalFallYards;
+using OverseerDecisions::VOID_PLANE_Z;
 
 namespace
 {
@@ -114,6 +115,68 @@ void UnsampledIsNotNoDrop()
     }
 }
 
+// #323. A BODY BELOW THE KILL PLANE DID NOT FALL, IT WAS DELETED.
+//
+// These are the three deaths that opened the issue, taken from the live rows.
+// The column says 136.9, 55.5 and 150.4 yards; the terrain at those x and y
+// reads +178.5, +210.9 and +125.8, so the characters were 548 to 726 yards
+// below the ground and the distance in the column is the slice of the descent
+// that happened to fall between the last two samples. The core did not charge
+// them for a drop: MovementHandler.cpp:506-521 dealt max health outright.
+void AVoidDeathIsNotAFallHoweverFarTheColumnSaysItFell()
+{
+    Is("Bork at z -507.2, column says 136.9",
+       AccountForFall(136.9f, 0.f, 1.f, -507.2f, VOID_PLANE_Z),
+       FallAccount::VoidPlane);
+    Is("Og at z -515.4, column says 55.5",
+       AccountForFall(55.5f, 0.f, 1.f, -515.4f, VOID_PLANE_Z),
+       FallAccount::VoidPlane);
+    Is("Grog at z -528.2, column says 150.4",
+       AccountForFall(150.4f, 0.f, 1.f, -528.2f, VOID_PLANE_Z),
+       FallAccount::VoidPlane);
+    // The shallowest void death measured is -500.65, and the deepest body that
+    // is NOT one is +648.5. The plane is the whole of the difference.
+    Is("the shallowest void death measured",
+       AccountForFall(30.1f, 0.f, 1.f, -500.65f, VOID_PLANE_Z),
+       FallAccount::VoidPlane);
+    Is("a hair above the plane is still an ordinary fall",
+       AccountForFall(150.4f, 0.f, 1.f, -499.9f, VOID_PLANE_Z),
+       FallAccount::EnoughToKill);
+}
+
+// The plane beats the unsampled marker, and it has to: 9 of the 59 measured
+// void deaths carried no sample at all, and "unsampled" would have hidden the
+// only fact about them that matters.
+void ThePlaneIsAnAnswerEvenWithNoSample()
+{
+    Is("no sample, but a body below the plane",
+       AccountForFall(-1.f, 0.f, 1.f, -514.9f, VOID_PLANE_Z),
+       FallAccount::VoidPlane);
+    Is("no sample and no plane asked about",
+       AccountForFall(-1.f), FallAccount::Unsampled);
+}
+
+// A CALLER THAT DOES NOT ASK GETS EXACTLY WHAT IT GOT BEFORE. Every existing
+// call site passes three arguments, and a plane at or above zero is the "not
+// asking" reading - so the rows written before this existed still account the
+// same way.
+void NotAskingAboutThePlaneChangesNothing()
+{
+    Is("a real fall, plane not asked about",
+       AccountForFall(136.9f), FallAccount::EnoughToKill);
+    Is("the same drop, plane disabled explicitly",
+       AccountForFall(136.9f, 0.f, 1.f, -507.2f, 0.f), FallAccount::EnoughToKill);
+    Is("a short drop below where a plane would be, but none was asked about",
+       AccountForFall(4.09f, 0.f, 1.f, -9999.f, 0.f),
+       FallAccount::TooShortToHurt);
+}
+
+// The plane is the core's constant, not a number this module chose.
+void ThePlaneIsTheCoresOwnConstant()
+{
+    Near("MIN_HEIGHT, from GridTerrainData.h", VOID_PLANE_Z, -500.f);
+}
+
 }  // namespace
 
 int main()
@@ -122,6 +185,10 @@ int main()
     SixtyNineYardsKillsWhoeverYouAre();
     TheIncidentRowsCannotAccountForTheDeaths();
     UnsampledIsNotNoDrop();
+    AVoidDeathIsNotAFallHoweverFarTheColumnSaysItFell();
+    ThePlaneIsAnAnswerEvenWithNoSample();
+    NotAskingAboutThePlaneChangesNothing();
+    ThePlaneIsTheCoresOwnConstant();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

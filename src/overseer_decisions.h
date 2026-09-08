@@ -129,9 +129,99 @@ constexpr char VERSION[] = "0.1.0";
 // for the client's own MOVEMENTFLAG_FALLING/FALLING_FAR and for a server-side
 // fall spline (Unit.cpp:15934-15938) - and the second of those is exactly what
 // MoveFall issues, so the scripted drop is covered by the same question.
+//
+// THE `falling` THIS NOW RECEIVES IS MEASURED, NOT THE FLAG (#323).
+// Everything above is still exactly right about a fall that is a fall; it is
+// wrong about a flag that has stopped describing one. MeasuredToBeFalling
+// below is what the adapter passes here, and its comment carries the
+// measurement. This declaration is unchanged so the eight arguments still line
+// up one-for-one with FallGuardStandDownMask's, which is what stops the two
+// drifting.
 bool TerrainRecoveryMayInspect(bool alive, bool teleporting, bool inFlight,
                                bool flying, bool falling, bool inWater,
                                bool onTransport, bool onVehicle);
+
+// ------------------------------ a fall that is never going to resolve (#323) --
+//
+// THE STAND-DOWN ABOVE HAS NO CLOCK ON IT, AND THAT IS WHAT KILLED THEM.
+//
+// The argument for standing down mid-fall is written out above and it is a
+// good one: a scripted drop down a Wailing Caverns shaft is a fall, the
+// recovery yanked a tank out of one, and the run lost its tank. Nothing here
+// disagrees with any of that. The defect is the OTHER half of the same
+// sentence - "a genuine fall out of the world resolves itself within seconds
+// when the character lands or dies". It does resolve. It resolves by dying,
+// and the drive that could have prevented that is the one waiting for it.
+//
+// MEASURED ON `overseer_death`, 2026-09-06 to 2026-09-08. Of 146 self-killed
+// deaths with a sampled stand-down mask, 50 were on the void plane described
+// at VOID_PLANE_Z below. FORTY-EIGHT OF THOSE FIFTY carried FALL_GUARD_FALLING
+// at the last poll before the death, which is to say that on the last poll
+// this module took of a character it was about to lose, TerrainRecoveryMayInspect
+// returned false and the recovery drive did not look at it at all. The two
+// that did not carry it are the whole of the population this drive was awake
+// for.
+//
+// AND THE FLAG IS THE ONE #291 ALREADY PROVED CANNOT BE TRUSTED. See
+// FallBaselineMayInspect: EffectMovementGenerator::Finalize opens with
+// `if (!unit->IsCreature()) return;`, so a player's MOVEMENTFLAG_FALLING is
+// never cleared server-side, and this roster sends no client packets to clear
+// it either. #291 measured characters standing still with the flag on and a
+// descent of 1.63 yards. It took the flag away from the FALL BASELINE and
+// deliberately left it deciding here, on the argument that "the recovery may
+// reasonably decline to move a character whose flags say falling, because
+// moving one is expensive and being wrong about it is worse". Being wrong
+// about it turned out to cost 48 characters, so the argument survives and its
+// conclusion does not.
+//
+// SO THE STAND-DOWN KEEPS ITS REASON AND ASKS THE MEASUREMENT INSTEAD.
+//
+// This needs no new instrument, because #291 already built the right one and
+// only wired it to the other drive. FallBaselineStep takes two of this
+// character's own positions a second apart and declines to rebase when it is
+// losing height faster than FallBaselineLimits allows a body on its feet to.
+// That number is already recorded on every death row as
+// FALL_GUARD_DESCENDING. It is the answer to the question the `falling`
+// argument is really asking, and it is the answer the flag was standing in
+// for.
+//
+// IT SEPARATES THE TWO CASES IN ONE POLL, which is the whole reason to prefer
+// it to any clock:
+//
+//   - the scripted shaft drop the stand-down exists for is a real descent, so
+//     it is measured as one and is still stood down for, every poll of it. The
+//     log quoted above is one second into that drop and 10.8 yards down, which
+//     is free fall and nowhere near the limit;
+//   - a character standing still under the terrain with the flag stuck on was
+//     measured descending 1.63 and 1.88 yards per second (#281), which is a
+//     walk. The drive looks, and that is the case this exists to reach.
+//
+// WHAT IT STILL CANNOT DO, said plainly rather than left to be discovered. A
+// character in genuine continuous free fall out of the world is measured as
+// falling and is still stood down for, all the way to the plane. That is not a
+// regression and it is not a gap this could close: the adapter's surface probe
+// reaches sixty yards, a free fall crosses that in under three seconds, and
+// below it the probe reads no surface and the remedy would not fire anyway.
+// What this fixes is the population that is NOT descending - the one that sits
+// under the terrain with a flag nothing will ever clear - and on the measured
+// rows that is the population the drive was losing.
+//
+// AND IT CANNOT MAKE A REAL FALL WORSE, which is structural rather than
+// hopeful. The remedy behind this gate needs a valid surface ABOVE the
+// character at its own x and y (BelowTerrainNeedsRecovery) and no floor within
+// a stride of its feet (FloorUnderfoot). A character falling in open air off a
+// cliff has nothing overhead at its own x/y, so the gap is negative and
+// nothing holds. Opening the gate cannot invent a remedy the reading does not
+// authorize.
+//
+// ONE FOLD, READ IN TWO PLACES, for the reason ReadingStandsOnTheGround gives:
+// the adapter builds FALL_GUARD_DESCENDING from these three answers and this
+// gate decides on them, and two places is one too many the moment they have to
+// agree. `baselineRebased` is FallBaselineVerdict::rebase - the guard putting
+// the baseline back under the character's feet, which it only does for a
+// character it did not measure falling.
+bool MeasuredToBeFalling(bool guardMayInspect, bool coreWouldNotCharge,
+                         bool baselineRebased);
 
 // `surfaceValid` is separate from the number because the core has two invalid
 // height sentinels. Invalid data grants no permission to move a character.
@@ -3074,6 +3164,39 @@ float FallDamageShare(float yardsDropped, float safeFallYards = 0.f,
 // stock realm. A recorded drop under this cannot be the whole story.
 float LethalFallYards(float safeFallYards = 0.f, float rate = 1.f);
 
+// THE HEIGHT BELOW WHICH THE CORE KILLS, AND IT IS NOT A FALL (#323).
+//
+// `MIN_HEIGHT` is -500.0f (GridTerrainData.h:29). Map::GetMinHeight returns
+// the tile's own minimum-height plane and falls back to that constant, and
+// GridTerrainData::getMinHeight falls back to it again when the tile carries
+// no flight bounds. MEASURED against the shipped map files in the running
+// image: not one of the 687 map 0 tiles and not one of the 988 map 1 tiles
+// carries MAP_HEIGHT_HAS_FLIGHT_BOUNDS - those exist only on Outland and
+// Northrend - so on both of this roster's continents getMinHeight returns the
+// constant at EVERY coordinate. The kill plane is flat, and it is -500.
+//
+// WHAT HAPPENS THERE IS A DIFFERENT EVENT FROM A FALL, and confusing the two
+// has now cost five investigations. WorldSession::HandleMovementOpcodes
+// (MovementHandler.cpp:506-521) tests the position against that plane and,
+// below it, sets PLAYER_FLAGS_IS_OUT_OF_BOUNDS and deals
+// `EnvironmentalDamage(DAMAGE_FALL_TO_VOID, GetMaxHealth())` before calling
+// KillPlayer. That is full max health, dealt outright, and Player.cpp:819-821
+// says in its own comment that DAMAGE_FALL_TO_VOID bypasses every immunity.
+//
+// SO NOTHING THIS MODULE DOES ABOUT FALL DAMAGE CAN PREVENT ONE. It does not
+// read m_lastFallZ, so SetFallInformation and the whole fall-baseline guard
+// are irrelevant to it. It does not consult HasHoverAura, HasFeatherFallAura
+// or HasFlyAura, so the charging gate #291 narrowed the stand-down to is not
+// on this path at all. It is not Player::HandleFall and it is not reached from
+// there.
+//
+// AND THE CORE ITSELF CALLS IT A FALL, which is the single most expensive fact
+// in this issue: Player.cpp:847 sends the combat log entry as
+// `type != DAMAGE_FALL_TO_VOID ? type : DAMAGE_FALL`. A void kill is reported
+// to everything downstream as fall damage. That is why every reader of these
+// rows, this module included, has spent five fixes on the fall arithmetic.
+constexpr float VOID_PLANE_Z = -500.0f;
+
 // WHAT THE RECORDED DROP ACCOUNTS FOR. Takes the column exactly as written,
 // where a negative value is the unsampled marker YardsFallen returns, so a
 // caller reads the row it has rather than reconstructing the sample.
@@ -3083,10 +3206,29 @@ enum class FallAccount
     NoDrop,          // it ended level with, or above, where it was last seen
     TooShortToHurt,  // a real drop, under the distance the core charges for
     Survivable,      // would have hurt it, could not have killed it from full
-    EnoughToKill     // would have killed it from full health outright
+    EnoughToKill,    // would have killed it from full health outright
+    // IT DID NOT LAND. The body is below the plane above, so the distance in
+    // the column is not the drop and the fall arithmetic does not apply to it.
+    // Measured on the same rows: the recorded drop on these deaths runs 30 to
+    // 300 yards while the character is 548 to 778 yards below the terrain at
+    // its own x and y, because the column is a delta across one sample gap and
+    // the descent began long before that gap. "fell 136.9 yards which is
+    // enough to kill it" was true of neither half.
+    VoidPlane
 };
+
+// `voidPlaneZ` IS ASKED FOR, NOT ASSUMED, and a value at or above zero means
+// the caller is not asking - the same "zero disables" this file uses for every
+// other optional bound. A kill plane is negative by construction, so there is
+// no legitimate reading this convention swallows. `deathZ` is read only when
+// it is being asked about, which is why it may keep a meaningless default.
+//
+// THE PLANE IS TESTED FIRST, BEFORE ANY ARITHMETIC. A body below it did not
+// land, so every later branch would be answering a question about a drop that
+// did not happen with a distance that is not it.
 FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
-                           float rate = 1.f);
+                           float rate = 1.f, float deathZ = 0.f,
+                           float voidPlaneZ = 0.f);
 char const* FallAccountName(FallAccount account);
 
 // ------------------------------------------------- a revival and a party --

@@ -19,6 +19,7 @@
 using OverseerDecisions::BelowTerrainNeedsRecovery;
 using OverseerDecisions::FloorUnderfoot;
 using OverseerDecisions::LargeSurfaceMismatchNeedsRecovery;
+using OverseerDecisions::MeasuredToBeFalling;
 using OverseerDecisions::ReadingStandsOnTheGround;
 using OverseerDecisions::TerrainRecoveryMayInspect;
 using OverseerDecisions::TerrainReading;
@@ -68,6 +69,82 @@ void DeliberatelyAirborneStatesAreLeftAlone()
               true, false, false, false, false, false, true, false), false);
     Check("vehicle", TerrainRecoveryMayInspect(
               true, false, false, false, false, false, false, true), false);
+}
+
+// #323. THE STAND-DOWN ABOVE KEEPS ITS REASON AND STOPS ASKING THE FLAG.
+//
+// A scripted shaft drop is a real descent and is still stood down for. A
+// character standing still under the terrain with a flag nothing will ever
+// clear is not, and that is the population 48 of the 50 sampled void deaths
+// came from. The fall baseline guard already tells these apart every poll;
+// this is that answer, named once so the mask and the gate cannot drift.
+void AMeasuredDescentIsStillAFall()
+{
+    // The guard looked, the core would charge, and it declined to put the
+    // baseline back under the feet - which it only declines to do for a
+    // character it measured losing height faster than a walk.
+    Check("a real descent", MeasuredToBeFalling(true, false, false), true);
+    Check("and it stands the recovery drive down",
+          TerrainRecoveryMayInspect(true, false, false, false,
+                                    MeasuredToBeFalling(true, false, false),
+                                    false, false, false), false);
+}
+
+void AStuckFlagOverAStandingCharacterIsNotAFall()
+{
+    // The guard measured 1.63 and 1.88 yards per second on the phantom deaths
+    // (#281) and rebased. That is a walk, so the drive gets to look - which is
+    // the whole of this change.
+    Check("the baseline went back under its feet",
+          MeasuredToBeFalling(true, false, true), false);
+    Check("so the recovery drive is allowed to look at it",
+          TerrainRecoveryMayInspect(true, false, false, false,
+                                    MeasuredToBeFalling(true, false, true),
+                                    false, false, false), true);
+}
+
+// AN ABSENCE OF EVIDENCE IS NOT EVIDENCE. A guard that did not look measured
+// nothing, and nothing is not a fall - the same asymmetry #291 chose when it
+// decided an unknown must let the guard RUN rather than stand it down.
+void AGuardThatDidNotLookMeasuredNoFall()
+{
+    Check("the guard stood down, so there is no measurement",
+          MeasuredToBeFalling(false, false, false), false);
+    Check("and a rebase it never made is not one either",
+          MeasuredToBeFalling(false, false, true), false);
+    // Every state that stops the guard looking is already a stand-down of the
+    // recovery's own, so this cannot open a gate those keep shut.
+    Check("a swimmer is still declined by its own reason",
+          TerrainRecoveryMayInspect(true, false, false, false,
+                                    MeasuredToBeFalling(false, false, false),
+                                    true, false, false), false);
+    Check("and so is a corpse",
+          TerrainRecoveryMayInspect(false, false, false, false,
+                                    MeasuredToBeFalling(false, false, false),
+                                    false, false, false), false);
+}
+
+// A character the core will not charge for a fall has no measurement behind
+// the rebase, because the guard returns before taking one.
+void AFreeFallIsNotAMeasuredOne()
+{
+    Check("hover, feather fall or a fly aura",
+          MeasuredToBeFalling(true, true, false), false);
+    Check("and the rebase flag says nothing either way there",
+          MeasuredToBeFalling(true, true, true), false);
+}
+
+// AND THE GATE ITSELF IS UNCHANGED. This decides what to PASS as `falling`; it
+// does not alter what TerrainRecoveryMayInspect does with it, which is what
+// keeps the eight arguments lined up with the stand-down mask.
+void TheGateStillDeclinesOnEveryFlagItAlwaysDid()
+{
+    Check("a fall stands the drive down",
+          TerrainRecoveryMayInspect(true, false, false, false, true, false, false,
+                                    false), false);
+    Check("and nothing wrong lets it look",
+          TerrainRecoveryMayInspect(true, false, false, false, false, false, false,
+                                    false), true);
 }
 
 void TheBoundaryIsARecovery()
@@ -852,6 +929,13 @@ int main()
 
     AScriptedFallIsNeverRecovered();
     EveryDeliberatelyAirborneStateStandsDown();
+
+    AMeasuredDescentIsStillAFall();
+    AStuckFlagOverAStandingCharacterIsNotAFall();
+    AGuardThatDidNotLookMeasuredNoFall();
+    AFreeFallIsNotAMeasuredOne();
+    TheGateStillDeclinesOnEveryFlagItAlwaysDid();
+
     ARungDoesNotFollowACharacterToAnotherIncident();
     DistanceEndsAnEpisodeButAWalkBackDoesNot();
 
