@@ -4841,7 +4841,13 @@ private:
 
         auto& holds = CastHoldsInForce();
         auto const existing = holds.find(name);
-        bool const fresh = existing == holds.end();
+        // AN EXPIRED RECORD IS NOT AN EXISTING HOLD. The sweep runs earlier in
+        // the same poll than any executor, so a record found past its deadline
+        // here is rare - but treating one as existing would give the new hold a
+        // deadline already in the past, and HeldStillToCast would answer false
+        // about a character a verb believes it is holding.
+        bool const fresh =
+            existing == holds.end() || time(nullptr) >= existing->second.until;
 
         OverseerDecisions::CastHoldFacts facts;
         facts.hasStay = botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
@@ -4908,12 +4914,33 @@ private:
     // A MISSING CHARACTER IS SAID OUT LOUD RATHER THAN DROPPED. The strategy set
     // of a character with no bot AI is not this module's to reason about, and a
     // silent skip here would look exactly like a successful release.
-    static void ReleaseCastHold(std::string const& name, Player* who, char const* why)
+    //
+    // AND IT ONLY LETS GO OF ITS OWN (#335). The register is keyed by character
+    // name and nothing serialises rows per character, so a hearth row ending
+    // while a conjure is mid-cast on the same character would otherwise release
+    // the conjure's hold and hand the mover back under a running cast - and the
+    // conjure's own release would then find nothing and quietly no-op. A caller
+    // that names a verb releases only a hold that verb placed. The expiry sweep
+    // names none, because a hold nobody came back for has to go whoever left it.
+    //
+    // `name` IS TAKEN BY VALUE, and that is structural rather than tidiness: it
+    // is read in the log lines below, after the erase, so a caller that passed a
+    // reference into the register would be logging freed memory.
+    static void ReleaseCastHold(std::string name, Player* who, char const* why,
+                                char const* expectedVerb = nullptr)
     {
         auto& holds = CastHoldsInForce();
         auto const hold = holds.find(name);
         if (hold == holds.end())
             return;
+        if (expectedVerb && hold->second.verb != expectedVerb)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: a {} row will not release '{}' - the hold on it was placed by "
+                     "{} and is that row's to lift",
+                     expectedVerb, name, hold->second.verb);
+            return;
+        }
         CastHoldRecord const record = hold->second;
         holds.erase(hold);
 
@@ -4989,6 +5016,31 @@ private:
     // same reason KeepRosterFollowing's strategy backstop is: a hand-back that
     // only ever happens on the path that took it is one a crash, an early
     // `return` or a logout can skip.
+    // IS A PARKED ROW STILL DRIVING THIS CHARACTER? Asked by the backstop, and
+    // it is what lets the ceiling stay at the one number #330 argued for.
+    //
+    // The ceiling and the longest row are both 45 seconds, and a hold's deadline
+    // is wall clock while a row's window is accumulated poll time, so under any
+    // poll jitter the backstop would fire on a row still casting, hand the mover
+    // back mid-cast, and leave the row's own release to find nothing. Raising
+    // the ceiling instead would mean every hold nobody comes back for - which is
+    // the common case for a refused hearth or summon - stands a character still
+    // for longer than this module ever needs to. Asking is exact, and it is
+    // three vectors this poll already owns.
+    bool ARowStillOwnsTheHold(std::string const& name) const
+    {
+        for (ConjureCheck const& check : _pendingConjures)
+            if (check.targetName == name)
+                return true;
+        for (HearthCheck const& check : _pendingHearths)
+            if (check.targetName == name)
+                return true;
+        for (SummonCheck const& check : _pendingSummons)
+            if (check.summonerName == name || check.ev.helper == name)
+                return true;
+        return false;
+    }
+
     void ReleaseExpiredCastHolds()
     {
         auto& holds = CastHoldsInForce();
@@ -4997,7 +5049,7 @@ private:
         time_t const now = time(nullptr);
         std::vector<std::string> due;
         for (auto const& hold : holds)
-            if (now >= hold.second.until)
+            if (now >= hold.second.until && !ARowStillOwnsTheHold(hold.first))
                 due.push_back(hold.first);
         for (std::string const& name : due)
             ReleaseCastHold(name, ObjectAccessor::FindPlayerByName(name, false),
@@ -11609,8 +11661,11 @@ private:
         if (!p->IsAlive() || p->IsInFlight() || InDungeonRun(p))
             return;
         // And a follower held after a revival is standing still on purpose,
-        // for a few seconds - see HoldAfterRevival.
-        if (HeldAfterRevival(name))
+        // for a few seconds - see HoldAfterRevival. So is one a casting verb is
+        // holding (#335): the grant site below would refuse it the mover
+        // anyway, so without this an escort errand is opened and a flight
+        // budget spent for a character that is not going to walk.
+        if (HeldAfterRevival(name) || HeldStillToCast(name))
             return;
         // ...AND ONE WHOSE LAST CATCH-UP WALK KILLED IT IS NOT SENT ON ANOTHER
         // ONE YET (#298). See CATCH_UP_STANDDOWN_SECONDS. This is the half of
@@ -15060,6 +15115,27 @@ private:
             return;
         bool const led = hold->second.second;
         _revivalHoldUntil.erase(hold);
+
+        // THE FIFTH HAND-BACK SITE, AND IT IS ONE HOLD LIFTING ANOTHER (#335).
+        // A revival hold is 20 seconds and a cast hold is 45, so a character
+        // that revives and is then asked to conjure five seconds later is
+        // carrying both, and this end of the shorter one would hand `follow` or
+        // `new rpg` straight back into a live cast. Worse, silently: the cast
+        // hold correctly recorded that it did not add `stay` (the revival hold
+        // had already put it there), so its own release will not take it off
+        // either and the two disagree about what the character is carrying.
+        //
+        // The revival hold's own bookkeeping is still ended here, because it HAS
+        // ended - what is deferred is only handing the mover back, and the cast
+        // hold hands back exactly what it took when it lifts.
+        if (HeldStillToCast(name))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is out of its post-revival hold but a casting verb is "
+                     "holding it still - the mover stays off and the cast hold hands it back",
+                     name);
+            return;
+        }
 
         botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
         if (led)
@@ -25409,8 +25485,10 @@ private:
     // kind='hearth' refuses a moving character outright and says why not to do
     // anything else: mod-playerbots' own UseHearthStone calls StopMoving and
     // clears the motion master, which would cancel a travel errand as a side
-    // effect of a verb nobody asked to do that. That reasoning still holds and
-    // this executor still does not call StopMoving. But refusing is not
+    // effect of a verb nobody asked to do that. The half of that reasoning which
+    // still holds is the motion master: the shared hold calls StopMoving and
+    // clears the chase and follow unit states, and it clears no movement
+    // generators, which is the line #163 draws. But refusing is not
     // available here either, because a bot under its own drive is moving nearly
     // always, and a verb that refuses nearly always feeds nobody.
     //
@@ -25751,7 +25829,7 @@ private:
         if (!ev.held)
             return;
         ev.held = false;
-        ReleaseCastHold(ev.character, who, "the conjure row ended");
+        ReleaseCastHold(ev.character, who, "the conjure row ended", "conjure");
     }
 
     static char const* DoConjure(Player* who, std::string const& command, char const*& status,
@@ -26832,7 +26910,7 @@ private:
                 // a record left standing would keep this module's own sweeps off
                 // a character that is no longer being held by anything (#335).
                 ReleaseCastHold(check.targetName, bot,
-                                "the character left the world mid-hearth");
+                                "the character left the world mid-hearth", "hearth");
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
@@ -26881,7 +26959,7 @@ private:
             // is written, so a character that hearthed does not stand at its
             // destination waiting out a ceiling (#335). A no-op for the rows
             // that never placed one, which is most of them.
-            ReleaseCastHold(check.targetName, bot, "the hearth row ended");
+            ReleaseCastHold(check.targetName, bot, "the hearth row ended", "hearth");
 
             char const* status = "error";
             char const* detail = "";
@@ -27345,11 +27423,17 @@ private:
 
     // THE OTHER END OF HoldSummonRitualStill, and it lets go of both.
     //
-    // The clicker a finished row actually used and the one an earlier refused
-    // row held are not always the same character, so both names are asked for
-    // and a name nothing is holding costs one lookup that finds nothing. The
-    // summoned character is never held: it is somewhere else entirely, which is
-    // the whole reason the verb exists.
+    // Both names are asked for because they are set on different paths and only
+    // one of them ever survives into a parked row: `helper` is the clicker a
+    // row that got as far as clicking actually used, and `heldHelper` is the one
+    // a row that refused held on its way out - and a refused row ends there, so
+    // its evidence never reaches this function. A name nothing is holding costs
+    // one lookup that finds nothing.
+    //
+    // SO A HELPER HELD BY A REFUSED ROW AND NOT CHOSEN BY THE NEXT ONE IS LEFT
+    // TO THE CEILING, said plainly rather than implied by a comment that reads
+    // as though this covered it. The summoned character is never held at all: it
+    // is somewhere else entirely, which is the whole reason the verb exists.
     static void ReleaseSummonRitualHold(SummonEvidence const& ev, std::string const& summoner,
                                         char const* why)
     {
@@ -27357,7 +27441,7 @@ private:
         {
             if (name.empty())
                 continue;
-            ReleaseCastHold(name, ObjectAccessor::FindPlayerByName(name, false), why);
+            ReleaseCastHold(name, ObjectAccessor::FindPlayerByName(name, false), why, "summon");
         }
     }
 
@@ -27391,8 +27475,19 @@ private:
 
         if (!targetArg.empty())
         {
+            // THE NAMED CLICKER IS CHECKED BEFORE IT IS HELD, and it has to be
+            // checked HERE rather than left to DoSummon's own helper block. This
+            // runs from the summoner's movement refusal, which fires long before
+            // that block, so `target_arg` has been checked for nothing at all at
+            // this point: without these, naming any online character would place
+            // a 45 second hold on it - in combat, dead, mid-teleport, or in
+            // somebody else's party. Combat above all, which is the rule this
+            // whole hold keeps: a character held still through a fight is a
+            // character killed by the hold.
             Player* named = ObjectAccessor::FindPlayerByName(targetArg, false);
-            if (named && named != who && named->IsInWorld())
+            if (named && named != who && named->IsInWorld() && named->GetSession()
+                && named->IsAlive() && !named->IsInCombat() && !named->IsBeingTeleported()
+                && named->IsInSameRaidWith(who))
             {
                 HoldStillAndReport(named, named->GetName(), "summon", ev.helperHold);
                 if (ev.helperHold.applied)
@@ -27656,7 +27751,8 @@ private:
                 // still fails (#335).
                 HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
                 HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
-                ev.heldHelper = helper->GetName();
+                if (ev.helperHold.applied)
+                    ev.heldHelper = helper->GetName();
                 return refuse("the second clicker is moving");
             }
             if (helper->IsNonMeleeSpellCast(false))

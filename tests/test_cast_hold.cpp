@@ -18,9 +18,9 @@
  * when it was written.
  *
  * What is pinned here is the half of that which is a decision rather than a
- * call: what a hold changes given what it found, what it therefore owes back,
- * and what a character that was asked to stand still and did not is allowed to
- * be called.
+ * call: what a hold changes given what it found, and what it therefore owes
+ * back. The waiting half is not a decision this header owns - `conjure` waits
+ * through ConjureNextStep and the other two verbs refuse rather than wait.
  *
  * The other half lives in tests/test_aimed_mover.cpp, where a cast hold now
  * answers `HeldOnPurpose` beside the revival hold, which is what stops the sweep
@@ -35,13 +35,8 @@
 #include <cstdlib>
 #include <string>
 
-using OverseerDecisions::CastHoldChangedAnything;
 using OverseerDecisions::CastHoldFacts;
 using OverseerDecisions::CastHoldPlan;
-using OverseerDecisions::CastHoldProgress;
-using OverseerDecisions::CastHoldStep;
-using OverseerDecisions::CastHoldStepWord;
-using OverseerDecisions::NextCastHoldStep;
 using OverseerDecisions::PlanCastHold;
 
 namespace
@@ -58,16 +53,6 @@ void Check(char const* what, bool got, bool want)
     ++failures;
 }
 
-void CheckStep(char const* what, CastHoldProgress const& progress, CastHoldStep want)
-{
-    CastHoldStep const got = NextCastHoldStep(progress);
-    if (got == want)
-        return;
-    std::printf("FAIL %s: got %s, wanted %s\n", what, CastHoldStepWord(got),
-                CastHoldStepWord(want));
-    ++failures;
-}
-
 // The three facts spelled out at every call site rather than mutated from a
 // shared fixture, so a case that reads as "a follower" cannot inherit a flag set
 // by the case above it.
@@ -78,17 +63,6 @@ CastHoldFacts Facts(bool hasStay, bool hasFollow, bool hasNewRpg)
     facts.hasFollow = hasFollow;
     facts.hasNewRpg = hasNewRpg;
     return facts;
-}
-
-CastHoldProgress Progress(bool moving, std::uint32_t settlePolls, std::uint32_t settleLimit,
-                          bool outOfTime)
-{
-    CastHoldProgress progress;
-    progress.moving = moving;
-    progress.settlePolls = settlePolls;
-    progress.settleLimit = settleLimit;
-    progress.outOfTime = outOfTime;
-    return progress;
 }
 
 // ---------------------------------------------------------------- the plan --
@@ -103,7 +77,8 @@ void AFollowerLosesTheThingThatIsActuallyMovingIt()
     Check("a follower is given stay", plan.addStay, true);
     Check("a follower loses follow", plan.dropFollow, true);
     Check("a follower has no new rpg to lose", plan.dropNewRpg, false);
-    Check("a follower's hold owes something back", CastHoldChangedAnything(plan), true);
+    Check("a follower's hold owes something back",
+          plan.addStay || plan.dropFollow || plan.dropNewRpg, true);
 }
 
 // THE OTHER CHARACTER AT THE STONE, AND IT IS THE LEADER. Read off the live
@@ -118,7 +93,8 @@ void ALeaderAlreadyCarriesStayAndWalksAnyway()
     Check("stay is not added twice", plan.addStay, false);
     Check("a leader has no follow to lose", plan.dropFollow, false);
     Check("the leader loses its self-drive", plan.dropNewRpg, true);
-    Check("the leader's hold owes something back", CastHoldChangedAnything(plan), true);
+    Check("the leader's hold owes something back",
+          plan.addStay || plan.dropFollow || plan.dropNewRpg, true);
 }
 
 // A hold that finds a character already standing with no mover on it has still
@@ -131,7 +107,8 @@ void AStandingCharacterIsHeldAndOwesNothing()
     CastHoldPlan const plan = PlanCastHold(Facts(true, false, false));
     Check("nothing is added", plan.addStay, false);
     Check("nothing is dropped", plan.dropFollow || plan.dropNewRpg, false);
-    Check("the release owes nothing", CastHoldChangedAnything(plan), false);
+    Check("the release owes nothing",
+          plan.addStay || plan.dropFollow || plan.dropNewRpg, false);
 }
 
 // A character carrying both movers loses both. Not a case anybody expects - the
@@ -154,7 +131,8 @@ void NothingKnownStillHolds()
     CastHoldPlan const plan = PlanCastHold(CastHoldFacts());
     Check("stay goes on", plan.addStay, true);
     Check("nothing is taken off", plan.dropFollow || plan.dropNewRpg, false);
-    Check("the hold owes stay back", CastHoldChangedAnything(plan), true);
+    Check("the hold owes stay back",
+          plan.addStay || plan.dropFollow || plan.dropNewRpg, true);
 }
 
 // THE RELEASE IS THE PLAN READ BACKWARDS, and that is the property worth pinning
@@ -188,75 +166,6 @@ void TheReleaseUndoesTheHoldAndNothingElse()
     }
 }
 
-// ---------------------------------------------------------------- the wait --
-
-// A hold is not instant. StopMoving stops the spline and the movement flags
-// isMoving reads clear on a later tick; a live conjure row that started moving
-// spent one settle poll before it could cast. A verb that asked and then refused
-// in the same breath is the `hearth` and `summon` behaviour this issue is about.
-void AStandingCharacterIsReadyEvenWithNoBudgetLeft()
-{
-    CheckStep("standing and idle", Progress(false, 0, 6, false), CastHoldStep::Ready);
-    // BOTH BUDGETS SPENT AND IT IS STILL READY, which is the ordering that
-    // matters: a character that came to a halt on the very poll its window ran
-    // out has stood still, and a row calling that `never stood still` would be
-    // false about the one fact it exists to report.
-    CheckStep("standing on the last poll", Progress(false, 99, 6, true), CastHoldStep::Ready);
-}
-
-void AMovingCharacterWithBudgetWaits()
-{
-    CheckStep("first settle poll", Progress(true, 0, 6, false), CastHoldStep::Settle);
-    CheckStep("one short of the limit", Progress(true, 5, 6, false), CastHoldStep::Settle);
-}
-
-void AMovingCharacterOutOfPollsIsNamed()
-{
-    CheckStep("at the settle limit", Progress(true, 6, 6, false),
-              CastHoldStep::NeverStoodStill);
-    CheckStep("past the settle limit", Progress(true, 40, 6, false),
-              CastHoldStep::NeverStoodStill);
-}
-
-// The window is the backstop under the poll count, and it bounds a different
-// failure: a settle limit ends a character being dragged on a spline the hold
-// cannot stop, and the window ends a row whose polls stopped arriving. Either
-// one alone leaves the other case holding a character still for ever.
-void AMovingCharacterOutOfTimeIsNamedEvenWithPollsLeft()
-{
-    CheckStep("out of time, polls to spare", Progress(true, 0, 6, true),
-              CastHoldStep::NeverStoodStill);
-}
-
-// A limit of zero is no poll limit, matching the ceiling conventions the rest of
-// this header uses, and the window still ends it. A verb that wants to wait as
-// long as its window allows must not have to invent a large number to say so.
-void ASettleLimitOfZeroIsNoLimit()
-{
-    CheckStep("no poll limit, in time", Progress(true, 5000, 0, false), CastHoldStep::Settle);
-    CheckStep("no poll limit, out of time", Progress(true, 0, 0, true),
-              CastHoldStep::NeverStoodStill);
-}
-
-void EveryStepHasItsOwnName()
-{
-    std::string const ready = CastHoldStepWord(CastHoldStep::Ready);
-    std::string const settle = CastHoldStepWord(CastHoldStep::Settle);
-    std::string const never = CastHoldStepWord(CastHoldStep::NeverStoodStill);
-    Check("ready is named", ready == "ready", true);
-    Check("settle is named", settle == "settle", true);
-    Check("never stood still is named", never == "never stood still", true);
-    Check("the three names differ", ready != settle && settle != never && ready != never,
-          true);
-    // THE WORDS GO STRAIGHT INTO A ROW'S `detail`, which is written into an
-    // UPDATE by hand. A quote in one strands the row until the worldserver
-    // restarts, which is #318 and is worth one line here rather than a second
-    // outage.
-    for (char const* word : {"ready", "settle", "never stood still"})
-        for (char const* c = word; *c; ++c)
-            Check("no step name carries a quote", *c == '\'' || *c == '"', false);
-}
-
 }  // namespace
 
 int main()
@@ -267,12 +176,6 @@ int main()
     BothMoversComeOffTogether();
     NothingKnownStillHolds();
     TheReleaseUndoesTheHoldAndNothingElse();
-    AStandingCharacterIsReadyEvenWithNoBudgetLeft();
-    AMovingCharacterWithBudgetWaits();
-    AMovingCharacterOutOfPollsIsNamed();
-    AMovingCharacterOutOfTimeIsNamedEvenWithPollsLeft();
-    ASettleLimitOfZeroIsNoLimit();
-    EveryStepHasItsOwnName();
 
     if (failures)
     {

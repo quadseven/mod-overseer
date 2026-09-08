@@ -6019,7 +6019,6 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
                       float x, float y, RouteLegLimits const& limits);
 
 
-
 // ------------------------------- a far teleport still in flight (#310) --
 //
 // A CHARACTER IN THE MIDDLE OF A CROSS-MAP TELEPORT IS NOT A CHARACTER THAT
@@ -6806,42 +6805,14 @@ struct CastHoldPlan
 // reading only this struct.
 CastHoldPlan PlanCastHold(CastHoldFacts const& facts);
 
-// Did the hold change anything at all? A hold that found the character already
-// standing with no mover on it has still taken hold - the caller has still
-// called StopMoving - but it owes nothing back, and a release that logs
-// "restored" about a strategy it never touched is the same lie in the other
-// direction.
-bool CastHoldChangedAnything(CastHoldPlan const& plan);
-
-// WHAT A CHARACTER THAT WAS ASKED TO STAND STILL IS DOING NOW.
-//
-// A hold is not instant and the row has to survive that. `Unit::StopMoving`
-// stops the spline, but the movement flags `Unit::isMoving` reads clear on a
-// later tick, and a live conjure row that started moving needed one settle poll
-// before it could cast. So every verb that holds has to be able to wait, and to
-// give up with a name rather than sitting in `verifying` for ever.
-enum class CastHoldStep : std::uint8_t
-{
-    // Standing. Go and cast.
-    Ready,
-    // Still moving, and there is budget left to wait for it to stop.
-    Settle,
-    // It never stopped. The one honest end for a hold that did not take, and a
-    // far better row than a bare count of refused casts.
-    NeverStoodStill,
-};
-
-char const* CastHoldStepWord(CastHoldStep step);
-
-struct CastHoldProgress
-{
-    bool moving{false};
-    std::uint32_t settlePolls{0};   // consecutive polls that found it moving
-    std::uint32_t settleLimit{0};   // 0 means no limit but the window
-    bool outOfTime{false};          // the verb's own window has run out
-};
-
-CastHoldStep NextCastHoldStep(CastHoldProgress const& progress);
+// AND THE WAITING HALF IS NOT HERE, deliberately. A hold is not instant -
+// StopMoving stops the spline and the flags Unit::isMoving reads clear on a
+// later tick, and a live conjure row that started moving spent one settle poll
+// before it could cast - but `conjure` already owns that decision in
+// ConjureNextStep, and `hearth` and `summon` do not wait at all: they refuse
+// with `later` and the sender re-asks with a fresh row, which is #230's rule
+// about never recycling one in place. A second settle decision here would be a
+// mechanism with no caller and a test pinning nothing.
 
 
 }  // namespace OverseerDecisions

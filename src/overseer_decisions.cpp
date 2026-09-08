@@ -5965,44 +5965,4 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
     return plan;
 }
 
-bool CastHoldChangedAnything(CastHoldPlan const& plan)
-{
-    return plan.addStay || plan.dropFollow || plan.dropNewRpg;
-}
-
-char const* CastHoldStepWord(CastHoldStep step)
-{
-    switch (step)
-    {
-        case CastHoldStep::Ready:
-            return "ready";
-        case CastHoldStep::Settle:
-            return "settle";
-        case CastHoldStep::NeverStoodStill:
-            return "never stood still";
-    }
-    return "never stood still";
-}
-
-CastHoldStep NextCastHoldStep(CastHoldProgress const& progress)
-{
-    // STANDING WINS OVER EVERY BUDGET, and it is asked first on purpose. A
-    // character that has come to a halt on the very poll its window ran out has
-    // stood still, and a row that answered `NeverStoodStill` about it would be
-    // false about the one fact it exists to report.
-    if (!progress.moving)
-        return CastHoldStep::Ready;
-    // THE WINDOW IS THE BACKSTOP AND THE POLL COUNT IS THE RULE. Both are here
-    // rather than only one, because they bound different failures: a settle
-    // limit ends a character that is being dragged somewhere on a spline the
-    // hold cannot stop, and the window ends a row whose polls stopped arriving
-    // at all. Either one alone leaves the other case holding a character still
-    // for ever, which is the worse half of this whole defect.
-    if (progress.outOfTime)
-        return CastHoldStep::NeverStoodStill;
-    if (progress.settleLimit != 0 && progress.settlePolls >= progress.settleLimit)
-        return CastHoldStep::NeverStoodStill;
-    return CastHoldStep::Settle;
-}
-
 }  // namespace OverseerDecisions
