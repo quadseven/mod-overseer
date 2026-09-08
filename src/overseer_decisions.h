@@ -4743,7 +4743,7 @@ struct ErrandDeathVerdict
 ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
                                       ErrandDeathLimits const& limits);
 
-// --------------------------- an errand that is eating the questing (#333) --
+// ---------------------------------- an errand that is eating the questing --
 //
 // THE SECOND WAY AN ERRAND GOES WRONG, AND THE ONE THE BREAKER ABOVE CANNOT
 // SEE. That breaker asks whether an errand is killing its traveller. This one

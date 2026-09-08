@@ -12013,7 +12013,7 @@ private:
                 toll.catchUp = IsCatchingUp(name);
 
                 // THE SECOND REASON TO CALL AN ERRAND OFF, CHARGED HERE AND
-                // ANSWERED BY THE RULE BELOW (#333). The breaker asks whether an
+                // ANSWERED BY THE RULE BELOW. The breaker asks whether an
                 // errand is killing this character. This asks the other question
                 // that was never asked: whether errands that are all going
                 // PERFECTLY WELL are nonetheless the whole of what it does.
