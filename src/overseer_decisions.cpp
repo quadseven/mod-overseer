@@ -561,6 +561,26 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
     return true;
 }
 
+bool DungeonRunHoldsAtStage(DungeonRunMemberState const& member,
+                            ApproachLimits const& limits)
+{
+    // THROUGH THE DOOR IS NOT AT THE DOOR. Asked first because every reading
+    // below it is about a member standing outside, and an inside member has no
+    // measured distance to the staging point at all - it would fall out at the
+    // shape test anyway, but for the wrong reason and with the wrong sentence
+    // in any log line built off this.
+    if (member.inside)
+        return false;
+    if (!member.seen || !member.alive || member.inCombat)
+        return false;
+    // THE SAME SHAPE TEST THE BARRIER MAKES, ON THE SAME LIMITS, and it is one
+    // call to one function rather than two readings that agree today. `Arrived`
+    // is the only shape that may be held: `Closing` is a member still walking,
+    // `Overhead` is a member on a ledge that has to find a route rather than
+    // stand still on the wrong one, and `Unmeasured` is no reading at all.
+    return ApproachShapeOf(GapOf(member), limits) == ApproachShape::Arrived;
+}
+
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
                                       ApproachLimits const& limits)
 {
@@ -2988,7 +3008,7 @@ AimedMover ReadAimedMover(AimedMoverFacts const& facts)
     // outranks the roles rather than sitting beside them: a held LEADER is the
     // measured case, and granting it back would override a hold this module
     // placed three seconds earlier and still intends to lift itself.
-    if (facts.heldAfterRevival || facts.heldToCast)
+    if (facts.heldAfterRevival || facts.heldStill)
         return AimedMover::HeldOnPurpose;
     // The leader before the steerer, because the two are not exclusive and the
     // leader is the stronger claim. A leader escorted by its own dungeon run is

@@ -4779,6 +4779,23 @@ private:
     // follow-gap catch-up, and ReleaseRevivalHold - which is one hold lifting
     // another and was the easiest of the six to miss.
     //
+    // AND IT IS NOT A CASTING REGISTER, WHICH IS #346. A fourth reason joined
+    // the three verbs that day and it does not cast anything: a member that has
+    // reached a dungeon run's staging point has to STAY on it until the barrier
+    // opens, and for exactly the reason the three casts do - the six sites
+    // above hand a mover back to it otherwise, and a character with a mover
+    // walks. Measured on the dev realm 2026-09-08, four members reached the
+    // Wailing Caverns door together and then orbited it at 42, 142, 173, 103
+    // and 214 yards while the barrier waited, three runs in a row, until the
+    // twelve minute window was spent. Nothing about the mechanism differed from
+    // a summoner drifting off a meeting stone; only the verb did.
+    //
+    // So the names here say `hold` rather than `cast hold`. Building a second
+    // register instead would have meant six more `||` at six sites that had
+    // already been the hard part twice, and the seventh reason after that.
+    // WHAT IS STILL PER-REASON is the ceiling, which is a parameter, and the
+    // verb on the record, which is what makes a release let go only of its own.
+    //
     // ONE RECORD, IN ONE PLACE. The register is the single copy of what a hold
     // changed; a verb holds a NAME. Two copies of that record is how a release
     // gives back a strategy it never took, and #329 has already been bitten
@@ -4787,7 +4804,7 @@ private:
     // WORLD THREAD ONLY, unguarded, exactly like _revivalHoldUntil and
     // _pendingChecks and for the same reason: every writer here is a poll or a
     // command executor and both run on it.
-    struct CastHoldRecord
+    struct HoldRecord
     {
         bool addedStay{false};
         bool removedFollow{false};
@@ -4804,9 +4821,36 @@ private:
     // `summon` row that placed one on its way to a refusal and ended there.
     static constexpr uint32 CAST_HOLD_CEILING_SECONDS = 45;
 
-    static std::map<std::string, CastHoldRecord>& CastHoldsInForce()
+    // THE STAGING HOLD'S CEILING, AND IT IS BORROWED RATHER THAN PICKED (#346).
+    // DUNGEON_STAGING_BACKSTOP_SECONDS is how long a whole run may spend being
+    // assembled before it is written off, and a hold placed while a barrier
+    // waits can never need to outlive the run that is waiting.
+    //
+    // IT CANNOT CUT A LIVE BARRIER SHORT, and that is arithmetic rather than a
+    // margin. `stagingSince` is set once, on the first assembling poll, and is
+    // never reset on the way into BARRIER - so it is strictly earlier than any
+    // hold this phase places, because reaching BARRIER costs at least the polls
+    // RESETTING and GATHERING take. The run's own clock therefore always runs
+    // out first, on a phase that closes the run and releases every hold with
+    // it. What is left for this number to bound is the case the sweep below
+    // cannot reach: the coordinator not polling at all.
+    //
+    // AND ERRING SHORT IS THE SAFE DIRECTION HERE TOO. A hold released early
+    // costs the orbit resuming under a run that is already ending. A hold that
+    // outlived its run would be a party pinned at a door with nothing coming
+    // for it, which is strictly worse than the defect this fixes.
+    static constexpr uint32 STAGE_HOLD_CEILING_SECONDS =
+        static_cast<uint32>(DUNGEON_STAGING_BACKSTOP_SECONDS);
+
+    // The verb a staging hold is recorded under, spelled once. It is what makes
+    // ReleaseHold let go of this module's staging holds and nothing else - see
+    // the `expectedVerb` argument there - so it must be the same string at the
+    // place that holds and the places that release.
+    static constexpr char const* STAGE_HOLD_VERB = "stage";
+
+    static std::map<std::string, HoldRecord>& HoldsInForce()
     {
-        static std::map<std::string, CastHoldRecord> holds;
+        static std::map<std::string, HoldRecord> holds;
         return holds;
     }
 
@@ -4814,10 +4858,42 @@ private:
     // everything that hands a mover back. Past its deadline the answer is false
     // even though the record is still there, so a sweep that has not run yet can
     // never keep a character held one poll longer than the ceiling says.
-    static bool HeldStillToCast(std::string const& name)
+    static bool HeldStill(std::string const& name)
     {
-        auto const hold = CastHoldsInForce().find(name);
-        return hold != CastHoldsInForce().end() && time(nullptr) < hold->second.until;
+        auto const hold = HoldsInForce().find(name);
+        return hold != HoldsInForce().end() && time(nullptr) < hold->second.until;
+    }
+
+    // WHICH HOLD, AND FOR HOW MUCH LONGER (#346). For the one line that tells an
+    // operator a character is standing still on purpose rather than stuck.
+    //
+    // THAT LINE USED TO NAME THE WRONG HOLD WITH COMPLETE CONFIDENCE. It was
+    // written when this module had one, so it said "the hold after its revival"
+    // and quoted REVIVAL_HOLD_SECONDS whatever was actually holding the
+    // character - and #335 put a second reason under it without the line
+    // changing. An operator reading it about a summoner mid-ritual was told a
+    // revival had just happened and that the wait was twenty seconds. This
+    // module has now paid twice for a field that reports what the code that
+    // wrote it believed instead of what is true (#329, #337), and a hard-coded
+    // sentence is the same bug with the write done at compile time.
+    //
+    // SO IT IS READ OFF THE REGISTERS THEMSELVES, both of them, in the order
+    // ReadAimedMover asks them so the two can never name different holds about
+    // one character.
+    std::string WhyHeldStill(std::string const& name) const
+    {
+        int64 const now = int64(time(nullptr));
+        auto const revival = _revivalHoldUntil.find(name);
+        if (revival != _revivalHoldUntil.end() && now < revival->second.first)
+            return "the hold after its revival, for up to another " +
+                   std::to_string(revival->second.first - now) + "s";
+        auto const hold = HoldsInForce().find(name);
+        if (hold != HoldsInForce().end() && now < int64(hold->second.until))
+            return "the hold placed to " + hold->second.verb + ", for up to another " +
+                   std::to_string(int64(hold->second.until) - now) + "s";
+        // Reachable, and honest rather than defensive: the verdict this explains
+        // was read a few statements earlier and a hold can lift between the two.
+        return "a hold that has lifted since the question was asked";
     }
 
     // ASK THE CHARACTER TO STAND STILL, and re-assert if it is already held.
@@ -4847,18 +4923,26 @@ private:
     // that was already standing. A row needs to be able to tell those apart:
     // reporting "no hold" for a cast that a previous row's hold was covering is
     // what sent the operator looking for a hold that was working (#337).
+    //
+    // THE CEILING IS A PARAMETER AND THE REASON IS THE VERB (#346). Those two
+    // are the whole of what differs between a hold placed for a three second
+    // cast and one placed for a barrier that may legitimately wait minutes.
+    // Everything else - what is taken, what is owed back, who may lift it - is
+    // the same mechanism, which is why there is one of it.
     static bool HoldCharacterStill(Player* who, PlayerbotAI* botAI, std::string const& name,
-                                   char const* verb)
+                                   char const* verb,
+                                   uint32 ceilingSeconds = CAST_HOLD_CEILING_SECONDS,
+                                   bool standItUp = true)
     {
         if (!who || !botAI)
             return false;
 
-        auto& holds = CastHoldsInForce();
+        auto& holds = HoldsInForce();
         auto const existing = holds.find(name);
         // AN EXPIRED RECORD IS NOT AN EXISTING HOLD. The sweep runs earlier in
         // the same poll than any executor, so a record found past its deadline
         // here is rare - but treating one as existing would give the new hold a
-        // deadline already in the past, and HeldStillToCast would answer false
+        // deadline already in the past, and HeldStill would answer false
         // about a character a verb believes it is holding.
         bool const fresh =
             existing == holds.end() || time(nullptr) >= existing->second.until;
@@ -4896,28 +4980,52 @@ private:
         // stopped, out of combat, is a character its own `food` strategy sits
         // down to eat, so the hold's own success creates this wall. Doing it here
         // rather than in each verb is the point of there being one hold.
-        bool const wasSitting = !who->IsStandState();
+        //
+        // ...AND A STAGING HOLD ASKS IT NOT TO, WHICH IS #346's ONE DISAGREEMENT
+        // WITH #337. Standing a character up is right for a cast and wrong for a
+        // wait. The three casting verbs are holding a character for seconds so
+        // it can finish a spell a sitting character cannot start; a barrier
+        // holds a party at a dungeon door for as long as its slowest member
+        // takes, and the single most useful thing a level-appropriate party can
+        // do with that time is EAT. `food` is not a diverter and is not stood
+        // down for the trip, so left alone it will feed them to full before
+        // anybody knocks. Standing them up every five seconds for twelve minutes
+        // would send a party into an instance on the health and mana it happened
+        // to arrive with.
+        //
+        // The flag is a parameter rather than a test on the verb so that the
+        // caller says what it wants and this function does not have to know the
+        // reasons by name.
+        bool const wasSitting = standItUp && !who->IsStandState();
         if (wasSitting)
             who->SetStandState(UNIT_STAND_STATE_STAND);
 
         if (fresh)
         {
-            CastHoldRecord record;
+            HoldRecord record;
             record.addedStay = plan.addStay;
             record.removedFollow = plan.dropFollow;
             record.removedNewRpg = plan.dropNewRpg;
-            record.until = time(nullptr) + CAST_HOLD_CEILING_SECONDS;
+            record.until = time(nullptr) + ceilingSeconds;
             record.verb = verb ? verb : "";
             record.stoodItUp = wasSitting;
             holds[name] = record;
             LOG_INFO("module.overseer",
                      "overseer: '{}' is held still to {} for at most {}s (stay {}, follow {}, "
-                     "new rpg {}, {}); it walks again the moment the row ends, however it ends",
-                     name, record.verb, uint32(CAST_HOLD_CEILING_SECONDS),
+                     "new rpg {}, {}); it walks again the moment the hold is lifted, "
+                     "however it is lifted",
+                     name, record.verb, ceilingSeconds,
                      plan.addStay ? "added" : "already on",
                      plan.dropFollow ? "removed" : "was off",
                      plan.dropNewRpg ? "removed" : "was off",
-                     wasSitting ? "stood up from sitting" : "already standing");
+                     // THREE ANSWERS AND NOT TWO, because a hold that never
+                     // looked at the stand state must not report the one it
+                     // did not take. "already standing" about a character
+                     // sitting down to eat is the same false confidence
+                     // WhyHeldStill was written to end.
+                     !standItUp   ? "stand state left alone, so it may eat"
+                     : wasSitting ? "stood up from sitting"
+                                  : "already standing");
             return true;
         }
 
@@ -4968,22 +5076,22 @@ private:
     // `name` IS TAKEN BY VALUE, and that is structural rather than tidiness: it
     // is read in the log lines below, after the erase, so a caller that passed a
     // reference into the register would be logging freed memory.
-    static void ReleaseCastHold(std::string name, Player* who, char const* why,
+    static void ReleaseHold(std::string name, Player* who, char const* why,
                                 char const* expectedVerb = nullptr)
     {
-        auto& holds = CastHoldsInForce();
+        auto& holds = HoldsInForce();
         auto const hold = holds.find(name);
         if (hold == holds.end())
             return;
         if (expectedVerb && hold->second.verb != expectedVerb)
         {
             LOG_INFO("module.overseer",
-                     "overseer: a {} row will not release '{}' - the hold on it was placed by "
-                     "{} and is that row's to lift",
+                     "overseer: the {} hand-back will not release '{}' - the hold on it was "
+                     "placed by {} and is that one's to lift",
                      expectedVerb, name, hold->second.verb);
             return;
         }
-        CastHoldRecord const record = hold->second;
+        HoldRecord const record = hold->second;
         holds.erase(hold);
 
         PlayerbotAI* botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
@@ -5047,7 +5155,7 @@ private:
         if (!botAI)
             return;
         bool const placed = HoldCharacterStill(who, botAI, name, verb);
-        auto const& holds = CastHoldsInForce();
+        auto const& holds = HoldsInForce();
         auto const record = holds.find(name);
         if (record == holds.end())
             return;
@@ -5081,6 +5189,16 @@ private:
     // the common case for a refused hearth or summon - stands a character still
     // for longer than this module ever needs to. Asking is exact, and it is
     // three vectors this poll already owns.
+    //
+    // A STAGING HOLD IS DELIBERATELY NOT ASKED ABOUT HERE (#346), and that is
+    // the difference between a ceiling that bounds a race and one that bounds a
+    // forgotten hold. The three rows below can outlive their own ceiling under
+    // poll jitter, because a row's window is accumulated poll time and a hold's
+    // deadline is wall clock. A staging hold cannot: its ceiling is the run's
+    // own staging backstop and its clock starts strictly later, so the run
+    // always closes first and releases it by phase. What reaches this sweep is
+    // therefore only the case nothing else can reach - the coordinator not
+    // polling at all - and for that one the honest answer is to let go.
     bool ARowStillOwnsTheHold(std::string const& name) const
     {
         for (ConjureCheck const& check : _pendingConjures)
@@ -5095,9 +5213,9 @@ private:
         return false;
     }
 
-    void ReleaseExpiredCastHolds()
+    void ReleaseExpiredHolds()
     {
-        auto& holds = CastHoldsInForce();
+        auto& holds = HoldsInForce();
         if (holds.empty())
             return;
         time_t const now = time(nullptr);
@@ -5106,8 +5224,90 @@ private:
             if (now >= hold.second.until && !ARowStillOwnsTheHold(hold.first))
                 due.push_back(hold.first);
         for (std::string const& name : due)
-            ReleaseCastHold(name, ObjectAccessor::FindPlayerByName(name, false),
-                            "its hold reached the ceiling and nothing came back for it");
+            ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false),
+                        "its hold reached the ceiling and nothing came back for it");
+    }
+
+    // ---------------------------------------------- the staging hold (#346) --
+    //
+    // THE FOURTH REASON IN THE REGISTER ABOVE, AND THE ONLY ONE THAT IS NOT A
+    // CAST. A member that has reached a dungeon run's staging point is held on
+    // it until the barrier opens, instead of being walked back onto it every
+    // five seconds for as long as the barrier waits.
+    //
+    // WHY RE-WALKING WAS NEVER GOING TO BE ENOUGH. Nothing in this module
+    // releases an escorted member's errand on arrival - that branch says so in
+    // its own words, and it is right. Upstream ends the walk anyway: an arrived
+    // place-aim calls ChangeToIdle and NewRpgStatusUpdateAction turns RPG_IDLE
+    // into a randomly chosen status on the bot's next AI tick, so what actually
+    // holds a member on a doorstep is the coordinator re-issuing the walk. The
+    // travel poll was already dropped to the coordinator's own five seconds to
+    // narrow that window (see the poll block in OnUpdate) and it narrowed it
+    // rather than closing it. Measured on the dev realm 2026-09-08 with a
+    // forced save every fifty seconds, four members at the Wailing Caverns
+    // door: 42/47/44/45 yards out, then 142/142/139/139, then 173/171/175/178,
+    // then 103/100/102/104, then 214/215/215/214. They move as one, which is
+    // correct - they are following a leader who is the one wandering - and they
+    // never settle. Three runs in a row spent the whole twelve minute window
+    // like that.
+    //
+    // A HOLD IS THE THING THAT WORKS BECAUSE IT IS NOT A RACE. Re-issuing a
+    // walk competes with `new rpg` at relevance 11 every five seconds and loses
+    // some of them. Taking the mover off, and being visible to the six sweeps
+    // that would otherwise hand it back, is not a competition.
+
+    // Is there a staging hold on this character's name right now?
+    //
+    // DELIBERATELY NOT DEADLINE-CHECKED, unlike HeldStill. This is asked by the
+    // release paths, and a record that is past its ceiling but still sitting in
+    // the register is one that must still be LET GO of - answering false about
+    // it would leave the strategies it owes unpaid until the ceiling sweep got
+    // there. HeldStill answers the other question, "is it held", and that one
+    // has to go false the instant the deadline passes.
+    static bool HasStagingHold(std::string const& name)
+    {
+        auto const hold = HoldsInForce().find(name);
+        return hold != HoldsInForce().end() && hold->second.verb == STAGE_HOLD_VERB;
+    }
+
+    // Place the hold, or re-assert one already standing. Called on every poll a
+    // member is wanted still, for the reason HoldCharacterStill's own comment
+    // gives: the register stops this module's sweeps and nothing else, so a
+    // strategy something outside it granted has to be taken off again.
+    static void HoldAtStagingPoint(Player* member, std::string const& name)
+    {
+        PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        if (!botAI)
+            return;
+        // `false` IS THE STAND STATE, AND IT IS THE ONE THING THIS HOLD ASKS
+        // FOR DIFFERENTLY. A party waiting at a door should be eating; see
+        // HoldCharacterStill's stand-state block.
+        HoldCharacterStill(member, botAI, name, STAGE_HOLD_VERB,
+                           STAGE_HOLD_CEILING_SECONDS, false);
+    }
+
+    // Lift one, naming the reason a reader wants: why this character is walking
+    // again, not which function called this.
+    static void ReleaseStagingHold(std::string const& name, char const* why)
+    {
+        ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
+                    STAGE_HOLD_VERB);
+    }
+
+    // Lift all of them. Collected before anything is released for the reason
+    // ReleaseExpiredHolds collects: ReleaseHold erases from the register this
+    // is reading.
+    //
+    // AND IT NAMES THE VERB, so a conjure hold on a character that happens to be
+    // standing at a door is not lifted by a barrier opening. See ReleaseHold.
+    static void ReleaseEveryStagingHold(char const* why)
+    {
+        std::vector<std::string> held;
+        for (auto const& hold : HoldsInForce())
+            if (hold.second.verb == STAGE_HOLD_VERB)
+                held.push_back(hold.first);
+        for (std::string const& name : held)
+            ReleaseStagingHold(name, why);
     }
 
     // Give the followers somebody to follow (infra#2818).
@@ -5423,7 +5623,7 @@ private:
             // that relevance means in practice.
             if (!leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 !HeldAfterRevival(leader->GetName()) &&
-                !HeldStillToCast(leader->GetName()))
+                !HeldStill(leader->GetName()))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' leads but did not carry `new rpg` - granting it, "
@@ -5554,7 +5754,7 @@ private:
             // what to remove. It was removing it into a sweep that could not see
             // a hold existed.
             if (!botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT) &&
-                !HeldAfterRevival(p->GetName()) && !HeldStillToCast(p->GetName()))
+                !HeldAfterRevival(p->GetName()) && !HeldStill(p->GetName()))
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' had a master but no follow strategy - granting "
@@ -5641,7 +5841,7 @@ private:
             // a confident log line about it is worse than no line at all.
             if (!botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 SplitFromLeader(p->GetName()) && !IsEscorted(p->GetName()) &&
-                !HeldAfterRevival(p->GetName()) && !HeldStillToCast(p->GetName()) &&
+                !HeldAfterRevival(p->GetName()) && !HeldStill(p->GetName()) &&
                 OverseerDecisions::ReadSplitErrand(
                     _travelAims.TargetFor(p->GetName())) ==
                     OverseerDecisions::SplitErrand::Nothing)
@@ -11684,7 +11884,7 @@ private:
         OverseerDecisions::AimedMoverFacts facts;
         facts.carriesStrategy = CanBeSentToNpc(botAI);
         facts.heldAfterRevival = HeldAfterRevival(name);
-        facts.heldToCast = HeldStillToCast(name);
+        facts.heldStill = HeldStill(name);
         facts.leadsItsParty = LeadsItsParty(bot);
         facts.steersItself = steersItself;
         facts.cutOffFromLeader = SplitFromLeader(name);
@@ -12003,7 +12203,7 @@ private:
         // holding (#335): the grant site below would refuse it the mover
         // anyway, so without this an escort errand is opened and a flight
         // budget spent for a character that is not going to walk.
-        if (HeldAfterRevival(name) || HeldStillToCast(name))
+        if (HeldAfterRevival(name) || HeldStill(name))
             return;
         // ...AND ONE WHOSE LAST CATCH-UP WALK KILLED IT IS NOT SENT ON ANOTHER
         // ONE YET (#298). See CATCH_UP_STANDDOWN_SECONDS. This is the half of
@@ -12927,20 +13127,26 @@ private:
 
             if (mover == OverseerDecisions::AimedMover::HeldOnPurpose)
             {
-                // NOT LATCHED WITH THE REFUSAL, because it is not one. The hold
-                // is seconds long, this module lifts it itself, and the errand
-                // is not over - so `state.arrived` stays clear for the refusal
-                // that may still be owed, and this line is rationed by its own
-                // flag instead. Cleared below the moment the hold lifts.
+                // NOT LATCHED WITH THE REFUSAL, because it is not one. This
+                // module lifts the hold itself and the errand is not over - so
+                // `state.arrived` stays clear for the refusal that may still be
+                // owed, and this line is rationed by its own flag instead.
+                // Cleared below the moment the hold lifts.
+                //
+                // AND IT NAMES THE HOLD IT FOUND (#346). It used to name the
+                // post-revival one whichever was in force; see WhyHeldStill for
+                // what that cost. A staging hold in particular is minutes rather
+                // than seconds, so a line quoting REVIVAL_HOLD_SECONDS at one
+                // would have sent a reader looking for a stuck character
+                // twenty seconds later.
                 if (!state.heldSaid)
                 {
                     state.heldSaid = true;
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is sent to '{}' and does not carry `new rpg` "
-                             "because this module took it off for the hold after its "
-                             "revival - not granted back and not refused either, since the "
-                             "hold restores it itself within {}s",
-                             name, target, REVIVAL_HOLD_SECONDS);
+                             "because this module took it off for {} - not granted back "
+                             "and not refused either, since the hold restores it itself",
+                             name, target, WhyHeldStill(name));
                 }
                 continue;
             }
@@ -15466,7 +15672,7 @@ private:
         // The revival hold's own bookkeeping is still ended here, because it HAS
         // ended - what is deferred is only handing the mover back, and the cast
         // hold hands back exactly what it took when it lifts.
-        if (HeldStillToCast(name))
+        if (HeldStill(name))
         {
             LOG_INFO("module.overseer",
                      "overseer: '{}' is out of its post-revival hold but a casting verb is "
@@ -18679,6 +18885,30 @@ private:
 
     void DriveDungeonRun()
     {
+        // WHAT RELEASES A STAGING HOLD, AND IT IS THE PHASE RATHER THAN A LIST
+        // OF EXITS (#346). BARRIER is the only phase that ever wants a member
+        // pinned to a staging point, so every other phase is a release - and
+        // asking the phase, here, covers in one line every way a run can stop
+        // wanting one: the barrier opening (ENTER), the staging backstop
+        // closing the run, a give-up on any of the dozen paths that end one,
+        // the leader's job changing out of `dungeon`, and a worldserver bounce,
+        // which puts this coordinator back at IDLE while the register it wrote
+        // is gone with the strategies it recorded.
+        //
+        // FIRST STATEMENT FOR THE SAME REASON THE ESCORT SWEEP BELOW IS, and
+        // ahead of it on purpose. The hold hands back what it took, which for
+        // an escorted member includes a `new rpg` the ESCORT had leased it; the
+        // sweep below then takes that lease back if the escort is over. In the
+        // other order the sweep would strip a strategy the hold was about to
+        // hand straight back, and the follower would carry `new rpg` with
+        // nothing escorting it - which is the scatter, one poll long.
+        //
+        // A HOLD THIS MODULE PLACED FOR A CAST IS NOT TOUCHED. The release
+        // names the staging verb, so a conjure that happens to be running on a
+        // character standing at a door is left to the conjure's own release.
+        if (_dungeonRunCoordinator.phase != DungeonRunPhase::Barrier)
+            ReleaseEveryStagingHold("its run is no longer holding a barrier");
+
         // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN (#122). Everything
         // this function escorts is marked as still wanted at the point it is
         // wanted, and this ends whatever the previous poll stopped marking -
@@ -20530,8 +20760,54 @@ private:
             bool const onTheCorridor =
                 legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
 
+            // A MEMBER THAT IS THERE IS HELD THERE (#346). See
+            // DungeonRunHoldsAtStage for the measurement and for why the answer
+            // is the barrier's own reading of this same member, narrowed.
+            //
+            // ASKED OF `state`, WHICH IS THE READING AGAINST THE DOOR, and not
+            // of the leg being walked. Whether the party is assembled is a
+            // question about the staging point and always was; the corridor is
+            // only how a member gets there.
+            bool const standsReady =
+                OverseerDecisions::DungeonRunHoldsAtStage(state, DUNGEON_APPROACH_LIMITS);
+
+            if (standsReady)
+                HoldAtStagingPoint(member, name);
+            // ...AND ONE THAT WAS HELD AND IS NOT STANDING READY ANY MORE WALKS
+            // AGAIN ON THIS POLL. Pulled into a fight, killed, or knocked off
+            // the point: the reading above went false, and the mover has to come
+            // back before any of the escorting below can act on it. This is the
+            // per-member half of the release; the phase-level half at the top of
+            // this function is the one that covers a run ending.
+            //
+            // A FIGHT IS THE CASE THIS IS FOR, and it is half of why a hold here
+            // is safe at all. `stay` and `follow` are non-combat strategies, so
+            // a held member still fights and still flees - but it comes out of
+            // the fight wherever the fight took it, and it needs `follow` back
+            // to get home. One poll, five seconds.
+            else if (HasStagingHold(name))
+                ReleaseStagingHold(name,
+                                   "it is no longer standing ready on the staging point");
+
+            // AND A HELD MEMBER KEEPS ITS ESCORT, WHICH IS NOT A CONTRADICTION.
+            // The escort is what CLAIMS the aim, and the claim is what keeps
+            // this character's travel focus alive - the record of the `gather`,
+            // `grind` and `loot` strategies that were stood down for the trip.
+            // Drop the claim and SweepTravelFocus hands all of them back within
+            // one travel poll, which over a barrier that may legitimately wait
+            // minutes is a held character walked off to a herb node by a
+            // strategy that outranks `stay`. Nothing walks it on the claim: the
+            // travel drive reads the hold, answers HeldOnPurpose and re-issues
+            // nothing. What the claim buys here is the stand-down, not a walk.
+            //
+            // It is also what keeps the escort's own `new rpg` lease honest. The
+            // hold hands back what it found, and what it found on an escorted
+            // member includes that lease; ending the escort underneath the hold
+            // would have the release hand back a lease nothing owns any more and
+            // KeepRosterFollowing strip it a poll later, warning about a scatter
+            // that never happened.
             if (gap.measured && legAim.usable &&
-                (isLeader || onTheCorridor ||
+                (isLeader || onTheCorridor || standsReady ||
                  OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) !=
                      OverseerDecisions::ApproachShape::Arrived))
             {
@@ -20575,7 +20851,17 @@ private:
             // is handed the leg's own gap for the same reason GATHERING's is.
             OverseerDecisions::ApproachGap const legGap =
                 onTheCorridor ? legAim.gap : gap;
-            if (RunStagingWatchdog(coord, name, member, legGap))
+            // AND A MEMBER THIS MODULE IS HOLDING STILL IS NOT WATCHED AT ALL
+            // (#346). The watchdog asks whether a member is getting NEARER, and
+            // a held one is not getting anywhere on purpose. StagingWatchdog
+            // already exempts an `Arrived` shape and resets the ladder, so this
+            // is belt as well as braces - but the gap fed to it is the LEG's
+            // whenever a member is on the corridor, and a rule that holds only
+            // while two functions agree about which leg an arrived member is on
+            // is a rule that breaks the first time one of them changes. A
+            // character this module has deliberately stopped is not a character
+            // whose stillness is evidence of anything.
+            if (!standsReady && RunStagingWatchdog(coord, name, member, legGap))
             {
                 // ABOVE THE DOOR AND NOT COMING DOWN (#217). One member in that
                 // state is enough to close the run: the barrier needs all of
@@ -21790,7 +22076,7 @@ private:
         // AFTER the four above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
         // this only ever picks up the ones nothing came back for.
-        ReleaseExpiredCastHolds();
+        ReleaseExpiredHolds();
 
         // Then collect any row a run that is no longer here is still holding,
         // because nothing below this line can ever see one.
@@ -26293,7 +26579,7 @@ private:
         // READ THE RECORD BACK RATHER THAN ASSUMING THE PLAN. A re-assertion on
         // a later poll must not overwrite what the FIRST one found, and the
         // register is the side that knows which call this was.
-        auto const& holds = CastHoldsInForce();
+        auto const& holds = HoldsInForce();
         auto const record = holds.find(ev.character);
         if (record == holds.end())
             return;
@@ -26306,13 +26592,13 @@ private:
 
     // Runs on every exit this row has, exactly as before. `who` may be null: a
     // character that logged out mid-loop cannot be released on, the register
-    // entry still has to go, and ReleaseCastHold says so rather than pretending.
+    // entry still has to go, and ReleaseHold says so rather than pretending.
     static void ReleaseConjureHold(Player* who, ConjureEvidence& ev)
     {
         if (!ev.held)
             return;
         ev.held = false;
-        ReleaseCastHold(ev.character, who, "the conjure row ended", "conjure");
+        ReleaseHold(ev.character, who, "the conjure row ended", "conjure");
     }
 
     static char const* DoConjure(Player* who, std::string const& command, char const*& status,
@@ -27441,7 +27727,7 @@ private:
                 // release it on: a relog rebuilds a character's strategies, and
                 // a record left standing would keep this module's own sweeps off
                 // a character that is no longer being held by anything (#335).
-                ReleaseCastHold(check.targetName, bot,
+                ReleaseHold(check.targetName, bot,
                                 "the character left the world mid-hearth", "hearth");
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
@@ -27491,7 +27777,7 @@ private:
             // is written, so a character that hearthed does not stand at its
             // destination waiting out a ceiling (#335). A no-op for the rows
             // that never placed one, which is most of them.
-            ReleaseCastHold(check.targetName, bot, "the hearth row ended", "hearth");
+            ReleaseHold(check.targetName, bot, "the hearth row ended", "hearth");
 
             char const* status = "error";
             char const* detail = "";
@@ -27986,7 +28272,7 @@ private:
         {
             if (name.empty())
                 continue;
-            ReleaseCastHold(name, ObjectAccessor::FindPlayerByName(name, false), why, "summon");
+            ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why, "summon");
         }
     }
 
