@@ -704,9 +704,36 @@ static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float 
 //
 // `out` is sized here rather than by the caller so the two cannot disagree, and
 // its order is the order of `points`.
+// WHETHER THIS SPAWN IS THE OTHER SIDE'S PEOPLE RATHER THAN A MONSTER (#326).
+//
+// Hostile and above level is the question #267 and #300 ask, and it is the
+// wrong one for a ROUTE: on Kalimdor it is true of 10139 spawns for a level 28
+// Alliance character, most of them wildlife, and a party walks past wildlife
+// every day. What killed this family was a town.
+//
+// THE CORE ALREADY SEPARATES THE TWO AND THE MASK IS WHERE. FactionMasks
+// (SharedDefines.h) is PLAYER 1, ALLIANCE 2, HORDE 4, MONSTER 8, and a faction
+// template's `ourMask` says which of those its holder belongs to. `Barrens
+// Guard`, `Horde Guard` and `Stonetalon Grunt` all carry faction template 85,
+// whose ourMask is PLAYER|HORDE; a gorilla's is MONSTER. So the test is
+// whether the spawn's ourMask carries a PLAYER-side bit the character's own
+// does not, which needs no hard-coded side and is right for a Horde family
+// without a second branch.
+//
+// Measured on the shipped world data for an Alliance party at this family's
+// levels: this narrows 1592 flagged walk legs on Kalimdor to 647, and both
+// legs the party actually died on are still in.
+static bool IsTheOtherSidesGround(FactionTemplateEntry const& theirs,
+                                  FactionTemplateEntry const& mine)
+{
+    static constexpr uint32 PLAYER_SIDES = FACTION_MASK_ALLIANCE | FACTION_MASK_HORDE;
+    return (theirs.ourMask & PLAYER_SIDES & ~mine.ourMask) != 0;
+}
+
 static void HostileSpawnsNearEach(Player* bot, uint32 mapId,
                                   std::vector<std::pair<float, float>> const& points,
                                   float radius, uint32 aboveLevel,
+                                  bool theOtherSideOnly,
                                   std::vector<NearbyThreat>& out)
 {
     out.assign(points.size(), NearbyThreat{});
@@ -727,6 +754,8 @@ static void HostileSpawnsNearEach(Player* bot, uint32 mapId,
             continue;
         FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
         if (!theirs || !theirs->IsHostileTo(*mine))
+            continue;
+        if (theOtherSideOnly && !IsTheOtherSidesGround(*theirs, *mine))
             continue;
 
         for (std::size_t i = 0; i < points.size(); ++i)
@@ -1503,6 +1532,31 @@ constexpr float TRAVEL_ROUTE_GAIN_YARDS = 200.0f;
 // board (#279); a portal changes maps and nothing here can rejoin a party split
 // across two of them (#241). Of the 15041 links shipped, 13885 are walks.
 constexpr uint32 TRAVEL_ROUTE_LINK_WALK = 1;
+
+// HOW OFTEN A ROUTE MAY BE RE-PLANNED WHILE IT LEARNS WHAT ITS LEGS CROSS
+// (#326).
+//
+// The guarded flag is a property of ground, and the honest way to measure it is
+// against the survey's own waypoints for a leg, which bend up to 274 yards off
+// the straight line between its two nodes. Measuring every leg on a continent
+// up front would mean reading 328614 waypoint rows on the world thread to
+// answer a question about four of them, so this measures only the legs of the
+// route it was actually given, marks what it finds, and asks the planner again
+// with the new knowledge. What is learned is kept for the process, so the
+// second errand down the same road pays nothing.
+//
+// Measured by replaying the five journeys of #326 against the shipped survey:
+// the Wailing Caverns approach settles in TWO passes having measured 5 legs,
+// and the longest, the Ratchet approach, takes FOUR and measures 14. Six leaves
+// margin and bounds the work; a route that has not settled by then keeps the
+// last plan, which is today's behaviour.
+constexpr unsigned TRAVEL_ROUTE_GUARDED_PASSES = 6;
+
+// How far apart to read the ground along a leg. The same thirty yards
+// PlanRouteSamples already uses for the straight-line gate, so the two readings
+// of "what is standing on this ground" are taken at the same resolution and a
+// number tuned for one cannot silently mean something else in the other.
+constexpr float TRAVEL_ROUTE_GUARDED_SPACING_YARDS = 30.0f;
 
 // A follower that has stopped, and never closes the gap (#70).
 //
@@ -7438,7 +7492,7 @@ private:
             std::vector<NearbyThreat> threats;
             HostileSpawnsNearEach(bot, mapId, usableAt, TRAVEL_THREAT_RADIUS,
                                   bot->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1,
-                                  threats);
+                                  false, threats);
             for (std::size_t k = 0; k < usableIndex.size(); ++k)
             {
                 candidates[usableIndex[k]].guardCount = threats[k].count;
@@ -7513,7 +7567,7 @@ private:
             std::vector<NearbyThreat> ground;
             HostileSpawnsNearEach(bot, mapId, alongTheWay, TRAVEL_THREAT_RADIUS,
                                   bot->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1,
-                                  ground);
+                                  false, ground);
             std::size_t at = 0;
             for (std::size_t k = 0; k < shortlist.size(); ++k)
             {
@@ -10089,6 +10143,18 @@ private:
         bool said{false};
         std::vector<OverseerDecisions::RouteNode> nodes;
         std::vector<OverseerDecisions::RouteLink> links;
+        // WHICH LEGS HAVE BEEN READ, and for whom (#326). `guardedGround` on
+        // the links above is the answer; this is the record of having asked, so
+        // a leg that came back clean is not re-read on every errand down the
+        // same road.
+        //
+        // AND `forOurMask` IS WHY THIS IS NOT SIMPLY A CACHE. "Guarded" is a
+        // question about a character's own side, so the answers belong to a
+        // side and not to the world. If a character of the other side is ever
+        // routed by this process, everything learned so far is about somebody
+        // else and is thrown away rather than reused.
+        std::set<std::uint64_t> measuredLegs;
+        uint32 forOurMask{0};
     };
 
     // World thread only - DriveTravel runs from OnUpdate - so unguarded, in the
@@ -10195,6 +10261,112 @@ private:
         out.push_back(point);
     }
 
+    // ONE LEG, NAMED THE WAY A SET CAN HOLD IT.
+    static std::uint64_t LegKey(uint32 from, uint32 to)
+    {
+        return (static_cast<std::uint64_t>(from) << 32) | to;
+    }
+
+    // BOTH DIRECTIONS, BECAUSE THE GROUND DOES NOT CARE WHICH WAY IT IS WALKED.
+    // The survey stores each leg twice, once per direction, and a guard standing
+    // beside it guards both.
+    static void MarkLegGuarded(TravelSurvey& survey, uint32 from, uint32 to)
+    {
+        for (OverseerDecisions::RouteLink& link : survey.links)
+            if ((link.from == from && link.to == to) ||
+                (link.from == to && link.to == from))
+                link.guardedGround = true;
+    }
+
+    // WHAT THIS ROUTE'S LEGS CROSS, READ ONCE PER LEG PER PROCESS (#326).
+    //
+    // Returns true when it learned something new about a leg of THIS plan, which
+    // is the caller's signal to ask for the route again now that it knows more.
+    //
+    // ONE SWEEP FOR THE WHOLE ROUTE, not one per leg and not one per point. Same
+    // reason HostileSpawnsNearEach exists at all: the points of a four-leg route
+    // are about a hundred and twenty, and a hundred and twenty passes over every
+    // creature spawn on a continent, on the world thread, is not a cost worth
+    // paying for a question one pass answers.
+    //
+    // AND IT IS READ ALONG THE SURVEY'S OWN WAYPOINTS rather than along the
+    // straight line between the two nodes. Measured on the leg this family died
+    // on: its waypoints bend a median 112 and a maximum 274 yards off that
+    // chord, and the guard that killed them twice is 5 yards from the waypoints
+    // and 66 from the chord. The chord is not the ground the party walks.
+    static bool MeasureGuardedLegs(Player* bot, TravelSurvey& survey,
+                                   uint32 mapId,
+                                   std::vector<std::uint32_t> const& nodes,
+                                   std::map<uint32, OverseerDecisions::RouteNode const*> const& byId)
+    {
+        std::vector<std::pair<float, float>> points;
+        std::vector<std::size_t> legOfPoint;
+        std::vector<std::pair<uint32, uint32>> legs;
+        for (std::size_t i = 0; i + 1 < nodes.size(); ++i)
+        {
+            uint32 const from = nodes[i];
+            uint32 const to = nodes[i + 1];
+            if (survey.measuredLegs.find(LegKey(from, to)) != survey.measuredLegs.end())
+                continue;
+            auto const toNode = byId.find(to);
+            if (toNode == byId.end())
+                continue;
+            std::vector<OverseerDecisions::RoutePoint> leg;
+            AppendLeg(from, to, *toNode->second, leg);
+            std::size_t const index = legs.size();
+            legs.emplace_back(from, to);
+            // Every TRAVEL_ROUTE_GUARDED_SPACING_YARDS of the leg gets one
+            // reading, and the first and last points always get one: an unread
+            // stretch can hide a guard and can never invent one, but the ends of
+            // a leg are where a node sits and where the next leg begins.
+            float carried = TRAVEL_ROUTE_GUARDED_SPACING_YARDS;
+            float lastX = 0.f;
+            float lastY = 0.f;
+            for (std::size_t p = 0; p < leg.size(); ++p)
+            {
+                if (p != 0)
+                {
+                    float const dx = leg[p].x - lastX;
+                    float const dy = leg[p].y - lastY;
+                    carried += std::sqrt(dx * dx + dy * dy);
+                }
+                lastX = leg[p].x;
+                lastY = leg[p].y;
+                if (carried < TRAVEL_ROUTE_GUARDED_SPACING_YARDS && p + 1 != leg.size())
+                    continue;
+                carried = 0.f;
+                points.emplace_back(leg[p].x, leg[p].y);
+                legOfPoint.push_back(index);
+            }
+        }
+        if (legs.empty())
+            return false;
+
+        std::vector<bool> guarded(legs.size(), false);
+        if (!points.empty())
+        {
+            std::vector<NearbyThreat> ground;
+            HostileSpawnsNearEach(bot, mapId, points, GRAVEYARD_THREAT_RADIUS,
+                                  bot->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1,
+                                  true, ground);
+            for (std::size_t p = 0; p < ground.size(); ++p)
+                if (ground[p].level)
+                    guarded[legOfPoint[p]] = true;
+        }
+
+        bool learnedSomethingGuarded = false;
+        for (std::size_t i = 0; i < legs.size(); ++i)
+        {
+            survey.measuredLegs.insert(LegKey(legs[i].first, legs[i].second));
+            survey.measuredLegs.insert(LegKey(legs[i].second, legs[i].first));
+            if (!guarded[i])
+                continue;
+            MarkLegGuarded(survey, legs[i].first, legs[i].second);
+            learnedSomethingGuarded = true;
+        }
+        return learnedSomethingGuarded;
+    }
+
     // THE WHOLE ROUTE FOR ONE ERRAND, planned once and then walked. Empty means
     // "there is no route to plan", which every caller must read as "aim at the
     // errand", never as an error: that is what this module did before #316 and
@@ -10226,12 +10398,48 @@ private:
         if (want.GetMapId() != bot->GetMapId())
             return route;
 
+        std::map<uint32, OverseerDecisions::RouteNode const*> byId;
+        for (OverseerDecisions::RouteNode const& node : survey.nodes)
+            if (node.mapId == bot->GetMapId())
+                byId.emplace(node.id, &node);
+
+        // WHOSE SIDE THE MARKS ARE FOR (#326). See TravelSurvey::forOurMask:
+        // guarded is a question about a character's own side, so a character of
+        // the other side inherits nothing.
+        FactionTemplateEntry const* const mine = bot->GetFactionTemplateEntry();
+        uint32 const ourMask = mine ? mine->ourMask : 0;
+        if (survey.forOurMask != ourMask)
+        {
+            survey.forOurMask = ourMask;
+            survey.measuredLegs.clear();
+            for (OverseerDecisions::RouteLink& link : survey.links)
+                link.guardedGround = false;
+        }
+
+        // PLAN, READ WHAT THAT PLAN CROSSES, PLAN AGAIN (#326). The first pass
+        // is exactly what #316 did; each later one is the same search knowing
+        // more about the same graph. It ends as soon as a plan tells it nothing
+        // new, which is the common case on the first pass and always the case
+        // the second time an errand goes down a road already read.
         OverseerDecisions::RoutePlanLimits limits;
         limits.entryNodeYards = TRAVEL_ROUTE_ENTRY_YARDS;
         limits.minGainYards = TRAVEL_ROUTE_GAIN_YARDS;
-        OverseerDecisions::RoutePlan const plan = OverseerDecisions::PlanFootRoute(
-            survey.nodes, survey.links, bot->GetMapId(), bot->GetPositionX(),
-            bot->GetPositionY(), want.GetPositionX(), want.GetPositionY(), limits);
+        OverseerDecisions::RoutePlan plan;
+        for (unsigned pass = 0; pass <= TRAVEL_ROUTE_GUARDED_PASSES; ++pass)
+        {
+            plan = OverseerDecisions::PlanFootRoute(
+                survey.nodes, survey.links, bot->GetMapId(), bot->GetPositionX(),
+                bot->GetPositionY(), want.GetPositionX(), want.GetPositionY(), limits);
+            if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
+                break;
+            // The last time round is a plan and not a measurement, so whatever
+            // is returned was planned with everything that has been learned.
+            if (pass == TRAVEL_ROUTE_GUARDED_PASSES)
+                break;
+            if (!MeasureGuardedLegs(bot, survey, bot->GetMapId(), plan.nodes, byId))
+                break;
+        }
+
         if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
         {
             LOG_INFO("module.overseer",
@@ -10243,10 +10451,6 @@ private:
             return route;
         }
 
-        std::map<uint32, OverseerDecisions::RouteNode const*> byId;
-        for (OverseerDecisions::RouteNode const& node : survey.nodes)
-            if (node.mapId == bot->GetMapId())
-                byId.emplace(node.id, &node);
         for (std::size_t i = 0; i + 1 < plan.nodes.size(); ++i)
         {
             auto const to = byId.find(plan.nodes[i + 1]);
@@ -10262,6 +10466,24 @@ private:
                  "boat or a portal, because the party walks together (#316)",
                  name, target, static_cast<uint32>(plan.nodes.size()), plan.yards,
                  static_cast<uint32>(route.size()), plan.endsFromAimYards);
+        // SAID SEPARATELY AND ONLY WHEN THERE IS SOMETHING TO SAY, so the line
+        // above keeps meaning what it has always meant and an operator reading
+        // for #326 is not reading past it every errand.
+        if (plan.wentRound)
+            LOG_INFO("module.overseer",
+                     "overseer: that route goes ROUND ground the other side guards rather "
+                     "than through it, and going round is not farther - it walks {:.0f} yards "
+                     "of leg and hands over {:.0f}. This is what the party died on twice at "
+                     "the Barrens road (#326)",
+                     plan.yards, plan.endsFromAimYards);
+        else if (plan.guardedLegs)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' is sent to '{}' and {} of its {} legs cross ground the "
+                     "other side guards, with no way round that is not farther. It walks it. "
+                     "If this errand starts dying to guards, the answer is a different "
+                     "errand and not a different route (#326)",
+                     name, target, plan.guardedLegs,
+                     static_cast<uint32>(plan.nodes.size() ? plan.nodes.size() - 1 : 0));
         return route;
     }
 
