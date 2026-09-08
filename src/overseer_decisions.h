@@ -6121,9 +6121,15 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
 // WHAT IT COST. Six dungeon runs in a row ended `staging_failed` with the
 // leader still more than a thousand yards from the door, and the death table
 // says why: the leader was killed by level 40 guards of the other side, at
-// level 30, on the road the route chose. A leader death is the expensive one -
-// reviving the party sends all five to the LEADER's bind - so every one of
-// those deaths reset the whole family and the next run walked the same road.
+// level 30, on the road the route chose.
+//
+// AND THE DEATHS COMPOUND RATHER THAN COSTING ONE RUN EACH, which is the whole
+// reason a staging walk is worth writing a corridor for. The comment on the
+// revival-split rule above already says it in its own words: this zone is the
+// other side's ground, so its graveyards stand beside the other side's guards,
+// and for this family the loop closes on itself - die, revive at the
+// graveyard, be killed by the guards standing at it. Nothing about being
+// routed there in the first place is that rule's business. It is this one's.
 //
 // AND THE LEVEL GAP IS ALREADY IN THE MARK. `RouteLink::guardedGround` is set
 // off a reading whose level floor is the character's own level plus
