@@ -4484,4 +4484,202 @@ bool MailRefusalRetryable(std::string const& reason)
     return false;
 }
 
+HearthRequest ParseHearthRequest(std::string const& command)
+{
+    HearthRequest request;
+    std::vector<std::string> const words = TownWords(command);
+
+    // An EMPTY command is `use`, for the reason ParseBindRequest gives for the
+    // same shape: this verb has exactly one form and no arguments, so an empty
+    // column is unambiguous rather than lazy, and a sender does not have to
+    // know a magic word to ask for the only thing the verb does.
+    if (words.empty())
+    {
+        request.verb = HearthVerb::Use;
+        return request;
+    }
+
+    if (words[0] == "use")
+    {
+        if (words.size() == 1)
+        {
+            request.verb = HearthVerb::Use;
+            return request;
+        }
+        request.error = "malformed hearth: use takes no arguments";
+        return request;
+    }
+
+    request.error = "malformed hearth: unknown verb (want use, or nothing at all)";
+    return request;
+}
+
+char const* HearthOutcomeWord(HearthOutcome outcome)
+{
+    switch (outcome)
+    {
+        case HearthOutcome::Arrived:
+            return "arrived";
+        case HearthOutcome::Stayed:
+            return "stayed";
+        case HearthOutcome::Elsewhere:
+            return "elsewhere";
+        case HearthOutcome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
+namespace
+{
+
+// Squared throughout, so this file keeps including nothing but the five
+// standard headers the decisions job compiles it with. Same rule, and the same
+// reason, as BindReadBack above.
+bool HearthWithin(HomeBind const& a, HomeBind const& b, float yards)
+{
+    if (a.mapId != b.mapId)
+        return false;
+    float const dx = a.x - b.x;
+    float const dy = a.y - b.y;
+    float const dz = a.z - b.z;  // an inn has floors, and so does a bank
+    return dx * dx + dy * dy + dz * dz <= yards * yards;
+}
+
+}  // namespace
+
+bool HearthWouldMoveNobody(HomeBind const& standing, HomeBind const& home,
+                           float arrivedYards)
+{
+    // A reading nobody took is not a reason to refuse. The executor asks about
+    // the readings themselves before it asks this, and answering `true` here
+    // for an unread home would refuse every character whose home could not be
+    // read, which is a different refusal wearing this one's words.
+    if (!standing.known || !home.known)
+        return false;
+    return HearthWithin(standing, home, arrivedYards);
+}
+
+HearthOutcome HearthReadBack(HomeBind const& from, HomeBind const& home,
+                             HomeBind const& now, float arrivedYards,
+                             float movedYards)
+{
+    // ALL THREE OR NOTHING, the rule BindReadBack keeps for the same reason: a
+    // verdict built out of two readings and a guess at the third is the half
+    // that was missing, invented.
+    if (!from.known || !home.known || !now.known)
+        return HearthOutcome::Unreadable;
+
+    // AND THE START LINE MUST NOT BE THE FINISH LINE. When the character began
+    // the cast at its own home, `Arrived` and `Stayed` are the same reading and
+    // this function cannot tell them apart. The executor refuses that row
+    // before the packet (HearthWouldMoveNobody), so reaching here means the
+    // home moved under a cast already in flight. Saying so is honest; picking
+    // one of the two would be a coin toss reported as a measurement.
+    if (HearthWithin(from, home, arrivedYards))
+        return HearthOutcome::Unreadable;
+
+    // HOME FIRST. It is the only outcome that is the thing that was asked for,
+    // and after the guard above it cannot also be the start line.
+    if (HearthWithin(now, home, arrivedYards))
+        return HearthOutcome::Arrived;
+
+    // Still on the start line. A tolerance of its own, and a tighter one than
+    // the arrival's: a character that never left is standing on the spot, and
+    // the width that has to absorb a bind point recorded at a doorway is not
+    // the width that decides whether somebody moved.
+    if (HearthWithin(now, from, movedYards))
+        return HearthOutcome::Stayed;
+
+    return HearthOutcome::Elsewhere;
+}
+
+uint32_t HearthVerifyWindowMs(uint32_t castMs, uint32_t marginMs, uint32_t floorMs)
+{
+    // Saturating. A cast time out of the DBC is not this module's number, and
+    // an addition that wraps would turn an absurd one into a window shorter
+    // than the floor - which is precisely the reading that judges a hearth as
+    // `Stayed` while the character is still casting it.
+    uint32_t const wanted = castMs > UINT32_MAX - marginMs ? UINT32_MAX : castMs + marginMs;
+    return wanted < floorMs ? floorMs : wanted;
+}
+
+TownRetry HearthRefusalRetry(std::string const& detail)
+{
+    // The literals mod_overseer.cpp's DoHearth returns, grouped by what would
+    // have to change for the SAME row to succeed.
+    static char const* const NEVER[] = {
+        "malformed hearth: use takes no arguments",
+        "malformed hearth: unknown verb (want use, or nothing at all)",
+        "malformed hearth request",
+        // The item is the wall, which is what Never means here. Waiting does
+        // not put a hearthstone in a bag and neither does walking; somebody has
+        // to hand one over or an innkeeper has to replace it, and either way it
+        // is not this row that succeeds afterwards.
+        "character carries no hearthstone",
+        // The item is in the bags and its template carries no ON_USE spell for
+        // Player::CastItemUseSpell to find. A world database that says that is
+        // not going to say something else while this row waits.
+        "the hearthstone has no on-use spell",
+        // The same class of answer one step either side of it: an item row with
+        // no template at all, and a spell id the core's DBC does not carry.
+        // Both are the server's own data being wrong rather than the character
+        // being busy, and no amount of waiting or walking changes either. They
+        // are named separately from the one above because they fail at
+        // different points and an operator should not have to guess which.
+        "the hearthstone has no template",
+        "the core does not know that spell",
+    };
+    static char const* const ELSEWHERE[] = {
+        // AN INSTANCE IS NOT ON THIS LIST, AND THE BIND VERB'S IS. That
+        // difference is measured, not assumed. WorldSession::SendBindPoint
+        // opens by returning when the map is instanceable, so #286 refuses a
+        // bind there because the core would do nothing and say nothing. Nothing
+        // on the hearthstone's path does that: SPELL_EFFECT_TELEPORT_UNITS has
+        // no case in Spell::CheckCast's effect switch and SpellInfo::
+        // CheckLocation only bars a spell carrying
+        // SPELL_ATTR6_NOT_IN_RAID_INSTANCES, which this one does not. A
+        // hearthstone cast from inside a dungeon is legal, it is the ordinary
+        // way a player leaves one, and refusing it here would be this module
+        // inventing a rule the game does not have.
+        //
+        // AN ARENA IS ON IT, because the core genuinely refuses there twice
+        // over: Spell::CheckCast bars any spell with a recovery time of ten
+        // minutes or more, and the handler bars the item before that with
+        // EQUIP_ERR_NOT_DURING_ARENA_MATCH.
+        "character is in an arena",
+        // AND A TRANSPORT IS THIS MODULE'S OWN, which is worth saying plainly:
+        // SPELL_FAILED_NOT_ON_TRANSPORT is declared in the core and used
+        // nowhere, so the game would allow this. It is refused here because the
+        // READ-BACK cannot survive it. The judgement below compares where the
+        // character ends up against where it started, and a deck is a start
+        // line that moves on its own, so `stayed` and `elsewhere` stop meaning
+        // anything. A verdict that cannot be trusted is worse than a refusal
+        // that can, and #279 already says nothing of ours can board a
+        // transport, so this costs the family nothing today.
+        "character is on a transport",
+        // The one refusal that is about the destination rather than the
+        // character: the home is already here, so there is nowhere to go. It is
+        // `Elsewhere` and not `Never` because it is answered either by walking
+        // away or by binding somewhere else, and both are things this family
+        // does.
+        "home is where the character already stands",
+    };
+
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    for (char const* literal : ELSEWHERE)
+        if (detail == literal)
+            return TownRetry::Elsewhere;
+
+    // Everything left is the character's own state, and every one of them ends
+    // on its own: a fight, a flight, a corpse run, a walk, a cast already in
+    // progress, an hour of cooldown, a mind control, a session that is going
+    // away, a bot AI that has not attached yet. `Later` is also what an
+    // unrecognised literal gets, which is the same call the bind, sell and
+    // repair tables make.
+    return TownRetry::Later;
+}
+
 }  // namespace OverseerDecisions

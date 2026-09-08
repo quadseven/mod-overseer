@@ -1,0 +1,208 @@
+-- Send a family member home on the hearthstone in its own bags, through the
+-- core's own CMSG_USE_ITEM handler, the way a player does it (part of #274).
+--
+-- WHY THIS EXISTS. #286 gave this module the first half of the game's own
+-- cross-continent return: an innkeeper can be asked to set a character's home,
+-- and the home is read back out of character_homebind rather than believed.
+-- This is the second half. A home is only worth having if something can go to
+-- it, and nothing here could. The migration alongside this one said so in as
+-- many words: "the hearthstone takes you there from anywhere, across an ocean,
+-- with no deck to board" - and then nothing in this module could pick one up.
+--
+-- WHAT THAT COSTS, MEASURED, on the roster this module steers, read off the
+-- live realm on 2026-09-07 rather than remembered:
+--
+--   character  standing        bound            hearthstones
+--   ---------  --------------  ---------------  ------------
+--   Og (lead)  map 1 Kalimdor  map 1 Kalimdor   1
+--   Bork       map 1 Kalimdor  map 0 Elwynn     1
+--   Grog       map 0 Eastern   map 1 Ratchet    1
+--   Grug       map 0 Eastern   map 0 Elwynn     1
+--   Ugga       map 0 Eastern   map 0 Elwynn     1
+--
+-- The dungeon they are asked to run a hundred times is on map 1 and the count
+-- stands at 0 of 100. Two of the five are on that map. ONE ROW against Grog
+-- makes it three, because Grog is the single member already bound on the
+-- correct continent and standing on the wrong one, and a hearthstone is exactly
+-- the mechanic for that.
+--
+-- WHAT IT DOES NOT DO, said here so nobody reads more into it. It does nothing
+-- for Grug and Ugga, who are bound in Elwynn and standing in Eastern Kingdoms:
+-- for them a hearth is a short trip that changes no continent. It is worse than
+-- nothing for Bork, who is standing on Kalimdor with the dungeon and is bound in
+-- Elwynn, so a hearth would carry him OFF the map the party needs. This verb
+-- does not know any of that and must not: choosing whether a hearth is worth
+-- casting needs the whole party's maps and the dungeon's map side by side, which
+-- is what the side outside the worldserver holds. It is the same seam #286 drew
+-- when it refused to decide which inn was worth binding at. What the executor
+-- guarantees is narrower and it is the part that was missing: that the row says
+-- truthfully whether the character moved.
+--
+-- WHY THE ITEM AND NOT Player::TeleportTo(m_homebind...). This file could have
+-- been four lines. This module already teleports characters to m_homebind* in
+-- four places, and every one of them is a revival exit that argued for itself
+-- as a revival. A fifth call with nothing in front of it is not a fifth of the
+-- same thing: it is a GM teleport with a game mechanic's name on it, available
+-- on demand, for free, to any character in any state. #286's migration named
+-- the rule and it holds one step along - Player::SetHomebind "is public and
+-- would work, and that is exactly the problem". AGENTS.md's standing
+-- instruction is to always fix the code and never reach for an admin shortcut,
+-- and it records what following that instruction has already bought: chasing a
+-- ghost-wipe instead of GM-reviving found that Player::GetCorpse is map-scoped,
+-- a defect a revive would have hidden for every future wipe.
+--
+-- So the verb is the ITEM. The hearthstone in the character's own bags, its own
+-- spell, its own ten second cast, its own hour of cooldown, its own interrupts.
+-- A character in combat fails the way a player's would because it is the same
+-- code refusing. That is also the honest accounting: this buys the family a
+-- return trip that costs an hour of cooldown and can fail, not a free door.
+--
+-- CAN A BOT CAST AN ITEM AT ALL? YES, and this was the question the whole
+-- design turned on, so it was read at the SHAs .github/workflows/build.yml pins
+-- rather than remembered:
+--
+--   * WorldSession::HandleUseItemOpcode (SpellHandler.cpp:58) takes a raw
+--     WorldPacket, the same shape as the binder handler #286 drives and the
+--     areatrigger handler the dungeon approach drives. Counted rather than
+--     guessed: eighteen distinct core handlers are already driven this way from
+--     this file, and HandleUseItemOpcode makes nineteen.
+--   * Every client-facing thing on the path funnels through
+--     WorldSession::SendPacket, which returns at `if (!m_Socket)`
+--     (WorldSession.cpp:308). A bot's session is constructed with a null
+--     socket, so SendEquipError and SendCastResult are no-ops for it. The
+--     packets are cosmetic; the `return` after each one is not, which is why
+--     every condition the handler would refuse on is named on this side first.
+--   * mod-playerbots ALREADY makes this exact call. UseItemAction::UseItem
+--     hand-builds a CMSG_USE_ITEM and passes it to
+--     bot->GetSession()->HandleUseItemOpcode, and UseHearthStone sits on top of
+--     it. So the packet path is not novel. What is novel is judging it.
+--
+-- THE DESTINATION IS NOT THIS MODULE'S TO CHOOSE, which is what makes this the
+-- second half of #286 rather than a new power. Spell::SelectImplicitCasterDest-
+-- Targets resolves TARGET_DEST_HOME to playerCaster->m_homebindX/Y/Z/MapId
+-- (Spell.cpp:1394) - the same four fields HandleBinderActivateOpcode writes and
+-- the same four this module already reads back to prove a bind moved. There is
+-- no coordinate anywhere in this verb and the grammar has no way to express one.
+--
+-- WHY A HEARTH CANNOT BE ANSWERED BY THE POLL THAT SENT IT. This is the one
+-- structural difference from every other executor in the file. A hearthstone has
+-- a cast time. When HandleUseItemOpcode returns, the spell is in
+-- SPELL_STATE_PREPARING with a timer, and nothing has happened. Spell::update
+-- decrements that timer on the world tick and only then calls cast(), and the
+-- teleport itself is deferred again to the end of that tick because
+-- Player::Update wraps itself in SetMustDelayTeleport. Reading the world back
+-- inside the call, which is what kind='bind', kind='repair' and kind='mail' all
+-- do, would find the character standing exactly where it was and would be right,
+-- ten seconds too early.
+--
+-- So the row parks in `verifying` - the status a strategy command already uses
+-- while its post-condition is read back - and ResolveHearthChecks judges it
+-- later. THE WAIT IS NOT A CONSTANT. VERIFY_GRACE_MS is 6000 and the cast is
+-- longer than that, so reusing it would report every hearth this family casts as
+-- a failure while the character was still standing there casting. The window is
+-- SpellInfo::CalcCastTime plus a margin for the tick the teleport lands on, the
+-- ack, and this module's own poll interval, floored so that a cast time reading
+-- zero cannot produce a window that judges instantly.
+--
+-- WHAT A ROW SAYS WHILE IT IS IN FLIGHT. `verifying`, with a result that already
+-- names the item, the spell, the measured cast time, the window, and the home it
+-- is aiming at. An honest "started, here is what to check and when" rather than a
+-- status that has decided something nobody has observed yet.
+--
+-- WHY THE ROW IS BELIEVED ONLY AFTER THE WORLD IS READ BACK. Three readings, not
+-- one: where the character stood when the cast began, the home it was bound to at
+-- that moment, and where it is when the window is up. "It is not at home" is only
+-- half an answer - whether it is still on the start line or somewhere else
+-- entirely is the half that says what went wrong, and they are different words.
+-- HearthReadBack in overseer_decisions.h is that rule and tests/test_hearth.cpp
+-- pins it, including the case where the character began at its own home and no
+-- reading could have told an arrival from a failure. That case is refused before
+-- the packet rather than judged after it, because finding it out would spend an
+-- hour of the only cross-continent return this family has to travel zero yards.
+--
+-- THE MAP IS PART OF THE PLACE. Two continents share a coordinate space and this
+-- family is split across exactly those two, so a comparison that comes out right
+-- on the numbers and wrong on the map would report the crossing as done while the
+-- character stood on the wrong side of the ocean. Every distance here is compared
+-- within one map or not at all.
+--
+-- Column re-use, no new columns:
+--   target_name  the character to send home
+--   command      `use`, or empty, which means the same thing. There is no way to
+--                name a destination and that is deliberate.
+--   target_arg   unused
+--   detail       short refusal literal, or empty
+--   result       JSON: outcome (casting|arrived|stayed|elsewhere|refused|
+--                unreadable), reason, retry (never|elsewhere|later - see
+--                HearthRefusalRetry in overseer_decisions.h), character, verdict,
+--                item, spell, cast_ms, window_ms, waited_ms, casting_after_call,
+--                cooldown_at_verdict, and home, from and now each
+--                {map, area, x, y, z} or null, request
+--   status       'verifying' from the moment the cast goes out, then 'applied'
+--                when the character reads back at its home, 'unchanged' when it
+--                never left, 'error' otherwise. NOT 'delivered'. AGENTS.md
+--                records "sending a character home" as one of two verbs seen
+--                reporting delivery while changing nothing, and a verb with a ten
+--                second cast is the easiest place in this module to reproduce
+--                that mistake.
+--
+-- ONE CORRECTION TO THE RECORD, while this is being written down. AGENTS.md's
+-- pair of null-result verbs names "sending a character home", and the verb that
+-- actually did that was upstream's SetHomeAction, which SETS a home at an
+-- innkeeper. It is the verb #286 replaced. It was never a way to travel to one,
+-- so the return trip was not a broken feature - there was no feature. That is
+-- worth having straight, because "it is already there and it is broken" and "it
+-- does not exist" lead to different next steps, and the first reading is why
+-- nobody looked for a while.
+--
+-- THE REFUSALS, and two of them are deliberate differences from #286 rather than
+-- oversights:
+--
+--   * AN INSTANCE IS NOT REFUSED HERE, and it is refused for a bind. The
+--     difference is measured. SendBindPoint opens by returning when the map is
+--     instanceable, so a bind there is a call that changes nothing silently.
+--     Nothing on the hearthstone's path does that: SPELL_EFFECT_TELEPORT_UNITS
+--     has no case in Spell::CheckCast's effect switch and SpellInfo::CheckLocation
+--     only bars a spell carrying SPELL_ATTR6_NOT_IN_RAID_INSTANCES, which this one
+--     does not. Hearthing out of a dungeon is how a player leaves one. Copying
+--     bind's refusal across would have been this module inventing a rule the game
+--     does not have, and for a family that lives in dungeons it would have removed
+--     the most useful thing the verb can do.
+--
+--   * A TRANSPORT IS REFUSED HERE, and the core would allow it:
+--     SPELL_FAILED_NOT_ON_TRANSPORT is declared in the core and used nowhere. It
+--     is refused because the READ-BACK cannot survive it. The judgement compares
+--     where a character ends up against where it started, and a deck is a start
+--     line that moves on its own, so `stayed` and `elsewhere` stop meaning
+--     anything. A refusal that can be trusted beats a verdict that cannot, and
+--     #279 already established that nothing of ours can board a transport, so
+--     today this costs the family nothing.
+--
+--   * A MOVING CHARACTER IS REFUSED RATHER THAN STOPPED. mod-playerbots'
+--     UseHearthStone calls StopMoving and clears the motion master first, which is
+--     right for an AI deciding for itself and wrong for a queued command: it would
+--     cancel a travel errand as a side effect of a verb nobody asked to do that,
+--     and #163 is what happens when an errand is cleared by something that was not
+--     asked to clear it. The refusal is classed `later`, and clearing the aim
+--     first is the sender's job, which is where aiming already lives.
+--
+--   * A CHARACTER WITH NO BOT AI IS REFUSED, and this one is not a taste
+--     decision. A cross-map teleport sets a far-teleport semaphore and waits for
+--     MSG_MOVE_WORLDPORT_ACK, a packet a client sends. mod-playerbots answers it
+--     in PlayerbotAI::HandleTeleportAck, pumped every tick from
+--     PlayerbotHolder::UpdateSessions for any bot that reads IsBeingTeleported.
+--     With no bot AI there is nothing in the world to finish the crossing and the
+--     character would hang mid-teleport, which is worse than any refusal.
+--
+-- NO STATUS VALUES ARE ADDED. 'verifying', 'applied' and 'unchanged' are already
+-- in the status enum, added by 2026_08_24_04_overseer_outcome.sql for the
+-- strategy read-back, and they mean here exactly what they mean there. This
+-- migration therefore touches one column.
+--
+-- THE ENUM LISTS THE FULL UNION, for the reason spelled out on the bind, repair
+-- and buy migrations: parallel branches are adding values, each ALTER names every
+-- one of them, and the base CREATE TABLE is `IF NOT EXISTS` so it can never add
+-- one.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth')
+        NOT NULL DEFAULT 'bot';
