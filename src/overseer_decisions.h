@@ -4743,6 +4743,115 @@ struct ErrandDeathVerdict
 ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
                                       ErrandDeathLimits const& limits);
 
+// ---------------------------------- an errand that is eating the questing --
+//
+// THE SECOND WAY AN ERRAND GOES WRONG, AND THE ONE THE BREAKER ABOVE CANNOT
+// SEE. That breaker asks whether an errand is killing its traveller. This one
+// asks whether an errand that is going perfectly well is nonetheless the whole
+// of what a character does.
+//
+// MEASURED ON THE DEV REALM, 2026-09-08, over thirty minutes of one character's
+// world log. Nine economy errands, alternating `vendor` and `repair`, holding
+// the quest drive down for 60, 280, 60, 81, 60, 60, 60, 60 and 460 seconds:
+// 1181 seconds of 1781, or 66.3% of the wall clock. Every one of them ARRIVED
+// and released cleanly - ten arrivals for ten sendings, and the four `repair`
+// rows that ran in the same day all answered "repaired". Nothing failed.
+// Meanwhile that character's `quests_rewarded` had not moved in twelve hours
+// while his four siblings, who were issued no travel errands at all in the same
+// window, gained levels.
+//
+// WHY NOTHING ALREADY CATCHES IT. Every existing guard on this drive is keyed
+// to an errand going BADLY - deaths, an unreachable destination, refused
+// footing, a twenty-minute backstop. A short errand that arrives is invisible
+// to all of them, and the harm here is not in any single errand; it is in the
+// rate. Nine correct errands in half an hour is the bug, and no one of the nine
+// is.
+//
+// WHY IT IS NOT SELF-LIMITING. The errand column is written by a bridge outside
+// this module, which re-arms it on a fixed cadence for as long as its reason
+// holds - and arriving at the counter is not what clears that reason, so the
+// reason holds forever. Measured over eight hours the same character was
+// nominated for the economy errand 181 times out of 181 and no sibling once.
+// A character that is near a counter is therefore kept near it.
+//
+// SO THE RULE IS A BUDGET AND NOT A COOLDOWN, and that choice is forced by the
+// measurement rather than preferred. The observed loop ALTERNATES roles - five
+// `vendor` against three `repair` in the window above - so a rule of the shape
+// "not the same errand twice in a row" never fires on it even once. A budget
+// does not ask which counter it is walking to; it asks what share of a
+// character's life the counters have had, which is the thing that was measured
+// and the thing that hurts.
+//
+// AND IT REFILLS, which is what keeps it from being a tax on characters that do
+// not have this problem. A character that has been questing has a full budget
+// and its first errand goes out with no delay whatever. Only one that has
+// already spent its share is held off, so the four siblings above would never
+// notice this rule exists.
+struct ErrandBudgetLimits
+{
+    // The window the share is measured over. Half an hour, because that is the
+    // order of a quest: long enough that one legitimate town trip inside it is
+    // not remarkable, short enough that a character does not have to be wrong
+    // for an hour before anything answers.
+    int64_t windowSeconds{30 * 60};
+
+    // How much of that window economy errands may hold. Seven minutes in
+    // thirty, a little under a quarter.
+    //
+    // NOT TUNED TO THE MEASUREMENT, DELIBERATELY. The observed 66.3% could be
+    // met by any number below it, and picking one just under the observed value
+    // would encode this evening's loop rather than a rule. A quarter is the
+    // share at which errands are plainly still the minority of what a character
+    // does, which is the property actually wanted, and it is three times what
+    // the untroubled siblings spent (zero).
+    int64_t spendSeconds{7 * 60};
+};
+
+// What economy errands have cost this character lately, as a draining total.
+//
+// A BUCKET RATHER THAN A LIST OF TIMESTAMPS. The question is only ever "how
+// much, lately", so the answer is one integer and a clock, and the memory is
+// bounded at the size of the roster forever - the same reason the refusal
+// memory beside it keeps one entry per character and not a growing list.
+struct ErrandSpend
+{
+    // Errand seconds still counted against this character.
+    int64_t seconds{0};
+    // When `seconds` was last brought up to date. Zero means never, which is a
+    // character this rule has not yet had to think about rather than one with a
+    // spend of zero at the epoch.
+    time_t markedAt{0};
+};
+
+// Bring a spend up to `now` and add `heldSeconds` of fresh errand to it.
+//
+// THE DRAIN IS THE RULE, not a decoration on it. The bucket loses
+// `spendSeconds` for every `windowSeconds` of wall clock that passes, so a
+// character spending exactly its allowance holds level, one spending less
+// drains to empty and one spending more fills up and is eventually refused.
+// That is the whole of "a share of a window" expressed without keeping a
+// window's worth of history.
+//
+// CLAMPED AT BOTH ENDS, AND NOT AT THE SAME PLACE. Never below zero, because
+// credit banked by a character that has not been near a counter for a day is
+// not a licence to spend a day at one. Above the line it is allowed to reach
+// TWICE the budget and no further: the rule is asked once per poll, so an
+// errand still running when the budget is reached costs the rest of that poll,
+// and a total that cannot go past the line would discard that overshoot rather
+// than repay it - handing the same seconds back on every saturation. Measured
+// over a six-hour replay of the observed loop, clamping at the line leaked 600
+// seconds and took a 23.3% allowance out at 26.1%. Bounded at twice rather than
+// unbounded because from there exactly one window of drain brings it back to the
+// line, so a single bad stretch cannot cost an afternoon of refusing errands
+// that are now perfectly reasonable.
+ErrandSpend ErrandSpendAfter(ErrandSpend const& before, time_t now, int64_t heldSeconds,
+                             ErrandBudgetLimits const& limits);
+
+// Has this character had its share? `>=` and not `>`, for the same reason the
+// death rule uses it: the second that reaches the line is the evidence, and a
+// rule that waits to be sure spends the thing it is protecting.
+bool ErrandOverspent(ErrandSpend const& spend, ErrandBudgetLimits const& limits);
+
 // ----------------------------------------------------------------- auction --
 //
 // THE PARTS OF kind='auction' THAT NEED NO WORLD: reading the command text,
