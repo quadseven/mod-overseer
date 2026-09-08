@@ -9766,6 +9766,51 @@ private:
             if (!candidate.wearable)
                 continue;
 
+            // A HAND THAT IS ALREADY SPOKEN FOR (#145). FindEquipSlot answers
+            // "where does this go", and for a shield, an off-hand weapon or a
+            // held-in-off-hand it answers EQUIPMENT_SLOT_OFFHAND whenever that
+            // slot is EMPTY - which it always is while the character is holding
+            // a two-hander, because a two-hander occupies both hands without
+            // putting anything in the second one. So the slot looks free, an
+            // empty slot is worth exactly zero, and every off-hand item in the
+            // bags is therefore an upgrade by construction. The swap is then
+            // refused by the core every single time: Player::CanEquipItem will
+            // not put anything in the off hand while a two-handed weapon is in
+            // the main hand and the character has no titan grip.
+            //
+            // MEASURED, on the dev realm: the level 30 paladin holds a
+            // two-handed sword and carries a shield, a held-in-off-hand and a
+            // second held-in-off-hand, and the drive re-attempted all three on
+            // every poll - one every five seconds, indefinitely - each one
+            // reported as "the server refused the swap". Nothing moved and
+            // nothing ever could.
+            //
+            // AND IT IS REFUSED RATHER THAN TRADED FOR, on purpose. Putting the
+            // shield on means taking the two-hander OFF, and that is not this
+            // slot's question: it is "is a one-hander plus this shield worth
+            // more than the two-hander", which needs a main-hand candidate this
+            // loop is not holding and a comparison across two slots at once.
+            // The mirror of it is already answered - a two-hander has to beat
+            // BOTH hands (#14, the Severing Axe) - so refusing here leaves the
+            // pair of rules consistent: the two-hander may be displaced by
+            // something that beats the pair, and never by something that
+            // silently assumes it can be dropped for free.
+            if (found == EQUIPMENT_SLOT_OFFHAND)
+            {
+                Item* const mainHand =
+                    bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+                ItemTemplate const* mainProto = mainHand ? mainHand->GetTemplate() : nullptr;
+                if (mainProto && mainProto->InventoryType == INVTYPE_2HWEAPON)
+                {
+                    if (SayGearOnce(who.name, item->GetEntry()))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' is carrying {} and cannot put it in the off "
+                                 "hand while holding {} in both, so it stays in the bags - {}",
+                                 who.name, proto->Name1, mainProto->Name1, candidate.why);
+                    continue;
+                }
+            }
+
             uint8 target = found;
             OverseerDecisions::GearIncumbentScore incumbent =
                 GearWornIncumbent(bot, who, found);
