@@ -7781,6 +7781,77 @@ struct CastHoldPlan
 // reading only this struct.
 CastHoldPlan PlanCastHold(CastHoldFacts const& facts);
 
+// ------------- standing at the inn long enough to be bound there (#369) -----
+//
+// THE FIFTH REASON TO HOLD A CHARACTER STILL, AND THE SECOND THAT IS NOT A
+// CAST. It exists because "an escorted character that has arrived holds there"
+// was a sentence in a comment and not a thing the code did.
+//
+// WHAT THE SENTENCE CLAIMED. The travel drive's escort arrival branch
+// deliberately does not release an errand on arrival, and says so: releasing
+// would have an arrived place-aim call ChangeToIdle, and the next AI tick turn
+// RPG_IDLE into a randomly chosen status, two of which pick a position out of
+// the world and walk to it. Its answer was to fall through and let the walk be
+// re-issued every poll, which it called holding.
+//
+// WHAT #346 ALREADY MEASURED ABOUT THAT ANSWER, at a different destination.
+// Upstream ends the walk on arrival whether or not this module releases
+// anything, so re-issuing is a race, and it is a race this module loses often
+// enough to matter: four members at a dungeon door, sampled every fifty
+// seconds, read 42/47/44/45 yards out, then 142/142/139/139, then
+// 173/171/175/178, then 103/100/102/104, then 214/215/215/214. They never
+// settle. The remedy was a hold, on the argument that taking the mover off is
+// not a competition, and it was applied at exactly one of the module's arrival
+// points.
+//
+// AND THE SAME SIGNATURE AT THE INN, MEASURED THE SAME WAY. A campaign will not
+// open a run until every member is bound at the inn its dungeon is approached
+// from, and two members spent twelve minutes each failing to be. Sampled from
+// forced saves rather than from stale rows: one read 3 yards from the
+// innkeeper, then 26, 265, 144, 160, 296, 783. The other read 261, 164, 146,
+// 99, 406, 333, 959. One of them got to THREE YARDS and was not bound.
+//
+// WHY THAT IS ENOUGH TO FAIL EVERY TIME. The bind is attempted only on a poll
+// on which the character is already inside the arrival radius, and that poll is
+// the party poll, which is thirty seconds. Nothing holds the character inside a
+// five yard circle for thirty seconds, so the two almost never coincide, and a
+// walk that is re-issued cannot make them: an arrived character rolls a new
+// status on the next AI tick, and a committed far move is not clobbered by the
+// next re-issue while it still has ten yards to run. Twelve minutes of that is
+// the backstop, and the backstop stands the character down for fifteen more,
+// during which the campaign cannot start at all.
+enum class InnHold : std::uint8_t
+{
+    // Nothing to do: it is not standing there and this module is not holding
+    // it.
+    Nothing,
+    // Stand it still where it is, or re-asserted over a hold already there.
+    Take,
+    // Let go. Either it is not standing at the inn any more - dragged off by a
+    // fight, which `stay` does not prevent because `stay` is a non-combat
+    // strategy - or the bind has been refused here and standing still is no
+    // longer useful.
+    Release,
+};
+
+// THE REFUSAL IS AN INPUT, AND IT IS THE WHOLE SAFETY ARGUMENT FOR THIS.
+//
+// A hold is a promise that standing still is what gets this character bound. It
+// is a true promise while the creature that binds is in reach and a false one
+// the moment it is not: the arrival radius is measured against a point recorded
+// in this module, and the bind is gated on the core's own interact check
+// against the LIVE creature, which has feet. Where those two disagree - an
+// innkeeper a few yards off its spawn row, or one of the other faction, which
+// the core turns down however close a character stands - a hold would pin the
+// character at the recorded point forever, and it would be this fix that
+// stopped it ever getting lucky. So a refused bind lets go, and the drive that
+// owns the walk is free to walk it again.
+//
+// AND `alreadyHeld` IS ASKED SO THAT LETTING GO IS SAID ONCE. Releasing a hold
+// that is not there is a no-op with a log line attached, and a log line every
+// poll about a character nothing is holding is how a real one gets buried.
+InnHold InnHoldStep(bool atTheInn, bool bindRefusedHere, bool alreadyHeld);
+
 // AND THE WAITING HALF IS NOT HERE, deliberately. A hold is not instant -
 // StopMoving stops the spline and the flags Unit::isMoving reads clear on a
 // later tick, and a live conjure row that started moving spent one settle poll

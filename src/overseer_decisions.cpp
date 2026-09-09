@@ -6474,6 +6474,27 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
     return plan;
 }
 
+InnHold InnHoldStep(bool atTheInn, bool bindRefusedHere, bool alreadyHeld)
+{
+    // THE REFUSAL IS ASKED FIRST, AND IT OUTRANKS STANDING THERE. Standing at
+    // the recorded point is exactly the state in which a refusal is most
+    // tempting to ignore - the character is where it was sent, so surely it
+    // should stay - and it is exactly the state in which staying is useless,
+    // because the bind was just attempted from there and turned down.
+    if (bindRefusedHere)
+        return alreadyHeld ? InnHold::Release : InnHold::Nothing;
+
+    // TAKEN WHETHER OR NOT ONE IS ALREADY IN FORCE, on purpose. Placing a hold
+    // and re-asserting one are the same call, because the register stops this
+    // module's own sweeps and nothing else: a strategy something outside it
+    // granted has to be taken off again, and a caller that skipped the
+    // re-assertion would leave that to nobody.
+    if (atTheInn)
+        return InnHold::Take;
+
+    return alreadyHeld ? InnHold::Release : InnHold::Nothing;
+}
+
 // ------------------- and a hold that is taken once is not a hold (#358) --
 
 bool RetakeTheHold(HeldStillFacts const& facts, float slackYards)

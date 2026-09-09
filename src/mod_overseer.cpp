@@ -5926,6 +5926,56 @@ private:
             ReleaseStagingHold(name, why);
     }
 
+    // ------------------------------------------------- the inn hold (#369) --
+    //
+    // THE FIFTH REASON IN THE REGISTER, AND IT IS THE STAGING HOLD ABOVE APPLIED
+    // AT THE MODULE'S OTHER ARRIVAL POINT. The whole argument, and the two sets
+    // of measurements behind it, is on OverseerDecisions::InnHold; what is here
+    // is the three calls a world needs.
+
+    // The verb an inn hold is recorded under, spelled once for the same reason
+    // STAGE_HOLD_VERB is: it is what makes a release let go of this hold and not
+    // of a cast, a summon or a barrier's.
+    static constexpr char const* INN_HOLD_VERB = "bind";
+
+    // AND IT EXPIRES WHEN THE TRIP DOES. Deliberately the home errand's own
+    // backstop rather than a number of its own: the walk gives up at that point
+    // and stands the character down, so a hold that outlived it would be this
+    // module holding a character still for a trip it had already abandoned.
+    static constexpr uint32 INN_HOLD_CEILING_SECONDS =
+        static_cast<uint32>(HOME_BIND_BACKSTOP_SECONDS);
+
+    // Is there an inn hold on this character's name? Deliberately not
+    // deadline-checked, for the reason HasStagingHold gives: this is asked by
+    // the release paths, and a record past its ceiling is one that must still be
+    // LET GO of.
+    static bool HasInnHold(std::string const& name)
+    {
+        auto const hold = HoldsInForce().find(name);
+        return hold != HoldsInForce().end() && hold->second.verb == INN_HOLD_VERB;
+    }
+
+    static void HoldAtItsInn(Player* member, std::string const& name)
+    {
+        PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        if (!botAI)
+            return;
+        // `false` IS "THIS HOLD IS NOT FOR A CAST", the same answer the staging
+        // hold gives and for the same two reasons. The bind is a packet this
+        // module sends to the core's own handler, not a spell this character
+        // casts, so nothing here needs it standing or off its mount - and a
+        // party waiting at an inn is exactly where sitting down to eat is worth
+        // more than standing to attention.
+        HoldCharacterStill(member, botAI, name, INN_HOLD_VERB,
+                           INN_HOLD_CEILING_SECONDS, false);
+    }
+
+    static void ReleaseInnHold(std::string const& name, char const* why)
+    {
+        ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
+                    INN_HOLD_VERB);
+    }
+
     // Give the followers somebody to follow (infra#2818).
     //
     // WHY `follow` HAS NEVER MOVED ANYBODY. It is on all five and it is not
@@ -13248,6 +13298,21 @@ private:
     void EndOneEscort(std::string const& name, bool granted)
     {
         _travelAims.Release(name);
+        // THE INN HOLD DIES WITH THE WALK THAT TOOK IT (#369), and it is
+        // released HERE rather than in the home drive because this is the one
+        // statement every end of every escort passes through: the bind
+        // succeeding, the twelve minute backstop giving up, the sweep finding
+        // an entry nobody re-marked, and the death breaker ending a walk that
+        // was killing the character. A hand-back that only happens on the path
+        // that took it is a hand-back an unforeseen `return` can skip, which is
+        // the argument KeepRosterFollowing's own strategy backstop already
+        // makes.
+        //
+        // NAMED BY VERB, so this is a no-op for every escort that is not a trip
+        // to an inn and can never lift a cast, a summon or a barrier's hold on
+        // a character that happens to be standing in one.
+        ReleaseInnHold(name, "its escort is over");
+        _innBindRefused.erase(name);
         if (!granted)
             return;
 
@@ -14424,6 +14489,63 @@ private:
                                  "overseer: '{}' has reached its escort point '{}' and holds "
                                  "there - the {} releases it, not the arrival",
                                  name, target, EscortOwnerName(name));
+                    }
+
+                    // AND FOR A HOME ERRAND, "HOLDS THERE" IS NOW SOMETHING
+                    // THIS MODULE DOES RATHER THAN SOMETHING IT SAYS (#369).
+                    // The paragraph above is right that releasing would be
+                    // worse and wrong that falling through holds anything:
+                    // upstream ends the walk on arrival whether or not this
+                    // module releases the errand, so re-issuing it is a race,
+                    // and #346 measured this module losing that race at the
+                    // other arrival point badly enough to need a hold there.
+                    // The same signature was then measured at the inn - one
+                    // character 3 yards from the innkeeper on one sample and
+                    // 265 on the next - and it costs more here, because the
+                    // bind is only ever attempted on a poll that already finds
+                    // the character inside the arrival radius and that poll is
+                    // PARTY_POLL_MS apart. Nothing kept it inside a five yard
+                    // circle for thirty seconds, so the two almost never
+                    // coincided and a campaign that will not open a run until
+                    // every member is bound could not open one at all.
+                    //
+                    // ONLY THE HOME ERRAND, and the narrowness is deliberate
+                    // rather than caution. A run's own escort already has this
+                    // in BARRIER, under its own verb, and one register holds one
+                    // hold per character: a second verb taken over the same name
+                    // would leave each release looking for a hold the other one
+                    // placed. A catch-up walk wants the opposite thing anyway -
+                    // it is escorting a follower back to a leader that is
+                    // moving, so standing still is the failure and not the
+                    // remedy.
+                    //
+                    // TAKEN HERE RATHER THAN IN THE DRIVE THAT OWNS THE TRIP,
+                    // because this is the only loop that sees an arrival within
+                    // DUNGEON_RUN_POLL_MS of it happening. DriveHomeBind runs on
+                    // the party's own thirty seconds, which is the window this
+                    // is closing and so cannot be the thing that closes it.
+                    if (IsWalkingHome(name))
+                    {
+                        OverseerDecisions::InnHold const hold =
+                            OverseerDecisions::InnHoldStep(true,
+                                                           BindRefusedAtItsInn(name),
+                                                           HasInnHold(name));
+                        if (hold == OverseerDecisions::InnHold::Take)
+                        {
+                            HoldAtItsInn(bot, name);
+                            // AND THE REST OF THIS POLL IS NOT SPENT ON IT, the
+                            // same `continue` the held-on-purpose branch six
+                            // hundred lines above takes and for its reason: a
+                            // character this module has just stopped must not
+                            // then be handed a walk by the statements below.
+                            // Every later poll leaves at that branch instead,
+                            // because the hold is in force by then.
+                            continue;
+                        }
+                        if (hold == OverseerDecisions::InnHold::Release)
+                            ReleaseInnHold(name,
+                                           "the bind was refused where it stands, so "
+                                           "standing there is not what gets it bound");
                     }
                 }
                 else if (plan && !TrainOnArrival(name, bot, entry, *plan))
@@ -17765,6 +17887,25 @@ private:
         return true;
     }
 
+    // WHOSE LAST BIND ATTEMPT AT THE INN WAS TURNED DOWN (#369). Written by the
+    // one place that attempts a bind and cleared by the one place that ends a
+    // trip to an inn, so it says what it is named: standing still at the
+    // recorded point did not get this character bound last time it was tried.
+    //
+    // IT IS A SEPARATE REGISTER FROM `_homeBindSaid` AND NOT A READ OF IT.
+    // That one is a say-once dedupe holding whatever was last said about a
+    // character, which includes "another walk owns it" and "its home is on
+    // another map" - neither of which is a refused bind, and both of which
+    // would switch this off for a character that had never attempted one. A
+    // fact this module acts on is worth its own field; see #329 and #337 for
+    // what reusing a field that nearly means the right thing has already cost.
+    std::set<std::string> _innBindRefused;
+
+    bool BindRefusedAtItsInn(std::string const& name) const
+    {
+        return _innBindRefused.count(name) != 0;
+    }
+
     // WHO IS NOT BOUND WHERE THIS CAMPAIGN RUNS, AND COULD STILL BE WALKED
     // THERE ON THIS POLL. THE ONE READING, taken the same way by both of its
     // callers: this drive, which does the walking, and the run coordinator,
@@ -18026,6 +18167,15 @@ private:
             // half of the defect.
             if (bot->GetDistance2d(anchor.x, anchor.y) > TRAVEL_ARRIVED_POSITION_YARDS)
             {
+                // AND A CHARACTER THAT IS NOT THERE IS NOT BEING HELD THERE
+                // (#369). `stay` is a non-combat strategy, so a held character
+                // still fights and still flees, and it comes out of a fight
+                // wherever the fight took it. This is the release that lets the
+                // walk start again; the travel drive takes the hold back when
+                // it arrives. Thirty seconds late is acceptable for a recovery
+                // and this is the drive that owns the trip.
+                if (HasInnHold(name))
+                    ReleaseInnHold(name, "it is not standing at its inn any more");
                 EscortHomeToward(name, aim);
                 continue;
             }
@@ -18043,12 +18193,34 @@ private:
                              "down however close it stands. It holds here and is asked "
                              "again next poll",
                              name, refusal, ev.nearestYards, ev.innkeepersInReach);
-                // STILL MARKED, so the member holds where it is instead of
-                // wandering off between polls, and the backstop above is what
-                // ends this if the refusal never clears.
+                // AND THE REFUSAL IS REMEMBERED, WHICH IS WHAT STOPS THE HOLD
+                // BEING TAKEN OVER IT (#369). The arrival radius is measured
+                // against a point recorded in this module and the bind is gated
+                // on the core's own interact check against the live creature,
+                // which has feet. Where the two disagree - an innkeeper a few
+                // yards off its spawn row, or one of the other faction, which
+                // the core turns down however close a character stands -
+                // standing still is the one thing that cannot work, so this
+                // module does not make the character do it. The line above
+                // already prints the pair that tells those apart: how far the
+                // nearest innkeeper-flagged creature was, and how many passed
+                // the gate.
+                _innBindRefused.insert(name);
+                if (HasInnHold(name))
+                    ReleaseInnHold(name,
+                                   "the bind was refused where it stands, so standing "
+                                   "there is not what gets it bound");
+                // STILL MARKED, so the walk still owns this character and its
+                // travel focus survives, and the backstop above is what ends
+                // this if the refusal never clears.
                 EscortHomeToward(name, aim);
                 continue;
             }
+
+            // A BIND THAT WAS NOT REFUSED CLEARS THE REFUSAL (#369). Whatever
+            // the read-back says next, the reason a hold was being withheld has
+            // gone: the core's own gate accepted an innkeeper this time.
+            _innBindRefused.erase(name);
 
             switch (ev.outcome)
             {
