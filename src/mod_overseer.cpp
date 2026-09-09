@@ -6339,6 +6339,22 @@ private:
         // GetNPCIfCanInteractWith and on the item, and on nothing else. Standing
         // a character up to sell to a vendor would be this hold insisting on
         // something the player it imitates never has to do.
+        // AND THIS IS THE ONE HOLD IN THE REGISTER THAT IS TAKEN ONCE RATHER
+        // THAN RE-ASSERTED EVERY POLL, which is worth saying out loud because
+        // every other one says the opposite. A staging hold and an inn hold are
+        // re-asserted because a drive is still looking at the character and the
+        // register stops this module's own sweeps and nothing else. There is no
+        // such poll here: the errand is released on the same statement, so
+        // nothing looks at this character again until it is given a new aim.
+        //
+        // WHAT CARRIES IT INSTEAD IS THE TWO HALVES THE REGISTER ALREADY HAS.
+        // KeepHeldCharactersStill runs on every world tick and re-takes the
+        // active motion slot wherever the character has drifted off its anchor,
+        // which is the half that answers a walk something outside this module
+        // started; and all six hand-back sites ask HeldStill before they grant a
+        // mover, which is the half that stops one being started. A hold taken
+        // once is therefore held until its ceiling, and #358's sweep is the
+        // reason that sentence is true now and was not before.
         HoldCharacterStill(member, botAI, name, COUNTER_HOLD_VERB,
                            COUNTER_HOLD_CEILING_SECONDS, false);
     }
