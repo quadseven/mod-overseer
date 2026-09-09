@@ -23213,6 +23213,30 @@ private:
                                  "a place, so the walk picks a counter this character may "
                                  "actually trade with and is not standing in hostile ground",
                                  name, damaged, broken);
+                    // THE AIM IS THE ROLE KEYWORD `repair`, AND IT MUST NEVER
+                    // BECOME A CREATURE NAME (#398). ResolveTravelTarget takes
+                    // an `at:` place, a `trigger:` id, a numeric creature entry,
+                    // or one of the role keywords in TravelRoles. It does NOT
+                    // take a name: such an aim is accepted, matches no spawn, and
+                    // is released with "there is no such spawn on map N".
+                    //
+                    // THAT IS THE WHOLE OF WHY 47 OF THE 67 REPAIR ROWS EVER
+                    // WRITTEN SAY "repairer not in range". Measured on the dev
+                    // realm: four repairs were asked for with a repair-flagged
+                    // vendor 47 yards away and all four refused in the same
+                    // second, because the aim that should have walked them there
+                    // was a NAME and had already been released. DoRepair is not a
+                    // walker and never was - it sweeps 30 yards around wherever
+                    // the character is standing and correctly finds nothing. The
+                    // missing half was always the walk.
+                    //
+                    // The role keyword is what makes this leg independent of that
+                    // fix. It resolves out of the spawn tables to a real spawn's
+                    // own coordinates - navmesh valid because a creature stands on
+                    // them - having already excluded every spawn this character
+                    // may not interact with (#234), every one standing in hostile
+                    // ground (#267), and every one whose route samples lethal.
+                    //
                     // EscortPurpose::Assemble and not LeaveInstance: nobody is
                     // inside anything. The purpose is read by DriveDungeonClear to
                     // decide whether to stand the dungeon brain down, and standing
@@ -23252,7 +23276,12 @@ private:
                           "The next run opens anyway, because a campaign that waits forever "
                           "costs the campaign while a run on worn gear costs one run - but a "
                           "member listed as broken here is fighting with slots that give no "
-                          "armour at all. The walk to the counter is the thing to look at",
+                          "armour at all. The walk to the counter is the thing to look "
+                          "at, and the one failure this leg cannot see for itself is "
+                          "the travel drive refusing the aim: a line reading 'there is "
+                          "no such spawn on map N' means no repairer on this map passed "
+                          "the faction, guard and route gates, and no amount of waiting "
+                          "was ever going to help",
                           leaderName, uint32(heldFor / 60),
                           uint32(DUNGEON_REPAIR_BACKSTOP_SECONDS / 60), outstanding, owed);
                 break;
