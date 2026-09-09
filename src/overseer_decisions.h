@@ -7273,18 +7273,58 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts);
 // have. And the hold makes it MORE likely rather than less, because a character
 // that has stopped moving and is out of combat is a character its own `food`
 // strategy will sit down and eat.
+// AND FIVE WALLS WERE NOT ENOUGH, WHICH IS WHAT THE NEXT NIGHT MEASURED. Six
+// more hearths on the same party leader, on the build carrying this gate, and
+// four of them came back `the cast did not start and nothing in front of it was
+// true`. The hold reported the character already standing, the hearthstone
+// cooldown read clear at the verdict, and every one of the five below was clear.
+// So the wall was real, it was outside the list, and the row had been given a
+// better sentence for the same dead end.
+//
+// TWO MORE WALLS WERE MISSING AND BOTH ARE IN Spell::CheckCast AT THE PINNED
+// SHA, read there rather than remembered:
+//
+//   * THE MOUNT (Spell.cpp:6018). The core refuses any non-passive spell cast
+//     by a MOUNTED player that does not carry SPELL_ATTR0_ALLOW_WHILE_MOUNTED,
+//     and it answers SPELL_FAILED_NOT_ON_TAXI when the caster is in flight and
+//     SPELL_FAILED_NOT_MOUNTED when it is on a ground mount. `grounded` below
+//     was therefore reading ONE BRANCH of a check whose other branch nothing
+//     here had ever asked, and a ground mount is by far the commoner of the
+//     two. A real player never reaches this line, because the client sends
+//     CMSG_CANCEL_MOUNT_AURA before it sends the use: the same shape as the
+//     areatrigger and the stand state, a part of the player a bot does not
+//     have.
+//
+//     AND IT IS THE ONE THING THAT SORTS A LEADER FROM A FOLLOWER, which is the
+//     discriminator those six rows carry and the reason this wall is named
+//     first among the new ones. The same verb succeeded first try on a follower
+//     the same evening. mod-playerbots' CheckMountStateAction mounts a bot
+//     whose travel target is further away than its mount distance, and makes a
+//     bot with a master mirror that master's mount state, so the character the
+//     travel drive is walking across a continent is the mounted one and the
+//     character standing beside an inn is not.
+//
+//   * THE GLOBAL COOLDOWN (Spell.cpp:5711). It returns SPELL_FAILED_NOT_READY,
+//     Player::HasSpellCooldown cannot see it, and it is transient, which is
+//     exactly the shape of a wall that hits four rows out of six and never the
+//     same way twice. ConjureCastGate has asked it since #330 under the name
+//     `globalReady`; `hearth` and `summon` never did, and the two gates being
+//     different lists was itself the bug.
 struct CastWallGate
 {
-    bool grounded{true};  // not flying and not on a taxi
-    bool standing{true};  // Unit::IsStandState - a bot has no client to stand it
-    bool still{true};     // not moving, which cancels any cast with the flag
-    bool ready{true};     // the spell's own cooldown has finished
-    bool free{true};      // not already casting something else
+    bool grounded{true};    // not flying and not on a taxi
+    bool unmounted{true};   // ...and not on a ground mount either, which is the
+                            // same core check answering its other branch
+    bool standing{true};    // Unit::IsStandState - a bot has no client to stand it
+    bool still{true};       // not moving, which cancels any cast with the flag
+    bool ready{true};       // the spell's own cooldown has finished
+    bool globalReady{true};  // ...and so has the global one, which the line above cannot see
+    bool free{true};        // not already casting something else
 };
 
 // Which wall, or "" when the gate is clear. A cast refused with none of them
 // true gets NoneNamed rather than a shrug: an honest unknown that has ruled the
-// other five out is a far better place to start than a bare false.
+// other walls out is a far better place to start than a bare false.
 char const* CastWallBlocker(CastWallGate const& gate);
 
 // THE LITERALS GO STRAIGHT INTO AN UPDATE, so none may carry a quote character.
@@ -7296,11 +7336,29 @@ char const* CastWallBlocker(CastWallGate const& gate);
 namespace CastWall
 {
 constexpr char const* InFlight = "the character was in flight when the cast was driven";
+constexpr char const* Mounted = "the character was on a mount when the cast was driven";
 constexpr char const* NotStanding = "the character was sitting when the cast was driven";
 constexpr char const* Moving = "the character was moving when the cast was driven";
 constexpr char const* OnCooldown = "the spell was on cooldown when the cast was driven";
+constexpr char const* OnGlobalCooldown =
+    "the global cooldown was still running when the cast was driven";
 constexpr char const* AlreadyCasting = "the character was already casting when the cast was driven";
-constexpr char const* NoneNamed = "the cast did not start and nothing in front of it was true";
+// NOT A WALL, AND IT IS HERE BECAUSE IT IS WHAT THE ROW USED TO GUESS AT. The
+// comment beside `casting_after_call` says an absent cast may mean the core
+// parked the packet on its spell queue to replay when the global cooldown
+// clears, and that this is "indistinguishable from here". It is not: the queue
+// is Player::SpellQueue, a public deque of PendingSpellCastRequest carrying the
+// spell id, so the executor can look and say so instead of shrugging. A row
+// carrying this sentence has not failed; it has not finished, and the verdict
+// still comes from where the character is when the window is up.
+constexpr char const* Queued =
+    "the cast was parked on the core spell queue and had not started yet";
+// AND THE HONEST UNKNOWN, WHICH IS NOW A SMALLER ONE. It used to read `nothing
+// in front of it was true`, which sent whoever read it next looking for a wall
+// this module had never been able to see. It says what it can honestly say: the
+// walls this row is able to read were all clear, so the next place to look is a
+// wall it cannot read rather than one of these.
+constexpr char const* NoneNamed = "the cast did not start and every wall this row can read was clear";
 }  // namespace CastWall
 
 // THE `stayed` VERDICT HAS TWO CAUSES AND THE ROW ASSERTED ONLY ONE OF THEM.
@@ -7309,12 +7367,24 @@ constexpr char const* NoneNamed = "the cast did not start and nothing in front o
 // out at all. A sentence a row cannot have checked is worse than no sentence:
 // it sent the operator looking for a failed teleport when the failure was that
 // nothing was ever cast.
+// AND THEN IT HAD THREE, WHICH IS THE SAME MISTAKE ONE STEP ALONG. `the cast
+// never started` is a reading taken in the instant after the packet, and for a
+// packet the core copied onto its spell queue that instant is not the story: the
+// queue replays it a fraction of a second later, so the row would be asserting
+// that nothing was cast when something very probably was. So a parked cast gets
+// its own sentence rather than being folded into either of the other two.
 constexpr char const* HEARTH_STAYED_CAST_SEEN =
     "the cast went out and the character never left";
 constexpr char const* HEARTH_STAYED_NO_CAST =
     "the cast never started and the character never left";
+constexpr char const* HEARTH_STAYED_QUEUED =
+    "the cast was parked on the core spell queue and the character never left";
 
-char const* HearthStayedDetail(bool castWasSeen);
+// The three are mutually exclusive and asked in the order a row can be sure of
+// them: a cast that was SEEN is the one thing here nothing has to infer, a
+// parked one is read off the core's own queue, and only what is neither gets the
+// sentence that says nothing started.
+char const* HearthStayedDetail(bool castWasSeen, bool castWasQueued);
 
 
 }  // namespace OverseerDecisions

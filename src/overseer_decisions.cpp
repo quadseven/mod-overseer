@@ -6150,26 +6150,38 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
 
 char const* CastWallBlocker(CastWallGate const& gate)
 {
-    // IN THE ORDER THE CORE REACHES THEM, so a row never names a wall the cast
-    // had not got to yet. Flight first because it is checked before the spell is
-    // looked at, then the stand state, then movement, then the two that are
-    // about the spell rather than the caster.
+    // ONE WALL AND NOT A LIST, so a row carries the thing to act on rather than
+    // an inventory. The order pairs each wall with the one the core asks in the
+    // same breath: flight and the mount are the two answers of a single check
+    // (Spell.cpp:6018), and the spell's own cooldown and the global one are the
+    // two SPELL_FAILED_NOT_READY (Spell.cpp:5689 and 5711). Flight leads because
+    // it is the only one of the seven that also makes the teleport itself
+    // impossible, so naming anything else about a character on a taxi would send
+    // a reader after the wrong half of the problem.
     if (!gate.grounded)
         return CastWall::InFlight;
+    if (!gate.unmounted)
+        return CastWall::Mounted;
     if (!gate.standing)
         return CastWall::NotStanding;
     if (!gate.still)
         return CastWall::Moving;
     if (!gate.ready)
         return CastWall::OnCooldown;
+    if (!gate.globalReady)
+        return CastWall::OnGlobalCooldown;
     if (!gate.free)
         return CastWall::AlreadyCasting;
     return "";
 }
 
-char const* HearthStayedDetail(bool castWasSeen)
+char const* HearthStayedDetail(bool castWasSeen, bool castWasQueued)
 {
-    return castWasSeen ? HEARTH_STAYED_CAST_SEEN : HEARTH_STAYED_NO_CAST;
+    if (castWasSeen)
+        return HEARTH_STAYED_CAST_SEEN;
+    if (castWasQueued)
+        return HEARTH_STAYED_QUEUED;
+    return HEARTH_STAYED_NO_CAST;
 }
 
 }  // namespace OverseerDecisions
