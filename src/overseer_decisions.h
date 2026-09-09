@@ -1803,6 +1803,91 @@ struct DungeonWrongSide
 
 DungeonWrongSide DungeonRunWrongSide(std::vector<DungeonRunEntryState> const& members);
 
+// ------------ how long a walk back in outlives the run that asked for it (#393) --
+//
+// THE LEASE THAT DIED WITH ITS RUN. A member stranded outside a dungeon is
+// walked back to the entrance by the run coordinator, and that walk is only
+// legal because an ESCORT is the first branch of the adapter's MaySteerItself.
+// A point aim is refused to a cut-off follower on purpose - SplitErrand above
+// argues that refusal and nothing here weakens it - so without an escort the
+// roster sweep takes `new rpg` straight back off and the member stops walking.
+//
+// The escort was marked from inside ONE branch of ONE phase of the run and
+// swept on the run's own clock, so it could not outlive the run. Measured on
+// the realm, two lines eight seconds apart: the member was aimed at the
+// entrance 3712 yards away and issued a route of 5420 yards of walking legs,
+// and the very next roster poll found it carrying `new rpg` with no escort and
+// took it back. It covered no ground at all - 3712 yards out, and 3718 yards
+// out half an hour and three deaths later.
+//
+// WHICH IS A LIFETIME PROBLEM AND NOT A RULE PROBLEM. The sweep is right that a
+// follower travelling on its own is the scatter. What was wrong is that a
+// member DELIBERATELY SENT somewhere stopped counting as sent the moment the
+// run that sent it ended - and that run ends BECAUSE this member is missing, so
+// every attempt re-aimed it from the same place and every close took the aim
+// away again. Progress between runs was structurally impossible. The walk
+// therefore gets a lease of its own, and this is the rule that bounds it.
+//
+// THE SAME LESSON #298 AND #348 ALREADY PAID FOR, said a third time because
+// this is a third claimant on the same lease. A walk that claims the travel
+// column with no clock behind it makes every deference to "the claimant answers
+// for it" a deference to nobody - ErrandDeathBreaker's first rule leaves a
+// run-owned aim alone precisely because a timer ends the run. So this walk
+// arrives owing a clock, and the adapter borrows the one that already bounds
+// the errand the lease is holding open.
+//
+// FOUR ANSWERS, AND THEY ARE ORDERED. Not being in the world at all outranks
+// everything: there is nobody to hold a lease for. Being back on the family's
+// map outranks the clock, because a walk that has done its job is finished
+// however long it took. The clock is asked last, and it is the only answer that
+// is a give-up rather than an end.
+enum class RejoinWalk : std::uint8_t
+{
+    // Still on the wrong side and still inside its clock: hold the lease and
+    // renew the claim, so the strategy that walks it is not taken back out from
+    // underneath it.
+    Keep,
+    // On the same map as the rest of the family. The split this walk exists to
+    // end is over, however it ended - through the door under its own power, or
+    // because the party came back out to where it stands.
+    BackWithTheFamily,
+    // Not in the world this poll: logged out, mid-teardown, or the worldserver
+    // bounced. Fails closed the same way every other "not seen" in this file
+    // does - there is nothing to hold a lease for and nothing to hand back to.
+    Gone,
+    // The clock ran out. The walk is given up on rather than held forever,
+    // which is the whole of what makes a lease with no run behind it safe to
+    // hand out at all.
+    GaveUp,
+};
+
+char const* RejoinWalkName(RejoinWalk verdict);
+
+// Everything the answer turns on. The defaults are the safe reading of "nothing
+// is known", which for this decision is Gone: a lease whose holder nobody can
+// see is a lease to end.
+struct RejoinWalkFacts
+{
+    bool seen = false;
+    // This member and the group's leader are on the same map this poll. False
+    // when the leader cannot be found either, which keeps the walk running on
+    // its clock rather than ending it on a reading nobody actually took.
+    bool withTheFamily = false;
+    // How long this walk has been running, and how long it may. A backstop of
+    // zero or less is not a clock and never gives up, stated rather than
+    // implied: a zero read as a deadline would end every walk on its first
+    // poll, which is the failure mode a defaulted duration always has.
+    std::int64_t walkingForSeconds = 0;
+    std::int64_t backstopSeconds = 0;
+};
+
+RejoinWalk ReadRejoinWalk(RejoinWalkFacts const& facts);
+
+// Does this verdict end the walk? The form the sweep asks, so "keep going" and
+// "hand the wheel back" cannot drift apart from the enumerator list above when
+// a fifth answer is added.
+bool RejoinWalkEnds(RejoinWalk verdict);
+
 // CAN AN AIM AT A DOORWAY EVER OPEN IT?
 //
 // An arrival tolerance is the distance at which a walk STOPS: the errand reads
