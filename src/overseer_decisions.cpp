@@ -6426,6 +6426,31 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
     return plan;
 }
 
+// ------------------- and a hold that is taken once is not a hold (#358) --
+
+bool RetakeTheHold(HeldStillFacts const& facts, float slackYards)
+{
+    // THE FOUR REFUSALS FIRST, AND EACH OF THEM IS AN ANSWER RATHER THAN A
+    // GUARD. Every one is a case where the right thing to do is nothing
+    // whatever the distance says, so reading the distance first and treating
+    // these as tie-breaks would be the same code with three of its reasons
+    // demoted to footnotes.
+    if (!facts.present)
+        return false;
+    if (facts.pastDeadline)
+        return false;
+    if (facts.walkingOnPurpose)
+        return false;
+    if (facts.inCombat)
+        return false;
+
+    // AND THEN THE ONLY MEASUREMENT. Strictly greater, so a slack of zero
+    // means "any drift at all" - which is what a reader expects that word to
+    // mean, and is a legitimate thing for a caller to ask for even though the
+    // one caller that exists asks for more.
+    return facts.driftYards > slackYards;
+}
+
 // ------------------ what stopped a cast this module drove at the core (#337) --
 
 char const* CastWallBlocker(CastWallGate const& gate)
