@@ -213,9 +213,34 @@ jobs:
         # and `libncurses5-dev` is spelled `libncurses-dev`, which is what that
         # transitional package resolves to on 24.04. The runner image already
         # ships several of the rest; apt does not mind being told twice.
+        #
+        # AND THE INDEX REFRESH IS NOT ALLOWED TO FAIL THIS JOB OVER A
+        # REPOSITORY NOTHING HERE INSTALLS FROM.
+        #
+        # The runner image ships third-party apt sources this gate has no use
+        # for, and `apt-get update` exits non-zero if ANY of them is broken,
+        # even when every archive the list below is actually served from
+        # refreshed perfectly. On 2026-09-09 one of those third-party
+        # repositories published a Release file whose recorded hash for its own
+        # package index did not match the index it was serving, and it served
+        # that mismatched pair consistently rather than intermittently, so a
+        # rerun could not get past it. Four consecutive runs of this gate died
+        # in ten seconds over a repository that has nothing to do with compiling
+        # a worldserver, and nothing about the branch under test was ever read.
+        #
+        # LETTING THE REFRESH REPORT AND CARRY ON IS NOT A WEAKENING, AND THE
+        # LINE UNDER IT IS THE REASON. The refresh is a convenience; what this
+        # job needs is the packages, and `apt-get install` still fails hard if
+        # it cannot fetch them, which is the property the gate actually rests
+        # on. An index that is stale but can still satisfy the list installs
+        # exactly as before. One that cannot fails on the next line, with an
+        # error naming the package this job wanted rather than somebody else's
+        # Release file. So this turns an unrelated third party's publishing
+        # mistake from "the gate is red and says nothing" into "the gate ran".
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
+          # Reported rather than fatal - see the note above this step.
+          sudo apt-get update -qq || echo "::warning::apt-get update reported an error, which is usually a third-party repository on the runner image rather than one this job installs from. The install below is what decides, and it fails hard if a package cannot be fetched."
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential libtool cmake-data ninja-build cmake clang \
             git curl unzip openssl \
