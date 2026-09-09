@@ -2014,6 +2014,42 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   unsigned skips,
                                                   unsigned maximumSkips);
 
+// ------------------------------ how long busy may mean anything (#382) --
+//
+// `partyBusy` above is the input that outranks everything, and until #382
+// nothing decided how long a caller was allowed to keep saying it. The
+// adapter's watchdog answered "is anybody busy right now", stamped its
+// patience clock and returned, on every poll, forever - so a single member
+// whose combat flag never cleared held the clock down and the skips and the
+// extraction below them were unreachable by construction. Measured: a run sat
+// `active` for 152 minutes with one member flagged in combat, four idle at full
+// health, and the party's positions identical to the yard over 95 of those
+// minutes.
+//
+// SO THE HOLD GETS A CEILING, AND THE CEILING IS MEASURED FROM THE RUN'S LAST
+// REAL PROGRESS RATHER THAN FROM THE START OF THE BUSY STRETCH. That choice is
+// the whole robustness of this rule and it was made the second way first. A
+// clock that restarts whenever nobody happens to look busy is a clock a
+// flickering combat flag resets, and a fix that a flicker can turn back off is
+// not a fix - it is the same 152 minutes with more code in front of it. Real
+// progress is a boss credited or thirty yards covered, both of which a stuck
+// party cannot produce and a working one produces constantly, so `advancedAt`
+// only ever moves when something actually happened.
+//
+// The reading, then: a party that looks busy is believed, but only while the
+// run it is busy inside has got somewhere recently. Busy and going nowhere for
+// longer than the ceiling is not a slow party, it is a stuck flag.
+//
+// `advancedAt` is when the caller last saw that progress; the caller owns
+// stamping it, because it is the only thing that can measure a boss or a yard.
+// Zero means nothing has been recorded yet, which holds - the caller is on its
+// first poll and about to stamp it. A `ceilingSeconds` of zero means no grace
+// is wanted at all and the hold is never believed, the same way a
+// `maximumSkips` of zero above means extract immediately: a bound of nothing is
+// a bound, not a request for no bound.
+bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
+                                time_t ceilingSeconds);
+
 // ------------------------------------------- what counts as a run (#225) --
 //
 // DID THE PARTY ACTUALLY GET INTO THE DUNGEON? Measured 2026-09-05: a campaign

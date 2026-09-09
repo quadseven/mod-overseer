@@ -1249,6 +1249,38 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                 : DungeonClearStallAction::Extract;
 }
 
+bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
+                                time_t ceilingSeconds)
+{
+    // NOBODY BUSY IS NOT A SHORT HOLD, IT IS NO HOLD. Said first because it is
+    // the only answer that does not depend on a clock: with nothing to hold the
+    // patience down, the caller's ordinary ratchet is already the right judge
+    // and this rule has nothing to add.
+    if (!anyBusy)
+        return false;
+
+    // A ceiling of nothing is believed for nothing. See the header for why this
+    // is the same reading `maximumSkips == 0` already has.
+    if (ceilingSeconds == 0)
+        return false;
+
+    // NOTHING RECORDED YET MEANS THE CALLER IS ON ITS FIRST POLL. The safe
+    // reading of "unknown" is the young one, because the expensive mistake here
+    // is ending a run that is fighting a boss, and the caller stamps this in the
+    // same pass it first marks the run.
+    if (advancedAt == 0)
+        return true;
+
+    // STRICTLY GREATER, matching Ratchet's own patience test, so a ceiling of N
+    // seconds is still believed at exactly N and the two clocks in this file
+    // cannot disagree by one poll about what "past the bound" means.
+    //
+    // A `now` behind `advancedAt` - a clock stepped backwards under a running
+    // worldserver - makes this subtraction negative and the hold simply stays
+    // believed, which is the direction that costs a wait rather than a run.
+    return now - advancedAt <= ceilingSeconds;
+}
+
 bool DungeonRunEnteredTheInstance(std::string const& outcome)
 {
     // THE CLOSED PAIR, NAMED RATHER THAN DERIVED. These are the only two

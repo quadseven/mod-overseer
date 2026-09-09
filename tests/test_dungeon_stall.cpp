@@ -57,6 +57,24 @@ void ExhaustedRunIsExtracted()
           DungeonClearStallAction::Extract);
 }
 
+void ABusyHoldThatExpiredNoLongerProtectsTheRun()
+{
+    // #382: the adapter used to pass a literal `false` here, because its own
+    // busy loop returned before this policy was ever consulted - so the branch
+    // above was unreachable from the world and the hold it modelled had no
+    // ceiling. `partyBusy` is now the BOUNDED hold rather than the raw reading,
+    // which is what makes these two cases different at all: a party that still
+    // looks busy but has looked busy too long is judged on what can be seen.
+    Check("hold still believed", DungeonClearStallDecision(false, true, false, true, 0, 3),
+          DungeonClearStallAction::Nothing);
+    Check("hold expired, first skip",
+          DungeonClearStallDecision(false, false, false, true, 0, 3),
+          DungeonClearStallAction::Skip);
+    Check("hold expired, skips spent",
+          DungeonClearStallDecision(false, false, false, true, 3, 3),
+          DungeonClearStallAction::Extract);
+}
+
 } // namespace
 
 int main()
@@ -64,5 +82,6 @@ int main()
     HealthyProgressIsNeverInterrupted();
     StalledRunGetsBoundedSkips();
     ExhaustedRunIsExtracted();
+    ABusyHoldThatExpiredNoLongerProtectsTheRun();
     return failures ? 1 : 0;
 }
