@@ -1145,6 +1145,44 @@ bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards)
     return arrivalYards < triggerRadiusYards;
 }
 
+DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
+                                float arrivalYards, float triggerRadiusYards)
+{
+    DoorAimHeight out;
+    // THE TRIGGER'S OWN Z IS THE ANSWER UNTIL SOMETHING BETTER IS PROVED, so
+    // every refusal below is a plain return and none of them has to remember to
+    // restore anything.
+    out.z = triggerZ;
+
+    // Nothing was found under the door. A probe that answers "no surface" is
+    // the edge of the world, a hole, or an unloaded grid, and none of those is
+    // a floor to move an aim onto.
+    if (!haveGround)
+        return out;
+
+    // The same two refusals ArrivalReachesTrigger makes, for its own reasons,
+    // and asked FIRST so a door this question has no answer for keeps its z
+    // rather than being measured against a radius that is not one.
+    if (arrivalYards <= 0.f || triggerRadiusYards <= 0.f)
+        return out;
+
+    float const correction = Magnitude(groundZ - triggerZ);
+
+    // COMPARED AS SQUARES, so this needs no square root and no header to get
+    // one. All three quantities are yards and none of them is negative here -
+    // Magnitude has just made sure of the only one that could have been - so
+    // squaring both sides is the same comparison and not an approximation of
+    // it. The strictness is ArrivalReachesTrigger's own: strictly inside.
+    if (arrivalYards * arrivalYards + correction * correction >=
+        triggerRadiusYards * triggerRadiusYards)
+        return out;
+
+    out.z = groundZ;
+    out.grounded = true;
+    out.correctionYards = correction;
+    return out;
+}
+
 bool RatchetProgressed(float reading, float best, RatchetLimits const& limits,
                        bool seen)
 {
