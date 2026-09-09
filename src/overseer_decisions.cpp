@@ -1332,12 +1332,33 @@ char const* DungeonRunExitOutcome(bool provedComplete, bool stalled)
     return stalled ? "stalled" : "left";
 }
 
+CounterRole CounterRoleForAim(std::string const& aim)
+{
+    // The bridge's ECONOMY_ERRANDS, and the same three keywords the travel
+    // roles carry, kept in step by the same discipline they already are: two
+    // copies of a vocabulary that must agree, so a test compares them rather
+    // than a comment asking somebody to remember.
+    //
+    // AND THE MATCH IS EXACT RATHER THAN A PREFIX. `travel_npc` also carries
+    // "at:" and "trigger:" aims, and "profession trainer" contains neither of
+    // these words but "class trainer" is one keyword away from being read
+    // loosely by a future edit. An aim is a whole keyword or it is not this.
+    if (aim == "vendor")
+        return CounterRole::Vendor;
+    if (aim == "banker")
+        return CounterRole::Banker;
+    if (aim == "repair")
+        return CounterRole::Repairer;
+    return CounterRole::None;
+}
+
 bool IsMaintenanceErrand(std::string const& aim)
 {
-    // The bridge's ECONOMY_ERRANDS, kept in step by the same discipline the
-    // travel roles already are: two copies of a vocabulary that must agree, so
-    // a test compares them rather than a comment asking somebody to remember.
-    return aim == "vendor" || aim == "banker" || aim == "repair";
+    // ASKED OF THE ONE VOCABULARY (#378). This used to carry its own copy of
+    // the three keywords above, which was fine while it was the only reader and
+    // stopped being fine the moment the travel drive's arrival branch needed
+    // the same answer plus the role.
+    return CounterRoleForAim(aim) != CounterRole::None;
 }
 
 MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
@@ -6673,6 +6694,46 @@ InnHold InnHoldStep(bool atTheInn, bool bindRefusedHere, bool alreadyHeld)
         return InnHold::Take;
 
     return alreadyHeld ? InnHold::Release : InnHold::Nothing;
+}
+
+// ------------- standing at a counter long enough to trade there (#378) ------
+
+CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby)
+{
+    // NOT A COUNTER, NOT THIS DECISION. Answered first and answered `Done`,
+    // which is byte for byte what the arrival branch did for every creature
+    // errand before this existed: a trainer, a flight master, a stable master
+    // and a tabard designer all still arrive and release. Putting this test
+    // anywhere but first would make a new reason to hold apply to errands
+    // nobody has measured anything about.
+    if (role == CounterRole::None)
+        return CounterArrival::Done;
+
+    // IN REACH OUTRANKS EVERYTHING ELSE, because it is the only state in which
+    // the promise a hold makes is true. It is deliberately not combined with
+    // `oneIsNearby`: an adapter that could pass `inReach` true and `oneIsNearby`
+    // false has a bug in its sweep, and answering StandAndTrade anyway is the
+    // right thing for this function to do about it - the character IS at a
+    // counter the core will talk to, whatever a wider search thought.
+    if (inReach)
+        return CounterArrival::StandAndTrade;
+
+    // NEARBY AND OUT OF REACH IS "NOT YET", AND IT IS THE ORDINARY CASE. The
+    // arrival radius is measured against a spawn row and the creature has feet,
+    // so a vendor eight yards off its row is a walk with a few yards left in it
+    // rather than an errand that is over. Releasing here is what made the log
+    // say "errand done" about a character that could not sell anything.
+    if (oneIsNearby)
+        return CounterArrival::CloseTheGap;
+
+    // AND NOTHING OF THE ROLE ANYWHERE NEAR IS "NEVER", WHICH IS A DIFFERENT
+    // ANSWER AND HAS TO BE. Standing on an empty spawn point waiting for a
+    // creature that is despawned, dead or phased is exactly the pin #370
+    // refused to place, and it would cost more here than there: the errand's
+    // own backstop is twenty minutes, and the run that is waiting for this trip
+    // is bounded by the same number. Releasing hands the problem back to the
+    // pass that wrote the aim, which can write a different one.
+    return CounterArrival::Done;
 }
 
 // ------------------- and a hold that is taken once is not a hold (#358) --
