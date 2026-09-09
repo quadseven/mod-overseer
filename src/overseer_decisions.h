@@ -3122,6 +3122,140 @@ struct GearContender
 
 std::string GearNeedWinner(std::vector<GearContender> const& contenders);
 
+// ------------------------------------------ what an equip displaced (#372) --
+//
+// WHAT `kind='item_equip'` COULD NOT SAY, AND WHY IT COULD NOT. The row records
+// the item that went on and the slot it went into, and the whole of its detail
+// column is the literal string `slot <n>` - measured over all 453 rows ever
+// written on the dev realm, whose distinct details are `slot 7`, `slot 14`,
+// `slot 9`, `slot 15`, `slot 4`, `slot 8`, `slot 6` and `slot 2` and nothing
+// else. An upgrade is a comparison and only one side of the comparison was
+// ever stored, so the armory can list equips and can say nothing about
+// progression: not what improved, not by how much, not which drop mattered.
+//
+// The measured cost of that is an ambiguity nobody can settle from the table. A
+// roster character's row at 15:02 records one weapon going into slot 15 and the
+// live inventory afterwards holds a different one. Either it was swapped
+// straight back, or the equip never stuck, and the row is identical under both.
+//
+// WHY A SHADOW AND NOT A READ AT THE HOOK. The previous occupant is genuinely
+// not reachable from the equip hook. Player::EquipItem visualises the new item
+// into the slot (PlayerStorage.cpp:2844) BEFORE it calls OnPlayerEquip
+// (PlayerStorage.cpp:2936), and Player::SwapItem has already called
+// RemoveItem(dstbag, dstslot, false) (PlayerStorage.cpp:3971) before it calls
+// EquipItem at all (PlayerStorage.cpp:3980) - so at the instant the hook runs
+// the new item IS the slot's occupant and the displaced one is in neither the
+// slot nor the bags. Reading the slot inside the hook returns what was just put
+// on. The only place the answer still exists is a memory of what was there
+// before, which is what these three functions maintain.
+//
+// AND WHY THE STAMP. A slot can also be emptied with nothing put back - the
+// core's own AutoUnequipOffhandIfNeed does exactly that when a two-hander goes
+// into the main hand - and an equip into that slot an hour later displaced
+// nothing, it filled an empty slot. Both cases reach the shadow as "a clear,
+// then later a fill", so the two are told apart by WHEN the clear happened.
+// `stamp` is the core's per-world-update millisecond reading,
+// GameTime::GetGameTimeMS, set once at the top of World::Update by
+// _UpdateGameTime and constant for the whole of that update including the map
+// phase every bot runs in. A clear and a fill inside one Player::SwapItem are
+// consecutive statements with nothing between them, so they always carry the
+// same stamp; a clear and a fill an hour apart never do. Where two genuinely
+// different actions do land in one world update, calling the second a
+// displacement of the first is the true answer anyway.
+struct GearSlotOccupant
+{
+    unsigned entry{0};
+    std::string name;
+    // ItemTemplate::Quality (0 poor, 1 common, 2 uncommon, 3 rare ...) and
+    // ItemTemplate::ItemLevel, denormalised at the moment of the equip. NOT
+    // left to be looked up from `item_template` later: a content patch that
+    // edits a template must not retro-date a judgement about what happened
+    // today, and a reader that has to join to answer "was this an upgrade" is
+    // the second round trip #372 exists to remove.
+    unsigned quality{0};
+    unsigned itemLevel{0};
+};
+
+// UNOBSERVED IS NOT EMPTY, and keeping them apart is the whole reason this is
+// three states and not a bool. A module that has never looked at a slot and a
+// slot that has been looked at and is bare are different facts with different
+// readings, and folding the first into the second would write "this was the
+// character's first ever shoulder piece" over an equip that replaced something
+// this module simply had not seen. The death context columns document the same
+// rule for the same reason: unknown is never a plausible value.
+enum class GearSlotState : std::uint8_t
+{
+    Unobserved,
+    Empty,
+    Occupied,
+};
+
+// What this module last saw in ONE character's ONE equipment slot. Lives in the
+// adapter, one per roster character per slot, and is fed only by hooks that
+// already fire: nothing here polls.
+struct GearSlotShadow
+{
+    // Has anything ever looked at this slot for this character? Set by the
+    // login seed and by either observation below.
+    bool observed{false};
+
+    // What is in it now, when `occupied`.
+    bool occupied{false};
+    GearSlotOccupant worn;
+
+    // What was last taken OUT of it, and the world update that happened on.
+    // Kept after the clear rather than discarded, because in a straight swap
+    // the clear is the only place the displaced item is still named.
+    bool removedValid{false};
+    GearSlotOccupant removed;
+    std::uint64_t removedStamp{0};
+};
+
+// The answer the equip row wants: what the slot held immediately before the
+// item that has just gone into it.
+struct GearSlotBefore
+{
+    GearSlotState state{GearSlotState::Unobserved};
+    GearSlotOccupant item;   // meaningful only when state is Occupied
+};
+
+// The three words `overseer_event.prior_state` can hold for an item_equip row.
+// An empty string is a fourth thing and means the row predates #372 - which is
+// why the column defaults to '' rather than to 'unknown'.
+namespace GearPrior
+{
+constexpr char const* Unknown = "unknown";
+constexpr char const* Empty = "empty";
+constexpr char const* Item = "item";
+}  // namespace GearPrior
+
+// The slot was emptied. `stamp` is the world update it happened on.
+void GearSlotCleared(GearSlotShadow& shadow, std::uint64_t stamp);
+
+// The slot's occupant, as read directly off a character. Used by the login seed
+// for every slot including the bare ones, which is what makes a later "the slot
+// was empty" a fact rather than an absence of evidence.
+void GearSlotSeen(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item);
+
+// What did the item now in this slot displace? Must be asked BEFORE
+// GearSlotFilled records the new occupant, because after that call the shadow
+// describes the new state and no longer the old one.
+GearSlotBefore GearSlotDisplaced(GearSlotShadow const& shadow, std::uint64_t stamp);
+
+// An item went into the slot. Consumes the pending removal, whatever the answer
+// above was, so one clear can only ever explain one fill.
+void GearSlotFilled(GearSlotShadow& shadow, GearSlotOccupant const& item);
+
+// The word for the column, and the detail sentence for the row.
+char const* GearPriorWord(GearSlotState state);
+
+// The existing detail is the literal `slot <n>` and the website reads it, so
+// the slot number stays exactly where it is and the new half is appended. A
+// reader that parses the leading `slot <n>` is unaffected; one that compares
+// the whole string against `slot <n>` sees a longer string, which is why the
+// machine-readable copy of all of this is in columns rather than in here.
+std::string GearSwapDetail(unsigned slot, GearSlotBefore const& before);
+
 // -------------------------------------------------------------- sell (#18) --
 //
 // WHAT THE VENDOR SALE DECIDES WITHOUT A WORLD, and why so little of it.

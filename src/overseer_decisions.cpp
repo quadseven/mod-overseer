@@ -2260,6 +2260,134 @@ std::string GearNeedWinner(std::vector<GearContender> const& contenders)
     return winner;
 }
 
+
+// ------------------------------------------ what an equip displaced (#372) --
+
+void GearSlotCleared(GearSlotShadow& shadow, std::uint64_t stamp)
+{
+    // A clear of an already-bare slot carries no news and must not overwrite a
+    // pending removal: the core clears the visible-item fields of a slot that
+    // was already empty on more than one path, and letting that erase the
+    // memory would lose exactly the item the next fill is about to be asked to
+    // name.
+    if (shadow.occupied)
+    {
+        shadow.removed = shadow.worn;
+        shadow.removedValid = true;
+        shadow.removedStamp = stamp;
+    }
+
+    shadow.observed = true;
+    shadow.occupied = false;
+    shadow.worn = GearSlotOccupant{};
+}
+
+void GearSlotSeen(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item)
+{
+    shadow.observed = true;
+    shadow.occupied = occupied;
+    shadow.worn = occupied ? item : GearSlotOccupant{};
+
+    // A direct reading of the world supersedes anything half-remembered. What
+    // this seeds is "the slot is like this now", and a removal recorded before
+    // it has already been either consumed or made irrelevant by it.
+    shadow.removedValid = false;
+    shadow.removed = GearSlotOccupant{};
+    shadow.removedStamp = 0;
+}
+
+GearSlotBefore GearSlotDisplaced(GearSlotShadow const& shadow, std::uint64_t stamp)
+{
+    GearSlotBefore before;
+
+    // AN OCCUPIED SLOT OVERWRITTEN IN PLACE. Not a path the pinned core takes
+    // for equipment - it removes before it equips - but it is the honest answer
+    // if it ever does, and asking it first means this function never depends on
+    // that remaining true.
+    if (shadow.occupied)
+    {
+        before.state = GearSlotState::Occupied;
+        before.item = shadow.worn;
+        return before;
+    }
+
+    // THE STRAIGHT SWAP. The clear and this fill are the same world update, so
+    // they are the two halves of one Player::SwapItem and the item that came
+    // out is what this one displaced. See the header for why the stamp is the
+    // discriminator and not the wall clock.
+    if (shadow.removedValid && shadow.removedStamp == stamp)
+    {
+        before.state = GearSlotState::Occupied;
+        before.item = shadow.removed;
+        return before;
+    }
+
+    // Looked at, and bare. This is the first item into the slot, or the first
+    // since whatever left it empty in some earlier update.
+    if (shadow.observed)
+    {
+        before.state = GearSlotState::Empty;
+        return before;
+    }
+
+    // Never looked at. Says so, rather than guessing empty - see the header.
+    return before;
+}
+
+void GearSlotFilled(GearSlotShadow& shadow, GearSlotOccupant const& item)
+{
+    shadow.observed = true;
+    shadow.occupied = true;
+    shadow.worn = item;
+
+    // ONE CLEAR EXPLAINS AT MOST ONE FILL. Without this a swap in the main hand
+    // would leave its displaced item pending, and a later fill of the same slot
+    // in the same world update - which two-handed weapons and the core's own
+    // AutoUnequipOffhandIfNeed do produce - would name it a second time.
+    shadow.removedValid = false;
+    shadow.removed = GearSlotOccupant{};
+    shadow.removedStamp = 0;
+}
+
+char const* GearPriorWord(GearSlotState state)
+{
+    switch (state)
+    {
+        case GearSlotState::Occupied: return GearPrior::Item;
+        case GearSlotState::Empty:    return GearPrior::Empty;
+        case GearSlotState::Unobserved: break;
+    }
+    return GearPrior::Unknown;
+}
+
+std::string GearSwapDetail(unsigned slot, GearSlotBefore const& before)
+{
+    std::string detail = "slot " + std::to_string(slot);
+    switch (before.state)
+    {
+        case GearSlotState::Occupied:
+            // The name and not the entry, because this column is the half a
+            // person reads; the entry is in prior_id for everything else.
+            detail += " over " + (before.item.name.empty()
+                                      ? std::string("an item with no template")
+                                      : before.item.name);
+            break;
+        case GearSlotState::Empty:
+            detail += " over nothing";
+            break;
+        case GearSlotState::Unobserved:
+            detail += " over an unobserved slot";
+            break;
+    }
+
+    // The column is VARCHAR(255) and an item name is VARCHAR(255) on its own,
+    // so a long enough name would be truncated by MySQL rather than by this
+    // module. Truncating here instead keeps the sentence readable and, more to
+    // the point, keeps the truncation a decision this file can be tested on.
+    if (detail.size() > 255)
+        detail.resize(255);
+    return detail;
+}
 // -------------------------------------------------------------- sell (#18) --
 
 namespace

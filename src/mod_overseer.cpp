@@ -2830,6 +2830,33 @@ struct EventKey
     }
 };
 
+// THE COLUMNS ONE KIND FILLS IN (#372). 2026_09_09_00_overseer_event_gear_swap
+// added seven columns to overseer_event and only 'item_equip' writes them,
+// which is why they are a struct with defaults rather than seven more
+// parameters on RecordEvent: the other eight call sites say nothing about gear
+// and should not have to name seven zeroes to keep saying it. Every field is
+// the zero the migration gives the column, so a kind that ignores this writes
+// exactly what a row written before the migration reads back as.
+struct EventExtra
+{
+    // The item that went ON. ItemTemplate::Quality and ItemTemplate::ItemLevel,
+    // read at the moment of the equip rather than joined later, for the reason
+    // the migration argues at length: item_template is content, and a judgement
+    // rendered from today's template about last month's equip is a judgement
+    // about the wrong world.
+    uint32 subjectQuality = 0;
+    uint32 subjectItemLevel = 0;
+
+    // What the slot held immediately before. 'item', 'empty' or 'unknown' -
+    // see OverseerDecisions::GearPrior for why the third is not the second.
+    // Empty here means the kind does not use these columns at all.
+    std::string priorState;
+    uint32 priorId = 0;
+    std::string priorName;
+    uint32 priorQuality = 0;
+    uint32 priorItemLevel = 0;
+};
+
 struct PendingEvent
 {
     std::string subjectName;
@@ -2839,6 +2866,7 @@ struct PendingEvent
     uint32 occurrences = 0;
     uint16 mapId = 0;
     uint8 level = 0;
+    EventExtra extra;
 };
 
 // A MAP, not a vector, and that is the whole de-duplication design. The chat
@@ -2854,7 +2882,8 @@ uint64 g_droppedEvents = 0;
 // happened on - for bots, a map-update thread - so it does NO database work
 // and does not resolve anything it was not handed.
 void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
-                 std::string const& subjectName, std::string const& detail)
+                 std::string const& subjectName, std::string const& detail,
+                 EventExtra const& extra)
 {
     if (!actor || !kind)
         return;
@@ -2889,7 +2918,187 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
     pending.zoneId = actor->GetZoneId();
     pending.mapId = static_cast<uint16>(actor->GetMapId());
     pending.level = actor->GetLevel();
+    pending.extra = extra;
     ++pending.occurrences;
+}
+
+// The form every kind but 'item_equip' uses, unchanged for its eight callers.
+// It exists so that adding gear columns to the table did not become a diff
+// across every recording site in the module, and so that a future kind that
+// wants none of them keeps saying so by saying nothing.
+void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
+                 std::string const& subjectName, std::string const& detail)
+{
+    RecordEvent(actor, kind, subjectId, subjectName, detail, EventExtra());
+}
+
+// ----------------------------------------- what an equip displaced (#372) --
+//
+// WHY THIS EXISTS. A `kind='item_equip'` row named the item that went on and
+// the slot it went into, and nothing at all about what came off - the whole of
+// its detail column was the literal `slot <n>`, over all 453 rows ever written
+// on the dev realm. An upgrade is a comparison and only one side of it was
+// stored, so the armory could list equips and say nothing about progression,
+// and a row recording a weapon going into a slot that later held a different
+// weapon could not be told apart from an equip that never stuck.
+//
+// WHY IT IS A MEMORY AND NOT A READ. The obvious fix - ask the slot what is in
+// it, inside the equip hook - returns the item that was just put on.
+// Player::EquipItem visualises the new item into the slot
+// (PlayerStorage.cpp:2844) before it calls OnPlayerEquip
+// (PlayerStorage.cpp:2936), and Player::SwapItem has already called
+// RemoveItem(dstbag, dstslot, false) (PlayerStorage.cpp:3971) before it calls
+// EquipItem at all (PlayerStorage.cpp:3980), which leaves the displaced item in
+// neither the slot nor the bags for the instant the hook runs. The previous
+// occupant is genuinely unreachable from that call site, so the only place the
+// answer still exists is a memory of what was there before. This is the same
+// posture the death-context caches below take, and for the same reason.
+//
+// WHAT IT COSTS, WHICH IS THE OTHER HALF OF THE DESIGN. Nothing polls. Three
+// hooks feed it and all three already fire:
+//
+//   - the login seed walks EQUIPMENT_SLOT_END slots ONCE per roster login,
+//     which is nineteen reads of Player::m_items, an array index each, five
+//     times per realm start. It exists so that a bare slot is a fact rather
+//     than an absence of evidence, which no other hook can establish.
+//   - the equip hook, which was already recording the row, reads one entry and
+//     writes one entry.
+//   - OnPlayerAfterSetVisibleItemSlot, the only hook in the core that sees an
+//     equipment slot go EMPTY. It fires for every player on the world, so it
+//     returns on three integer tests before it touches a lock: a fill is not
+//     its business, a bag slot is not its business, and a null player is not
+//     anybody's. Only a clear of an equipment slot on a roster character gets
+//     as far as the roster lookup.
+//
+// So the steady-state cost is a map lookup on an event that happens a few
+// hundred times a month, against 500 bots the roster test rejects before any of
+// this. There is no per-tick scan of anybody's inventory, which is the thing
+// #372 explicitly asked not to buy this with.
+//
+// WHY THE STAMP. A slot can be emptied with nothing put back - the core's own
+// AutoUnequipOffhandIfNeed does exactly that when a two-hander goes into the
+// main hand - and an equip into that slot an hour later displaced nothing. Both
+// reach this cache as "a clear, then later a fill", so the two are told apart
+// by WHEN the clear happened. GameTime::GetGameTimeMS is set once at the top of
+// World::Update by World::_UpdateGameTime and is constant for the whole of that
+// update, including the map phase every bot's AI runs in, so a clear and a fill
+// inside one Player::SwapItem always carry the same reading and a clear and a
+// fill an hour apart never do. The decision itself is in
+// OverseerDecisions::GearSlotDisplaced, where a test can reach it.
+//
+// BOUNDED BY THE ROSTER, like g_hpHistory below and for the same reason: every
+// write is behind OnRoster, so this holds one vector of nineteen small structs
+// per enabled roster row and nothing else. The 500 bots never reach it.
+std::mutex g_wornMutex;
+std::map<std::string, std::vector<OverseerDecisions::GearSlotShadow>> g_wornSlots;
+
+// The three facts about an item this module keeps, resolved from the template
+// while the Item* is still valid. An unresolvable template leaves the name
+// empty and the numbers zero, exactly as subject_name already may be.
+OverseerDecisions::GearSlotOccupant WornOccupant(Item const* item)
+{
+    OverseerDecisions::GearSlotOccupant occupant;
+    if (!item)
+        return occupant;
+    occupant.entry = item->GetEntry();
+    if (ItemTemplate const* proto = item->GetTemplate())
+    {
+        occupant.name = proto->Name1;
+        occupant.quality = proto->Quality;
+        occupant.itemLevel = proto->ItemLevel;
+    }
+    return occupant;
+}
+
+// The world update this hook is running in. See the section comment for why
+// this and not the wall clock.
+uint64 WorldUpdateStamp()
+{
+    return static_cast<uint64>(GameTime::GetGameTimeMS().count());
+}
+
+// g_wornMutex must be held. Returns nullptr for anything that is not an
+// equipment slot, which is the caller's cue that there is nothing to remember.
+OverseerDecisions::GearSlotShadow* WornSlotLocked(std::string const& name, uint8 slot)
+{
+    if (slot >= EQUIPMENT_SLOT_END)
+        return nullptr;
+    std::vector<OverseerDecisions::GearSlotShadow>& slots = g_wornSlots[LowerName(name)];
+    if (slots.size() < static_cast<size_t>(EQUIPMENT_SLOT_END))
+        slots.resize(EQUIPMENT_SLOT_END);
+    return &slots[slot];
+}
+
+// Read every equipment slot off a character once, at login. This is the ONLY
+// place this module looks at a character's gear for this purpose, and the only
+// thing that can establish "this slot is empty" as an observation rather than
+// as silence. Nineteen array reads.
+void SeedWornSlots(Player* player)
+{
+    if (!player)
+        return;
+
+    std::lock_guard<std::mutex> guard(g_wornMutex);
+    std::vector<OverseerDecisions::GearSlotShadow>& slots =
+        g_wornSlots[LowerName(player->GetName())];
+    slots.resize(EQUIPMENT_SLOT_END);
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        Item const* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        OverseerDecisions::GearSlotSeen(slots[slot], item != nullptr, WornOccupant(item));
+    }
+}
+
+// An equipment slot went empty. The item is remembered against the world update
+// it left on, so the equip that displaced it - if there is one - can name it,
+// and an equip much later cannot.
+void ForgetWornSlot(Player* player, uint8 slot)
+{
+    if (!player)
+        return;
+
+    std::lock_guard<std::mutex> guard(g_wornMutex);
+    if (OverseerDecisions::GearSlotShadow* shadow = WornSlotLocked(player->GetName(), slot))
+        OverseerDecisions::GearSlotCleared(*shadow, WorldUpdateStamp());
+}
+
+// What did the item now in this slot displace, and remember that it is now the
+// occupant. One call, because the answer must be taken BEFORE the new occupant
+// is written and doing both here is what makes that impossible to get wrong at
+// a call site.
+OverseerDecisions::GearSlotBefore TakeWornSlot(Player* player, uint8 slot, Item const* item)
+{
+    OverseerDecisions::GearSlotBefore before;
+    if (!player)
+        return before;
+
+    std::lock_guard<std::mutex> guard(g_wornMutex);
+    OverseerDecisions::GearSlotShadow* shadow = WornSlotLocked(player->GetName(), slot);
+    if (!shadow)
+        return before;
+
+    uint64 const stamp = WorldUpdateStamp();
+    before = OverseerDecisions::GearSlotDisplaced(*shadow, stamp);
+    OverseerDecisions::GearSlotFilled(*shadow, WornOccupant(item));
+    return before;
+}
+
+// The row's half of it: the seven columns, filled from the answer above and
+// from the arriving item's own template.
+EventExtra EquipExtra(ItemTemplate const* proto, OverseerDecisions::GearSlotBefore const& before)
+{
+    EventExtra extra;
+    extra.subjectQuality = proto ? proto->Quality : 0;
+    extra.subjectItemLevel = proto ? proto->ItemLevel : 0;
+    extra.priorState = OverseerDecisions::GearPriorWord(before.state);
+    if (before.state == OverseerDecisions::GearSlotState::Occupied)
+    {
+        extra.priorId = before.item.entry;
+        extra.priorName = before.item.name;
+        extra.priorQuality = before.item.quality;
+        extra.priorItemLevel = before.item.itemLevel;
+    }
+    return extra;
 }
 
 // ------------------------------------------------------------- death context --
@@ -4155,9 +4364,21 @@ public:
 class OverseerEventScript : public PlayerScript
 {
 public:
-    // Only the six hooks this script implements. An empty list would enable
-    // ALL player hooks, which on a 500-bot world puts this script in the
-    // dispatch loop for every player event the core has.
+    // Only the hooks this script implements. An empty list would enable ALL
+    // player hooks, which on a 500-bot world puts this script in the dispatch
+    // loop for every player event the core has.
+    //
+    // THE LAST TWO ARE BOTH #372 AND NEITHER IS A POLL. PLAYERHOOK_ON_LOGIN
+    // seeds the equipment shadow once per roster login; without it a bare slot
+    // is indistinguishable from a slot nobody looked at, and a row would have
+    // to say 'unknown' where it can honestly say 'empty'.
+    // PLAYERHOOK_ON_AFTER_SET_VISIBLE_ITEM_SLOT is the only hook in the core
+    // that sees an equipment slot go EMPTY - Player::RemoveItem clears the
+    // visible-item fields through Player::SetVisibleItemSlot
+    // (PlayerStorage.cpp:3065), which is how the core's own
+    // AutoUnequipOffhandIfNeed reaches this module at all. It is also the
+    // busiest thing in this list, which is why its handler returns on integer
+    // tests before it touches a lock.
     OverseerEventScript() : PlayerScript("OverseerEventScript", {
         PLAYERHOOK_ON_LEVEL_CHANGED,
         PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
@@ -4168,7 +4389,50 @@ public:
         PLAYERHOOK_ON_PVP_KILL,
         PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE,
         PLAYERHOOK_ON_BEFORE_LOGOUT,
+        PLAYERHOOK_ON_LOGIN,
+        PLAYERHOOK_ON_AFTER_SET_VISIBLE_ITEM_SLOT,
     }) {}
+
+    // NINETEEN ARRAY READS, ONCE (#372). Player::GetItemByPos on
+    // INVENTORY_SLOT_BAG_0 is an index into Player::m_items, so this is the
+    // whole of what the equipment shadow ever costs to establish, and it
+    // establishes the one thing no other hook can: that a slot is empty because
+    // somebody looked, rather than because nothing has happened yet.
+    //
+    // Roster-gated first, so the hundreds of headless bots a production world
+    // runs never reach the walk. ReloadRosterNames primes the roster at startup
+    // for exactly this kind of caller, so a character logging into a running
+    // realm is tested against a roster that is already known; a login in the
+    // seconds before that first read gets 'unknown' on its first equip per
+    // slot, which is the honest answer rather than a guessed one.
+    void OnPlayerLogin(Player* player) override
+    {
+        if (!player || !OnRoster(player->GetName()))
+            return;
+        SeedWornSlots(player);
+    }
+
+    // AN EQUIPMENT SLOT WENT EMPTY (#372). The three tests in front of the
+    // roster lookup are the reason this hook is affordable: it fires for every
+    // player on the world, and a fill is the equip hook's business rather than
+    // this one's, so the common case leaves on the first test having taken no
+    // lock at all.
+    //
+    // A LOGIN REACHES HERE NINETEEN TIMES BEFORE IT EQUIPS ANYTHING.
+    // Player::LoadFromDB clears every visible item slot before _LoadInventory
+    // fills them (PlayerStorage.cpp:5156), and the fills that follow are
+    // QuickEquipItem calls whose equip hook returns early on PlayerLoading. So
+    // during a load this cache is emptied and not refilled, which is exactly
+    // why OnPlayerLogin seeds it afterwards from the world - and why a
+    // GearSlotSeen supersedes any removal remembered before it.
+    void OnPlayerAfterSetVisibleItemSlot(Player* player, uint8 slot, Item* item) override
+    {
+        if (item || !player || slot >= EQUIPMENT_SLOT_END)
+            return;
+        if (!OnRoster(player->GetName()))
+            return;
+        ForgetWornSlot(player, slot);
+    }
 
     // Fires on the way DOWN as well - the hook is named for a change, not a
     // gain - so the level reached is the subject and the level left is the
@@ -4228,9 +4492,30 @@ public:
         if (player->GetSession() && player->GetSession()->PlayerLoading())
             return;
 
+        // ASKED HERE RATHER THAN LEFT TO RecordEvent, and asked first. Taking
+        // the answer out of a slot is a WRITE to the shadow, and the shadow
+        // must not be touched for the 500 bots, so this cannot be left to the
+        // roster test the recording call makes for every other kind. It costs
+        // the same one lookup that call was already making.
+        if (!OnRoster(player->GetName()))
+            return;
+
         ItemTemplate const* proto = item->GetTemplate();
+
+        // WHAT CAME OFF, TAKEN BEFORE IT IS OVERWRITTEN (#372). By the time
+        // this hook runs the new item IS the slot's occupant and the displaced
+        // one is in neither the slot nor the bags, so this reads the memory the
+        // section above maintains and not the world. The same call records the
+        // new occupant, because the answer is only right when it is taken
+        // before that happens.
+        OverseerDecisions::GearSlotBefore const before = TakeWornSlot(player, slot, item);
+
+        // The detail keeps its existing `slot <n>` opening - the website parses
+        // it - and gains a sentence naming what came out. The machine-readable
+        // copy of all of this is in the columns, so nothing has to parse this.
         RecordEvent(player, "item_equip", item->GetEntry(), proto ? proto->Name1 : "",
-                    "slot " + std::to_string(static_cast<uint32>(slot)));
+                    OverseerDecisions::GearSwapDetail(static_cast<unsigned>(slot), before),
+                    EquipExtra(proto, before));
     }
 
     // Who landed the killing blow, captured while `killer` is still a live
@@ -23887,7 +24172,9 @@ private:
 
         std::ostringstream ss;
         ss << "INSERT INTO overseer_event (character_name, character_guid, kind, subject_id, "
-              "subject_name, detail, level, map, zone, bucket, occurrences) VALUES ";
+              "subject_name, detail, level, map, zone, bucket, occurrences, "
+              "subject_quality, subject_item_level, prior_state, prior_id, prior_name, "
+              "prior_quality, prior_item_level) VALUES ";
         bool first = true;
         for (std::pair<EventKey const, PendingEvent> const& entry : batch)
         {
@@ -23907,6 +24194,17 @@ private:
                << ',' << ev.zoneId
                << ',' << key.bucket
                << ',' << ev.occurrences
+               // The seven columns 2026_09_09_00 added (#372). Every kind but
+               // 'item_equip' leaves these at the defaults that migration gives
+               // them, so a quest or a death writes exactly what it wrote
+               // before this shipped.
+               << ',' << ev.extra.subjectQuality
+               << ',' << ev.extra.subjectItemLevel
+               << ",'" << Esc(ev.extra.priorState)
+               << "'," << ev.extra.priorId
+               << ",'" << Esc(ev.extra.priorName)
+               << "'," << ev.extra.priorQuality
+               << ',' << ev.extra.priorItemLevel
                << ')';
         }
 
@@ -23929,7 +24227,19 @@ private:
               "detail = VALUES(detail), "
               "level = VALUES(level), "
               "map = VALUES(map), "
-              "zone = VALUES(zone)";
+              "zone = VALUES(zone), "
+              // Same rule as `detail`, and it has to be: these describe ONE
+              // occurrence of the thing the key names, so the last one in the
+              // bucket wins. A character flipping between two weapons produces
+              // one row per weapon carrying the count of the flips and the most
+              // recent swap's pair, which is what makes the loop legible.
+              "subject_quality = VALUES(subject_quality), "
+              "subject_item_level = VALUES(subject_item_level), "
+              "prior_state = VALUES(prior_state), "
+              "prior_id = VALUES(prior_id), "
+              "prior_name = VALUES(prior_name), "
+              "prior_quality = VALUES(prior_quality), "
+              "prior_item_level = VALUES(prior_item_level)";
         CharacterDatabase.Execute(ss.str().c_str());
     }
 
