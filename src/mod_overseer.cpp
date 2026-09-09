@@ -20872,6 +20872,20 @@ private:
     // this walks a character with the same travel errand every other walk in
     // this module uses and lets the game's own areatrigger decide.
     //
+    // WHAT THIS DOES NOT MAKE SAFE, SAID RATHER THAN IMPLIED. AGENTS.md records
+    // that an aim across a map is routed without regard for what it crosses, and
+    // that sending a party through the wrong zone turned a six-hour quiet streak
+    // into 24 deaths in fifteen minutes. Nothing here changes that: a member
+    // 2200 yards out is walked across whatever lies between, and
+    // ChooseTravelTarget's danger refusal is about CHOOSING among candidate
+    // destinations, not about a fixed aim at a door. What can be said is that
+    // the alternative is not "stay put" - it is the measured behaviour, which is
+    // an idle character sent several thousand yards further off by whichever
+    // drive picks it up and killed three times out there. A shorter, purposeful
+    // walk toward a door the party is standing behind is the better of the two
+    // available walks, not a safe one, and the phase's own backstop bounds how
+    // long it may be attempted.
+    //
     // Returns how many members were aimed back at the door this poll.
     uint32 WalkStrandedBackIn(
         std::string const& leaderName, DungeonPortal const& portal,
