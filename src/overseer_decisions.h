@@ -7693,6 +7693,77 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts);
 // mechanism with no caller and a test pinning nothing.
 
 
+// ------------------- and a hold that is taken once is not a hold (#358) --
+//
+// THE HOLD ABOVE STOPS A CHARACTER BEING SENT SOMEWHERE AND DOES NOT STOP ONE
+// ALREADY WALKING, AND FOUR VERBS SPENT THEIR WHOLE LIVES ASSUMING OTHERWISE.
+// `conjure`, `hearth`, `summon` and `stage` all take that hold, and all four
+// are written as though nothing were in flight when they do. Read off the
+// pinned core rather than inferred: Unit::StopMoving (Unit.cpp:13045) clears
+// UNIT_STATE_MOVING and stops the current spline and never touches the
+// MotionMaster, so a FollowMovementGenerator that MoveFollow left in
+// MOTION_SLOT_ACTIVE is still sitting there and re-splines on the next tick
+// that finds its target out of position (TargetedMovementGenerator.cpp:580).
+// Measured on the dev realm on 2026-09-09, a character whose log line reported
+// every half of the hold going on - stay added, follow removed, already
+// standing, taken off its mount - read fifteen yards from a meeting stone and
+// fifty-five yards from it nine seconds later.
+//
+// WHAT THE ADAPTER DOES ABOUT IT IS TAKE THE ACTIVE MOTION SLOT, which is a
+// call rather than a decision and so is not here. WHAT IS HERE IS THE ONE
+// QUESTION THE SWEEP THAT KEEPS THE HOLD HAS TO ANSWER ON EVERY TICK - and
+// every way of answering it wrongly is a separate defect, which is why it is a
+// function with a test rather than four conditions in a loop.
+
+// What is true about a held character at the moment the sweep looks.
+struct HeldStillFacts
+{
+    // In the world and not mid-teleport. A name that resolves to nothing is a
+    // character that logged out or is crossing a map; the hold's own release
+    // and the ceiling sweep are what end that, not this.
+    bool present{false};
+    // The ceiling is up and the release is already owed. Re-taking a hold past
+    // its deadline would be this module standing a character still for longer
+    // than it ever said it would, which is the one thing the ceiling exists to
+    // make impossible.
+    bool pastDeadline{false};
+    // A VERB IS WALKING THIS CHARACTER UNDER ITS OWN HOLD, which is #357 and is
+    // the only input here that is not a fact about the world. The summon's
+    // approach closes the last few yards onto a meeting stone with a MovePoint
+    // issued deliberately, under the hold; a sweep that re-took the slot every
+    // time a held character was somewhere other than where it started would
+    // cancel that walk on the tick after it began, turning the fix for one verb
+    // into a defect in the same verb.
+    bool walkingOnPurpose{false};
+    // FIGHTING. `stay` and `follow` are non-combat strategies, so a held
+    // character still fights and still flees, and `flee` is left on the list
+    // deliberately for exactly that reason: a hold that pinned a character
+    // through a fight would be this module holding one still while something
+    // kills it. That argument is older than this decision and applies with more
+    // force to a pin that takes the slot the combat engine is steering with.
+    bool inCombat{false};
+    // HOW FAR IT IS FROM WHERE THE HOLD LAST MEANT, and this is deliberately
+    // not "is it moving". Unit::isMoving reads a movement flag that the core
+    // writes and clears inside the very calls a hold makes, so a sweep keyed on
+    // it would be reading the hold's own working rather than the world's; and
+    // it would answer nothing at all about a character that has been dragged
+    // thirty yards and has just that moment stopped. A distance from a place
+    // this module chose is a fact about the hold rather than about a flag.
+    float driftYards{0.f};
+};
+
+// Does the hold have to be re-taken on this tick?
+//
+// THE SLACK IS A PARAMETER BECAUSE IT IS A DISTANCE THE ADAPTER MEASURES AND
+// NOT A NUMBER THIS HEADER KNOWS. What this header can say about it is that it
+// must be above zero: the call that takes a hold ends by stopping a spline, and
+// stopping one recomputes the unit's position from it, so a character that has
+// just been pinned can read a fraction of a yard from where its anchor was
+// written. A slack of zero would have the sweep answering "it has drifted"
+// about its own pin, every tick, for as long as the hold stood.
+bool RetakeTheHold(HeldStillFacts const& facts, float slackYards);
+
+
 // ------------------ what stopped a cast this module drove at the core (#337) --
 //
 // THE HOLD WORKS AND THE CAST STILL DOES NOT GO OUT, WHICH IS A DIFFERENT

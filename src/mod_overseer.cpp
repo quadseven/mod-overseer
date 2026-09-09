@@ -4513,6 +4513,21 @@ public:
                 "DELETE FROM overseer_death WHERE created_at < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
         }
+        // EVERY TICK, AND ON NO TIMER AT ALL (#358). A hold that is only
+        // re-asserted when some poll happens to come round is a hold with a
+        // five second hole in it, and five seconds is thirty-five yards at a
+        // bot's run speed - which is the whole defect this answers. See
+        // KeepHeldCharactersStill for why running it unconditionally is
+        // affordable: it returns on its first line whenever nothing is held,
+        // which is almost every tick this world will ever run.
+        //
+        // ABOVE THE RECOVERY AND BELOW EVERYTHING ELSE, on purpose. Every drive
+        // above this line already asks the register before it hands a mover
+        // back, so none of them can be walking a held character by the time
+        // this runs; and leaving the recovery last keeps the promise its own
+        // comment makes, that a teleport out of the floor is the final movement
+        // decision in the tick and cannot be overwritten by a pin.
+        KeepHeldCharactersStill();
         // LAST, so a recovery is the final movement decision in this world
         // tick. A quest, travel or follow drive cannot overwrite the teleport
         // before the next update sees that the character is already in flight.
@@ -4910,6 +4925,46 @@ private:
         bool dismountedIt{false};
         time_t until{0};
         std::string verb;
+        // WHERE THE HOLD MEANS, WHICH IS THE HALF #358 ADDED. Every field above
+        // this line describes what a character may be GIVEN - a strategy, a
+        // deadline, a verb that owns the release - and not one of them is about
+        // where it is standing. That is precisely the gap the measurement in
+        // HoldCharacterStill's own comment opened: a character can carry a
+        // perfect hold and still be forty yards away nine seconds later,
+        // because nothing in the record was ever about a place.
+        //
+        // THE ANCHOR IS ALWAYS WHERE IT STOOD WHEN THE HOLD WAS LAST TAKEN, and
+        // never a place it is walked back to. That distinction is #138 and is
+        // not a preference: a MovePoint at a coordinate the navmesh will not
+        // route to falls back to a straight line, which is how this module has
+        // already killed characters, and a hold is the last thing that should
+        // be issuing an unproved walk. Re-anchoring where the character now
+        // stands needs no path at all, so it cannot.
+        //
+        // TWO DIMENSIONS AND NOT THREE, which is the same call the dungeon
+        // coordinator's own anchor makes a few thousand lines below: this is a
+        // question about ground covered, and a character standing on a ramp or
+        // settling onto a floor changes its z without having gone anywhere. The
+        // map id is carried because a hold can outlive a map change and a
+        // distance between two maps is not a number.
+        uint32 anchorMapId{0};
+        float anchorX{0.f};
+        float anchorY{0.f};
+        // A VERB IS WALKING THIS CHARACTER UNDER ITS OWN HOLD UNTIL THIS TIME,
+        // and without this field #358's sweep would break #357. The summon's
+        // approach closes the last few yards onto a meeting stone with a
+        // MovePoint issued deliberately, under the hold, and a sweep that
+        // re-took the active slot whenever a held character was somewhere other
+        // than its anchor would cancel that walk on the tick after it started.
+        // The walk says so here rather than the sweep guessing from the
+        // movement generator's type, which cannot tell one MovePoint from
+        // another and would have to guess wrong in one direction or the other.
+        time_t walkingUntil{0};
+        // How many times the pin had to be re-taken while this hold stood. It
+        // is a measurement rather than a counter for its own sake: zero says
+        // nothing fought the hold, and a large number on a `stage` row says the
+        // party is being dragged by something this module has not identified.
+        uint32 retaken{0};
     };
 
     // THE CEILING, AND IT IS THE ONE #330 ARGUED FOR. 45 seconds is how long
@@ -4918,6 +4973,36 @@ private:
     // What it actually bounds is the hold nobody comes back for - a `hearth` or
     // `summon` row that placed one on its way to a refusal and ended there.
     static constexpr uint32 CAST_HOLD_CEILING_SECONDS = 45;
+
+    // The id handed to MotionMaster::MovePoint when the hold takes the active
+    // motion slot. Zero, and for the reason SUMMON_APPROACH_POINT_ID is zero
+    // and says at greater length: PointMovementGenerator<Player>::MovementInform
+    // is the empty generic template on the pinned core
+    // (PointMovementGenerator.cpp:313), only the Creature specialisation informs
+    // an AI, so this number reaches nobody's dispatch table and cannot collide
+    // with an upstream one. Named anyway, because a bare literal in a MovePoint
+    // call is the kind of thing somebody later reads as meaningful.
+    static constexpr uint32 HOLD_PIN_POINT_ID = 0;
+
+    // HOW FAR A HELD CHARACTER MAY BE FROM ITS ANCHOR BEFORE THE PIN IS
+    // RE-TAKEN (#358).
+    //
+    // IT HAS TO BE ABOVE ZERO AND THE REASON IS NOT FLOATING POINT TASTE. The
+    // pin ends in Unit::StopMoving, and MoveSplineInit::Stop recomputes the
+    // unit's position off the spline it is finalising and sends a stop from
+    // there (MoveSplineInit.cpp:139-157). A character that has just been pinned
+    // can therefore read a fraction of a yard from where the anchor was
+    // written, and a slack of zero would have this sweep answering "it has
+    // drifted" about its own pin, on every tick, for as long as the hold stood.
+    //
+    // ONE YARD IS NOTHING NEXT TO WHAT IT CATCHES, WHICH IS THE OTHER HALF OF
+    // WHY IT IS THIS NUMBER. The drag this exists to stop was measured at forty
+    // yards in nine seconds, which is a yard every quarter of a second, so the
+    // sweep answers a new walk within a tick or two of it starting. Erring wide
+    // would be the wrong direction here for once: the tightest consumer is the
+    // summon, whose two clickers have to be inside a meeting stone's five yard
+    // interaction distance at the moment the ritual settles.
+    static constexpr float HOLD_PIN_SLACK_YARDS = 1.0f;
 
     // THE STAGING HOLD'S CEILING, AND IT IS BORROWED RATHER THAN PICKED (#346).
     // DUNGEON_STAGING_BACKSTOP_SECONDS is how long a whole run may spend being
@@ -4994,6 +5079,105 @@ private:
         return "a hold that has lifted since the question was asked";
     }
 
+    // TAKE THE SLOT THE WALK IS IN (#358).
+    //
+    // THIS IS THE HALF OF A HOLD THAT WAS MISSING FOR ITS WHOLE LIFE, and the
+    // argument for it is in HoldCharacterStill's own comment below rather than
+    // repeated here. What this function is, in one sentence: a MovePoint at the
+    // character's own standing position, which MotionMaster::Mutate services by
+    // deleting whatever generator was in MOTION_SLOT_ACTIVE first
+    // (MotionMaster.cpp:904-915), so the FollowMovementGenerator that
+    // Unit::StopMoving cannot reach is displaced by a walk that ends where the
+    // character already stands.
+    //
+    // IT ONLY ACTS WHEN THERE IS SOMETHING IN THE SLOT TO DISPLACE, and asking
+    // is exact rather than approximate: GetMotionSlotType answers
+    // NULL_MOTION_TYPE for an empty slot (MotionMaster.cpp:1031-1037), and an
+    // empty active slot IS the state this whole mechanism exists to reach. Two
+    // things depend on the test rather than on it merely being cheap. A pin
+    // taken over an empty slot would put a generator into the state the hold
+    // wants empty and send every observer a stop packet to no purpose; and the
+    // answer this returns is what the log lines and the `retaken` counter
+    // report, so without it every hold would claim to have taken over a walk
+    // and the counter would count holds instead of fights.
+    //
+    // AND IT STOPS THE WALK IT ITSELF JUST STARTED, WHICH IS NOT A DETAIL. The
+    // core does not leave a MovePoint onto a unit's own position alone:
+    // PointMovementGenerator::DoInitialize nudges a destination whose x and y
+    // fuzzy-equal the unit's own by 0.2 yards along its facing
+    // (PointMovementGenerator.cpp:73-78, a deliberate fix for a client-side
+    // orientation artefact) and then launches a spline for it, and
+    // MoveSplineInit::Launch writes MOVEMENTFLAG_FORWARD into m_movementInfo in
+    // that same call (MoveSplineInit.cpp:74, :111). That flag is what
+    // Unit::isMoving reads, and three verbs read Unit::isMoving in the
+    // statement after they take this hold - so a pin that did not stop itself
+    // would refuse `summoner is moving` about a character it had just rooted,
+    // which is the defect this change is fixing, wearing this change's clothes.
+    //
+    // STOPPING IT COSTS THE CHARACTER NOTHING AND LEAVES EXACTLY THE RIGHT
+    // STATE. Both calls happen inside one tick, before anything advances a
+    // spline, so the fifth of a yard is never travelled; the follow generator
+    // is gone because MotionMaster::Mutate deleted it before the point
+    // generator was initialised; and PointMovementGenerator::DoUpdate answers
+    // false on a finalised spline (PointMovementGenerator.cpp:241-247), so the
+    // motion master drops the pin on its next update and the active slot ends
+    // up empty. That is the same mechanism #355 wrote down when it warned that
+    // a hold placed AFTER a walk kills the walk, used deliberately.
+    static bool PinWhereItStands(Player* who)
+    {
+        if (!who)
+            return false;
+        MotionMaster* const motion = who->GetMotionMaster();
+        if (!motion)
+            return false;
+        if (motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == NULL_MOTION_TYPE)
+            return false;
+        motion->MovePoint(HOLD_PIN_POINT_ID, who->GetPositionX(), who->GetPositionY(),
+                          who->GetPositionZ());
+        who->StopMoving();
+        return true;
+    }
+
+    // Write down where a hold means, which is always where the character is
+    // standing at the moment the hold is taken or re-taken. Never a remembered
+    // place: see HoldRecord's own note on why re-anchoring cannot walk anybody
+    // over ground nothing has proved.
+    static void AnchorHoldWhereItStands(HoldRecord& record, Player* who)
+    {
+        record.anchorMapId = who->GetMapId();
+        record.anchorX = who->GetPositionX();
+        record.anchorY = who->GetPositionY();
+    }
+
+    // A VERB IS WALKING THIS HELD CHARACTER ON PURPOSE, AND THE SWEEP MUST NOT
+    // UNDO IT (#357, #358).
+    //
+    // Exactly one caller exists and it is the summon's approach, which walks a
+    // clicker the last few yards onto a meeting stone with a MovePoint issued
+    // under the hold. Without this the per-tick sweep would see a held
+    // character further from its anchor than the slack allows, conclude it was
+    // being dragged, and re-take the slot - killing the walk that #357 added
+    // and moving the summon's failure rather than fixing it.
+    //
+    // IT IS SAID BY THE WALK RATHER THAN GUESSED BY THE SWEEP, because there is
+    // nothing to guess from. Both the pin and the approach are POINT_MOTION_TYPE
+    // in the same slot, and so is a mod-playerbots MoveTo - which is the driver
+    // the dev realm's death rows name as `movement_generator=point` with no
+    // attributable owner. A sweep that tried to tell them apart by type would
+    // have to be wrong about one of them.
+    //
+    // A NAME THAT IS NOT HELD IS A NO-OP RATHER THAN AN ERROR. The approach can
+    // legitimately run for a character whose hold has just reached its ceiling,
+    // and the honest answer there is that the sweep has nothing to suppress.
+    static void LetHeldCharacterWalk(std::string const& name, uint32 forSeconds)
+    {
+        auto& holds = HoldsInForce();
+        auto const hold = holds.find(name);
+        if (hold == holds.end())
+            return;
+        hold->second.walkingUntil = time(nullptr) + forSeconds;
+    }
+
     // ASK THE CHARACTER TO STAND STILL, and re-assert if it is already held.
     //
     // RE-ASSERTION IS THE POINT OF CALLING THIS TWICE. A strategy set is not
@@ -5037,25 +5221,58 @@ private:
     //     for as long as the leader keeps moving - which is exactly forty yards
     //     in nine seconds.
     //
-    // SO THE HOLD IS EXACTLY AS STRONG AS ITS NAME AND NO STRONGER: it stops a
-    // character being SENT somewhere, and it stops one that was standing still
-    // from wandering off. It is not a root. Every verb that depends on it is
-    // depending on the character having nothing already in flight, which is
-    // true for a `conjure` or a `hearth` on a character at an inn and is not
-    // true for a party being walked to a door. `stage` (#346) is the one most
-    // exposed to this, because it holds a whole party at the exact moment its
-    // leader is being re-aimed.
+    // THAT USED TO BE WHERE THIS COMMENT STOPPED, and it stopped by saying the
+    // hold was exactly as strong as its name and no stronger: it prevented a
+    // character being SENT somewhere and it was not a root. Four verbs depended
+    // on it anyway, all four written as though nothing were ever in flight,
+    // which is true for a `conjure` or a `hearth` at an inn and false for a
+    // party being walked to a door. What that cost, on one day on the dev
+    // realm: a hearth asked fourteen times in two minutes on one character,
+    // refusing `character is moving`, then `character is already casting`, then
+    // `hearthstone is on cooldown` over and over, because a ten second cast
+    // cannot survive a character that is being dragged and the item goes on
+    // cooldown when the cast breaks; a summon refused for the same reason on
+    // the same afternoon; and, over the module's whole history on that realm,
+    // zero rows of kind `bind` in its own event table against 1426
+    // quest_accept and 801 death. The inn-bind errand had never once completed,
+    // so most of the family is still bound on the wrong continent and every
+    // death teleports them across an ocean.
     //
-    // WHAT IS DONE ABOUT IT HERE: NOTHING, DELIBERATELY, AND THE REASON IS
-    // #163. Clearing the slot for every hold would cancel travel errands this
-    // module never asked to cancel, which is the failure that line was drawn to
-    // prevent. What #355 does instead is narrower and is in the summon verb
-    // rather than in the hold: WalkTowardTheStone issues a MovePoint, which
-    // mutates the same MOTION_SLOT_ACTIVE (MotionMaster.h:230, :242) and so
-    // displaces the chase with a walk that ENDS - and it is only ever issued to
-    // a character this hold is already holding, so it cancels nothing that was
-    // not already stopped. A verb that needs a character to stay put while
-    // something outside it is walking has to say where, not just say stop.
+    // SO THE HOLD TAKES THE ACTIVE MOTION SLOT NOW (#358), AND THAT IS THE
+    // WHOLE OF THE CHANGE. PinWhereItStands, just above, issues a MovePoint at
+    // the character's own standing position. MotionMaster::Mutate deletes
+    // whatever was in MOTION_SLOT_ACTIVE before it puts the new generator there
+    // (MotionMaster.cpp:900-928) and MoveFollow uses that same slot
+    // (MotionMaster.h:230, :242), so the follow generator that was dragging the
+    // character is not merely out-ranked, it is gone, and the walk that
+    // replaces it ends where the character already is.
+    //
+    // IT IS STILL NOT A MOTION MASTER CLEAR, WHICH IS THE LINE #308 DREW AND
+    // #330 KEPT, AND THE DIFFERENCE IS NOT A TECHNICALITY. MotionMaster::Clear
+    // discards every generator a character has; this replaces one slot with a
+    // walk that ENDS and then falls back to idle, which is the same shape of
+    // call the travel drive itself makes every time it aims anybody. Nor is an
+    // errand a movement generator: a `travel_npc` aim is a row this module
+    // wrote and mod-playerbots re-reads, so a character whose current leg is
+    // displaced resumes it from wherever it stands the moment the hold lifts
+    // and its strategies come back. Nothing is cancelled, which is exactly what
+    // #163's failure was.
+    //
+    // THIS IS THE SAME MECHANISM #355 ALREADY SHIPPED, MOVED ONE LEVEL DOWN.
+    // WalkTowardTheStone has been issuing a MovePoint under this hold since
+    // #357 merged, on the argument - correct, and now generalised - that doing
+    // it to a character the hold is already holding cancels nothing, because a
+    // held character's errand is already stopped. What that fixed for one verb,
+    // this fixes for the hold every verb shares.
+    //
+    // AND ONE CALL IS NOT ENOUGH, WHICH IS THE OTHER HALF. A hearthstone is a
+    // ten second cast and the register stops this module's own sweeps, not the
+    // bot AI: `loot`, `gather` and the rest are still on the list and any of
+    // them can put a new generator in the slot on a later tick. Nothing
+    // re-asserted the hold between polls - a parked `hearth` row reads the
+    // world back and holds nothing - so KeepHeldCharactersStill runs on every
+    // world tick and re-takes the slot for any held character that has drifted
+    // off its anchor. See that function for what it deliberately leaves alone.
     //
     // AND `flee` IS LEFT ALONE, DELIBERATELY. A fleeing character moves, so
     // `flee` fights this hold, and removing it would be a casting verb holding a
@@ -5110,6 +5327,16 @@ private:
         who->StopMoving();
         who->ClearUnitState(UNIT_STATE_CHASE);
         who->ClearUnitState(UNIT_STATE_FOLLOW);
+
+        // AND THEN THE SLOT, WHICH IS AN ORDER AND NOT AN ORDERING (#358).
+        // StopMoving has to come first: it finalises the spline the generator
+        // is currently running, and #355 already had to write down that a hold
+        // placed AFTER a walk kills the walk for exactly that reason. Taking
+        // the slot second means the generator this hold cannot otherwise reach
+        // is deleted while the character is already standing, so there is no
+        // tick on which it is half held. PinWhereItStands closes the same loop
+        // on itself; see its own comment for why it has to.
+        bool const pinned = PinWhereItStands(who);
 
         // AND IT STANDS THE CHARACTER UP, WHICH IS PART OF HOLDING IT (#337).
         // A sitting character is not held, it is parked: it cannot cast, and
@@ -5196,10 +5423,11 @@ private:
             record.verb = verb ? verb : "";
             record.stoodItUp = wasSitting;
             record.dismountedIt = wasMounted;
+            AnchorHoldWhereItStands(record, who);
             holds[name] = record;
             LOG_INFO("module.overseer",
                      "overseer: '{}' is held still to {} for at most {}s (stay {}, follow {}, "
-                     "new rpg {}, {}, {}); it walks again the moment the hold is lifted, "
+                     "new rpg {}, {}, {}, {}); it walks again the moment the hold is lifted, "
                      "however it is lifted",
                      name, record.verb, ceilingSeconds,
                      plan.addStay ? "added" : "already on",
@@ -5219,9 +5447,31 @@ private:
                      // there was: a leader the travel drive had put on a mount.
                      !readyToCast ? "mount left alone"
                      : wasMounted ? "taken off its mount"
-                                  : "not mounted");
+                                  : "not mounted",
+                     // ...and the reading the other five never had, which is
+                     // the one #358 is about. A row that said `already
+                     // standing` was read as "so there was nothing left to
+                     // stop it", and there was: a walk in the motion master
+                     // that no part of this hold could see, let alone report.
+                     pinned ? "the walk it was already on is taken over"
+                            : "nothing was already walking it");
             return true;
         }
+
+        // AND THE ANCHOR MOVES TO WHERE THE CHARACTER NOW IS, ON EVERY
+        // RE-ASSERTION, WHICH IS LOAD-BEARING FOR THE SUMMON (#358). A hold
+        // means "stand where you are", and where the character is is what it
+        // was last told to be. #355's approach walks a held clicker up to forty
+        // yards onto a meeting stone and then holds it again there; an anchor
+        // left at the place the FIRST hold was taken would put that character
+        // permanently outside the slack, and the sweep would spend the rest of
+        // the hold re-taking a slot nothing was in.
+        AnchorHoldWhereItStands(existing->second, who);
+        // ...and any claim that a verb is walking this character is stale the
+        // moment the hold stops it. The approach re-states it immediately
+        // afterwards, in the same statement, which is the order
+        // HoldAndWalkTheClickers already documents.
+        existing->second.walkingUntil = 0;
 
         // A re-assertion that had to stand it up again is worth the record
         // carrying, because it is the `food` strategy winning between polls.
@@ -5255,6 +5505,19 @@ private:
                      "the core refuses a mounted caster and reports it to a client this "
                      "character does not have",
                      name, existing->second.verb);
+        // AND A WALK FOUND IN THE SLOT MID-HOLD IS THE READING #358 EXISTS FOR.
+        // Something outside this module put a mover on a character this module
+        // is holding, between two polls, and said so nowhere. It is counted as
+        // well as logged, so the release line can report how hard the hold had
+        // to be held rather than only that it was.
+        if (pinned)
+        {
+            ++existing->second.retaken;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' had a walk in flight mid-{} and the motion slot is taken "
+                     "over again - this is the {} time this hold has had to do that",
+                     name, existing->second.verb, existing->second.retaken);
+        }
         return false;
     }
 
@@ -5317,10 +5580,17 @@ private:
             botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
         LOG_INFO("module.overseer",
                  "overseer: '{}' is released from its {} hold - {} (stay {}, follow {}, "
-                 "new rpg {})",
+                 "new rpg {}); the motion slot had to be taken over {} time(s) while it stood",
                  name, record.verb, why ? why : "", record.addedStay ? "removed" : "left alone",
                  record.removedFollow ? "restored" : "not touched",
-                 record.removedNewRpg ? "restored" : "not touched");
+                 record.removedNewRpg ? "restored" : "not touched",
+                 // ZERO IS THE INTERESTING ANSWER AS OFTEN AS A LARGE NUMBER IS
+                 // (#358). It says nothing fought this hold, which is what a
+                 // `conjure` at an inn should read; a `stage` row reading five
+                 // says a party is being dragged by something the register does
+                 // not stop, and that is a different investigation from
+                 // whichever verb happened to be running.
+                 record.retaken);
     }
 
     // WHAT A ROW REPORTS ABOUT ITS HOLD, and the same four fields for all three
@@ -5439,6 +5709,112 @@ private:
         for (std::string const& name : due)
             ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false),
                         "its hold reached the ceiling and nothing came back for it");
+    }
+
+    // AND THE THING THAT MAKES A HOLD LAST LONGER THAN THE INSTANT IT IS TAKEN
+    // (#358).
+    //
+    // WHY A HOLD NEEDS ANYTHING AT ALL BETWEEN POLLS. A hearthstone is a ten
+    // second cast and a meeting stone's ritual settles over five, and nothing
+    // in this module re-asserted a hold across either of those windows: a
+    // parked `hearth` row reads the world back and holds nobody, and the
+    // `summon` that got as far as clicking is done issuing calls. The register
+    // stops this module's own six hand-back sites and it stops nothing else,
+    // so `loot`, `gather` and every other strategy the hold deliberately leaves
+    // on can put a fresh generator in the active slot on any tick. The dev
+    // realm's own death rows name that driver and cannot attribute it:
+    // `movement_generator=point` with no owner, which is a mod-playerbots
+    // MoveTo and not anything this module wrote.
+    //
+    // SO IT RUNS ON EVERY WORLD TICK, AND THAT IS AFFORDABLE RATHER THAN
+    // CHEAP-SOUNDING. The register is empty on almost every tick of this
+    // module's life - it holds a name only while a verb is casting or a barrier
+    // is waiting - and the first line here is the early-out that says so. When
+    // it is not empty it holds at most a handful of names, and the lookup is a
+    // hash: ObjectAccessor::FindPlayerByName is PlayerNameMapHolder::Find with
+    // one IsInWorld test after it (ObjectAccessor.cpp:271-278), not a walk over
+    // the world's players. A timer here would put a floor under how long a
+    // dragged character keeps moving, and that duration is the entire quantity
+    // this function exists to minimise.
+    //
+    // IT NEVER WALKS ANYBODY BACK. The pin is re-taken where the character now
+    // stands and the anchor moves with it, so a hold that has been dragged five
+    // yards stops the drag rather than undoing it. Walking it back would mean
+    // issuing a MovePoint at a remembered coordinate over ground nothing has
+    // proved this poll, which is #138's mechanism, and #138 killed characters.
+    // A hold is a root, not a leash.
+    //
+    // WHAT IT LEAVES ALONE IS IN RetakeTheHold, where it can be tested. The
+    // short version, because a reader here will want it: a name that does not
+    // resolve, a hold past its ceiling, a character a verb is walking on
+    // purpose, and a character in combat.
+    static void KeepHeldCharactersStill()
+    {
+        auto& holds = HoldsInForce();
+        if (holds.empty())
+            return;
+
+        time_t const now = time(nullptr);
+        for (auto& entry : holds)
+        {
+            HoldRecord& record = entry.second;
+            Player* const who = ObjectAccessor::FindPlayerByName(entry.first, false);
+
+            OverseerDecisions::HeldStillFacts facts;
+            facts.present = who && who->IsInWorld() && !who->IsBeingTeleported();
+            facts.pastDeadline = now >= record.until;
+            facts.walkingOnPurpose = now < record.walkingUntil;
+            facts.inCombat = facts.present && who->IsInCombat();
+
+            // A CHARACTER ON ANOTHER MAP UNDER ITS OWN HOLD IS A HEARTH THAT
+            // WORKED, and this sweep has nothing to say about where it landed.
+            // The anchor follows it rather than the pin being re-taken: the
+            // row's own resolver reads the arrival back and releases the hold a
+            // moment later, and a distance between two maps is not a number
+            // this or any other reader should be computing.
+            if (facts.present && who->GetMapId() != record.anchorMapId)
+            {
+                AnchorHoldWhereItStands(record, who);
+                continue;
+            }
+
+            // Position::GetExactDist2d (Position.h:170) and not
+            // WorldObject::GetDistance2d, for the reason every other distance
+            // in this file gives: the latter subtracts the character's own
+            // size, and this is a question about ground covered.
+            if (facts.present)
+                facts.driftYards = who->GetExactDist2d(record.anchorX, record.anchorY);
+
+            if (!OverseerDecisions::RetakeTheHold(facts, HOLD_PIN_SLACK_YARDS))
+                continue;
+
+            // `who` is not null here and that is the decision's doing rather
+            // than luck: RetakeTheHold refuses everything `present` is false
+            // for, and a name that resolved to nothing is one of them.
+            float const drifted = facts.driftYards;
+            who->StopMoving();
+            who->ClearUnitState(UNIT_STATE_CHASE);
+            who->ClearUnitState(UNIT_STATE_FOLLOW);
+            bool const pinned = PinWhereItStands(who);
+            AnchorHoldWhereItStands(record, who);
+            if (!pinned)
+                continue;
+
+            ++record.retaken;
+            // ONCE PER HOLD AND THEN COUNTED, DELIBERATELY. This runs on every
+            // world tick, so a character something is fighting hard for would
+            // otherwise write a line several times a second and bury the rest
+            // of the run. The first one is the interesting one - it says a hold
+            // started being fought and how far it had got - and the total is on
+            // the release line, which is the reading an operator goes to
+            // afterwards anyway.
+            if (record.retaken == 1)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' had drifted {:.1f}y off the place its {} hold meant "
+                         "and the motion slot is taken over - something outside this module "
+                         "put a walk on a character it is holding",
+                         entry.first, drifted, record.verb);
+        }
     }
 
     // ---------------------------------------------- the staging hold (#346) --
@@ -30034,6 +30410,22 @@ private:
             return false;
         who->GetMotionMaster()->MovePoint(SUMMON_APPROACH_POINT_ID, step.GetPositionX(),
                                           step.GetPositionY(), step.GetPositionZ());
+        // AND THE HOLD IS TOLD THAT THIS WALK IS DELIBERATE (#358). The hold
+        // now takes the active motion slot itself and a per-tick sweep re-takes
+        // it for any held character that has left the place its hold meant -
+        // which, without this line, is a precise description of a clicker
+        // walking the last fifteen yards onto a meeting stone. The sweep cannot
+        // tell this MovePoint from the one dragging a follower after its
+        // leader, because they are the same call in the same slot, so the walk
+        // says so rather than the sweep guessing.
+        //
+        // THE WINDOW IS THE ROW'S OWN CEILING FOR THIS WALK AND NOT A NEW
+        // NUMBER. SUMMON_APPROACH_CEILING_MS is how long the row will wait for
+        // the approach before giving up on it, so a suppression that outlived
+        // it would be protecting a walk nothing is waiting for any more, and
+        // one that expired first would have the sweep cancel a walk the row was
+        // still counting on.
+        LetHeldCharacterWalk(who->GetName(), SUMMON_APPROACH_CEILING_MS / 1000);
         return true;
     }
 
