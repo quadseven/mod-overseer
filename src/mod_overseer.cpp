@@ -10835,20 +10835,6 @@ private:
         return OverseerDecisions::GearReadRandomProperty(effects, everyEnchantmentRead);
     }
 
-    // A DROP THAT DOES NOT EXIST YET HAS NOTHING TO READ. A loot roll names a
-    // property id, but the Item it will become has not been created, so there
-    // are no enchantment slots to walk and no honest way to price it. The
-    // answer is the one this drive gave everything before #340: there is
-    // something here and it has not been read, so the score is a floor. That is
-    // deliberately unchanged for the Need vote, which reads `judged` and wants
-    // the strict answer.
-    static OverseerDecisions::GearResolvedProperty GearRandomPropertyUnread(bool present)
-    {
-        OverseerDecisions::GearResolvedProperty unread;
-        unread.unresolved = present;
-        return unread;
-    }
-
     // An item template flattened into the plain facts the scorer reads. The
     // scorer includes no core header, so this is where a core type stops.
     static OverseerDecisions::GearItem GearItemFor(
@@ -10933,25 +10919,6 @@ private:
             return OverseerDecisions::GearWorn(OverseerDecisions::GearVerdict{});
         return OverseerDecisions::GearWorn(
             GearScoreFor(bot, who, proto, GearRandomPropertyOf(item)));
-    }
-
-    // The same thing as a bare number, which is all the Need vote wants: what
-    // it is comparing is one member's total against another's, and a total is
-    // never exact anyway.
-    static float GearWornScore(Player* bot, OverseerDecisions::GearWearer const& who,
-                               uint8 slot)
-    {
-        return GearWornIncumbent(bot, who, slot).score;
-    }
-
-    // Everything a character is wearing, scored, which is what decides who
-    // Needs when two of them want the same drop.
-    static float GearTotalWorn(Player* bot, OverseerDecisions::GearWearer const& who)
-    {
-        float total = 0.f;
-        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
-            total += GearWornScore(bot, who, slot);
-        return total;
     }
 
     // Everything in the backpack and the equipped bags. Same walk ProbeBags
@@ -11207,196 +11174,55 @@ private:
         }
     }
 
-    // Everything one member needs to be voted for.
+    // Everything the gear drive needs to know about one member.
     struct GearMember
     {
         Player* bot{nullptr};
         OverseerDecisions::GearWearer who;
     };
 
-    // NEED ON A REAL UPGRADE, GREED ON EVERYTHING ELSE (#10, #145).
+    // WHY THIS DRIVE CASTS NO NEED/GREED VOTE (#10, #145, #374).
     //
-    // WHAT THIS ADDS TO WHAT IS ALREADY DEPLOYED, AND WHAT IT LEAVES ALONE.
-    // The voting itself works: LootNeedRollLevel = 2 and LootGreedRollLevel = 1
-    // are set on this realm, so a NEED reaches the tally as a NEED and a GREED
-    // as a GREED rather than being downgraded to a pass, and patch 0008 already
-    // stopped BAD_EQUIP - the value that means "I have decided not to wear
-    // this" - from voting NEED. None of that is touched. What is added is the
-    // judgement in front of it, from the same scorer the sweep above uses, so
-    // that "upgrade" means the same thing to the roll as it does to the
-    // wardrobe.
+    // It used to. The vote scored a drop against the incumbent in the slot it
+    // would occupy, Needed only on a real upgrade, Greeded on everything else,
+    // and settled two members wanting the same drop by whoever carried the
+    // lower total equipped score. Nothing about that rule was wrong. It was
+    // simply never the first to reach an open roll, and it never could be:
+    // across the whole retained worldserver log of the dev realm, over a period
+    // in which rolls were demonstrably opening and being won, neither of its two
+    // log lines appeared even once.
     //
-    // IT ONLY EVER FILLS IN A VOTE NOBODY HAS CAST. mod-playerbots'
-    // LootRollAction votes on the same rolls from the bot's own AI tick and
-    // guards itself the same way (LootRollAction.cpp:26-28), and whichever of
-    // the two reaches a still-unvoted roll first is the one that counts. This
-    // does not try to overrule a vote already cast, because it cannot:
-    // Group::CountRollVote has no idempotence at all (Group.cpp:1501-1548
-    // increments totalNeed/totalGreed/totalPass unconditionally and calls
-    // CountTheRoll the moment they add up), so voting twice for one member
-    // corrupts the tally and can end the roll early. A race that is only ever
-    // resolved in favour of "somebody has an opinion" is safe; one resolved by
-    // arithmetic on a shared counter is not.
+    // WHAT REACHES AN OPEN ROLL FIRST. mod-playerbots' LootRollAction answers a
+    // roll from the packet that opens it rather than from a poll: the local
+    // patch that binds SMSG_LOOT_START_ROLL to the `loot roll` trigger gives
+    // that action a node at relevance 100 in every one of a bot's engines, and
+    // LootRollAction::Execute then votes on EVERY roll where its own vote is
+    // still NOT_EMITED_YET, not only the one the packet named. So by the time
+    // anything on this side could look, no member has an un-emitted vote left.
     //
-    // MASTER LOOT AND FREE FOR ALL ARE LEFT ENTIRELY ALONE. Under those methods
-    // the roll is not how the item is distributed and upstream votes PASS
-    // (LootRollAction.cpp:96-105); there is nothing here to improve and a Need
-    // cast into one would be noise.
-    void VoteOnOpenRolls(Group* group, std::vector<GearMember> const& members)
-    {
-        LootMethod const method = group->GetLootMethod();
-        if (method == MASTER_LOOT || method == FREE_FOR_ALL)
-            return;
-
-        // GetRolls returns a COPY of the vector, which is what makes this safe
-        // to iterate while voting: CountRollVote can finish and delete the roll
-        // it was given, and the pointers to the OTHER rolls stay good. The one
-        // rule is that nothing may read `roll` after the first vote is cast on
-        // it, so everything needed is taken off it up front.
-        std::vector<Roll*> const rolls = group->GetRolls();
-        for (Roll* roll : rolls)
-        {
-            if (!roll)
-                continue;
-
-            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll->itemid);
-            if (!proto)
-                continue;
-
-            // GEAR ONLY. This scorer knows what a piece of armour and a weapon
-            // are worth to a character and knows nothing whatever about a
-            // recipe it could learn, a bigger bag, a reagent a profession
-            // wants, or an armour token. Upstream's ItemUsage does know about
-            // all four (ItemUsageValue.cpp:32-95 for the skill and consumable
-            // cases, LootRollAction.cpp:51-58 for tokens and :72-79 for
-            // recipes), and every one of those is a NEED it would cast and
-            // this file would turn into a Greed. So the vote is left entirely
-            // alone for anything that is not worn.
-            if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
-                continue;
-
-            ObjectGuid const rollGuid = roll->itemGUID;
-            bool const randomProperty = roll->itemRandomPropId != 0 || roll->itemRandomSuffix != 0;
-            bool const needAllowed = (roll->rollVoteMask & ROLL_FLAG_TYPE_NEED) != 0;
-
-            struct GearBallot
-            {
-                Player* bot{nullptr};
-                std::string name;
-                OverseerDecisions::GearVerdict verdict;
-                float incumbent{0.f};
-                bool wants{false};
-            };
-            std::vector<GearBallot> ballots;
-            std::vector<OverseerDecisions::GearContender> contenders;
-
-            for (GearMember const& member : members)
-            {
-                Roll::PlayerVote::const_iterator const cast =
-                    roll->playerVote.find(member.bot->GetGUID());
-                // Not in the roll at all (out of reward range), or already
-                // voted - either way this drive has nothing to add.
-                if (cast == roll->playerVote.end() || cast->second != NOT_EMITED_YET)
-                    continue;
-
-                GearBallot ballot;
-                ballot.bot = member.bot;
-                ballot.name = member.who.name;
-                ballot.verdict = GearScoreFor(member.bot, member.who, proto,
-                                              GearRandomPropertyUnread(randomProperty));
-
-                // AN UNJUDGED VERDICT CASTS NO VOTE AT ALL. Not a Greed: a
-                // Greed is an opinion, and the whole content of `judged ==
-                // false` is that this file does not have one - the item's
-                // worth is partly in a proc it does not read, or in a random
-                // suffix that could not be resolved, or the character's role
-                // was never named. Leaving the vote un-emitted hands the roll
-                // back to mod-playerbots' LootRollAction on the bot's next
-                // tick, which is exactly what happened before this drive
-                // existed. Silence is the only answer here that cannot be a
-                // regression.
-                if (!ballot.verdict.judged)
-                    continue;
-
-                if (ballot.verdict.wearable)
-                {
-                    uint8 const found = member.bot->FindEquipSlot(proto, NULL_SLOT, true);
-                    if (found != NULL_SLOT && found < EQUIPMENT_SLOT_END)
-                    {
-                        ballot.incumbent = GearWornScore(member.bot, member.who, found);
-                        if (proto->InventoryType == INVTYPE_2HWEAPON &&
-                            found == EQUIPMENT_SLOT_MAINHAND)
-                        {
-                            ballot.incumbent = OverseerDecisions::GearIncumbent(
-                                ballot.incumbent,
-                                GearWornScore(member.bot, member.who, EQUIPMENT_SLOT_OFFHAND),
-                                true);
-                        }
-                        else if (found == EQUIPMENT_SLOT_FINGER1 ||
-                                 found == EQUIPMENT_SLOT_TRINKET1)
-                        {
-                            float const second = GearWornScore(
-                                member.bot, member.who, static_cast<uint8>(found + 1));
-                            if (second < ballot.incumbent)
-                                ballot.incumbent = second;
-                        }
-                        ballot.wants =
-                            OverseerDecisions::GearIsUpgrade(ballot.verdict, ballot.incumbent);
-                    }
-                }
-
-                if (ballot.wants)
-                {
-                    OverseerDecisions::GearContender contender;
-                    contender.name = ballot.name;
-                    contender.gain = ballot.verdict.score - ballot.incumbent;
-                    contender.totalWorn = GearTotalWorn(member.bot, member.who);
-                    contenders.push_back(contender);
-                }
-                ballots.push_back(ballot);
-            }
-
-            if (ballots.empty())
-                continue;
-
-            // Two members wanting the same drop is settled here rather than by
-            // the dice: the one with the lower total equipped score Needs and
-            // the other Greeds, so the run raises the party's floor instead of
-            // handing the item to whoever rolled higher. See GearNeedWinner.
-            std::string const winner =
-                needAllowed ? OverseerDecisions::GearNeedWinner(contenders) : std::string();
-
-            for (GearBallot const& ballot : ballots)
-            {
-                bool const needs = !winner.empty() && ballot.name == winner;
-                if (needs)
-                {
-                    std::string const contested =
-                        contenders.size() > 1
-                            ? std::string(", and is the worst geared of those who want it")
-                            : std::string();
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' needs on {} - {} against {} for the {} it is "
-                             "wearing{}",
-                             ballot.name, proto->Name1, ballot.verdict.why,
-                             static_cast<int>(ballot.incumbent),
-                             GearSlotName(ballot.bot->FindEquipSlot(proto, NULL_SLOT, true)),
-                             contested);
-                }
-                else
-                {
-                    std::string why = ballot.verdict.why;
-                    if (ballot.verdict.wearable)
-                        why = ballot.wants ? "another member wants it more"
-                                           : "not an upgrade for it";
-                    LOG_INFO("module.overseer", "overseer: '{}' greeds on {} - {}",
-                             ballot.name, proto->Name1, why);
-                }
-                group->CountRollVote(ballot.bot->GetGUID(), rollGuid,
-                                     needs ? uint8(ROLL_NEED) : uint8(ROLL_GREED));
-            }
-        }
-    }
+    // AND NO POLL CAN BE MADE FAST ENOUGH, which is why this is a removal and
+    // not a smaller GEAR_POLL_MS. Two orderings inside the core settle it.
+    // World::Update runs sMapMgr->Update BEFORE sScriptMgr->OnWorldUpdate, so
+    // every bot's AI - and therefore every packet-driven vote - runs ahead of
+    // this module's OnUpdate within the same world tick; this drive sits at the
+    // back of the tick by construction. And Group::GroupLoot sends the opening
+    // packet BEFORE it pushes the roll onto RollId, so the roll is not yet in
+    // group->GetRolls() at the one instant a packet hook could act on it, which
+    // closes the other obvious repair as well.
+    //
+    // WHERE THE POLICY HAS TO LIVE INSTEAD. In LootRollAction, which is where
+    // the vote is actually cast. That is a change to the local mod-playerbots
+    // patch set and not to this adapter, because the pure scorer is not
+    // linkable from that tree and the rule would have to be re-expressed there.
+    // #374 records what upstream's rule currently is, including the part worth
+    // knowing: it does not Need on a duplicate of what a character is WEARING,
+    // and it does Need again on a second copy of an upgrade that is still
+    // sitting in the bags.
+    //
+    // WHAT IS DELIBERATELY KEPT. The whole pure layer, untouched and still
+    // tested: GearScore, GearIsUpgrade, GearIncumbent and GearNeedWinner are
+    // the rule itself and are what a future patch would re-express. Only the
+    // call site that could never run is gone.
 
     // Every enabled character's talent tree, which is the only thing this drive
     // needs out of the roster table. Read on its own, on the same terms as
@@ -11441,23 +11267,8 @@ private:
         if (members.empty())
             return;
 
-        // THE SWEEP FIRST, THE VOTE SECOND, on purpose: a character that puts
-        // something on this pass is voting on the next drop against what it is
-        // NOW wearing, which is the loop this issue exists to close. Doing it
-        // the other way round would have every roll judged against the gear the
-        // character had already decided to stop wearing.
         for (GearMember& member : members)
             SweepGear(member.bot, member.who);
-
-        // One vote per group, not one per member: the whole family shares a
-        // party, and asking each of them for its group would walk the same roll
-        // list five times.
-        std::set<Group*> groups;
-        for (GearMember const& member : members)
-            if (Group* group = member.bot->GetGroup())
-                groups.insert(group);
-        for (Group* group : groups)
-            VoteOnOpenRolls(group, members);
     }
 
     // Only `new rpg` walks a character to an NPC: it owns the `wander npc
