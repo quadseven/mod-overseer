@@ -18849,6 +18849,24 @@ private:
         bool loggedGathering{false};
         bool loggedBarrierWaiting{false};
         bool loggedCrossingAim{false};
+        // AND WHAT THAT LINE SAID ABOUT THE DOOR'S OWN HEIGHT (#376). The aim
+        // line is said once per crossing, which is right for it, and the one
+        // fact in it that can change mid-crossing is whether the aim got onto
+        // the floor: the surface probe needs the door's grid loaded, and a
+        // crossing can begin before it is. Said once and never again, the line
+        // would then report an ungrounded aim for the rest of a crossing that
+        // grounded on its second poll - a log describing a state the module is
+        // no longer in. So the verdict is remembered and the line is said again
+        // when it flips, which is once more at most and only when something a
+        // reader would act on has actually changed.
+        //
+        // IT NEEDS NO RESET OF ITS OWN, deliberately, and that is why it is not
+        // added to the four places that clear loggedCrossingAim. It is only
+        // ever read beside that flag, and clearing that flag makes the next
+        // poll say the line unconditionally and overwrite this one with the
+        // verdict it just printed. A reset here would be a fifth thing to
+        // remember for no change in behaviour.
+        bool loggedCrossingAimGrounded{false};
         bool loggedCrossingWaiting{false};
         bool loggedStagedWaiting{false};
         bool loggedAccepted{false};
@@ -20058,9 +20076,15 @@ private:
                 EscortToward(state.name, doorAim, what, purpose);
         }
 
-        if (!coord.loggedCrossingAim)
+        // SAID AGAIN IF THE GROUNDING VERDICT FLIPPED, and only then. See
+        // loggedCrossingAimGrounded: a crossing that begins before the door's
+        // grid is loaded starts on the trigger's own z and moves onto the floor
+        // a poll or two later, and a line that cannot say so is describing a
+        // state the module has left.
+        if (!coord.loggedCrossingAim || coord.loggedCrossingAimGrounded != doorHeight.grounded)
         {
             coord.loggedCrossingAim = true;
+            coord.loggedCrossingAimGrounded = doorHeight.grounded;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} walks the party the last yards onto "
                      "areatrigger {} ({}) - every member under its own power, and nobody "
