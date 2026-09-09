@@ -6886,17 +6886,21 @@ TeleportFlight ReadTeleportFlight(bool inNameMap, bool inWorld, bool stillTelepo
 //   target_arg   optional: the second clicker. Empty means "pick an eligible
 //                party member already standing at the stone"
 //   detail       short refusal literal, or empty on success
-//   result       JSON: outcome (arrived|stayed|elsewhere|refused|unreadable),
-//                reason, retry (never|elsewhere|later - see
+//   result       JSON: outcome (arrived|stayed|elsewhere|refused|unreadable|
+//                walking|summoning), reason, retry (never|elsewhere|later - see
 //                SummonRefusalRetry), summoner, summoned, helper, stone,
 //                stone_entry, portal_entry, participants, required, flight (see
 //                TeleportFlightWord), accepts, settle_ms, window_ms, waited_ms,
-//                at, from and now each {map, area, x, y, z} or null, request
-//   status       'verifying' from the moment the portal is clicked, then
-//                'applied' when the summoned character reads back at the stone,
-//                'unchanged' when it never moved, 'error' otherwise. NOT
-//                'delivered', for the same reason kind='hearth' is not: a
-//                crossing that reports delivery and moves nobody is the bug.
+//                walked_summoner, walked_helper, approach_ms,
+//                helper_stone_yards, at, from and now each {map, area, x, y, z}
+//                or null, request
+//   status       'verifying' from the moment the row starts walking its
+//                clickers to the stone, and still 'verifying' through the
+//                ritual; then 'applied' when the summoned character reads back
+//                at the stone, 'unchanged' when it never moved, 'error'
+//                otherwise. NOT 'delivered', for the same reason kind='hearth'
+//                is not: a crossing that reports delivery and moves nobody is
+//                the bug.
 
 enum class SummonVerb
 {
@@ -6988,6 +6992,79 @@ uint32_t SummonVerifyWindowMs(uint32_t settleMs, uint32_t marginMs, uint32_t flo
 // change for the SAME row to succeed. Unknown is `Later`, the same call the
 // bind, hearth, sell and repair tables make.
 TownRetry SummonRefusalRetry(std::string const& detail);
+
+// ------------------------------------ the last few yards to a stone (#355) --
+//
+// WHAT THIS DECIDES, AND THE MEASUREMENT THAT ASKED FOR IT. `kind='summon'` is
+// this module's own stated answer for a member stranded on another continent -
+// the home drive's refusal says so in as many words - and an operator could not
+// land one in seven attempts over forty minutes on the dev realm on 2026-09-09.
+// The reason is structural rather than luck: ONLY THE LEADER EVER REACHES THE
+// STONE. A leader can be aimed, and on its aim it reached three yards. A
+// FOLLOWER walks to the LEADER and stops at follow distance, which parked the
+// two measured clickers 15 and 16 yards from the stone, and the gate the core
+// keeps is GameObject::GetInteractionDistance - INTERACTION_DISTANCE for a
+// meeting stone, about five yards. So a follower chosen as a clicker is never
+// in reach however long anybody waits, and the two refusals the row produced
+// said exactly that:
+//
+//     Bork 15y, Og 16y  ->  summoner is moving
+//     Bork 55y          ->  no meeting stone within reach of the summoner
+//
+// THE HOLD WAS ALREADY THERE AND IT IS NOT THE MISSING HALF. #335 and #338
+// built one hold for the three casting verbs and #350 put a dismount inside it,
+// and the log shows all of it working. But a hold pins a character WHERE IT
+// ALREADY STANDS, and where it stood was fifteen yards out. What was missing is
+// the short walk that turns a hold at the wrong place into a hold at the stone.
+//
+// SO A ROW HAS THREE ANSWERS AND NOT TWO, and this is the whole of the rule.
+// The executor supplies the core's own verdict on whether the stone can be
+// clicked from where the character stands, the distance to the nearest stone it
+// can see, how far this verb is willing to walk, and how long the walk has
+// already had.
+//
+// THE GATE IS AN INPUT AND IS NOT RE-DERIVED HERE. The comparison the core's
+// own handler makes is WorldObject::IsWithinDistInMap against the object's
+// interaction distance: three dimensions, both bounding radii subtracted, and
+// the map and the phase checked on the way past. A float comparison in this
+// file could not answer that and must not pretend to, and a decision that
+// disagreed with the handler by a hand's breadth would produce a row that walks
+// to a stone, believes it has arrived, and has its click dropped in silence for
+// ever. So the executor asks the core and passes the answer in, which is the
+// same discipline every other decision in this file keeps about facts only the
+// worldserver holds.
+enum class SummonApproach
+{
+    // Nothing this verb can use. Either the sweep found no stone at all
+    // (`nearestYards` negative, which is the executor's "never took a reading")
+    // or it found one further off than this verb will walk anybody. Both mean
+    // the same thing to a sender - stand somewhere else - which is why they are
+    // one answer and not two.
+    NoStone,
+    // Inside the gate WorldSession::HandleGameObjectUseOpcode itself enforces,
+    // so the ritual can be driven from where the character already is. This is
+    // the answer every summon before #355 could ever get.
+    Click,
+    // Outside that gate and inside the walk. The clicker is walked the last few
+    // yards and the row waits, which is the answer that did not exist.
+    Walk,
+    // The walk has had its time and the clicker is still not in reach. A real
+    // answer rather than a row that walks for ever: something the executor
+    // cannot see is holding the character up, and saying so with the distance
+    // beside it is what the next attempt needs.
+    OutOfTime,
+};
+
+// "no-stone", "click", "walk", "out-of-time". Here rather than in the executor
+// so the word a test pins is the word a row carries.
+char const* SummonApproachWord(SummonApproach approach);
+
+// ARRIVAL IS ASKED BEFORE THE CLOCK, DELIBERATELY. A clicker that reaches the
+// stone on the very poll its walk runs out has arrived, and answering
+// `OutOfTime` about a character standing on the stone would throw away a summon
+// that was about to work. The clock only decides between walking and giving up.
+SummonApproach ReadSummonApproach(bool inReach, float nearestYards, float walkYards,
+                                  uint32_t walkedMs, uint32_t ceilingMs);
 // ---------------------------------------------------- conjure (#147, #18) --
 //
 // WHAT A kind='conjure' ROW MAY SAY, AND WHY THIS VERB EXISTS AT ALL.
