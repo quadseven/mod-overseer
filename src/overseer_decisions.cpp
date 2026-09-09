@@ -175,6 +175,28 @@ bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach)
                           reading.floorBelowValid, footingReach);
 }
 
+bool SomeInstrumentFoundGround(TerrainReading const& reading,
+                               float footingReach)
+{
+    // Detour's raw answer, with the footing correction taken off. The
+    // correction is a statement about walking and this is a question about
+    // ground; see the header for the two characters thirty yards apart that
+    // separated them.
+    return reading.hasLocalNavmesh ||
+           FloorUnderfoot(reading.z, reading.floorBelowZ,
+                          reading.floorBelowValid, footingReach);
+}
+
+bool NearTheVoidPlane(float currentZ, float catchYards)
+{
+    if (catchYards <= 0.f)
+        return false;
+    // No lower bound. A character already past the plane and not yet killed
+    // is still worth lifting, and one that has been killed is declined by the
+    // drive's own stand-down on a corpse long before this is asked.
+    return currentZ <= VOID_PLANE_Z + catchYards;
+}
+
 namespace
 {
 
@@ -224,6 +246,41 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         // over there has nothing to say about it.
         state = TerrainRecoveryState{};
     }
+
+    // AND THE GIVE-UP EXPIRES (#188). Separate from the three above rather
+    // than a fourth branch of them, because it answers a different question:
+    // those ask whether this is still the same incident, and this asks whether
+    // this module is still entitled to refuse to act on it.
+    //
+    // IT IS MEASURED FROM THE LAST REMEDY AND NOT FROM THE LAST HOLD, which is
+    // the whole reason the old window never opened. `lastHeld` is refreshed by
+    // every poll the condition is true on, so a character genuinely under the
+    // world pushed the forget window ahead of itself forever and the episode
+    // could not end: "GIVING UP until it has been clear for 600s" was, for the
+    // one population it was ever said about, giving up. `lastAttempt` does not
+    // move once the module has stopped acting, so ten minutes of being out of
+    // remedies really is ten minutes.
+    //
+    // ONLY THE LADDER COMES BACK, not the warning. `saidOnGround` is a note
+    // about a character nothing is being done to - an arch, a bridge deck, a
+    // tower floor - and repeating it every ten minutes would buy a reader
+    // nothing and cost them 79 lines a night at one Northshire coordinate
+    // alone. `attempts` is the remedy a character under the world needs
+    // another go at. The anchor is left alone so this is the same episode
+    // getting another rung and not a new one.
+    if (limits.forgetSeconds > 0 && state.lastAttempt &&
+        now - state.lastAttempt >= limits.forgetSeconds)
+    {
+        state.attempts = 0;
+        state.lastAttempt = 0;
+    }
+
+    // OUT OF THE BAND RE-ARMS THE CATCH, and it is cleared here rather than
+    // in the branch below because a character the catch WORKED on is fine on
+    // the next poll and returns long before that branch is reached. See
+    // TerrainRecoveryState::caughtBelow.
+    if (!NearTheVoidPlane(reading.z, limits.voidCatchYards))
+        state.caughtBelow = false;
 
     // WHETHER THIS CHARACTER IS ON THE GROUND, decided once and then read
     // three times, because all three readings are the same question. A polygon
@@ -283,6 +340,45 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
     }
 
+    // THE LAST STRETCH ABOVE THE KILL PLANE, WHERE THE BOUND STOPS APPLYING
+    // (#188). Read this AFTER the on-the-ground branch above and not before
+    // it: a character with a floor at its own feet at this depth is standing
+    // on a legitimate deep interior and must not be moved by anything, and
+    // that ordering is what keeps this rung from being a licence to displace.
+    //
+    // WHAT IT IS FOR. Six void deaths on 2026-09-08/09, all map 1, all at full
+    // health, out of combat, `driver=idle`, every one of them at z -506 to
+    // -528 with the previous sample already at -265 to -468. There is a window
+    // in which the character is demonstrably below the world and still alive,
+    // and this module was standing down through all of it: the ordinary
+    // stand-down declines a measured descent, and even without it the
+    // sixty-yard surface probe finds nothing overhead once a character is that
+    // far down, so there was no height to lift to and no rung left to spend.
+    // The adapter answers the first two; this answers the third.
+    //
+    // WHY IT MAY IGNORE THE LADDER. The ladder bounds displacement of
+    // characters that are probably fine, and #188 measured 204 of those in six
+    // hours. None of them was two hundred yards under the world. Inside this
+    // band the alternative to a remedy is not "leave a character where it is",
+    // it is a max-health kill past every immunity followed by a graveyard that
+    // has already been observed to be on another continent - which is the
+    // outcome the no-cross-map rule exists to prevent, arrived at by not
+    // acting instead of by acting.
+    //
+    // AND IT IS STILL A LIFT. Same map, same x, same y. The remedy set is not
+    // widened by one yard here; what changes is only whether the module is
+    // allowed to use it.
+    if (NearTheVoidPlane(reading.z, limits.voidCatchYards))
+    {
+        if (state.caughtBelow)
+            return TerrainRecoveryVerdict{};
+        state.caughtBelow = true;
+        state.lastAttempt = now;
+        return TerrainRecoveryVerdict{
+            TerrainRemedy::LiftToSurface,
+            reading.surfaceAboveZ + limits.liftClearance};
+    }
+
     // NO POLYGON. The ladder, and it is short on purpose: the failure this
     // replaces was an unbounded series, so the bound is the fix and not a
     // tuning knob. `surfaceValid` is already true here - neither predicate
@@ -312,7 +408,15 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
             state.lastAttempt = now;
             return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
         default:
-            // Said and done. Staying quiet is the point of this rung.
+            // Said and done, FOR THE LENGTH OF THE FORGET WINDOW. Staying
+            // quiet is still the point of this rung - a repeated identical
+            // line helps nobody - but it is a cooldown now and not a
+            // retirement: the re-arm above puts `attempts` back to zero ten
+            // minutes after the give-up, and the character gets its lift
+            // again. Four of the five characters that reached this rung on
+            // 2026-09-09 were dead within the hour, and the rung's own
+            // sentence had been promising them a 600 second window that could
+            // never open (#188).
             return TerrainRecoveryVerdict{};
     }
 }

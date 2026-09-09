@@ -393,6 +393,41 @@ constexpr float TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS = 25.0f;
 // MAX_HEIGHT, which can answer with an unrelated roof or terrain layer.
 constexpr float TERRAIN_RECOVERY_PROBE_YARDS = 60.0f;
 
+// AND HOW FAR IT REACHES FOR A CHARACTER THAT IS ALREADY FALLING OUT OF THE
+// WORLD (#188).
+//
+// THE BOUND ABOVE IS WHY THE VOID DEATHS HAD NO REMEDY. Sixty yards is the
+// right reach for the question it was written for - is there a roof over this
+// character's head, or a city floor it has slipped under - and it is the wrong
+// reach for a character at z -300 whose terrain is at z 140. The probe finds
+// nothing, `surfaceValid` comes back false, and every rule downstream
+// correctly refuses to move a character to a height nobody measured. So the
+// module watched six characters fall past it on 2026-09-08/09 with no height
+// to offer any of them.
+//
+// THE OBJECTION TO MAX_HEIGHT DOES NOT APPLY DOWN HERE. It is that a probe
+// from the top of the world can answer with an unrelated roof or terrain
+// layer, which would be a bad place to put a character that was walking along
+// a street. A character four hundred yards under the world has no good place
+// to be put and is about to be killed outright: an unrelated roof at its own
+// x and y is somewhere it can stand, on its own map, and is strictly better
+// than the plane. So the reach is widened only where the ordinary probe has
+// already come back empty AND the character is inside the band above the kill
+// plane, and it is deliberately a number rather than MAX_HEIGHT so the search
+// stays bounded and this comment stays falsifiable.
+//
+// A THOUSAND, BECAUSE THE FALL IS AT MOST THAT LONG. The plane is at -500 and
+// the highest ground either of this roster's continents reaches is under 500,
+// so a probe that starts a thousand yards over the character's own head
+// covers every surface that can exist above it anywhere in the band.
+constexpr float TERRAIN_RECOVERY_VOID_PROBE_YARDS = 1000.0f;
+
+// HOW FAR ABOVE THE KILL PLANE THE LADDER'S BOUND STOPS APPLYING. Derived
+// from the poll and from where this roster can legitimately stand; the whole
+// argument is on OverseerDecisions::TerrainRecoveryLimits::voidCatchYards and
+// is not repeated here.
+constexpr float TERRAIN_RECOVERY_VOID_CATCH_YARDS = 250.0f;
+
 // Four short probes answer whether the character's current height belongs to
 // the local walkable mesh. Two yards fits inside an ordinary room while still
 // requiring the navmesh to find a real polygon rather than a point in place.
@@ -467,7 +502,8 @@ constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_GAP_YARDS, TERRAIN_RECOVERY_OVERRIDE_GAP_YARDS,
     TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS,
     TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS,
-    TERRAIN_RECOVERY_FOOTING_REACH_YARDS};
+    TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
+    TERRAIN_RECOVERY_VOID_CATCH_YARDS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -10833,15 +10869,23 @@ private:
     // map terrain and VMAP geometry, which is the distinction the incident
     // needs: the raw terrain held the party at z 60 while the city WMO floor
     // above it was around z 95.
-    static bool SurfaceAbove(Player* bot, float& out)
+    //
+    // `probeYards` IS THE REACH, AND THE CALLER HAS TO CHOOSE IT. It defaults
+    // to the sixty this was written with, which is the right reach for asking
+    // whether a character has slipped under a roof. It is widened only for a
+    // character already falling out of the world, where sixty yards answers
+    // nothing at all; see TERRAIN_RECOVERY_VOID_PROBE_YARDS for why that is a
+    // different question rather than the same one with a bigger number.
+    static bool SurfaceAbove(Player* bot, float& out,
+                             float probeYards = TERRAIN_RECOVERY_PROBE_YARDS)
     {
         Map* map = bot->GetMap();
         if (!map)
             return false;
-        float const z = bot->GetPositionZ() + TERRAIN_RECOVERY_PROBE_YARDS;
+        float const z = bot->GetPositionZ() + probeYards;
         float const surface = map->GetHeight(
             bot->GetPhaseMask(), bot->GetPositionX(), bot->GetPositionY(), z,
-            true, TERRAIN_RECOVERY_PROBE_YARDS);
+            true, probeYards);
         if (surface <= INVALID_HEIGHT)
             return false;
         out = surface;
@@ -15113,14 +15157,35 @@ private:
                 RememberStandDown(name, standDown);
             }
 
+            // IS THIS CHARACTER IN THE LAST STRETCH ABOVE THE KILL PLANE
+            // (#188)? Asked here, before the stand-down, because it is the one
+            // thing that changes what the stand-down is allowed to do.
+            bool const nearThePlane = OverseerDecisions::NearTheVoidPlane(
+                bot->GetPositionZ(), TERRAIN_RECOVERY_VOID_CATCH_YARDS);
+
             // AND NOW THE STAND-DOWN, WITH THE MEASUREMENT IN IT (#323). The
             // eight arguments and their order are unchanged; the fifth is the
             // measured descent rather than Unit::IsFalling, for the reasons on
             // OverseerDecisions::MeasuredToBeFalling. Everything else this
             // declines on is a flag nobody has caught lying.
+            //
+            // EXCEPT IN THE BAND, WHERE STANDING DOWN ON A DESCENT IS THE
+            // DEATH (#188). The descent stand-down is right everywhere else
+            // and it is why the scripted Wailing Caverns shaft drop is never
+            // interfered with: a character that is falling is falling for a
+            // reason and this module has no business moving it. Below z -250
+            // there is no such reason. The deepest floor this roster has been
+            // measured standing on is -105.83, which is that same shaft's
+            // bottom, so nothing legitimate descends into this band; and the
+            // six void deaths of 2026-09-08/09 were every one of them a
+            // character descending through it while this line declined to
+            // look. The other seven stand-downs are untouched: a corpse, a
+            // teleport in progress, a taxi, a free flight, a swimmer, a
+            // transport and a vehicle all still stand the drive down at any
+            // height.
             bool const mayInspect = OverseerDecisions::TerrainRecoveryMayInspect(
                 bot->IsAlive(), bot->IsBeingTeleported(), bot->IsInFlight(),
-                bot->IsFlying(), descending, bot->IsInWater(),
+                bot->IsFlying(), descending && !nearThePlane, bot->IsInWater(),
                 bot->GetTransport() != nullptr, bot->GetVehicle() != nullptr);
             if (!mayInspect)
                 continue;
@@ -15130,7 +15195,16 @@ private:
             reading.x = bot->GetPositionX();
             reading.y = bot->GetPositionY();
             reading.z = bot->GetPositionZ();
+            // THE ORDINARY REACH FIRST, ALWAYS, and the deep one only where it
+            // came back empty in the band. Written this way round rather than
+            // as a widened probe for everybody so that not one reading outside
+            // the band changes by a yard: a character walking under an arch is
+            // measured exactly as it was before this change, which is the half
+            // of #188 that took 204 displacements to get right.
             reading.surfaceValid = SurfaceAbove(bot, reading.surfaceAboveZ);
+            if (!reading.surfaceValid && nearThePlane)
+                reading.surfaceValid = SurfaceAbove(
+                    bot, reading.surfaceAboveZ, TERRAIN_RECOVERY_VOID_PROBE_YARDS);
             // Most characters see their own footing again and stop here. Ask
             // the pure rule first with the conservative no-navmesh answer so
             // four Detour probes are paid only where the vertical gap itself
@@ -15170,6 +15244,16 @@ private:
             // separately from the same two arguments, which is one place too
             // many the moment there is a third input.
             bool const onTheGround = OverseerDecisions::ReadingStandsOnTheGround(
+                reading, TERRAIN_RECOVERY_LIMITS.footingReach);
+            // AND THE SAME QUESTION WITH THE #262 CORRECTION TAKEN OFF, which
+            // is not the same question and was being answered as though it
+            // were. The correction is about walking; the give-up sentence
+            // below is about whether there is ground here at all. See
+            // OverseerDecisions::SomeInstrumentFoundGround for the two
+            // characters thirty yards apart whose only difference was the
+            // footing fan, and which of the two was declared below the world
+            // and left there.
+            bool const foundGround = OverseerDecisions::SomeInstrumentFoundGround(
                 reading, TERRAIN_RECOVERY_LIMITS.footingReach);
 
             OverseerDecisions::TerrainRecoveryState& memory =
@@ -15266,6 +15350,36 @@ private:
                 OverseerDecisions::FallBaselineHandedOver(
                     _fallBaseline[LowerName(name)], verdict.liftZ,
                     std::time(nullptr));
+                // A CATCH ABOVE THE KILL PLANE IS NOT THE SAME EVENT AS A
+                // LIFT AND MUST NOT READ AS ONE. An ordinary lift is a
+                // character that has slipped a few tens of yards under
+                // something; this is a character that was seconds from a
+                // max-health kill, and a reader counting "recoveries per hour"
+                // needs to be able to separate them or the metric #188 asked
+                // for measures two different things at once. ERROR rather than
+                // WARN for the same reason: an ordinary lift is routine and
+                // this is not.
+                if (nearThePlane)
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' was falling out of the world at map {} "
+                              "position ({:.1f}, {:.1f}, {:.1f}), which is inside the "
+                              "{:.0f} yards above the kill plane at z {:.0f} where the "
+                              "core deals max health outright and no immunity applies. "
+                              "CAUGHT: lifted straight up to z {:.1f} at the same x/y, "
+                              "onto the surface at its own coordinates found by the deep "
+                              "probe. Same map, same x, same y - nothing here can split "
+                              "the family, and crossing the plane demonstrably does "
+                              "(#188). It keeps aim job='{}' quest={} travel='{}'. This "
+                              "is a rescue and not a fix: somebody still needs to look at "
+                              "what drops a character through the world at these "
+                              "coordinates",
+                              name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                              TERRAIN_RECOVERY_VOID_CATCH_YARDS,
+                              OverseerDecisions::VOID_PLANE_Z, verdict.liftZ, job,
+                              questAim, travelTarget);
+                    continue;
+                }
                 LOG_WARN("module.overseer",
                          "overseer: '{}' read as below the world at map {} position "
                          "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
@@ -15297,6 +15411,19 @@ private:
             // is deliberately loud: giving up in a log line a person can find
             // beats a remedy that relocates the problem out of sight.
             //
+            // BUT IT IS THE END OF A RUNG AND NOT OF A CHARACTER (#188). "A
+            // character this module cannot recover where it stands is reported
+            // and left" was the whole design, and on 2026-09-09 it was
+            // measured: five characters reached this line and four were dead
+            // at the kill plane within the hour, at full health, out of
+            // combat, with nothing steering them. Leaving a character in that
+            // state until it dies produces the exact outcome the no-cross-map
+            // rule exists to prevent - one of the four resurrected on another
+            // continent - and produces it by NOT acting, which the rule never
+            // licensed. So the ladder is re-armed ten minutes later and the
+            // fall itself is caught above the plane; see
+            // OverseerDecisions::TerrainRecoveryStep.
+            //
             // THE TWO GIVE-UPS ARE NOT THE SAME THING, and one log line for
             // both is how #188 got its title. With a polygon under its feet the
             // character is standing on the ground and the DETECTOR is wrong,
@@ -15323,22 +15450,58 @@ private:
                               static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS));
                     continue;
                 }
+                // AND THE LOUD SENTENCE ONLY WHERE THE READINGS CARRY IT
+                // (#188). "STILL reads as below the world" and "somebody needs
+                // to look at what is under these coordinates" are claims about
+                // the world, and a refused footing fan is not evidence for
+                // either: it says the character cannot WALK, which is what
+                // #262 added it to say. On 2026-09-09 that distinction was the
+                // only difference between the character that was declared
+                // below the world and the one thirty yards away that was
+                // declared to be standing on the ground, and the first one
+                // died. So where an instrument did find ground, this says what
+                // it actually knows.
+                if (foundGround)
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
+                              "reads {:.1f} yards under a surface at z {:.1f} and a lift "
+                              "at these coordinates did not stick, but {} - so this module "
+                              "CANNOT TELL whether it is under the world or sealed in a "
+                              "pocket it cannot walk out of (#262), and it is not claiming "
+                              "either. It is NOT being moved and NOT being sent anywhere "
+                              "off this map (#188). It gets the lift again in {}s if the "
+                              "condition is still true then. Aim job='{}' quest={} "
+                              "travel='{}' last aimed position map {} ({:.1f}, {:.1f}, "
+                              "{:.1f})",
+                              name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                              surface - fromZ, surface, footing,
+                              static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS), job,
+                              questAim, travelTarget, static_cast<uint32>(aimedMap),
+                              aimedX, aimedY, aimedZ);
+                    continue;
+                }
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' STILL reads as below the world at map {} "
                           "position ({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} "
                           "yards up), {}, and a lift at these "
                           "coordinates did not stick. This module is OUT OF REMEDIES for "
-                          "it and is GIVING UP until it has been clear for {}s. It is NOT "
-                          "being moved, NOT being sent to a bind point and NOT being "
-                          "resurrected: the cross-map escalation that used to be here "
-                          "split the family across an ocean without fixing the reading "
-                          "(#188), so a character this module cannot recover WHERE IT "
-                          "STANDS is reported and left. Aim job='{}' quest={} travel='{}' "
+                          "it and is GOING QUIET for {}s, after which it gets the lift "
+                          "again - it is not being abandoned, which is what the old "
+                          "wording promised and the old code did not deliver (#188). It "
+                          "is NOT being moved off this map, NOT being sent to a bind "
+                          "point and NOT being resurrected: the cross-map escalation that "
+                          "used to be here split the family across an ocean without "
+                          "fixing the reading, so a character this module cannot recover "
+                          "WHERE IT STANDS is reported and retried rather than relocated. "
+                          "If it falls from here it is caught again within {:.0f} yards "
+                          "of the kill plane. Aim job='{}' quest={} travel='{}' "
                           "last aimed position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody "
                           "needs to look at what is under these coordinates",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
                           surface, surface - fromZ, footing,
-                          static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS), job,
+                          static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS),
+                          TERRAIN_RECOVERY_VOID_CATCH_YARDS, job,
                           questAim, travelTarget, static_cast<uint32>(aimedMap),
                           aimedX, aimedY, aimedZ);
             }
