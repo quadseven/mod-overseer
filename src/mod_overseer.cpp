@@ -4907,6 +4907,7 @@ private:
         bool removedFollow{false};
         bool removedNewRpg{false};
         bool stoodItUp{false};
+        bool dismountedIt{false};
         time_t until{0};
         std::string verb;
     };
@@ -5029,7 +5030,7 @@ private:
     static bool HoldCharacterStill(Player* who, PlayerbotAI* botAI, std::string const& name,
                                    char const* verb,
                                    uint32 ceilingSeconds = CAST_HOLD_CEILING_SECONDS,
-                                   bool standItUp = true)
+                                   bool readyToCast = true)
     {
         if (!who || !botAI)
             return false;
@@ -5093,9 +5094,53 @@ private:
         // The flag is a parameter rather than a test on the verb so that the
         // caller says what it wants and this function does not have to know the
         // reasons by name.
-        bool const wasSitting = standItUp && !who->IsStandState();
+        bool const wasSitting = readyToCast && !who->IsStandState();
         if (wasSitting)
             who->SetStandState(UNIT_STAND_STATE_STAND);
+
+        // AND IT TAKES THE CHARACTER OFF ITS MOUNT, WHICH IS THE OTHER HALF OF
+        // THE SAME ARGUMENT AND THE ONE THAT WAS STILL COSTING CASTS (#337).
+        //
+        // WHAT THE CORE DOES, read at the pinned SHA. Spell::CheckCast refuses
+        // any non-passive spell cast by a mounted player that does not carry
+        // SPELL_ATTR0_ALLOW_WHILE_MOUNTED (Spell.cpp:6018), answering
+        // SPELL_FAILED_NOT_ON_TAXI in flight and SPELL_FAILED_NOT_MOUNTED on a
+        // ground mount. It is reported to a client, so for a bot it is silent,
+        // and no precondition this module asked could see it: `IsInFlight` is
+        // the OTHER branch of that same check.
+        //
+        // WHY A CLIENT NEVER HITS IT. The client sends CMSG_CANCEL_MOUNT_AURA
+        // before it sends the use, so a player is on foot by the time the cast
+        // is checked. That is the areatrigger's argument word for word: walking
+        // in like a player depends on a part of the player a bot does not have,
+        // and the packet has to be sent deliberately, to the same handler.
+        //
+        // SO THE HANDLER IS DRIVEN RATHER THAN Dismount() BEING CALLED HERE.
+        // WorldSession::HandleCancelMountAuraOpcode (MiscHandler.cpp:1475)
+        // re-checks IsMounted and IsInFlight itself and then does BOTH halves,
+        // Dismount() and RemoveAurasByType(SPELL_AURA_MOUNTED). Calling only the
+        // first would clear the flag and leave the aura to put it back.
+        //
+        // AND IT IS IN THE HOLD RATHER THAN IN A VERB for the reason the stand
+        // state is: three verbs cast, all three are driven at handlers that a
+        // client would have dismounted for, and one place to fix is the point of
+        // there being one hold. A staging hold asks for none of this, the same
+        // way it asks not to be stood up, because a party waiting at a door is
+        // not about to cast anything.
+        //
+        // IN FLIGHT IS LEFT ALONE ON PURPOSE. The handler refuses it anyway, and
+        // a hearth already refuses a character in flight before it gets here;
+        // taking somebody off a taxi mid-route would be this module cancelling
+        // an errand it was not asked to cancel.
+        bool const wasMounted = readyToCast && who->IsMounted() && !who->IsInFlight();
+        if (wasMounted)
+        {
+            if (WorldSession* session = who->GetSession())
+            {
+                WorldPacket cancelMount(CMSG_CANCEL_MOUNT_AURA, 0);
+                session->HandleCancelMountAuraOpcode(cancelMount);
+            }
+        }
 
         if (fresh)
         {
@@ -5106,10 +5151,11 @@ private:
             record.until = time(nullptr) + ceilingSeconds;
             record.verb = verb ? verb : "";
             record.stoodItUp = wasSitting;
+            record.dismountedIt = wasMounted;
             holds[name] = record;
             LOG_INFO("module.overseer",
                      "overseer: '{}' is held still to {} for at most {}s (stay {}, follow {}, "
-                     "new rpg {}, {}); it walks again the moment the hold is lifted, "
+                     "new rpg {}, {}, {}); it walks again the moment the hold is lifted, "
                      "however it is lifted",
                      name, record.verb, ceilingSeconds,
                      plan.addStay ? "added" : "already on",
@@ -5120,9 +5166,16 @@ private:
                      // did not take. "already standing" about a character
                      // sitting down to eat is the same false confidence
                      // WhyHeldStill was written to end.
-                     !standItUp   ? "stand state left alone, so it may eat"
+                     !readyToCast ? "stand state left alone, so it may eat"
                      : wasSitting ? "stood up from sitting"
-                                  : "already standing");
+                                  : "already standing",
+                     // ...and the same three for the mount, which is the reading
+                     // the six rows of #337 did not have. "already standing" was
+                     // being read as "so there is nothing left to stop it", and
+                     // there was: a leader the travel drive had put on a mount.
+                     !readyToCast ? "mount left alone"
+                     : wasMounted ? "taken off its mount"
+                                  : "not mounted");
             return true;
         }
 
@@ -5130,6 +5183,12 @@ private:
         // carrying, because it is the `food` strategy winning between polls.
         if (wasSitting)
             existing->second.stoodItUp = true;
+        // Same for a re-mount, and it is the likelier of the two to happen
+        // mid-hold: CheckMountStateAction re-mounts a bot whose travel target is
+        // still further away than its mount distance, and the hold does not
+        // cancel the errand that says so (#163).
+        if (wasMounted)
+            existing->second.dismountedIt = true;
 
         // AN EXTENDED HOLD IS STILL BOUNDED BY THE CEILING FROM WHEN IT STARTED.
         // The deadline is not pushed out by re-assertion, or a verb that polls
@@ -5145,6 +5204,12 @@ private:
             LOG_INFO("module.overseer",
                      "overseer: '{}' had sat down mid-{} and is stood up again - a held "
                      "character out of combat is one its own `food` strategy will feed",
+                     name, existing->second.verb);
+        if (wasMounted)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' had got back on a mount mid-{} and is taken off it again - "
+                     "the core refuses a mounted caster and reports it to a client this "
+                     "character does not have",
                      name, existing->second.verb);
         return false;
     }
@@ -5239,6 +5304,11 @@ private:
         bool tookFollow{false};
         bool tookNewRpg{false};
         bool stoodItUp{false};
+        // AND WHETHER IT HAD TO TAKE THE CHARACTER OFF A MOUNT (#337). The row
+        // that reported `already standing` and then a cast that never started
+        // was missing exactly this reading: the character was standing and
+        // mounted, and the core refuses a mounted caster silently.
+        bool dismountedIt{false};
     };
 
     // Hold, and tell the row what the hold in force actually took. The two
@@ -5262,6 +5332,7 @@ private:
         report.tookFollow = record->second.removedFollow;
         report.tookNewRpg = record->second.removedNewRpg;
         report.stoodItUp = record->second.stoodItUp;
+        report.dismountedIt = record->second.dismountedIt;
     }
 
     // THE BACKSTOP UNDER EVERY VERB'S OWN RELEASE, on its own clock.
@@ -5376,9 +5447,12 @@ private:
         PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
         if (!botAI)
             return;
-        // `false` IS THE STAND STATE, AND IT IS THE ONE THING THIS HOLD ASKS
-        // FOR DIFFERENTLY. A party waiting at a door should be eating; see
-        // HoldCharacterStill's stand-state block.
+        // `false` IS "THIS HOLD IS NOT FOR A CAST", AND IT IS THE ONE THING THIS
+        // HOLD ASKS FOR DIFFERENTLY. It covers the two things a client does
+        // before a cast and nothing else does for a bot: standing the character
+        // up, and taking it off its mount. A party waiting at a door should be
+        // eating rather than standing, and is not about to cast anything, so it
+        // wants neither; see HoldCharacterStill's stand-state and mount blocks.
         HoldCharacterStill(member, botAI, name, STAGE_HOLD_VERB,
                            STAGE_HOLD_CEILING_SECONDS, false);
     }
@@ -11821,6 +11895,24 @@ private:
     // World-thread-only and unguarded, like the coordinator state it belongs
     // to. A restart loses it, and a restart also wipes every strategy in every
     // bot's engine, so the two are lost consistently.
+
+    // WHAT AN ESCORT IS FOR, in the one respect a drive somewhere else has to
+    // know about (#351). Named rather than a bool for the reason
+    // DungeonCrossingResult gives about its own three outcomes: `false` at a
+    // call site says nothing, and this one is read six hundred lines away by a
+    // drive that has no other way to tell the two apart.
+    //
+    // The distinction is not "which direction is this walk" - it is "is the run
+    // this character is in OVER". Assemble covers every walk toward a door or a
+    // staging point, in or out of an instance; LeaveInstance is written only by
+    // the EXIT crossing and by the reset's own evacuation, and both of those
+    // are a run ending.
+    enum class EscortPurpose : uint8
+    {
+        Assemble,      // walking a member to a door, or to the point in front of one
+        LeaveInstance  // walking a member out of an instance whose run is over
+    };
+
     struct DungeonEscort
     {
         // Whether THIS module granted `new rpg` for the escort, so only what
@@ -11836,6 +11928,18 @@ private:
         // per destination rather than once per five-second poll - the same
         // log-once discipline every other drive in this file keeps.
         std::string aim;
+        // WHY THIS MEMBER IS BEING WALKED, for DriveDungeonClear (#351). That
+        // drive arms the dungeon brain on GEOGRAPHY - alive, on an instance map
+        // - and on nothing else, because it cannot gate itself on a run row it
+        // is the only opener of. That is right for arming and it leaves the
+        // drive no way to tell an instance a party is CLEARING from one a
+        // straggler is being walked OUT of. This is that way.
+        //
+        // Re-stated by every EscortToward rather than latched, and it dies with
+        // the escort in SweepDungeonEscorts, so there is no second lifetime to
+        // keep in step - which is the whole reason it lives on the escort
+        // rather than in a register of its own.
+        EscortPurpose purpose{EscortPurpose::Assemble};
         // WHOSE ESCORT THIS IS (#138). False: a dungeon run's, marked by
         // EscortToward and swept by SweepDungeonEscorts on the coordinator's
         // clock. True: the follow drive's catch-up, marked by CatchUpToward
@@ -11907,6 +12011,22 @@ private:
         if (IsWalkingHome(name))
             return "home errand";
         return "run";
+    }
+
+    // IS THE RUN COORDINATOR WALKING THIS CHARACTER OUT OF AN INSTANCE RIGHT
+    // NOW? (#351) Asked by DriveDungeonClear and by nothing else; see
+    // DungeonEscort::purpose for why the answer lives on the escort.
+    //
+    // DELIBERATELY NOT A FOURTH ANSWER FOR EscortOwnerName ABOVE. That question
+    // is "who owns this lease", and the owner here is the run, exactly as it is
+    // for a crossing or a barrier. This one is "what is the run doing with it",
+    // which is a different axis: the home errand and the catch-up walk both
+    // answer false to it while owning leases of their own.
+    bool WalkingOutOfInstance(std::string const& name) const
+    {
+        auto const it = _dungeonEscorts.find(name);
+        return it != _dungeonEscorts.end() &&
+               it->second.purpose == EscortPurpose::LeaveInstance;
     }
 
     // WHICH FOLLOWERS MAY NOT BE WALKED TO THEIR LEADER YET, AND SINCE WHEN
@@ -12057,10 +12177,19 @@ private:
     // re-ask while the same aim is in flight is what every poll of a crossing
     // does, and TravelAimBook::Claim already refuses to disturb a walk it is
     // holding the memory for.
-    void EscortToward(std::string const& name, std::string const& aim, char const* what)
+    //
+    // `purpose` is stated by every caller rather than defaulted, because the
+    // two answers stand a different drive down - see DungeonEscort::purpose.
+    void EscortToward(std::string const& name, std::string const& aim, char const* what,
+                      EscortPurpose purpose)
     {
         DungeonEscort& escort = _dungeonEscorts[name];
         escort.wanted = true;
+        // Re-stated every poll rather than latched, for exactly the reason
+        // `wanted` is: the caller is the authority on what this walk is for,
+        // and a walk that stops being an evacuation has to stop reading as one
+        // on the very next poll.
+        escort.purpose = purpose;
         // The run takes over a catch-up in progress rather than queueing
         // behind it (#138): both walk the member toward the family, the run
         // knows where the family is going, and the lease it inherits -
@@ -14523,6 +14652,13 @@ private:
         bool accepted{false};
         time_t issuedAt{0};
         bool loggedRefused{false};
+        // AND WHETHER THIS PROCESS HAS SINCE TOLD THE BRAIN TO LET GO (#351).
+        // Set by StandDownDungeonBrain and cleared by the next arming, so a
+        // `dc off` goes out ONCE per walk out of an instance for the same
+        // reason a `dc on` goes out once per stay inside it: both verbs reset
+        // the dungeon module's transient run state, and a verb re-issued eight
+        // times a minute is a run restarted eight times a minute.
+        bool stoodDown{false};
     };
     std::map<std::string, DcOnRecord> _dcOnIssued;
 
@@ -14536,6 +14672,72 @@ private:
     {
         auto const it = _dcOnIssued.find(name);
         return it != _dcOnIssued.end() && it->second.runId == runId && it->second.accepted;
+    }
+
+    // TELL THE DUNGEON BRAIN TO LET GO OF ONE CHARACTER, ONCE (#351).
+    //
+    // WHY THIS EXISTS AT ALL, GIVEN THAT THE SECTION ABOVE SAYS THIS DRIVE ONLY
+    // EVER TURNS THE BRAIN ON. Both halves of that sentence are still true and
+    // neither is being walked back: leaving an instance is not the same as
+    // ending a run - a wipe puts the party outside at a graveyard with the run
+    // still meaningfully in progress - and the module's own `dc` verbs own that
+    // lifecycle. What has changed is that there is now a fact this drive can
+    // read which means exactly "the run is over AND this character is being
+    // taken out of the instance", rather than the geography that cannot tell
+    // those apart: the run coordinator holds it under an escort whose purpose
+    // is EscortPurpose::LeaveInstance, which is written by the EXIT crossing
+    // and by the reset's own evacuation and by nothing else.
+    //
+    // AND IT IS DELIBERATELY HERE RATHER THAN AT THE COORDINATOR. The EXIT
+    // crossing's give-up path has named the armed brain as the first thing to
+    // suspect since it was written, and rejected disarming from out there on
+    // the grounds that it would be a second opinion on a lifecycle these verbs
+    // own. That reasoning is why the call is in this drive: this is the one
+    // thing that issues `dc on`, so it is the one thing that may issue its
+    // opposite, and the coordinator still issues no `dc` verb of its own.
+    //
+    // WHY IT MATTERS RATHER THAN BEING TIDY. While the brain is armed,
+    // mod-dungeon-clear is steering these characters too and has no idea the
+    // run has ended, so it can walk them back toward the instance while the
+    // travel aim walks them at the door. Taking the strategy off by hand is not
+    // an alternative and is why `dungeon clear` is not in
+    // ESCORT_DIVERT_STRATEGIES: the dungeon module's own gate reinstalls it on
+    // any bot standing on a dungeon map, and what its triggers actually read is
+    // the run's `enabled` flag, which only a verb clears.
+    //
+    // THE WALK OUT DOES NOT DEPEND ON THIS TAKING. A refusal is said and then
+    // left alone - the escort still holds the aim, the travel drive still walks
+    // it, and the areatrigger still answers for itself - so this is one steerer
+    // fewer rather than a precondition that can strand anybody by failing.
+    void StandDownDungeonBrain(std::string const& name, Player* bot, PlayerbotAI* botAI)
+    {
+        DcOnRecord& record = _dcOnIssued[name];
+        if (record.stoodDown)
+            return;
+        record.stoodDown = true;
+        // AND THE RECORD STOPS CLAIMING THIS CHARACTER IS ARMED. A character
+        // that stops being walked out - it gets through the door, the escort is
+        // swept, the coordinator stands down - falls through to the arming path
+        // below on its next poll and is armed again, rather than being left
+        // inside with a brain nobody switched back on.
+        record.runId = 0;
+        record.accepted = false;
+        record.loggedRefused = false;
+
+        Player* issuer = AuthorizedDcIssuer(bot);
+        // Event(source, param, owner)  Event.h:21-24; the owner is what
+        // IsAuthorized reads (DungeonClearChatActions.cpp:62), exactly as the
+        // arming path and the CLEARING watchdog's `dc skip` already do.
+        bool const off =
+            issuer && botAI->DoSpecificAction("dc off", Event("dc", "", issuer), true);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is being walked out of map {} because its run is over - "
+                 "issuing 'dc off' as '{}': {}",
+                 name, static_cast<uint32>(bot->GetMapId()),
+                 issuer ? issuer->GetName() : "nobody",
+                 off ? "accepted, so nothing else is steering it while it walks to the door"
+                     : "REFUSED or unavailable. The walk out does not depend on it; the "
+                       "dungeon module's own log says why under 'DC command refused'");
     }
 
     void DriveDungeonClear()
@@ -14640,6 +14842,21 @@ private:
                 continue;
             }
 
+            // ...AND THE RUN CAN BE OVER, WHICH THIS DRIVE HAD NO WAY TO LEARN
+            // (#351). See StandDownDungeonBrain for the whole argument,
+            // including why disarming belongs here and not at the coordinator.
+            //
+            // BELOW THE HEARTBEAT, for the reason the heartbeat's own comment
+            // gives at length: a character being walked out is still IN there,
+            // so the run row must still be touched for it. Liveness outlives
+            // the work, and a signal written only on the arming path is a run
+            // that goes cold with people standing in it.
+            if (WalkingOutOfInstance(name))
+            {
+                StandDownDungeonBrain(name, bot, botAI);
+                continue;
+            }
+
             // WHO ISSUES THE COMMAND DECIDES WHETHER IT IS OBEYED, and for a
             // year of runs the answer has been "nobody may".
             //
@@ -14708,6 +14925,9 @@ private:
             record.runId = runId;
             record.accepted = accepted;
             record.issuedAt = now;
+            // Armed again, so a later walk out of this instance gets its own
+            // single `dc off` rather than being skipped by an old one (#351).
+            record.stoodDown = false;
 
             if (accepted)
             {
@@ -17566,6 +17786,14 @@ private:
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
         bool loggedCampaignOver{false};
+        // AND THE TWO LINES THE RESET'S EVACUATION SAYS ONCE (#351).
+        // `loggedWalkingOut` rations the sentence that explains why anybody is
+        // being walked out of an instance at all; `loggedNoWayOut` rations the
+        // refusal for a door this world cannot be aimed at, which is a standing
+        // fact about the tables rather than a transient and so is said once and
+        // then left alone. See WalkStragglersOut.
+        bool loggedWalkingOut{false};
+        bool loggedNoWayOut{false};
         // WHEN THIS COORDINATOR STARTED WAITING FOR SOMEBODY ELSE'S ERRAND
         // (#168), and whether it has said so. In-process like every other
         // flag on this struct: a bounce restarts the clock, which errs
@@ -18419,6 +18647,12 @@ private:
     // name for the log lines ("ENTER" / "EXIT") so the reader of a log can tell
     // which door is being knocked on without inferring it from a trigger id.
     //
+    // `purpose` is the same fact in a form another drive can act on, and it is
+    // a parameter rather than a test on `what` because a log label is not a
+    // decision: ENTER assembles a party at a door, EXIT ends a run, and
+    // DriveDungeonClear has to be able to tell those apart without matching
+    // strings. See DungeonEscort::purpose.
+    //
     // The caller owns what a result MEANS - which phase comes next, whether
     // giving up returns to IDLE or says something else - because that is the
     // only part that genuinely differs between the two directions.
@@ -18426,6 +18660,7 @@ private:
                                                std::string const& leaderName,
                                                AreaTrigger const* door, uint32 triggerId,
                                                uint32 throughMapId, char const* what,
+                                               EscortPurpose purpose,
                                                DungeonRunCoordinatorState& coord)
     {
         uint32 through = 0;
@@ -18541,7 +18776,7 @@ private:
             if (state.name == leaderName)
                 leaderState = &state;
             if (!state.through && state.distanceFromDoor >= 0.f)
-                EscortToward(state.name, doorAim, what);
+                EscortToward(state.name, doorAim, what, purpose);
         }
 
         if (!coord.loggedCrossingAim)
@@ -18601,6 +18836,231 @@ private:
                      static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60));
         }
         return DungeonCrossingResult::Working;
+    }
+
+    // ---------------------------------------- dungeon run: the straggler (#351) --
+    //
+    // WHAT THIS IS FOR, AND WHY IT IS NOT THE EXIT CROSSING. EXIT walks a PARTY
+    // out of a door together, and it is reachable only from inside a run this
+    // coordinator owns. What follows is the other state, and until now nothing
+    // owned it at all: the run is over, the leader is OUTSIDE, and one or two
+    // members are still standing in the instance.
+    //
+    // NOTHING GOT THEM THERE BY MISTAKE AND NOTHING WAS GOING TO GET THEM OUT.
+    // IDLE only ADOPTS a run when the LEADER is inside one, which is right - it
+    // is the leader's bind the party would land in - and it means a leader
+    // standing outside with two followers left behind opens a fresh run
+    // instead. A fresh run starts at RESET. RESET cannot reset an instance that
+    // anybody is standing in (InstanceMap::Reset returns whether the map is
+    // empty), so it waited, said so once, and gave the run up five minutes
+    // later; the next poll opened another one and did exactly the same thing.
+    //
+    // MEASURED ON MAP 43. Two members at (-163.5, 132.9, -73.7) - the entrance
+    // trigger's own landing point, to the decimal - unmoved for over an hour,
+    // with the leader on map 1. `ended_reason` on twelve consecutive rows: "the
+    // reset never became possible in 5 minutes - still on map 43", every five
+    // minutes, `run_number` never leaving 1, because a reset that never happens
+    // deliberately does not spend a campaign slot. The whole campaign was two
+    // characters standing still, and the only thing steering them was the split
+    // follower's `new rpg` grant, which is a grant to wander and not to leave.
+    //
+    // WHY A `trigger:` AIM AND NOT THE `at:` ONE THE CROSSING WRITES. Both walk
+    // to the same coordinates. They differ in what happens on ARRIVAL, and here
+    // that difference is the entire fix:
+    //
+    //   * An `at:` aim under an escort ARRIVES AND HOLDS. DriveTravel's escort
+    //     branch is deliberate about that, because a party assembling at a door
+    //     must not dissolve one member at a time - and nothing then knocks,
+    //     because the knock lives in the crossing behind DungeonRunEntryReady,
+    //     which asks about the whole party. A straggler under an `at:` aim
+    //     would stand five yards from the door exactly as long as this pair
+    //     stood twelve yards from it.
+    //   * A `trigger:` aim IS the knock. ResolveTravelTarget resolves it to the
+    //     trigger's OWN position, DriveTravel arrives on
+    //     TRAVEL_ARRIVED_POSITION_YARDS, and StepThroughAreaTrigger sends the
+    //     packet a client would have sent to the handler that re-checks
+    //     IsInAreaTriggerRadius itself. Nothing here moves anybody through a
+    //     door they have not walked to; a refusal is not the end of the errand,
+    //     and the walk carries on and knocks again next poll.
+    //
+    // AND TRICKLING OUT ONE AT A TIME - the reason the crossing refuses a
+    // `trigger:` aim - is exactly right here. There is no party left inside to
+    // keep together. There are characters holding a reset open.
+    //
+    // THE AIM ON ITS OWN IS NOT ENOUGH, AND WRITING ONE BY HAND PROVES IT
+    // RATHER THAN FIXING IT. `overseer_roster.travel_npc` set to the exit
+    // trigger's own coordinates, by hand, on the measured pair, moved neither
+    // of them in an hour. That is not a second defect: ReadSplitErrand
+    // classifies every `at:` and `trigger:` aim as NeedsTheFamily, so
+    // SplitFollowerDrivesItself refuses a cut-off follower the mover for one,
+    // and KeepRosterFollowing's backstop takes `new rpg` straight back off it.
+    // The refusal is deliberate and is the safety property that decision exists
+    // for - a coordinate the FAMILY picked must not be walked away from by
+    // somebody who has lost the family - and widening it was considered and
+    // rejected: it would let any cut-off follower walk to any point anybody
+    // wrote, which is the scatter three fixes in this file already removed.
+    //
+    // What makes this walk legal is the ESCORT, which is the first branch of
+    // MaySteerItself and the exemption the backstop's own comment names ("`new
+    // rpg` comes off a follower NOBODY IS ESCORTING"). So the escort is not
+    // bookkeeping around the aim here; it is the half that makes the aim run at
+    // all, and that is why this walks members through EscortToward rather than
+    // writing the column.
+    //
+    // THE TOLERANCE HAS TO BE TIGHTER THAN THE DOOR, and this is the one place
+    // that is checked against the actual door rather than against the smallest
+    // trigger anybody remembered. Five yards inside a radius of twelve has room
+    // to spare, which is what makes the walk's own knock land as soon as it
+    // finishes.
+    //
+    // AND THE MEASURED PAIR DID NOT NEED THE WALK AT ALL, which is the sharpest
+    // thing in this defect and was nearly missed. 12.7 yards from a radius of
+    // 12 reads as outside it. That is not the comparison the server makes:
+    // Player::IsInAreaTriggerRadius (Player.cpp:2216) tests the radius against
+    // WorldObject::GetDistance (Object.cpp:1311), which subtracts the
+    // character's own combat reach - GetObjectSize, Object.cpp:2892, which for
+    // a player is scale * DEFAULT_COMBAT_REACH (Player.h:1104,
+    // ObjectDefines.h:45), 1.5 at scale 1. So the figure that decides is
+    // 12.7 - 1.5 = 11.2 against 12, and they had been standing INSIDE their own
+    // exit for an hour with nothing ever asking it. That is why the knock below
+    // happens at poll rate rather than only when a walk reports arriving.
+    //
+    // NO GM VERB ANYWHERE IN HERE, on AGENTS.md's standing instruction. This
+    // walks characters with the same travel errand every other walk in this
+    // module uses and lets the game's own areatrigger decide.
+    //
+    // Returns how many members were aimed at the door this poll.
+    uint32 WalkStragglersOut(std::vector<std::string> const& members,
+                             std::string const& leaderName, DungeonPortal const& portal,
+                             DungeonRunCoordinatorState& coord)
+    {
+        // GetAreaTrigger  ObjectMgr.h:868  AreaTrigger const* GetAreaTrigger(uint32) const
+        AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.exitTriggerId);
+        if (!door)
+        {
+            if (!coord.loggedNoWayOut)
+            {
+                coord.loggedNoWayOut = true;
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run {} cannot walk anybody out of map {} - "
+                          "this world's tables have no areatrigger {}, so there is no door "
+                          "to aim at and the reset can only wait for the instance to empty "
+                          "by some other means",
+                          coord.runNumber, portal.insideMapId, portal.exitTriggerId);
+            }
+            return 0;
+        }
+
+        // AreaTrigger::radius  ObjectMgr.h:429  float radius
+        if (!OverseerDecisions::ArrivalReachesTrigger(TRAVEL_ARRIVED_POSITION_YARDS,
+                                                      door->radius))
+        {
+            if (!coord.loggedNoWayOut)
+            {
+                coord.loggedNoWayOut = true;
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run {} will not aim anybody at areatrigger {} "
+                          "- a walk to it stops improving at {:.0f}y and the trigger's own "
+                          "radius is {:.0f}, so arriving would mean standing OUTSIDE the "
+                          "door with the errand reported as done. Nobody is aimed, rather "
+                          "than aimed somewhere that cannot work",
+                          coord.runNumber, portal.exitTriggerId,
+                          TRAVEL_ARRIVED_POSITION_YARDS, door->radius);
+            }
+            return 0;
+        }
+        coord.loggedNoWayOut = false;
+
+        // THE SAME CENSUS THE CROSSING TAKES, against the exit door, so
+        // `through` means "out on the map outside". Asked on every poll of the
+        // hold rather than once: the answer changes as members leave, and this
+        // is what notices that the last one has.
+        uint32 out = 0;
+        std::vector<OverseerDecisions::DungeonRunEntryState> const states =
+            DungeonRunCensus(members, door, portal.outsideMapId, out);
+        OverseerDecisions::DungeonEvacuation const evacuation =
+            OverseerDecisions::DungeonRunEvacuation(states);
+        if (evacuation.walk.empty() && evacuation.wait.empty())
+            return 0;   // the hold is something other than a body on the map
+
+        std::ostringstream aim;
+        aim << "trigger:" << portal.exitTriggerId;
+        std::string const exitAim = aim.str();
+
+        for (std::string const& name : evacuation.walk)
+            EscortToward(name, exitAim, "RESET", EscortPurpose::LeaveInstance);
+
+        // AND THE DOOR IS KNOCKED ON AT POLL RATE, NOT ONLY ON ARRIVAL, which
+        // for the measured pair is the difference between walking eight yards
+        // and walking none.
+        //
+        // DriveTravel knocks for a `trigger:` aim once it is inside
+        // TRAVEL_ARRIVED_POSITION_YARDS (5), and that is the right rule for it:
+        // five yards is where an ERRAND ends. It is not where a DOOR opens. The
+        // door opens on the server's own radius, which for this one is 12 and
+        // is measured after the character's combat reach is taken off - see the
+        // arithmetic above - so a member the walk would not think to ask about
+        // for another eight yards is already through. Asking every poll is what
+        // collects that, and it costs one refused packet a poll when it does
+        // not.
+        //
+        // THIS ADDS NO AUTHORITY AND CANNOT MOVE ANYBODY. DungeonRunKnock is
+        // the module's one knock, sending the packet a client would have sent
+        // to the handler that re-checks IsInAreaTriggerRadius itself, so a
+        // member that has not walked to the door is refused by the server and
+        // nothing here can carry it through. The crossing already relies on
+        // exactly that, and says so.
+        //
+        // ONLY THE LIVING ARE KNOCKED FOR. A ghost inside is walking to its own
+        // corpse under the revival drive, and putting it through the door would
+        // take it away from the corpse the dungeon module's post-combat rez may
+        // be walking a healer to - which that drive's own comment records as a
+        // measured cost. The census rows are matched back by name because five
+        // names is a list rather than a set.
+        std::vector<OverseerDecisions::DungeonRunEntryState> walking;
+        walking.reserve(evacuation.walk.size());
+        for (OverseerDecisions::DungeonRunEntryState const& state : states)
+            for (std::string const& name : evacuation.walk)
+                if (state.name == name)
+                    walking.push_back(state);
+
+        // The leader name is passed for the ordering DungeonRunKnock takes it
+        // for - anchor last - and it costs nothing here, where the leader is
+        // outside and is not in `walking` at all. A run that somehow has its
+        // leader inside gets the same ordering the crossing would give it.
+        uint32 const crossed =
+            DungeonRunKnock(walking, leaderName, portal.exitTriggerId);
+        if (crossed)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} knocked on areatrigger {} for the {} left "
+                     "inside map {} - {} went through this poll, which is what the reset "
+                     "was waiting for",
+                     coord.runNumber, portal.exitTriggerId,
+                     static_cast<uint32>(walking.size()), portal.insideMapId, crossed);
+
+        // SAID ONCE PER RUN. EscortToward already says which character is being
+        // walked where; this is the sentence that says why anybody is being
+        // walked out of an instance at all, which is the fact an operator
+        // reading a `reset_failed` row needs and the one the hold line above
+        // could never give.
+        if (!coord.loggedWalkingOut)
+        {
+            coord.loggedWalkingOut = true;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} holds at RESET because map {} is not empty, "
+                     "so whoever is left in there is WALKED OUT through areatrigger {} "
+                     "rather than waited for - `follow` cannot cross a doorway and a "
+                     "member cut off from its leader has nothing else that would take it "
+                     "to one. Still inside: {}{}",
+                     coord.runNumber, portal.insideMapId, portal.exitTriggerId,
+                     OverseerDecisions::DungeonRunEntryBlockers(
+                         states, DUNGEON_DOORSTEP_RADIUS_YARDS),
+                     evacuation.wait.empty()
+                         ? ""
+                         : ". One of them is dead: a corpse walks nowhere and holds the "
+                           "instance open just as hard, and the revival drive owns it");
+        }
+        return static_cast<uint32>(evacuation.walk.size());
     }
 
     // ------------------------------------------------------ dungeon run: reset --
@@ -20631,6 +21091,24 @@ private:
                 DungeonResetBlockers(members, leaderName, portal->insideMapId);
             if (!blockers.empty())
             {
+                // AND WAITING IS NOT A PLAN WHEN WHAT IS BEING WAITED FOR IS A
+                // CHARACTER THAT CANNOT LEAVE (#351). This used to be the whole
+                // of the hold: say it once, wait five minutes, write the run
+                // off, open another one and wait again. That is right for a
+                // party still filing out of a door under EXIT's own aim and
+                // wrong for the case it was actually reached in - a member left
+                // inside with the leader outside, which no phase of this
+                // coordinator owns and which `follow` cannot fix, because
+                // `follow` acts only while the master is on the same map.
+                //
+                // Called on every blocker rather than only on the "still on map
+                // N" one: the reset also declines for a group shape or a
+                // difficulty, and a member stranded inside during one of those
+                // is stranded exactly as hard. The census inside answers
+                // whether there is anybody to walk, and returns doing nothing
+                // when there is not.
+                WalkStragglersOut(members, leaderName, *portal, coord);
+
                 if (!coord.loggedResetWaiting)
                 {
                     coord.loggedResetWaiting = true;
@@ -21013,7 +21491,8 @@ private:
             if (coord.phase == DungeonRunPhase::Enter)
             {
                 switch (DriveDungeonCrossing(members, leaderName, door, triggerId,
-                                             portal->insideMapId, "ENTER", coord))
+                                             portal->insideMapId, "ENTER",
+                                             EscortPurpose::Assemble, coord))
                 {
                     case DungeonCrossingResult::Through:
                         coord.phase = DungeonRunPhase::StagedInside;
@@ -21059,7 +21538,8 @@ private:
             if (coord.phase == DungeonRunPhase::Exiting)
             {
                 switch (DriveDungeonCrossing(members, leaderName, door, triggerId,
-                                             portal->outsideMapId, "EXIT", coord))
+                                             portal->outsideMapId, "EXIT",
+                                             EscortPurpose::LeaveInstance, coord))
                 {
                     case DungeonCrossingResult::Through:
                         LOG_INFO("module.overseer",
@@ -21115,30 +21595,41 @@ private:
                         // run row's own cold-heartbeat close is the only thing
                         // left, and it takes RUN_COLD_SECONDS to notice.
                         //
-                        // THE FIRST THING TO SUSPECT IF THIS FIRES IS THE
-                        // ARMED DUNGEON BRAIN, and it is named here so nobody
-                        // has to rediscover it. While `dungeon clear` is held,
+                        // THE FIRST THING TO SUSPECT IF THIS FIRES USED TO BE
+                        // THE ARMED DUNGEON BRAIN, and it is no longer left to
+                        // be suspected (#351). While `dungeon clear` is held,
                         // mod-dungeon-clear is steering these characters too,
                         // and it has no idea the run is over - so it can walk
                         // them back toward the instance while the travel aim
-                        // walks them toward the door. Disarming from here is
-                        // NOT the fix and was rejected on purpose. When this
-                        // was written the arming drive re-issued to any
-                        // character whose strategy was missing, so a `dc off`
-                        // from here was undone within seconds; since #140 it
-                        // issues once per stay inside and would not, but a
-                        // `dc off` asserted from out here is still a second
-                        // opinion on a lifecycle the module's own `dc` verbs
-                        // own. The real fix is for that drive to learn that a
-                        // run can be over, which is a change to its lifecycle
-                        // and belongs with those verbs.
+                        // walks them toward the door. Disarming from HERE was
+                        // rejected on purpose and still is: a `dc off`
+                        // asserted from the coordinator is a second opinion on
+                        // a lifecycle the module's own `dc` verbs own, and
+                        // this comment said the real fix was for the arming
+                        // drive to learn that a run can be over. That is what
+                        // was built. Every member EXIT escorts now carries
+                        // EscortPurpose::LeaveInstance, DriveDungeonClear
+                        // reads it and stands the brain down for exactly those
+                        // characters, and the coordinator issues no `dc` verb
+                        // of its own. See StandDownDungeonBrain.
+                        //
+                        // AND GIVING UP IS NO LONGER THE END OF THE ATTEMPT.
+                        // IDLE cannot adopt a run whose leader is outside, so
+                        // this used to hand the party to nothing at all: the
+                        // next poll opened a fresh run, RESET found the map
+                        // occupied, waited five minutes and wrote the run off,
+                        // forever. RESET now walks whoever is left inside out
+                        // through this same door - see WalkStragglersOut - so
+                        // the recovery this line promises is real rather than
+                        // an adoption that cannot happen.
                         LOG_ERROR("module.overseer",
                                   "overseer: dungeon run EXIT could not get the party back "
                                   "out through areatrigger {} - they are still on map {} "
                                   "with every other drive stood down on them. The "
-                                  "coordinator returns to IDLE and will adopt the run again "
-                                  "next poll; if this repeats, the party cannot reach its "
-                                  "own exit", triggerId, portal->insideMapId);
+                                  "coordinator returns to IDLE; the next run's RESET walks "
+                                  "whoever is left inside out through that same door, and "
+                                  "if this repeats, the party cannot reach its own exit",
+                                  triggerId, portal->insideMapId);
                         _travelAims.Release(leaderName);
                         coord = DungeonRunCoordinatorState();
                         return;
@@ -21732,7 +22223,7 @@ private:
                  OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) !=
                      OverseerDecisions::ApproachShape::Arrived))
             {
-                EscortToward(name, legAim.aim, "BARRIER");
+                EscortToward(name, legAim.aim, "BARRIER", EscortPurpose::Assemble);
                 if (coord.legAim[name] != legAim.aim)
                 {
                     coord.legAim[name] = legAim.aim;
@@ -28172,9 +28663,21 @@ private:
     //     walking character and changing nothing took fourteen consecutive asks
     //     on one character to land a single cast. So this verb now places the
     //     shared hold - `+stay`, `-follow`, `-new rpg`, StopMoving, clear the
-    //     chase and follow unit states, nothing else - and still refuses the
-    //     row with `later`. The hold outlives the row by its own ceiling, so
-    //     the sender's next ask arrives at a character that is standing.
+    //     chase and follow unit states, stand it up, take it off its mount,
+    //     nothing else - and still refuses the row with `later`. The hold
+    //     outlives the row by its own ceiling, so the sender's next ask arrives
+    //     at a character that is standing.
+    //
+    //   * IT DOES TAKE A CHARACTER OFF ITS MOUNT, AND THAT IS WHAT WAS LEFT
+    //     AFTER THE HOLD STARTED WORKING (#337). Spell::CheckCast refuses a
+    //     mounted player's spell with SPELL_FAILED_NOT_MOUNTED (Spell.cpp:6018)
+    //     and reports it to a client, which is silence for a bot. A real player
+    //     never meets that line, because the client sends CMSG_CANCEL_MOUNT_AURA
+    //     before it sends the use. So this verb sends that too, at the same
+    //     handler, exactly as it sends the areatrigger a client would have sent.
+    //     It is not a diverter and it cancels no errand: the bot's own AI puts a
+    //     mount back on the next tick it wants one, and the core asks the
+    //     question once, at Spell::prepare.
     //
     //   * IT DOES REFUSE A CHARACTER WITH NO BOT AI, which is not a taste
     //     decision. A cross-map teleport waits on MSG_MOVE_WORLDPORT_ACK, a
@@ -28264,6 +28767,11 @@ private:
         uint32 windowMs{0};
         uint32 waitedMs{0};
         int32 castingAfterCall{-1};   // -1 never asked, 0 no, 1 yes
+        // AND WHETHER THE CORE PARKED IT RATHER THAN REFUSING IT (#337). The
+        // one reading that turns an absent cast from a failure into a wait, and
+        // the row could not take it: see CastWall::Queued for why "the spell
+        // queue is indistinguishable from here" was not true.
+        int32 queuedAfterCall{-1};    // -1 never asked, 0 no, 1 parked on the queue
         int32 cooldownAtVerdict{-1};  // -1 never asked, 0 ready, 1 on cooldown
         int32 teleportWasStillInFlight{-1};  // -1 never asked, 0 no, 1 yes
         // WHAT THE HOLD TOOK, IF THIS ROW PLACED ONE (#335). A hearth that finds
@@ -28359,7 +28867,13 @@ private:
           << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
           << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
           << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
+          << ",\"hold_dismounted_it\":" << (ev.hold.dismountedIt ? "true" : "false")
           << ",\"cast_blocker\":" << J(ev.castBlocker);
+        o << ",\"queued_after_call\":";
+        if (ev.queuedAfterCall < 0)
+            o << "null";
+        else
+            o << (ev.queuedAfterCall ? "true" : "false");
         o << ",\"home\":";
         HearthPlace(o, ev.home);
         o << ",\"from\":";
@@ -28547,10 +29061,27 @@ private:
         // always had.
         //
         // So the hold goes on HERE too, immediately before the packet, where it
-        // also stands a sitting character up. Placed this late rather than at the
-        // top of the executor so the refusals in between - no hearthstone, on
-        // cooldown, already home - do not stop a character for 45 seconds over
-        // something standing still cannot fix.
+        // also stands a sitting character up and takes it off its mount. Placed
+        // this late rather than at the top of the executor so the refusals in
+        // between - no hearthstone, on cooldown, already home - do not stop a
+        // character for 45 seconds over something standing still cannot fix.
+        //
+        // AND THE MOUNT IS WHY THIS ROW WAS STILL FAILING AFTER THE HOLD WORKED.
+        // Six rows on the party leader, the hold reporting the character already
+        // standing every time, the cooldown clear at every verdict, and no cast:
+        // Spell::CheckCast refuses a mounted caster and reports it to a client
+        // that a bot does not have (Spell.cpp:6018). The leader is the mounted
+        // one because it is the character the travel drive walks across a
+        // continent, which is exactly why the same verb worked first try on a
+        // follower standing at an inn the same evening. See HoldCharacterStill's
+        // mount block for what is sent and why it is sent rather than called.
+        //
+        // IT IS PLACED IN THE SAME BREATH AS THE PACKET, and that is load
+        // bearing rather than tidy: nothing else in this module runs between
+        // these two statements, so no poll, no sweep and no bot AI tick can put
+        // the character back on a mount or back on the ground before the core
+        // checks. What happens a tick later cannot undo a cast that has started,
+        // because the mount is checked once, at Spell::prepare.
         HoldStillAndReport(who, ev.character, "hearth", ev.hold);
 
         {
@@ -28585,27 +29116,66 @@ private:
         // nothing anywhere could say why.
         //
         // A CAST IN FLIGHT IS STILL NOT A SUCCESS and an absent one is still not
-        // a failure, which is the rule the paragraph above already sets: the
-        // handler may have parked the packet on the spell queue for the global
-        // cooldown. So this NAMES a wall rather than judging on one, and the
+        // a failure. So this NAMES a wall rather than judging on one, and the
         // verdict still comes from where the character is when the window is up.
+        //
+        // THE QUEUE IS ASKED FIRST AND IT IS NOT A WALL. HandleUseItemOpcode
+        // copies the packet onto Player::SpellQueue and returns when
+        // CanExecutePendingSpellCastRequest says no and CanRequestSpellCast says
+        // it may wait (SpellHandler.cpp:110 at the pinned SHA); Player::Update
+        // replays it within the queue window. Nothing is casting at that instant
+        // and nothing has failed either, and the comment above used to call that
+        // indistinguishable from here. It is distinguishable: the deque is
+        // public and the entries carry the spell id, so the row looks.
+        for (PendingSpellCastRequest const& parked : who->SpellQueue)
+        {
+            if (parked.spellId != ev.spellId)
+                continue;
+            ev.queuedAfterCall = 1;
+            break;
+        }
+        if (ev.queuedAfterCall < 0)
+            ev.queuedAfterCall = 0;
+
         if (!ev.castingAfterCall)
         {
-            OverseerDecisions::CastWallGate gate;
-            gate.grounded = !who->IsInFlight();
-            gate.standing = who->IsStandState();
-            gate.still = !who->isMoving();
-            gate.ready = !who->HasSpellCooldown(ev.spellId);
-            gate.free = !who->IsNonMeleeSpellCast(false);
-            char const* const wall = OverseerDecisions::CastWallBlocker(gate);
-            ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+            if (ev.queuedAfterCall)
+            {
+                ev.castBlocker = OverseerDecisions::CastWall::Queued;
+            }
+            else
+            {
+                OverseerDecisions::CastWallGate gate;
+                gate.grounded = !who->IsInFlight();
+                // THE OTHER BRANCH OF THE SAME CORE CHECK, AND THE ONE THAT WAS
+                // COSTING THE CASTS (#337). Read AFTER the packet like the rest
+                // of this gate, which also means it reads the world the hold has
+                // already dismounted: a `true` here on a row whose hold reports
+                // `hold_dismounted_it` is a character that got back on a mount
+                // between the two statements, and that is worth knowing on its
+                // own.
+                gate.unmounted = !who->IsMounted();
+                gate.standing = who->IsStandState();
+                gate.still = !who->isMoving();
+                gate.ready = !who->HasSpellCooldown(ev.spellId);
+                // Spell::CheckCast:5711 returns SPELL_FAILED_NOT_READY on this
+                // and HasSpellCooldown above cannot see it. `conjure` has asked
+                // it since #330; this gate had never been given the question.
+                gate.globalReady = !who->GetGlobalCooldownMgr().HasGlobalCooldown(spell);
+                gate.free = !who->IsNonMeleeSpellCast(false);
+                char const* const wall = OverseerDecisions::CastWallBlocker(gate);
+                ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+            }
         }
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is using its hearthstone ({}, spell {}) - a {}ms cast for "
-                 "map {}; judging in {}ms, not now. {}",
+                 "map {}; judging in {}ms, not now. It was {} for the cast "
+                 "(stand state {}, mount {}). {}",
                  ev.character, ev.itemEntry, ev.spellId, ev.castMs, ev.home.mapId,
-                 ev.windowMs,
+                 ev.windowMs, ev.hold.applied ? "held" : "NOT held",
+                 ev.hold.stoodItUp ? "stood up" : "left as it was",
+                 ev.hold.dismountedIt ? "taken off" : "left as it was",
                  ev.castingAfterCall ? "A cast is running." : ev.castBlocker);
 
         HearthCheck check;
@@ -28758,7 +29328,8 @@ private:
                     // looking for a failed teleport when the failure is that
                     // nothing was ever cast.
                     status = "unchanged";
-                    detail = HearthStayedDetail(check.ev.castingAfterCall == 1);
+                    detail = HearthStayedDetail(check.ev.castingAfterCall == 1,
+                                                check.ev.queuedAfterCall == 1);
                     LOG_WARN("module.overseer",
                              "overseer: hearth {} - '{}' NEVER LEFT: still on map {} after "
                              "{}ms, its hearthstone cooldown reads {}, and {}; see "
@@ -29066,12 +29637,18 @@ private:
           << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
           << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
           << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
+          // THE SAME FIELDS FOR ALL THREE VERBS, which is what CastHoldReport is
+          // for: a reader that has learned to read one hold can read the others.
+          // A summoner is mounted for the same reason a hearthing leader is, and
+          // the ritual is refused at the same line of the core (#337).
+          << ",\"hold_dismounted_it\":" << (ev.hold.dismountedIt ? "true" : "false")
           << ",\"held_helper\":" << J(ev.heldHelper)
           << ",\"helper_hold_applied\":" << (ev.helperHold.applied ? "true" : "false")
           << ",\"helper_hold_took_stay\":" << (ev.helperHold.tookStay ? "true" : "false")
           << ",\"helper_hold_took_follow\":" << (ev.helperHold.tookFollow ? "true" : "false")
-          << ",\"helper_hold_took_new_rpg\":"
-          << (ev.helperHold.tookNewRpg ? "true" : "false");
+          << ",\"helper_hold_took_new_rpg\":" << (ev.helperHold.tookNewRpg ? "true" : "false")
+          << ",\"helper_hold_dismounted_it\":"
+          << (ev.helperHold.dismountedIt ? "true" : "false");
         o << ",\"at\":";
         SummonPlace(o, ev.at);
         o << ",\"from\":";
