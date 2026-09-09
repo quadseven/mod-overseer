@@ -1,0 +1,375 @@
+name: The adapter compiles
+
+# Compiles src/mod_overseer.cpp against the pinned core ON A PULL REQUEST, so a
+# branch cannot be green while the module does not build.
+#
+# WHAT WAS BROKEN (#288). build.yml is the only job in this repository that has
+# ever compiled this file, and it triggers on `push: branches: [main]`.
+# check.decisions.yml does run on every pull request, but it compiles
+# src/overseer_decisions.{h,cpp} plus one test with no include path into a core,
+# deliberately, and must keep doing exactly that - that isolation is half of
+# what that job is for, see its own header. So the 31,000-line adapter was
+# compiled for the first time AFTER it had already merged, every single time.
+# The bill so far: #284, a static_assert naming a constant declared 53 lines
+# later, green on the pull request and red on main; the same shape of failure
+# again on a later branch, costing another full cycle; and on 2026-09-09 a
+# 908-line addition to this file merged with no compiler having read it, because
+# there was no way to make one read it before merge.
+#
+# WHY THIS IS NOT SIMPLY `pull_request:` ADDED TO build.yml. That job clones
+# AzerothCore and mod-playerbots and builds an entire worldserver in Docker: 36
+# to 88 minutes of job time, median 60, measured over its own 37 successful runs.
+# Putting that on every push to every branch buys the same answer this job gives
+# for roughly an order of magnitude more runner time, and an hour-long gate is a
+# gate people learn to merge past. The existing cache does not rescue that
+# option either. A pull request run CAN read a cache the default branch wrote, so
+# warmth is not the problem - the problem is that a warm run of that workflow is
+# still 36 minutes, and a pull request run would additionally WRITE cache entries
+# into the repository's shared 10 GB cache budget, which is the same budget
+# holding the `buildx-$CORE_SHA-$MODULE_SHA` entry that keeps main's build at 36
+# minutes instead of the 40 to 90 a cold one costs. Speeding up the branch by
+# evicting the thing that keeps main fast is not a trade worth making.
+#
+# WHAT THIS JOB ACTUALLY DOES. One translation unit. It lays out the same tree
+# build.yml lays out - pinned core, pinned mod-playerbots, patches/ applied,
+# this checkout dropped in at modules/mod-overseer - then runs the pinned core's
+# OWN cmake configure, copied from the cmake invocation in its
+# apps/docker/Dockerfile, and compiles exactly one file with `-fsyntax-only`.
+# Nothing is linked, no image is produced, no other translation unit is touched.
+# The runner is ubuntu-latest, which is 24.04, which is the same
+# `ARG UBUNTU_VERSION=24.04` the core's Dockerfile builds on, and the apt list
+# below is that Dockerfile's build-stage list verbatim.
+#
+# THE COMPILE FLAGS ARE NOT HAND-ROLLED. Guessing at include paths and defines
+# would produce a job that compiles something adjacent to what the real build
+# compiles, and the first time the two disagreed nobody would know which was
+# lying. Instead the core's cmake is asked: it already sets
+# CMAKE_EXPORT_COMPILE_COMMANDS in its top-level CMakeLists.txt, so configure
+# alone writes a compile_commands.json containing the exact command line the real
+# build would use for this file - every -I, every -D, -DMOD_PLAYERBOTS included -
+# and this job runs that command with the output flags stripped and
+# `-fsyntax-only` added. When the pins move, the flags move with them, because
+# they were never written down here in the first place.
+#
+# WHAT IT PROVES, AND WHAT IT DOES NOT. It proves src/mod_overseer.cpp is
+# accepted by the same compiler, with the same flags, against the same headers
+# the merged build will use: undeclared names, wrong types, bad overloads, a
+# member that upstream does not have, a static_assert in the wrong order. It does
+# NOT link, so it cannot see an undefined symbol; it does not compile any other
+# translation unit, though the only other one in this module is
+# src/overseer_decisions.cpp, which check.decisions.yml compiles and runs on the
+# same pull request; and it does not run anything, so it says nothing whatsoever
+# about behaviour. build.yml on main remains the proof that the whole thing links
+# and produces a worldserver. This job is the fast half of that answer, moved to
+# where it can still change the outcome.
+#
+# NON-VACUITY IS CHECKED, NOT ASSUMED. The failure mode this workflow exists to
+# remove is a green check that verified nothing, so it must not be able to become
+# one itself. Two defences. First, every step that could silently find nothing
+# fails instead: an empty pin, a missing compile_commands.json entry for
+# mod_overseer.cpp, a compile command that lost its `-fsyntax-only`. Second, the
+# workflow can break the adapter on purpose and demand that it notice: dispatch
+# it with `self_test: true` and it appends a static_assert naming a constant that
+# does not exist to the COPY of the file inside the core tree - never to anything
+# in this repository - and then PASSES only if the compile failed. A green
+# self_test run is a standing, re-runnable proof that this gate is not vacuous.
+#
+# IT CACHES NOTHING, DELIBERATELY. Caching the apt packages or the core clone
+# would save a couple of minutes and would spend part of the repository's shared
+# 10 GB cache budget on every pull request. That budget is what build.yml's
+# buildx cache lives in, and evicting that turns a 36-minute build on main into a
+# cold one. A few minutes on a branch is not worth an hour on main. If this job
+# ever needs to be faster, take the time out of the work, not out of that cache.
+#
+# CONCURRENCY IS PER REF WITH CANCEL ON, WHICH IS NOT WHAT build.yml DOES, AND
+# THAT IS NOT AN OVERSIGHT. Read build.yml's concurrency comment before changing
+# this. That workflow keys on the commit and refuses to cancel because it runs on
+# main, a run there costs an hour, and every commit reaching main must produce a
+# compile result: keying it on the repository once evicted 60 of 100 runs and
+# left 31 of 56 pushes to main with no build result at all. None of that applies
+# here. This job runs on pull requests only, it costs minutes, and when a branch
+# is pushed again the older run is answering a question about code that no longer
+# exists. So the key is the ref and the older run is cancelled, which is exactly
+# what check.decisions.yml does and for exactly the same reason. It is NOT the
+# repository-wide group that caused the eviction, and it must not become one.
+#
+# WHICH IS ALSO WHY THIS DOES NOT RUN ON PUSHES TO MAIN. It could, and it would
+# give a red eight minutes after a merge instead of an hour after one. But two
+# merges four seconds apart are both `refs/heads/main`, so a per-ref group would
+# have the second evict the first and hand main the same grey tick #288's
+# neighbour was fixed to stop producing, and avoiding that means carrying
+# build.yml's per-commit key here as well. The information is not new - build.yml
+# is already compiling that commit - so the gate stays where the information is
+# new, which is before the merge.
+#
+# NO PATH FILTERS. The obvious `paths: [src/**, ...]` would skip this on pull
+# requests that only touch docs. It is left off on purpose. A path-filtered
+# workflow that is also a required check is reported as expected-but-never-run
+# and blocks the pull request forever, which is a worse failure than a few
+# unnecessary minutes; and the set of paths that can break this compile is wider
+# than it looks - the adapter includes overseer_decisions.h, the patches under
+# patches/ are a real build dependency of it, and the pins live in another
+# workflow file. Running always is the version with no way to be wrong.
+#
+# THE PINS ARE READ OUT OF build.yml, NOT COPIED INTO HERE. Two workflows that
+# each carry their own copy of CORE_SHA drift the moment one is bumped and the
+# other is not, and the failure is silent in the worst possible way: the gate
+# goes on passing while compiling against a core that main no longer uses. So
+# build.yml stays the one place the pins are written and this job greps them out
+# of it, asserting it found a 40-character hex SHA for each. If that file's env
+# block is ever reformatted this job fails loudly on the next pull request rather
+# than quietly compiling against nothing.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      self_test:
+        description: >-
+          Append a deliberate compile error to the COPY of the adapter inside the
+          core tree and require this job to catch it. Nothing in this repository
+          is modified. The run PASSES only if the compile failed.
+        type: boolean
+        default: false
+
+concurrency:
+  group: adapter-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  adapter:
+    runs-on: ubuntu-latest
+    # Expected to finish in single-digit minutes. The cap is here so a hung
+    # configure or a stalled apt mirror costs one job rather than six hours of
+    # the account's runner budget, not because the work is expected to approach
+    # it. If this ever legitimately takes 30 minutes, that is a finding worth
+    # writing down, not a number worth raising.
+    timeout-minutes: 30
+    # Clones public repositories, compiles one file, writes nothing anywhere.
+    # Named explicitly rather than inherited, because the repository default is a
+    # setting somebody can change without ever reading this file. `pull_request`
+    # and not `pull_request_target` is the other half of that: this job compiles
+    # the branch's own source, which on a public repository can come from a fork,
+    # so it must run in the unprivileged context where no secret is reachable. It
+    # needs none.
+    permissions:
+      contents: read
+    env:
+      SELF_TEST: ${{ github.event.inputs.self_test == 'true' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          path: mod-overseer
+
+      - name: Read the pins out of build.yml
+        working-directory: mod-overseer
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/build.yml
+          get_sha() {
+            grep -oE "^[[:space:]]+$1:[[:space:]]+[0-9a-f]{40}[[:space:]]*$" "$wf" \
+              | head -1 | awk '{print $2}'
+          }
+          get_url() {
+            grep -oE "^[[:space:]]+$1:[[:space:]]+https://[^[:space:]]+" "$wf" \
+              | head -1 | awk '{print $2}'
+          }
+          CORE_SHA="$(get_sha CORE_SHA)"
+          MODULE_SHA="$(get_sha MODULE_SHA)"
+          CORE_REPO="$(get_url CORE_REPO)"
+          MODULE_REPO="$(get_url MODULE_REPO)"
+          for pair in "CORE_SHA=$CORE_SHA" "MODULE_SHA=$MODULE_SHA" \
+                      "CORE_REPO=$CORE_REPO" "MODULE_REPO=$MODULE_REPO"; do
+            name="${pair%%=*}"
+            value="${pair#*=}"
+            test -n "$value" || {
+              echo "::error::could not read $name out of $wf - this job compiles against the pins that workflow declares, and will not guess at them"
+              exit 1
+            }
+            echo "$name=$value" >> "$GITHUB_ENV"
+            echo "$name: $value"
+          done
+
+      - name: Install what the core's own Dockerfile installs
+        # The `build` stage of the pinned core's apps/docker/Dockerfile installs
+        # exactly this list, kept in that order so somebody can diff the two when
+        # the pins move. Three differences, all forced: `ccache` is gone because
+        # nothing here compiles twice, `default-mysql-client` and `lsb-base` are
+        # gone because they are for running a server rather than compiling one,
+        # and `libncurses5-dev` is spelled `libncurses-dev`, which is what that
+        # transitional package resolves to on 24.04. The runner image already
+        # ships several of the rest; apt does not mind being told twice.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential libtool cmake-data ninja-build cmake clang \
+            git curl unzip openssl \
+            default-libmysqlclient-dev libboost-all-dev libssl-dev libmysql++-dev \
+            libreadline-dev zlib1g-dev libbz2-dev libncurses-dev liblzma-dev
+          clang++ --version | head -1
+          cmake --version | head -1
+
+      - name: Lay out the pinned tree
+        # Same layout build.yml builds, assembled the same way, with one
+        # difference: the core and mod-playerbots are fetched at a single commit
+        # rather than cloned whole. The core's history is hundreds of megabytes
+        # and nothing here reads it - the core's own genrev.cmake falls back to
+        # "unknown 1970-01-01 (Archived)" when `git describe` finds no tags,
+        # which is a version string in a banner this job never prints. Cloning
+        # the history to throw it away would be most of this job's runtime.
+        run: |
+          set -euo pipefail
+          git init -q acore
+          git -C acore remote add origin "$CORE_REPO"
+          git -C acore fetch -q --depth 1 origin "$CORE_SHA"
+          git -C acore checkout -q FETCH_HEAD
+
+          mkdir -p acore/modules
+          git init -q acore/modules/mod-playerbots
+          git -C acore/modules/mod-playerbots remote add origin "$MODULE_REPO"
+          git -C acore/modules/mod-playerbots fetch -q --depth 1 origin "$MODULE_SHA"
+          git -C acore/modules/mod-playerbots checkout -q FETCH_HEAD
+          rm -rf acore/modules/mod-playerbots/.git
+
+          cp -r mod-overseer acore/modules/mod-overseer
+          rm -rf acore/modules/mod-overseer/.git
+
+          test -f acore/apps/docker/Dockerfile
+          test -d acore/modules/mod-playerbots/src
+          test -f acore/modules/mod-overseer/src/mod_overseer.cpp
+          ls -1 acore/modules
+
+      - name: Apply mod-playerbots patches this module depends on
+        # The same call build.yml makes, for the same reason: patches/ is a real
+        # build dependency of this module, not a mirror. 0005 adds the
+        # `NewRpgInfo::WanderNpc::npcEntry` field and the
+        # `ChangeToWanderNpc(entry, pos)` overload that mod_overseer.cpp calls and
+        # upstream mod-playerbots does not have, so without this step the compile
+        # below would fail for a reason that has nothing to do with the branch
+        # under test. `bash apply-patches.sh` rather than `./apply-patches.sh`
+        # because the exec bit does not survive every path this file takes to get
+        # here - see build.yml's note on losing 20 minutes to exit 126.
+        working-directory: mod-overseer
+        run: bash apply-patches.sh "$GITHUB_WORKSPACE/acore"
+
+      - name: Break the adapter on purpose
+        # Only ever reachable from a manual dispatch with self_test: true, and it
+        # edits the COPY inside the core tree, never the file in this repository.
+        # The shape is #284's: a static_assert naming a constant that is not in
+        # scope. If the compile below survives this, the gate is vacuous and the
+        # job says so.
+        if: env.SELF_TEST == 'true'
+        run: |
+          set -euo pipefail
+          cat >> acore/modules/mod-overseer/src/mod_overseer.cpp <<'EOF'
+
+          // Appended by the self_test dispatch input. Not in the repository.
+          static_assert(kThisConstantDoesNotExist, "self-test: this must not compile");
+          EOF
+          tail -3 acore/modules/mod-overseer/src/mod_overseer.cpp
+
+      - name: Configure the core the way its Dockerfile configures it
+        # This cmake line is the one out of the pinned core's
+        # apps/docker/Dockerfile, with three deliberate differences, all of them
+        # about not doing work whose answer this job does not read:
+        #   - TOOLS_BUILD=none rather than "all": the map extractors are separate
+        #     executables, none of which this module's translation unit can reach.
+        #   - No ccache launcher: nothing here is compiled twice, and a launcher
+        #     in front of the compiler is a launcher that can end up in the
+        #     compile command this job later re-runs by hand.
+        #   - No --build and no --install. Configure is all that is wanted; the
+        #     compile is one file, done below.
+        # APPS_BUILD stays "all" because the core only descends into modules/ when
+        # the worldserver application is being built, and MODULES stays "static"
+        # because that is what puts mod_overseer.cpp into a translation unit at
+        # all. Changing either of those silently removes this file from the build
+        # and this job would pass having compiled nothing, which the assertions in
+        # the next step exist to catch.
+        run: |
+          set -euo pipefail
+          mkdir -p acore/build
+          cd acore/build
+          cmake "$GITHUB_WORKSPACE/acore" \
+            -G Ninja \
+            -DCMAKE_INSTALL_PREFIX="$PWD/dist" \
+            -DAPPS_BUILD="all" \
+            -DTOOLS_BUILD="none" \
+            -DSCRIPTS="static" \
+            -DMODULES="static" \
+            -DWITH_WARNINGS="ON" \
+            -DCMAKE_BUILD_TYPE="RelWithDebInfo" \
+            -DCMAKE_CXX_COMPILER="clang++" \
+            -DCMAKE_C_COMPILER="clang" \
+            -DBoost_USE_STATIC_LIBS="ON"
+          # revision.h is produced by a build-time custom target, not by
+          # configure, and it is the one generated header a core include can
+          # reach from this translation unit. Building that target alone runs a
+          # cmake -P script and nothing else.
+          cmake --build . --target revision.h
+
+      - name: Compile src/mod_overseer.cpp, and only that
+        run: |
+          set -euo pipefail
+          src="$GITHUB_WORKSPACE/acore/modules/mod-overseer/src/mod_overseer.cpp"
+          db="$GITHUB_WORKSPACE/acore/build/compile_commands.json"
+
+          test -f "$db" || { echo "::error::no compile_commands.json - configure did not produce one, so there is no compile command to trust"; exit 1; }
+
+          count="$(jq --arg f "$src" '[.[] | select(.file == $f)] | length' "$db")"
+          echo "compile_commands.json entries for the adapter: $count"
+          test "$count" -ge 1 || {
+            echo "::error::compile_commands.json has no entry for $src - the core's build does not contain this file, so compiling it here would prove nothing. Check that MODULES=static and APPS_BUILD=all still put modules/ into the build."
+            exit 1
+          }
+
+          cmd="$(jq -r --arg f "$src" '[.[] | select(.file == $f)][0].command' "$db")"
+          # Drop the object-file output, the -c that goes with it, and the
+          # -MD/-MT/-MF depfile flags. The depfile ones have to go for a dull
+          # reason worth writing down rather than rediscovering: -MF names a path
+          # inside the object directory, and that directory only exists once ninja
+          # has run the edge that creates it. Nothing here runs ninja on that
+          # edge, so leaving -MF in gets "unable to open output file", which is a
+          # red check that says nothing about the branch. Everything else - the
+          # include paths, the defines, the standard, the warning flags - is left
+          # exactly as it is, because it is what the merged build will use and
+          # because cmake, not this file, wrote it.
+          syntax="$(printf '%s' "$cmd" \
+            | sed -E 's@ -o [^ ]+@@g; s@ -c [^ ]+@@g; s@ -MD@@g; s@ -MT [^ ]+@@g; s@ -MF [^ ]+@@g')"
+          case "$syntax" in
+            *clang++*) ;;
+            *) echo "::error::the compile command out of compile_commands.json does not name a compiler: $syntax"; exit 1 ;;
+          esac
+          case "$syntax" in
+            *" -o "*|*" -c "*|*" -MF "*)
+              echo "::error::failed to strip the output flags out of the compile command, refusing to run it: $syntax"
+              exit 1 ;;
+          esac
+
+          echo "== command"
+          printf '%s -fsyntax-only %s\n' "$syntax" "$src"
+          echo "== compiling"
+          started=$SECONDS
+          status=0
+          eval "$syntax -fsyntax-only \"$src\"" || status=$?
+          elapsed=$((SECONDS - started))
+          echo "== compile took ${elapsed}s, exit $status"
+
+          {
+            echo "### The adapter compiles"
+            echo
+            echo "- pins: core \`$CORE_SHA\`, mod-playerbots \`$MODULE_SHA\`"
+            echo "- one translation unit, \`-fsyntax-only\`, ${elapsed}s"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$SELF_TEST" = "true" ]; then
+            if [ "$status" -eq 0 ]; then
+              echo "::error::self-test: the adapter was broken on purpose and this job compiled it clean. The gate is vacuous - fix it before trusting a green tick from it."
+              exit 1
+            fi
+            echo "self-test: the deliberately broken adapter failed to compile, exit $status. The gate is not vacuous."
+            echo "- self-test: caught the deliberate error (exit $status)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          exit "$status"
