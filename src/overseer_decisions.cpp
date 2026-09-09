@@ -6835,4 +6835,173 @@ char const* HearthStayedDetail(bool castWasSeen, bool castWasQueued)
     return HEARTH_STAYED_NO_CAST;
 }
 
+
+char const* PartyFlightBlockWord(PartyFlightBlock block)
+{
+    switch (block)
+    {
+        case PartyFlightBlock::None:
+            return "has nothing in its way";
+        case PartyFlightBlock::InCombat:
+            return "is in combat";
+        case PartyFlightBlock::NotSteerable:
+            return "is not a character this module steers";
+        case PartyFlightBlock::NoDepartureNode:
+            return "has no departure node where it stands";
+        case PartyFlightBlock::MasterOutOfReach:
+            return "would have to walk as far to a flight master as this errand is "
+                   "long enough to fly";
+        case PartyFlightBlock::UndiscoveredNode:
+            return "has never discovered a node the route needs";
+        case PartyFlightBlock::NoRoute:
+            return "has no route from its own node to that landing";
+        case PartyFlightBlock::TooPoor:
+            return "cannot pay its own fare";
+    }
+    // Unreachable while the enum and this switch agree, and said rather than
+    // silent for the reason every other word function here is: a verdict that
+    // prints nothing is a verdict nobody can act on.
+    return "cannot board for a reason this module has not named";
+}
+
+char const* PartyFlightVerdictWord(PartyFlightVerdict verdict)
+{
+    switch (verdict)
+    {
+        case PartyFlightVerdict::Fly:
+            return "fly";
+        case PartyFlightVerdict::WaitForIt:
+            return "wait";
+        case PartyFlightVerdict::Walk:
+            return "walk";
+    }
+    return "walk";
+}
+
+PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members)
+{
+    PartyFlightPlan plan;
+
+    // EXACTLY ONE LEADER, OR NOTHING FLIES. This is a caller bug rather than a
+    // world state - the adapter builds this roster off Group::GetLeaderGUID and
+    // knows which character is carrying the errand - and it is refused rather
+    // than guessed at because every remaining rule here is written about "the
+    // character the others follow". A roster with no leader, or two, has no
+    // such character and the safe answer is the one that changes nothing.
+    // `blockedBy` stays empty, which is how a caller tells a refused ROSTER
+    // from a refused MEMBER.
+    unsigned leaders = 0;
+    for (PartyFlightMember const& member : members)
+        if (member.leader)
+            ++leaders;
+    if (leaders != 1)
+        return plan;   // Walk, the default
+
+    std::vector<std::string> boarding;
+    bool permanent = false;
+    bool transient = false;
+    std::string transientName;
+
+    for (PartyFlightMember const& member : members)
+    {
+        // WHO IS BEHIND THE LEADER, which is the only population any of this is
+        // about. The three exemptions carried over from #138 and the two added
+        // by #360, in one expression so they cannot drift apart. The leader
+        // itself is exempt from the last of them, because the character
+        // carrying the errand is not following anybody by definition and would
+        // otherwise exempt itself out of its own flight.
+        bool const behind = member.onSameMap && member.alive && !member.inFlight &&
+                            !member.atArrival &&
+                            (member.leader || member.followingTheLeader);
+        if (!behind)
+        {
+            // ...and the leader is never exempt, because the leader is the one
+            // boarding. If the caller handed over a leader that is dead, off
+            // the map, already flying or already at the landing, then whatever
+            // it is asking, it is not the question this answers. Refuse the
+            // roster, again with an empty `blockedBy`.
+            if (member.leader)
+                return PartyFlightPlan{};
+            continue;
+        }
+
+        // THE ORDER OF THESE FOUR IS THE ORDER A CHARACTER MEETS THEM, and
+        // combat is asked LAST on purpose. A member that is both in a fight and
+        // holding no node at all must report the node, because that is the half
+        // that will still be true when the fight ends. Asking combat first
+        // would print the wolf and hide the reason the party is walking.
+        PartyFlightBlock block = PartyFlightBlock::None;
+        std::uint32_t node = 0;
+        if (!member.steerable)
+            block = PartyFlightBlock::NotSteerable;
+        else if (!member.hasDepartureNode)
+            block = PartyFlightBlock::NoDepartureNode;
+        else if (!member.masterInReach)
+            block = PartyFlightBlock::MasterOutOfReach;
+        else if (!member.routeKnown)
+        {
+            // An undiscovered node and a missing route are the same refusal to
+            // the executor and completely different work to whoever reads the
+            // log: one of them names a flight master somebody can be sent to.
+            block = member.undiscoveredNode ? PartyFlightBlock::UndiscoveredNode
+                                            : PartyFlightBlock::NoRoute;
+            node = member.undiscoveredNode;
+        }
+        else if (!member.canPayFare)
+            block = PartyFlightBlock::TooPoor;
+        else if (member.inCombat)
+            block = PartyFlightBlock::InCombat;
+
+        if (block == PartyFlightBlock::None)
+        {
+            boarding.push_back(member.name);
+            continue;
+        }
+        if (block == PartyFlightBlock::InCombat)
+        {
+            if (!transient)
+            {
+                transient = true;
+                transientName = member.name;
+            }
+            continue;
+        }
+        // FIRST PERMANENT BLOCKER IN ROSTER ORDER WINS THE REPORT, and the loop
+        // carries on rather than returning: the verdict is already settled, and
+        // finishing the sweep is what makes the answer independent of the order
+        // the caller happened to build the roster in.
+        if (!permanent)
+        {
+            permanent = true;
+            plan.blockedBy = member.name;
+            plan.block = block;
+            plan.blockedNode = node;
+        }
+    }
+
+    // A PERMANENT BLOCKER BEATS A TRANSIENT ONE. Waiting out a fight only to
+    // refuse afterwards is a party standing still for no reason, so the walk
+    // starts now.
+    if (permanent)
+    {
+        plan.verdict = PartyFlightVerdict::Walk;
+        return plan;
+    }
+    if (transient)
+    {
+        plan.verdict = PartyFlightVerdict::WaitForIt;
+        plan.blockedBy = transientName;
+        plan.block = PartyFlightBlock::InCombat;
+        return plan;
+    }
+
+    // Everybody behind the leader can board, which includes the case where
+    // nobody is behind it at all: a lone character, or one whose whole party is
+    // dead, off the map or already in the air, boards on its own exactly as it
+    // did before this existed.
+    plan.verdict = PartyFlightVerdict::Fly;
+    plan.boarding = std::move(boarding);
+    return plan;
+}
+
 }  // namespace OverseerDecisions
