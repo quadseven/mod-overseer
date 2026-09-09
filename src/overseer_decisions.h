@@ -2069,13 +2069,28 @@ bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
 // that direction is chosen rather than fallen into. The vocabulary grows toward
 // endings of real runs - the accounting migration already names 'complete' as
 // the value #143 will add the moment a run has a goal to complete - while the
-// two outcomes that mean nobody got inside are a closed pair, both written by
-// this module at the two points in the state machine that come before anyone
-// crosses the door. An unknown word is far likelier to be a new way for a real
-// run to end than a third way to fail before one starts, and counting a real
-// run as no run is the failure that loses a campaign's progress silently. An
-// empty outcome is also "it entered": that is what the cold-heartbeat close
-// leaves on a row, and that row exists because somebody was on the map.
+// outcomes that mean the party never got inside TOGETHER are a closed set, all
+// of them written by this module at points in the state machine that come
+// before the run is handed to the dungeon brain. An unknown word is far likelier
+// to be a new way for a real run to end than a new way to fail before one
+// starts, and counting a real run as no run is the failure that loses a
+// campaign's progress silently. An empty outcome is also "it entered": that is
+// what the cold-heartbeat close leaves on a row, and that row exists because
+// somebody was on the map.
+//
+// AND 'split_failed' JOINS THAT SET RATHER THAN COUNTING AS A RUN (#384), which
+// is the one member of it that has somebody standing on the instance map while
+// it is written. That looks like a contradiction of "the bar is the instance
+// map" and is not, because the bar was never one character: STAGED_INSIDE holds
+// precisely until the census says EVERY member is through, and a run that never
+// satisfies it is never handed to the clearing drive, never arms the dungeon
+// brain, and clears nothing. Measured on the dev realm: a run adopted with one
+// of five inside sat 'active' for over 36 minutes with four members inside not
+// moving one yard and the fifth on another map, because it had died inside and
+// released to a graveyard outside. Letting that spend a slot in a campaign of a
+// hundred is exactly the defect #225 exists to have removed - a campaign that
+// reports success having cleared nothing - and it is the same argument, one
+// phase later.
 bool DungeonRunEnteredTheInstance(std::string const& outcome);
 
 // HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
@@ -2086,8 +2101,11 @@ bool DungeonRunEnteredTheInstance(std::string const& outcome);
 // something else: it consumed a campaign slot, so a staging that failed for a
 // reason that kept being true ran out of campaign eventually. Taking that slot
 // away (which is the fix #225 asks for) takes the bound away with it, so the
-// stop has to cover both ways of failing before entry or the fix trades a wrong
-// count for a loop with nothing at the end of it.
+// stop has to cover every way of failing before entry or the fix trades a wrong
+// count for a loop with nothing at the end of it. The same argument brought
+// 'split_failed' in with #384: a run that cannot assemble its census inside
+// spends no slot either, so nothing else would ever bound a party that keeps
+// splitting on the same door.
 //
 // `outcomesNewestFirst` is exactly what the caller's `ORDER BY id DESC LIMIT n`
 // returns, and the count stops at the first outcome that entered - so a

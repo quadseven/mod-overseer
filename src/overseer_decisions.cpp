@@ -1283,15 +1283,18 @@ bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
 
 bool DungeonRunEnteredTheInstance(std::string const& outcome)
 {
-    // THE CLOSED PAIR, NAMED RATHER THAN DERIVED. These are the only two
-    // outcomes this module writes at a point in the state machine that comes
-    // before anybody has crossed the door: the instance would not reset, and
-    // the party would not assemble. Everything else it writes - 'left',
-    // 'stalled', 'wipe', 'emptied' - is written about a party that was on the
-    // instance map, and so is an empty outcome, which is what the
+    // THE CLOSED SET, NAMED RATHER THAN DERIVED. These are the only outcomes
+    // this module writes at a point in the state machine that comes before the
+    // party is inside TOGETHER: the instance would not reset, the party would
+    // not assemble outside the door, and (#384) the party crossed but the
+    // census never reached everybody, so the run was never handed to the
+    // clearing drive. Everything else it writes - 'left', 'stalled', 'wipe',
+    // 'emptied' - is written about a party that was on the instance map with
+    // the run under way, and so is an empty outcome, which is what the
     // cold-heartbeat close leaves behind on a row that only exists because
     // somebody was seen in there.
-    return outcome != "reset_failed" && outcome != "staging_failed";
+    return outcome != "reset_failed" && outcome != "staging_failed" &&
+           outcome != "split_failed";
 }
 
 unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst)

@@ -2103,6 +2103,52 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_CROSSING_RATCHET{
     OverseerDecisions::RatchetReading::CountAchieved,
     0.f, DUNGEON_CROSSING_BACKSTOP_SECONDS};
 
+// HOW LONG STAGED_INSIDE MAY WAIT FOR A CENSUS THAT NEVER COMPLETES (#384).
+//
+// THE PHASE HAD NO BOUND AT ALL. STAGED_INSIDE holds until the census says
+// every roster member is on the instance map, and until now the only thing it
+// did about a party that was split was print one line and return - on every
+// poll, forever. #382 gave the phase AFTER it a ceiling and is deliberately
+// silent here, because a run that never satisfies this census never reaches
+// CLEARING for that ceiling to bound.
+//
+// WHAT IT COST, MEASURED ON THE DEV REALM. A run was adopted at STAGED_INSIDE
+// with one of five members inside, and then sat `state = active` for over 36
+// minutes with four members inside whose positions were identical to the yard
+// across samples sixteen minutes apart. The fifth was outside and was never
+// coming back: it had taken environmental damage inside the instance
+// (killer_type 'self', out of combat, 118 yards below the floor, so drowning)
+// and released to a graveyard on the outdoor map about 2200 yards from the
+// door. Nothing in this module was waiting for it, and nothing was walking it
+// back, so the census could not reach five by any path.
+//
+// KEYED ON PROGRESS, NOT ON ELAPSED TIME, which is the same rule
+// DUNGEON_CROSSING_BACKSTOP_SECONDS above already states for the phase before
+// this one and #63 taught the travel backstop before that. The reading is how
+// many members the census found inside, so the clock restarts every time one
+// more actually gets in there. A party trickling in one at a time is never
+// given up on; a party that has stopped assembling is.
+//
+// FIFTEEN MINUTES, AND WHY IT IS THREE TIMES THE CROSSING'S FIVE. ENTER's
+// members are standing on a doorstep and the only thing left for them to do is
+// take a packet, so five minutes without one more crossing is already a long
+// time. A member that has to reach this door from outside may be a graveyard
+// away - 2200 yards on the measured run, which is minutes of walking on top of
+// however long the revival drive takes to get it on its feet - and giving up
+// while somebody is visibly walking back is the mistake #63 is named for. It is
+// still under half the 36 minutes that were actually observed, and every minute
+// past this one is five characters standing still.
+constexpr time_t DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS = 15 * 60;
+
+// The assembly ratchet. The same CountAchieved shape and the same argument as
+// DUNGEON_CROSSING_RATCHET: the reading is how many members are already inside,
+// one more is one more, and a count has no jitter for a margin to absorb. Zero
+// is a real reading rather than an unmeasured one, which keeps the clock the
+// phase entry started running while nobody has got in yet.
+constexpr OverseerDecisions::RatchetLimits DUNGEON_STAGED_INSIDE_RATCHET{
+    OverseerDecisions::RatchetReading::CountAchieved,
+    0.f, DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS};
+
 // How long CLEARING waits for `dc on` to be ACCEPTED before it says, out loud,
 // that the run is being fought with open-world logic (#88, #140).
 //
@@ -7871,17 +7917,24 @@ private:
         return result ? result->Fetch()[0].Get<uint32>() : 0;
     }
 
-    // How many of this campaign's most recent runs never got inside at all,
-    // counting back from the newest and stopping at the first that did.
+    // How many of this campaign's most recent runs never got the party inside
+    // together, counting back from the newest and stopping at the first that
+    // did.
     //
     // IT USED TO ASK ONLY ABOUT 'reset_failed', AND WIDENING IT IS NOT OPTIONAL
     // (#225). A staging failure had a bound of its own for as long as it
     // consumed a campaign slot, and FailStaging's own comment leaned on exactly
     // that: "Each closed run counts against the campaign's own cap, so a staging
     // that fails for a reason that keeps being true cannot run forever." Taking
-    // the slot away takes that bound with it, so this stop has to cover both
-    // ways of failing before entry or the count is fixed at the price of a loop
+    // the slot away takes that bound with it, so this stop has to cover every
+    // way of failing before entry or the count is fixed at the price of a loop
     // with nothing at the end of it. Twelve minutes an attempt, forever.
+    //
+    // 'split_failed' JOINED THEM ON THE SAME ARGUMENT (#384). A run that gets
+    // some of the party inside and never the rest spends no campaign slot
+    // either, so without this it would be the same unbounded loop again - a
+    // quarter of an hour an attempt, forever, on whatever keeps splitting the
+    // party at that door.
     //
     // The rows come back newest first and the counting itself is
     // OverseerDecisions::DungeonRunTrailingFailures, which is where the
@@ -7949,12 +8002,12 @@ private:
             LOG_ERROR("module.overseer",
                       "overseer: the dungeon campaign for '{}' is stopped - the "
                       "last {} attempts of campaign {} all ended without the "
-                      "party ever reaching the instance, so a further one would "
+                      "party ever being inside together, so a further one would "
                       "fail the same way. The reasons are on those rows. Once "
                       "the cause is fixed, take them out of the campaign to "
                       "start again: UPDATE overseer_dungeon_run SET campaign_id "
                       "= 0 WHERE campaign_id = {} AND outcome IN "
-                      "('reset_failed','staging_failed')",
+                      "('reset_failed','staging_failed','split_failed')",
                       leaderName, failures, campaignId, campaignId);
         return true;
     }
@@ -19083,6 +19136,18 @@ private:
         // the same way and now through the same function. Shared by ENTER and
         // EXIT because only one crossing is ever in progress.
         OverseerDecisions::RatchetState crossing;
+        // STAGED_INSIDE'S OWN PROGRESS, IN A RATCHET OF ITS OWN (#384). The
+        // reading is how many members the census found on the instance map, so
+        // "progress" is one more of them getting in there and the clock
+        // restarts on it. It is NOT `crossing` above, even though the reading
+        // is the same number: that one belongs to a crossing this coordinator
+        // is driving, is reset on the way into EXIT, and is shared by the two
+        // crossings on the argument that only one is ever in progress.
+        // STAGED_INSIDE is not a crossing - nothing here knocks on a door - and
+        // a phase that borrowed another phase's clock would be bounded by
+        // whichever of them was entered last. One ratchet per phase is what the
+        // three that already exist do. See DUNGEON_STAGED_INSIDE_RATCHET.
+        OverseerDecisions::RatchetState assembly;
         // THE STAGING WATCHDOG'S PER-MEMBER MEMORY (#164): whether each member
         // is actually closing on the staging point, and how far up the
         // correction ladder it has been taken. It lives on the RUN rather than
@@ -21164,6 +21229,109 @@ private:
                         std::string(phase) +
                             " was refused: the party is above the staging point, not "
                             "near it, and has stopped descending - " + blockers,
+                        stillWanted);
+    }
+
+    // THE SAME CLOSING AGAIN, FOR A RUN THAT GOT INSIDE AND NEVER GOT INSIDE
+    // TOGETHER (#384).
+    //
+    // WHAT IT IS FOR. STAGED_INSIDE waits for the census to say every roster
+    // member is on the instance map, and that is the right condition: the
+    // clearing drive is handed a PARTY, and handing it four fifths of one is how
+    // a tank pulls with no healer. What was missing is what happens when the
+    // census can never say it. Measured on the dev realm: a run adopted with one
+    // of five inside, four members inside who did not move one yard in 36
+    // minutes, and a fifth that had drowned inside the instance and released to
+    // a graveyard on the outdoor map 2200 yards away. The phase printed its one
+    // "the party is split" line and returned, on every poll, for as long as the
+    // worldserver stayed up.
+    //
+    // WHY IT IS A THIRD FAILURE FUNCTION AND NOT A FLAG ON EITHER OF THE TWO
+    // ABOVE. FailStaging closes on "a phase held for over twelve minutes and
+    // never opened" and FailApproach on "a member is above the staging point and
+    // has stopped descending". Both are sentences about a party OUTSIDE the
+    // door, and both are told before anybody has crossed. This one is told about
+    // a party that is on both sides of the door at once, which is a different
+    // fact, needs a different reason on the row, and is the state the run table
+    // could not previously describe at all.
+    //
+    // AND THE OUTCOME WORD IS ITS OWN, WHICH IS NOT FREE AND IS ARGUED FOR.
+    // FailApproach deliberately reuses `staging_failed` because "did this run
+    // get staged" has one answer however the staging failed. The same question
+    // asked here has a different answer: the staging worked, the crossing
+    // worked for whoever crossed, and what failed is the assembly INSIDE. An
+    // operator reading `staging_failed` on a row whose party was standing in a
+    // dungeon would be reading something untrue. `split_failed` is a VARCHAR
+    // value like the others and needs no migration, and
+    // OverseerDecisions::DungeonRunEnteredTheInstance carries the argument for
+    // why it counts as a run that never happened rather than as a run that did.
+    //
+    // WHICH IS ALSO WHAT PUTS A CEILING ON THE REPEAT. A split run spends no
+    // slot in the campaign, so nothing about the cap bounds a party that keeps
+    // splitting on the same door; what bounds it is TrailingUnenteredRuns, which
+    // counts `split_failed` beside the other two, and stops the campaign with
+    // the ERROR that already exists after DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES
+    // of them.
+    //
+    // WHY CLOSING RECOVERS THE PARTY RATHER THAN ABANDONING IT. Everything
+    // FailStaging's own comment says about a closed run being recoverable
+    // applies here and one thing more: the very next poll opens a fresh run at
+    // RESETTING, RESET finds the map occupied, and WalkStragglersOut (#351)
+    // walks whoever is still inside back out through the exit door. So the
+    // members who were stuck inside are collected by machinery that already
+    // exists, the stranded one is outside where the barrier can gather it, and
+    // the next attempt starts with all five on the same map. Left `active`,
+    // none of that is reachable: the run holds the one-active-run-per-map key
+    // the next one needs.
+    void FailSplitInside(DungeonRunCoordinatorState& coord,
+                         std::string const& leaderName,
+                         std::vector<std::string> const& members,
+                         DungeonPortal const& portal, uint32 inside, uint32 roster,
+                         std::string const& blockers, bool stillWanted)
+    {
+        std::string const minutes =
+            std::to_string(DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS / 60);
+        std::string const reason =
+            "STAGED_INSIDE held with " + std::to_string(inside) + " of " +
+            std::to_string(roster) + " on map " + std::to_string(portal.insideMapId) +
+            " and nobody else got in for " + minutes + " minutes - " + blockers;
+        uint32 const runId =
+            coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} cannot assemble its census - {} "
+                  "of {} are on map {} and nobody else has got in there for {} minutes. "
+                  "Still outside: {}. The attempt is CLOSED rather than left 'active': the "
+                  "census is what hands the run to the clearing drive, so a run that cannot "
+                  "satisfy it is not a slow run, it is five characters standing still with "
+                  "no ceiling on them. Closing lets the next poll open a fresh run, whose "
+                  "RESET walks whoever is left inside back out through the exit door and "
+                  "whose BARRIER can then gather everybody on one map. It does not spend "
+                  "run {} of the campaign: the party was never inside together",
+                  coord.runNumber, coord.campaignId, inside, roster, portal.insideMapId,
+                  minutes, blockers, coord.runNumber);
+
+        if (runId)
+            // The row exists because somebody is standing on the instance map,
+            // which is the same reason FailStaging stamps a row a stray member
+            // opened: this attempt's numbers belong on this attempt's row, and
+            // nothing else would ever put them there once the coordinator has
+            // stopped driving it.
+            StampRunIntoCampaign(runId, coord.campaignId, coord.runNumber,
+                                 JoinNames(members));
+        else
+            // Defensive rather than expected. This branch is only reachable
+            // with somebody inside and no `active` row for the map, which
+            // should not happen because the arming drive opens one on sight of
+            // exactly that - but a failure with nothing in the table is the
+            // shape #225 measured ("dungeon run 0 ended 'staging_failed'" in
+            // the log and no row), and the stop that bounds the repeat reads
+            // rows.
+            RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
+                               coord.runNumber, "split_failed", reason,
+                               JoinNames(members));
+
+        EndRunAndDecide(coord, leaderName, portal, runId, "split_failed", reason,
                         stillWanted);
     }
 
@@ -23506,21 +23674,64 @@ private:
             {
                 if (!OverseerDecisions::DungeonRunAllThrough(states))
                 {
+                    // IS THE PARTY STILL ASSEMBLING, OR HAS IT STOPPED (#384)?
+                    //
+                    // The reading is how many members are inside, ratcheted, so
+                    // one more getting in there restarts the clock and a party
+                    // arriving one at a time is never given up on. It is the
+                    // rule the crossing before this phase already states, asked
+                    // through the same shared Ratchet and a mark of its own;
+                    // what is new is that this phase asks it at all, rather than
+                    // the mechanism. Until now it printed the line below and
+                    // returned, on every poll, with nothing anywhere that could
+                    // ever end the run - which is how a run sat 'active' for 36
+                    // minutes with four members inside not moving one yard and
+                    // a fifth that had died inside and released to a graveyard
+                    // on the outdoor map, never to return.
+                    //
+                    // Taken BEFORE the log-once flag is read, so that a member
+                    // getting in makes the phase say the line again with the
+                    // new count rather than staying silent on a number that has
+                    // changed. Same treatment loggedCrossingWaiting gets.
+                    OverseerDecisions::RatchetVerdict const assembling =
+                        OverseerDecisions::Ratchet(coord.assembly,
+                                                   static_cast<float>(inside),
+                                                   std::time(nullptr),
+                                                   DUNGEON_STAGED_INSIDE_RATCHET);
+                    if (assembling.progressed)
+                        coord.loggedStagedWaiting = false;
+
                     // SOME IN, SOME OUT. Said out loud once rather than held
                     // silently: a party split across a portal is the exact
                     // state the barrier exists to prevent, and it having
                     // happened AFTER entry is a fact worth reading in a log.
+                    std::string const blockers =
+                        OverseerDecisions::DungeonRunEntryBlockers(
+                            states, DUNGEON_DOORSTEP_RADIUS_YARDS);
                     if (!coord.loggedStagedWaiting)
                     {
                         coord.loggedStagedWaiting = true;
                         LOG_WARN("module.overseer",
                                  "overseer: dungeon run is staged inside map {} but the "
-                                 "party is split - {} of {} are in there. Still outside: {}",
+                                 "party is split - {} of {} are in there. Still outside: "
+                                 "{}. This is bounded: if nobody else gets in there within "
+                                 "{} minutes the run is closed 'split_failed' rather than "
+                                 "held forever",
                                  portal->insideMapId, inside,
-                                 static_cast<uint32>(states.size()),
-                                 OverseerDecisions::DungeonRunEntryBlockers(
-                                     states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+                                 static_cast<uint32>(states.size()), blockers,
+                                 static_cast<uint32>(
+                                     DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS / 60));
                     }
+
+                    // AND THE CEILING ITSELF, WHICH IS THE WHOLE OF #384's
+                    // FIRST HALF. Read with the ratchet above, `stalled` means
+                    // nobody has got inside for a whole backstop, not that the
+                    // phase has merely been running that long. A party that is
+                    // still filing in is never touched by it.
+                    if (assembling.stalled)
+                        FailSplitInside(coord, leaderName, members, *portal, inside,
+                                        static_cast<uint32>(states.size()), blockers,
+                                        IsDungeonJob(leaderJob));
                     return;
                 }
 
