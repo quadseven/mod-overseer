@@ -2289,6 +2289,88 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
                              RatchetLimits const& limits,
                              ApproachLimits const& approach);
+
+// ------------ whether the staging walk is still the run's to measure (#367) --
+//
+// THE WATCHDOG ABOVE ANSWERS "IS THIS CHARACTER GETTING NEARER". IT CANNOT
+// ANSWER "IS ANYTHING WALKING IT AT ALL", AND THAT TURNED OUT TO BE THE
+// QUESTION. GATHERING claimed the leader's staging aim once per leg and never
+// again, which made it the only walking mechanism in the module whose aim
+// nothing renews: the barrier re-claims through its escort every poll, so do
+// the crossing, the catch-up walk and the home errand. The leader on a staging
+// aim is the one claimant with no escort entry - he is aimed, not escorted -
+// so no sweep covered him, and every path that can end an errand ended his
+// silently. His `grind`, `quest` and `move random` went back on with the
+// travel focus that was swept with the errand, the follow drive re-granted him
+// `new rpg` because he leads, and the phase then spent its whole twelve minute
+// window measuring the distance to a staging point nothing was walking him to.
+// Measured on the dev realm across three consecutive runs of one campaign: the
+// gap to the leg being walked wandered between about 1000 and 1500 yards and
+// the height relative to it changed sign, which is a character grinding rather
+// than a character walking a route.
+//
+// AND THE ERRAND DEATH BREAKER ALREADY ASSUMED THIS WAS NOT SO. Its
+// DeclineRunOwned case declines to release a run-owned errand on the stated
+// grounds that a run re-claims its own aim within one coordinator poll, so
+// calling it off there would change nothing. That was true of every claimant
+// except this one.
+//
+// THE DECISION IS HERE RATHER THAN INLINE BECAUSE OF ITS THIRD ANSWER. Two of
+// the three cases were already in the adapter as an `if` on the aim string; the
+// one that was missing is the case where the string has NOT changed and the
+// claim has gone anyway, which is the whole defect and is exactly the case an
+// `if` on the string cannot see.
+enum class StagingAim : std::uint8_t
+{
+    // The claim still stands on the leg being walked. Re-asserting it is a
+    // no-op and there is nothing to say about it.
+    Hold,
+    // The leg being walked has changed, which is the ordinary handover from
+    // the approach corridor to the staging point (#242). Not a fault.
+    NewLeg,
+    // The claim has gone from under a leg nobody changed. Something ended this
+    // character's errand while the run was still waiting on it, and the run has
+    // to take it back rather than keep measuring a walk that is not happening.
+    Rearm,
+};
+
+// `legChanged` is "the aim string this poll wants is not the one this run last
+// claimed". `runStillOwns` is "the aim this run wrote is still the errand in
+// force" - which its caller has to read off BOTH of the registers that can
+// answer it, because neither does alone: the claim register survives a poll the
+// travel drive has not taken yet, and the travel drive's own record is the only
+// thing that sees an errand written OVER rather than ended.
+//
+// AN ERRAND WRITTEN OVER MATTERS AS MUCH AS ONE ENDED, and it is the case a
+// claim register on its own gets wrong. Something outside this module owns this
+// column too. A row it rewrites is still a row, so nothing prunes it, and the
+// claim register goes on naming an aim that is no longer what the character is
+// walking to - which reads as a healthy run measuring a walk to a door while the
+// character walks to a vendor.
+//
+// A LEG CHANGE OUTRANKS A LOST CLAIM, and the order is the rule rather than
+// tidiness. A leg change re-claims anyway, and both answers can be true at once
+// - the poll a leader reaches the corridor is a poll on which the old aim may
+// also have just been released by arriving at it - so reporting that one as a
+// fault would put a warning about a lost errand in the log every single time a
+// run handed over from the corridor to the door, which is the normal thing that
+// is supposed to happen.
+StagingAim StagingAimStep(bool legChanged, bool runStillOwns);
+
+// DOES THIS ANSWER START THE MEASUREMENT AGAIN? Both the ones that write a new
+// aim do, and for one reason stated once: the watchdog's ladder measures the
+// best distance to the thing being walked at, and after either of these that
+// thing is not what the ladder has been measuring. #242 already made this
+// clearing for a leg change, because the leader reaches the corridor at about
+// four yards and the very next reading is his distance to the door. A re-arm
+// needs it for the other half of the same argument: the rungs spent while
+// nothing was walking the character were spent on nothing, and measuring a walk
+// that has only just been given back against the old mark climbs straight to
+// GiveUp on a leader that has only just been set off.
+//
+// ASKED RATHER THAN WRITTEN AS `aim != Hold` AT THE CALL SITE, so a fourth
+// answer added later cannot silently inherit an argument nobody made for it.
+bool StagingAimRestartsMeasurement(StagingAim aim);
 // ------------------------------------------------------------- professions --
 //
 // THE THIRD TENANT, AND THE SAME REASON AS THE OTHER TWO. The roster declares

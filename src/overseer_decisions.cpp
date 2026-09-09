@@ -1429,6 +1429,20 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
     return StagingNudge::ClearMovement;
 }
 
+StagingAim StagingAimStep(bool legChanged, bool runStillOwns)
+{
+    // THE LEG FIRST, FOR THE REASON THE HEADER GIVES: both can be true on one
+    // poll, and only one of them is news.
+    if (legChanged)
+        return StagingAim::NewLeg;
+    return runStillOwns ? StagingAim::Hold : StagingAim::Rearm;
+}
+
+bool StagingAimRestartsMeasurement(StagingAim aim)
+{
+    return aim == StagingAim::NewLeg || aim == StagingAim::Rearm;
+}
+
 namespace
 {
 

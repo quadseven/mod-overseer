@@ -18531,13 +18531,29 @@ private:
         // door from there walks onto the rim and stops. A corridor the leader
         // walks and the followers do not is half a corridor.
         std::map<std::string, OverseerDecisions::ApproachRouteState> approach;
-        // The aim string this run last claimed for the leader. Held so that the
-        // approach can be re-claimed WHEN THE LEG CHANGES and not on every
-        // poll: Claim deliberately drops the errand's memory, including the
-        // travel backstop's own clock, so claiming the same string every five
+        // The aim string this run last claimed for the leader, which is how a
+        // poll tells the ordinary handover from the approach corridor to the
+        // staging point from an aim that has not moved.
+        //
+        // IT IS NO LONGER WHAT DECIDES WHETHER TO CLAIM (#367). It used to be,
+        // on the reasoning that Claim drops the errand's memory - including the
+        // travel backstop's own clock - so claiming the same string every five
         // seconds would keep resetting the clock that is supposed to notice a
-        // leader who is going nowhere. Empty until the first claim.
+        // leader going nowhere. That reasoning does not survive reading Claim,
+        // which returns on its first line when the column it last saw already
+        // holds this string and therefore drops nothing at all; it is exactly
+        // what lets BARRIER call it on every poll of an assembly that runs for
+        // minutes. What the guard actually did was make GATHERING the one
+        // walking phase in this module whose aim nothing renews. See
+        // OverseerDecisions::StagingAim.
         std::map<std::string, std::string> legAim;
+        // HOW MANY TIMES THIS RUN HAS HAD TO TAKE ITS LEADER'S STAGING ERRAND
+        // BACK (#367). Zero on a healthy run, and any other number is the
+        // measurement that says something outside this phase is ending the walk
+        // it is waiting on. Carried into the failure line so a run that could
+        // not be staged says which of the two failures it was: a leader that
+        // walked and did not arrive, or a leader that kept being stopped.
+        unsigned stagingRearms{0};
         bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
@@ -19289,6 +19305,20 @@ private:
                 // explanation for a gap that will not close and is the measured
                 // cause of both halves of #164. Re-asserting costs a read of
                 // the live list and, usually, no write at all.
+                //
+                // WHETHER THERE IS A FOCUS TO RE-ASSERT AT ALL, ASKED BEFORE
+                // THE CALL (#367). The name-only AssertTravelFocus returns an
+                // empty string for two states that are nothing alike: a
+                // character that IS travelling and had nothing to be taken back
+                // off it, and a character the travel drive is not walking
+                // anywhere, whose focus record was erased by SweepTravelFocus
+                // when its errand ended and whose `grind` went back on in the
+                // same sweep. This line reported both as "nothing had come back
+                // on, so this is not what is holding it", which is a confident
+                // negative about the one condition that was in fact holding it.
+                // It cost an afternoon of looking at routing. `delivered` is not
+                // `done`, and neither is `empty` a diagnosis.
+                bool const focused = _travelFocus.count(name) != 0;
                 std::string const took = AssertTravelFocus(name);
                 LOG_WARN("module.overseer",
                          "overseer: dungeon run staging - '{}' has got no nearer than {} "
@@ -19298,9 +19328,18 @@ private:
                          name, static_cast<uint32>(stall.progress.best),
                          static_cast<uint32>(DUNGEON_STAGING_STALL_SECONDS), where,
                          static_cast<uint32>(OverseerDecisions::STAGING_NUDGE_STEPS),
-                         took.empty() ? std::string("nothing had come back on, so this "
-                                                    "is not what is holding it")
-                                      : ("took " + took + " back off it"));
+                         !took.empty()
+                             ? ("took " + took + " back off it")
+                             : focused
+                                   ? std::string("nothing had come back on, so this is "
+                                                 "not what is holding it")
+                                   : std::string(
+                                         "there is no travel focus on this character at "
+                                         "all, which is not the same answer: the travel "
+                                         "drive is not walking it anywhere, and the "
+                                         "strategies stood down for the trip went back on "
+                                         "when its errand ended. Look for the errand, not "
+                                         "for the route"));
                 return false;
             }
 
@@ -22074,6 +22113,11 @@ private:
                 coord.approach.clear();
                 coord.legAim.clear();
                 coord.loggedCorridor = false;
+                // AND IT ANSWERS FOR ITS OWN INTERRUPTIONS AND NOT THE LAST
+                // RUN'S (#367). A campaign that goes again reuses this struct,
+                // and a count carried over would tell the operator that the run
+                // now starting had already been interrupted before it began.
+                coord.stagingRearms = 0;
 
                 DungeonApproachAim const first = DungeonApproachAimFor(
                     *portal, coord.approach[leaderName], leader, coord.stageX,
@@ -22187,42 +22231,152 @@ private:
             bool const onTheCorridor =
                 legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
 
-            // AND THE AIM FOLLOWS THE LEG, RE-CLAIMED ONLY WHEN IT CHANGES.
-            // A leg that ends hands the leader on to the next point in the same
-            // poll it ends in, so without this he would arrive at the corridor
-            // and then stand there under an aim that had been satisfied. Guarded
-            // on the string because Claim drops the errand's memory: see
-            // DungeonRunCoordinatorState::legAim.
-            if (onTheOutsideMap && legAim.usable && legAim.aim != coord.legAim[leaderName])
+            // AND THE AIM FOLLOWS THE LEG, AND IS RE-ASSERTED ON EVERY POLL
+            // (#367). A leg that ends hands the leader on to the next point in
+            // the same poll it ends in, so without the first half of this he
+            // would arrive at the corridor and then stand there under an aim
+            // that had been satisfied.
+            //
+            // THE SECOND HALF IS THE ONE THAT WAS MISSING, AND IT IS THE WHOLE
+            // OF THIS PHASE'S FAILURE. This used to be guarded on the aim string
+            // alone, which made GATHERING the only walking mechanism in this
+            // module that does not renew its own aim: BARRIER re-claims through
+            // EscortToward on every poll, so do the crossing, the catch-up walk
+            // and the home errand. The leader on a staging aim is the one
+            // claimant with no escort entry to re-claim from - TravelAimBook::
+            // Claim says so in as many words, "the LEADER on a staging aim is
+            // not escorted, he is aimed" - so no sweep covered him.
+            //
+            // AND SEVERAL THINGS END THAT ERRAND WITHOUT THIS COORDINATOR
+            // TOUCHING IT. The ground refusal give-up releases it after
+            // TRAVEL_GROUND_REFUSAL_LIMIT refused polls, the travel backstop
+            // releases it after TRAVEL_BACKSTOP_SECONDS, an arrival inside
+            // TRAVEL_ARRIVED_POSITION_YARDS releases it because an aimed leader
+            // misses the escort branch that would have held him there, and the
+            // bridge owns this column too and clears it whenever it re-aims the
+            // family - which TravelAimBook::PruneVanished absorbs silently and
+            // by design, because a row that stops coming back is not an error.
+            // Every one of them ends the same way: SweepTravelFocus hands
+            // `grind`, `quest` and `move random` back, KeepRosterFollowing
+            // re-grants the leader `new rpg` because he leads, and the character
+            // this phase is waiting for is grinding rather than walking to a
+            // door. Measured across three consecutive runs of one campaign on
+            // the dev realm: the gap to the leg being walked wandered between
+            // about 1000 and 1500 yards for the whole window and the height
+            // relative to it changed sign.
+            //
+            // AND THE DEATH BREAKER ALREADY DEPENDED ON THIS BEING TRUE. Its
+            // DeclineRunOwned case declines to release a run-owned errand on the
+            // stated grounds that "a run re-Claims its own aim within
+            // DUNGEON_RUN_POLL_MS, so calling it off here would change nothing.
+            // The run decides". That held for every claimant except this one.
+            //
+            // CLAIMING EVERY POLL COSTS NOTHING WHILE THE ERRAND IS LIVE.
+            // TravelAimBook::Claim returns on its first line when the column it
+            // last saw already holds this string, so the steady state is one map
+            // lookup and no write - which is exactly why BARRIER has been able
+            // to call it on every poll since #122.
+            if (onTheOutsideMap && legAim.usable)
             {
+                // WHOSE AIM THIS STILL IS, ASKED BEFORE IT IS RE-ASSERTED, AND
+                // ASKED OF BOTH REGISTERS BECAUSE NEITHER ANSWERS IT ALONE.
+                //
+                // RunOwns reads the claim register, which Claim writes the
+                // instant a claim is made and which Release and PruneVanished
+                // erase - so it answers on the first poll of a leg as well as
+                // the hundredth, without waiting for a travel poll and without a
+                // query of its own. What it cannot see is an errand WRITTEN OVER
+                // rather than ended: the bridge owns this column too, and a row
+                // it rewrites is still a row, so PruneVanished never fires and
+                // the claim register still names the aim this run wrote.
+                //
+                // TargetFor is the other half, and it is the column as the
+                // travel drive last read it. Empty is not "gone" here, because
+                // Claim erases that record on purpose and the first travel poll
+                // of a new errand is up to TRAVEL_POLL_MS away: a run that read
+                // an empty record as a lost errand would report a re-arm on
+                // every leg it ever claimed. Empty is "no reading yet", and the
+                // claim register is what covers that window.
+                std::string const inFlight = _travelAims.TargetFor(leaderName);
+                OverseerDecisions::StagingAim const step =
+                    OverseerDecisions::StagingAimStep(
+                        legAim.aim != coord.legAim[leaderName],
+                        _travelAims.RunOwns(leaderName, legAim.aim) &&
+                            (inFlight.empty() || inFlight == legAim.aim));
+
                 _travelAims.Claim(leaderName, legAim.aim);
                 coord.legAim[leaderName] = legAim.aim;
 
-                // AND A FRESH LEG GETS A FRESH RATCHET, which is not tidying:
-                // without it the second leg is given up on at ninety seconds
-                // every single time. DUNGEON_STAGING_RATCHET tracks the BEST
-                // distance to the point being walked at, and the point changes
-                // here. The leader reaches the corridor at about four yards,
-                // so `best` is four; the very next reading is his distance to
-                // the staging point, which for the Wailing Caverns corridor is
-                // 179 yards and falling. A ratchet that kept the four would
-                // read every yard of a 465 yard descent as no progress, start
-                // the stall clock at the top of it, and climb the correction
-                // ladder to GiveUp while the leader was walking correctly.
-                //
-                // This is the same clearing, for the same reason, that BARRIER
-                // already does on entry: a new thing to measure against is a
-                // new measurement. The whole-run clock `stagingSince` is
-                // deliberately NOT reset - it bounds the assembly end to end,
-                // and a leg change is not a new assembly.
-                coord.staging.clear();
+                // SAID EVERY TIME, AND AT WARN, BECAUSE A SILENT SELF-HEAL
+                // WOULD HIDE THE THING WORTH KNOWING. Re-arming the aim gets
+                // the leader walking again, but something outside this phase
+                // stopped him, and a run that quietly takes its errand back
+                // twenty times is a different fault from a run that takes it
+                // back once. Not rationed to one line per phase for the same
+                // reason: the count IS the measurement.
+                if (step == OverseerDecisions::StagingAim::Rearm)
+                {
+                    ++coord.stagingRearms;
+                    LOG_WARN("module.overseer",
+                             "overseer: dungeon run staging - the errand walking '{}' to "
+                             "{} ({}) had ended or been written over, and this run is "
+                             "still waiting on it. The column now reads '{}'. Nothing "
+                             "else would have taken it back: the leader on a staging aim "
+                             "is aimed rather than escorted, so no sweep renews it. "
+                             "Re-armed ({} so far this run) and the stall ladder starts "
+                             "again, because the yards it measured were measured on a "
+                             "character nothing was walking toward this point. He is {}",
+                             leaderName,
+                             onTheCorridor ? "the start of the approach corridor"
+                                           : "the staging point",
+                             legAim.aim,
+                             inFlight.empty() ? "nothing" : inFlight.c_str(),
+                             coord.stagingRearms,
+                             OverseerDecisions::ApproachWhere(gap));
+                }
 
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' is now walking at {} ({}) - {}",
-                         leaderName,
-                         onTheCorridor ? "the start of the approach corridor"
-                                       : "the staging point",
-                         legAim.aim, OverseerDecisions::ApproachWhere(gap));
+                if (OverseerDecisions::StagingAimRestartsMeasurement(step))
+                {
+                    // AND A FRESH LEG GETS A FRESH RATCHET, which is not
+                    // tidying: without it the second leg is given up on at
+                    // ninety seconds every single time. DUNGEON_STAGING_RATCHET
+                    // tracks the BEST distance to the point being walked at, and
+                    // the point changes here. The leader reaches the corridor at
+                    // about four yards, so `best` is four; the very next reading
+                    // is his distance to the staging point, which for the
+                    // Wailing Caverns corridor is 179 yards and falling. A
+                    // ratchet that kept the four would read every yard of a 465
+                    // yard descent as no progress, start the stall clock at the
+                    // top of it, and climb the correction ladder to GiveUp while
+                    // the leader was walking correctly.
+                    //
+                    // This is the same clearing, for the same reason, that
+                    // BARRIER already does on entry: a new thing to measure
+                    // against is a new measurement. The whole-run clock
+                    // `stagingSince` is deliberately NOT reset - it bounds the
+                    // assembly end to end, and neither a leg change nor a
+                    // re-armed errand is a new assembly.
+                    //
+                    // AND A RE-ARMED ERRAND GETS IT FOR THE OTHER HALF OF THE
+                    // SAME ARGUMENT (#367). The rungs the ladder spent while
+                    // there was no errand were spent on a character nothing was
+                    // walking, and carrying that mark into a walk that has only
+                    // just been given back would climb straight to GiveUp on a
+                    // leader who has only just been set off. See
+                    // OverseerDecisions::StagingAimRestartsMeasurement.
+                    coord.staging.clear();
+                }
+
+                // SAID ONLY FOR A LEG CHANGE, because that is the only one of
+                // the two that is news about where the leader is going. A
+                // re-arm has already said its own, louder, piece above.
+                if (step == OverseerDecisions::StagingAim::NewLeg)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is now walking at {} ({}) - {}",
+                             leaderName,
+                             onTheCorridor ? "the start of the approach corridor"
+                                           : "the staging point",
+                             legAim.aim, OverseerDecisions::ApproachWhere(gap));
             }
 
             // SAID ONCE, AND ONLY WHERE THERE IS A CORRIDOR TO SAY IT ABOUT.
@@ -22260,8 +22414,21 @@ private:
                         ? OverseerDecisions::ApproachWhere(gap)
                         : "on map " + std::to_string(uint32(leader->GetMapId())) +
                               " rather than map " + std::to_string(portal->outsideMapId);
+                // AND IT NAMES THE OTHER CAUSE TOO (#367), which the reading
+                // above cannot carry: a leader that walked the whole window and
+                // did not arrive and a leader whose errand kept being ended
+                // under him produce the same distance and want different fixes.
+                // Said only when it happened, so the line keeps meaning what it
+                // has meant since #217 on every run where it did not.
+                std::string const interrupted =
+                    coord.stagingRearms
+                        ? ", and its staging errand had ended and been taken back " +
+                              std::to_string(coord.stagingRearms) +
+                              " times, so it was not walking for some of this"
+                        : std::string();
                 FailStaging(coord, leaderName, members, *portal, "GATHERING",
-                            leaderName + " (" + where + ")", IsDungeonJob(leaderJob));
+                            leaderName + " (" + where + ")" + interrupted,
+                            IsDungeonJob(leaderJob));
                 return;
             }
 
