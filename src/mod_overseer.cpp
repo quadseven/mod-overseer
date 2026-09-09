@@ -2208,6 +2208,40 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_CLEAR_RATCHET{
 // so the next poll can open a fresh one.
 constexpr unsigned DUNGEON_CLEAR_SKIPS = 3;
 
+// HOW LONG A PARTY MAY LOOK BUSY BEFORE THE WATCHDOG STOPS BELIEVING IT (#382).
+//
+// Combat, looting, sitting, a corpse and a pending resurrect all HOLD the stall
+// clock rather than being absorbed into it, for the reason
+// DUNGEON_CLEAR_STALL_SECONDS gives above, and that was right in every way
+// except one: the hold had no ceiling. A single member whose combat flag never
+// cleared re-stamped the clock on every five second poll, so the ratchet never
+// accumulated a second of patience and the three skips and the extraction below
+// them could not be reached at all. Measured: a run sat `active` for 152
+// minutes with one member flagged fighting and four idle at full health, and
+// the party's positions were identical to the yard across 95 of those minutes.
+//
+// MEASURED FROM THE RUN'S LAST REAL PROGRESS, NOT FROM WHEN SOMEBODY LOOKED
+// BUSY. See DungeonClearBusyStillHolds for why that distinction is the whole
+// robustness of the rule: a clock keyed on the busy flag is a clock a flicker
+// of that flag resets, and a bound a flicker can switch off is not a bound.
+//
+// FIFTEEN MINUTES, WHICH IS THREE STALL WINDOWS AND WIDER THAN ANYTHING
+// LEGITIMATE. The longest honest stretch on this route with no boss credited
+// and no thirty yards covered is a boss fight that goes badly: a wipe, five
+// staggered corpse runs from the instance graveyard, and drinking back to full.
+// That is minutes, not tens of them, and most of it does not reach this ceiling
+// at all, because ghosts running back MOVE and movement is measured before this
+// hold rather than behind it.
+//
+// The ceiling does not itself end anything. It only stops holding, which hands
+// the run to the ladder that already exists, so the worst case before a stalled
+// run is walked out is this plus (DUNGEON_CLEAR_SKIPS + 1) stall windows -
+// thirty-five minutes of no boss credit and no yards. A legitimate run on this
+// route has taken 147 minutes, so the bound has to be generous; thirty-five
+// minutes of a party that has not moved is not a run being slow, and the
+// operator asked for it to be ENDED rather than narrated.
+constexpr time_t DUNGEON_CLEAR_BUSY_CEILING_SECONDS = 15 * 60;
+
 // ------------------------------------------------- the run goes again (#144) --
 //
 // HOW MANY TIMES THE RESET MAY BE ASKED FOR BEFORE THE RUN IS WRITTEN OFF.
@@ -19089,6 +19123,26 @@ private:
         // progress signal that does not depend on where anybody is standing.
         uint32 clearEncounters{0};
         unsigned clearSkips{0};
+        // WHEN THIS RUN LAST ACTUALLY GOT SOMEWHERE (#382): a boss credited or
+        // the leader thirty yards from its mark, and nothing else. A busy party
+        // holds the watchdog's patience clock, which is correct, and before this
+        // field there was nothing bounding how long it could do it - so one
+        // member stuck in combat held the clock down for 152 minutes and the
+        // whole ladder below was unreachable by construction.
+        //
+        // IT IS KEYED ON PROGRESS RATHER THAN ON THE BUSY FLAG DELIBERATELY. A
+        // clock that restarted whenever nobody happened to look busy would be
+        // reset by a combat flag that flickers, which is a plausible shape for
+        // the very fault this bounds - and a bound a flicker can switch off is
+        // not a bound. Stamped only where `clearSkips` is cleared, which are the
+        // two places this run demonstrably advanced. See
+        // DUNGEON_CLEAR_BUSY_CEILING_SECONDS.
+        time_t clearAdvancedAt{0};
+        // Said once per stretch rather than once per poll, the log-once
+        // discipline the rest of this struct follows. It is the line that tells
+        // an operator WHY the watchdog started counting against a party that
+        // looks busy, and which member and which flag were doing the holding.
+        bool loggedBusyCeiling{false};
         // WHY THE PARTY IS BEING WALKED OUT, when it is not simply over. Set by
         // the CLEARING watchdog and read by EXIT, so a run that died inside ends
         // on its row as what it was rather than as an ordinary 'left'. Empty for
@@ -19537,12 +19591,22 @@ private:
     //   - NO MOVEMENT. The tank has not got DUNGEON_CLEAR_STALL_YARDS from a
     //     mark this drive moves to wherever it last saw it going somewhere -
     //     the shared ratchet, on the reading the follower stall already uses.
-    //   - NOT BUSY. Nobody inside is fighting, looting, sitting to eat or drink,
-    //     dead, or waiting on a resurrect. Every one of those is a party doing
-    //     something legitimately slow, and every one of them HOLDS the clock
-    //     rather than being absorbed into the patience: a bound that has to be
-    //     wide enough to cover the longest boss fight is a bound that cannot
-    //     catch a stall shorter than one.
+    //   - NOT BUSY, FOR A BOUNDED WHILE (#382). Nobody inside is fighting,
+    //     looting, sitting to eat or drink, dead, or waiting on a resurrect.
+    //     Every one of those is a party doing something legitimately slow, and
+    //     every one of them HOLDS the clock rather than being absorbed into the
+    //     patience: a bound that has to be wide enough to cover the longest
+    //     boss fight is a bound that cannot catch a stall shorter than one.
+    //
+    //     THE HOLD ITSELF NOW HAS A CEILING, because it did not and that was
+    //     the whole of the next failure. A run sat 'active' for 152 minutes with
+    //     one member flagged in combat, four idle at full health and every
+    //     position identical to the yard over 95 of those minutes; the hold
+    //     re-stamped the patience clock on all 1,140 polls, so the ratchet below
+    //     never accumulated a second and the skips and the extraction were
+    //     unreachable by construction. Past DUNGEON_CLEAR_BUSY_CEILING_SECONDS
+    //     of a busy party with no boss credit and no yards, the flag stops being
+    //     believed and this watchdog judges the run on what it can see.
     //
     // THE REMEDY THE MODULE ALREADY SHIPS COMES FIRST. `dc skip` is what a
     // person types at this exact state, and it worked instantly when one did.
@@ -19580,6 +19644,12 @@ private:
             coord.clearProgress.since = now;
             coord.clearMarked = false;
             coord.clearSkips = 0;
+            // AND THE RUN DEMONSTRABLY ADVANCED (#382). A boss died, so whatever
+            // the party has been busy with for the last however-long, it was
+            // busy doing THAT. The ceiling below exists to catch a hold that
+            // produced nothing; this one produced a boss.
+            coord.clearAdvancedAt = now;
+            coord.loggedBusyCeiling = false;
             return false;
         }
 
@@ -19594,19 +19664,52 @@ private:
         // somebody to run back, and it is the case most likely to look like a
         // freeze from in here. The whole party leaving is a different fact and
         // is already answered above, where a run that holds nobody ends.
+        //
+        // WHO IS BUSY AND WHY, RATHER THAN MERELY WHETHER ANYBODY IS (#382).
+        // The measured stall was ONE member flagged in combat among four idle
+        // at full health, and a reading that says only "busy" cannot be told
+        // apart from five people in a boss fight. The name and the flag are
+        // what make the ceiling's log line below something an operator can act
+        // on; the first busy member found is enough, because one is all it takes
+        // to hold the clock and one is what did.
+        std::string busyName;
+        char const* busyReason = "";
         for (OverseerDecisions::DungeonRunEntryState const& state : states)
         {
             Player* member = ObjectAccessor::FindPlayerByName(state.name);
             if (!SteerableAI(member))
                 continue;
-            if (member->IsInCombat() || !member->IsAlive() || member->IsSitState() ||
-                !member->GetLootGUID().IsEmpty() || member->isResurrectRequested())
-            {
-                coord.clearProgress.since = now;
-                return false;
-            }
+            if (member->IsInCombat())
+                busyReason = "in combat";
+            else if (!member->IsAlive())
+                busyReason = "dead";
+            else if (member->IsSitState())
+                busyReason = "sitting to eat or drink";
+            else if (!member->GetLootGUID().IsEmpty())
+                busyReason = "looting";
+            else if (member->isResurrectRequested())
+                busyReason = "waiting on a resurrect";
+            else
+                continue;
+            busyName = member->GetName();
+            break;
         }
+        bool const anyBusy = !busyName.empty();
 
+        // MOVEMENT IS MEASURED BEFORE THE BUSY HOLD NOW, NOT BEHIND IT (#382).
+        //
+        // It used to be behind, and that ordering is half of what made the
+        // measured 152 minute stall unreachable: while the hold was up this
+        // block never ran, so the one signal that could have overruled the hold
+        // was never read at all.
+        //
+        // Putting it first is also what keeps the ceiling from ever touching a
+        // healthy run. A party fighting its way through a dungeon is busy on
+        // almost every poll and covers ground between pulls, and covering ground
+        // ends the busy stretch here before the ceiling is ever consulted. The
+        // ceiling can therefore only be reached by a party that is busy AND
+        // going nowhere, which is the only shape it is meant to catch.
+        //
         // THE MARK IS A POSITION AND THE RATCHET TAKES ONE NUMBER, so the mark is
         // dropped here exactly as KeepRosterFollowing's stall check drops its
         // own, and for the same reason.
@@ -19624,14 +19727,83 @@ private:
             // The run is moving, so whatever it had to skip to get moving is
             // paid for. A later obstacle gets the full three tries of its own.
             coord.clearSkips = 0;
+            // And the ceiling below is paid for by the same yards: a party that
+            // got somewhere was busy getting there.
+            coord.clearAdvancedAt = now;
+            coord.loggedBusyCeiling = false;
             return false;
         }
+
+        // BUSY HOLDS THE CLOCK, FOR A BOUNDED WHILE (#382). The hold itself is
+        // right and stays: a bound wide enough to cover the longest boss fight
+        // is a bound that cannot catch a stall shorter than one, so combat,
+        // looting, sitting, a corpse and a pending resurrect are held OUT of
+        // the reading rather than absorbed into it.
+        //
+        // What was missing is a ceiling on how long they may be. Nothing
+        // measured how long the run had been held, so a member whose combat flag
+        // never cleared re-stamped the patience clock every five seconds for 152
+        // minutes and everything below this line was unreachable by
+        // construction.
+        //
+        // THE AGE THAT MATTERS IS THE RUN'S, NOT THE FLAG'S. `clearAdvancedAt`
+        // is stamped in the two branches above and nowhere else, so it says when
+        // this run last credited a boss or covered thirty yards. A party busy
+        // inside a run that has done neither for a quarter of an hour is not
+        // being slow, and keying it this way is what a flickering combat flag
+        // cannot reset. DungeonClearBusyStillHolds owns what the age means.
+        bool const busyHolds = OverseerDecisions::DungeonClearBusyStillHolds(
+            anyBusy, coord.clearAdvancedAt, now, DUNGEON_CLEAR_BUSY_CEILING_SECONDS);
+
+        if (busyHolds)
+        {
+            coord.clearProgress.since = now;
+        }
+        else if (anyBusy && !coord.loggedBusyCeiling)
+        {
+            // SAID ONCE PER STRETCH, AND SAID AT ALL BECAUSE IT IS THE WHOLE
+            // EXPLANATION. Everything below now treats a party that still LOOKS
+            // busy as stalled, which is a strong claim, and an operator reading
+            // the `dc skip`s and the extraction that follow deserves the reason
+            // in front of them rather than inferred from their absence.
+            coord.loggedBusyCeiling = true;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} of campaign {} has credited no boss and "
+                     "not moved '{}' {}y on map {} for {} minutes, and '{}' is {}. That "
+                     "is longer than being busy is believed for, so it stops holding the "
+                     "stall clock, which now runs. The ladder of {} 'dc skip's and then "
+                     "an exit follows if nothing changes",
+                     coord.runNumber, coord.campaignId, leader->GetName(),
+                     static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId,
+                     static_cast<uint32>((now - coord.clearAdvancedAt) / 60), busyName,
+                     busyReason, static_cast<uint32>(DUNGEON_CLEAR_SKIPS));
+        }
+
+        // AND `partyBusy` IS A REAL INPUT NOW. It was passed a literal `false`
+        // because the loop above returned before ever reaching here, so the one
+        // branch of this policy that mattered most could not be exercised from
+        // the adapter at all. It is the bounded hold that decides it.
         OverseerDecisions::DungeonClearStallAction const action =
             OverseerDecisions::DungeonClearStallDecision(
-                false, false, false, progress.stalled, coord.clearSkips,
+                false, busyHolds, false, progress.stalled, coord.clearSkips,
                 DUNGEON_CLEAR_SKIPS);
         if (action == OverseerDecisions::DungeonClearStallAction::Nothing)
             return false;
+
+        // WHAT THE PARTY LOOKED LIKE, IN WORDS THE LOGS BELOW CAN USE WITHOUT
+        // LYING. Those lines used to assert flatly that nobody was fighting,
+        // looting, resting, dead or being resurrected, which was safe only while
+        // a busy party could not reach them. It can now - that is the whole of
+        // #382 - so the claim is measured rather than assumed. A watchdog that
+        // ends runs must not describe a state it did not check.
+        //
+        // Built here rather than above because this is the first line that is
+        // certain to use it, and because everything above this point is a poll
+        // that decided to do nothing.
+        std::string const busyNote =
+            anyBusy ? "'" + busyName + "' " + busyReason + " throughout, for longer "
+                      "than that is believed"
+                    : "nobody fighting, looting, resting, dead or being resurrected";
 
         // STALLED. The clock restarts on every rung, so whatever is tried here
         // gets a whole patience window to work in before the next thing is.
@@ -19650,14 +19822,13 @@ private:
                 leaderAI->DoSpecificAction("dc skip", Event("dc", "", issuer), true);
             LOG_WARN("module.overseer",
                      "overseer: dungeon run CLEARING has not moved '{}' more than {}y on "
-                     "map {} for {} minutes, with nobody fighting, looting, resting, dead "
-                     "or being resurrected, and no boss credited - so it is stuck on an "
-                     "objective it cannot finish. Issuing 'dc skip' ({} of {}) as '{}': "
-                     "{}. Which objective is in the dungeon module's own log, which is "
-                     "the only place it exists",
+                     "map {} for {} minutes, with {}, and no boss credited - so it is "
+                     "stuck on an objective it cannot finish. Issuing 'dc skip' ({} of "
+                     "{}) as '{}': {}. Which objective is in the dungeon module's own "
+                     "log, which is the only place it exists",
                      leader->GetName(), static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS),
                      insideMapId,
-                     static_cast<uint32>(DUNGEON_CLEAR_STALL_SECONDS / 60),
+                     static_cast<uint32>(DUNGEON_CLEAR_STALL_SECONDS / 60), busyNote,
                      coord.clearSkips, static_cast<uint32>(DUNGEON_CLEAR_SKIPS),
                      issuer ? issuer->GetName() : "nobody",
                      skipped ? "accepted"
@@ -19672,21 +19843,28 @@ private:
         // has one way to leave an instance and this is not the place to grow a
         // second - and `stalledReason` is what makes the row that EXIT closes
         // say what actually happened instead of 'left'.
+        //
+        // AND THE REASON CARRIES THE STUCK FLAG WHEN THERE WAS ONE (#382). The
+        // row is what an operator reads afterwards, and "one member had been in
+        // combat the whole time" is the difference between a dungeon this party
+        // could not clear and a party the world stopped hitting. Both end the
+        // run; only one of them is worth chasing upstream.
         coord.stalledReason =
             "the run stopped progressing inside map " + std::to_string(insideMapId) +
             ": no boss credit and no movement for " +
             std::to_string((DUNGEON_CLEAR_SKIPS + 1) * DUNGEON_CLEAR_STALL_SECONDS / 60) +
             " minutes, and " + std::to_string(DUNGEON_CLEAR_SKIPS) +
-            " 'dc skip's did not restart it";
+            " 'dc skip's did not restart it" +
+            (anyBusy ? " (" + busyName + " was " + busyReason + " throughout)" : "");
         LOG_ERROR("module.overseer",
                   "overseer: dungeon run {} of campaign {} cannot be cleared - {} 'dc "
-                  "skip's and '{}' has still not moved {}y on map {}. Walking the party "
-                  "back out through EXIT and ending the run so the next poll can open a "
-                  "fresh one; a run left 'active' inside a dungeon it is not clearing is "
-                  "the half hour of nothing this bound exists to end",
+                  "skip's and '{}' has still not moved {}y on map {}, with {}. Walking "
+                  "the party back out through EXIT and ending the run so the next poll "
+                  "can open a fresh one; a run left 'active' inside a dungeon it is not "
+                  "clearing is the half hour of nothing this bound exists to end",
                   coord.runNumber, coord.campaignId,
                   static_cast<uint32>(DUNGEON_CLEAR_SKIPS), leader->GetName(),
-                  static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId);
+                  static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId, busyNote);
 
         coord.phase = DungeonRunPhase::Exiting;
         coord.crossing.best = 0.f;
