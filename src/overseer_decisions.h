@@ -2214,6 +2214,26 @@ char const* DungeonRunExitOutcome(bool provedComplete, bool stalled);
 // working; just "the run waits its turn", which costs one cycle of a campaign
 // that has ninety-nine more.
 
+// WHICH COUNTER A TRAVEL AIM NAMES, AND `None` FOR EVERY AIM THAT IS NOT ONE
+// (#378).
+//
+// THE VOCABULARY IS DECLARED ONCE HERE AND IsMaintenanceErrand IS ANSWERED IN
+// TERMS OF IT, rather than the two carrying their own copy of the same three
+// strings. They already had to agree: the run gate asks one of them about
+// `travel_npc` and the travel drive's arrival branch now asks the other about
+// the same column, and two lists that must agree is a shape this module has
+// paid for before. A reader adding a fourth economy errand edits one function
+// and both callers follow.
+enum class CounterRole : std::uint8_t
+{
+    None,      // not a counter: a trainer, an innkeeper, an `at:`, a portal
+    Vendor,    // "vendor" - what `sell` and `buy` need
+    Banker,    // "banker" - what `bank` needs
+    Repairer,  // "repair" - what `repair` needs
+};
+
+CounterRole CounterRoleForAim(std::string const& aim);
+
 // Is this travel aim one of the economy passes' errands?
 //
 // The three roles are the same three the bridge treats as economy errands, and
@@ -8144,6 +8164,95 @@ InnHold InnHoldStep(bool atTheInn, bool bindRefusedHere, bool alreadyHeld);
 // with `later` and the sender re-asks with a fresh row, which is #230's rule
 // about never recycling one in place. A second settle decision here would be a
 // mechanism with no caller and a test pinning nothing.
+
+
+// ------------- standing at a counter long enough to trade there (#378) ------
+//
+// THE SIXTH REASON TO HOLD A CHARACTER STILL, AND IT IS #369 AT THE OTHER END
+// OF THE SAME TRIP. The inn hold above exists because "an escorted character
+// that has arrived holds there" was a sentence in a comment rather than a thing
+// the code did. This exists because "reached the vendor - errand done" is a
+// sentence in a LOG LINE that is true for about as long as it takes to print.
+//
+// WHAT WAS MEASURED, off the module's own command table on the dev realm, all
+// time. sell: 23025 error against 1608 delivered, 6.5%. repair: 52 against 15.
+// buy: 20 against 6. bank: 66 against 0, never once. And one detail dominates
+// every one of them - "vendor not in range" is 17200 of the 23025, "repairer
+// not in range" 47 of 52, "banker not in range" 52 of 66. The remaining sell
+// errors are about the seller rather than the counter: not online, item not
+// carried, dead, in flight, count exceeds stack.
+//
+// WHY BEING IN RANGE IS THE THING THAT FAILS, IN TWO PARTS THAT COMPOUND.
+//
+//   1. NOTHING HOLDS THE CHARACTER AT THE COUNTER. The travel drive releases
+//      the errand the poll it reads as arrived, and that release IS the signal
+//      the pass outside the worldserver waits for before it writes any rows -
+//      it clears `travel_npc`. So the transaction is asked for strictly after
+//      the module has stopped holding on to the character, and by then upstream
+//      has already ended the walk: an arrived aimed wander calls ChangeToIdle
+//      and NewRpgStatusUpdateAction rolls RPG_IDLE into a randomly chosen
+//      status on the next AI tick, two of which walk somewhere. This is the
+//      identical mechanism #346 measured at a dungeon door and #369 measured at
+//      an inn, and the identical remedy: a hold is not a race, and re-issuing a
+//      walk is.
+//   2. AND "ARRIVED" IS TWELVE YARDS, WHERE NO COUNTER WORKS. The arrival
+//      radius for a creature errand is deliberately loose because it is
+//      measured against a spawn point out of the creature table while the
+//      creature patrols away from it, which is right for a flight master where
+//      arriving IS the errand. A counter is not that. Every one of `sell`,
+//      `repair` and `bank` calls the core's own GetNPCIfCanInteractWith before
+//      it calls the core's handler, and that gate is INTERACTION_DISTANCE, five
+//      yards. A character eleven yards from a vendor's spawn row has
+//      "completed" its errand and cannot sell anything.
+//
+// SO ARRIVAL AT A COUNTER IS ASKED AS A DIFFERENT QUESTION, and it is asked of
+// the LIVE CREATURE rather than of the recorded point. That is also why the
+// answer has three values and not two: the case where the errand is not
+// finished is not the same as the case where there is nothing there to finish
+// it, and treating those alike is what would either strand a character in front
+// of a corpse or send it away from a vendor standing eight yards off its spawn.
+enum class CounterArrival : std::uint8_t
+{
+    // Release the errand, exactly as this branch always has. Either the aim is
+    // not a counter at all, or it is and there is no creature of that role
+    // anywhere near: the spawn is empty, dead or phased, and standing on it
+    // achieves nothing that the pass which wrote the aim cannot do better by
+    // writing another one.
+    Done,
+    // Do NOT release, and do not hold either. One of the role is nearby and
+    // out of reach, which is the ordinary last few yards of the walk rather
+    // than a fault - the same thing the doorway branch says about an arrival
+    // radius wider than a trigger. Falling through re-issues the aim, and
+    // upstream's own aimed wander closes the gap: it walks to `pos` until it is
+    // inside INTERACTION_DISTANCE and then resolves the live creature within
+    // INTERACTION_DISTANCE * 3.
+    CloseTheGap,
+    // Take the hold, then release the errand. The character is at the counter
+    // on the core's own terms, so standing still is exactly what lets its rows
+    // find it there.
+    StandAndTrade,
+};
+
+// `inReach` IS THE CORE'S OWN ANSWER AND NOT A DISTANCE, and that is the whole
+// safety argument, unchanged from #370's. A hold is a promise that standing
+// still is what completes this errand. It is a true promise only while a
+// creature that can serve the errand passes the same gate the executor will
+// put it through, and false the moment it does not - an unfriendly vendor is
+// turned down however close a character stands, and no amount of holding will
+// change that. So the adapter asks GetNPCIfCanInteractWith with the role's own
+// npcflag, which is the same call DoSell, DoRepair and DoBank each make, and
+// passes the answer here rather than a number this could be tempted to compare.
+//
+// `oneIsNearby` EXISTS TO TELL "NOT YET" FROM "NEVER", and the adapter measures
+// it at the radius upstream's own arrival will search rather than at whatever a
+// sweep happens to see. Once an aimed wander is within INTERACTION_DISTANCE of
+// the recorded point it looks for the creature with
+// FindNearestCreature(npcEntry, INTERACTION_DISTANCE * 3) and idles if it finds
+// nothing, so a counter further off its spawn row than that is a gap no loop is
+// closing. Answering CloseTheGap for one would have the errand sit out its own
+// twenty minute backstop waiting for a walk nobody is making, which is worse
+// than releasing rather than better.
+CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby);
 
 
 // ------------------- and a hold that is taken once is not a hold (#358) --

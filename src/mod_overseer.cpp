@@ -1742,6 +1742,14 @@ constexpr time_t CATCH_UP_STANDDOWN_SECONDS =
 // block in DriveTravel for what is done with it.
 constexpr uint32 UPSTREAM_MOVE_FAR_STUCK_SECONDS = 90;
 
+// Upstream's own lease on an aimed wander: `statusWanderNpcDuration`, five
+// minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278). It is already
+// quoted twice in this file in prose - by TRAVEL_POLL_MS, which is set to
+// renew inside it, and by the escort arrival branch - and #378 needs it as a
+// number, so it is named here for the same reason the stuck fuse above is: one
+// place for a pin bump to change.
+constexpr time_t UPSTREAM_WANDER_NPC_LEASE_SECONDS = 5 * 60;
+
 // WHAT AN ESCORT TAKES OFF A CHARACTER WHILE IT IS TRAVELLING (#164).
 //
 // TWO MEASUREMENTS, TWELVE HOURS APART, AND THE SECOND ONE IS WHY THIS IS NOT
@@ -6259,6 +6267,226 @@ private:
     {
         ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
                     INN_HOLD_VERB);
+    }
+
+    // ------------------------------------------ the counter hold (#378) --
+    //
+    // THE SIXTH REASON IN THE REGISTER, AND IT IS THE INN HOLD ABOVE APPLIED AT
+    // THE MODULE'S THIRD ARRIVAL POINT. The whole argument, and the counts
+    // behind it, is on OverseerDecisions::CounterArrivalStep; what is here is
+    // the three calls a world needs plus the one question only a world can
+    // answer.
+
+    // The verb a counter hold is recorded under, spelled once for the reason
+    // STAGE_HOLD_VERB and INN_HOLD_VERB are: it is what makes a release let go
+    // of this hold and not of a cast, a summon, a barrier's or a bind's.
+    static constexpr char const* COUNTER_HOLD_VERB = "trade";
+
+    // HOW LONG A CHARACTER MAY BE STOOD AT A COUNTER, AND IT IS BORROWED RATHER
+    // THAN PICKED.
+    //
+    // IT CANNOT BE THE ERRAND'S OWN BACKSTOP, WHICH IS WHAT THE INN HOLD
+    // BORROWS. An inn hold is taken with the errand still open, so that
+    // backstop is a clock genuinely still running and the drive that owns the
+    // trip is still looking at the character. This hold is taken as the errand
+    // is RELEASED, because that release is the signal the pass outside the
+    // worldserver waits for before it writes a single row. Afterwards this
+    // character has no aim, no errand and no drive looking at it, so nothing
+    // would come back for a hold measured against a trip.
+    //
+    // SO IT IS UPSTREAM'S OWN ANSWER TO THE SAME QUESTION. An aimed wander that
+    // nobody renews self-expires to IDLE after
+    // UPSTREAM_WANDER_NPC_LEASE_SECONDS, which is exactly how long
+    // mod-playerbots is willing to leave a character standing in front of an NPC
+    // it was sent to. A hold that stands for that long is this module agreeing
+    // with upstream about the length of a visit rather than inventing a number,
+    // and a character let go at the end of one is in the state it would have
+    // been in anyway.
+    //
+    // AND IT IS COMFORTABLY LONGER THAN THE WORK AND COMFORTABLY SHORTER THAN
+    // THE WAIT. The rows drain at COMMANDS_PER_POLL every COMMAND_POLL_MS, so
+    // even a bagful of greens is tens of seconds; the run that is waiting for
+    // this trip waits DUNGEON_MAINTENANCE_HOLD_SECONDS, which is four times
+    // this. A hold nobody comes back for therefore ends well inside the window
+    // the trip was allowed, and ReleaseExpiredHolds is what ends it.
+    static constexpr uint32 COUNTER_HOLD_CEILING_SECONDS =
+        static_cast<uint32>(UPSTREAM_WANDER_NPC_LEASE_SECONDS);
+
+    static_assert(UPSTREAM_WANDER_NPC_LEASE_SECONDS < DUNGEON_MAINTENANCE_HOLD_SECONDS,
+                  "a character held at a counter must be let go before the run that is "
+                  "waiting for its trip gives up and walks it to a dungeon door");
+
+    // Is there a counter hold on this character's name? Deliberately not
+    // deadline-checked, for the reason HasStagingHold gives: this is asked by
+    // the release paths, and a record past its ceiling is one that must still be
+    // LET GO of.
+    static bool HasCounterHold(std::string const& name)
+    {
+        auto const hold = HoldsInForce().find(name);
+        return hold != HoldsInForce().end() && hold->second.verb == COUNTER_HOLD_VERB;
+    }
+
+    static void HoldAtTheCounter(Player* member, std::string const& name)
+    {
+        PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        if (!botAI)
+            return;
+        // `false` IS "THIS HOLD IS NOT FOR A CAST", the same answer the staging
+        // and inn holds give and for the same two reasons. Selling, repairing
+        // and banking are packets this module hands to the core's own handlers
+        // rather than spells this character casts, and not one of those handlers
+        // asks whether the character is sitting or mounted: each is gated on
+        // GetNPCIfCanInteractWith and on the item, and on nothing else. Standing
+        // a character up to sell to a vendor would be this hold insisting on
+        // something the player it imitates never has to do.
+        // AND THIS IS THE ONE HOLD IN THE REGISTER THAT IS TAKEN ONCE RATHER
+        // THAN RE-ASSERTED EVERY POLL, which is worth saying out loud because
+        // every other one says the opposite. A staging hold and an inn hold are
+        // re-asserted because a drive is still looking at the character and the
+        // register stops this module's own sweeps and nothing else. There is no
+        // such poll here: the errand is released on the same statement, so
+        // nothing looks at this character again until it is given a new aim.
+        //
+        // WHAT CARRIES IT INSTEAD IS THE TWO HALVES THE REGISTER ALREADY HAS.
+        // KeepHeldCharactersStill runs on every world tick and re-takes the
+        // active motion slot wherever the character has drifted off its anchor,
+        // which is the half that answers a walk something outside this module
+        // started; and all six hand-back sites ask HeldStill before they grant a
+        // mover, which is the half that stops one being started. A hold taken
+        // once is therefore held until its ceiling, and #358's sweep is the
+        // reason that sentence is true now and was not before.
+        HoldCharacterStill(member, botAI, name, COUNTER_HOLD_VERB,
+                           COUNTER_HOLD_CEILING_SECONDS, false);
+    }
+
+    static void ReleaseCounterHold(std::string const& name, char const* why)
+    {
+        ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
+                    COUNTER_HOLD_VERB);
+    }
+
+    // The predicate the counter sweep runs over each creature in the visited
+    // cells: alive, carrying the role's own npcflag, and within `range`. The
+    // same shape VendorNearbyCheck already gives Acore::CreatureListSearcher
+    // (GridNotifiers.h:494-508), with the flag as a field so one sweep answers
+    // for all three roles instead of three near-identical structs.
+    struct CounterNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        // NPCFlags AND NOT uint32, WHICH IS THE CORE'S CHOICE RATHER THAN A
+        // PREFERENCE: Unit::HasNpcFlag takes the enum (Unit.h:764) and an
+        // unscoped enum will not be constructed from an integer without a cast.
+        // Carrying the enum from NpcFlagForCounter all the way here is what
+        // keeps that cast out of the code entirely; the widening to uint32 that
+        // GetNPCIfCanInteractWith wants (Player.h:1146) is implicit and safe in
+        // the direction it goes.
+        NPCFlags npcFlag;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive() && creature->HasNpcFlag(npcFlag)
+                && from->IsWithinDistInMap(creature, range);
+        }
+    };
+
+    // WHICH NPCFLAG A COUNTER ROLE MEANS. The decisions layer names the role and
+    // cannot name the flag - it compiles with no core behind it, which is half
+    // of what its own CI proves - so the mapping lives here, beside the sweep
+    // that is the only thing needing it.
+    static NPCFlags NpcFlagForCounter(OverseerDecisions::CounterRole role)
+    {
+        switch (role)
+        {
+            case OverseerDecisions::CounterRole::Vendor:
+                return UNIT_NPC_FLAG_VENDOR;
+            case OverseerDecisions::CounterRole::Banker:
+                return UNIT_NPC_FLAG_BANKER;
+            case OverseerDecisions::CounterRole::Repairer:
+                return UNIT_NPC_FLAG_REPAIR;
+            case OverseerDecisions::CounterRole::None:
+                break;
+        }
+        // UnitDefines.h:321, and it is the core's own name for "no flag at all"
+        // rather than a zero this file made up. Nothing carries it, so a sweep
+        // for it would match nothing, which is why the caller refuses on it
+        // instead of running one.
+        return UNIT_NPC_FLAG_NONE;
+    }
+
+    // IS THIS CHARACTER ACTUALLY AT THE COUNTER, ASKED THE WAY THE EXECUTOR WILL
+    // ASK IT (#378).
+    //
+    // TWO ANSWERS OUT OF ONE SWEEP, because they are two questions about the
+    // same list and the sweep is the expensive half. The return value is the
+    // core's own GetNPCIfCanInteractWith with the role's flag - byte for byte
+    // the call DoSell, DoRepair and DoBank each make before handing a packet to
+    // a handler, so a creature this accepts is one the executor will accept.
+    // `outOneIsNearby` is the wider list, and it exists only to tell "the walk
+    // has a few yards left in it" from "there is nothing here", which are
+    // different facts with different right answers.
+    //
+    // THE WIDER RADIUS IS DoSell's OWN, and deliberately the same number: that
+    // sweep exists so a refusal can say how far the nearest vendor WAS, and this
+    // one exists so the drive can decide whether to keep walking toward it. Two
+    // different answers to "is one about" would have this drive send a character
+    // away from a counter its own executor was about to report as eight yards
+    // off.
+    //
+    // AND THE GATE CARRIES THE DISTANCE TEST ITSELF (Player.cpp:2115-2165: not
+    // in world, in flight, dead either side, charmed, unfriendly, wrong npcflag,
+    // or farther than INTERACTION_DISTANCE). Comparing yards here as well would
+    // be this module keeping a second opinion about a question the core has
+    // already answered, and a second opinion about exactly that question is what
+    // a twelve yard arrival radius already is.
+    static bool CounterInReach(Player* who, OverseerDecisions::CounterRole role,
+                               bool& outOneIsNearby, float& outNearestYards)
+    {
+        outOneIsNearby = false;
+        outNearestYards = -1.f;
+
+        NPCFlags const npcFlag = NpcFlagForCounter(role);
+        if (!who || npcFlag == UNIT_NPC_FLAG_NONE)
+            return false;
+
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        CounterNearbyCheck check{who, SWEEP_YARDS, npcFlag};
+        Acore::CreatureListSearcher<CounterNearbyCheck> searcher(who, nearby, check);
+        Cell::VisitObjects(who, searcher, SWEEP_YARDS);
+
+        bool inReach = false;
+        for (Creature* creature : nearby)
+        {
+            float const yards = who->GetDistance(creature);
+            if (outNearestYards < 0.f || yards < outNearestYards)
+                outNearestYards = yards;
+            if (who->GetNPCIfCanInteractWith(creature->GetGUID(), npcFlag))
+                inReach = true;
+        }
+
+        // "NEARBY" MEANS A GAP UPSTREAM WILL ACTUALLY CLOSE, NOT ONE THIS SWEEP
+        // CAN SEE, and the two are different numbers on purpose.
+        //
+        // The wider sweep above is DoSell's own, and it is here for the same
+        // reason it is there: so a refusal or a log line can say how far the
+        // nearest one WAS. It is not the radius anybody is walking. What closes
+        // the last few yards is upstream's aimed wander, and once it is within
+        // INTERACTION_DISTANCE of the recorded point it looks for the creature
+        // with FindNearestCreature(npcEntry, INTERACTION_DISTANCE * 3) and
+        // ChangeToIdle's if it finds nothing (patch 0005's block in
+        // NewRpgWanderNpcAction::Execute). A counter further off its spawn row
+        // than that is one nothing is going to walk to, so declining to release
+        // the errand for it would be this module waiting out its own twenty
+        // minute backstop on a gap no loop is closing - which is worse than
+        // today rather than better, because today the errand at least ends.
+        //
+        // MEASURED FROM THE CHARACTER, WHICH IS WHERE UPSTREAM MEASURES IT.
+        // Both radii are around the bot, so the two questions line up: a
+        // creature this calls nearby is one upstream's own resolve would find
+        // from where the character is standing right now.
+        outOneIsNearby =
+            outNearestYards >= 0.f && outNearestYards <= INTERACTION_DISTANCE * 3.f;
+        return inReach;
     }
 
     // Give the followers somebody to follow (infra#2818).
@@ -13982,6 +14210,26 @@ private:
                 state.routePlanned = false;
                 state.route.clear();
                 state.routeCursor = OverseerDecisions::RouteCursor{};
+                // AND A CHARACTER WITH SOMEWHERE NEW TO BE IS NOT STILL BEING
+                // HELD AT THE LAST COUNTER (#378). This is the one statement
+                // every "the aim changed" passes through, which is what
+                // EndOneEscort is for the inn hold, and it is the only release
+                // this hold has other than its ceiling: an arrived counter
+                // errand is RELEASED as the hold is taken, so afterwards the
+                // character has no aim and no drive is looking at it until a
+                // new one is written here.
+                //
+                // AND IT IS NAMED BY VERB, so it is a no-op for every character
+                // that was not standing at a counter and can never lift a cast,
+                // a summon, a barrier's hold or a bind's. Without it the next
+                // leg of the trip - the walk from the vendor to the bank - would
+                // be handed to a character this module had taken the mover off,
+                // and the log line it would leave says the hold restores the
+                // mover itself, which for five minutes would be a lie.
+                if (HasCounterHold(name))
+                    ReleaseCounterHold(name,
+                                       "it has been sent somewhere else and cannot be "
+                                       "both at a counter and on its way to one");
             }
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -14672,17 +14920,126 @@ private:
                 }
                 else
                 {
-                    // Opportunistic, and deliberately BEFORE the errand is
-                    // cleared rather than after: `entry` and `bot` are both
-                    // already in hand here, and this is a no-op for anything
-                    // that is not a flight master. See DiscoverFlightPointOnArrival.
-                    DiscoverFlightPointOnArrival(name, bot, entry);
+                    // AND A COUNTER IS NOT A DESTINATION, IT IS AN INTERACTION
+                    // (#378). For every other creature errand in this branch -
+                    // a flight master, a stable master, a tabard designer -
+                    // being here IS the errand, and releasing on the recorded
+                    // point is right. For a vendor, a banker or a repairer it
+                    // is not: the errand is a packet the command drain sends
+                    // later, gated on the core's own GetNPCIfCanInteractWith,
+                    // and this release is what tells the pass outside the
+                    // worldserver to write the rows that send it. So the
+                    // question this branch asks about a counter is not "is the
+                    // character near the spawn row" but "will the executor's
+                    // own gate accept somebody standing here", and the answer
+                    // decides between three different things to do rather than
+                    // two. See OverseerDecisions::CounterArrivalStep.
+                    OverseerDecisions::CounterRole const counter =
+                        OverseerDecisions::CounterRoleForAim(target);
+                    bool oneIsNearby = false;
+                    float nearestYards = -1.f;
+                    // NOT ASKED AT ALL FOR AN AIM THAT IS NOT A COUNTER, which
+                    // is what keeps a cell sweep off the arrival of every
+                    // trainer and flight master this module has ever sent
+                    // anybody to. CounterInReach would answer false for them
+                    // anyway; paying for a sweep to hear it would be a cost
+                    // this branch never had.
+                    bool const inReach =
+                        counter == OverseerDecisions::CounterRole::None
+                            ? false
+                            : CounterInReach(bot, counter, oneIsNearby, nearestYards);
 
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' reached '{}' (creature {}) - errand done, "
-                             "releasing", name, target, entry);
-                    _travelAims.Release(name);
-                    continue;
+                    OverseerDecisions::CounterArrival const arrival =
+                        OverseerDecisions::CounterArrivalStep(counter, inReach,
+                                                              oneIsNearby);
+
+                    if (arrival == OverseerDecisions::CounterArrival::CloseTheGap)
+                    {
+                        // NOT RELEASED, AND DELIBERATELY NOT `continue` - the
+                        // same two sentences the doorway and trainer branches
+                        // above already carry, for the same reason. Falling
+                        // through reaches the re-issue guard, which renews the
+                        // aim, and upstream's own aimed wander is what closes
+                        // the gap from there: it walks to `pos` while further
+                        // than INTERACTION_DISTANCE and then resolves the live
+                        // creature within INTERACTION_DISTANCE * 3, which is
+                        // the last few yards this module has no business
+                        // pathing by hand (#138). The twenty minute backstop
+                        // bounds it, and now bounds the right thing: a
+                        // character that has stopped getting nearer to a
+                        // counter it cannot reach.
+                        //
+                        // SAID ONCE PER ERRAND, on `state.arrived`, which is
+                        // already this state's "said already" flag and is
+                        // reset whenever the errand changes.
+                        if (!state.arrived)
+                        {
+                            state.arrived = true;
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' has reached '{}' (creature {}) and the "
+                                     "nearest one of that role is {:.1f}y off, which is "
+                                     "outside the interact gate its rows will be judged by - "
+                                     "not released, the walk closes the last few yards",
+                                     name, target, entry, nearestYards);
+                        }
+                    }
+                    else
+                    {
+                        if (arrival == OverseerDecisions::CounterArrival::StandAndTrade)
+                        {
+                            // THE HOLD IS TAKEN BEFORE THE RELEASE AND NOT
+                            // AFTER, because the release IS the signal. It
+                            // clears `travel_npc`, which is what the pass that
+                            // wrote the aim reads as "arrived" before it writes
+                            // a single row, and a character not already pinned
+                            // by then has an AI tick in which to roll RPG_IDLE
+                            // into something that walks. The order of these two
+                            // statements is the whole of the fix at this point.
+                            HoldAtTheCounter(bot, name);
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' is at the '{}' it was sent to ({:.1f}y, "
+                                     "and the core's own interact gate accepts it) and is "
+                                     "held there for up to {}s, so its rows find it standing "
+                                     "at the counter instead of walking away from one",
+                                     name, target, nearestYards,
+                                     uint32(COUNTER_HOLD_CEILING_SECONDS));
+                        }
+                        else if (counter != OverseerDecisions::CounterRole::None)
+                        {
+                            // AND A COUNTER AIM WITH NOTHING OF THAT ROLE IN
+                            // THE SWEEP IS WORTH A LINE OF ITS OWN, because it
+                            // is the one arrival that reads as a success and is
+                            // not one. The spawn row this module walked to is
+                            // real and whatever should be standing on it is
+                            // despawned, dead or phased, so the errand is over
+                            // and the AIM was wrong - which is something the
+                            // pass that wrote it can act on and nothing here
+                            // can.
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' reached the '{}' spawn it was sent to "
+                                     "(creature {}) and the nearest creature of that role is "
+                                     "{:.1f}y away, a negative distance meaning none within "
+                                     "30 yards at all - further than upstream's own arrival "
+                                     "resolve will look, so nothing is going to close it. "
+                                     "Releasing, because standing on a spawn point nothing "
+                                     "is standing on does not get anything sold, banked or "
+                                     "repaired. The aim is what to look at",
+                                     name, target, entry, nearestYards);
+                        }
+
+                        // Opportunistic, and deliberately BEFORE the errand is
+                        // cleared rather than after: `entry` and `bot` are both
+                        // already in hand here, and this is a no-op for
+                        // anything that is not a flight master. See
+                        // DiscoverFlightPointOnArrival.
+                        DiscoverFlightPointOnArrival(name, bot, entry);
+
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' reached '{}' (creature {}) - errand done, "
+                                 "releasing", name, target, entry);
+                        _travelAims.Release(name);
+                        continue;
+                    }
                 }
             }
 
