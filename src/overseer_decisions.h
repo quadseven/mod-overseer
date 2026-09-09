@@ -7156,6 +7156,68 @@ char const* SummonApproachWord(SummonApproach approach);
 // that was about to work. The clock only decides between walking and giving up.
 SummonApproach ReadSummonApproach(bool inReach, float nearestYards, float walkYards,
                                   uint32_t walkedMs, uint32_t ceilingMs);
+
+// ----------------- the portal does not exist yet when the stone is clicked --
+//
+// THE THIRD WAIT, AND IT IS THE ONE THAT WAS MISSING ENTIRELY (#365). The verb
+// clicked the meeting stone and looked for the ritual object in the next
+// statement, which cannot work and never once did.
+//
+// WHAT THE CORE ACTUALLY DOES, at the pinned SHA. `GameObject::Use`'s
+// MEETINGSTONE branch (GameObject.cpp:1902) casts spell 23598 on the clicker,
+// and that spell is channelled - which the module's own evidence proves rather
+// than assumes, because `GetCurrentSpell(CURRENT_CHANNELED_SPELL)` came back
+// non-null and only `Spell::GetCurrentContainer` (Spell.cpp:8021) puts a spell
+// in that container. `Spell::prepare` casts a spell immediately in exactly two
+// places and a channelled one takes neither: Spell.cpp:3646 wants
+// `!IsChanneled() || !GetMaxDuration()`, and Spell.cpp:3691 wants
+// `GetCurrentContainer() == CURRENT_GENERIC_SPELL`. What prepare DOES do is
+// `SetCurrentCastedSpell` (Spell.cpp:3665), which is the whole of why the
+// channel reads as started. The cast itself is left to `Spell::update`
+// (Spell.cpp:4430), and only inside that does `handle_immediate`
+// (Spell.cpp:4036) reach `Spell::EffectTransmitted` (SpellEffects.cpp:5379),
+// its `GAMEOBJECT_TYPE_SUMMONING_RITUAL` branch (SpellEffects.cpp:5466) and
+// finally `AddToMap` (SpellEffects.cpp:5497).
+//
+// AND THIS MODULE'S POLL IS ON THE WRONG SIDE OF THAT. `World::Update` runs the
+// maps at World.cpp:1242 and this module's hook at World.cpp:1342, so the spell
+// is prepared after the map update that would have cast it. The portal first
+// exists one world tick later, which is always after the poll that clicked the
+// stone has finished refusing.
+//
+// SO THE ROW WAITS, exactly as it already waits for the walk and for the
+// settle, and this is the reading that says how.
+enum class SummonPortal
+{
+    // The portal is in the world and can be clicked. Asked first and before
+    // anything else, because an object that exists is the answer whatever the
+    // clock or the channel say about how it got there.
+    Click,
+    // No portal yet, and the summoner is still channelling the spell that makes
+    // one. This is the ordinary answer on the poll after the click and the
+    // reason this decision exists.
+    Wait,
+    // No portal, and no channel either. Waiting is waiting for nothing: the
+    // ritual object is destroyed with the channel that owns it
+    // (`m_caster->AddGameObject(pGameObj)`, SpellEffects.cpp:5470, removed at
+    // spell cancel), so a summoner that has stopped channelling with no portal
+    // in the world is a summon that is over.
+    NoChannel,
+    // Still channelling, still no portal, and the wait has had its time.
+    // Something the executor cannot see is in the way, and saying so is what
+    // the next attempt needs.
+    OutOfTime,
+};
+
+// "click", "wait", "no-channel", "out-of-time". Here rather than in the
+// executor so the word a test pins is the word a row carries.
+char const* SummonPortalWord(SummonPortal portal);
+
+// `channelling` is whether the summoner still holds the channelled spell, read
+// off the core rather than inferred, and `waitedMs` is how long this row has
+// been in this wait alone - not the walk's clock and not the ritual's.
+SummonPortal ReadSummonPortal(bool portalSeen, bool channelling, uint32_t waitedMs,
+                              uint32_t ceilingMs);
 // ---------------------------------------------------- conjure (#147, #18) --
 //
 // WHAT A kind='conjure' ROW MAY SAY, AND WHY THIS VERB EXISTS AT ALL.

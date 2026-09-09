@@ -5975,6 +5975,54 @@ char const* SummonApproachWord(SummonApproach approach)
     return "out-of-time";
 }
 
+char const* SummonPortalWord(SummonPortal portal)
+{
+    switch (portal)
+    {
+        case SummonPortal::Click:
+            return "click";
+        case SummonPortal::Wait:
+            return "wait";
+        case SummonPortal::NoChannel:
+            return "no-channel";
+        case SummonPortal::OutOfTime:
+            break;
+    }
+    return "out-of-time";
+}
+
+SummonPortal ReadSummonPortal(bool portalSeen, bool channelling, uint32_t waitedMs,
+                              uint32_t ceilingMs)
+{
+    // THE OBJECT FIRST, AND BEFORE EVERYTHING. A portal in the world is the
+    // thing that gets clicked, so its existence settles this whether the clock
+    // has run out on the same poll or the channel reads oddly. It is also the
+    // only one of these three inputs that is a fact about the ritual rather
+    // than about the summoner.
+    if (portalSeen)
+        return SummonPortal::Click;
+
+    // AND THEN THE CHANNEL, BEFORE THE CLOCK. The ritual object belongs to the
+    // channel: the core hands it to the caster with `AddGameObject` and takes
+    // it away when the spell is cancelled. So a summoner that has stopped
+    // channelling with no portal in the world is not a row that needs more
+    // time, it is a row whose spell went away - refused at cast time, walked
+    // out of, or interrupted - and spending the rest of the window on it would
+    // hold a claim open to watch nothing happen.
+    if (!channelling)
+        return SummonPortal::NoChannel;
+
+    // THE WAIT HAS HAD ITS TIME. Named separately from the answer above because
+    // they are different things to report and different things to do about:
+    // one says the spell is gone, the other says the spell is still running and
+    // has produced nothing, and a single literal covering both is exactly the
+    // fault this issue is half about.
+    if (waitedMs >= ceilingMs)
+        return SummonPortal::OutOfTime;
+
+    return SummonPortal::Wait;
+}
+
 SummonApproach ReadSummonApproach(bool inReach, float nearestYards, float walkYards,
                                   uint32_t walkedMs, uint32_t ceilingMs)
 {
