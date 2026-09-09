@@ -10278,6 +10278,154 @@ private:
                  name, node, npc->GetName(), entry);
     }
 
+    // ONE MEMBER OF A PARTY FLIGHT, READ OUT OF THE WORLD (#360).
+    //
+    // `read` is the only thing the decision sees; everything beside it is what
+    // the executor needs the instant that decision says Fly. They are measured
+    // together and kept together on purpose: the alternative is deciding on one
+    // reading and boarding on a second, and a character refused by a check it
+    // has already passed is the shape of bug this module keeps finding.
+    struct PartyFlightSeat
+    {
+        OverseerDecisions::PartyFlightMember read;
+        Player* who{nullptr};
+        PlayerbotAI* ai{nullptr};
+        uint32 fmEntry{0};
+        WorldPosition fmPos;
+        std::vector<uint32> path;
+        uint32 fare{0};
+    };
+
+    // READ ONE FOLLOWER AGAINST ONE CANDIDATE LANDING (#360).
+    //
+    // EVERY QUESTION IS ASKED OF THE MEMBER AND NOT OF THE LEADER, which is the
+    // whole point of the exercise: the members of a scattered party stand at
+    // different nodes, hold different taximasks and carry different money, and
+    // the refusal this replaces treated all five as one character standing
+    // where the leader stood.
+    //
+    // THE EXPENSIVE HALF IS SKIPPED FOR ANYBODY NOT BEHIND THE LEADER. A member
+    // on another map, dead, already in the air, already at the landing or
+    // walking an errand of its own is exempt from the party rule, so its nodes,
+    // its route and its fare are never looked up. That is not only cost: a
+    // route read for a character the decision is going to ignore is a fact
+    // nobody should be able to act on later by mistake.
+    void ReadPartyFlightSeat(Player* leader, Player* member, uint32 toNode,
+                             TaxiNodesEntry const* arrival, PartyFlightSeat& seat)
+    {
+        seat.who = member;
+        seat.read.name = member->GetName();
+        seat.read.leader = false;
+        seat.read.onSameMap = member->GetMapId() == leader->GetMapId();
+        seat.read.alive = member->IsAlive();
+        seat.read.inFlight = member->IsInFlight();
+        seat.read.inCombat = member->IsInCombat();
+        // ALREADY AT THE LANDING IS THE SAME THRESHOLD AS "WORTH FLYING AT
+        // ALL", read from the other end. A character whose walk from the
+        // arrival node is shorter than TRAVEL_FLIGHT_MIN_YARDS is one this
+        // module would never buy a ticket for, so it has nothing to cross and
+        // is not behind anybody.
+        seat.read.atArrival =
+            arrival && member->GetMapId() == arrival->map_id &&
+            member->GetDistance2d(arrival->x, arrival->y) < TRAVEL_FLIGHT_MIN_YARDS;
+        // FOLLOWING, RATHER THAN WALKING SOMEWHERE OF ITS OWN. A catch-up walk
+        // does not count as its own errand: its aim IS the leader's live
+        // position, rewritten every time the leader moves on, which is exactly
+        // the character #360 measured 4100 yards behind and diverging.
+        seat.read.followingTheLeader = _travelAims.TargetFor(seat.read.name).empty() ||
+                                       IsCatchingUp(seat.read.name);
+
+        if (!seat.read.onSameMap || !seat.read.alive || seat.read.inFlight ||
+            seat.read.atArrival || !seat.read.followingTheLeader)
+            return;
+
+        // The same two gates every other aimed errand in this file is held to,
+        // asked of the member rather than inherited from the leader.
+        seat.ai = SteerableAI(member);
+        seat.read.steerable = seat.ai != nullptr && CanBeSentToNpc(seat.ai);
+        if (!seat.read.steerable)
+            return;
+
+        // ObjectMgr.h:817 and Player.h:2142, the same pair ConsiderFlight and
+        // DiscoverFlightPointOnArrival both use to answer "whose node is this".
+        uint32 const fromNode = sObjectMgr->GetNearestTaxiNode(
+            member->GetPositionX(), member->GetPositionY(), member->GetPositionZ(),
+            member->GetMapId(), member->GetTeamId(true));
+        TaxiNodesEntry const* const departure =
+            fromNode ? sTaxiNodesStore.LookupEntry(fromNode) : nullptr;
+        seat.read.departureNode = fromNode;
+        seat.read.hasDepartureNode = departure != nullptr;
+        if (!departure)
+            return;
+
+        if (!ResolveTravelTarget(member, "flight master", seat.fmEntry, seat.fmPos))
+            return;   // no flight master resolved: masterInReach stays false
+
+        // TWO HALVES OF "IN REACH", AND THE SECOND IS THE ONE #360 ASKS TO HAVE
+        // DECIDED. The first is the rule this file already keeps: the nearest
+        // flight master and the nearest node of this character's own team have
+        // to be the same place, or the character is being sent to stand next to
+        // somebody who cannot sell it a ticket.
+        float const nodeDx = seat.fmPos.GetPositionX() - departure->x;
+        float const nodeDy = seat.fmPos.GetPositionY() - departure->y;
+        bool const answersForTheNode =
+            nodeDx * nodeDx + nodeDy * nodeDy <=
+            TRAVEL_FLIGHT_NODE_MATCH_YARDS * TRAVEL_FLIGHT_NODE_MATCH_YARDS;
+        // The second is the walk to the counter, and it is measured against
+        // TRAVEL_FLIGHT_MIN_YARDS deliberately rather than against a number of
+        // its own. That constant is this module's answer to "how long does a
+        // walk have to be before flying is worth considering"; a boarding walk
+        // longer than it is a journey in its own right, with its own guards and
+        // its own cliffs, and calling that "in reach" would be how a party gets
+        // scattered by the fix for being scattered.
+        seat.read.masterInReach =
+            answersForTheNode &&
+            member->GetDistance2d(seat.fmPos.GetPositionX(), seat.fmPos.GetPositionY()) <
+                TRAVEL_FLIGHT_MIN_YARDS;
+        if (!seat.read.masterInReach)
+            return;
+
+        // TravelNode.h:585, the same precomputed BFS the leader's own candidate
+        // loop reads. A member starts from its OWN node, so this is a different
+        // route from the leader's even when both end at `toNode`.
+        seat.path = sTravelNodeMap.FindTaxiPath(fromNode, toNode);
+        if (seat.path.size() < 2)
+            return;   // no route at all: `undiscoveredNode` stays zero, and that
+                      // zero is the only thing telling the two refusals apart
+
+        // EVERY HOP AFTER THE FIRST HAS TO BE KNOWN, and the first deliberately
+        // does not - a flight master teaches the node it stands at when the
+        // window opens (SendLearnNewTaxiNode), which is what upstream's
+        // NewRpgTravelFlightAction calls before it activates. Requiring the
+        // departure node in advance would be stricter than the game rather than
+        // safer than it. See the identical check in ConsiderFlight.
+        for (size_t hop = 1; hop < seat.path.size(); ++hop)
+        {
+            if (!member->m_taxi.IsTaximaskNodeKnown(seat.path[hop]))
+            {
+                seat.read.undiscoveredNode = seat.path[hop];
+                return;
+            }
+        }
+
+        // THE FARE, CHECKED HERE RATHER THAN DISCOVERED AT THE COUNTER, and
+        // undiscounted for the same reason the leader's is: the reputation
+        // discount needs the creature in hand, and it only ever makes the fare
+        // smaller, so this can refuse a flight that would have been affordable
+        // and can never wave through one that would not.
+        for (size_t hop = 1; hop < seat.path.size(); ++hop)
+        {
+            uint32 hopPath = 0;
+            uint32 hopCost = 0;
+            sObjectMgr->GetTaxiPath(seat.path[hop - 1], seat.path[hop], hopPath, hopCost);
+            if (!hopPath)
+                return;   // the BFS graph and the DBC disagree: no route
+            seat.fare += hopCost;
+        }
+        seat.read.routeKnown = true;
+        seat.read.canPayFare = member->GetMoney() >= seat.fare;
+    }
+
     // FLY INSTEAD OF WALKING, WHERE FLYING IS SHORTER (#68).
     //
     // WHAT THIS IS FOR. #93 made the family GATHER flight points and they now
@@ -10432,71 +10580,35 @@ private:
             TRAVEL_FLIGHT_NODE_MATCH_YARDS * TRAVEL_FLIGHT_NODE_MATCH_YARDS)
             return false;
 
-        // THE LEADER DOES NOT BOARD WHILE A FOLLOWER IS ON FOOT (#138).
+        // THE LEADER DOES NOT BOARD WHILE A FOLLOWER IS ON FOOT (#138), AND
+        // SINCE #360 THE ANSWER TO THAT IS TO PUT THE FOLLOWER ON A TAXI.
         //
-        // The paragraph above this function still says the other four "keep
-        // walking the overland route and regroup at the far end". Measured
-        // 2026-09-01, they do not: the leader flew 4333 yards, landed, and
-        // within three minutes three followers had killed themselves at one
-        // coordinate in a zone with nothing hostile in it. Following works by
-        // stepping straight at the master (see FOLLOW_CATCH_UP_YARDS), and a
-        // master who has just crossed a mountain range by air is on the far
-        // side of terrain his followers now walk straight into. The flight
-        // was a saving of a few minutes for one character, paid for with the
-        // other four.
+        // The refusal that used to stand HERE, before the candidate search, was
+        // right about the danger and wrong about the alternative. Measured
+        // 2026-09-01: the leader flew 4333 yards, landed, and within three
+        // minutes three followers had killed themselves at one coordinate in a
+        // zone with nothing hostile in it. Following works by stepping straight
+        // at the master (see FOLLOW_CATCH_UP_YARDS), and a master who has just
+        // crossed a mountain range by air is on the far side of terrain his
+        // followers now walk straight into. That is all still true.
         //
-        // So a flight is refused while anyone who would try to follow it is
-        // still on the ground: a live groupmate on the same map who is not
-        // himself in the air. A dead one is a ghost walking to its corpse and
-        // follows nobody (FollowActions.cpp:296-306); one on another map
-        // cannot follow across it (FollowActions.cpp:285); one already on a
-        // taxi is not on foot. ONLY THE GROUP LEADER IS HELD TO THIS. A
-        // follower on a catch-up walk carries `new rpg` too and reaches this
-        // same function; nobody follows a follower, so nothing is behind it
-        // to be dragged, and a follower that holds the nodes flying to where
-        // the leader stands is the closest thing to "everyone flies" the
-        // issue asks for that this module can do without every member
-        // holding every node.
+        // What was NOT true is the thing the refusal was buying. #360 measured
+        // it in the same second as the refusal: the three followers it declined
+        // to leave behind were 1500 to 4100 yards behind the leader, each on
+        // its own catch-up walk, each crossing guarded ground alone. It paid the
+        // whole price of keeping the party together and bought none of it, and
+        // the walk it chose instead was 7720 yards with five of its seven legs
+        // across ground the other side guards.
         //
-        // Said once per errand through `flightSaid`, like every other refusal
-        // here, and BEFORE the candidate search rather than after it: the
-        // search is the expensive half of this function and its answer would
-        // not be acted on. GetGroup Player.h; GetLeaderGUID Group.h:228;
-        // GetFirstMember Group.h:252, GetGroup Player.h:2520 - the same walk
-        // this file's other member loops use.
-        if (Group* group = bot->GetGroup())
-        {
-            if (group->GetLeaderGUID() == bot->GetGUID())
-            {
-                std::string onFoot;
-                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
-                {
-                    Player* member = ref->GetSource();
-                    if (!member || member == bot || !member->IsInWorld() ||
-                        !member->IsAlive() || member->IsInFlight() ||
-                        member->GetMapId() != bot->GetMapId())
-                        continue;
-                    if (!onFoot.empty())
-                        onFoot += ", ";
-                    onFoot += '\'' + member->GetName() + '\'';
-                }
-                if (!onFoot.empty())
-                {
-                    if (!state.flightSaid)
-                    {
-                        state.flightSaid = true;
-                        LOG_INFO("module.overseer",
-                                 "overseer: '{}' is sent to '{}' {} yards away and has a "
-                                 "departure node ({}) in reach, but {} would be left on foot "
-                                 "behind it - walking, because a party that follows a "
-                                 "leader across the sky arrives one cliff at a time",
-                                 name, state.target, static_cast<uint32>(walkYards),
-                                 fromNode, onFoot);
-                    }
-                    return false;
-                }
-            }
-        }
+        // So the question is asked further down, INSIDE the candidate loop,
+        // where the arrival node is known - because "can everybody board" is a
+        // question about a particular landing and cannot be answered before one
+        // is chosen. The comment that used to say the search was too expensive
+        // to run before this refusal was right when the answer would have been
+        // thrown away; now the answer is what the refusal is made of. See
+        // OverseerDecisions::PlanPartyFlight for the whole rule, including what
+        // "in reach" means per member and what happens to a member that is
+        // dead, in combat, or stranded when the rest depart.
 
         // How far the flight costs before it has flown anywhere. Half of the
         // flight-adjusted comparison below, and constant across every
@@ -10659,6 +10771,161 @@ private:
                              fromNode, toNode, fare, bot->GetMoney());
                 }
                 continue;
+            }
+
+            // THE PARTY BOARDS TOGETHER, OR NOBODY DOES (#360). This is the
+            // refusal that used to sit above the candidate search, asked down
+            // here instead because it is a question about THIS landing: a
+            // member holds a route to one node and not to another, so "can
+            // everybody board" has no answer until there is somewhere to board
+            // to.
+            //
+            // ONLY THE GROUP LEADER IS HELD TO IT, exactly as before. Nobody
+            // follows a follower, so a follower that reaches this function on
+            // its own catch-up walk has nothing behind it to drag.
+            //
+            // GetGroup Player.h:2520; GetLeaderGUID Group.h:228; GetFirstMember
+            // Group.h:252 - the same member walk this file's other group loops
+            // make.
+            Group* const group = bot->GetGroup();
+            if (group && group->GetLeaderGUID() == bot->GetGUID())
+            {
+                TaxiNodesEntry const* const arrival = sTaxiNodesStore.LookupEntry(toNode);
+                std::vector<PartyFlightSeat> seats;
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* const member = ref->GetSource();
+                    if (!member || !member->IsInWorld())
+                        continue;
+                    seats.emplace_back();
+                    if (member == bot)
+                    {
+                        // THE LEADER IS NOT READ TWICE. Everything above this
+                        // point in this function has already established each
+                        // of these about it, against this very candidate, and a
+                        // second reading that disagreed with the first would
+                        // refuse a flight this function has already decided is
+                        // available. Its `followingTheLeader` is left at the
+                        // default and never consulted: the character carrying
+                        // the errand follows nobody, and PlanPartyFlight
+                        // exempts the leader from that test for exactly that
+                        // reason.
+                        PartyFlightSeat& mine = seats.back();
+                        mine.who = bot;
+                        mine.ai = botAI;
+                        mine.fmEntry = fmEntry;
+                        mine.fmPos = fmPos;
+                        mine.path = path;
+                        mine.fare = fare;
+                        mine.read.name = name;
+                        mine.read.leader = true;
+                        mine.read.steerable = true;
+                        mine.read.hasDepartureNode = true;
+                        mine.read.masterInReach = true;
+                        mine.read.routeKnown = true;
+                        mine.read.canPayFare = true;
+                        mine.read.departureNode = fromNode;
+                        continue;
+                    }
+                    ReadPartyFlightSeat(bot, member, toNode, arrival, seats.back());
+                }
+
+                std::vector<OverseerDecisions::PartyFlightMember> roster;
+                roster.reserve(seats.size());
+                for (PartyFlightSeat const& seat : seats)
+                    roster.push_back(seat.read);
+                OverseerDecisions::PartyFlightPlan const plan =
+                    OverseerDecisions::PlanPartyFlight(roster);
+
+                if (plan.verdict != OverseerDecisions::PartyFlightVerdict::Fly)
+                {
+                    // SAID ONCE PER ERRAND, like every other refusal in this
+                    // function, and it names the member and the node because
+                    // that is the whole actionable content of it. "They will
+                    // not fly because she has never discovered node 32" is a
+                    // sentence somebody can act on; "they never fly" is not.
+                    if (!state.flightSaid)
+                    {
+                        state.flightSaid = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' is sent to '{}' {} yards away and could "
+                                 "fly node {} to node {} with its party, but '{}' {}{} - "
+                                 "{}, because a party that follows a leader across the "
+                                 "sky arrives one cliff at a time",
+                                 name, state.target, static_cast<uint32>(walkYards),
+                                 fromNode, toNode,
+                                 plan.blockedBy.empty() ? std::string("the roster")
+                                                        : plan.blockedBy,
+                                 OverseerDecisions::PartyFlightBlockWord(plan.block),
+                                 plan.blockedNode
+                                     ? " (" + std::to_string(plan.blockedNode) + ")"
+                                     : std::string(),
+                                 plan.verdict ==
+                                         OverseerDecisions::PartyFlightVerdict::WaitForIt
+                                     ? "holding the departure and asking again next poll"
+                                     : "walking");
+                    }
+                    // A REFUSAL ABOUT THIS LANDING IS WORTH TRYING THE NEXT NODE
+                    // OUT FOR; ONE ABOUT THE MEMBER IS NOT. A member that holds
+                    // no node at all, cannot reach a flight master, cannot pay,
+                    // or is in a fight is in that state at every landing, so
+                    // walking the rest of the candidates would spend the whole
+                    // search to arrive back here. A missing hop is different: it
+                    // is a fact about one route and the node beyond it may well
+                    // be reachable. This is the same `continue` the leader's own
+                    // undiscovered-hop check above makes, for the same reason.
+                    if (plan.verdict == OverseerDecisions::PartyFlightVerdict::Walk &&
+                        (plan.block ==
+                             OverseerDecisions::PartyFlightBlock::UndiscoveredNode ||
+                         plan.block == OverseerDecisions::PartyFlightBlock::NoRoute))
+                        continue;
+                    return false;
+                }
+
+                // EVERY PASSENGER BUT THE LEADER BOARDS HERE, and the leader
+                // boards below through the call it has always used, so exactly
+                // one place in this function starts a flight for the character
+                // carrying the errand.
+                //
+                // AND EACH PASSENGER'S OWN ERRAND IS TOLD IT IS ON A LEG, which
+                // is also how its ARRIVAL gets confirmed by somebody.
+                // `flightSince` is what DriveTravel reads to tell "this
+                // character is walking to a flight master I sent it to" from
+                // "this character is walking to its errand", and it is the clock
+                // the leg's backstop runs on. Without it a passenger's own poll
+                // would read a RPG_TRAVEL_FLIGHT this module did not issue,
+                // re-aim the walk, and cancel the flight on the next tick -
+                // which is exactly what the comment beside that check says it
+                // does. With it, upstream returns a landed bot to RPG_IDLE
+                // (NewRpgAction.cpp:295), that character's own drive sees the
+                // status change, ends the leg, restarts its ratchet from where
+                // it landed and carries on. Nothing new watches the sky; the leg
+                // machinery #68 already built does, once per passenger.
+                std::string flying;
+                for (std::string const& passenger : plan.boarding)
+                {
+                    for (PartyFlightSeat& seat : seats)
+                    {
+                        if (seat.who == bot || !seat.ai || seat.read.name != passenger)
+                            continue;
+                        seat.ai->rpgInfo.ChangeToTravelFlight(seat.fmEntry, seat.fmPos,
+                                                              seat.path);
+                        TravelAimBook::TravelState& theirs =
+                            _travelAims.StateFor(seat.read.name);
+                        theirs.flights++;
+                        theirs.flightSince = std::time(nullptr);
+                        if (!flying.empty())
+                            flying += ", ";
+                        flying += '\'' + seat.read.name + '\'';
+                    }
+                }
+                if (!flying.empty())
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' takes {} with it to node {} rather than "
+                             "leaving them to walk - the party lands in one place, which "
+                             "is what the rule against flying away from them was for "
+                             "(#360)",
+                             name, flying, toNode);
             }
 
             // NewRpgInfo.h:107. From here the errand belongs to upstream's

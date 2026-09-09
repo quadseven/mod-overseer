@@ -8538,6 +8538,222 @@ constexpr char const* HEARTH_STAYED_QUEUED =
 char const* HearthStayedDetail(bool castWasSeen, bool castWasQueued);
 
 
+
+// ------------------------ the party flies, or nobody does (#360, #138, #68) --
+//
+// THE RULE THIS REPLACES WAS RIGHT ABOUT THE DANGER AND WRONG ABOUT THE
+// ALTERNATIVE. Since #138 the group leader refuses to board a taxi while any
+// live groupmate on its own map is still on the ground, and the sentence it
+// says is a true one: "a party that follows a leader across the sky arrives one
+// cliff at a time". That was measured with deaths - the leader flew 4333 yards
+// and within three minutes three followers had walked themselves off the far
+// side of the terrain he had just flown over.
+//
+// What the rule assumed is that the thing it was buying was a party walking
+// TOGETHER. On the dev realm that assumption was measured false in the same
+// breath as the refusal (#360). The leader was 5547 yards from its errand with
+// a departure node in reach; the three followers it declined to leave behind
+// were between 1500 and 4100 yards behind IT, each on its own catch-up walk,
+// each crossing guarded ground alone. The walk it chose instead was 7720 yards,
+// five of its seven legs across ground the other side guards, for a party of
+// levels 28 to 33 against level 40 guards, on ground those characters had
+// already died on. Nobody was walking together. The rule paid the whole price
+// of keeping the party together and bought none of it.
+//
+// SO THE RULE IS KEPT AND THE REMEDY IS INVERTED. The property worth protecting
+// is not "the leader stays on the ground", it is "the party ends up in one
+// place". A taxi keeps that property perfectly well when everybody is on one:
+// every member lands at the SAME arrival node, which is a good deal more
+// together than five separate overland walks converging on a moving leader. So
+// the question this asks is no longer "is anybody on foot" but "can everybody
+// board", and the answer grounds the leader only in the case the old rule was
+// actually written for, which is a member that genuinely cannot fly.
+//
+// WHAT "IN REACH" MEANS, PER MEMBER, DECIDED HERE RATHER THAN LEFT TO A FEELING.
+// A member is in reach of a flight when all four of these hold for IT, not for
+// the leader:
+//
+//   1. It has a departure node of its own team where it stands, and a flight
+//      master creature standing for that node. Those are two different lookups
+//      and they are already required to agree within a hundred yards before
+//      this module will issue any flight; nothing about that changes.
+//   2. Its walk to that flight master is SHORTER THAN THE WALK THIS MODULE
+//      WOULD BOTHER FLYING. That is the definition adopted, and it is chosen
+//      because it needs no new number and cannot drift away from the rest of
+//      the decision: if getting to the counter is itself a journey long enough
+//      to want a flight of its own, it is not "in reach", it is a second
+//      errand. The adapter passes the answer, not the yards, for the same
+//      reason the counter hold passes the core's own interact gate rather than
+//      a distance (#378).
+//   3. It holds every node of the route from its own departure node to the
+//      SHARED arrival node - the leader's chosen landing - except the departure
+//      node itself, which a flight master teaches on arrival exactly as it does
+//      for a player. Different members start from different nodes, so this is a
+//      different question for each of them and is asked once each.
+//   4. It can pay its own fare.
+//
+// WHO IS NOT ASKED AT ALL, AND WHY EACH ONE IS SAFE TO SKIP. The old rule
+// already worked this out and the reasoning is unchanged, so it is carried over
+// rather than re-derived: a member on another map cannot follow across one
+// (FollowActions.cpp:285); a DEAD one is a ghost walking to its corpse and
+// follows nobody (FollowActions.cpp:296-306); one already in the air is not on
+// foot. Two more are added here, and they are the only new exemptions:
+//
+//   * A member ALREADY AT THE ARRIVAL NODE has nothing to cross, so it is not
+//     behind anybody. Its own walk is shorter than the one this module would
+//     fly, which is the same test as (2) read from the other end.
+//   * A member WALKING ITS OWN ERRAND is not following anybody. The danger the
+//     whole rule exists to prevent is a follower stepping straight at a master
+//     who has crossed a mountain range, and a character aimed at a vendor of
+//     its own does not do that: it walks to the vendor. Flying it to the
+//     leader's landing would be this module hijacking an errand somebody else
+//     wrote, which is a worse fault than the one being fixed. A catch-up walk
+//     is NOT its own errand for this purpose - its aim IS the leader's live
+//     position, rewritten every time the leader moves on, so a catch-up walker
+//     is following in every sense that matters here and is exactly the
+//     character #360 measured 4100 yards behind.
+//
+// WHAT HAPPENS TO A MEMBER THAT IS DEAD, IN COMBAT, OR STRANDED WHEN THE REST
+// DEPART - the question #360 asks to have answered explicitly:
+//
+//   * DEAD: nothing, and it does not stop the party. It follows nobody while it
+//     is a ghost, so the danger the whole rule exists to prevent cannot happen
+//     to it, and the corpse run plus the catch-up walk that already exist are
+//     what bring it back. This is the shipped #138 reading and it is left alone.
+//   * IN COMBAT: NOBODY DEPARTS THIS POLL. A fight is over in seconds and the
+//     core refuses to board a character in one anyway (Player.cpp:10415), so
+//     this is a wait and not a refusal: the verdict is WaitForIt, the errand
+//     keeps its walk for now, and the question is asked again on the next poll.
+//     Treating it as a refusal would ground a party for the length of one wolf.
+//   * STRANDED - no node, no route, no fare: THE PARTY WALKS, and the line says
+//     which member and which node. That is the case the old rule was written
+//     for and it still gets the old answer. It is also the case worth printing
+//     rather than swallowing, because "they will not fly BECAUSE she has never
+//     discovered node 17" is a sentence somebody can act on, and "they never
+//     fly" is not.
+//
+// A PERMANENT BLOCKER BEATS A TRANSIENT ONE, wherever they land in the roster.
+// If one member is in combat and another holds no node at all, waiting for the
+// fight to end achieves nothing except a later refusal, so the verdict is Walk.
+// Scanning every member before deciding, rather than returning on the first
+// thing found, is what makes that true regardless of the order the caller
+// happens to hand them over in - and it is what lets the report name the member
+// that actually matters rather than the first one that was awkward.
+enum class PartyFlightBlock : std::uint8_t
+{
+    // Nothing is in this member's way.
+    None,
+    // TRANSIENT. The core will not board a character in combat and the fight
+    // will be over shortly; ask again rather than walking the party.
+    InCombat,
+    // This module does not steer this character at all: no live bot AI, or one
+    // that does not carry the strategy every aimed errand runs through. It is
+    // on foot, it will follow, and nothing here can put it on a taxi. Asked
+    // first of the permanent blockers because it is the one that makes every
+    // other question about that member meaningless.
+    NotSteerable,
+    // There is no taxi node of this character's own team where it stands.
+    NoDepartureNode,
+    // There is a node, and no flight master this character could walk to
+    // without that walk becoming a journey of its own - see (2) above.
+    MasterOutOfReach,
+    // The route from this member's node to the shared landing runs through a
+    // node it has never visited. `blockedNode` carries which one, because that
+    // number is the entire actionable content of this refusal.
+    UndiscoveredNode,
+    // The graph has no route at all from this member's node to the landing.
+    NoRoute,
+    // It cannot pay its own fare.
+    TooPoor,
+};
+
+// One clause, in the module's own voice, for the report the caller writes. No
+// member name and no node id: those are the caller's to interpolate, and a
+// sentence that carried them would have to be built here out of pieces this
+// file has no business holding.
+char const* PartyFlightBlockWord(PartyFlightBlock block);
+
+// One member of the party as the adapter read it out of the world. Every field
+// is an ANSWER and not a measurement, for the reason the long comment gives:
+// the yards, the npcflags and the taximask bits belong on the other side of
+// this seam, and a pure decision that started comparing distances would start
+// disagreeing with the executor that actually issues the flight.
+struct PartyFlightMember
+{
+    std::string name;
+    // The group leader, which is the character carrying the errand. Exactly one
+    // member should carry this; a roster that carries none is a caller bug and
+    // is refused rather than guessed at.
+    bool leader{false};
+    // Not on the leader's map: cannot follow across one, so not behind it.
+    bool onSameMap{true};
+    // Alive: a ghost follows nobody.
+    bool alive{true};
+    // Already on a taxi: not on foot.
+    bool inFlight{false};
+    // In combat right now.
+    bool inCombat{false};
+    // Already near enough to the shared arrival node that it has nothing to
+    // cross - see the exemptions above.
+    bool atArrival{false};
+    // Following the leader, rather than walking an errand of its own. False for
+    // a member carrying its own aim somewhere else, which this never puts on a
+    // taxi and never grounds the party for - see the exemptions above.
+    bool followingTheLeader{true};
+    // Whether this module steers this character at all - the same predicate
+    // every other aimed errand is gated on, asked of the member rather than
+    // assumed from the leader.
+    bool steerable{true};
+    // The four halves of "in reach", each answered by the adapter.
+    bool hasDepartureNode{false};
+    bool masterInReach{false};
+    bool routeKnown{false};
+    bool canPayFare{false};
+    // Which node it would board at, for the report. Zero when it has none.
+    std::uint32_t departureNode{0};
+    // The node on its route it has never discovered, when `routeKnown` is false
+    // because of one. Zero when the route is missing for any other reason,
+    // which is how the two are told apart.
+    std::uint32_t undiscoveredNode{0};
+};
+
+enum class PartyFlightVerdict : std::uint8_t
+{
+    // Everybody who is behind the leader can board. Issue a flight for each
+    // name in `boarding`, all to the same arrival node.
+    Fly,
+    // Nobody is permanently stuck and somebody is momentarily busy. Do not
+    // board anyone, do not spend the errand's flight budget, and ask again next
+    // poll. The walk carries on meanwhile, which is what it was doing anyway.
+    WaitForIt,
+    // Somebody cannot fly at all. The party walks, exactly as it has since
+    // #138, and `blockedBy` plus `block` say who and why.
+    Walk,
+};
+
+char const* PartyFlightVerdictWord(PartyFlightVerdict verdict);
+
+struct PartyFlightPlan
+{
+    PartyFlightVerdict verdict{PartyFlightVerdict::Walk};
+    // Who departs, in roster order, when the verdict is Fly. The leader is
+    // always one of them: a plan that flew everybody except the character
+    // carrying the errand would be the #138 failure with the roles swapped.
+    // Empty for every other verdict.
+    std::vector<std::string> boarding;
+    // The member the verdict is about, for Walk and WaitForIt. Empty for Fly.
+    std::string blockedBy;
+    PartyFlightBlock block{PartyFlightBlock::None};
+    // The node `blockedBy` has never discovered, when that is what stopped it.
+    std::uint32_t blockedNode{0};
+};
+
+// `members` is the whole group including the leader, as read this poll. The
+// arrival node is not passed because this makes no decision about WHERE to
+// land: the caller has already chosen the landing the leader can reach, and
+// `routeKnown` is each member's answer about that same landing.
+PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
