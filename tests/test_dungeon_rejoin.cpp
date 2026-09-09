@@ -23,10 +23,22 @@
  * both directions and say why; a second copy is how the second one rots. So this
  * test asks it in the direction the older test does not, over the same three
  * kinds of member.
+ *
+ * AND THE SECOND HALF: HOW LONG THAT WALK LASTS (#393). Picking who to walk was
+ * never the part that failed. The walk was asked for through the run's own
+ * escort lease, which is swept the poll after the run stops asking - and the run
+ * stops asking by closing `split_failed`, which it does BECAUSE this member is
+ * missing. Measured on the realm, two lines eight seconds apart: aimed at the
+ * entrance 3712 yards away with a route of 5420 yards of walking legs at
+ * 22:44:31, and stripped of `new rpg` "with no escort" at 22:44:39. Half an hour
+ * and three deaths later it was 3718 yards out. ReadRejoinWalk is the lease's
+ * own lifetime, and what is pinned below is that it outlives the run, ends on
+ * arriving rather than on a clock, and is still bounded.
  */
 
 #include "overseer_decisions.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -36,6 +48,11 @@ using OverseerDecisions::DungeonRunAllThrough;
 using OverseerDecisions::DungeonRunEntryState;
 using OverseerDecisions::DungeonRunWrongSide;
 using OverseerDecisions::DungeonWrongSide;
+using OverseerDecisions::ReadRejoinWalk;
+using OverseerDecisions::RejoinWalk;
+using OverseerDecisions::RejoinWalkEnds;
+using OverseerDecisions::RejoinWalkFacts;
+using OverseerDecisions::RejoinWalkName;
 
 namespace
 {
@@ -249,6 +266,124 @@ void TheDoorHasToBeReachableBeforeAnybodyIsAimedAtIt()
               ArrivalReachesTrigger(ARRIVAL_YARDS, 0.f), false);
 }
 
+// The lease's own clock, in the adapter's terms: DUNGEON_REJOIN_BACKSTOP_SECONDS
+// borrows TRAVEL_BACKSTOP_SECONDS, which is twenty minutes. Written here rather
+// than imported for the reason the arrival tolerance above is: this is about the
+// shape of the rule, and it must keep meaning the same thing if the adapter
+// retunes its number.
+constexpr std::int64_t BACKSTOP_SECONDS = 20 * 60;
+
+void CheckVerdict(char const* what, RejoinWalk got, RejoinWalk want)
+{
+    if (got == want)
+        return;
+    std::printf("FAIL %s: got %s, wanted %s\n", what, RejoinWalkName(got),
+                RejoinWalkName(want));
+    ++failures;
+}
+
+// A member still on the wrong side of the door, walking, `walkingFor` seconds
+// into its lease.
+RejoinWalkFacts StillWalking(std::int64_t walkingFor)
+{
+    RejoinWalkFacts facts;
+    facts.seen = true;
+    facts.withTheFamily = false;
+    facts.walkingForSeconds = walkingFor;
+    facts.backstopSeconds = BACKSTOP_SECONDS;
+    return facts;
+}
+
+void TheWalkOutlivesTheRunThatAskedForIt()
+{
+    // THE MEASURED DEFECT, AS THIS RULE SEES IT. Eight seconds after the aim was
+    // issued the run had closed and the old lease was two polls from being
+    // swept. Nothing about the member had changed: it was in the world, it was
+    // still on the wrong map, and it had 5420 yards of walking legs ahead of it.
+    // The only correct answer at eight seconds is to keep walking, and the run
+    // being over is not one of the inputs.
+    CheckVerdict("eight seconds in, the walk keeps going",
+                 ReadRejoinWalk(StillWalking(8)), RejoinWalk::Keep);
+    CheckBool("and eight seconds in is not an ending",
+              RejoinWalkEnds(ReadRejoinWalk(StillWalking(8))), false);
+
+    // AND IT IS STILL GOING WHEN THE WALK ITSELF WOULD FINISH. 5420 yards of
+    // legs at the core's own run speed of 7 yards a second is about thirteen
+    // minutes, which is the number the backstop has to clear for this fix to be
+    // worth shipping at all: a clock that expires mid-journey would strand the
+    // member exactly where the old lease did, only later.
+    CheckVerdict("and at thirteen minutes, which is the walk's own length",
+                 ReadRejoinWalk(StillWalking(13 * 60)), RejoinWalk::Keep);
+
+    // Half an hour is what was actually observed, and by then the clock has
+    // stopped this rather than let it run forever.
+    CheckVerdict("but half an hour is past the clock",
+                 ReadRejoinWalk(StillWalking(30 * 60)), RejoinWalk::GaveUp);
+}
+
+void ArrivingEndsItWhateverTheClockSays()
+{
+    // The walk exists to end a split, so ending the split ends the walk - and it
+    // is asked BEFORE the clock, because a walk that took longer than its
+    // backstop and still got there worked. Reporting that as a give-up would put
+    // a line in the log saying a walk failed on the poll it succeeded.
+    RejoinWalkFacts arrived = StillWalking(30 * 60);
+    arrived.withTheFamily = true;
+    CheckVerdict("back with the family outranks the clock",
+                 ReadRejoinWalk(arrived), RejoinWalk::BackWithTheFamily);
+    CheckBool("and it is an ending", RejoinWalkEnds(ReadRejoinWalk(arrived)), true);
+
+    RejoinWalkFacts early = StillWalking(8);
+    early.withTheFamily = true;
+    CheckVerdict("and it does not need the clock's permission",
+                 ReadRejoinWalk(early), RejoinWalk::BackWithTheFamily);
+}
+
+void ALeaseWithNobodyToHoldItEnds()
+{
+    // Not in the world this poll: logged out, mid-teardown, or the worldserver
+    // bounced. Answered first, ahead of every other reading, because a name that
+    // does not resolve has no map to compare and no strategy to hand back.
+    RejoinWalkFacts gone;
+    gone.seen = false;
+    gone.withTheFamily = true;
+    gone.walkingForSeconds = 8;
+    gone.backstopSeconds = BACKSTOP_SECONDS;
+    CheckVerdict("a member nobody can see ends the lease",
+                 ReadRejoinWalk(gone), RejoinWalk::Gone);
+    CheckBool("and that is an ending", RejoinWalkEnds(ReadRejoinWalk(gone)), true);
+
+    // The default-constructed facts are the same answer, which is the safe
+    // reading of "nothing is known" for a decision that hands a lease back.
+    CheckVerdict("and so does knowing nothing at all",
+                 ReadRejoinWalk(RejoinWalkFacts()), RejoinWalk::Gone);
+}
+
+void TheClockIsAClockAndNotAnAccident()
+{
+    // Exactly at the backstop is over: the comparison is >=, so a lease can
+    // never sit one second short of its own limit forever on a clock that only
+    // ticks when a poll happens to land.
+    CheckVerdict("one second under the clock keeps walking",
+                 ReadRejoinWalk(StillWalking(BACKSTOP_SECONDS - 1)), RejoinWalk::Keep);
+    CheckVerdict("exactly on it gives up",
+                 ReadRejoinWalk(StillWalking(BACKSTOP_SECONDS)), RejoinWalk::GaveUp);
+
+    // A backstop of zero is not a clock, and a walk is not ended by one. This is
+    // the failure mode a defaulted duration always has: read as a deadline, a
+    // zero would end every walk on its first poll, which is the old defect with
+    // a different cause.
+    RejoinWalkFacts noClock = StillWalking(30 * 60);
+    noClock.backstopSeconds = 0;
+    CheckVerdict("a backstop of zero never gives up",
+                 ReadRejoinWalk(noClock), RejoinWalk::Keep);
+
+    RejoinWalkFacts negative = StillWalking(30 * 60);
+    negative.backstopSeconds = -1;
+    CheckVerdict("and neither does a negative one",
+                 ReadRejoinWalk(negative), RejoinWalk::Keep);
+}
+
 } // namespace
 
 int main()
@@ -259,5 +394,9 @@ int main()
     WhatIsNotThisDoorsBusiness();
     AWholePartyInsideAsksForNothing();
     TheDoorHasToBeReachableBeforeAnybodyIsAimedAtIt();
+    TheWalkOutlivesTheRunThatAskedForIt();
+    ArrivingEndsItWhateverTheClockSays();
+    ALeaseWithNobodyToHoldItEnds();
+    TheClockIsAClockAndNotAnAccident();
     return failures ? 1 : 0;
 }

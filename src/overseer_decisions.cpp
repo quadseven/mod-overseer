@@ -1133,6 +1133,46 @@ DungeonWrongSide DungeonRunWrongSide(std::vector<DungeonRunEntryState> const& me
     return wrongSide;
 }
 
+char const* RejoinWalkName(RejoinWalk verdict)
+{
+    switch (verdict)
+    {
+        case RejoinWalk::Keep:              return "still walking back in";
+        case RejoinWalk::BackWithTheFamily: return "back on its family's map";
+        case RejoinWalk::Gone:              return "not in the world this poll";
+        case RejoinWalk::GaveUp:            return "given up on";
+    }
+    return "not in the world this poll";
+}
+
+RejoinWalk ReadRejoinWalk(RejoinWalkFacts const& facts)
+{
+    // Asked first because it makes every other reading meaningless: a name that
+    // does not resolve has no map to compare and no strategy to hand back.
+    if (!facts.seen)
+        return RejoinWalk::Gone;
+    // Then the thing the walk was FOR, ahead of the clock. A walk that has
+    // rejoined the family has succeeded however long it took, and reporting
+    // that as a give-up would put a false line in the log about a walk that
+    // worked.
+    if (facts.withTheFamily)
+        return RejoinWalk::BackWithTheFamily;
+    // A backstop of zero or less is not a clock. See RejoinWalkFacts.
+    if (facts.backstopSeconds > 0 && facts.walkingForSeconds >= facts.backstopSeconds)
+        return RejoinWalk::GaveUp;
+    return RejoinWalk::Keep;
+}
+
+bool RejoinWalkEnds(RejoinWalk verdict)
+{
+    // Written against the one enumerator that KEEPS rather than against the
+    // three that end, for the reason SplitFollowerDrivesItself gives above: a
+    // fifth answer added later is far more likely to be another way for a walk
+    // to finish than another reason to carry on, and spelling it the other way
+    // round would silently hold a lease open on a case nobody had considered.
+    return verdict != RejoinWalk::Keep;
+}
+
 bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards)
 {
     // A tolerance of zero or less is not a tolerance, and a trigger with no

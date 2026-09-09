@@ -2149,6 +2149,29 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_STAGED_INSIDE_RATCHET{
     OverseerDecisions::RatchetReading::CountAchieved,
     0.f, DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS};
 
+// HOW LONG A MEMBER MAY BE WALKING BACK IN BEFORE THE WALK IS GIVEN UP (#393).
+//
+// BORROWED RATHER THAN PICKED, from the one clock that already bounds the thing
+// this lease exists to hold open. The lease's whole job is to keep ONE travel
+// errand alive across the run that ordered it, and TRAVEL_BACKSTOP_SECONDS is
+// how long that errand may run before the travel drive declares its target
+// unreachable and releases it. A lease that outlived its own errand would
+// re-claim a walk the travel drive had already given up on, on every party
+// poll, forever.
+//
+// IT IS ALSO COMFORTABLY LONGER THAN THE WALK IT IS FOR. The rejoin that this
+// was measured on was 3712 yards out and the route came back as 5420 yards of
+// walking legs, which at the core's own run speed is about thirteen minutes of
+// walking - so twenty leaves room for a fight, a re-survey and a death on the
+// way without the lease dying in the middle of a walk that was working.
+//
+// AND IT IS THE ANSWER TO WHAT #298 AND #348 BOTH PAID FOR. A claim on the
+// travel column with no clock behind it makes ErrandDeathBreaker's
+// DeclineRunOwned branch a deference to nobody, and that rule says so in as
+// many words: a run's claim is left alone because a timer ends the run. This
+// claim is left alone because this timer ends this walk.
+constexpr time_t DUNGEON_REJOIN_BACKSTOP_SECONDS = TRAVEL_BACKSTOP_SECONDS;
+
 // How long CLEARING waits for `dc on` to be ACCEPTED before it says, out loud,
 // that the run is being fought with open-world logic (#88, #140).
 //
@@ -5140,6 +5163,15 @@ private:
         // stopped marking, or a follower keeps `new rpg` after the party it
         // was catching up to has gone.
         SweepCatchUps();
+
+        // AND THE FOURTH OWNER'S, ON THE SAME STATEMENT AND FOR A DIFFERENT
+        // REASON (#393). The three sweeps above and beside it end a lease the
+        // poll after its own drive stops marking it. This one has no drive
+        // marking it at all: the run that asks for a walk back in closes while
+        // that walk is still going, so the lease is renewed here, against the
+        // member and the clock, until one of them says stop. It is on this
+        // statement because this is the poll that outlives a run.
+        SweepRejoinWalks();
 
         // Designated leader first, so a freshly formed party starts in the
         // right hands rather than being corrected afterwards.
@@ -13121,6 +13153,30 @@ private:
         // only while `homeBind`; see HOME_BIND_BACKSTOP_SECONDS for why a walk
         // that claims this lease has to bring its own clock.
         time_t homeSince{0};
+        // ...AND THE FOURTH OWNER (#393). True: the walk back into a dungeon
+        // this member was stranded outside of, marked by RejoinToward and swept
+        // by SweepRejoinWalks on the PARTY's clock rather than on the run's.
+        //
+        // WHY IT CANNOT BE THE RUN'S, WHICH IS THE WHOLE DEFECT. The run marks
+        // this walk from one branch of one phase, and SweepDungeonEscorts ends
+        // whatever the previous poll stopped marking - so the lease died two
+        // polls after the run closed, and the run closes BECAUSE this member is
+        // missing. Measured on the realm: aimed at the door 3712 yards out at
+        // 22:44:31, stripped of `new rpg` at 22:44:39 having covered no ground,
+        // and re-aimed from the same place by the next attempt. A walk that
+        // only exists while the run that ordered it is still open is a walk
+        // that can never finish.
+        //
+        // MUTUALLY EXCLUSIVE WITH THE OTHER TWO FLAGS, and it gives way to a
+        // run on exactly their terms: EscortToward takes the entry over
+        // unconditionally and clears this, because once a run is gathering
+        // again its staging point is the authority on where anybody should be -
+        // and that point is a few yards from the very door this was aiming at.
+        bool rejoin{false};
+        // WHEN THE WALK BACK IN STARTED, so it can be given up on. Meaningful
+        // only while `rejoin`; see DUNGEON_REJOIN_BACKSTOP_SECONDS for why a
+        // walk that claims this lease has to bring its own clock.
+        time_t rejoinSince{0};
         // WHETHER THIS CATCH-UP MAY STILL DECIDE TO FLY (#138). Set by
         // CatchUpToward on the poll that STARTS the walk and spent by
         // ConsiderFlight the first time flying is genuinely on the table,
@@ -13152,17 +13208,29 @@ private:
         return it != _dungeonEscorts.end() && it->second.homeBind;
     }
 
-    // WHOSE WALK THIS IS, IN THE WORDS AN OPERATOR READS. Three owners share one
+    // IS THIS MEMBER WALKING BACK INTO A DUNGEON IT WAS STRANDED OUTSIDE OF?
+    // (#393) The one lease on this map that is deliberately NOT ended by the
+    // run's own sweep, so every sweep that is not its own has to be able to ask
+    // rather than infer it from the three flags that were there before.
+    bool IsRejoining(std::string const& name) const
+    {
+        auto const it = _dungeonEscorts.find(name);
+        return it != _dungeonEscorts.end() && it->second.rejoin;
+    }
+
+    // WHOSE WALK THIS IS, IN THE WORDS AN OPERATOR READS. Four owners share one
     // lease and every line about it used to be a two-way ternary written at the
     // call site, which is how the third owner would have arrived reported as the
-    // first. Asked once, here, so a fourth cannot be added without this
-    // answering for it.
+    // first. Asked once, here, so the fourth could not be added without this
+    // answering for it - and it was not.
     char const* EscortOwnerName(std::string const& name) const
     {
         if (IsCatchingUp(name))
             return "follow drive";
         if (IsWalkingHome(name))
             return "home errand";
+        if (IsRejoining(name))
+            return "walk back in";
         return "run";
     }
 
@@ -13348,17 +13416,31 @@ private:
         // knows where the family is going, and the lease it inherits -
         // `granted` - is handed back by the run's own sweep exactly as if the
         // run had granted it.
-        if (escort.catchUp || escort.homeBind)
+        if (escort.catchUp || escort.homeBind || escort.rejoin)
         {
             // ...AND OVER A HOME ERRAND ON THE SAME TERMS (#348). The errand
             // walks a member away from the family to an inn, which is exactly
             // what a run cannot have happening while it gathers, and the errand
             // is restartable: its drive only ever begins one from IDLE, so it
             // will pick this member up again after the run is over.
-            char const* const from = escort.catchUp ? "catch-up walk" : "home errand";
+            //
+            // ...AND OVER A WALK BACK IN (#393), which is the one this takeover
+            // HAD to be told about rather than the one it happens to also cover.
+            // That lease is deliberately swept by nothing on this drive's clock,
+            // so an entry left carrying `rejoin` under a run's escort is an entry
+            // SweepDungeonEscorts skips forever - a run escort nothing ever ends,
+            // which is precisely the leak that sweep exists to prevent. It is
+            // also the right handover on its own terms: a run that is gathering
+            // again is aiming this member at a staging point a few yards from
+            // the door the rejoin was walking it to.
+            char const* const from = escort.catchUp    ? "catch-up walk"
+                                     : escort.homeBind ? "home errand"
+                                                       : "walk back in";
             escort.catchUp = false;
             escort.homeBind = false;
             escort.homeSince = 0;
+            escort.rejoin = false;
+            escort.rejoinSince = 0;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} takes over '{}' from its {} - "
                      "the run's staging point is where the leader is going anyway",
@@ -13761,7 +13843,7 @@ private:
             // started (#138). A home errand is marked on its own drive's clock
             // and swept by SweepHomeBindEscorts, for exactly the same reason
             // (#348).
-            if (it->second.catchUp || it->second.homeBind)
+            if (it->second.catchUp || it->second.homeBind || it->second.rejoin)
             {
                 ++it;
                 continue;
@@ -13773,6 +13855,181 @@ private:
                 continue;
             }
             EndOneEscort(it->first, it->second.granted);
+            it = _dungeonEscorts.erase(it);
+        }
+    }
+
+    // ------------------------------- the walk back in, and its own lease (#393) --
+    //
+    // WHAT WENT WRONG, IN TWO LINES EIGHT SECONDS APART. A member that died
+    // inside a dungeon and released to a graveyard outside is walked back to the
+    // entrance by WalkStrandedBackIn, and that walk was asked for through
+    // EscortToward like every other walk a run asks for:
+    //
+    //     22:44:31  '<member>' is sent to 'at:1:<the door>' 3712 yards away ...
+    //               routed round it - 8 surveyed nodes, 5420 yards of walking legs
+    //     22:44:39  WARN '<member>' follows but carries `new rpg` with no escort
+    //               and no errand of its own asking for it - taking it back
+    //
+    // The second line is KeepRosterFollowing's backstop and it is not wrong: a
+    // follower carrying `new rpg` with nothing escorting it IS the scatter. What
+    // was wrong is that nothing was escorting it any more. EscortToward marks an
+    // entry, SweepDungeonEscorts ends whatever the previous poll stopped marking,
+    // and the only thing that marks THIS walk is one branch of STAGED_INSIDE - so
+    // the lease died two polls after the run left that phase. The run leaves it
+    // by closing `split_failed`, and it closes `split_failed` BECAUSE this member
+    // is missing. Every attempt therefore re-aimed the same member from the same
+    // place and took the aim away again eight seconds later: measured 3712 yards
+    // out, and 3718 yards out half an hour and three deaths later.
+    //
+    // SO THE WALK GETS A LEASE OF ITS OWN, A FOURTH OWNER RATHER THAN A FOURTH
+    // MECHANISM - the same answer #138 and #348 already gave, for the same
+    // reason: the lease, the hand-back, the travel focus and the backstop under
+    // all of them are one machine, and a parallel copy of it is the scatter this
+    // module has already fixed three times. What is new is only WHOSE CLOCK it
+    // is swept on. A catch-up is swept on the party's clock because the run's is
+    // six times faster; a home errand on its own drive's for the same reason.
+    // This one is swept on the party's clock because the run's clock STOPS.
+    //
+    // AND IT IS STILL BOUNDED, WHICH IS WHAT KEEPS THE SCATTER RULE INTACT. The
+    // lease ends when the member is back on its family's map, when it is not in
+    // the world at all, when a run wants it somewhere else, and when
+    // DUNGEON_REJOIN_BACKSTOP_SECONDS runs out. See OverseerDecisions::
+    // ReadRejoinWalk for the rule and its test. Nothing here lets a follower
+    // pick its own destination; it lets a member somebody DELIBERATELY SENT
+    // somewhere keep counting as sent for as long as the walk can still work.
+    //
+    // WHAT IT COSTS WHILE IT RUNS. A live escort makes DriveTravel poll at the
+    // coordinator's cadence rather than its own (see the travel poll's own
+    // comment), so a rejoin walk holds the module at the faster travel poll for
+    // as long as it lasts. That is the same trade every escort already makes and
+    // it is the trade this one most needs: the lease is renewed by a poll, and a
+    // renewal that arrives late is a member idling at a door.
+
+    // Ask for a member to be walked back in, and say so once. Idempotent against
+    // the walk already in flight, exactly as EscortToward is and for the same
+    // reason: the coordinator asks again on every poll of the hold, and
+    // TravelAimBook::Claim refuses to disturb a walk it is holding the memory
+    // for.
+    void RejoinToward(std::string const& name, std::string const& aim)
+    {
+        DungeonEscort& escort = _dungeonEscorts[name];
+        // A WALK ANOTHER OWNER HOLDS IS NOT TURNED ROUND, on the terms
+        // EscortHomeToward already states. The case this is really about is the
+        // crossing's own escort draining out of the entry a poll or two after
+        // ENTER finished: it ends itself, and the next poll of the hold starts
+        // the rejoin on a clean entry rather than mixing two owners on one.
+        //
+        // The default-constructed entry this may leave behind is not a leak: an
+        // entry that did not exist has an empty aim, so it never reaches this
+        // return.
+        if (!escort.rejoin && !escort.aim.empty())
+            return;
+
+        escort.rejoin = true;
+        escort.wanted = true;
+        // Re-stated rather than latched, for the reason EscortToward gives about
+        // its own purpose: a walk toward a door is an assembly whichever lease
+        // is carrying it, and DriveDungeonClear reads this field to tell a party
+        // that is CLEARING from a straggler being walked out of an instance.
+        escort.purpose = EscortPurpose::Assemble;
+        if (!escort.rejoinSince)
+            escort.rejoinSince = std::time(nullptr);
+
+        _travelAims.Claim(name, aim);
+        if (escort.aim == aim)
+            return;
+
+        escort.aim = aim;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is walked back to {} under a lease of its own - the run "
+                 "that asked for it closes when this member is missing, so a walk that "
+                 "ended with the run could never finish the journey it started",
+                 name, aim);
+    }
+
+    // THE SWEEP THAT IS NOT A RUN'S. Runs first, every poll of KeepRosterGrouped,
+    // before any `return` in that function can forget one - the same discipline
+    // SweepCatchUps keeps beside it and for the same reason. Entries belonging to
+    // the other three owners are left alone here, exactly as this one's are left
+    // alone by their sweeps.
+    //
+    // IT RENEWS RATHER THAN MARKS, which is the difference from the other three.
+    // They end an entry the poll after their drive stops marking it; there is no
+    // drive marking this one, so what keeps it alive is the verdict below and
+    // nothing else. That is the whole point: a walk back in has to survive the
+    // run that asked for it.
+    void SweepRejoinWalks()
+    {
+        for (auto it = _dungeonEscorts.begin(); it != _dungeonEscorts.end(); )
+        {
+            if (!it->second.rejoin)
+            {
+                ++it;
+                continue;
+            }
+
+            std::string const name = it->first;
+
+            OverseerDecisions::RejoinWalkFacts facts;
+            // SteerableAI, not a bare lookup - a name can resolve to a Player
+            // mid-login or mid-teardown, which is the "not seen" this decision
+            // fails closed on.
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (SteerableAI(member))
+            {
+                facts.seen = true;
+                // THE GROUP'S LEADER, NOT THE ROSTER'S, and asked of the member
+                // whose walk this is rather than of a roster query, for the
+                // reason KeepRosterFollowing gives about the two disagreeing for
+                // a poll every time leadership drifts. A leader this poll cannot
+                // find leaves `withTheFamily` false, which KEEPS the walk running
+                // on its clock rather than ending it on a reading nobody took.
+                Group* const group = member->GetGroup();
+                Player* const leader =
+                    group ? ObjectAccessor::FindPlayer(group->GetLeaderGUID()) : nullptr;
+                // GetMapId  Position.h:281  uint32 GetMapId() const
+                facts.withTheFamily =
+                    leader && leader->GetMapId() == member->GetMapId();
+            }
+            facts.walkingForSeconds =
+                it->second.rejoinSince
+                    ? static_cast<std::int64_t>(std::time(nullptr) - it->second.rejoinSince)
+                    : 0;
+            facts.backstopSeconds =
+                static_cast<std::int64_t>(DUNGEON_REJOIN_BACKSTOP_SECONDS);
+
+            OverseerDecisions::RejoinWalk const verdict =
+                OverseerDecisions::ReadRejoinWalk(facts);
+            if (!OverseerDecisions::RejoinWalkEnds(verdict))
+            {
+                // RE-CLAIMED EVERY POLL, exactly as the catch-up walk's own
+                // re-claim is and for the reason that one gives: Claim is
+                // idempotent against the walk it remembers and writes only when
+                // that memory is gone, which is what DriveTravel's own backstop
+                // does when it releases a walk as unreachable. Without this the
+                // member would keep `new rpg` with no aim under it, and a
+                // `new rpg` with no aim goes idle and then wherever
+                // NewRpgStatusUpdateAction rolls it.
+                _travelAims.Claim(name, it->second.aim);
+                ++it;
+                continue;
+            }
+
+            if (verdict == OverseerDecisions::RejoinWalk::GaveUp)
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been walked toward {} for {} minutes without "
+                         "rejoining its family - the walk is given up on and `follow` has "
+                         "it from here. A lease with no run behind it needs a clock of its "
+                         "own, and this is that clock rather than a walk gone wrong",
+                         name, it->second.aim,
+                         static_cast<uint32>(DUNGEON_REJOIN_BACKSTOP_SECONDS / 60));
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' stops being walked back in - it is {}",
+                         name, OverseerDecisions::RejoinWalkName(verdict));
+
+            EndOneEscort(name, it->second.granted);
             it = _dungeonEscorts.erase(it);
         }
     }
@@ -20937,8 +21194,22 @@ private:
             << doorHeight.z;
         std::string const doorAim = aim.str();
 
+        // UNDER A LEASE OF ITS OWN AND NOT THE RUN'S (#393). Everything
+        // EscortToward marks is ended by SweepDungeonEscorts the poll after this
+        // branch stops marking it, and this branch stops the moment the run
+        // leaves STAGED_INSIDE - which it does by closing `split_failed`, which
+        // it does BECAUSE this member is missing. So the one walk that must
+        // outlive its run was the one walk tied hardest to it. See RejoinToward.
+        //
+        // THE KNOCK STAYS WITH THE RUN, deliberately. Nothing knocks for a
+        // member whose run has closed, and nothing needs to: the walk carries it
+        // to the door and the escort holds it there, which is where the next
+        // run's BARRIER gathers and its ENTER crossing knocks. A lease that kept
+        // knocking after its run had closed would put one member inside a fresh
+        // instance on its own, which is the trickle this module refuses
+        // everywhere else.
         for (std::string const& name : stranded.walk)
-            EscortToward(name, doorAim, "STAGED_INSIDE", EscortPurpose::Assemble);
+            RejoinToward(name, doorAim);
 
         // KNOCKED FOR ONLY THE LIVING, matched back out of the census by name
         // because five names is a list rather than a set - the same matching
