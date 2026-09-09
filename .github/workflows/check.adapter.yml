@@ -259,7 +259,7 @@ jobs:
         # The shape is #284's: a static_assert naming a constant that is not in
         # scope. If the compile below survives this, the gate is vacuous and the
         # job says so.
-        if: env.SELF_TEST == 'true'
+        if: true # TEMPORARY, reverted in the next commit: prove this goes red
         run: |
           set -euo pipefail
           cat >> acore/modules/mod-overseer/src/mod_overseer.cpp <<'EOF'
