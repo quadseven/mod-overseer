@@ -6627,12 +6627,15 @@ enum class StagingCorridorVerdict : std::uint8_t
     // is somebody else's corridor. Measured ground is only ever measured ground
     // for the walk it was measured FOR.
     NotThisAim,
-    // The aim IS on the corridor, and it is behind where this character would
-    // join. A corridor is a walk in one direction; the ground it crosses was
-    // measured being walked that way, and handing back its points reversed
-    // would be claiming a second thing that was never measured. Refused, and
-    // today's routing stands.
-    AimIsBehind,
+    // THERE IS NO "THE AIM IS BEHIND THE JOIN" REFUSAL HERE ANY MORE, AND #356
+    // IS WHY. This enum used to carry one, on the argument that a corridor is a
+    // walk in one direction and handing its points back reversed would claim
+    // something nobody measured. See PlanStagingCorridor below for why that
+    // argument does not survive reading what the row actually measures, and for
+    // the 72 minutes of deaths the refusal cost. A join past the aim is now the
+    // same corridor walked the other way, and it is reported as `reversed`
+    // rather than as a verdict.
+    //
     // The corridor is real and this character is not near it. The join hop is
     // the one stretch of a corridor walk that is NOT measured ground, so it is
     // bounded rather than trusted; past the bound there is nothing honest to
@@ -6720,6 +6723,15 @@ struct StagingCorridorPlan
     // last point of the route below. Zero and meaningless unless the verdict is
     // Joined.
     std::size_t endIndex{0};
+    // WHICH WAY ALONG THE WRITTEN POINTS THIS ROUTE RUNS (#356). False is the
+    // order the corridor is written in, which is the order it was measured
+    // walking; true is the same points from a later index down to an earlier
+    // one, which is what a walk BACK up the corridor is. `joinIndex` is greater
+    // than `endIndex` exactly when this is true, so it carries no information a
+    // caller could not derive - it is here because the line an operator reads
+    // about a corridor walk should say which way the party is going without the
+    // reader having to compare two indices.
+    bool reversed{false};
     // The widest gap between two consecutive points of the whole corridor,
     // which is the number LegTooLong was decided on and is worth having in the
     // line an operator reads either way.
@@ -6743,6 +6755,49 @@ struct StagingCorridorPlan
 // THE ROUTE RUNS FROM THE JOIN TO THE AIM AND STOPS THERE, so one written
 // corridor serves every aim along its own length. Points past the aim are not
 // handed back: they are measured ground, but they are not this walk.
+//
+// AND IT RUNS IN WHICHEVER DIRECTION THE AIM LIES (#356). This used to refuse a
+// join that stood past the aim, on the argument that "a corridor is a walk in
+// one direction; the ground it crosses was measured being walked that way, and
+// handing back its points reversed would be claiming a second thing that was
+// never measured".
+//
+// THAT ARGUMENT DOES NOT SURVIVE READING WHAT THE ROW MEASURES. Every number
+// written beside the corridor this module ships is a property of a line segment
+// and not of a traveller: the length of a leg, the multiplier the navmesh
+// charges over that leg's straight line, and the distance from that leg to the
+// nearest spawn hostile to this family. A segment has two ends and no
+// direction, so a leg that stands 225 yards clear of the other side stands 225
+// yards clear walked either way. The one reading that sounds directional - that
+// all 82 polygons of the descent are Closing against the approach rule at the
+// staging point - is a statement about POSITION relative to that point, so the
+// same polygons stood on in the other order read the same, and a character
+// walking AWAY from the door is not being judged by that rule at all.
+//
+// WHAT THE REFUSAL COST, measured on the dev realm over 72 minutes after a
+// deploy. The campaign's own inn IS the corridor's first point, so the walk
+// that corrects a wrongly bound member (#349) has its aim at index 0, and every
+// character not already standing on it read a join past the aim and was
+// refused outright. Over one ten minute window the corridor was refused five
+// times and used none. The surveyed road taken instead passes within 5 yards of
+// a level 40 guard spawn where the corridor's tightest point keeps 225 yards
+// from anything of the other side, and 8 of the 11 deaths in that window were
+// faction guards. One member reached 188 yards from the innkeeper before dying
+// and resurrected 1967 yards away; another reached 379 and did the same. The
+// bind was never corrected, so the campaign held and no run could start.
+//
+// AND THE COORDINATOR ALREADY ASKS FOR THIS WALK IN SO MANY WORDS. Its note
+// beside the per-run approach state says the next run "starts at the top of the
+// corridor again, because the party comes back out of the door onto the ravine
+// floor and has to be walked out and round". Out of the ravine and round to the
+// top IS this corridor walked from a later point to an earlier one. The one
+// walk the coordinator says it needs was the one walk this corridor would not
+// serve.
+//
+// NOTHING IS INVENTED BY WALKING IT BACK. The route still begins on a written
+// point, still ends on the point the aim stands on, and still contains no point
+// that was not measured. `reversed` says which way it runs so the line an
+// operator reads says it too.
 //
 // THE JOIN IS THE NEAREST POINT, AND THE ROUTE IS EVERYTHING FROM THERE ON.
 // Nearest rather than first, because a character halfway along its corridor -

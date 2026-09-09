@@ -11511,17 +11511,28 @@ private:
             }
 
             route = plan.route;
+            // WHICH WAY THE PARTY IS GOING ALONG IT, SAID RATHER THAN LEFT TO
+            // BE DERIVED (#356). A walk back up the corridor is what the inn
+            // errand and the re-approach from the ravine floor both are, and
+            // both of them used to be refused here and walked down the guarded
+            // road instead. An operator reading this line for a death should
+            // not have to compare two point numbers to know which of the two
+            // walks he is looking at.
+            char const* const which =
+                plan.reversed ? "back toward its start, which is the direction the "
+                                "inn and the way out of the ravine both lie in"
+                              : "toward its end, which is the direction the door lies in";
             LOG_INFO("module.overseer",
                      "overseer: '{}' is sent to '{}' and walks the measured '{}' corridor "
                      "instead of a surveyed route - joined at point {} of {}, {:.0f} yards "
                      "away, {} points left to walk, widest leg {:.0f} yards. The survey graph "
                      "is not consulted for this walk, because its nodes follow the road the "
-                     "other side patrols (#342)",
+                     "other side patrols (#342). It walks {} (#356)",
                      name, target, portal.keyword,
                      static_cast<uint32>(plan.joinIndex),
                      static_cast<uint32>(portal.approach.size()),
                      plan.joinYards, static_cast<uint32>(route.size()),
-                     plan.longestLegYards);
+                     plan.longestLegYards, which);
             return true;
         }
         return false;
@@ -16670,6 +16681,17 @@ private:
         // the travel layer still planned its way there through the guard post
         // and turned a 408 yard hop into 2238 yards of surveyed leg. So this
         // REPLACES the planned route for that one walk; see PlanRoute.
+        //
+        // AND IT IS WRITTEN IN ONE ORDER AND WALKED IN TWO (#356). "In walking
+        // order" above says how these points were measured, not the only way
+        // they may be used. Three walks of this campaign go the other way along
+        // them: a member walked to the inn to have a wrong bind corrected
+        // (#349, and for this row the inn IS the first point below), a member
+        // escorted up out of the ravine after a death at the door, and the
+        // party's own way back out to the top of the corridor between runs.
+        // Each of those used to be refused by PlanStagingCorridor and walked
+        // down the guarded road instead, which is what #356 measured 8 guard
+        // deaths in 72 minutes on.
         std::vector<OverseerDecisions::RoutePoint> approach;
 
         // AND WHERE THE FAMILY RUNNING THIS DOOR KEEPS ITS HOMES (#348).

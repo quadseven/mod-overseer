@@ -12,6 +12,16 @@
  * follow roads. So the way is written down instead, and this file is the rule
  * for using one.
  *
+ * AND IT IS USED IN BOTH DIRECTIONS (mod-overseer#356). The first draft of the
+ * rule refused any walk whose aim lay behind where the character would join,
+ * which sounds like a small corner and was not: this campaign's inn is the
+ * corridor's own first point, so the errand that corrects a wrongly bound
+ * member aims at index 0 and was refused for everybody not already standing on
+ * it. Over one ten minute window on the dev realm the corridor was refused five
+ * times and used none; over the 72 minutes after that deploy, 8 of 11 deaths
+ * were faction guards on the road it fell back to. The tests below marked #356
+ * are the walks that were being refused.
+ *
  * THE FIXTURE IS THE REAL CORRIDOR, not a shape invented to make the rule fire.
  * Every point below was read off the shipped navmesh tiles for map 1 - grids
  * 33/34 through 33/39 - by walking their polygon adjacency, and the clearances
@@ -180,17 +190,97 @@ void TheSecondAimOfTheApproachWalksTheDescent()
           plan.route[1].x > plan.route[0].x && STAGE_X < TERRACE_X, true);
 }
 
-// A corridor is a walk in one direction. Coming back out of the door and asked
-// for the terrace, it refuses rather than handing its own points back reversed.
-void TheCorridorIsNotWalkedBackwards()
+// ------------------------------------------ and it is walked both ways (#356) --
+
+// THE ONE THAT WAS REFUSED AND SHOULD NOT HAVE BEEN. Standing at the door and
+// asked for the terrace is the walk the coordinator's own note calls being
+// "walked out and round": out of the ravine floor and back to the top of the
+// corridor, which is where the next run's approach starts and where a member
+// that resurrected at the graveyard has to be escorted from. It used to be
+// refused for being an aim behind the join, and the road taken instead is the
+// one the party dies on.
+void TheWalkBackOutOfTheRavineIsTheCorridorToo()
 {
     StagingCorridorLimits const limits;
     StagingCorridorPlan const plan =
         PlanStagingCorridor(Corridor(), TERRACE_X, TERRACE_Y, STAGE_X, STAGE_Y, limits);
-    CheckVerdict("an aim behind the join is refused", plan.verdict,
-                 StagingCorridorVerdict::AimIsBehind);
-    CheckUInt("and nothing is offered to walk",
-              static_cast<unsigned>(plan.route.size()), 0u);
+    CheckVerdict("the corridor serves the walk back up it", plan.verdict,
+                 StagingCorridorVerdict::Joined);
+    Check("and says it is running against the order it was written in",
+          plan.reversed, true);
+    CheckUInt("joined at the staging point", static_cast<unsigned>(plan.joinIndex), 16u);
+    CheckUInt("and ending at the terrace", static_cast<unsigned>(plan.endIndex), 11u);
+    CheckUInt("which is the five legs of the descent climbed",
+              static_cast<unsigned>(plan.route.size()), 6u);
+    Check("the route begins where the character stands",
+          plan.route[0].x == -733.7f && plan.route[0].y == -2214.9f, true);
+    Check("and ends on the point the aim stands on",
+          plan.route[5].x == TERRACE_X && plan.route[5].y == TERRACE_Y, true);
+}
+
+// THE ONE THAT BLOCKED THE CAMPAIGN (#356). The town this campaign binds in is
+// the corridor's own FIRST point, so the walk that corrects a wrongly bound
+// member (#349) has its aim at index 0 and every character not already standing
+// on it read a join past the aim. The refusal was therefore unconditional for
+// that errand: the bind was never corrected, the coordinator held the next run
+// waiting for it, and the walk it fell back to killed two members at 188 and
+// 379 yards from the innkeeper.
+void TheWalkToTheCampaignsInnIsTheCorridorRunBackwards()
+{
+    StagingCorridorLimits const limits;
+    // Standing at the door, sent to the inn at the corridor's mouth.
+    StagingCorridorPlan const plan =
+        PlanStagingCorridor(Corridor(), BIND_X, BIND_Y, STAGE_X, STAGE_Y, limits);
+    CheckVerdict("the inn is on this corridor and the corridor is used",
+                 plan.verdict, StagingCorridorVerdict::Joined);
+    Check("walked against the order it was written in", plan.reversed, true);
+    CheckUInt("joined at the staging point", static_cast<unsigned>(plan.joinIndex), 16u);
+    CheckUInt("and ending at the inn", static_cast<unsigned>(plan.endIndex), 0u);
+    CheckUInt("which is the whole corridor, every point of it",
+              static_cast<unsigned>(plan.route.size()), 17u);
+    Check("its first point is the door end", plan.route[0].y == -2214.9f, true);
+    Check("and its last is the inn", plan.route[16].x == -1050.0f, true);
+    CheckNear("the widest leg is the same one either way", plan.longestLegYards,
+              193.f, 2.f);
+}
+
+// AND THE DIRECTION IS NOT A NEW WAY TO BORROW SOMEBODY ELSE'S GROUND. The two
+// bounds that decide whether this corridor is this walk's corridor at all are
+// asked before the direction is, and they are unchanged: an aim that stands
+// nowhere on it is still NotThisAim however near the character is, and a
+// character too far off it is still TooFarToJoin however the aim lies.
+void WalkingItBackwardsStillObeysBothBounds()
+{
+    StagingCorridorLimits const limits;
+    // At the door, aimed at a place on another continent that is behind
+    // nothing, because it is not on this corridor at all.
+    CheckVerdict("a walk that goes nowhere on it is still not this corridor's",
+                 PlanStagingCorridor(Corridor(), -11208.2f, 1665.34f, STAGE_X, STAGE_Y,
+                                     limits).verdict,
+                 StagingCorridorVerdict::NotThisAim);
+    // At the guard post, aimed BACK at the inn. The aim is on the corridor and
+    // the character is 540 yards off it, so the join hop is what refuses.
+    CheckVerdict("and a character nowhere near it still does not join it backwards",
+                 PlanStagingCorridor(Corridor(), BIND_X, BIND_Y, -360.0f, -2634.0f,
+                                     limits).verdict,
+                 StagingCorridorVerdict::TooFarToJoin);
+}
+
+// STANDING ON THE AIM IS NEITHER DIRECTION, and it must not become one. A join
+// index equal to the end index is one point of route, which RouteLegStep
+// answers `arrived` for, and `reversed` says false because nothing was walked.
+void StandingOnTheAimIsOnePointAndNoDirection()
+{
+    StagingCorridorLimits const limits;
+    StagingCorridorPlan const plan =
+        PlanStagingCorridor(Corridor(), TERRACE_X, TERRACE_Y, TERRACE_X, TERRACE_Y,
+                            limits);
+    CheckVerdict("the corridor is joined", plan.verdict, StagingCorridorVerdict::Joined);
+    Check("and no direction is claimed", plan.reversed, false);
+    CheckUInt("the route is the one point", static_cast<unsigned>(plan.route.size()), 1u);
+    CheckUInt("which is both the join and the end",
+              static_cast<unsigned>(plan.joinIndex), 11u);
+    CheckUInt("the same point", static_cast<unsigned>(plan.endIndex), 11u);
 }
 
 // Three of the four doors in the portal table carry no corridor, and that is the
@@ -401,6 +491,32 @@ void TheDescentIsWalkedPointByPointAndNotCutAcross()
           bad.worstAim > good.worstAim, true);
 }
 
+// A REVERSED ROUTE IS STILL WALKED BY THE THING THAT WALKS ROUTES (#356), and
+// this is the assertion that matters most about it for the same reason the
+// forward one does: an aim that never advances looks exactly like a character
+// standing still. RouteLegStep's cursor only ever moves forward THROUGH THE
+// ROUTE IT IS HANDED, which is exactly why the points are handed to it already
+// in the order they are to be walked rather than with a direction flag it would
+// have to read.
+void TheReversedCorridorIsWalkedEndToEndByTheOrdinaryRouteStep()
+{
+    StagingCorridorLimits const limits;
+    // The whole corridor backwards: standing at the door, sent to the inn.
+    StagingCorridorPlan const plan =
+        PlanStagingCorridor(Corridor(), BIND_X, BIND_Y, STAGE_X, STAGE_Y, limits);
+    CheckVerdict("the corridor is joined", plan.verdict, StagingCorridorVerdict::Joined);
+
+    RouteLegLimits legs;
+    legs.maxPointsAhead = 1;   // what the travel layer passes for a measured route
+    Walked const w = Walk(plan.route, legs, STAGE_X, STAGE_Y);
+    Check("every poll of it has an aim", w.everyPollHadAnAim, true);
+    Check("the inn is reached", w.arrived, true);
+    CheckUInt("and every poll of it moved the character", w.advanced, w.polls);
+    Check("no aim on it is further off than one written leg",
+          w.worstAim < 250.f, true);
+    Check("in fewer polls than the staging window allows", w.polls < 100, true);
+}
+
 // The bound is off by default, so every route that is not a measured corridor
 // keeps the aim it has always had.
 void ASurveyedRouteKeepsItsLookahead()
@@ -437,9 +553,13 @@ int main()
     TheWholeCorridorIsMeasuredAndNotOnlyTheTail();
     NonsenseLimitsAreRefusedAndNotClamped();
     TheSecondAimOfTheApproachWalksTheDescent();
-    TheCorridorIsNotWalkedBackwards();
+    TheWalkBackOutOfTheRavineIsTheCorridorToo();
+    TheWalkToTheCampaignsInnIsTheCorridorRunBackwards();
+    WalkingItBackwardsStillObeysBothBounds();
+    StandingOnTheAimIsOnePointAndNoDirection();
     TheCorridorIsWalkedEndToEndByTheOrdinaryRouteStep();
     TheDescentIsWalkedPointByPointAndNotCutAcross();
+    TheReversedCorridorIsWalkedEndToEndByTheOrdinaryRouteStep();
     ASurveyedRouteKeepsItsLookahead();
 
     if (failures)
