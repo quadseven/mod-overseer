@@ -6639,7 +6639,17 @@ enum class StagingCorridorVerdict : std::uint8_t
     // The corridor is real and this character is not near it. The join hop is
     // the one stretch of a corridor walk that is NOT measured ground, so it is
     // bounded rather than trusted; past the bound there is nothing honest to
-    // say and today's routing stands.
+    // say about walking it in one bearing.
+    //
+    // THIS IS NOT "THERE IS NO CORRIDOR FOR THIS WALK", AND READING IT THAT WAY
+    // WAS THE OTHER HALF OF #356. The bound above is a true statement about one
+    // hop and nothing more; the corridor is still the measured way to this door
+    // and the character is still going there. So this verdict now reports
+    // `joinIndex` and `joinYards` like a join that succeeded - which point is
+    // nearest is a fact worth answering whether or not it is near enough - and
+    // a caller that has a way of covering ground can use them to REACH the
+    // corridor rather than to give it up. `route` stays empty, because there is
+    // no walk to hand back until the character is on it.
     TooFarToJoin,
     // Two points of it stand further apart than one lookahead. That is a
     // deadlock and not a detour - see StagingCorridorLimits::maxLegYards - so
@@ -6712,12 +6722,18 @@ struct StagingCorridorLimits
 struct StagingCorridorPlan
 {
     StagingCorridorVerdict verdict{StagingCorridorVerdict::NoCorridor};
-    // Which point of the corridor the character joins at. Zero and meaningless
-    // unless the verdict is Joined.
+    // Which point of the corridor the character joins at, or would join at if
+    // it were near enough. Meaningful when the verdict is Joined and when it is
+    // TooFarToJoin, and zero and meaningless for every other verdict, which is
+    // the honest split rather than a tidy one: those two are the answers where
+    // a nearest point was actually looked for, and the rest are refusals that
+    // never got that far.
     std::size_t joinIndex{0};
-    // How far the character stands from that point. Negative when nothing was
-    // joined - the same "no reading" convention ApproachDistance already
-    // returns, and a value no caller can mistake for having arrived.
+    // How far the character stands from that point. Negative when no nearest
+    // point was looked for at all - the same "no reading" convention
+    // ApproachDistance already returns, and a value no caller can mistake for
+    // having arrived. Under TooFarToJoin it is a real reading and it is over
+    // `StagingCorridorLimits::joinYards`, which is what the verdict says.
     float joinYards{-1.f};
     // Which point of the corridor the aim itself stands on, and therefore the
     // last point of the route below. Zero and meaningless unless the verdict is
@@ -6798,6 +6814,26 @@ struct StagingCorridorPlan
 // point, still ends on the point the aim stands on, and still contains no point
 // that was not measured. `reversed` says which way it runs so the line an
 // operator reads says it too.
+//
+// AND BEING TOO FAR OFF IT IS A DISTANCE AND NOT A DISMISSAL (#356 again). The
+// direction half of that issue was fixed and the reach half was not, and the
+// reach half is the one that was still killing characters. Measured on the dev
+// realm: a member standing 1361 yards from the nearest point of the corridor
+// was sent to the top of the descent, read `TooFarToJoin`, and was handed the
+// surveyed route for the WHOLE journey - including the last stretch, which is
+// the corridor's own ground and is the one place a surveyed route is known to
+// run past a level 40 guard spawn at five yards. The bound did its job, which
+// is to say that ONE hop of 1361 yards must not be crossed on a bearing, and
+// then the caller drew a conclusion the bound does not support: that a corridor
+// a character cannot step straight onto is a corridor it cannot use at all.
+//
+// So the nearest point is reported under that verdict too, and the caller is
+// left to decide how to cover the gap. This function still refuses to CLAIM
+// that gap - it hands back no route, because it has measured nothing between
+// the character and the corridor - and that refusal is exactly what makes the
+// reading useful: "here is where the measured ground begins, and I am not
+// telling you how to reach it" is a different sentence from "there is nothing
+// here for you", and only the first one is true.
 //
 // THE JOIN IS THE NEAREST POINT, AND THE ROUTE IS EVERYTHING FROM THERE ON.
 // Nearest rather than first, because a character halfway along its corridor -

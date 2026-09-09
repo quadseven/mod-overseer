@@ -3592,6 +3592,30 @@ public:
         // route and the wrong one for a written-down corridor, so the fact has
         // to travel with the route rather than be guessed from it.
         bool routeIsMeasured{false};
+        // AND WHETHER IT IS THE WHOLE JOURNEY OR ONLY THE WAY TO THE MEASURED
+        // ONE (#356). True means this route is a surveyed leg planned to a
+        // corridor's join point rather than to the errand, and it decides two
+        // more things RouteLeg would otherwise get wrong.
+        //
+        // FIRST, THE MINIMUM ROUTE LENGTH MUST NOT THROW IT AWAY. That rule
+        // drops a surveyed route once the character is within
+        // TRAVEL_ROUTE_MIN_YARDS of the AIM, and for this door the join point
+        // and the aim are often inside that distance of each other - the nearest
+        // corridor point to the top of the descent is 155 yards from it. So the
+        // rule would fire halfway along the leg, drop the route, and hand the
+        // character a bearing straight at the door across the rim of the ravine,
+        // which is the #344 failure wearing #356's clothes.
+        //
+        // SECOND, A SPENT JOIN LEG IS NOT A SPENT JOURNEY. An ordinary route
+        // that runs out has done its job and the ordinary step covers the rest;
+        // this one has only delivered the character to the start of the measured
+        // ground, and what happens next is the corridor. So RouteLeg plans again
+        // rather than handing over.
+        //
+        // IT IS NOT DERIVABLE FROM `routeIsMeasured`. A join leg is surveyed, so
+        // that flag is false for it exactly as it is for an ordinary surveyed
+        // route, and the two want opposite things here. Two facts, two flags.
+        bool routeJoinsCorridor{false};
         std::vector<OverseerDecisions::RoutePoint> route;
         OverseerDecisions::RouteCursor routeCursor{};
     };
@@ -11467,11 +11491,41 @@ private:
     // ONE MAP, like everything else in this layer: a corridor belongs to the map
     // its door is approached from, and a character standing on another one is
     // not on it.
-    static bool StagingCorridorRoute(Player* bot, WorldPosition const& want,
-                                     std::string const& name,
-                                     std::string const& target,
-                                     std::vector<OverseerDecisions::RoutePoint>& route)
+    //
+    // AND THE ANSWER IS THREE THINGS AND NOT TWO (#356). "Walk the corridor" and
+    // "there is no corridor here" were the only two answers this rule could give,
+    // and the third one - "this IS your corridor and you are not on it yet" - was
+    // being folded into the second, which is what handed a character the surveyed
+    // road for the corridor's own ground. See StagingCorridorAnswer.
+
+    // WHAT THE CORRIDOR RULE ANSWERED FOR ONE WALK.
+    //
+    // The two flags are exclusive and both may be false, which is the common case
+    // and the one that must cost nothing: three of the four doors in the portal
+    // table carry no corridor at all and fall straight through to the survey.
+    struct StagingCorridorAnswer
     {
+        // The corridor IS this walk's route and the route argument holds it,
+        // join point first. Nothing else needs planning.
+        bool walkIt{false};
+        // The corridor is this walk's corridor, and the character is further off
+        // it than one bearing may be trusted to cross. `joinAt` is the point the
+        // corridor takes over at; getting there is somebody else's problem, and
+        // PlanRoute below is who it belongs to.
+        bool joinFirst{false};
+        // Where the measured ground begins for this character. Meaningless
+        // unless `joinFirst`, and it is a WRITTEN point of the corridor rather
+        // than anything derived from one, because inventing a place to walk to
+        // is the mistake the three zeros in the portal table exist to refuse.
+        OverseerDecisions::RoutePoint joinAt;
+    };
+
+    static StagingCorridorAnswer StagingCorridorRoute(
+        Player* bot, WorldPosition const& want, std::string const& name,
+        std::string const& target,
+        std::vector<OverseerDecisions::RoutePoint>& route)
+    {
+        StagingCorridorAnswer answer;
         OverseerDecisions::StagingCorridorLimits limits;
         // THE TWO NUMBERS ARE THIS MODULE'S OWN, READ FROM WHERE THEY ALREADY
         // LIVE. The join hop is unsurveyed ground crossed by bearing, which is
@@ -11494,6 +11548,44 @@ private:
             if (plan.verdict == OverseerDecisions::StagingCorridorVerdict::NotThisAim)
                 continue;
 
+            // TOO FAR OFF IT IS A LEG TO WALK AND NOT A CORRIDOR TO GIVE UP
+            // (#356). This branch used to fall in with the refusals below and
+            // hand the whole journey to the surveyed planner, and that is the
+            // half of #356 that #359 did not close. The bound it failed is
+            // about ONE HOP crossed on a bearing, which is a true and useful
+            // thing to say and is not the same sentence as "this corridor is
+            // not for you": the aim still stands on these points, the points
+            // are still the measured way to this door, and the only thing
+            // missing is a way to reach them. So the corridor is kept and the
+            // reaching is planned, which is what PlanRoute does with this.
+            //
+            // WHAT THE OLD ANSWER COST, measured on the dev realm. A member
+            // standing 1361 yards from the nearest point of the corridor was
+            // sent to the top of the descent, read this verdict, and was routed
+            // to the door by survey for the entire journey - including the last
+            // stretch, which is the corridor's own ground and is where the road
+            // passes within five yards of a level 40 guard spawn. The party are
+            // levels 28 to 33. The corridor's tightest point stands 225 yards
+            // clear of anything of the other side, and it was refused for being
+            // 1361 yards away rather than for being unsafe.
+            if (plan.verdict == OverseerDecisions::StagingCorridorVerdict::TooFarToJoin)
+            {
+                answer.joinFirst = true;
+                answer.joinAt = portal.approach[plan.joinIndex];
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is sent to '{}', which is the '{}' approach, and it is "
+                         "{:.0f} yards off the measured corridor - {}. The corridor is not given "
+                         "up for that: the walk is planned to its point {} of {} and the measured "
+                         "points take over there, so no surveyed leg is ever laid over the "
+                         "corridor's own ground, which is where the road passes a guard post "
+                         "(#342, #356)",
+                         name, target, portal.keyword, plan.joinYards,
+                         OverseerDecisions::StagingCorridorVerdictName(plan.verdict),
+                         static_cast<uint32>(plan.joinIndex),
+                         static_cast<uint32>(portal.approach.size()));
+                return answer;
+            }
+
             if (plan.verdict != OverseerDecisions::StagingCorridorVerdict::Joined)
             {
                 // SAID, AND SAID ONCE PER ERRAND rather than per poll, because
@@ -11501,13 +11593,21 @@ private:
                 // that exists for this walk and was not used is the one case an
                 // operator has to be able to see, since what happens instead is
                 // the route that killed the leader.
+                //
+                // WHAT IS LEFT HERE IS A MALFORMED TABLE AND NOTHING ELSE
+                // (#356). TooFarToJoin was the common way in and it has its own
+                // branch above; LegTooLong and BadLimits are the remainder, and
+                // both of them mean somebody wrote a row this module cannot
+                // walk. Falling back to the surveyed route is the right answer
+                // for those, because there is no corridor to be had - but it is
+                // also the answer that kills, so it is a warning and not a note.
                 LOG_WARN("module.overseer",
                          "overseer: '{}' is sent to '{}', which is the '{}' approach, and its "
                          "measured corridor is not used - {}. It falls back to the surveyed "
                          "route, which for this door crosses ground the other side guards (#342)",
                          name, target, portal.keyword,
                          OverseerDecisions::StagingCorridorVerdictName(plan.verdict));
-                return false;
+                return answer;
             }
 
             route = plan.route;
@@ -11533,9 +11633,10 @@ private:
                      static_cast<uint32>(portal.approach.size()),
                      plan.joinYards, static_cast<uint32>(route.size()),
                      plan.longestLegYards, which);
-            return true;
+            answer.walkIt = true;
+            return answer;
         }
-        return false;
+        return answer;
     }
 
     // THE WHOLE ROUTE FOR ONE ERRAND, planned once and then walked. Empty means
@@ -11544,14 +11645,54 @@ private:
     // what it keeps doing for every journey a survey cannot improve on.
     static std::vector<OverseerDecisions::RoutePoint> PlanRoute(
         Player* bot, WorldPosition const& want, std::string const& name,
-        std::string const& target, bool& measured)
+        std::string const& target, bool& measured, bool& joinsCorridor)
     {
         std::vector<OverseerDecisions::RoutePoint> route;
         measured = false;
-        if (StagingCorridorRoute(bot, want, name, target, route))
+        joinsCorridor = false;
+        StagingCorridorAnswer const corridor =
+            StagingCorridorRoute(bot, want, name, target, route);
+        if (corridor.walkIt)
         {
             measured = true;
             return route;
+        }
+
+        // AND WHEN THE CORRIDOR IS OUT OF REACH, THE SURVEY IS SENT TO THE
+        // CORRIDOR AND NOT TO THE ERRAND (#356). This is the whole of the reach
+        // fix, and it is four lines because the two planners were already the
+        // right shape for it: the surveyed planner is good at crossing ground
+        // nobody measured, the corridor is the only thing that knows this door,
+        // and the mistake was asking one of them to do the other's job for the
+        // whole journey. Aimed at the join point, the surveyed route ENDS where
+        // the measured ground begins, so not one yard of it is ever laid over
+        // the corridor.
+        //
+        // THE JOIN LEG CAN STILL BE GUARDED, AND THAT IS SAID RATHER THAN
+        // PRETENDED AWAY. Nothing was measured between the character and the
+        // corridor, so nothing here can promise the 225 yards of clearance the
+        // corridor's own legs carry. What it gets instead is the surveyed
+        // planner's own faction reading (#326), which goes round guarded ground
+        // when a way round exists that is not farther and warns in so many words
+        // when it does not - the same treatment every other errand on this realm
+        // gets. That is a smaller promise than the corridor's and it is the true
+        // one, and it is strictly more than the leg had before, when it was one
+        // stretch of a route whose LAST legs were the ones that killed.
+        //
+        // AND THE NEAREST POINT IS THE RIGHT ONE TO AIM AT for the same reason
+        // it is the right one to join at: the corridor cannot say anything about
+        // ground it did not measure, so the only quantity this rule can honestly
+        // minimise is the number of yards spent off it, and the nearest point is
+        // what minimises it. Aiming further along the corridor to get a "better"
+        // entry would be choosing more unmeasured ground on a guess about ground
+        // nobody has read, which is the shape of mistake that put a hand-written
+        // staging point into the wall of a mine shaft (#121).
+        float aimX = want.GetPositionX();
+        float aimY = want.GetPositionY();
+        if (corridor.joinFirst)
+        {
+            aimX = corridor.joinAt.x;
+            aimY = corridor.joinAt.y;
         }
 
         // AND THE MINIMUM LENGTH IS THE SURVEYED PLANNER'S ALONE (#344). It used
@@ -11564,8 +11705,16 @@ private:
         // corridor and before the survey, it keeps every word of its own
         // reasoning and stops making a claim about a route it knows nothing
         // about.
-        if (bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
-            TRAVEL_ROUTE_MIN_YARDS)
+        //
+        // AND IT IS ASKED OF THE AIM THE PLANNER IS ACTUALLY BEING GIVEN (#356),
+        // which is the join point on a walk that has to reach a corridor first.
+        // Asking it of the errand instead would be asking whether the survey can
+        // improve on a journey the survey is not being asked to plan. It cannot
+        // change the answer for a join leg - a character near enough to the
+        // corridor for this test to fire would have joined it rather than got
+        // here - but writing it against `want` would leave the one line in this
+        // function that still confused the two aims.
+        if (bot->GetExactDist2d(aimX, aimY) <= TRAVEL_ROUTE_MIN_YARDS)
             return route;
 
         ReadTheSurvey();
@@ -11621,7 +11770,7 @@ private:
         {
             plan = OverseerDecisions::PlanFootRoute(
                 survey.nodes, survey.links, bot->GetMapId(), bot->GetPositionX(),
-                bot->GetPositionY(), want.GetPositionX(), want.GetPositionY(), limits);
+                bot->GetPositionY(), aimX, aimY, limits);
             if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
                 break;
             // The last time round is a plan and not a measurement, so whatever
@@ -11634,12 +11783,31 @@ private:
 
         if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
         {
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' is sent to '{}' and the shipped travel survey has no "
-                     "way round for it - {}. It walks at the aim as before, which is only "
-                     "a problem if terrain is in the way (#316)",
-                     name, target,
-                     OverseerDecisions::RoutePlanVerdictName(plan.verdict));
+            // AND A JOIN LEG THAT CANNOT BE PLANNED DOES NOT BECOME THE ROAD
+            // AGAIN (#356). The tempting fallback here is to re-plan to the
+            // errand itself and walk whatever the survey offers, which is what
+            // this function did for this case before. It is the wrong answer for
+            // exactly the reason the corridor was measured in the first place:
+            // the surveyed route to THIS door is the thing that kills, so "I
+            // could not work out how to reach the safe way" is not a reason to
+            // take the unsafe one. The character walks at its aim unaided, which
+            // is what every errand on a realm with no survey already does.
+            if (corridor.joinFirst)
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is sent to '{}' and the shipped travel survey cannot "
+                         "plan a way to its measured corridor - {}. No route is planned and the "
+                         "surveyed road to this door is deliberately NOT used instead, because "
+                         "that road is what the corridor was measured to avoid. It walks at the "
+                         "aim unaided (#342, #356)",
+                         name, target,
+                         OverseerDecisions::RoutePlanVerdictName(plan.verdict));
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is sent to '{}' and the shipped travel survey has no "
+                         "way round for it - {}. It walks at the aim as before, which is only "
+                         "a problem if terrain is in the way (#316)",
+                         name, target,
+                         OverseerDecisions::RoutePlanVerdictName(plan.verdict));
             return route;
         }
 
@@ -11651,6 +11819,17 @@ private:
             AppendLeg(plan.nodes[i], plan.nodes[i + 1], *to->second, route);
         }
 
+        // AND THE FACT THAT THIS LEG IS GOING TO A CORRIDOR TRAVELS WITH IT
+        // (#356). RouteLeg cannot read it back off the points - a surveyed leg
+        // to a corridor and a surveyed leg to an errand are the same list of
+        // waypoints - and it has to know two things this decides: that the leg
+        // must not be thrown away in the last yards of the ERRAND, because the
+        // errand is not what it is walking to, and that when it is spent there is
+        // a second half of the journey to plan rather than an aim to hand over
+        // to. Asked of an empty route it is false, because a leg nobody is
+        // walking reaches nothing.
+        joinsCorridor = corridor.joinFirst && !route.empty();
+
         LOG_INFO("module.overseer",
                  "overseer: '{}' is sent to '{}' and is routed round it - {} surveyed nodes, "
                  "{:.0f} yards of walking legs and {} waypoints, finishing {:.0f} yards from "
@@ -11658,6 +11837,19 @@ private:
                  "boat or a portal, because the party walks together (#316)",
                  name, target, static_cast<uint32>(plan.nodes.size()), plan.yards,
                  static_cast<uint32>(route.size()), plan.endsFromAimYards);
+        // AND SAID SEPARATELY WHEN THAT ROUTE IS ONLY THE FIRST HALF (#356), for
+        // the same reason the guarded note below is separate: the line above has
+        // meant one thing since #316 and an operator reading it for a death must
+        // not have to work out from context whether "the aim" in it was the
+        // errand or a waypoint on the way to it.
+        if (joinsCorridor)
+            LOG_INFO("module.overseer",
+                     "overseer: that route goes to the measured corridor and NOT to '{}' - it "
+                     "hands over {:.0f} yards short of the corridor's own point, and the "
+                     "measured points are planned afresh and walked from wherever it leaves "
+                     "this character. No surveyed leg is laid over the corridor's ground, which "
+                     "is the half of #356 that was still killing characters at this door",
+                     target, plan.endsFromAimYards);
         // SAID SEPARATELY AND ONLY WHEN THERE IS SOMETHING TO SAY, so the line
         // above keeps meaning what it has always meant and an operator reading
         // for #326 is not reading past it every errand.
@@ -11693,52 +11885,120 @@ private:
                                   std::string const& name,
                                   std::string const& target)
     {
-        if (!state.routePlanned)
+        // TWICE ROUND AT MOST, AND THE SECOND TIME IS THE CORRIDOR (#356). A
+        // walk that has to reach a measured corridor before it can walk one is
+        // two routes and not one, and this loop is where the first becomes the
+        // second. It is bounded at two by the `for` itself rather than by an
+        // argument about what can happen, because the thing being avoided is a
+        // poll that plans forever.
+        //
+        // WHY THE TWO ROUTES ARE NOT SIMPLY CONCATENATED, which is the obvious
+        // implementation and does not work. A surveyed route ends where its last
+        // NODE is, routinely hundreds of yards short of what it was aimed at -
+        // the nearest node this family can walk to near this door is 343 yards
+        // out, and RoutePlan::endsFromAimYards says so in its own comment. Glued
+        // together, the seam between the last surveyed waypoint and the
+        // corridor's first point is that gap, and RouteLegStep aims at the
+        // furthest point inside one lookahead of 250: a successor further off
+        // than that can never be aimed at, so the cursor stops on the seam and
+        // the character is handed its own feet every poll for the rest of the
+        // errand. That is precisely the deadlock StagingCorridorLimits::
+        // maxLegYards exists to refuse in a hand-written corridor, and building
+        // one here on purpose would be worse than tolerating it. Bridging the
+        // seam with points of our own is the other tempting answer and it is the
+        // one this module refuses everywhere: a point nobody measured is not a
+        // place. So the routes stay separate and the second is planned when the
+        // first is spent, from wherever it actually left the character.
+        //
+        // AND THE TWO HALVES WANT OPPOSITE STEPPING RULES ANYWAY, which is the
+        // same argument arriving from the other side. A surveyed leg is
+        // waypoints about five yards apart and wants the full lookahead; a
+        // corridor's points stand up to 193 apart and each one is written down
+        // BECAUSE the line past it does not work, so it wants one point at a
+        // time (#344). One route carries one set of limits, and a glued route
+        // would have to be walked under the wrong ones for half its length.
+        for (unsigned pass = 0; pass < 2; ++pass)
         {
-            state.routePlanned = true;
-            state.route =
-                PlanRoute(bot, want, name, target, state.routeIsMeasured);
-            state.routeCursor = OverseerDecisions::RouteCursor{};
-        }
-        if (state.route.empty())
-            return want;
+            if (!state.routePlanned)
+            {
+                state.routePlanned = true;
+                state.route = PlanRoute(bot, want, name, target,
+                                        state.routeIsMeasured, state.routeJoinsCorridor);
+                state.routeCursor = OverseerDecisions::RouteCursor{};
+            }
+            if (state.route.empty())
+                return want;
 
-        // A SURVEYED ROUTE IS STILL DROPPED IN THE LAST YARDS, exactly as it
-        // has been since #316 and for its own unchanged reason: its last node
-        // is routinely hundreds of yards from the aim, and the ordinary step
-        // covers that better than a spent route can. A MEASURED one is not
-        // dropped, because on the walk this rule was written for the last yards
-        // are a ravine and the points are the way down it (#344).
-        if (!state.routeIsMeasured &&
-            bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
-                TRAVEL_ROUTE_MIN_YARDS)
-        {
-            state.route.clear();
-            return want;
-        }
+            // A SURVEYED ROUTE IS STILL DROPPED IN THE LAST YARDS, exactly as it
+            // has been since #316 and for its own unchanged reason: its last node
+            // is routinely hundreds of yards from the aim, and the ordinary step
+            // covers that better than a spent route can. A MEASURED one is not
+            // dropped, because on the walk this rule was written for the last yards
+            // are a ravine and the points are the way down it (#344).
+            //
+            // AND NEITHER IS A LEG THAT IS GOING SOMEWHERE ELSE (#356). This rule
+            // measures the distance to the ERRAND, and a join leg is not walking
+            // to the errand; it is walking to a point on the corridor which may
+            // itself be inside this distance of the door. Dropped there, the
+            // character would be handed a bearing at the door with the corridor
+            // never walked, which is the outcome the whole fix exists to end.
+            if (!state.routeIsMeasured && !state.routeJoinsCorridor &&
+                bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
+                    TRAVEL_ROUTE_MIN_YARDS)
+            {
+                state.route.clear();
+                return want;
+            }
 
-        OverseerDecisions::RouteLegLimits limits;
-        limits.lookaheadYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
-        limits.arrivedYards = TRAVEL_ROUTE_ARRIVED_YARDS;
-        // ONE POINT AT A TIME FOR A MEASURED CORRIDOR. See
-        // RouteLegLimits::maxPointsAhead: the descent's whole switchback fits
-        // inside one lookahead, so the ordinary rule aims across the ravine at
-        // a point 465 navmesh yards away, which comes back as a refused
-        // shortcut. A surveyed route keeps the lookahead it has always had.
-        if (state.routeIsMeasured)
-            limits.maxPointsAhead = 1;
-        OverseerDecisions::RouteAim const aim = OverseerDecisions::RouteLegStep(
-            state.routeCursor, state.route, bot->GetPositionX(),
-            bot->GetPositionY(), limits);
-        if (!aim.hasAim)
-        {
-            // Walked, or nothing left to offer. THE ROUTE IS DROPPED RATHER
-            // THAN KEPT AND SKIPPED, so the rest of this errand costs nothing
-            // and re-reads nothing.
-            state.route.clear();
-            return want;
+            OverseerDecisions::RouteLegLimits limits;
+            limits.lookaheadYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
+            limits.arrivedYards = TRAVEL_ROUTE_ARRIVED_YARDS;
+            // ONE POINT AT A TIME FOR A MEASURED CORRIDOR. See
+            // RouteLegLimits::maxPointsAhead: the descent's whole switchback fits
+            // inside one lookahead, so the ordinary rule aims across the ravine at
+            // a point 465 navmesh yards away, which comes back as a refused
+            // shortcut. A surveyed route keeps the lookahead it has always had,
+            // and a join leg IS a surveyed route.
+            if (state.routeIsMeasured)
+                limits.maxPointsAhead = 1;
+            OverseerDecisions::RouteAim const aim = OverseerDecisions::RouteLegStep(
+                state.routeCursor, state.route, bot->GetPositionX(),
+                bot->GetPositionY(), limits);
+            if (!aim.hasAim)
+            {
+                // Walked, or nothing left to offer. THE ROUTE IS DROPPED RATHER
+                // THAN KEPT AND SKIPPED, so the rest of this errand costs nothing
+                // and re-reads nothing.
+                state.route.clear();
+
+                // ...UNLESS IT WAS ONLY THE WAY TO THE MEASURED GROUND, in which
+                // case the journey is half done and the corridor is the other
+                // half (#356). Planned again from HERE rather than from where the
+                // errand started, which is the whole reason it is a second plan
+                // and not a second half prepared in advance: the character is now
+                // standing at the end of the leg, the corridor is within the one
+                // bearing PlanStagingCorridor is willing to trust, and the point
+                // it joins at is chosen on where it actually ended up.
+                //
+                // ONCE PER POLL, AND IT TERMINATES. Only the first pass may do
+                // this, so no poll can plan more than twice. The second pass gets
+                // one of three answers and every one of them ends: the corridor,
+                // which is walked; nothing, which hands over to the ordinary step;
+                // or another join leg, which PlanFootRoute will only return if it
+                // gets at least RoutePlanLimits::minGainYards nearer the corridor
+                // than this character already is, so it cannot be a leg to where
+                // it is already standing.
+                if (state.routeJoinsCorridor && pass == 0)
+                {
+                    state.routeJoinsCorridor = false;
+                    state.routePlanned = false;
+                    continue;
+                }
+                return want;
+            }
+            return WorldPosition(want.GetMapId(), aim.x, aim.y, aim.z);
         }
-        return WorldPosition(want.GetMapId(), aim.x, aim.y, aim.z);
+        return want;
     }
 
     // The point to hand the mover THIS POLL for a character wanted at `want`.

@@ -5620,7 +5620,7 @@ char const* StagingCorridorVerdictName(StagingCorridorVerdict verdict)
         case StagingCorridorVerdict::Joined:       return "joined";
         case StagingCorridorVerdict::NoCorridor:   return "no measured corridor for this door";
         case StagingCorridorVerdict::NotThisAim:   return "this walk does not go anywhere on that corridor";
-        case StagingCorridorVerdict::TooFarToJoin: return "nothing on the corridor is near enough to walk to";
+        case StagingCorridorVerdict::TooFarToJoin: return "nothing on the corridor is near enough to step straight onto";
         case StagingCorridorVerdict::LegTooLong:   return "two of its points stand more than one lookahead apart";
         case StagingCorridorVerdict::BadLimits:    return "the limits asked for are not distances";
     }
@@ -5694,6 +5694,14 @@ StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
             join = i;
         }
     }
+    // SAID BEFORE THE BOUND IS ASKED, so the refusal carries the reading it was
+    // made on (#356). Which point is nearest is a fact about the corridor and
+    // the character, and it is the same fact whether or not the distance passes;
+    // stamping it here rather than after the test is what lets a caller that is
+    // too far off walk TOWARD the corridor instead of abandoning it. See the
+    // header on TooFarToJoin for the journey that was being thrown away.
+    plan.joinIndex = join;
+    plan.joinYards = joinDistance;
     if (joinDistance > limits.joinYards)
     {
         plan.verdict = StagingCorridorVerdict::TooFarToJoin;
@@ -5712,9 +5720,7 @@ StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
     for (std::size_t i = 0; i < span; ++i)
         plan.route.push_back(corridor[plan.reversed ? join - i : join + i]);
     plan.verdict = StagingCorridorVerdict::Joined;
-    plan.joinIndex = join;
     plan.endIndex = end;
-    plan.joinYards = joinDistance;
     return plan;
 }
 
