@@ -5620,7 +5620,6 @@ char const* StagingCorridorVerdictName(StagingCorridorVerdict verdict)
         case StagingCorridorVerdict::Joined:       return "joined";
         case StagingCorridorVerdict::NoCorridor:   return "no measured corridor for this door";
         case StagingCorridorVerdict::NotThisAim:   return "this walk does not go anywhere on that corridor";
-        case StagingCorridorVerdict::AimIsBehind:  return "the aim is behind where this character would join it";
         case StagingCorridorVerdict::TooFarToJoin: return "nothing on the corridor is near enough to walk to";
         case StagingCorridorVerdict::LegTooLong:   return "two of its points stand more than one lookahead apart";
         case StagingCorridorVerdict::BadLimits:    return "the limits asked for are not distances";
@@ -5701,19 +5700,17 @@ StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
         return plan;
     }
 
-    // WALKING FORWARD OR NOT AT ALL. A join past the aim would hand back the
-    // corridor reversed, which is a second claim about the ground that nobody
-    // measured. Equal is fine and means "standing at the aim already": the
-    // route is the one point, and RouteLegStep answers `arrived` for it.
-    if (join > end)
-    {
-        plan.verdict = StagingCorridorVerdict::AimIsBehind;
-        return plan;
-    }
-
-    plan.route.reserve(end - join + 1);
-    for (std::size_t i = join; i <= end; ++i)
-        plan.route.push_back(corridor[i]);
+    // WALKING TOWARD THE AIM, WHICHEVER WAY ALONG THE CORRIDOR THAT IS (#356).
+    // The points between the join and the aim are the walk either way round;
+    // see the header for why the direction they were measured in is not one of
+    // the things the row measures. Equal is fine and means "standing at the aim
+    // already": the route is the one point, and RouteLegStep answers `arrived`
+    // for it.
+    plan.reversed = join > end;
+    std::size_t const span = (plan.reversed ? join - end : end - join) + 1;
+    plan.route.reserve(span);
+    for (std::size_t i = 0; i < span; ++i)
+        plan.route.push_back(corridor[plan.reversed ? join - i : join + i]);
     plan.verdict = StagingCorridorVerdict::Joined;
     plan.joinIndex = join;
     plan.endIndex = end;
