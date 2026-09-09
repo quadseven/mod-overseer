@@ -6457,13 +6457,35 @@ private:
         bool inReach = false;
         for (Creature* creature : nearby)
         {
-            outOneIsNearby = true;
             float const yards = who->GetDistance(creature);
             if (outNearestYards < 0.f || yards < outNearestYards)
                 outNearestYards = yards;
             if (who->GetNPCIfCanInteractWith(creature->GetGUID(), npcFlag))
                 inReach = true;
         }
+
+        // "NEARBY" MEANS A GAP UPSTREAM WILL ACTUALLY CLOSE, NOT ONE THIS SWEEP
+        // CAN SEE, and the two are different numbers on purpose.
+        //
+        // The wider sweep above is DoSell's own, and it is here for the same
+        // reason it is there: so a refusal or a log line can say how far the
+        // nearest one WAS. It is not the radius anybody is walking. What closes
+        // the last few yards is upstream's aimed wander, and once it is within
+        // INTERACTION_DISTANCE of the recorded point it looks for the creature
+        // with FindNearestCreature(npcEntry, INTERACTION_DISTANCE * 3) and
+        // ChangeToIdle's if it finds nothing (patch 0005's block in
+        // NewRpgWanderNpcAction::Execute). A counter further off its spawn row
+        // than that is one nothing is going to walk to, so declining to release
+        // the errand for it would be this module waiting out its own twenty
+        // minute backstop on a gap no loop is closing - which is worse than
+        // today rather than better, because today the errand at least ends.
+        //
+        // MEASURED FROM THE CHARACTER, WHICH IS WHERE UPSTREAM MEASURES IT.
+        // Both radii are around the bot, so the two questions line up: a
+        // creature this calls nearby is one upstream's own resolve would find
+        // from where the character is standing right now.
+        outOneIsNearby =
+            outNearestYards >= 0.f && outNearestYards <= INTERACTION_DISTANCE * 3.f;
         return inReach;
     }
 
@@ -14995,11 +15017,14 @@ private:
                             // can.
                             LOG_WARN("module.overseer",
                                      "overseer: '{}' reached the '{}' spawn it was sent to "
-                                     "(creature {}) and there is no creature of that role "
-                                     "within 30 yards of it at all - releasing, because "
-                                     "standing on an empty spawn point is not what gets "
-                                     "anything sold, banked or repaired. The aim is what to "
-                                     "look at", name, target, entry);
+                                     "(creature {}) and the nearest creature of that role is "
+                                     "{:.1f}y away, a negative distance meaning none within "
+                                     "30 yards at all - further than upstream's own arrival "
+                                     "resolve will look, so nothing is going to close it. "
+                                     "Releasing, because standing on a spawn point nothing "
+                                     "is standing on does not get anything sold, banked or "
+                                     "repaired. The aim is what to look at",
+                                     name, target, entry, nearestYards);
                         }
 
                         // Opportunistic, and deliberately BEFORE the errand is

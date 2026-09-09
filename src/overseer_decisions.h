@@ -8243,9 +8243,15 @@ enum class CounterArrival : std::uint8_t
 // npcflag, which is the same call DoSell, DoRepair and DoBank each make, and
 // passes the answer here rather than a number this could be tempted to compare.
 //
-// `oneIsNearby` IS THE WIDER SWEEP, and it exists to tell "not yet" from
-// "never". It is the same sweep DoSell already runs so that a refusal can say
-// how far the nearest vendor WAS.
+// `oneIsNearby` EXISTS TO TELL "NOT YET" FROM "NEVER", and the adapter measures
+// it at the radius upstream's own arrival will search rather than at whatever a
+// sweep happens to see. Once an aimed wander is within INTERACTION_DISTANCE of
+// the recorded point it looks for the creature with
+// FindNearestCreature(npcEntry, INTERACTION_DISTANCE * 3) and idles if it finds
+// nothing, so a counter further off its spawn row than that is a gap no loop is
+// closing. Answering CloseTheGap for one would have the errand sit out its own
+// twenty minute backstop waiting for a walk nobody is making, which is worse
+// than releasing rather than better.
 CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby);
 
 
