@@ -30193,6 +30193,20 @@ private:
     // that time is reached. The core's number, read rather than guessed.
     static constexpr uint32 SUMMON_RITUAL_SETTLE_MS = 5000;
 
+    // HOW LONG THE ROW WAITS FOR THE PORTAL TO EXIST (#365). The core creates
+    // the ritual object inside Spell::cast, and a channelled spell is cast from
+    // Spell::update rather than from Spell::prepare (Spell.cpp:3691 and 4430),
+    // so the object appears on the world tick AFTER the one the stone was
+    // clicked on. That is fifty milliseconds; this waits six seconds, which is
+    // three of this module's own polls.
+    //
+    // WIDE ON PURPOSE, BECAUSE WIDE COSTS NOTHING HERE. A row waiting for a
+    // portal is a row whose clickers are already held and standing on the
+    // stone, so an extra poll spends a poll. What erring short would cost is a
+    // summon abandoned one tick before the object it was waiting for turned up,
+    // which is this defect again wearing a smaller number.
+    static constexpr uint32 SUMMON_PORTAL_CEILING_MS = 6000;
+
     // What the world needs after the ritual settles: the request goes out on
     // the tick the ritual completes, the accept is driven on the poll after
     // that, the teleport starts on the tick after THAT, and this module only
@@ -30316,6 +30330,20 @@ private:
         bool walkedSummoner{false};
         bool walkedHelper{false};
         uint32 approachMs{0};
+        // HOW LONG THIS ROW WAITED FOR THE PORTAL TO EXIST (#365), which is a
+        // third clock and not a slice of either of the other two. `approachMs`
+        // is the walk and `waitedMs` is the ritual settling; this is the gap
+        // between the stone being clicked and the core getting round to casting
+        // the spell that makes the thing the ritual needs. A reader that cannot
+        // see it separately cannot tell a slow world from a summon that never
+        // produced a portal at all.
+        uint32 portalMs{0};
+        // WHAT THE CORE HAD ACTUALLY MADE WHEN THIS MODULE FOUND NO PORTAL
+        // (#365). -1 is "never asked", which is every row that did not have to
+        // give up on the wait; 0 is "asked, and this character owned no
+        // summoning ritual at all"; anything else is the entry of one that was
+        // there and that SUMMON_PORTAL_ENTRY does not match. See AnyRitualCheck.
+        int32 ritualSeenEntry{-1};
         float helperStoneYards{-1.f};
         int32 channellingAfterClick{-1};  // -1 never asked, 0 no, 1 yes
         int32 requestSeen{-1};            // -1 never asked, 0 never pending, 1 pending
@@ -30380,6 +30408,13 @@ private:
         // alive while the walk is running.
         std::string helperName;
         bool approaching{false};
+        // WAITING FOR THE CORE TO CREATE THE PORTAL (#365). A row has THREE
+        // waits now and not two, and this is the middle one: the stone has been
+        // clicked, the summoner is channelling, and the ritual object does not
+        // exist yet because a channelled spell is cast from Spell::update
+        // rather than from Spell::prepare. Like `approaching` it goes false
+        // exactly once, on the poll that finds the portal and clicks it.
+        bool awaitingPortal{false};
         SummonEvidence ev;
     };
 
@@ -30440,7 +30475,8 @@ private:
           << ",\"helper_stone_yards\":" << ev.helperStoneYards
           << ",\"walked_summoner\":" << (ev.walkedSummoner ? "true" : "false")
           << ",\"walked_helper\":" << (ev.walkedHelper ? "true" : "false")
-          << ",\"approach_ms\":" << ev.approachMs;
+          << ",\"approach_ms\":" << ev.approachMs << ",\"portal_ms\":" << ev.portalMs
+          << ",\"ritual_seen_entry\":" << ev.ritualSeenEntry;
         o << ",\"channelling_after_click\":";
         if (ev.channellingAfterClick < 0)
             o << "null";
@@ -30518,6 +30554,32 @@ private:
         bool operator()(GameObject* go) const
         {
             return go->GetEntry() == SUMMON_PORTAL_ENTRY && go->GetOwnerGUID() == owner;
+        }
+    };
+
+    // THE SAME QUESTION WITHOUT THE ENTRY, ASKED ONLY WHEN THE EXACT ONE FOUND
+    // NOTHING (#365).
+    //
+    // The check above is deliberately exact, and it is right to be: a type 18
+    // ritual that is not SUMMON_PORTAL_ENTRY is somebody's Ritual of Summoning
+    // or Ritual of Doom, and clicking a warlock's closet because it was nearby
+    // is not a summon. What that exactness cannot do is tell a reader which
+    // kind of nothing it found. An entry constant that is wrong for this realm's
+    // world database and an object the core has not created yet produce exactly
+    // the same row, and this module has already spent an afternoon on a summon
+    // failure whose row named the wrong cause.
+    //
+    // So when the wait gives up, this asks the looser question once: is there
+    // ANY summoning ritual in the world that this character owns? It clicks
+    // nothing and decides nothing. Its whole purpose is that the next failure
+    // names its own cause instead of needing another afternoon.
+    struct AnyRitualCheck
+    {
+        ObjectGuid owner;
+        bool operator()(GameObject* go) const
+        {
+            return go->GetGoType() == GAMEOBJECT_TYPE_SUMMONING_RITUAL
+                   && go->GetOwnerGUID() == owner;
         }
     };
 
@@ -30696,6 +30758,20 @@ private:
         Acore::GameObjectListSearcher<SummonPortalCheck> searcher(summoner, portals, check);
         Cell::VisitObjects(summoner, searcher, SUMMON_SWEEP_YARDS);
         return portals.empty() ? nullptr : portals.front();
+    }
+
+    // The entry of any summoning ritual this character owns, or 0 for none. See
+    // AnyRitualCheck for why this exists and why it is only ever asked on the
+    // way out of a failure.
+    static uint32 RitualEntryOwnedBy(Player* summoner)
+    {
+        if (!summoner)
+            return 0;
+        std::list<GameObject*> rituals;
+        AnyRitualCheck check{summoner->GetGUID()};
+        Acore::GameObjectListSearcher<AnyRitualCheck> searcher(summoner, rituals, check);
+        Cell::VisitObjects(summoner, searcher, SUMMON_SWEEP_YARDS);
+        return rituals.empty() ? 0 : rituals.front()->GetEntry();
     }
 
     // CMSG_SET_SELECTION is one guid and nothing else
@@ -30921,7 +30997,7 @@ private:
         // own hold goes on, so a row that is going to refuse has stopped
         // nobody.
         //
-        // THEY ARE ASKED AGAIN IN DriveSummonRitual AND THAT IS NOT AN
+        // THEY ARE ASKED AGAIN IN DriveTheStoneClick AND THAT IS NOT AN
         // OVERSIGHT. This walk can take twenty seconds; the ritual is driven at
         // the end of it. A fight that starts halfway is a fact about the moment
         // it is read, and reading it once at the start of a walk and calling
@@ -30990,7 +31066,7 @@ private:
         return true;
     }
 
-    // THE RITUAL ITSELF, FROM THE HOLD TO THE PORTAL.
+    // THE FIRST HALF OF THE RITUAL: THE HOLD, THE SELECTION AND THE STONE.
     //
     // ONE FUNCTION BECAUSE #355 GAVE IT A SECOND CALLER. It used to be the tail
     // of DoSummon and nothing else could reach it, which was fine while every
@@ -30998,15 +31074,21 @@ private:
     // its clickers to the stone first is answered by ResolveSummonChecks
     // several polls later, and that poll needs to drive exactly the same
     // sequence with exactly the same gates and exactly the same words. Two
-    // copies of a five-packet ritual is how one of them quietly stops re-asserting
-    // a selection or stops checking the portal's own distance.
+    // copies of a five-packet ritual is how one of them quietly stops
+    // re-asserting a selection or stops checking the portal's own distance.
     //
-    // Returns the refusal literal, or nullptr when the ritual is running and
-    // the row should be parked to wait it out. It writes no row, releases no
-    // hold and parks nothing: each caller finishes in the shape its own path
-    // wants.
-    static char const* DriveSummonRitual(Player* who, Player* summoned, Player* helper,
-                                         GameObject* stone, SummonEvidence& ev)
+    // AND IT STOPS AT THE CLICK NOW, WHICH IS #365. What used to follow was a
+    // search for the portal in the next statement, and it could never find one:
+    // the object does not exist until the core has cast a channelled spell it
+    // has only prepared. The portal half is DriveThePortalClick, a poll or more
+    // later, and the argument is written out where this function ends.
+    //
+    // Returns the refusal literal, or nullptr when the summoner is channelling
+    // and the row should be parked to wait for the portal. It writes no row,
+    // releases no hold and parks nothing: each caller finishes in the shape its
+    // own path wants.
+    static char const* DriveTheStoneClick(Player* who, Player* summoned, Player* helper,
+                                          GameObject* stone, SummonEvidence& ev)
     {
         // FOUR POINTERS AND FOUR ANSWERS, not one catch-all. Both callers have
         // already checked all of these, so none of this is expected to fire -
@@ -31113,9 +31195,70 @@ private:
         // world, not by trusting a void call.
         ev.channellingAfterClick = who->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0;
 
-        GameObject* portal = FindSummonPortal(who);
-        if (!portal)
+        // AND THIS IS WHERE THE RITUAL STOPS AND THE ROW WAITS (#365).
+        //
+        // WHAT USED TO BE HERE WAS A SEARCH FOR THE PORTAL, IN THE NEXT
+        // STATEMENT, AND IT COULD NEVER FIND ONE. GameObject::Use's MEETINGSTONE
+        // branch (GameObject.cpp:1902) casts spell 23598 on the clicker. That
+        // spell is channelled, which the line above PROVES rather than assumes:
+        // only Spell::GetCurrentContainer (Spell.cpp:8021) puts a spell in
+        // CURRENT_CHANNELED_SPELL. A channelled spell is not cast by
+        // Spell::prepare - both of prepare's immediate branches exclude it
+        // (Spell.cpp:3646 and Spell.cpp:3691) - and what prepare does instead is
+        // SetCurrentCastedSpell (Spell.cpp:3665), which is the whole of why the
+        // channel reads as started. The cast happens in Spell::update
+        // (Spell.cpp:4430), and only inside that does handle_immediate
+        // (Spell.cpp:4036) reach EffectTransmitted (SpellEffects.cpp:5379), its
+        // GAMEOBJECT_TYPE_SUMMONING_RITUAL branch (SpellEffects.cpp:5466) and
+        // AddToMap (SpellEffects.cpp:5497). This module's hook runs after the
+        // map update of the same tick (World.cpp:1242 and World.cpp:1342), so
+        // the object first exists a tick after the poll that clicked the stone.
+        //
+        // THE ROW'S OWN EVIDENCE SAID SO AND THE REFUSAL CONTRADICTED IT. A
+        // refused row on the dev realm carried `channelling_after_click` true
+        // beside `the summoner did not begin channelling the portal`, with the
+        // two clickers 1.4 and 1.8 yards from the stone against a gate of five.
+        // Everything the ritual needed was true and the verb refused anyway,
+        // naming the one thing that had gone right.
+        //
+        // SO THE LITERAL NOW MEANS WHAT IT SAYS, and it is kept for the case it
+        // actually describes: a click that started nothing at all, which is what
+        // a silently dropped CMSG_GAMEOBJ_USE or an early return inside
+        // GameObject::Use looks like from here.
+        if (!ev.channellingAfterClick)
             return "the summoner did not begin channelling the portal";
+        return nullptr;
+    }
+
+    // THE SECOND HALF OF THE RITUAL, ONE POLL OR MORE LATER (#365).
+    //
+    // Everything from the portal to the settle window. It is separated from the
+    // click above by a WAIT rather than by a blank line, because the object it
+    // works on does not exist until the core has run a tick this module cannot
+    // reach from inside its own poll. See the end of DriveTheStoneClick for the
+    // whole argument and the core's line numbers.
+    //
+    // The portal is found by the caller rather than here, because the caller is
+    // what decides between waiting and giving up on the absence of one, and a
+    // sweep run twice would be two answers to one question.
+    //
+    // Returns the refusal literal, or nullptr when the ritual is running and the
+    // row should be parked to wait it out.
+    static char const* DriveThePortalClick(Player* who, Player* helper, GameObject* portal,
+                                           SummonEvidence& ev)
+    {
+        // Three pointers and three answers, on the same rule the click half
+        // opens with: a defensive branch that borrows somebody else's literal
+        // sends the retry table after the wrong thing.
+        if (!who)
+            return "summoner is not in the world";
+        if (!helper)
+            return "the second clicker is not in the world";
+        if (!portal)
+            return "the summoner is channelling but no portal appeared";
+        WorldSession* const helperSession = helper->GetSession();
+        if (!helperSession)
+            return "the second clicker has no session";
         ev.portalEntry = portal->GetEntry();
 
         GameObjectTemplate const* portalInfo = portal->GetGOInfo();
@@ -31370,7 +31513,7 @@ private:
             // because a sender that named somebody is owed the reason that
             // person will not do rather than a bare "nobody could". The state
             // checks that used to follow them have moved into
-            // DriveSummonRitual, where both callers ask them in one place.
+            // DriveTheStoneClick, where both callers ask them in one place.
             helper = ObjectAccessor::FindPlayerByName(targetArg, false);
             if (!helper)
                 return refuse("the second clicker is not online");
@@ -31461,15 +31604,14 @@ private:
             return "";
         }
 
-        if (char const* wall = DriveSummonRitual(who, summoned, helper, stone, ev))
+        if (char const* wall = DriveTheStoneClick(who, summoned, helper, stone, ev))
             return refuse(wall);
 
         LOG_INFO("module.overseer",
-                 "overseer: '{}' is summoning '{}' to the meeting stone ({}) with '{}' as the "
-                 "second clicker - {} of {} participants, map {} to map {}; judging in {}ms, "
-                 "not now",
-                 ev.summoner, ev.summoned, ev.stoneEntry, ev.helper, ev.participants,
-                 ev.required, ev.from.mapId, ev.at.mapId, ev.windowMs);
+                 "overseer: '{}' has clicked the meeting stone ({}) to summon '{}' with '{}' as "
+                 "the second clicker, and is channelling - the core does not create the portal "
+                 "until the world tick after this one, so the row waits up to {}ms for it",
+                 ev.summoner, ev.stoneEntry, ev.summoned, ev.helper, SUMMON_PORTAL_CEILING_MS);
 
         SummonCheck check;
         check.id = id;
@@ -31478,6 +31620,7 @@ private:
         check.summonerGuid = who->GetGUID();
         check.summonedGuid = summoned->GetGUID();
         check.helperName = helper->GetName();
+        check.awaitingPortal = true;
         check.ev = ev;
         parked.push_back(check);
 
@@ -31486,7 +31629,7 @@ private:
         // and not 'applied', which nothing has earned yet.
         status = "verifying";
         ev.verdict = SummonOutcome::Unreadable;
-        out = SummonJson(ev, "summoning", "");
+        out = SummonJson(ev, "clicking", "");
         return "";
     }
 
@@ -31641,28 +31784,143 @@ private:
                                                      SUMMON_ARRIVED_YARDS))
             return giveUp("error", "the character to summon is already at the summon point");
 
-        if (char const* wall = DriveSummonRitual(summoner, summoned, helper, stone, check.ev))
+        if (char const* wall = DriveTheStoneClick(summoner, summoned, helper, stone, check.ev))
             return giveUp("error", wall);
 
         LOG_INFO("module.overseer",
-                 "overseer: '{}' walked {}ms to the meeting stone ({}) and is summoning '{}' "
-                 "with '{}' as the second clicker - {} of {} participants, map {} to map {}; "
-                 "judging in {}ms, not now",
+                 "overseer: '{}' walked {}ms to the meeting stone ({}), has clicked it to summon "
+                 "'{}' with '{}' as the second clicker, and is channelling - the row now waits "
+                 "up to {}ms for the core to create the portal",
                  check.summonerName, check.ev.approachMs, check.ev.stoneEntry,
-                 check.ev.summoned, check.ev.helper, check.ev.participants, check.ev.required,
-                 check.ev.from.mapId, check.ev.at.mapId, check.ev.windowMs);
+                 check.ev.summoned, check.ev.helper, SUMMON_PORTAL_CEILING_MS);
 
-        // THE SECOND WAIT STARTS CLEAN. `waitedMs` is the ritual's clock and
-        // has to begin at the ritual, or a walk that took eighteen seconds
-        // would spend the whole verify window before the portal had settled and
-        // the row would answer `stayed` about a summon still in progress.
+        // THE NEXT WAIT STARTS CLEAN, AND SO DOES THE ONE AFTER IT. Each of the
+        // three has its own clock for the same reason: a walk that took eighteen
+        // seconds must not spend the portal's window, and a portal that took two
+        // polls must not spend the ritual's.
         check.approaching = false;
+        check.awaitingPortal = true;
+        check.ev.portalMs = 0;
         check.ev.waitedMs = 0;
 
         // The row's own JSON is rewritten so a reader looking at it mid-ritual
-        // sees the ritual rather than the walk. The status does not move: it
-        // was `verifying` for the walk and it is `verifying` for the ritual,
-        // which is the one honest status for either.
+        // sees the click rather than the walk. The status does not move: it was
+        // `verifying` for the walk and it is `verifying` for this, which is the
+        // one honest status for either.
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = 'verifying', detail = '', result = '{}' "
+            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            EscLong(SummonJson(check.ev, "clicking", "")), check.id, g_runToken);
+        return true;
+    }
+
+    // ------------------- one poll of the wait for the portal (#365) --
+    //
+    // WHY THIS WAIT EXISTS AT ALL is written out at the end of
+    // DriveTheStoneClick, with the core's own line numbers: a channelled spell
+    // is prepared by the click and cast by the caster's next update, and the
+    // ritual object is created inside the cast. So there is nothing to click on
+    // the poll that clicks the stone, and there was never going to be.
+    //
+    // WHAT IT DOES EVERY POLL. It keeps the selection alive, for the reason the
+    // settle wait below keeps it alive: the ritual reads the summoner's target
+    // again when it completes, and a summoner that retargets in between summons
+    // nobody and says nothing about it. It does NOT re-assert the holds - the
+    // per-tick sweep #362 added is what keeps those, and re-asserting one ends
+    // in a StopMoving that a channel does not need and a pin it already has.
+    //
+    // Returns whether the row stays parked. A row it answers has already had its
+    // holds released and its UPDATE written.
+    bool ResolveSummonPortal(SummonCheck& check, uint32 elapsedMs)
+    {
+        using OverseerDecisions::SummonPortal;
+
+        check.ev.portalMs += elapsedMs;
+
+        // Answered where it is given up on, exactly like the walk's own
+        // resolver, so that every exit from this wait releases both holds and
+        // writes one row.
+        auto giveUp = [&](char const* status, char const* detail) -> bool
+        {
+            ReleaseSummonRitualHold(check.ev, check.summonerName,
+                                    "the wait for the summoning portal ended");
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(SummonJson(check.ev, "refused", detail)), check.id,
+                g_runToken);
+            return false;
+        };
+
+        Player* const summoner = ObjectAccessor::FindPlayerByName(check.summonerName, false);
+        if (!summoner || !summoner->IsInWorld() || !summoner->GetSession())
+            return giveUp("error", "summoner is not in the world");
+        if (!summoner->IsAlive())
+            return giveUp("error", "summoner is dead");
+
+        Player* const helper = ObjectAccessor::FindPlayerByName(check.helperName, false);
+        if (!helper || !helper->IsInWorld() || !helper->GetSession())
+            return giveUp("error", "the second clicker is not in the world");
+
+        // KEEP THE SELECTION ALIVE, for the reason the settle wait does.
+        if (summoner->GetTarget() != check.summonedGuid)
+            DriveSelection(summoner->GetSession(), check.summonedGuid);
+
+        // THE CHANNEL IS READ OFF THE SUMMONER RATHER THAN REMEMBERED. The
+        // ritual object belongs to the channel - the core hands it over with
+        // AddGameObject (SpellEffects.cpp:5470) and takes it away when the spell
+        // is cancelled - so a channel that has ended with no portal in the world
+        // is a summon that is over, and waiting out the rest of the window on it
+        // would hold a claim open to watch nothing.
+        GameObject* const portal = FindSummonPortal(summoner);
+        bool const channelling = summoner->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr;
+
+        SummonPortal const answer = OverseerDecisions::ReadSummonPortal(
+            portal != nullptr, channelling, check.ev.portalMs, SUMMON_PORTAL_CEILING_MS);
+
+        if (answer == SummonPortal::Wait)
+            return true;
+
+        // BOTH WAYS OUT ASK THE LOOSER QUESTION FIRST, because both of them are
+        // a row that found no portal and neither could otherwise say whether
+        // that is because none exists or because this module is looking for the
+        // wrong entry. See AnyRitualCheck.
+        if (answer == SummonPortal::NoChannel || answer == SummonPortal::OutOfTime)
+        {
+            check.ev.ritualSeenEntry = static_cast<int32>(RitualEntryOwnedBy(summoner));
+            LOG_WARN("module.overseer",
+                     "overseer: summon {} found no portal ({}) after {}ms - the summoner is {}, "
+                     "and the summoning rituals it owns read as entry {} (0 means none at all)",
+                     check.id, SUMMON_PORTAL_ENTRY, check.ev.portalMs,
+                     channelling ? "still channelling" : "no longer channelling",
+                     check.ev.ritualSeenEntry);
+        }
+        // TWO LITERALS AND NOT ONE, WHICH IS THE OTHER HALF OF #365. A refusal
+        // that names the wrong cause is a defect in its own right: the row this
+        // was diagnosed from said the summoner had not begun channelling while
+        // carrying `channelling_after_click` true in the same JSON, and an hour
+        // went into the clickers' distance to the stone because of it. These two
+        // say which of the two things actually happened, and the one they
+        // replaced now means only what it says, where the click is driven.
+        if (answer == SummonPortal::NoChannel)
+            return giveUp("error", "the summoner stopped channelling before a portal appeared");
+        if (answer == SummonPortal::OutOfTime)
+            return giveUp("error", "the summoner is channelling but no portal appeared");
+
+        if (char const* wall = DriveThePortalClick(summoner, helper, portal, check.ev))
+            return giveUp("error", wall);
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is summoning '{}' to the meeting stone ({}) with '{}' as the "
+                 "second clicker - the portal ({}) appeared after {}ms and has {} of {} "
+                 "participants; judging in {}ms, not now",
+                 check.summonerName, check.ev.summoned, check.ev.stoneEntry, check.ev.helper,
+                 check.ev.portalEntry, check.ev.portalMs, check.ev.participants,
+                 check.ev.required, check.ev.windowMs);
+
+        check.awaitingPortal = false;
+        check.ev.waitedMs = 0;
+
         CharacterDatabase.Execute(
             "UPDATE overseer_command SET status = 'verifying', detail = '', result = '{}' "
             "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
@@ -31694,6 +31952,19 @@ private:
             if (check.approaching)
             {
                 if (ResolveSummonApproach(check, elapsedMs))
+                    stillSummoning.push_back(check);
+                continue;
+            }
+
+            // ---- and the wait for the portal to exist, before there is one --
+            //
+            // THE SECOND OF THREE (#365), and nothing below it can be asked
+            // about a row in it either: there is no portal, no request and no
+            // teleport, and `waitedMs` must not start running or the ritual's
+            // own window would be spent before the ritual began.
+            if (check.awaitingPortal)
+            {
+                if (ResolveSummonPortal(check, elapsedMs))
                     stillSummoning.push_back(check);
                 continue;
             }

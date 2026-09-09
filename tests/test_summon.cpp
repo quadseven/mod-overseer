@@ -434,6 +434,16 @@ void EveryRefusalCarriesWhereToTryAgain()
     later("the second clicker has no session");
     later("the summoner did not begin channelling the portal");
     later("the ritual did not reach the participants it needs");
+    // AND THE TWO THE PORTAL'S OWN WAIT ADDS (#365). The literal above used to
+    // be returned for a summoner that WAS channelling, because the verb looked
+    // for the ritual object in the statement after the click and the core does
+    // not create it until the next world tick. It now means only what it says,
+    // and these two say what actually happens: the channel ended before a portal
+    // appeared, or it is still running and none has. Both are about a moment
+    // rather than a place, so the same pair on the same stone is the right thing
+    // to try next. tests/test_summon_portal.cpp pins the decision behind them.
+    later("the summoner stopped channelling before a portal appeared");
+    later("the summoner is channelling but no portal appeared");
 
     // AND AN UNRECOGNISED LITERAL IS `later`, which is the same call the bind,
     // hearth, sell and repair tables make: a refusal this table has never heard
