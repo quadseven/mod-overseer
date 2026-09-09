@@ -1109,27 +1109,28 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
     return blockers;
 }
 
-DungeonEvacuation DungeonRunEvacuation(std::vector<DungeonRunEntryState> const& members)
+DungeonWrongSide DungeonRunWrongSide(std::vector<DungeonRunEntryState> const& members)
 {
-    DungeonEvacuation evacuation;
+    DungeonWrongSide wrongSide;
     for (DungeonRunEntryState const& member : members)
     {
-        // Out already, or not in the world this poll. See the header for why
-        // the second is not counted as inside rather than counted and then not
-        // walked: a name that does not resolve is not on the map either.
+        // Through already, or not in the world this poll. See the header for
+        // why the second is not counted as being on this side rather than
+        // counted and then not walked: a name that does not resolve is not on
+        // the map either.
         if (member.through || !member.seen)
             continue;
-        // Not on the door's map, and the exit door's map is the inside one -
-        // so this member is somewhere else entirely and is not what holds the
-        // reset. The same negative sentinel the crossing predicates read.
+        // Not on the door's map at all, so this member is somewhere else
+        // entirely and is not on the wrong side of THIS door. The same negative
+        // sentinel the crossing predicates read.
         if (member.distanceFromDoor < 0.f)
             continue;
         if (member.alive)
-            evacuation.walk.push_back(member.name);
+            wrongSide.walk.push_back(member.name);
         else
-            evacuation.wait.push_back(member.name);
+            wrongSide.wait.push_back(member.name);
     }
-    return evacuation;
+    return wrongSide;
 }
 
 bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards)

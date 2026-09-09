@@ -30,10 +30,10 @@
 #include <vector>
 
 using OverseerDecisions::ArrivalReachesTrigger;
-using OverseerDecisions::DungeonEvacuation;
+using OverseerDecisions::DungeonWrongSide;
 using OverseerDecisions::DungeonRunEntryBlockers;
 using OverseerDecisions::DungeonRunEntryState;
-using OverseerDecisions::DungeonRunEvacuation;
+using OverseerDecisions::DungeonRunWrongSide;
 
 namespace
 {
@@ -132,7 +132,7 @@ void TheTwoLeftInsideAreTheOnesWalkedOut()
         Inside("Straggler", 12.7f), Inside("OtherStraggler", 12.7f),
     };
 
-    DungeonEvacuation const evacuation = DungeonRunEvacuation(census);
+    DungeonWrongSide const evacuation = DungeonRunWrongSide(census);
     CheckNames("who is walked out", evacuation.walk, {"Straggler", "OtherStraggler"});
     CheckNames("who is only named", evacuation.wait, {});
 }
@@ -148,7 +148,7 @@ void NobodyThatIsAlreadyOutIsWalkedAnywhere()
         Outside("Fourth"), Outside("Fifth"),
     };
 
-    DungeonEvacuation const evacuation = DungeonRunEvacuation(census);
+    DungeonWrongSide const evacuation = DungeonRunWrongSide(census);
     CheckNames("nobody to walk", evacuation.walk, {});
     CheckNames("nobody to name", evacuation.wait, {});
 }
@@ -165,7 +165,7 @@ void ADeadMemberIsNamedRatherThanWalked()
         DeadInside("Corpse", 300.f),
     };
 
-    DungeonEvacuation const evacuation = DungeonRunEvacuation(census);
+    DungeonWrongSide const evacuation = DungeonRunWrongSide(census);
     CheckNames("the living one is walked", evacuation.walk, {"Straggler"});
     CheckNames("the dead one is named", evacuation.wait, {"Corpse"});
 }
@@ -181,7 +181,7 @@ void AMemberSomewhereElseIsNotAStraggler()
         Inside("Straggler", 12.7f),
     };
 
-    DungeonEvacuation const evacuation = DungeonRunEvacuation(census);
+    DungeonWrongSide const evacuation = DungeonRunWrongSide(census);
     CheckNames("only the one inside", evacuation.walk, {"Straggler"});
     CheckNames("and nobody is waited for", evacuation.wait, {});
 }
@@ -193,7 +193,7 @@ void AMemberSomewhereElseIsNotAStraggler()
 // thing to do when there is nobody to walk.
 void AnEmptyCensusWalksNobody()
 {
-    DungeonEvacuation const evacuation = DungeonRunEvacuation({});
+    DungeonWrongSide const evacuation = DungeonRunWrongSide({});
     CheckNames("no walkers", evacuation.walk, {});
     CheckNames("no waiters", evacuation.wait, {});
 }
@@ -212,7 +212,7 @@ void EverybodyWalkedIsSomebodyTheCrossingIsWaitingOn()
     };
 
     std::string const blockers = DungeonRunEntryBlockers(census, 5.f);
-    DungeonEvacuation const evacuation = DungeonRunEvacuation(census);
+    DungeonWrongSide const evacuation = DungeonRunWrongSide(census);
     for (std::string const& name : evacuation.walk)
         CheckBool("walked member is a named blocker",
                   blockers.find(name) != std::string::npos, true);

@@ -1765,30 +1765,43 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
 // that decides is 12.7 - 1.5 = 11.2, and 11.2 is INSIDE 12. They had been
 // standing in their own exit for an hour. Nothing had asked it.
 //
-// ASKED OF THE SAME CENSUS THE CROSSING USES, taken against the EXIT door, so
-// `through` means "out on the map outside" and a negative distance means "not
-// on the door's map at all". A member on some third map is not what holds a
-// reset and is not this decision's business; a member this poll could not find
-// is not counted either, on the same terms the adapter's own reset blockers
-// already use - not in the world, and therefore not on the map.
+// ASKED OF THE SAME CENSUS THE CROSSING USES, taken against a door, so
+// `through` means "on the far side of it" and a negative distance means "not
+// on the door's map at all". A member on some third map is not on the wrong
+// side of THIS door and is not this decision's business; a member this poll
+// could not find is not counted either, on the same terms the adapter's own
+// reset blockers already use - not in the world, and therefore not on the map.
 //
 // TWO ANSWERS RATHER THAN ONE LIST, because they are acted on differently and
-// the difference is the whole reason to name it: one of them can be walked out
-// right now, and the other holds the instance open just as hard and cannot be
-// walked at all.
-struct DungeonEvacuation
+// the difference is the whole reason to name it: one of them can be walked
+// right now, and the other cannot be walked at all and matters just as much.
+//
+// AND IT IS ASKED IN BOTH DIRECTIONS, WHICH IS WHY IT IS NOT NAMED FOR ONE
+// (#384). It was `DungeonRunEvacuation`, because the only caller was the
+// reset walking stragglers OUT. #384 is the mirror image and the same
+// question: a member that died inside and released to a graveyard OUTSIDE is
+// on the wrong side of the entrance door, and what the caller needs to know
+// about it is exactly what the evacuation needed - can it be walked to that
+// door now, or is it a corpse somebody else owns. The crossing predicates
+// above already share one shape for both directions and say why; two copies of
+// this, one per direction, is how the second one rots.
+//
+// NOTHING ABOUT THE ANSWER CHANGED IN THE RENAME. `walk` is still alive, on the
+// door's map and reachable by an aim; `wait` is still dead and going nowhere
+// under its own power.
+struct DungeonWrongSide
 {
-    // Alive, inside, and reachable by an aim. Escort each of these at the exit
-    // trigger itself.
+    // Alive, on the door's map, and reachable by an aim. Escort each of these
+    // at the trigger itself.
     std::vector<std::string> walk;
-    // Inside and dead. No aim moves a corpse, the revival drive owns it, and
-    // the reset it is holding open waits for it either way - so it is NAMED
-    // rather than walked, and named separately rather than being quietly
-    // missing from a line about who is still in there.
+    // On the door's map and dead. No aim moves a corpse, the revival drive owns
+    // it, and whatever is waiting on this member waits for it either way - so
+    // it is NAMED rather than walked, and named separately rather than being
+    // quietly missing from a line about who is still on the wrong side.
     std::vector<std::string> wait;
 };
 
-DungeonEvacuation DungeonRunEvacuation(std::vector<DungeonRunEntryState> const& members);
+DungeonWrongSide DungeonRunWrongSide(std::vector<DungeonRunEntryState> const& members);
 
 // CAN AN AIM AT A DOORWAY EVER OPEN IT?
 //

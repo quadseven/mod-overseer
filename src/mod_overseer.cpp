@@ -19275,6 +19275,16 @@ private:
         // then left alone. See WalkStragglersOut.
         bool loggedWalkingOut{false};
         bool loggedNoWayOut{false};
+        // AND THE TWO THE REJOIN SAYS ONCE (#384), which are the same two
+        // sentences pointed the other way: `loggedWalkingBackIn` rations why
+        // anybody is being walked back TO an instance the rest of the party is
+        // already in, and `loggedNoWayBackIn` rations the refusal for an
+        // entrance this world cannot be aimed at. Separate flags rather than
+        // shared ones because the two walks can be wanted in the same run - a
+        // reset evacuates, a staged run rejoins - and a shared flag would have
+        // one of them silence the other. See WalkStrandedBackIn.
+        bool loggedWalkingBackIn{false};
+        bool loggedNoWayBackIn{false};
         // WHEN THIS COORDINATOR STARTED WAITING FOR SOMEBODY ELSE'S ERRAND
         // (#168), and whether it has said so. In-process like every other
         // flag on this struct: a bounce restarts the clock, which errs
@@ -20698,8 +20708,13 @@ private:
         uint32 out = 0;
         std::vector<OverseerDecisions::DungeonRunEntryState> const states =
             DungeonRunCensus(members, door, portal.outsideMapId, out);
-        OverseerDecisions::DungeonEvacuation const evacuation =
-            OverseerDecisions::DungeonRunEvacuation(states);
+        // ASKED IN THE OTHER DIRECTION SINCE #384, SO THE FUNCTION IS NAMED FOR
+        // NEITHER. `through` here is "out on the map outside", so the wrong
+        // side is inside; the rejoin below asks the same question of the
+        // entrance door, where the wrong side is outside. See the decision's
+        // own header.
+        OverseerDecisions::DungeonWrongSide const evacuation =
+            OverseerDecisions::DungeonRunWrongSide(states);
         if (evacuation.walk.empty() && evacuation.wait.empty())
             return 0;   // the hold is something other than a body on the map
 
@@ -20781,6 +20796,211 @@ private:
                            "instance open just as hard, and the revival drive owns it");
         }
         return static_cast<uint32>(evacuation.walk.size());
+    }
+
+    // ------------------------------ dungeon run: the stranded member (#384) --
+    //
+    // THE MIRROR IMAGE OF WalkStragglersOut, AND THE SAME KIND OF DEFECT. That
+    // one walks a member left INSIDE an instance whose run is over back out
+    // through the door. This walks a member left OUTSIDE an instance whose run
+    // is still on back IN through it.
+    //
+    // WHAT IT COST, MEASURED ON THE DEV REALM. A member took environmental
+    // damage inside map 43 - killer_type 'self', out of combat, 118 yards below
+    // the floor, so drowning rather than a fall - and released to a graveyard on
+    // the outdoor map about 2200 yards from the door. STAGED_INSIDE then held
+    // for the census to reach five and it never could, so the run sat 'active'
+    // for over 36 minutes with the four members inside not moving one yard.
+    // Within the hour the stranded one had walked to a zone several thousand
+    // yards further away and died three more times to hostile creatures there.
+    //
+    // WHY IT WANDERS, WHICH IS THE PART THAT LOOKS LIKE A SECOND BUG AND IS NOT.
+    // Every other drive in this module stands down on InDungeonRun, and that
+    // predicate asks whether the character is on an INSTANCE MAP with a run
+    // open. A member released to a graveyard outside is on neither, so the
+    // quest, profession, travel and grind drives all correctly come back on and
+    // send it wherever they would send any idle character. Nothing was wrong
+    // with them; what was missing was an errand of its own. An escort is exactly
+    // that errand and takes the rest off it - see the escort focus section, and
+    // the herb-gathering member 500 yards from a door that it was written for.
+    //
+    // ONLY THE LIVING ARE WALKED, AND THAT IS WHERE THE RESURRECT HAPPENS. A
+    // member released to a graveyard is a GHOST, and no aim moves one usefully:
+    // DriveStuckRevival owns it, releases it on its behalf when nobody is at the
+    // keyboard to answer the prompt, and resurrects it after
+    // STUCK_REVIVAL_DEAD_SECONDS plus at most the healer grace, then holds it
+    // still for REVIVAL_HOLD_SECONDS. That is about three minutes end to end,
+    // which is why the resurrect does not have to be waited for by anything
+    // here: it fits inside DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS several times
+    // over and leaves the rest of the quarter hour for the walk. A ghost is
+    // NAMED in the line below rather than aimed, on exactly the terms
+    // WalkStragglersOut names a corpse it cannot walk.
+    //
+    // THE AIM IS THE CROSSING'S, GROUNDED (#376), AND THE KNOCK IS THE RESET'S.
+    // Those two halves come from different places on purpose:
+    //
+    //   * The aim is the same grounded `at:` on the door's own x and y that
+    //     DriveDungeonCrossing writes, through the same DoorAimHeightFor. #376
+    //     is why that matters over a distance: an areatrigger's row position is
+    //     the middle of its box, PathGenerator refuses an endpoint more than
+    //     seven yards from any polygon, and a route to an ungrounded door is
+    //     therefore refused from EVERYWHERE on the map. A member 2200 yards out
+    //     needs a routable endpoint more than a member already on the doorstep
+    //     does.
+    //   * The knock is WalkStragglersOut's, at poll rate rather than only on
+    //     arrival, because the door opens on the server's own radius check and
+    //     that is measured after the character's combat reach is taken off - so
+    //     a member the walk would not think to ask about for another few yards
+    //     may already be through.
+    //
+    // AND THE REASON THE CROSSING REFUSES TO KNOCK EARLY DOES NOT APPLY HERE.
+    // It waits for DungeonRunEntryReady - everybody on the doorstep - so that
+    // the party crosses together instead of trickling in with the leader
+    // possibly first. There is no party out here to keep together: the party is
+    // already inside, waiting for this one member, and a member that reaches the
+    // door should go through it the moment the server will have it.
+    //
+    // WHICH INSTANCE IT LANDS IN IS NOT A GUESS EITHER.
+    // InstanceSaveMgr::PlayerGetDestinationInstanceId (InstanceSaveMgr.cpp:957)
+    // prefers the GROUP LEADER's bind over the entering player's own, and the
+    // leader is one of the members already inside this run - the same fact the
+    // reset section leans on when it explains why resetting a follower would
+    // leave the party walking back into the same saved instance.
+    //
+    // NO GM VERB ANYWHERE IN HERE, on AGENTS.md's standing instruction. The
+    // corpse run is the game's own answer to a death away from the party, and
+    // this walks a character with the same travel errand every other walk in
+    // this module uses and lets the game's own areatrigger decide.
+    //
+    // WHAT THIS DOES NOT MAKE SAFE, SAID RATHER THAN IMPLIED. AGENTS.md records
+    // that an aim across a map is routed without regard for what it crosses, and
+    // that sending a party through the wrong zone turned a six-hour quiet streak
+    // into 24 deaths in fifteen minutes. Nothing here changes that: a member
+    // 2200 yards out is walked across whatever lies between, and
+    // ChooseTravelTarget's danger refusal is about CHOOSING among candidate
+    // destinations, not about a fixed aim at a door. What can be said is that
+    // the alternative is not "stay put" - it is the measured behaviour, which is
+    // an idle character sent several thousand yards further off by whichever
+    // drive picks it up and killed three times out there. A shorter, purposeful
+    // walk toward a door the party is standing behind is the better of the two
+    // available walks, not a safe one, and the phase's own backstop bounds how
+    // long it may be attempted.
+    //
+    // Returns how many members were aimed back at the door this poll.
+    uint32 WalkStrandedBackIn(
+        std::string const& leaderName, DungeonPortal const& portal,
+        AreaTrigger const* door, uint32 triggerId,
+        std::vector<OverseerDecisions::DungeonRunEntryState> const& states,
+        DungeonRunCoordinatorState& coord)
+    {
+        // WHO IS ON THE WRONG SIDE OF THIS DOOR, asked of the census the caller
+        // already took against the ENTRANCE - so `through` is "inside" and the
+        // wrong side is out. A member on some third map carries the negative
+        // sentinel and is in neither list: an `at:` aim on this door's map would
+        // be refused by ResolveTravelTarget for a character that is not on it,
+        // and writing one that could only be refused is what the crossing
+        // already declines to do.
+        OverseerDecisions::DungeonWrongSide const stranded =
+            OverseerDecisions::DungeonRunWrongSide(states);
+        if (stranded.walk.empty() && stranded.wait.empty())
+            return 0;   // nobody is outside on this door's map
+
+        // AreaTrigger::radius  ObjectMgr.h:429  float radius
+        if (!OverseerDecisions::ArrivalReachesTrigger(TRAVEL_ARRIVED_POSITION_YARDS,
+                                                      door->radius))
+        {
+            if (!coord.loggedNoWayBackIn)
+            {
+                coord.loggedNoWayBackIn = true;
+                LOG_ERROR("module.overseer",
+                          "overseer: dungeon run {} will not aim anybody back at "
+                          "areatrigger {} - a walk to it stops improving at {:.0f}y and "
+                          "the trigger's own radius is {:.0f}, so arriving would mean "
+                          "standing OUTSIDE the door with the errand reported as done. "
+                          "Nobody is aimed, rather than aimed somewhere that cannot work",
+                          coord.runNumber, triggerId, TRAVEL_ARRIVED_POSITION_YARDS,
+                          door->radius);
+            }
+            return 0;
+        }
+        coord.loggedNoWayBackIn = false;
+
+        // ON THE FLOOR UNDER THE DOOR AND NOT IN THE MIDDLE OF ITS BOX (#376).
+        // The probe needs a member on the door's map, which is precisely who is
+        // being walked, so this is the one caller that always has one.
+        OverseerDecisions::DoorAimHeight const doorHeight =
+            DoorAimHeightFor(door, states);
+
+        std::ostringstream aim;
+        // AreaTrigger::map/x/y  ObjectMgr.h:425,426,427
+        aim << "at:" << door->map << ':' << door->x << ',' << door->y << ','
+            << doorHeight.z;
+        std::string const doorAim = aim.str();
+
+        for (std::string const& name : stranded.walk)
+            EscortToward(name, doorAim, "STAGED_INSIDE", EscortPurpose::Assemble);
+
+        // KNOCKED FOR ONLY THE LIVING, matched back out of the census by name
+        // because five names is a list rather than a set - the same matching
+        // WalkStragglersOut does and for the same reason. A ghost put through
+        // the door would be taken away from the corpse the revival drive is
+        // about to resurrect it on.
+        std::vector<OverseerDecisions::DungeonRunEntryState> walking;
+        walking.reserve(stranded.walk.size());
+        for (OverseerDecisions::DungeonRunEntryState const& state : states)
+            for (std::string const& name : stranded.walk)
+                if (state.name == name)
+                    walking.push_back(state);
+
+        // The leader name is passed for the ordering DungeonRunKnock takes it
+        // for - anchor last - and it costs nothing here, where the leader is one
+        // of the members already inside and is therefore not in `walking` at
+        // all. A run that somehow has its leader outside gets the same ordering
+        // the crossing would give it.
+        uint32 const crossed = DungeonRunKnock(walking, leaderName, triggerId);
+        if (crossed)
+            // NO LOG-ONCE FLAG IS CLEARED HERE, and that is deliberate rather
+            // than forgotten. The phase's own split line is re-armed by the
+            // assembly ratchet on the next poll, which is where the new count
+            // can actually be read; and the sentence below is said once per run
+            // like WalkStragglersOut's, because "this run is walking somebody
+            // back in" does not become a different fact when one of two
+            // stranded members makes it through.
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} knocked on areatrigger {} for the {} "
+                     "stranded outside map {} - {} went back in this poll and the census "
+                     "is that much nearer complete",
+                     coord.runNumber, triggerId, static_cast<uint32>(walking.size()),
+                     portal.insideMapId, crossed);
+
+        // SAID ONCE PER RUN. EscortToward already says which character is being
+        // walked where; this is the sentence that says why anybody is being
+        // walked back into an instance at all, which is the fact an operator
+        // watching four characters stand still needs.
+        if (!coord.loggedWalkingBackIn)
+        {
+            coord.loggedWalkingBackIn = true;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} is short a member and is WALKING IT BACK to "
+                     "areatrigger {} rather than waiting for it - a member that died inside "
+                     "and released to a graveyard is on the outdoor map, where `follow` "
+                     "cannot reach it across a doorway and nothing else would ever bring it "
+                     "home. That aim's z is {}, {:.2f}y from the middle of the door's own "
+                     "box (#376). Still outside: {}{}",
+                     coord.runNumber, triggerId,
+                     doorHeight.grounded
+                         ? "the floor under the door"
+                         : "the trigger's own row, because no floor under the door was "
+                           "found this poll",
+                     doorHeight.correctionYards,
+                     OverseerDecisions::DungeonRunEntryBlockers(
+                         states, DUNGEON_DOORSTEP_RADIUS_YARDS),
+                     stranded.wait.empty()
+                         ? ""
+                         : ". One of them is dead: no aim moves a corpse, so the revival "
+                           "drive owns it until it is on its feet and this walks it then");
+        }
+        return static_cast<uint32>(stranded.walk.size());
     }
 
     // ------------------------------------------------------ dungeon run: reset --
@@ -23722,6 +23942,32 @@ private:
                                  static_cast<uint32>(
                                      DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS / 60));
                     }
+
+                    // AND WAITING IS NOT A PLAN WHEN NOTHING IS BRINGING THE
+                    // MISSING MEMBER BACK (#384). The ceiling below turns this
+                    // hold from an infinite wedge into a failed run the campaign
+                    // can retry, which is worth having on its own and is not the
+                    // whole answer: a member that died inside and released to a
+                    // graveyard outside would be lost again on the very next
+                    // attempt, and by then it has walked further away.
+                    //
+                    // So the corpse run is done properly - the member is walked
+                    // back to the door and re-enters under its own power, which
+                    // is the same crossing ENTER performs. This is the exact
+                    // shape RESET already uses in the other direction
+                    // (WalkStragglersOut, #351): called on every poll of the
+                    // hold rather than once, because the answer changes as
+                    // members die, resurrect and arrive, and it returns doing
+                    // nothing when there is nobody outside to walk.
+                    //
+                    // ORDERED AFTER THE LINE ABOVE AND BEFORE THE CEILING BELOW
+                    // deliberately. The line describes the state this poll
+                    // found; the walk acts on it; the ceiling judges how long
+                    // acting on it has been getting nowhere. A rejoin that
+                    // works shows up as the census going up, which is the
+                    // ratchet's own reading and restarts its clock.
+                    WalkStrandedBackIn(leaderName, *portal, door, triggerId, states,
+                                       coord);
 
                     // AND THE CEILING ITSELF, WHICH IS THE WHOLE OF #384's
                     // FIRST HALF. Read with the ratchet above, `stalled` means
