@@ -1806,6 +1806,70 @@ DungeonEvacuation DungeonRunEvacuation(std::vector<DungeonRunEntryState> const& 
 // that knows.
 bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards);
 
+// A DOOR AIM GOES ON THE FLOOR, NOT IN THE MIDDLE OF THE BOX (#376).
+//
+// An areatrigger's row position is the middle of its box. This module already
+// knows that and says so where TRAVEL_GROUND_SNAP_YARDS is argued, and had
+// never applied it to the one aim it writes AT a door. For the Wailing Caverns
+// exit the middle of the box is 7.01 yards above the floor the game itself
+// lands a character on, and both rows are quoted in the adapter's own portal
+// table: areatrigger 226 stands at z -66.6471, while areatrigger_teleport for
+// the entrance puts an arriving player at z -73.66 in the same chamber, 10.6
+// yards away.
+//
+// SEVEN YARDS IN THE AIR IS NOT A PLACE, and the cost of pretending otherwise
+// is not a rounding error. PathGenerator sets PATHFIND_FARFROMPOLY_END past
+// seven yards from any polygon (PathGenerator.cpp:301), and
+// RoutedPathGoesWhereAsked above refuses a route whose actual end misses the
+// height asked for by more than five. So a route to the middle of that box is
+// refused from EVERYWHERE on the map, at every distance, and the travel drive
+// falls through to its greedy five-bearing fan for the whole journey. Outdoors
+// that fan only ever walks the last few yards from a staging point and nobody
+// notices. Inside a dungeon it is a straight line drawn through rock, and a
+// party that had just cleared the place could not walk 125 yards back to its
+// own door.
+//
+// IT IS ArrivalReachesTrigger IN THREE DIMENSIONS, and deliberately the same
+// rule rather than a second opinion about doors. That one asks whether a
+// character that has stopped `arrivalYards` from an aim is inside a trigger of
+// radius `triggerRadiusYards`. Grounding keeps the trigger's x and y and moves
+// only its z, so the character now stops `arrivalYards` away along the ground
+// and `correction` below, and the question is that same question over the
+// hypotenuse: sqrt(arrival^2 + correction^2) < radius. At a correction of zero
+// it IS ArrivalReachesTrigger, which is what makes this an extension of that
+// bound rather than a new one beside it.
+//
+// AND IT IS CONSERVATIVE ON PURPOSE. Player::IsInAreaTriggerRadius measures the
+// radius against WorldObject::GetDistance, which SUBTRACTS the character's own
+// size - 1.5 yards for a player at scale 1 - so the server is more permissive
+// than this test by that much in every direction. A correction this accepts is
+// inside the door with room the test never spends. For trigger 226 the sum is
+// sqrt(5^2 + 7.01^2) = 8.61 against a radius of 12.
+//
+// WHAT IS REFUSED, AND WHY REFUSING MEANS KEEPING THE OLD AIM RATHER THAN
+// AIMING NOWHERE. A door with no radius is a BOX trigger and this question has
+// no answer for it; a probe that found no surface has nothing to offer; and a
+// correction larger than the door would be relocating the aim rather than
+// grounding it, which is exactly what TRAVEL_GROUND_SNAP_YARDS refuses in the
+// general case. All three keep the trigger's own z, which is the behaviour
+// every door had before this existed - so a door this cannot improve is left
+// exactly as it was rather than broken in a new way.
+struct DoorAimHeight
+{
+    // The z the aim should carry.
+    float z{0.f};
+    // Whether that z is the floor rather than the middle of the box. The caller
+    // says so in its aim line: a door that never grounds is a door whose
+    // surface probe or whose radius wants looking at, and that should be
+    // legible from a log rather than only from a debugger.
+    bool grounded{false};
+    // How far the aim moved, for that same line. Zero when it did not move.
+    float correctionYards{0.f};
+};
+
+DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
+                                float arrivalYards, float triggerRadiusYards);
+
 // ------------------------------------------------------------- the ratchet --
 //
 // "HAS IT GOT ANYWHERE, AND IF NOT, FOR HOW LONG?" - a question this module

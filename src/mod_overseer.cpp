@@ -18849,6 +18849,24 @@ private:
         bool loggedGathering{false};
         bool loggedBarrierWaiting{false};
         bool loggedCrossingAim{false};
+        // AND WHAT THAT LINE SAID ABOUT THE DOOR'S OWN HEIGHT (#376). The aim
+        // line is said once per crossing, which is right for it, and the one
+        // fact in it that can change mid-crossing is whether the aim got onto
+        // the floor: the surface probe needs the door's grid loaded, and a
+        // crossing can begin before it is. Said once and never again, the line
+        // would then report an ungrounded aim for the rest of a crossing that
+        // grounded on its second poll - a log describing a state the module is
+        // no longer in. So the verdict is remembered and the line is said again
+        // when it flips, which is once more at most and only when something a
+        // reader would act on has actually changed.
+        //
+        // IT NEEDS NO RESET OF ITS OWN, deliberately, and that is why it is not
+        // added to the four places that clear loggedCrossingAim. It is only
+        // ever read beside that flag, and clearing that flag makes the next
+        // poll say the line unconditionally and overwrite this one with the
+        // verdict it just printed. A reset here would be a fifth thing to
+        // remember for no change in behaviour.
+        bool loggedCrossingAimGrounded{false};
         bool loggedCrossingWaiting{false};
         bool loggedStagedWaiting{false};
         bool loggedAccepted{false};
@@ -19831,6 +19849,76 @@ private:
         return crossed;
     }
 
+    // THE FLOOR UNDER A DOOR, AND WHY THE AIM WANTS IT (#376).
+    //
+    // The crossing used to write the areatrigger row's own three floats and
+    // that is the middle of the trigger's BOX, not the ground inside it. For
+    // Wailing Caverns the difference is 7.01 yards straight up - areatrigger
+    // 226 is at z -66.6471 and the entrance's own teleport row lands an
+    // arriving player at z -73.66 ten yards away, both quoted in the portal
+    // table above - and seven yards of air is enough to make the aim
+    // unreachable rather than merely imprecise. PathGenerator calls an endpoint
+    // that far from any polygon FARFROMPOLY_END (PathGenerator.cpp:301) and
+    // NavmeshRoutes refuses a route whose end misses the height asked for by
+    // more than TRAVEL_ROUTE_ENDPOINT_YARDS, so no route to that point is ever
+    // accepted, from anywhere on the map, and GroundedStep spends the whole
+    // journey on its five-bearing fan. Outdoors, where ENTER starts from a
+    // staging point a few yards out, that fan is enough and this was invisible
+    // for as long as the module had never had a run to walk OUT of.
+    //
+    // ASKED OF A MEMBER RATHER THAN OF A MAP ID, and that is not a
+    // convenience. For EXIT the door's map is an INSTANCE, so the surface has
+    // to be probed against the Map the party is actually standing in;
+    // resolving a map id would find some other copy of map 43 or none at all.
+    // DungeonRunCensus sets distanceFromDoor for exactly the members on the
+    // door's own map and leaves it negative for everybody else, so that field
+    // IS the test for "this Player can answer the question".
+    //
+    // THE SAME PROBE THE FOOTING CHECK WALKS. SurfaceAt is what GroundHolds
+    // samples with on every stride of every walk, so the z this writes into the
+    // aim and the z the step chooser will later measure against are the same
+    // number from the same primitive rather than two answers that have to be
+    // trusted to agree. Started from DUNGEON_STAGING_Z_PROBE_LIFT_YARDS above
+    // the door for the reason that constant already gives: the probe searches
+    // DOWNWARD, so beginning just above the door finds the floor the door
+    // stands on rather than a hillside or a tunnel roof over it.
+    //
+    // AND A POLL THAT CANNOT ANSWER KEEPS THE OLD AIM AND IS ASKED AGAIN. An
+    // unloaded grid is the one transient case here, the guard is the same
+    // IsGridLoaded that ResolveDungeonStagingPoint uses before its own probe,
+    // and the aim is recomputed from scratch every poll - so a door that could
+    // not be grounded this poll is grounded on a later one without anything
+    // having to remember that it failed.
+    static OverseerDecisions::DoorAimHeight DoorAimHeightFor(
+        AreaTrigger const* door,
+        std::vector<OverseerDecisions::DungeonRunEntryState> const& states)
+    {
+        Player* onDoorMap = nullptr;
+        for (OverseerDecisions::DungeonRunEntryState const& state : states)
+        {
+            if (state.distanceFromDoor < 0.f)
+                continue;
+            onDoorMap = ObjectAccessor::FindPlayerByName(state.name);
+            if (onDoorMap)
+                break;
+        }
+
+        float ground = 0.f;
+        bool haveGround = false;
+        // GetMap  Object.h:631  Map* GetMap() const
+        Map* const map = onDoorMap ? onDoorMap->GetMap() : nullptr;
+        // IsGridLoaded  Map.h:213  bool IsGridLoaded(float x, float y) const
+        if (map && map->IsGridLoaded(door->x, door->y))
+            haveGround = SurfaceAt(onDoorMap, door->x, door->y,
+                                   door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS,
+                                   ground);
+
+        // AreaTrigger::radius  ObjectMgr.h:429  float radius
+        return OverseerDecisions::DoorAimOnTheFloor(
+            door->z, haveGround, ground, TRAVEL_ARRIVED_POSITION_YARDS,
+            door->radius);
+    }
+
     // What one poll of a crossing decided. Named rather than returned as a pair
     // of bools, because "still working", "everybody is through" and "the
     // backstop fired" are three outcomes and a caller that gets two bools can
@@ -19964,9 +20052,19 @@ private:
         // escort on arrival would idle it, and an idle `new rpg` picks a random
         // errand on its next tick. Members stand at the door until everyone is
         // there.
+        //
+        // ON THE FLOOR UNDER THE DOOR AND NOT IN THE MIDDLE OF ITS BOX (#376).
+        // The x and y are the trigger's own and never move; only the z is
+        // grounded, and only as far as DoorAimOnTheFloor will let it. See
+        // DoorAimHeightFor above for what is probed and why a poll that cannot
+        // probe keeps the row's own z.
+        OverseerDecisions::DoorAimHeight const doorHeight =
+            DoorAimHeightFor(door, states);
+
         std::ostringstream aim;
-        // AreaTrigger::map/x/y/z  ObjectMgr.h:425,426,427,428
-        aim << "at:" << door->map << ':' << door->x << ',' << door->y << ',' << door->z;
+        // AreaTrigger::map/x/y  ObjectMgr.h:425,426,427
+        aim << "at:" << door->map << ':' << door->x << ',' << door->y << ','
+            << doorHeight.z;
         std::string const doorAim = aim.str();
 
         OverseerDecisions::DungeonRunEntryState const* leaderState = nullptr;
@@ -19978,16 +20076,28 @@ private:
                 EscortToward(state.name, doorAim, what, purpose);
         }
 
-        if (!coord.loggedCrossingAim)
+        // SAID AGAIN IF THE GROUNDING VERDICT FLIPPED, and only then. See
+        // loggedCrossingAimGrounded: a crossing that begins before the door's
+        // grid is loaded starts on the trigger's own z and moves onto the floor
+        // a poll or two later, and a line that cannot say so is describing a
+        // state the module has left.
+        if (!coord.loggedCrossingAim || coord.loggedCrossingAimGrounded != doorHeight.grounded)
         {
             coord.loggedCrossingAim = true;
+            coord.loggedCrossingAimGrounded = doorHeight.grounded;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} walks the party the last yards onto "
                      "areatrigger {} ({}) - every member under its own power, and nobody "
                      "is knocked through until everybody is on the doorstep. Leader '{}' "
-                     "is {:.0f}y out",
+                     "is {:.0f}y out. That aim's z is {}, {:.2f}y from the middle of the "
+                     "door's own box (#376)",
                      what, triggerId, doorAim, leaderName,
-                     leaderState ? leaderState->distanceFromDoor : -1.f);
+                     leaderState ? leaderState->distanceFromDoor : -1.f,
+                     doorHeight.grounded
+                         ? "the floor under the door"
+                         : "the trigger's own row, because no floor inside the door "
+                           "was found under it this poll",
+                     doorHeight.correctionYards);
         }
 
         if (!OverseerDecisions::DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))
