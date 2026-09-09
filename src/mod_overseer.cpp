@@ -11560,14 +11560,14 @@ private:
             // reaching is planned, which is what PlanRoute does with this.
             //
             // WHAT THE OLD ANSWER COST, measured on the dev realm. A member
-            // standing 1521 yards east of the corridor was sent to the top of
-            // the descent, read this verdict, and was routed to the door by
-            // survey for the entire journey - including the last stretch, which
-            // is the corridor's own ground and is where the road passes within
-            // five yards of a level 40 guard spawn. The party are levels 28 to
-            // 33. The corridor's tightest point stands 225 yards clear of
-            // anything of the other side, and it was refused for being 1521
-            // yards away rather than for being unsafe.
+            // standing 1361 yards from the nearest point of the corridor was
+            // sent to the top of the descent, read this verdict, and was routed
+            // to the door by survey for the entire journey - including the last
+            // stretch, which is the corridor's own ground and is where the road
+            // passes within five yards of a level 40 guard spawn. The party are
+            // levels 28 to 33. The corridor's tightest point stands 225 yards
+            // clear of anything of the other side, and it was refused for being
+            // 1361 yards away rather than for being unsafe.
             if (plan.verdict == OverseerDecisions::StagingCorridorVerdict::TooFarToJoin)
             {
                 answer.joinFirst = true;

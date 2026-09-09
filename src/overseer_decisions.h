@@ -6818,14 +6818,14 @@ struct StagingCorridorPlan
 // AND BEING TOO FAR OFF IT IS A DISTANCE AND NOT A DISMISSAL (#356 again). The
 // direction half of that issue was fixed and the reach half was not, and the
 // reach half is the one that was still killing characters. Measured on the dev
-// realm: a member standing 1521 yards east of the corridor was sent to the top
-// of the descent, read `TooFarToJoin`, and was handed the surveyed route for
-// the WHOLE journey - including the last stretch, which is the corridor's own
-// ground and is the one place a surveyed route is known to run past a level 40
-// guard spawn at five yards. The bound did its job, which is to say that ONE
-// hop of 1521 yards must not be crossed on a bearing, and then the caller drew
-// a conclusion the bound does not support: that a corridor a character cannot
-// step straight onto is a corridor it cannot use at all.
+// realm: a member standing 1361 yards from the nearest point of the corridor
+// was sent to the top of the descent, read `TooFarToJoin`, and was handed the
+// surveyed route for the WHOLE journey - including the last stretch, which is
+// the corridor's own ground and is the one place a surveyed route is known to
+// run past a level 40 guard spawn at five yards. The bound did its job, which
+// is to say that ONE hop of 1361 yards must not be crossed on a bearing, and
+// then the caller drew a conclusion the bound does not support: that a corridor
+// a character cannot step straight onto is a corridor it cannot use at all.
 //
 // So the nearest point is reported under that verdict too, and the caller is
 // left to decide how to cover the gap. This function still refuses to CLAIM
