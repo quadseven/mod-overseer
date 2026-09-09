@@ -5013,6 +5013,50 @@ private:
     // kept: discarding a character's movement generators would cancel a travel
     // errand nobody asked this verb to cancel (#163).
     //
+    // AND THAT LINE HAS A PRICE, WHICH IS NOW MEASURED AND HAS TO BE WRITTEN
+    // DOWN, BECAUSE FOUR MECHANISMS DEPEND ON THIS HOLD (#355). THIS HOLD DOES
+    // NOT STOP A FOLLOWER WHOSE LEADER IS WALKING. On the dev realm on
+    // 2026-09-09 a character was held with this function - the log line says
+    // "stay added, follow removed, new rpg was off, already standing, taken off
+    // its mount", so every half of the hold went on - and nine seconds later
+    // the same character read forty yards further away. That is not the hold
+    // failing to be applied. It is the hold being applied to the wrong layer:
+    //
+    //   * WHAT THE HOLD TAKES AWAY IS THE ABILITY TO BE GIVEN A NEW WALK. The
+    //     strategies come off and the six hand-back sites are made to ask
+    //     first, so nothing in this module or in mod-playerbots' action list
+    //     will START another one.
+    //   * WHAT IT DOES NOT TAKE AWAY IS THE WALK ALREADY IN PROGRESS.
+    //     Unit::StopMoving (Unit.cpp:13045) clears UNIT_STATE_MOVING and stops
+    //     the current spline; it does not touch the MotionMaster. So a
+    //     FollowMovementGenerator that MoveFollow put in MOTION_SLOT_ACTIVE is
+    //     still there, and FollowMovementGenerator<Player>::DoUpdate
+    //     (TargetedMovementGenerator.cpp:580) re-splines on the next tick that
+    //     finds its target out of position. A held follower behind a leader
+    //     that is still walking is therefore dragged after it, at run speed,
+    //     for as long as the leader keeps moving - which is exactly forty yards
+    //     in nine seconds.
+    //
+    // SO THE HOLD IS EXACTLY AS STRONG AS ITS NAME AND NO STRONGER: it stops a
+    // character being SENT somewhere, and it stops one that was standing still
+    // from wandering off. It is not a root. Every verb that depends on it is
+    // depending on the character having nothing already in flight, which is
+    // true for a `conjure` or a `hearth` on a character at an inn and is not
+    // true for a party being walked to a door. `stage` (#346) is the one most
+    // exposed to this, because it holds a whole party at the exact moment its
+    // leader is being re-aimed.
+    //
+    // WHAT IS DONE ABOUT IT HERE: NOTHING, DELIBERATELY, AND THE REASON IS
+    // #163. Clearing the slot for every hold would cancel travel errands this
+    // module never asked to cancel, which is the failure that line was drawn to
+    // prevent. What #355 does instead is narrower and is in the summon verb
+    // rather than in the hold: WalkTowardTheStone issues a MovePoint, which
+    // mutates the same MOTION_SLOT_ACTIVE (MotionMaster.h:230, :242) and so
+    // displaces the chase with a walk that ENDS - and it is only ever issued to
+    // a character this hold is already holding, so it cancels nothing that was
+    // not already stopped. A verb that needs a character to stay put while
+    // something outside it is walking has to say where, not just say stop.
+    //
     // AND `flee` IS LEFT ALONE, DELIBERATELY. A fleeing character moves, so
     // `flee` fights this hold, and removing it would be a casting verb holding a
     // character still while something kills it. Every one of these verbs already
@@ -5376,7 +5420,8 @@ private:
             if (check.targetName == name)
                 return true;
         for (SummonCheck const& check : _pendingSummons)
-            if (check.summonerName == name || check.ev.helper == name)
+            if (check.summonerName == name || check.ev.helper == name
+                || check.helperName == name || check.ev.heldHelper == name)
                 return true;
         return false;
     }
@@ -29452,6 +29497,31 @@ private:
     // one still. So the row goes to `verifying` and ResolveSummonChecks reads
     // back where the summoned character actually is, exactly as the hearth
     // does. `delivered` here would be the claim AGENTS.md warns about.
+    //
+    // AND WHY IT NOW PARKS TWICE (#355). Everything above assumed the two
+    // clickers were standing at the stone when the row arrived. Measured over
+    // seven attempts across forty minutes, they never are, and they never
+    // become so on their own: ONLY THE LEADER EVER REACHES THE STONE. A leader
+    // can be aimed and on its aim it reached three yards; a FOLLOWER walks to
+    // the LEADER and stops at follow distance, which parked the two best
+    // candidates 15 and 16 yards out against a gate of about five. So the verb
+    // now walks them the last few yards itself, and the walk is a phase of the
+    // row rather than a refusal: DoSummon parks with `approaching` set,
+    // ResolveSummonApproach re-asserts the holds and re-issues the walk every
+    // poll, and the poll on which both are in reach drives the ritual and hands
+    // the row on to the wait above.
+    //
+    // THE WALK CANNOT BE AN AIM, WHICH IS THE ONE DESIGN QUESTION THIS RAISED.
+    // Everywhere else this module walks somebody it writes `travel_npc` and
+    // lets patch 0012's aimed wander drive it, and #353 got a follower through
+    // a door that way with a `trigger:` aim under an escort. Neither is
+    // available here: an `at:` aim on a follower is NeedsTheFamily in
+    // ReadSplitErrand and its mover is taken straight back, and the escape #353
+    // used - an escort, which is the first branch of MaySteerItself - works by
+    // GRANTING `new rpg`, which is one of the two strategies this verb's hold
+    // has just removed. A hold and an aim are opposites by construction. So the
+    // approach is ordinary movement issued inside the verb, under the hold, and
+    // the whole argument is written out at WalkTowardTheStone.
 
     // The portal the meeting stone's spell creates, and the only gameobject
     // this executor ever clicks that it did not find by sweeping. Named as a
@@ -29502,6 +29572,63 @@ private:
     // mystery.
     static constexpr float SUMMON_SWEEP_YARDS = 40.f;
 
+    // ------------------------------------ the last few yards to a stone (#355) --
+    //
+    // HOW FAR THIS VERB WILL WALK A CLICKER, AND WHY IT IS THE SWEEP'S OWN
+    // NUMBER. The sweep width was chosen so a refusal could say how far the
+    // nearest stone WAS, on the argument that a stone that close is "an aim
+    // error somebody can correct". #355 is what happens when nobody can correct
+    // it: a FOLLOWER cannot be aimed at a coordinate at all, because
+    // ReadSplitErrand classes every `at:` aim NeedsTheFamily and
+    // KeepRosterFollowing takes the mover straight back off it, so the last
+    // fifteen yards were a correction only the module itself could make. Every
+    // stone this executor can see is therefore one it will walk to, and the two
+    // numbers are deliberately the same rather than coincidentally equal:
+    // widening the sweep widens the walk, which is the behaviour a reader
+    // expects from "how far it looks for a stone".
+    //
+    // IT IS BOUNDED BY THE GROUND AND NOT BY THIS NUMBER. Forty yards is the
+    // most this will ever ATTEMPT; what it actually walks is whatever
+    // GroundedStep proves stride by stride, which is the same gate every other
+    // place-aim in this module passes through (#138, #262).
+    static constexpr float SUMMON_APPROACH_YARDS = SUMMON_SWEEP_YARDS;
+
+    // HOW LONG THE WALK MAY TAKE BEFORE THE ROW GIVES UP ON IT.
+    //
+    // WHAT IT HAS TO COVER. Forty yards at a bot's run speed is under six
+    // seconds. TRAVEL_STEP_YARDS is 60, so even the stepped fallback
+    // GroundedStep drops to when the navmesh will not route covers this whole
+    // distance in one step rather than one step per poll. Twenty seconds is
+    // room for the walk to be restarted several times over, which is what it
+    // costs when something keeps handing the character a mover back.
+    //
+    // AND WHAT IT MUST STAY INSIDE, WHICH IS ARITHMETIC AND NOT A MARGIN. The
+    // holds on the two clickers are what make the walk stick, and
+    // CAST_HOLD_CEILING_SECONDS is 45 seconds from the moment a hold is PLACED
+    // - re-asserting does not push that deadline out, deliberately. The hold
+    // has to survive the walk and then the five seconds the ritual takes to
+    // settle, because that is the last moment CheckRitualList cares whether
+    // either clicker moved: 20 + 5 is 25, inside 45 with the rest of the ritual
+    // to spare. What happens after the settle - the request, the accept and the
+    // teleport - does not need either clicker standing still, and the summon
+    // point is re-read off the summoner on every poll anyway.
+    //
+    // Well inside COMMAND_CLAIM_LEASE_SECONDS for the reason
+    // SUMMON_SETTLE_CEILING_MS is: a parked summon is always resolved by this
+    // code and never reaped by the claim sweep with nothing to say.
+    static constexpr uint32 SUMMON_APPROACH_CEILING_MS = 20000;
+
+    // The id handed to MotionMaster::MovePoint for the approach.
+    //
+    // IT IS NOT READ BY ANYTHING, AND THAT IS WORTH WRITING DOWN RATHER THAN
+    // ASSUMING. PointMovementGenerator<Player>::MovementInform is empty on the
+    // pinned core (PointMovementGenerator.cpp) - only the Creature
+    // specialisation informs an AI - so this number reaches nobody's dispatch
+    // table and cannot collide with an upstream one. It is named anyway,
+    // because a bare literal in a MovePoint call is the kind of thing somebody
+    // later reads as meaningful.
+    static constexpr uint32 SUMMON_APPROACH_POINT_ID = 0;
+
     struct SummonEvidence
     {
         std::string summoner;
@@ -29519,6 +29646,19 @@ private:
         uint32 waitedMs{0};
         float stoneYards{-1.f};
         float nearestStoneYards{-1.f};
+        // WHAT THE APPROACH DID, AND IT IS FOUR SEPARATE READINGS ON PURPOSE
+        // (#355). "The row walked somebody" and "the row walked THIS somebody"
+        // are different questions, and the second clicker is the one that used
+        // to arrive by accident - so a reader that cannot tell which of the two
+        // was walked cannot tell an approach that worked from one that only
+        // half ran. `helperStoneYards` is the second clicker's own distance to
+        // the stone, which nothing before this ever recorded: every refusal
+        // about the second clicker was published with the SUMMONER'S distance
+        // beside it.
+        bool walkedSummoner{false};
+        bool walkedHelper{false};
+        uint32 approachMs{0};
+        float helperStoneYards{-1.f};
         int32 channellingAfterClick{-1};  // -1 never asked, 0 no, 1 yes
         int32 requestSeen{-1};            // -1 never asked, 0 never pending, 1 pending
         int32 deadAtVerdict{-1};
@@ -29544,9 +29684,29 @@ private:
         OverseerDecisions::SummonOutcome verdict{OverseerDecisions::SummonOutcome::Unreadable};
     };
 
-    // A summon waiting out its own ritual, request, accept and teleport. Held
-    // on the world thread beside _pendingChecks and _pendingHearths, and
-    // bounded the same way.
+    // A summon waiting out its own ritual, request, accept and teleport - and,
+    // since #355, the walk to the stone that comes before all of it. Held on
+    // the world thread beside _pendingChecks and _pendingHearths, and bounded
+    // the same way.
+    //
+    // A ROW NOW HAS TWO WAITS AND NOT ONE, AND THEY ARE TIMED SEPARATELY.
+    // `ev.approachMs` accumulates while the clickers walk and `ev.waitedMs`
+    // while the ritual settles, because a window that had already spent ten
+    // seconds on a walk would judge the ritual early and answer `stayed` about
+    // a summon that was still running. `approaching` is what says which of the
+    // two a poll is in, and it goes false exactly once, on the poll that drives
+    // the ritual.
+    //
+    // WHY THE WALK IS PARKED HERE RATHER THAN RETRIED BY THE SENDER. The three
+    // casting verbs refuse with a retry class and let the sender re-ask, which
+    // is #230's rule and it is kept everywhere it applies. It does not apply to
+    // a walk: the hold that makes the walk stick expires in 45 seconds, and the
+    // measured operator cadence on this verb was one ask every six minutes, so
+    // a row that walked the clickers and then ended would have released them to
+    // wander back before anything asked again. Parking is not a retry at the
+    // head of the queue - a `verifying` row is out of the FIFO already, which is
+    // the state this verb has used since #313 for exactly this shape of wait:
+    // the world has to move before the row can be answered.
     struct SummonCheck
     {
         uint32 id{0};
@@ -29554,6 +29714,14 @@ private:
         std::string summonedName;
         ObjectGuid summonerGuid;
         ObjectGuid summonedGuid;
+        // The second clicker the approach is walking, held by NAME rather than
+        // by pointer for the reason every other parked row here holds a name:
+        // the poll that reads it back is a different poll, and a Player* does
+        // not survive a logout. `ev.helper` carries the same name into the JSON
+        // and into ARowStillOwnsTheHold, which is what keeps the helper's hold
+        // alive while the walk is running.
+        std::string helperName;
+        bool approaching{false};
         SummonEvidence ev;
     };
 
@@ -29610,7 +29778,11 @@ private:
           << ",\"window_ms\":" << ev.windowMs
           << ",\"waited_ms\":" << ev.waitedMs
           << ",\"stone_yards\":" << ev.stoneYards
-          << ",\"nearest_stone_yards\":" << ev.nearestStoneYards;
+          << ",\"nearest_stone_yards\":" << ev.nearestStoneYards
+          << ",\"helper_stone_yards\":" << ev.helperStoneYards
+          << ",\"walked_summoner\":" << (ev.walkedSummoner ? "true" : "false")
+          << ",\"walked_helper\":" << (ev.walkedHelper ? "true" : "false")
+          << ",\"approach_ms\":" << ev.approachMs;
         o << ",\"channelling_after_click\":";
         if (ev.channellingAfterClick < 0)
             o << "null";
@@ -29691,39 +29863,156 @@ private:
         }
     };
 
-    // The meeting stone this character could click from where it stands, or
-    // nullptr. `nearestYards` is left at -1 when nothing stone-shaped was found
-    // at all, and otherwise carries the distance to the closest one even when
-    // none of them passed the gate - which is the difference between "walk to a
-    // dungeon that has a stone" and "walk four more yards".
-    static GameObject* FindMeetingStoneInReach(Player* who, float& nearestYards,
-                                               float& chosenYards)
+    // The nearest meeting stone this character can see, or nullptr when the
+    // sweep found nothing stone-shaped at all. `nearestYards` is left at -1 in
+    // that case, and otherwise carries the distance to the one that came back.
+    //
+    // IT USED TO RETURN ONLY A STONE ALREADY IN REACH, AND THAT WAS THE SHAPE
+    // OF #355 (this function was FindMeetingStoneInReach). While the only thing
+    // a row could do with an out-of-reach stone was name it in a refusal, "the
+    // one you may click" was the whole of what a caller wanted, and the
+    // distance to the closest was a number for the message. Now that the row
+    // WALKS to one, the caller wants the OBJECT: a walk needs its position, and
+    // taking that position from anywhere other than the object the gate will
+    // later be measured against is walking to a coordinate that is nearly the
+    // stone. Reach is a separate question with a separate answer - AtTheStone -
+    // asked of whichever character is being talked about, which is the other
+    // half of why this cannot return it: the summoner and the second clicker
+    // have different answers about one stone.
+    static GameObject* FindNearestMeetingStone(Player* who, float& nearestYards)
     {
         nearestYards = -1.f;
-        chosenYards = -1.f;
 
         std::list<GameObject*> stones;
         MeetingStoneNearbyCheck check{who, SUMMON_SWEEP_YARDS};
         Acore::GameObjectListSearcher<MeetingStoneNearbyCheck> searcher(who, stones, check);
         Cell::VisitObjects(who, searcher, SUMMON_SWEEP_YARDS);
 
-        GameObject* found = nullptr;
+        GameObject* nearest = nullptr;
         for (GameObject* go : stones)
         {
             float const yards = who->GetDistance(go);
-            if (nearestYards < 0.f || yards < nearestYards)
-                nearestYards = yards;
-
-            // THE GATE, AND IT IS THE CORE'S OWN. This is the exact test
-            // WorldSession::HandleGameObjectUseOpcode makes on the guid a
-            // client sends, so a stone this accepts is a stone that handler
-            // will accept.
-            if (found || !go->IsWithinDistInMap(who, go->GetInteractionDistance()))
+            if (nearestYards >= 0.f && yards >= nearestYards)
                 continue;
-            found = go;
-            chosenYards = yards;
+            nearestYards = yards;
+            nearest = go;
         }
-        return found;
+        return nearest;
+    }
+
+    // How far this character is from a stone, in the units every other reading
+    // in this verb uses. Named because the approach asks it about the SECOND
+    // CLICKER, which nothing did before, and a hand-rolled sqrt beside a
+    // GetDistance would be two ways of measuring one gap.
+    static float YardsFromTheStone(Player* who, GameObject* stone)
+    {
+        if (!who || !stone || !stone->IsInMap(who))
+            return -1.f;
+        return who->GetDistance(stone);
+    }
+
+    // CAN THIS CHARACTER CLICK THAT STONE FROM WHERE IT STANDS? Spelled once
+    // so that the row's own gate, the walk and the sweep cannot come to
+    // different answers about one gap.
+    //
+    // IT IS THE HANDLER'S OWN LINE AND NOT AN APPROXIMATION OF IT.
+    // WorldSession::HandleGameObjectUseOpcode (SpellHandler.cpp:336) opens with
+    // exactly `obj->IsWithinDistInMap(player, obj->GetInteractionDistance())`
+    // and returns silently when it fails, so a stone this answers true about is
+    // one that handler will accept and a click it answers false about is a
+    // packet that vanishes with no feedback of any kind.
+    //
+    // AND IT IS NOT `YardsFromTheStone() <= GetInteractionDistance()`, WHICH IS
+    // THE TEMPTING VERSION. WorldObject::IsWithinDistInMap measures three
+    // dimensions and subtracts BOTH objects' bounding radii, and it checks the
+    // map and the phase on the way past. A hand-rolled comparison agrees with
+    // it most of the time, and most of the time is what produces a row that
+    // walks to a stone, decides it has arrived, clicks, and is refused by the
+    // handler in silence - for ever, at whatever distance the two disagree by.
+    static bool AtTheStone(Player* who, GameObject* stone)
+    {
+        return who && stone && stone->IsWithinDistInMap(who, stone->GetInteractionDistance());
+    }
+
+    // ------------------------------ walk one clicker onto the stone (#355) --
+    //
+    // THE HALF THE HOLD NEVER HAD. #335 and #338 gave the three casting verbs
+    // one hold and #350 put a dismount inside it, and the log of the seven
+    // failed attempts shows every bit of that working. What a hold does is pin
+    // a character WHERE IT ALREADY STANDS, and where the two measured clickers
+    // stood was fifteen and sixteen yards from a stone with a five yard gate.
+    // So the hold was never going to be enough on its own, and this is the
+    // short walk that finishes it.
+    //
+    // WHY IT IS A MOTION MASTER CALL AND NOT AN AIM, WHICH IS THE WHOLE DESIGN
+    // QUESTION. Everywhere else this module walks somebody it writes a
+    // `travel_npc` aim and lets patch 0012's aimed wander drive it. That route
+    // is closed here, twice over:
+    //
+    //   * IT NEEDS `new rpg` AND THE HOLD HAS JUST TAKEN `new rpg` OFF. The two
+    //     mechanisms are opposites by construction. A row cannot hold a
+    //     character still for a five second channel and also hand it the
+    //     strategy that walks it around.
+    //   * AND A FOLLOWER CANNOT BE SENT TO A COORDINATE ANYWAY. ReadSplitErrand
+    //     classes every `at:` aim NeedsTheFamily, SplitFollowerDrivesItself
+    //     refuses a follower the mover for one, and KeepRosterFollowing's
+    //     backstop takes `new rpg` straight back off it. #353 hit exactly this
+    //     wall and worked around it with a `trigger:` aim under an ESCORT,
+    //     because `IsEscorted` is the first branch of MaySteerItself. That
+    //     escape is not available here either: an escort grants `new rpg`, and
+    //     granting `new rpg` to a character this row is holding still is the
+    //     thing the hold exists to prevent. A meeting stone is not an
+    //     areatrigger and there is no `stone:` aim to write, and inventing one
+    //     would be inventing a way for a cut-off follower to walk to any point
+    //     anybody wrote, which is the scatter three fixes in this file removed.
+    //
+    // So the approach happens INSIDE the verb, under the hold, and it is
+    // ordinary movement: MotionMaster::MovePoint, the same call patch 0012's
+    // mover ends in. No teleport, no GM command, and every gate the core keeps
+    // is still kept - the handler re-checks the interaction distance itself
+    // when the clicks finally go out.
+    //
+    // AND IT IS ONLY EVER ISSUED UNDER THE HOLD, WHICH IS WHAT MAKES IT SAFE
+    // AND WHAT MAKES IT STICK. MovePoint mutates MOTION_SLOT_ACTIVE
+    // (MotionMaster.h:242, MotionMaster::Mutate deletes whatever is in the
+    // slot), and MoveFollow uses that same slot (MotionMaster.h:230). So this
+    // call DISPLACES the follow generator that was dragging the character after
+    // its leader - see the note on HoldCharacterStill for why that generator
+    // survives a hold - and replaces it with a walk that ENDS at the stone.
+    // When it arrives, PointMovementGenerator returns false, the motion master
+    // falls back to idle, and nothing walks the character anywhere until the
+    // hold lifts and its strategies come back. Doing this to a character that
+    // was NOT held would be this module cancelling a travel errand nobody asked
+    // it to cancel (#163), which is the line #308 drew and #330 kept; doing it
+    // to one that is held cancels nothing, because a held character's errand is
+    // already stopped.
+    //
+    // THE GROUND IS PROVED, NOT ASSUMED. GroundedStep is the same gate every
+    // place-aim in this module passes through, and it is not optional here just
+    // because the walk is short: PointMovementGenerator::DoInitialize falls
+    // back to a raw straight-line MoveTo whenever the path it computes has two
+    // points or fewer, and PathGenerator's hole-in-the-mesh branch produces
+    // exactly such a path for a PLAYER without ever answering NOPATH. That is
+    // the mechanism behind the ten self-kills of #138, at fifteen yards as
+    // readily as at four hundred. So the point handed to MovePoint is whatever
+    // GroundedStep proved - the stone itself when the mesh routes there, and a
+    // short step over ground that holds when it does not, with the next poll
+    // stepping again from wherever the character then stands.
+    //
+    // Returns false when there is no step this module will take, which is a
+    // refusal about the GROUND and is reported as one.
+    static bool WalkTowardTheStone(Player* who, GameObject* stone)
+    {
+        if (!who || !stone || !stone->IsInMap(who))
+            return false;
+        WorldPosition const want(stone->GetMapId(), stone->GetPositionX(),
+                                 stone->GetPositionY(), stone->GetPositionZ());
+        WorldPosition step;
+        if (!GroundedStep(who, want, step))
+            return false;
+        who->GetMotionMaster()->MovePoint(SUMMON_APPROACH_POINT_ID, step.GetPositionX(),
+                                          step.GetPositionY(), step.GetPositionZ());
+        return true;
     }
 
     static GameObject* FindSummonPortal(Player* summoner)
@@ -29831,51 +30120,370 @@ private:
             return;
         HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
 
+        // `0` IS "NO DISTANCE LIMIT ON A NAMED CLICKER", and it is what this
+        // path has always done. A sender that names a second clicker has said
+        // who it wants; this hold is a remedy for a refusal and not a walk, so
+        // it holds whoever was named wherever it is. The approach passes a real
+        // number instead, because walking somebody in from two hundred yards is
+        // a different act with a different cost.
+        Player* const helper = PickSecondClicker(who, targetArg, summonedName,
+                                                 INTERACTION_DISTANCE, 0.f);
+        if (!helper)
+            return;
+        HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
+        if (ev.helperHold.applied)
+            ev.heldHelper = helper->GetName();
+    }
+
+    // WHO THE SECOND CLICKER IS, ASKED IN ONE PLACE (#355).
+    //
+    // THREE PLACES USED TO ANSWER THIS AND THEY DID NOT AGREE. The hold's own
+    // scan, DoSummon's named branch and DoSummon's scan each had a list of
+    // conditions, and the approach needed a fourth with a wider radius. Four
+    // opinions about which party member is going to click a portal is how a row
+    // holds one character and clicks with another, so there is one of them now.
+    //
+    // WHAT IS CHECKED HERE AND WHAT IS NOT. Everything that makes a character
+    // an ELIGIBLE clicker: it exists, it is not the summoner, it is not the
+    // character being summoned, it has a session, it is in the world, it is
+    // alive, it is not mid-teleport, and it is in the same raid - which is the
+    // core's own `castersGrouped` requirement on the portal. Combat is refused
+    // for the reason the hold gives everywhere else: a character held still
+    // through a fight is a character killed by the hold.
+    //
+    // MOVEMENT AND CASTING ARE DELIBERATELY NOT CHECKED. They are the two
+    // conditions this module can DO something about - the hold stops a walker
+    // and a cast ends on its own - and skipping a moving candidate here is what
+    // turned "everybody at the stone is walking" into a refusal about place. The
+    // ritual's own gates ask about both, at the point where the answer matters.
+    //
+    // `scanYards` bounds the SEARCH and `namedYards` bounds a clicker the sender
+    // NAMED, and they are separate because the two callers want different
+    // things: a hold placed on the way out of a refusal takes the sender's word
+    // for it (`namedYards` 0, meaning no limit, which is what that path has
+    // always done), and a walk will not drag a named character in from further
+    // than it would walk anybody else.
+    static Player* PickSecondClicker(Player* who, std::string const& targetArg,
+                                     std::string const& summonedName, float scanYards,
+                                     float namedYards)
+    {
+        auto eligible = [&](Player* member) -> bool
+        {
+            if (!member || member == who)
+                return false;
+            if (!member->GetSession() || !member->IsInWorld() || !member->IsAlive())
+                return false;
+            if (member->IsInCombat() || member->IsBeingTeleported())
+                return false;
+            return member->IsInSameRaidWith(who);
+        };
+
         if (!targetArg.empty())
         {
-            // THE NAMED CLICKER IS CHECKED BEFORE IT IS HELD, and it has to be
-            // checked HERE rather than left to DoSummon's own helper block. This
-            // runs from the summoner's movement refusal, which fires long before
-            // that block, so `target_arg` has been checked for nothing at all at
-            // this point: without these, naming any online character would place
-            // a 45 second hold on it - in combat, dead, mid-teleport, or in
-            // somebody else's party. Combat above all, which is the rule this
-            // whole hold keeps: a character held still through a fight is a
-            // character killed by the hold.
-            Player* named = ObjectAccessor::FindPlayerByName(targetArg, false);
-            if (named && named != who && named->IsInWorld() && named->GetSession()
-                && named->IsAlive() && !named->IsInCombat() && !named->IsBeingTeleported()
-                && named->IsInSameRaidWith(who))
-            {
-                HoldStillAndReport(named, named->GetName(), "summon", ev.helperHold);
-                if (ev.helperHold.applied)
-                    ev.heldHelper = named->GetName();
-            }
-            return;
+            Player* const named = ObjectAccessor::FindPlayerByName(targetArg, false);
+            if (!eligible(named))
+                return nullptr;
+            if (namedYards > 0.f && !named->IsWithinDistInMap(who, namedYards))
+                return nullptr;
+            return named;
         }
 
-        Group* group = who->GetGroup();
+        Group* const group = who->GetGroup();
         if (!group)
-            return;
+            return nullptr;
         for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
         {
-            Player* member = ref->GetSource();
-            if (!member || member == who || member->GetName() == summonedName)
+            Player* const member = ref->GetSource();
+            if (!eligible(member) || member->GetName() == summonedName)
                 continue;
-            if (!member->GetSession() || !member->IsInWorld() || !member->IsAlive())
+            if (!member->IsWithinDistInMap(who, scanYards))
                 continue;
-            // Combat is left alone on purpose, here as everywhere else in this
-            // hold: a character held still through a fight is a character
-            // killed by the hold.
-            if (member->IsInCombat() || member->IsBeingTeleported())
-                continue;
-            if (!member->IsWithinDistInMap(who, INTERACTION_DISTANCE))
-                continue;
-            HoldStillAndReport(member, member->GetName(), "summon", ev.helperHold);
-            if (ev.helperHold.applied)
-                ev.heldHelper = member->GetName();
-            return;
+            return member;
         }
+        return nullptr;
+    }
+
+    // HOLD BOTH CLICKERS AND WALK WHICHEVER OF THEM IS NOT AT THE STONE (#355).
+    //
+    // THE ORDER IS LOAD-BEARING AND IT IS HOLD, THEN WALK, IN THAT ORDER, IN ONE
+    // CALL. HoldCharacterStill ends in Unit::StopMoving, which finalises the
+    // spline; PointMovementGenerator::DoUpdate answers false on a finalised
+    // spline and the motion master then drops it. So a hold placed AFTER a walk
+    // kills the walk, and a hold placed on a later poll would kill it too if
+    // anything came between the two calls. Nothing does: every caller holds and
+    // walks in the same statement, on the same tick, so the character never
+    // stops for a tick that anything else could see.
+    //
+    // AND BOTH ARE WALKED, WHICH IS THE HALF THE ISSUE ASKED ABOUT TWICE. The
+    // second clicker has the identical problem to the summoner - it is a
+    // FOLLOWER, it walks to its leader and stops at follow distance, and it has
+    // arrived at a stone by accident or not at all - and a ritual with one
+    // clicker in reach is a ritual that fails five seconds later when
+    // CheckRitualList re-counts. Walking only the summoner would have moved the
+    // failure rather than fixed it.
+    //
+    // WHOEVER IS ALREADY IN REACH IS HELD AND LEFT ALONE. Walking a character
+    // that is standing on the stone would be a walk that ends where it started,
+    // and the hold is what should be pinning it by then.
+    //
+    // `ev.walked*` RECORD WHAT THIS DID rather than what it intended: false
+    // means either "it was already there" or "the ground refused", and the
+    // refusal literal is what tells those apart.
+    static bool HoldAndWalkTheClickers(Player* who, Player* helper, GameObject* stone,
+                                       SummonEvidence& ev, char const*& wall)
+    {
+        wall = nullptr;
+        if (!who || !stone)
+        {
+            wall = "no meeting stone within reach of the summoner";
+            return false;
+        }
+
+        // NOBODY IS HELD FOR A WALK WHO COULD NOT BE HELD AT ALL, and this is
+        // the one place that decides it for both clickers. A character held
+        // still through a fight is a character killed by the hold - the rule
+        // every hold in this file keeps - and a corpse cannot be walked to a
+        // stone whatever is done to it. These are asked BEFORE the summoner's
+        // own hold goes on, so a row that is going to refuse has stopped
+        // nobody.
+        //
+        // THEY ARE ASKED AGAIN IN DriveSummonRitual AND THAT IS NOT AN
+        // OVERSIGHT. This walk can take twenty seconds; the ritual is driven at
+        // the end of it. A fight that starts halfway is a fact about the moment
+        // it is read, and reading it once at the start of a walk and calling
+        // that good enough is how a row clicks a portal with a corpse.
+        if (who->IsInCombat())
+        {
+            wall = "summoner is in combat";
+            return false;
+        }
+        if (helper && !helper->IsAlive())
+        {
+            wall = "the second clicker is dead";
+            return false;
+        }
+        if (helper && helper->IsInCombat())
+        {
+            wall = "the second clicker is in combat";
+            return false;
+        }
+
+        HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
+        ev.nearestStoneYards = YardsFromTheStone(who, stone);
+        if (!AtTheStone(who, stone))
+        {
+            if (!WalkTowardTheStone(who, stone))
+            {
+                wall = "the ground between the summoner and the meeting stone does not hold";
+                return false;
+            }
+            ev.walkedSummoner = true;
+        }
+
+        if (!helper)
+            return true;
+
+        // THE SECOND CLICKER'S WALK IS BOUNDED BY THE STONE AND NOT BY THE
+        // SUMMONER, and that is a different measurement from the one that
+        // chose it. PickSecondClicker's scan bounds a candidate by how far it
+        // is from the SUMMONER, which is the right question for "who is here";
+        // this is "how far would it have to walk", and for a clicker the sender
+        // NAMED there was no bound at all. Without this a `target_arg` naming
+        // somebody across the zone would start a two hundred yard walk under a
+        // 45 second hold and end in a timeout twenty seconds later, having
+        // taken a character off whatever it was doing for nothing. A negative
+        // reading - a clicker on another map - is refused by the same test.
+        ev.helperStoneYards = YardsFromTheStone(helper, stone);
+        if (ev.helperStoneYards < 0.f || ev.helperStoneYards > SUMMON_APPROACH_YARDS)
+        {
+            wall = "no second party member is at the stone";
+            return false;
+        }
+
+        HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
+        if (ev.helperHold.applied)
+            ev.heldHelper = helper->GetName();
+        if (!AtTheStone(helper, stone))
+        {
+            if (!WalkTowardTheStone(helper, stone))
+            {
+                wall =
+                    "the ground between the second clicker and the meeting stone does not hold";
+                return false;
+            }
+            ev.walkedHelper = true;
+        }
+        return true;
+    }
+
+    // THE RITUAL ITSELF, FROM THE HOLD TO THE PORTAL.
+    //
+    // ONE FUNCTION BECAUSE #355 GAVE IT A SECOND CALLER. It used to be the tail
+    // of DoSummon and nothing else could reach it, which was fine while every
+    // summon was driven on the poll the row was claimed. A row that has to WALK
+    // its clickers to the stone first is answered by ResolveSummonChecks
+    // several polls later, and that poll needs to drive exactly the same
+    // sequence with exactly the same gates and exactly the same words. Two
+    // copies of a five-packet ritual is how one of them quietly stops re-asserting
+    // a selection or stops checking the portal's own distance.
+    //
+    // Returns the refusal literal, or nullptr when the ritual is running and
+    // the row should be parked to wait it out. It writes no row, releases no
+    // hold and parks nothing: each caller finishes in the shape its own path
+    // wants.
+    static char const* DriveSummonRitual(Player* who, Player* summoned, Player* helper,
+                                         GameObject* stone, SummonEvidence& ev)
+    {
+        // FOUR POINTERS AND FOUR ANSWERS, not one catch-all. Both callers have
+        // already checked all of these, so none of this is expected to fire -
+        // but a defensive branch that returns somebody else's refusal literal
+        // is worse than no branch at all, because the retry table then tells a
+        // sender to go and stand somewhere else about a null pointer.
+        if (!who || !summoned)
+            return "the character to summon is not online";
+        if (!stone)
+            return "no meeting stone within reach of the summoner";
+        if (!helper)
+            return "no second party member is at the stone";
+
+        WorldSession* const session = who->GetSession();
+        WorldSession* const helperSession = helper->GetSession();
+        if (!session)
+            return "summoner has no session";
+        if (!helperSession)
+            return "the second clicker has no session";
+
+        // ---- the walls a hold cannot take down, asked before anybody is held --
+        //
+        // #338'S RULE, KEPT. A hold stops a character for 45 seconds, so it is
+        // placed as late as possible and never for a refusal standing still
+        // cannot fix. These three are exactly those: a transport, a corpse and
+        // a fight. Combat above all, which is the rule the hold keeps
+        // everywhere - a character held still through a fight is a character
+        // killed by the hold.
+        if (who->GetTransport())
+            return "summoner is on a transport";
+        if (!helper->IsAlive())
+            return "the second clicker is dead";
+        if (helper->IsInCombat())
+            return "the second clicker is in combat";
+
+        // ---- hold BOTH for the ritual, before a packet goes out (#337) ---
+        //
+        // Every hold this verb placed before #337 was a remedy for a refusal:
+        // it stopped the characters so that the NEXT ask would find them
+        // standing, and then the next ask drove the whole ritual with no hold
+        // of its own. That ritual is a channel the summoner has to keep for
+        // five seconds while CheckRitualList re-counts the participants, so
+        // the one attempt that gets this far is exactly the attempt that
+        // needs holding, and it was the only one that never was.
+        //
+        // Both, and the summoner first, because the portal is its channel.
+        // This also stands either of them up and takes either of them off a
+        // mount: the hold does both now (#337, #350), and a sitting or mounted
+        // character cannot click a stone any more than it can cast.
+        HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
+        HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
+        if (ev.helperHold.applied)
+            ev.heldHelper = helper->GetName();
+
+        // ---- and the walls the hold has just answered ------------------------
+        //
+        // ASKED AFTER THE HOLD AND NOT BEFORE IT, WHICH IS #355's OTHER
+        // REORDERING. HoldCharacterStill ends in Unit::StopMoving, and
+        // MoveSplineInit::Stop clears MOVEMENTFLAG_FORWARD out of
+        // m_movementInfo in that same call - which is what `Unit::isMoving`
+        // reads. So a character the hold has just stopped answers false here
+        // immediately, and this refusal stops meaning "it happened to be
+        // walking when the row was claimed" and starts meaning "it is still
+        // moving after being told to stop", which is a wall worth reporting.
+        //
+        // It matters most on the path that walks: a row whose clickers have
+        // just arrived is a row whose clickers are still moving, and asking
+        // this before the hold would refuse every summon the approach was about
+        // to land.
+        //
+        // THE SUMMONER HAS TO HOLD A CHANNEL FOR THE PORTAL'S WHOLE LIFE.
+        // Spell::update cancels a channel with a movement interrupt flag on the
+        // next tick that finds the caster moving, and a character already
+        // casting cannot start this one.
+        if (who->isMoving())
+            return "summoner is moving";
+        if (who->IsNonMeleeSpellCast(false))
+            return "summoner is already casting";
+        // THE SECOND CLICKER HAS TO HOLD A CHANNEL TOO, and nothing said so
+        // until a review asked. Its click starts the portal's anim spell,
+        // which is channelled with movement among its interrupt flags, and
+        // GameObject::Update runs CheckRitualList AGAIN when the ritual
+        // settles - erasing any participant that stopped channelling and
+        // dropping the count back below the one the ritual needs. A helper
+        // that walks therefore kills the summon silently, five seconds after
+        // everything looked fine.
+        if (helper->isMoving())
+            return "the second clicker is moving";
+        if (helper->IsNonMeleeSpellCast(false))
+            return "the second clicker is already casting";
+        // ---- drive the core's own handlers -----------------------------------
+        //
+        // Selection first, because GameObject::Use reads it to decide who is
+        // being summoned, then the stone, then the portal. Three packets, three
+        // handlers, and not one line of this decides where anybody goes.
+
+        DriveSelection(session, summoned->GetGUID());
+        DriveGameObjectUse(session, stone->GetGUID());
+
+        // EVIDENCE, NOT A VERDICT. The summoner should now be channelling the
+        // portal spell. Recorded rather than believed: the click may have been
+        // refused inside GameObject::Use for a reason it reports to a client
+        // that is not there, and this module finds that out by reading the
+        // world, not by trusting a void call.
+        ev.channellingAfterClick = who->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0;
+
+        GameObject* portal = FindSummonPortal(who);
+        if (!portal)
+            return "the summoner did not begin channelling the portal";
+        ev.portalEntry = portal->GetEntry();
+
+        GameObjectTemplate const* portalInfo = portal->GetGOInfo();
+        if (!portalInfo)
+            return "the core does not know that summoning portal";
+        ev.required = portalInfo->summoningRitual.reqParticipants;
+
+        // THE GATE, AND IT IS THE CORE'S OWN, on the object that is actually
+        // being clicked. Everything before this measured the helper against the
+        // STONE; this is the exact test WorldSession::HandleGameObjectUseOpcode
+        // makes, against the portal's own model and its own interaction
+        // distance. The portal is created at the SUMMONER and not at the stone,
+        // so the two are not the same question - which is the reason the
+        // approach walks both clickers to one point rather than walking the
+        // helper to wherever the summoner happens to be standing. Without this
+        // a helper right on the boundary passes this module and is dropped by
+        // the handler, and the row then blames the participant count.
+        if (!portal->IsWithinDistInMap(helper, portal->GetInteractionDistance()))
+            return "no meeting stone within reach of the second clicker";
+
+        DriveGameObjectUse(helperSession, portal->GetGUID());
+        ev.participants = portal->GetUniqueUseCount();
+
+        // The ritual only settles when the count is reached. Below it, nothing
+        // is going to happen at all and there is no point parking a row to
+        // watch nothing happen for twenty seconds.
+        //
+        // THE WORLD HAS CHANGED BY THE TIME THIS REFUSAL IS WRITTEN, and the
+        // row says so rather than pretending otherwise: the portal exists and
+        // the summoner is channelling it. Nothing is torn down here, because
+        // that is exactly the state a player is left in when the friend they
+        // were waiting for does not click - the channel ends on its own, or the
+        // moment the character moves. `channelling_after_click`,
+        // `portal_entry`, `participants` and `required` are all in the JSON so
+        // a reader can see which of those it is.
+        if (ev.participants < ev.required)
+            return "the ritual did not reach the participants it needs";
+
+        ev.settleMs = SUMMON_RITUAL_SETTLE_MS;
+        ev.windowMs = OverseerDecisions::SummonVerifyWindowMs(ev.settleMs, SUMMON_MARGIN_MS,
+                                                              SUMMON_FLOOR_MS);
+        return nullptr;
     }
 
     static char const* DoSummon(Player* who, std::string const& command,
@@ -29886,7 +30494,6 @@ private:
         using OverseerDecisions::SummonOutcome;
         using OverseerDecisions::SummonRequest;
         using OverseerDecisions::SummonVerb;
-        using OverseerDecisions::SummonVerifyWindowMs;
         using OverseerDecisions::SummonWouldMoveNobody;
 
         SummonEvidence ev;
@@ -29940,34 +30547,32 @@ private:
         if (who->IsInCombat())
             return refuse("summoner is in combat");
 
-        // The summoner has to hold a channel for the portal's whole life.
-        // Spell::update cancels a channel with a movement interrupt flag on the
-        // next tick that finds the caster moving, and a character already
-        // casting cannot start this one.
-        //
-        // AND THE ROW NOW STOPS THE RITUAL RATHER THAN ONLY NAMING IT (#335).
-        // This refusal fired 29 times in three hours and changed nothing each
-        // time, because the summoner is a follower dragged behind a leader that
-        // `new rpg` was walking around. Both are held here, so the sender's next
-        // ask arrives at a stone with two characters standing at it. The row
-        // still refuses with `later` rather than growing a settle loop of its
-        // own - see the hearth's note for the #230 argument that keeps a retry
-        // off the head of the queue.
-        if (who->isMoving())
-        {
-            HoldSummonRitualStill(who, targetArg, request.who, ev);
-            return refuse("summoner is moving");
-        }
-        if (who->IsNonMeleeSpellCast(false))
-            return refuse("summoner is already casting");
-        if (who->GetTransport())
-            return refuse("summoner is on a transport");
-
         // ---- the stone -------------------------------------------------------
+        //
+        // ASKED BEFORE THE MOVEMENT CHECKS NOW, WHICH IS #355's ONE REORDERING
+        // AND IS THE WHOLE POINT OF IT. A summoner fifteen yards from the stone
+        // is a summoner that has to WALK, and a walk starts with a moving
+        // character - so a row that refused `summoner is moving` before it had
+        // even looked for a stone could never reach the branch that closes the
+        // distance. The movement checks are unchanged and are asked below,
+        // where they mean what they say: a character that IS at the stone and
+        // will not stand still cannot channel.
+        //
+        // THE SWEEP ANSWERS TWICE. `stone` is the one this character could click
+        // from where it stands, which is the core's own gate; `nearestStone` is
+        // the closest one it can see at all, which is what the approach walks
+        // to. Before #355 only the first existed and the second was a float in
+        // a refusal message.
 
-        GameObject* stone = FindMeetingStoneInReach(who, ev.nearestStoneYards, ev.stoneYards);
+        GameObject* stone = FindNearestMeetingStone(who, ev.nearestStoneYards);
         if (!stone)
             return refuse("no meeting stone within reach of the summoner");
+        // `stone_yards` KEEPS ITS OLD MEANING: the distance to a stone this
+        // character may actually click, and -1 when there is none. A reader
+        // that has been telling "at the stone" from "near the stone" by which
+        // of the two numbers is set goes on being right.
+        if (AtTheStone(who, stone))
+            ev.stoneYards = ev.nearestStoneYards;
 
         GameObjectTemplate const* stoneInfo = stone->GetGOInfo();
         if (!stoneInfo)
@@ -30071,12 +30676,27 @@ private:
         //
         // The portal needs one more participant than itself: the spell effect
         // that creates it counts the summoner already. Named in target_arg when
-        // the sender knows who should do it, and otherwise the nearest party
-        // member that could.
+        // the sender knows who should do it, and otherwise a party member near
+        // enough that this row can get it to the stone.
+        //
+        // THE SCAN IS AS WIDE AS THE WALK NOW, AND THAT IS THE OTHER HALF OF
+        // #355. It used to require a candidate within INTERACTION_DISTANCE of
+        // the summoner and standing still, which is a description of a second
+        // clicker that had already arrived BY ACCIDENT: nothing in this module
+        // ever walked one to a stone, and a follower parks at follow distance
+        // from its leader. The two conditions that used to be filters here -
+        // being close enough, and standing still - are now things this row
+        // makes true, so filtering on them would be refusing to fix the thing
+        // it was about to fix.
 
         Player* helper = nullptr;
         if (!targetArg.empty())
         {
+            // THE NAMED CLICKER'S IDENTITY CHECKS STAY HERE, one literal each,
+            // because a sender that named somebody is owed the reason that
+            // person will not do rather than a bare "nobody could". The state
+            // checks that used to follow them have moved into
+            // DriveSummonRitual, where both callers ask them in one place.
             helper = ObjectAccessor::FindPlayerByName(targetArg, false);
             if (!helper)
                 return refuse("the second clicker is not online");
@@ -30088,144 +30708,87 @@ private:
                 return refuse("the second clicker is not in the same party");
             if (!helper->GetSession())
                 return refuse("the second clicker has no session");
-            if (!helper->IsAlive())
-                return refuse("the second clicker is dead");
-            if (helper->IsInCombat())
-                return refuse("the second clicker is in combat");
-            // THE SECOND CLICKER HAS TO HOLD A CHANNEL TOO, and nothing said so
-            // until a review asked. Its click starts the portal's anim spell,
-            // which is channelled with movement among its interrupt flags, and
-            // GameObject::Update runs CheckRitualList AGAIN when the ritual
-            // settles - erasing any participant that stopped channelling and
-            // dropping the count back below the one the ritual needs. A helper
-            // that walks therefore kills the summon silently, five seconds
-            // after everything looked fine. Refused for the same reason, and
-            // with the same words, as a summoner that is moving.
-            if (helper->isMoving())
-            {
-                // BOTH, NOT JUST THE ONE THAT MOVED. The summoner passed its own
-                // movement check on this poll and may be walking again by the
-                // next ask; a ritual with one held character is a ritual that
-                // still fails (#335).
-                HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
-                HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
-                if (ev.helperHold.applied)
-                    ev.heldHelper = helper->GetName();
-                return refuse("the second clicker is moving");
-            }
-            if (helper->IsNonMeleeSpellCast(false))
-                return refuse("the second clicker is already casting");
         }
-        else if (Group* group = who->GetGroup())
+        else
         {
-            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
-            {
-                Player* member = ref->GetSource();
-                if (!member || member == who || member == summoned)
-                    continue;
-                if (!member->GetSession() || !member->IsInWorld() || !member->IsAlive())
-                    continue;
-                if (member->IsInCombat() || member->IsBeingTeleported())
-                    continue;
-                // Same channel requirement as the named path above.
-                if (member->isMoving() || member->IsNonMeleeSpellCast(false))
-                    continue;
-                if (!member->IsWithinDistInMap(who, INTERACTION_DISTANCE))
-                    continue;
-                helper = member;
-                break;
-            }
+            helper = PickSecondClicker(who, targetArg, ev.summoned, SUMMON_APPROACH_YARDS, 0.f);
         }
         if (!helper)
         {
-            // THE SCAN ABOVE SKIPS A MOVING CANDIDATE, AND IT IS RIGHT TO -
-            // it cannot click. But that turns "everybody at the stone is
-            // walking" into a refusal about PLACE, which SummonRefusalRetry
-            // classes `elsewhere` and which tells the sender to go and stand
-            // somewhere else. Movement is the actual wall, and it is one this
-            // module can take down: hold whoever is standing near enough to be
-            // chosen next time, and the same literal then means what it says
-            // (#335).
+            // THE SCAN SKIPS A CANDIDATE IN COMBAT, A DEAD ONE AND ONE
+            // MID-TELEPORT, AND IT IS RIGHT TO - none of the three can be held
+            // still and walked to a stone. What it no longer skips is a
+            // candidate that is merely walking or merely far away, so this
+            // literal now means what it says: there is nobody in this party
+            // near this stone at all. The hold is still placed on the way out
+            // for the #335 reason - the next ask arrives at a summoner that is
+            // standing.
             HoldSummonRitualStill(who, targetArg, request.who, ev);
             return refuse("no second party member is at the stone");
         }
         ev.helper = helper->GetName();
+        ev.helperStoneYards = YardsFromTheStone(helper, stone);
 
-        // ---- hold BOTH for the ritual, before a packet goes out (#337) ---
+        // ---- the last few yards to the stone (#355) --------------------------
         //
-        // Every hold this verb placed until now was a remedy for a refusal:
-        // it stopped the characters so that the NEXT ask would find them
-        // standing, and then the next ask drove the whole ritual with no hold
-        // of its own. That ritual is a channel the summoner has to keep for
-        // five seconds while CheckRitualList re-counts the participants, so
-        // the one attempt that gets this far is exactly the attempt that
-        // needs holding, and it was the only one that never was.
-        //
-        // Both, and the summoner first, because the portal is its channel.
-        // This also stands either of them up: the hold does that now, and a
-        // sitting character cannot click a stone any more than it can cast.
-        HoldStillAndReport(who, who->GetName(), "summon", ev.hold);
-        HoldStillAndReport(helper, helper->GetName(), "summon", ev.helperHold);
-        if (ev.helperHold.applied)
-            ev.heldHelper = helper->GetName();
+        // BOTH CLICKERS OR NEITHER, WHICH IS THE READING THAT WAS MISSING. The
+        // ritual needs two characters in reach of one object for five seconds,
+        // and every attempt before this asked the question only about the
+        // summoner. A row that found the summoner at the stone drove the whole
+        // ritual and then failed at the portal's own gate with "no meeting
+        // stone within reach of the second clicker" - a true sentence about a
+        // problem nothing was going to solve, because the second clicker had
+        // never been walked anywhere in its life.
+        OverseerDecisions::SummonApproach const approach = OverseerDecisions::ReadSummonApproach(
+            AtTheStone(who, stone) && AtTheStone(helper, stone), ev.nearestStoneYards,
+            SUMMON_APPROACH_YARDS, ev.approachMs, SUMMON_APPROACH_CEILING_MS);
 
-        // ---- drive the core's own handlers -----------------------------------
-        //
-        // Selection first, because GameObject::Use reads it to decide who is
-        // being summoned, then the stone, then the portal. Three packets, three
-        // handlers, and not one line of this decides where anybody goes.
+        if (approach != OverseerDecisions::SummonApproach::Click)
+        {
+            if (approach == OverseerDecisions::SummonApproach::NoStone)
+                return refuse("no meeting stone within reach of the summoner");
 
-        DriveSelection(session, summoned->GetGUID());
-        DriveGameObjectUse(session, stone->GetGUID());
+            // `OutOfTime` cannot be reached from here - this row has walked
+            // nobody yet, so `approachMs` is zero - and it is not asserted
+            // away, because the same call in ResolveSummonChecks does reach it
+            // and one reader should see the same three answers in both places.
+            char const* wall = nullptr;
+            if (!HoldAndWalkTheClickers(who, helper, stone, ev, wall))
+                return refuse(wall);
 
-        // EVIDENCE, NOT A VERDICT. The summoner should now be channelling the
-        // portal spell. Recorded rather than believed: the click may have been
-        // refused inside GameObject::Use for a reason it reports to a client
-        // that is not there, and this module finds that out by reading the
-        // world, not by trusting a void call.
-        ev.channellingAfterClick = who->GetCurrentSpell(CURRENT_CHANNELED_SPELL) ? 1 : 0;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is walking to the meeting stone ({}) to summon '{}', with "
+                     "'{}' as the second clicker - {} and {} yards out against a gate of about "
+                     "{}; both are held, and the walk has {}ms",
+                     ev.summoner, ev.stoneEntry, ev.summoned, ev.helper,
+                     static_cast<uint32>(ev.nearestStoneYards < 0.f ? 0.f : ev.nearestStoneYards),
+                     static_cast<uint32>(ev.helperStoneYards < 0.f ? 0.f : ev.helperStoneYards),
+                     static_cast<uint32>(stone->GetInteractionDistance()),
+                     SUMMON_APPROACH_CEILING_MS);
 
-        GameObject* portal = FindSummonPortal(who);
-        if (!portal)
-            return refuse("the summoner did not begin channelling the portal");
-        ev.portalEntry = portal->GetEntry();
+            SummonCheck walking;
+            walking.id = id;
+            walking.summonerName = who->GetName();
+            walking.summonedName = summoned->GetName();
+            walking.summonerGuid = who->GetGUID();
+            walking.summonedGuid = summoned->GetGUID();
+            walking.helperName = helper->GetName();
+            walking.approaching = true;
+            walking.ev = ev;
+            parked.push_back(walking);
 
-        GameObjectTemplate const* portalInfo = portal->GetGOInfo();
-        if (!portalInfo)
-            return refuse("the core does not know that summoning portal");
-        ev.required = portalInfo->summoningRitual.reqParticipants;
+            // THE SAME STATUS THE RITUAL PARKS UNDER, AND FOR THE SAME REASON.
+            // Nothing has happened yet and nothing is claimed to have: the row
+            // is out of the queue's head, its holds are protected by
+            // ARowStillOwnsTheHold, and ResolveSummonChecks owns it from here.
+            status = "verifying";
+            ev.verdict = SummonOutcome::Unreadable;
+            out = SummonJson(ev, "walking", "");
+            return "";
+        }
 
-        // THE GATE, AND IT IS THE CORE'S OWN, on the object that is actually
-        // being clicked. The cheap check above measured the helper against the
-        // SUMMONER at a bare INTERACTION_DISTANCE; this is the exact test
-        // WorldSession::HandleGameObjectUseOpcode makes, against the portal's
-        // own model and its own interaction distance. Without it a helper right
-        // on the boundary passes this module and is dropped by the handler, and
-        // the row then blames the participant count - which says `later` when
-        // the actual remedy is to stand closer.
-        if (!portal->IsWithinDistInMap(helper, portal->GetInteractionDistance()))
-            return refuse("no meeting stone within reach of the second clicker");
-
-        DriveGameObjectUse(helper->GetSession(), portal->GetGUID());
-        ev.participants = portal->GetUniqueUseCount();
-
-        // The ritual only settles when the count is reached. Below it, nothing
-        // is going to happen at all and there is no point parking a row to
-        // watch nothing happen for twenty seconds.
-        //
-        // THE WORLD HAS CHANGED BY THE TIME THIS REFUSAL IS WRITTEN, and the
-        // row says so rather than pretending otherwise: the portal exists and
-        // the summoner is channelling it. Nothing is torn down here, because
-        // that is exactly the state a player is left in when the friend they
-        // were waiting for does not click - the channel ends on its own, or the
-        // moment the character moves. `channelling_after_click`,
-        // `portal_entry`, `participants` and `required` are all in the JSON so
-        // a reader can see which of those it is.
-        if (ev.participants < ev.required)
-            return refuse("the ritual did not reach the participants it needs");
-
-        ev.settleMs = SUMMON_RITUAL_SETTLE_MS;
-        ev.windowMs = SummonVerifyWindowMs(ev.settleMs, SUMMON_MARGIN_MS, SUMMON_FLOOR_MS);
+        if (char const* wall = DriveSummonRitual(who, summoned, helper, stone, ev))
+            return refuse(wall);
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is summoning '{}' to the meeting stone ({}) with '{}' as the "
@@ -30240,6 +30803,7 @@ private:
         check.summonedName = summoned->GetName();
         check.summonerGuid = who->GetGUID();
         check.summonedGuid = summoned->GetGUID();
+        check.helperName = helper->GetName();
         check.ev = ev;
         parked.push_back(check);
 
@@ -30267,6 +30831,171 @@ private:
     //   * WAITS OUT THE TELEPORT instead of reading a position through it. See
     //     OverseerDecisions::ReadTeleportFlight and #310: leaving the world is
     //     what a successful cross-map teleport looks like from here.
+    // ------------------------- one poll of the walk to the stone (#355) --
+    //
+    // WHY THE WALK IS ANSWERED HERE AND NOT BY THE SENDER. The three casting
+    // verbs refuse and let the sender re-ask, which is #230's rule and it is
+    // kept everywhere it applies. It cannot apply to a walk. The hold that
+    // makes the walk stick expires in 45 seconds; the measured operator cadence
+    // on this verb was one ask every six minutes across seven attempts; so a
+    // row that walked its clickers and then ended would have released them to
+    // be dragged back after their leader long before anything asked again. That
+    // is not a retry policy, it is a treadmill.
+    //
+    // WHAT IT DOES EVERY POLL, AND WHY EACH OF THEM IS EVERY POLL. The hold is
+    // re-asserted because the register stops this module's own sweeps and
+    // nothing else, so a `follow` something outside it granted has to come off
+    // again - and if it did not, mod-playerbots' FollowAction would call
+    // MoveFollow, which mutates the same motion master slot the walk lives in
+    // and would replace the walk with a chase. The walk is re-issued in the
+    // same breath, because the hold's own Unit::StopMoving finalises the
+    // spline and PointMovementGenerator drops itself on a finalised spline. And
+    // the stone is swept for again rather than remembered, because a remembered
+    // GameObject* is a pointer into a world that has had polls to change.
+    //
+    // Returns whether the row stays parked. A row it answers has already had
+    // its holds released and its UPDATE written.
+    bool ResolveSummonApproach(SummonCheck& check, uint32 elapsedMs)
+    {
+        using OverseerDecisions::SummonApproach;
+
+        check.ev.approachMs += elapsedMs;
+
+        // THE ROW IS ANSWERED WHERE IT IS GIVEN UP ON, not by a caller reading
+        // a return value, so that every exit from this walk releases both holds
+        // and writes one row. A walk that ended with two characters still held
+        // and nothing in the queue to say why is the failure mode this whole
+        // verb was written to stop producing.
+        auto giveUp = [&](char const* status, char const* detail) -> bool
+        {
+            ReleaseSummonRitualHold(check.ev, check.summonerName,
+                                    "the walk to the meeting stone ended");
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(SummonJson(check.ev, "refused", detail)), check.id,
+                g_runToken);
+            return false;
+        };
+
+        Player* const summoner = ObjectAccessor::FindPlayerByName(check.summonerName, false);
+        if (!summoner || !summoner->IsInWorld() || !summoner->GetSession())
+            return giveUp("error", "summoner is not in the world");
+        if (!summoner->IsAlive())
+            return giveUp("error", "summoner is dead");
+
+        Player* const helper = ObjectAccessor::FindPlayerByName(check.helperName, false);
+        if (!helper || !helper->IsInWorld() || !helper->GetSession())
+            return giveUp("error", "the second clicker is not in the world");
+
+        GameObject* const stone = FindNearestMeetingStone(summoner, check.ev.nearestStoneYards);
+        if (!stone)
+            return giveUp("error", "no meeting stone within reach of the summoner");
+        check.ev.helperStoneYards = YardsFromTheStone(helper, stone);
+
+        bool const bothInReach = AtTheStone(summoner, stone) && AtTheStone(helper, stone);
+        SummonApproach const approach = OverseerDecisions::ReadSummonApproach(
+            bothInReach, check.ev.nearestStoneYards, SUMMON_APPROACH_YARDS, check.ev.approachMs,
+            SUMMON_APPROACH_CEILING_MS);
+
+        if (approach == SummonApproach::NoStone)
+            return giveUp("error", "no meeting stone within reach of the summoner");
+
+        if (approach == SummonApproach::OutOfTime)
+        {
+            // A REAL ANSWER WITH THE TWO DISTANCES IN IT. Something this module
+            // cannot see is holding the walk up - a fight it walked into, a
+            // drop the ground check will not take it over, a door - and the
+            // next attempt starts from wherever the walk got to, which is
+            // nearer than where it started. That is why the retry table calls
+            // this `later` and not `elsewhere`.
+            LOG_WARN("module.overseer",
+                     "overseer: summon {} gave up walking to the meeting stone ({}) after "
+                     "{}ms - '{}' is {} yards out and '{}' is {} yards out, against a gate of "
+                     "about {}",
+                     check.id, check.ev.stoneEntry, check.ev.approachMs, check.summonerName,
+                     static_cast<uint32>(check.ev.nearestStoneYards < 0.f
+                                             ? 0.f
+                                             : check.ev.nearestStoneYards),
+                     check.helperName,
+                     static_cast<uint32>(check.ev.helperStoneYards < 0.f
+                                             ? 0.f
+                                             : check.ev.helperStoneYards),
+                     static_cast<uint32>(stone->GetInteractionDistance()));
+            return giveUp("error", "the clickers did not reach the meeting stone in time");
+        }
+
+        if (approach == SummonApproach::Walk)
+        {
+            char const* wall = nullptr;
+            if (!HoldAndWalkTheClickers(summoner, helper, stone, check.ev, wall))
+                return giveUp("error", wall);
+            return true;
+        }
+
+        // ---- both are at the stone, so the ritual is driven now --------------
+
+        check.ev.stoneYards = check.ev.nearestStoneYards;
+
+        // THE FAR END IS READ AGAIN, BECAUSE IT HAS HAD THE WHOLE WALK TO
+        // CHANGE. DoSummon checked all of this on the poll the row was claimed
+        // and up to twenty seconds have passed since. Same literals, so a row
+        // that fails here reads exactly like one that failed before a step was
+        // taken.
+        Player* const summoned = ObjectAccessor::FindPlayerByName(check.summonedName, false);
+        if (!summoned)
+            return giveUp("error", "the character to summon is not online");
+        if (!summoned->IsAlive())
+            return giveUp("error", "the character to summon is dead");
+        if (summoned->IsInCombat())
+            return giveUp("error", "the character to summon is in combat");
+        if (summoned->IsInFlight())
+            return giveUp("error", "the character to summon is in flight");
+        if (summoned->IsBeingTeleported())
+            return giveUp("error", "the character to summon is already being teleported");
+        if (!summoned->IsInWorld())
+            return giveUp("error", "the character to summon is not in the world");
+
+        // AND THE TWO PLACES THE VERDICT IS MEASURED AGAINST ARE TAKEN NOW,
+        // NOT AT THE CLAIM. The summon point is the SUMMONER's own position at
+        // the moment the ritual completes, and the summoner has just walked
+        // fifteen yards; judging against where it stood before the walk would
+        // call an arrival `elsewhere` by exactly the length of the approach.
+        check.ev.at = ReadStandingPlace(summoner);
+        check.ev.from = ReadStandingPlace(summoned);
+        if (OverseerDecisions::SummonWouldMoveNobody(check.ev.from, check.ev.at,
+                                                     SUMMON_ARRIVED_YARDS))
+            return giveUp("error", "the character to summon is already at the summon point");
+
+        if (char const* wall = DriveSummonRitual(summoner, summoned, helper, stone, check.ev))
+            return giveUp("error", wall);
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' walked {}ms to the meeting stone ({}) and is summoning '{}' "
+                 "with '{}' as the second clicker - {} of {} participants, map {} to map {}; "
+                 "judging in {}ms, not now",
+                 check.summonerName, check.ev.approachMs, check.ev.stoneEntry,
+                 check.ev.summoned, check.ev.helper, check.ev.participants, check.ev.required,
+                 check.ev.from.mapId, check.ev.at.mapId, check.ev.windowMs);
+
+        // THE SECOND WAIT STARTS CLEAN. `waitedMs` is the ritual's clock and
+        // has to begin at the ritual, or a walk that took eighteen seconds
+        // would spend the whole verify window before the portal had settled and
+        // the row would answer `stayed` about a summon still in progress.
+        check.approaching = false;
+        check.ev.waitedMs = 0;
+
+        // The row's own JSON is rewritten so a reader looking at it mid-ritual
+        // sees the ritual rather than the walk. The status does not move: it
+        // was `verifying` for the walk and it is `verifying` for the ritual,
+        // which is the one honest status for either.
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = 'verifying', detail = '', result = '{}' "
+            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            EscLong(SummonJson(check.ev, "summoning", "")), check.id, g_runToken);
+        return true;
+    }
+
     void ResolveSummonChecks(uint32 elapsedMs)
     {
         using OverseerDecisions::ReadTeleportFlight;
@@ -30281,6 +31010,20 @@ private:
 
         for (SummonCheck& check : _pendingSummons)
         {
+            // ---- the walk to the stone, before there is a ritual to read back --
+            //
+            // A ROW HAS TWO WAITS AND THIS IS THE FIRST OF THEM (#355). Nothing
+            // below this block can be asked about a row whose clickers are
+            // still walking: there is no portal, no request and no teleport to
+            // read, and `waitedMs` must not start running or the ritual's own
+            // window would be spent before the ritual began.
+            if (check.approaching)
+            {
+                if (ResolveSummonApproach(check, elapsedMs))
+                    stillSummoning.push_back(check);
+                continue;
+            }
+
             check.ev.waitedMs += elapsedMs;
 
             uint32 const ceilingMs = check.ev.windowMs + SUMMON_SETTLE_CEILING_MS;

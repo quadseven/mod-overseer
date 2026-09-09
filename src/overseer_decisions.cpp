@@ -5916,6 +5916,15 @@ TownRetry SummonRefusalRetry(std::string const& detail)
         "no meeting stone within reach of the summoner",
         "no meeting stone within reach of the second clicker",
         "no second party member is at the stone",
+        // AND THE TWO THE APPROACH ADDS (#355). The verb now walks a clicker
+        // the last few yards, and it refuses to walk over ground that does not
+        // hold - which is #262's rule and the reason this module steps rather
+        // than aims. That refusal is about a PLACE and not about the character:
+        // the same clicker standing on the other side of the stone would be
+        // walked without an argument, and waiting where it is changes nothing,
+        // which is exactly what `Elsewhere` means here.
+        "the ground between the summoner and the meeting stone does not hold",
+        "the ground between the second clicker and the meeting stone does not hold",
         // Being on the other side of the ocean is the point of this verb, so
         // "already here" is not a failure of the character's state - it is a
         // statement about where it is standing, and it stops being true the
@@ -5938,9 +5947,71 @@ TownRetry SummonRefusalRetry(std::string const& detail)
     // its own: a fight, a corpse, a flight, a walk, a cast already in progress,
     // a party that has not formed yet, a level that is still climbing, a summon
     // already pending, a mind control, a session going away, a bot AI that has
-    // not attached. `Later` is also what an unrecognised literal gets, which is
-    // the same call the bind, hearth, sell and repair tables make.
+    // not attached. A walk that ran out of time is in here too and belongs here
+    // rather than in ELSEWHERE (#355): the clickers ended the row nearer the
+    // stone than they started it, so the next row walks a shorter distance from
+    // a better place, which is the definition of `Later` and not of "go and
+    // stand somewhere else". `Later` is also what an unrecognised literal gets,
+    // which is the same call the bind, hearth, sell and repair tables make.
     return TownRetry::Later;
+}
+
+char const* SummonApproachWord(SummonApproach approach)
+{
+    switch (approach)
+    {
+        case SummonApproach::NoStone:
+            return "no-stone";
+        case SummonApproach::Click:
+            return "click";
+        case SummonApproach::Walk:
+            return "walk";
+        case SummonApproach::OutOfTime:
+            break;
+    }
+    return "out-of-time";
+}
+
+SummonApproach ReadSummonApproach(bool inReach, float nearestYards, float walkYards,
+                                  uint32_t walkedMs, uint32_t ceilingMs)
+{
+    // A READING NOBODY TOOK IS NOT A DISTANCE. The executor's sweep leaves
+    // `nearestYards` negative when it found nothing stone-shaped at all, and
+    // that is the same answer to a sender as a stone on the far side of the
+    // zone: there is nothing here to use.
+    //
+    // ASKED BEFORE `inReach`, so a caller that hands in a reach verdict about a
+    // stone it never found cannot be answered `Click`.
+    if (nearestYards < 0.f)
+        return SummonApproach::NoStone;
+
+    // THE CORE'S OWN GATE FIRST, AND BEFORE THE CLOCK. `inReach` is
+    // GameObject::IsWithinDistInMap against the stone's own interaction
+    // distance - the exact test WorldSession::HandleGameObjectUseOpcode makes -
+    // so a stone this answers `Click` about is one that handler will accept.
+    // And a clicker that gets here on the last poll of its walk has arrived,
+    // whatever the clock says.
+    if (inReach)
+        return SummonApproach::Click;
+
+    // FURTHER THAN THIS VERB WILL WALK ANYBODY. Not an error and not a wait:
+    // the stone was seen, it is simply not one this row is going to close the
+    // distance to, and the honest answer is the same one it gives for a map
+    // with no stone on it. The executor's sweep width and this walk are the
+    // same number today, so this branch is what keeps the rule true if either
+    // of them ever moves.
+    if (nearestYards > walkYards)
+        return SummonApproach::NoStone;
+
+    // THE WALK HAS HAD ITS TIME. Something the executor cannot see is holding
+    // the character up - a fight it walked into, a cliff the ground check will
+    // not take it over, a door - and a row that kept walking for ever would
+    // hold a claim open and say nothing. Giving up with the distance in the row
+    // is what the next attempt needs.
+    if (walkedMs >= ceilingMs)
+        return SummonApproach::OutOfTime;
+
+    return SummonApproach::Walk;
 }
 
 bool ClassRestoresManaByDrinking(uint32_t classId)
