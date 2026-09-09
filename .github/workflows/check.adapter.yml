@@ -40,6 +40,18 @@ name: The adapter compiles
 # `ARG UBUNTU_VERSION=24.04` the core's Dockerfile builds on, and the apt list
 # below is that Dockerfile's build-stage list verbatim.
 #
+# WHAT IT COSTS, MEASURED RATHER THAN ESTIMATED (2026-09-09, first three runs,
+# on this workflow's own pull request). 82, 99 and 121 seconds of job time, so
+# call it one and a half to two minutes, against 36 to 88 for build.yml. The
+# breakdown of the slowest of the three is the useful part, because it says where
+# any future effort would have to go: 65s installing the core's apt dependencies,
+# 33s fetching the two pinned trees, 9s in cmake configure, and 8s actually
+# compiling the adapter. The compile - the only part that is about this
+# repository at all - is under a tenth of the job. AGENTS.md is right that a
+# duration in a document is a reading from one day and not a property of the
+# build, so measure it again before planning around these; the step names below
+# are chosen so that the timing panel on any run gives you the same breakdown.
+#
 # THE COMPILE FLAGS ARE NOT HAND-ROLLED. Guessing at include paths and defines
 # would produce a job that compiles something adjacent to what the real build
 # compiles, and the first time the two disagreed nobody would know which was
@@ -74,12 +86,14 @@ name: The adapter compiles
 # in this repository - and then PASSES only if the compile failed. A green
 # self_test run is a standing, re-runnable proof that this gate is not vacuous.
 #
-# IT CACHES NOTHING, DELIBERATELY. Caching the apt packages or the core clone
-# would save a couple of minutes and would spend part of the repository's shared
-# 10 GB cache budget on every pull request. That budget is what build.yml's
-# buildx cache lives in, and evicting that turns a 36-minute build on main into a
-# cold one. A few minutes on a branch is not worth an hour on main. If this job
-# ever needs to be faster, take the time out of the work, not out of that cache.
+# IT CACHES NOTHING, DELIBERATELY. The timings above make the temptation obvious:
+# 98 of the slowest run's 121 seconds were apt and the two clones, and caching
+# either would take most of that back. It is not done, because a cache entry here
+# is spent out of the repository's shared 10 GB budget on every pull request, and
+# that budget is where build.yml's buildx cache lives. Evicting that turns a
+# 36-minute build on main into a cold one. Ninety seconds on a branch is not
+# worth an hour on main. If this job ever genuinely needs to be faster, take the
+# time out of the work it does, not out of that cache.
 #
 # CONCURRENCY IS PER REF WITH CANCEL ON, WHICH IS NOT WHAT build.yml DOES, AND
 # THAT IS NOT AN OVERSIGHT. Read build.yml's concurrency comment before changing
@@ -94,7 +108,7 @@ name: The adapter compiles
 # repository-wide group that caused the eviction, and it must not become one.
 #
 # WHICH IS ALSO WHY THIS DOES NOT RUN ON PUSHES TO MAIN. It could, and it would
-# give a red eight minutes after a merge instead of an hour after one. But two
+# give a red two minutes after a merge instead of an hour after one. But two
 # merges four seconds apart are both `refs/heads/main`, so a per-ref group would
 # have the second evict the first and hand main the same grey tick #288's
 # neighbour was fixed to stop producing, and avoiding that means carrying
@@ -139,12 +153,12 @@ concurrency:
 jobs:
   adapter:
     runs-on: ubuntu-latest
-    # Expected to finish in single-digit minutes. The cap is here so a hung
+    # Measured at 82 to 121 seconds. The cap is fifteen times that so a hung
     # configure or a stalled apt mirror costs one job rather than six hours of
-    # the account's runner budget, not because the work is expected to approach
-    # it. If this ever legitimately takes 30 minutes, that is a finding worth
+    # the account's runner budget, not because the work is expected to come near
+    # it. If this ever legitimately takes 20 minutes, that is a finding worth
     # writing down, not a number worth raising.
-    timeout-minutes: 30
+    timeout-minutes: 20
     # Clones public repositories, compiles one file, writes nothing anywhere.
     # Named explicitly rather than inherited, because the repository default is a
     # setting somebody can change without ever reading this file. `pull_request`
