@@ -4365,6 +4365,72 @@ TownRetry BindRefusalRetry(std::string const& detail)
     return TownRetry::Later;
 }
 
+// ------------------- a home the campaign's own dungeon can be reached from --
+
+char const* CampaignHomeName(CampaignHome verdict)
+{
+    switch (verdict)
+    {
+        case CampaignHome::NotAsked:
+            return "not-asked";
+        case CampaignHome::Suits:
+            return "suits";
+        case CampaignHome::OffTheDungeonsMap:
+            return "off-the-dungeons-map";
+        case CampaignHome::TooFarFromTheTown:
+            return "too-far";
+        case CampaignHome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
+CampaignHome ReadCampaignHome(HomeBind const& home, CampaignHomeAnchor const& anchor,
+                              float townYards)
+{
+    // THE CAMPAIGN IS ASKED FIRST. A door that names no town has no opinion
+    // about anybody's home, and answering "unreadable" for a character nobody
+    // was judging would be a complaint about a reading nobody wanted.
+    if (!anchor.known)
+        return CampaignHome::NotAsked;
+
+    if (!home.known)
+        return CampaignHome::Unreadable;
+
+    // THE MAP IS THE FATAL HALF AND IS ANSWERED ON ITS OWN. A home on another
+    // continent is not "far": it is out of reach of everything this module has,
+    // and folding it into a distance would mean subtracting two coordinate
+    // systems and reporting the result as yards, which is the non-reading #241
+    // was caught acting on.
+    if (home.mapId != anchor.mapId)
+        return CampaignHome::OffTheDungeonsMap;
+
+    // Squared, so these two files keep including nothing but the five standard
+    // headers the decisions job compiles them with.
+    float const dx = home.x - anchor.x;
+    float const dy = home.y - anchor.y;
+    return dx * dx + dy * dy > townYards * townYards ? CampaignHome::TooFarFromTheTown
+                                                     : CampaignHome::Suits;
+}
+
+bool CampaignHomeNeedsRebinding(CampaignHome verdict)
+{
+    switch (verdict)
+    {
+        case CampaignHome::OffTheDungeonsMap:
+        case CampaignHome::TooFarFromTheTown:
+            return true;
+        // NAMED RATHER THAN DEFAULTED, all three of them. A verdict added to
+        // this enum later has to be a compile error here rather than silently
+        // joining the side that walks a character across a continent.
+        case CampaignHome::Unreadable:
+        case CampaignHome::NotAsked:
+        case CampaignHome::Suits:
+            break;
+    }
+    return false;
+}
+
 uint16_t FallGuardStandDownMask(bool alive, bool teleporting, bool inFlight,
                                bool flying, bool falling, bool inWater,
                                bool onTransport, bool inVehicle)
