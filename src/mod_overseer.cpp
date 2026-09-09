@@ -6358,7 +6358,14 @@ private:
     {
         WorldObject const* from;
         float range;
-        uint32 npcFlag;
+        // NPCFlags AND NOT uint32, WHICH IS THE CORE'S CHOICE RATHER THAN A
+        // PREFERENCE: Unit::HasNpcFlag takes the enum (Unit.h:764) and an
+        // unscoped enum will not be constructed from an integer without a cast.
+        // Carrying the enum from NpcFlagForCounter all the way here is what
+        // keeps that cast out of the code entirely; the widening to uint32 that
+        // GetNPCIfCanInteractWith wants (Player.h:1146) is implicit and safe in
+        // the direction it goes.
+        NPCFlags npcFlag;
         bool operator()(Creature* creature) const
         {
             return creature->IsAlive() && creature->HasNpcFlag(npcFlag)
@@ -6370,7 +6377,7 @@ private:
     // cannot name the flag - it compiles with no core behind it, which is half
     // of what its own CI proves - so the mapping lives here, beside the sweep
     // that is the only thing needing it.
-    static uint32 NpcFlagForCounter(OverseerDecisions::CounterRole role)
+    static NPCFlags NpcFlagForCounter(OverseerDecisions::CounterRole role)
     {
         switch (role)
         {
@@ -6383,7 +6390,11 @@ private:
             case OverseerDecisions::CounterRole::None:
                 break;
         }
-        return 0;
+        // UnitDefines.h:321, and it is the core's own name for "no flag at all"
+        // rather than a zero this file made up. Nothing carries it, so a sweep
+        // for it would match nothing, which is why the caller refuses on it
+        // instead of running one.
+        return UNIT_NPC_FLAG_NONE;
     }
 
     // IS THIS CHARACTER ACTUALLY AT THE COUNTER, ASKED THE WAY THE EXECUTOR WILL
@@ -6417,8 +6428,8 @@ private:
         outOneIsNearby = false;
         outNearestYards = -1.f;
 
-        uint32 const npcFlag = NpcFlagForCounter(role);
-        if (!who || !npcFlag)
+        NPCFlags const npcFlag = NpcFlagForCounter(role);
+        if (!who || npcFlag == UNIT_NPC_FLAG_NONE)
             return false;
 
         float const SWEEP_YARDS = 30.f;
