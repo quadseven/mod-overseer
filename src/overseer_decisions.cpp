@@ -7044,4 +7044,64 @@ PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members)
     return plan;
 }
 
+
+RepairLegStep RepairLegMemberStep(RepairLegFacts const& facts)
+{
+    if (!facts.present)
+        return RepairLegStep::Wait;
+    if (!facts.damaged)
+        return RepairLegStep::Done;
+    if (facts.atARepairer)
+        return RepairLegStep::Repair;
+    return RepairLegStep::Walk;
+}
+
+char const* RepairLegStepWord(RepairLegStep step)
+{
+    switch (step)
+    {
+        case RepairLegStep::Wait:   return "wait";
+        case RepairLegStep::Done:   return "done";
+        case RepairLegStep::Repair: return "repair";
+        case RepairLegStep::Walk:   return "walk";
+    }
+    return "";
+}
+
+RepairReadBack ReadRepairBack(unsigned damagedItems, unsigned brokenItems)
+{
+    if (brokenItems)
+        return RepairReadBack::StillBroken;
+    if (damagedItems)
+        return RepairReadBack::StillDamaged;
+    return RepairReadBack::Whole;
+}
+
+char const* RepairReadBackWord(RepairReadBack readBack)
+{
+    switch (readBack)
+    {
+        case RepairReadBack::Whole:        return "whole";
+        case RepairReadBack::StillDamaged: return "still damaged";
+        case RepairReadBack::StillBroken:  return "still broken";
+    }
+    return "";
+}
+
+RepairLegVerdict RepairLegStatus(unsigned outstanding, time_t heldForSeconds,
+                                 time_t boundSeconds)
+{
+    if (outstanding == 0)
+        return RepairLegVerdict::Finished;
+    if (heldForSeconds >= boundSeconds)
+        return RepairLegVerdict::Overdue;
+    return RepairLegVerdict::Working;
+}
+
+bool RepairLegMayTryAgain(std::string const& detail)
+{
+    if (detail == REPAIR_CANNOT_AFFORD)
+        return false;
+    return RepairRefusalRetry(detail) != TownRetry::Never;
+}
 }  // namespace OverseerDecisions

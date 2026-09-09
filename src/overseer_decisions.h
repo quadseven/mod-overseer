@@ -8839,6 +8839,205 @@ struct PartyFlightPlan
 // `routeKnown` is each member's answer about that same landing.
 PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members);
 
+
+// -------------- the trip that follows a run, rather than one that never
+//                comes (#391) --
+//
+// WHAT WAS MEASURED, ON THE REALM AND IN THE SOURCE. Every `kind='repair'` row
+// ever written, 67 of them: 47 refused `repairer not in range`, 15 delivered, 3
+// found nothing damaged, 2 found nobody online. And the five characters those
+// rows belong to carry three or four items at durability ZERO each, right now.
+// A broken item gives no armour at all and a broken weapon does minimal damage,
+// so a family in that state is fighting a dungeon nearly unarmoured.
+//
+// THE 47 ARE NOT THE INTERESTING NUMBER. They are the arrival race
+// CounterArrivalStep above was written from, and every one of them predates the
+// commit that fixed it by hours. The interesting number is that the LAST repair
+// row of any kind was written hours before a run that then completed, and no
+// repair was attempted afterwards - because nothing in this module has ever
+// asked for one. `INSERT INTO overseer_command` has zero matches in the
+// adapter, so every repair that has ever happened was asked for by a producer
+// outside the worldserver.
+//
+// AND DURING A CAMPAIGN THAT PRODUCER CANNOT GET ONE THROUGH EITHER, which the
+// coordinator already says about itself: claiming the leader's aim for a
+// staging point "takes a vendor, bank or repair errand away from a pass that is
+// in the middle of it ... Nothing errors, which is why a hundred-run campaign
+// has never had a maintenance trip."
+//
+// THE ONE GATE THAT MENTIONS REPAIR IS A BRAKE RATHER THAN A TRIGGER.
+// DungeonRunMaintenanceHold holds a run open while somebody else's rows are
+// outstanding, and it is asked from exactly one place: the coordinator's IDLE
+// branch. A campaign of a hundred runs passes through IDLE twice, once before
+// the first run and once after the last, because every run that goes again sets
+// RESETTING directly. So that hold is evaluated once per CAMPAIGN. Between runs
+// 2 and 100 there is no gate, no trip, and no state in which one could happen,
+// and durability only ever falls.
+//
+// SO THE LEG IS THE MODULE'S OWN, AND THESE ARE THE DECISIONS IN IT. The
+// walking, the hold and the packet are machinery that already exists and is
+// already proven: the escort lease the home errand walks a member to an inn
+// with, the counter hold CounterArrivalStep takes on arrival, and the executor
+// a `kind='repair'` row already drives. What is new is only WHO IS OWED A TRIP,
+// WHEN THE LEG IS OVER, and WHAT THE READ-BACK ACTUALLY PROVED - and that third
+// one is here because the command table cannot answer it (see ReadRepairBack).
+
+// What is true about one roster member at the moment the leg looks at it.
+struct RepairLegFacts
+{
+    // In the world and steerable. A name that resolves to nothing is a member
+    // mid-login, logged out, or crossing a map, and NOTHING about it can be
+    // read: its durability lives on a live Player and nowhere else. So
+    // `damaged` is not false about such a member, it is unknown, which is why
+    // `Wait` is an answer separate from both of the others.
+    bool present{false};
+    // At least one carried item is below its maximum, over exactly the slots a
+    // repair-all walks. ONE READING, taken by the adapter with the same
+    // function the executor's own read-back uses, so that "damaged" cannot come
+    // to mean two things at the two ends of one leg.
+    bool damaged{false};
+    // The core's own GetNPCIfCanInteractWith accepts a repair-flagged creature
+    // from where this member is standing - byte for byte the call the executor
+    // makes before it hands a packet to a handler, so a true here is a repair
+    // that gate will not turn down.
+    //
+    // DELIBERATELY NOT A DISTANCE, for CounterArrivalStep's reason: arrival is
+    // twelve yards measured against a spawn row while the gate is five and a
+    // half measured against a creature that has feet, and 47 of the 67 repair
+    // rows ever written died in the gap between those two numbers. A leg that
+    // compared yards would be keeping a second opinion about a question the
+    // core has already answered.
+    bool atARepairer{false};
+};
+
+enum class RepairLegStep : std::uint8_t
+{
+    Wait,    // nothing can be read or done about this member on this poll
+    Done,    // it carries nothing damaged: the leg is finished with it
+    Repair,  // it is at a repairer the core will talk to: send the packet
+    Walk,    // it is damaged and not at one: aim it at a repairer
+};
+
+// THE ORDER OF THE FOUR TESTS IS THE MEANING, and each one makes the ones below
+// it unaskable.
+//
+// A member that is not in the world has no durability to read, so answering
+// `Done` about it would finish the leg for a character that logs in ten seconds
+// later with broken armour. Wait.
+//
+// `damaged` is asked before the counter and not after, because a member that
+// needs nothing is finished wherever it happens to be standing. The other order
+// would walk an undamaged character to a repairer to discover there was nothing
+// to do when it arrived.
+//
+// And `Repair` outranks `Walk` for the reason the whole leg exists: the poll on
+// which a character is standing in reach of a repairer is the poll to spend,
+// because nothing guarantees there will be another one. That is the same lesson
+// the inn bind and the counter hold each paid for at the other end of the trip.
+RepairLegStep RepairLegMemberStep(RepairLegFacts const& facts);
+
+// "wait", "done", "repair", "walk". Here rather than in the adapter so the word
+// a log line carries is the word a test pins.
+char const* RepairLegStepWord(RepairLegStep step);
+
+// ------------------------------ what a repair actually proved (#391) --
+//
+// WHY THE COMMAND ROW CANNOT ANSWER THIS, AND WHY THAT IS NOT A NITPICK.
+// `DoRepair` writes `status = 'delivered'` only after reading every carried
+// item's durability field back and finding one that rose, and the purse fallen.
+// That is a real assertion and a stronger one than most verbs make. What it is
+// NOT is an assertion that the character is whole: the success path writes the
+// same EMPTY `detail` whether nothing was left damaged or half the set was, and
+// the difference survives only inside the `result` JSON.
+//
+// That is not hypothetical. Player::DurabilityRepair charges per item and
+// simply RETURNS when the purse is short, so a repair-all against a thin purse
+// restores the earlier slots, silently leaves the rest, and reports delivered.
+// Fifteen delivered rows and eighteen broken items across five characters are
+// not in contradiction today, and they should be.
+//
+// So the leg judges itself on the world rather than on its own row, and it
+// distinguishes the two states that matter to a party about to walk into a
+// dungeon.
+enum class RepairReadBack : std::uint8_t
+{
+    Whole,         // nothing carried is below its maximum
+    StillDamaged,  // everything still works, something is short of its maximum
+    StillBroken,   // something is at ZERO: armour giving nothing, or a dead weapon
+};
+
+// BROKEN OUTRANKS DAMAGED, because they are not degrees of one thing. An item
+// at half durability is worn and works; an item at zero contributes no armour at
+// all and, on a weapon, minimal damage. A party sent back in with a broken set
+// is a party fighting nearly unarmoured, and that is worth a different word in
+// the log from a party whose gear is merely scuffed.
+//
+// `damagedItems` COUNTS THE BROKEN ONES TOO, because a broken item is a damaged
+// item and a caller that had to remember to add them would eventually not.
+RepairReadBack ReadRepairBack(unsigned damagedItems, unsigned brokenItems);
+
+// "whole", "still damaged", "still broken".
+char const* RepairReadBackWord(RepairReadBack readBack);
+
+enum class RepairLegVerdict : std::uint8_t
+{
+    Working,   // somebody still has something to do: hold the leg open
+    Finished,  // every member is repaired, or had nothing to repair
+    Overdue,   // the bound fired: the next run opens anyway, and this says who
+};
+
+// IS THE LEG OVER?
+//
+// AND IT IS BOUNDED, for the reason every wait in this file is bounded, failing
+// in the direction DungeonRunMaintenanceHold already argues for: a missed
+// repair costs one run's durability, and a campaign that silently stopped costs
+// the campaign. Past the bound the next run opens anyway and the leg says out
+// loud who it could not repair, which is a thing an operator can act on.
+//
+// FINISHED OUTRANKS OVERDUE wherever both are true, because a leg whose last
+// member was repaired on the very poll the bound fired did exactly the thing it
+// exists for. Reporting that as a failure would put an ERROR in the log for a
+// trip that worked, and an ERROR that fires on success is how a real one gets
+// ignored.
+//
+// A BOUND OF ZERO IS NOT AN UNBOUNDED LEG. It is a leg with no time at all, and
+// it answers Overdue on the first poll that has anybody outstanding. Reading a
+// zero as "no bound" is how a wait somebody meant to disable becomes a wait
+// that never ends.
+RepairLegVerdict RepairLegStatus(unsigned outstanding, time_t heldForSeconds,
+                                 time_t boundSeconds);
+
+// ------- the one refusal literal with three readers, so it has one home --
+//
+// `DoRepair` returns it into a command row's `detail`, RepairRefusalRetry keys
+// its table on it, and the post-run repair leg has to recognise it as well.
+// Three copies of a string that must agree is exactly the drift this file
+// exists to stop, and the sell table's own comment already says a refusal
+// literal and the table that classifies it are one fact written twice.
+constexpr char REPAIR_CANNOT_AFFORD[] = "cannot afford the repair";
+
+// Is this refusal one the LEG can do anything about on its next poll?
+//
+// A DIFFERENT QUESTION FROM RepairRefusalRetry, ASKED BY A DIFFERENT KIND OF
+// CALLER, which is why it is a second function rather than a second reading of
+// the first. That one answers whether a FRESH ROW would succeed, and `Later` is
+// the right answer for an empty purse there: the sender may sell something and
+// come back. This one is asked by a leg that is already standing the character
+// at a repairer the core's own gate has accepted, has already sent the packet,
+// and has already read the world back.
+//
+// MONEY IS WHERE THE TWO ANSWERS DIFFER, and it is the case that matters. A
+// purse that could not pay will not have filled by the next poll of a leg that
+// does not earn, so spinning on it would spend the whole bound to arrive at the
+// identical refusal - once per run, a hundred times, with an ERROR at the end
+// of each saying the trip failed when the trip worked and the family was broke.
+//
+// EVERYTHING ELSE DEFERS TO THE TABLE. A `Never` is permanent for both callers,
+// and everything the table has not heard of is worth one more poll here for the
+// same reason it is worth another row there: an unrecognised refusal is more
+// likely a new transient than a new permanent.
+bool RepairLegMayTryAgain(std::string const& detail);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

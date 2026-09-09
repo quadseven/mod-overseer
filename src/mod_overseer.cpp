@@ -2374,6 +2374,24 @@ constexpr uint32 DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES = 3;
 // which is the failure this whole constant exists to prevent.
 constexpr time_t DUNGEON_MAINTENANCE_HOLD_SECONDS = 20 * 60;
 
+// HOW LONG THE REPAIR LEG BETWEEN TWO RUNS MAY TAKE (#391), before the next
+// run opens anyway and the leg says who it could not repair.
+//
+// BORROWED RATHER THAN PICKED, from the one clock in this file that already
+// bounds this exact journey. The constant above is how long a run waits for
+// somebody else's trip to these same counters, and its own comment carries the
+// measurement that makes it right here too: the usable counter for this family
+// is about 1,470 yards from the dungeon door, because the nearer one belongs to
+// the other faction and is correctly refused. This leg walks that same distance
+// to that same town.
+//
+// AND IT FAILS IN THE SAME DIRECTION, deliberately. Past the bound the next run
+// opens on worn gear and an ERROR names every member still carrying broken
+// items. A missed repair costs one run's durability; a campaign that stopped
+// silently costs the campaign, and this module has paid for an unbounded wait
+// more than once already.
+constexpr time_t DUNGEON_REPAIR_BACKSTOP_SECONDS = DUNGEON_MAINTENANCE_HOLD_SECONDS;
+
 // HOW MANY TIMES A QUEST MAY BE CHOSEN AND ABANDONED BEFORE WE STOP CHOOSING
 // IT (infra#2801). Measured on the live realm: the leader was handed quest 109
 // thirty-eight times in twelve minutes and travelled 0.0 yards, because its
@@ -19553,7 +19571,25 @@ private:
         Enter,         // the party closes the last yards to the door and crosses together
         StagedInside,  // every member is on the instance map; handed to the clearing drive
         Clearing,      // the run is under way; the coordinator watches that the brain is on
-        Exiting        // the run is over; the party goes back out the door it came in
+        Exiting,       // the run is over; the party goes back out the door it came in
+        // AND THE RUN IS NOT OVER WHEN THE FIGHTING IS (#391). Every run
+        // wears the family's gear down and nothing ever put it back:
+        // `INSERT INTO overseer_command` has no matches in this file, so
+        // every repair that has ever happened was asked for from outside
+        // the worldserver, and the one gate in here that mentions repair is
+        // DungeonRunMaintenanceHold, which is a BRAKE and is asked only at
+        // IDLE. A hundred-run campaign reaches IDLE twice. Measured on the
+        // five characters: three or four items at durability ZERO each, out
+        // of twelve to fourteen equipped, which is a party fighting a
+        // dungeon with several slots contributing no armour at all.
+        //
+        // SO THE TRIP IS A PHASE OF THE RUN RATHER THAN A HOPE ABOUT THE GAP
+        // BETWEEN TWO. It sits between EXIT and the next RESET precisely
+        // because that gap is the only moment nothing else owns these
+        // characters - and because the coordinator claiming the leader's aim
+        // for a staging point is exactly what has always taken a repair
+        // errand away from whoever was in the middle of it.
+        Repairing      // the party is repaired before the next run opens
     };
 
     // World-thread-only, unguarded, lost on restart - same discipline as
@@ -19839,6 +19875,29 @@ private:
         // walkable again, and the line can therefore be said once per episode
         // rather than once per coordinator.
         bool loggedAboveTheDoor{false};
+
+        // --- the trip that follows this run (#391) ---------------------
+        //
+        // WHEN THE LEG STARTED, so it can be given up on. Stamped by
+        // EndRunAndDecide on the poll that ends a run and decides to go
+        // again; zero at every other moment, which is what "not repairing"
+        // means. It lives on the RUN rather than on this class because it
+        // dies with the run, exactly as the staging clock beside it does.
+        time_t repairSince{0};
+        // WHO THE LEG IS FINISHED WITH. A positive list rather than a count,
+        // deliberately: a member is settled when it carries nothing damaged,
+        // when it has been repaired, or when this leg has established that it
+        // cannot repair it, and each of those is said out loud at the moment
+        // it happens. A count could tell none of them apart, and could not be
+        // checked against a roster that changes size mid-leg.
+        std::set<std::string> repairSettled;
+        // WHAT THE LEG LAST SAID ABOUT A MEMBER, keyed on a short reason
+        // rather than on the sentence, so a condition that lasts ten minutes
+        // is one line and a condition that CHANGES is said again. The same
+        // register `_homeBindSaid` keeps for the walk to an inn, and for the
+        // same reason: the sentences carry live counts and would otherwise
+        // repeat themselves every poll.
+        std::map<std::string, std::string> repairSaid;
 
         // --- crossing a continent (#241) -----------------------------
         //
@@ -22220,7 +22279,23 @@ private:
         }
 
         coord = DungeonRunCoordinatorState();
-        coord.phase = DungeonRunPhase::Resetting;
+        // THE NEXT RUN DOES NOT OPEN ON BROKEN GEAR (#391). This used to set
+        // RESETTING directly, and that one assignment is why a hundred-run
+        // campaign has never repaired: a run that goes again never returns to
+        // IDLE, and IDLE is the only place this module has ever asked a
+        // maintenance question. REPAIRING is a phase of the run for that
+        // reason, and it hands over to RESETTING itself when it is done or
+        // when its bound fires.
+        //
+        // ENTERED AFTER AN ATTEMPT THAT NEVER GOT INSIDE AS WELL, and that is
+        // not carelessness. A party can lose durability dying on the approach
+        // just as it can inside, and the leg asks each member whether anything
+        // is actually damaged before it walks anybody: a family that needs
+        // nothing settles every member on the first poll and costs the campaign
+        // one poll. A condition here would be a second opinion about a question
+        // the leg already answers per member.
+        coord.phase = DungeonRunPhase::Repairing;
+        coord.repairSince = std::time(nullptr);
         coord.portalKeyword = keyword;
         // THE STAGING POINT IS CARRIED, NOT RE-RESOLVED. Its own comment gives
         // the reason it is resolved once per run rather than once per poll: the
@@ -22795,6 +22870,395 @@ private:
                 }
                 break;
         }
+    }
+
+    // ------------------- the trip that follows every run (#391) --
+    //
+    // WHY THIS EXISTS, MEASURED. Every `kind='repair'` row ever written on the
+    // dev realm, 67 of them: 47 refused "repairer not in range", 15 delivered, 3
+    // found nothing damaged, 2 found nobody online. The last one of any kind was
+    // written hours before a dungeon run that then completed, and nothing was
+    // attempted afterwards, because nothing in this module has ever asked for a
+    // repair: `INSERT INTO overseer_command` has no matches in this file. The
+    // only gate in here that mentions repair is DungeonRunMaintenanceHold, and
+    // that is a BRAKE on starting a run rather than a reason to make a trip - it
+    // is asked from one place, the coordinator's IDLE branch, which a
+    // hundred-run campaign reaches twice.
+    //
+    // WHAT IT COST. Read off the five characters: twelve to fourteen equipped
+    // items each and three or four of them at durability ZERO. A broken item
+    // contributes no armour at all and a broken weapon does minimal damage, so
+    // the family has been clearing a dungeon with several slots doing nothing,
+    // over and over, and every run made it worse.
+    //
+    // WHAT THIS IS BUILT OUT OF, AND WHY ALMOST NONE OF IT IS NEW. The walk is
+    // the escort lease DriveHomeBind already walks a member to an inn with. The
+    // aim is the `repair` role keyword, which ResolveTravelTarget already
+    // narrows to counters this character may actually interact with (#234) and
+    // away from ones standing in hostile ground (#267) - which is why no
+    // coordinate is written down here, and why this does not have to know where
+    // the town is. The last few yards and the standing still are
+    // CounterArrivalStep's hold, taken by the travel drive on arrival. The
+    // transaction is DoRepair, the same executor a `kind='repair'` row drives,
+    // called directly rather than copied. What is genuinely new is that
+    // somebody asks.
+    //
+    // AND IT BELIEVES NOTHING IT IS TOLD. `delivered` is not `done` anywhere in
+    // this module, and here it is doubly not: DoRepair writes the same EMPTY
+    // `detail` whether it left nothing damaged or half a set, because
+    // Player::DurabilityRepair charges per item and simply returns when the
+    // purse is short. So this reads the durability back itself, before and
+    // after, and judges on the world. See OverseerDecisions::ReadRepairBack.
+
+    // HOW MANY CARRIED ITEMS ARE DAMAGED, AND HOW MANY ARE BROKEN OUTRIGHT, over
+    // exactly the slots a repair-all walks - which is why it is expressed
+    // through ReadCarriedDurability rather than over the equipment slots
+    // ProbeGear reads. ONE READING for the decision to go and for the read-back
+    // afterwards, so "damaged" cannot come to mean two things at the two ends of
+    // one leg.
+    //
+    // BROKEN IS `current == 0` AND NOT A THRESHOLD. It is the state the game
+    // itself treats differently: at zero an item is unequipped in effect,
+    // contributing none of its armour and, on a weapon, minimal damage. Anything
+    // above zero still works.
+    static void ReadRepairNeed(Player* who, uint32& outDamaged, uint32& outBroken)
+    {
+        outDamaged = 0;
+        outBroken = 0;
+        if (!who)
+            return;
+        for (DurabilityReading const& reading : ReadCarriedDurability(who))
+        {
+            if (reading.current >= reading.maximum)
+                continue;
+            ++outDamaged;
+            if (reading.current == 0)
+                ++outBroken;
+        }
+    }
+
+    // Said once per member per reason, on the run's own register so it dies with
+    // the run. The same shape SayHomeBindOnce keeps and for the same reason: this
+    // leg's lines carry live counts, and a walk to a town is minutes of polls.
+    static bool SayRepairLegOnce(DungeonRunCoordinatorState& coord,
+                                 std::string const& name, std::string const& why)
+    {
+        auto const it = coord.repairSaid.find(name);
+        if (it != coord.repairSaid.end() && it->second == why)
+            return false;
+        coord.repairSaid[name] = why;
+        return true;
+    }
+
+    // THE LEG IS FINISHED WITH THIS MEMBER, whichever of the three ways it got
+    // there. The errand ends HERE rather than at the sweep, which is the
+    // discipline EndHomeEscort keeps for the same reason: a lease held thirty
+    // seconds longer than it is wanted is thirty seconds of a follower that
+    // could be following. The escort entry itself is left to
+    // SweepDungeonEscorts, which ends anything this poll stopped marking.
+    void SettleRepair(DungeonRunCoordinatorState& coord, std::string const& name)
+    {
+        coord.repairSettled.insert(name);
+        if (HasCounterHold(name))
+            ReleaseCounterHold(name, "the repair leg is finished with it");
+        _travelAims.Release(name);
+    }
+
+    // REPAIR THIS MEMBER WHERE IT IS STANDING, AND READ THE WORLD BACK.
+    // Returns true when the leg is finished with it.
+    //
+    // THE PACKET IS DoRepair's, NOT A SECOND COPY OF ONE. That executor already
+    // owns every gate the core would apply, the choice of repairer among those
+    // in reach, the quote written down beside what was actually spent, and the
+    // success line an operator reads. A parallel implementation here would be
+    // two ways to repair with two chances to be wrong, which is the mistake #348
+    // named when it lifted the bind out of DoBind rather than writing a second
+    // one beside it.
+    //
+    // ITS ANSWER IS EVIDENCE AND NOT A VERDICT, THOUGH. The row it fills in is
+    // discarded here - this leg has no row - and the judgement is made on the
+    // durability read back from the items themselves.
+    bool RepairMemberHere(DungeonRunCoordinatorState& coord, std::string const& name,
+                          Player* bot, uint32 damagedBefore, uint32 brokenBefore)
+    {
+        char const* status = "error";
+        std::string evidence;
+        // GUARDED RATHER THAN TRUSTED. Every return in DoRepair today is a
+        // literal or the empty string, so this can only be the empty string -
+        // but the sibling executor DoBind returns nullptr deliberately on its
+        // success path, and a std::string constructed from one is undefined
+        // behaviour rather than a crash you would find.
+        char const* const answer = DoRepair(bot, "all", status, evidence);
+        std::string const refusal = answer ? answer : "";
+
+        uint32 damagedAfter = 0;
+        uint32 brokenAfter = 0;
+        ReadRepairNeed(bot, damagedAfter, brokenAfter);
+
+        OverseerDecisions::RepairReadBack const readBack =
+            OverseerDecisions::ReadRepairBack(damagedAfter, brokenAfter);
+
+        // THE ROW THAT PROVES THIS LEG RAN, written for a refusal exactly as for
+        // a repair. "The leg tried here and could not" is the fact a campaign of
+        // a hundred runs needs in a table, and it is the one that has never
+        // existed: `overseer_event` has never held a `repair` row, because
+        // nothing has ever repaired outside a command the bridge sent.
+        {
+            std::ostringstream detail;
+            detail << OverseerDecisions::RepairReadBackWord(readBack) << ": "
+                   << damagedBefore << " damaged (" << brokenBefore << " broken) before, "
+                   << damagedAfter << " (" << brokenAfter << ") after";
+            if (!refusal.empty())
+                detail << "; " << refusal;
+            RecordEvent(bot, "repair", brokenAfter, name, detail.str());
+        }
+
+        if (readBack == OverseerDecisions::RepairReadBack::Whole)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is repaired - nothing it carries is below its maximum "
+                     "any more, where it had {} damaged item(s) and {} broken outright when "
+                     "the run ended",
+                     name, damagedBefore, brokenBefore);
+            SettleRepair(coord, name);
+            return true;
+        }
+
+        // A REPAIR THAT HAPPENED AND DID NOT FINISH THE JOB IS THE PURSE, and
+        // asking again on the next poll cannot change it. Player::DurabilityRepair
+        // charges per item and returns when the money runs out, so the second call
+        // repairs the same nothing the first one stopped at. Said out loud and
+        // settled, because a leg that spins here would spend its whole bound to
+        // reach the identical answer.
+        if (refusal.empty())
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was repaired at the counter and is {} - {} item(s) "
+                     "still damaged and {} still at zero durability, from {} and {}. The "
+                     "core repairs item by item and stops when the purse is short, so this "
+                     "is what the family could afford, not a failure of the trip. Selling "
+                     "and restocking are somebody else's leg",
+                     name, OverseerDecisions::RepairReadBackWord(readBack), damagedAfter,
+                     brokenAfter, damagedBefore, brokenBefore);
+            SettleRepair(coord, name);
+            return true;
+        }
+
+        // A REFUSAL WORTH ANOTHER POLL IS LEFT OUTSTANDING, and one that is not
+        // ends this member's leg. The classification is the pure one, so the
+        // literals live in one place and this cannot drift from the table the
+        // command queue keys on. See OverseerDecisions::RepairLegMayTryAgain for
+        // why the leg's question is narrower than the queue's.
+        if (OverseerDecisions::RepairLegMayTryAgain(refusal))
+        {
+            if (SayRepairLegOnce(coord, name, refusal))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is at a repairer and the repair was refused - {}. "
+                         "It is asked again next poll, until the {} minute bound",
+                         name, refusal, uint32(DUNGEON_REPAIR_BACKSTOP_SECONDS / 60));
+            return false;
+        }
+
+        LOG_ERROR("module.overseer",
+                  "overseer: '{}' cannot be repaired at the counter it is standing at - "
+                  "{}. It still carries {} damaged item(s), {} of them at zero durability, "
+                  "and this leg has nothing else to try for it. The next run opens with "
+                  "that gear",
+                  name, refusal, damagedAfter, brokenAfter);
+        SettleRepair(coord, name);
+        return true;
+    }
+
+    // Everything this leg claimed, handed back in one place, so that every way
+    // out of the leg lets go of the same things. The next phase claims the
+    // leader's aim for a staging point on its own poll, which is exactly why
+    // this must not leave one pointing at a shop.
+    void EndRepairLeg(DungeonRunCoordinatorState& coord,
+                      std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            if (HasCounterHold(name))
+                ReleaseCounterHold(name, "the repair leg is over");
+            _travelAims.Release(name);
+        }
+        coord.repairSince = 0;
+        coord.repairSettled.clear();
+        coord.repairSaid.clear();
+        coord.phase = DungeonRunPhase::Resetting;
+    }
+
+    void DriveRepairLeg(DungeonRunCoordinatorState& coord,
+                        std::string const& leaderName,
+                        std::vector<std::string> const& members)
+    {
+        unsigned outstanding = 0;
+        std::string owed;   // who is still owed a trip, for the overdue line
+
+        for (std::string const& name : members)
+        {
+            if (coord.repairSettled.count(name))
+                continue;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const botAI = SteerableAI(bot);
+
+            uint32 damaged = 0;
+            uint32 broken = 0;
+            OverseerDecisions::RepairLegFacts facts;
+            facts.present = botAI != nullptr;
+            if (facts.present)
+            {
+                ReadRepairNeed(bot, damaged, broken);
+                facts.damaged = damaged > 0;
+                // ASKED ONLY OF A MEMBER THAT NEEDS SOMETHING, which keeps a cell
+                // sweep off every undamaged character on every poll of the leg.
+                // The answer would not change what happens to one - an undamaged
+                // member is finished wherever it stands - so paying for it would
+                // be a cost with no reader.
+                //
+                // AND IT IS ASKED BEFORE THE WALK, WHICH IS WHAT MAKES A
+                // PORTABLE REPAIR BOT WORK FOR FREE. Both this gate and
+                // DoRepair's own sweep test HasNpcFlag(UNIT_NPC_FLAG_REPAIR)
+                // over the creatures actually near the character and then put
+                // each through the core's own GetNPCIfCanInteractWith. Neither
+                // looks up a stored entry, so any creature that repairs for a
+                // player - a town blacksmith, or a repair bot somebody summoned
+                // at the party's feet - is found by the same test. A member
+                // standing next to one therefore never walks anywhere: the step
+                // below is Repair rather than Walk, on the first poll of the
+                // leg. Nothing here has to know that portable repairers exist,
+                // and that is the point.
+                if (facts.damaged)
+                {
+                    bool oneIsNearby = false;
+                    float nearestYards = -1.f;
+                    facts.atARepairer =
+                        CounterInReach(bot, OverseerDecisions::CounterRole::Repairer,
+                                       oneIsNearby, nearestYards);
+                }
+            }
+
+            switch (OverseerDecisions::RepairLegMemberStep(facts))
+            {
+                case OverseerDecisions::RepairLegStep::Wait:
+                    // Mid-login, logged out, or crossing a map. Nothing about its
+                    // gear can be read from here, so it is neither finished nor
+                    // walkable, and the bound below is what ends this.
+                    ++outstanding;
+                    if (!owed.empty())
+                        owed += ", ";
+                    owed += name + " (not in the world)";
+                    if (SayRepairLegOnce(coord, name, "not in the world"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: the repair leg cannot read '{}' - it is not in "
+                                 "the world, so whether its gear is broken is unknown "
+                                 "rather than fine. It is waited for, up to the {} minute "
+                                 "bound",
+                                 name, uint32(DUNGEON_REPAIR_BACKSTOP_SECONDS / 60));
+                    break;
+
+                case OverseerDecisions::RepairLegStep::Done:
+                    if (SayRepairLegOnce(coord, name, "nothing damaged"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' carries nothing below its maximum "
+                                 "durability, so the repair leg is finished with it without "
+                                 "walking it anywhere",
+                                 name);
+                    SettleRepair(coord, name);
+                    break;
+
+                case OverseerDecisions::RepairLegStep::Repair:
+                    // THE HOLD IS RE-ASSERTED HERE, AND THE COMMENT ON
+                    // HoldAtTheCounter SAYS WHY IT COULD NOT BE BEFORE. That hold
+                    // is taken once, on arrival, because until now nothing looked
+                    // at the character again: the errand was released on the same
+                    // statement and the rows that transact were written by a
+                    // process outside the worldserver. This leg IS such a poll,
+                    // so it takes the half that was missing.
+                    //
+                    // AND IT IS NEEDED, because the errand's release is not
+                    // harmless. RestoreTravelFocus hands the stood-down
+                    // strategies back - `grind` among them - as soon as an aim
+                    // stops coming back from the roster, and it does not ask
+                    // whether anything is holding the character. KeepHeldCharactersStill
+                    // re-taking the motion slot is what actually keeps a wandering
+                    // character in place, and that only works while the hold is
+                    // still in force: its ceiling is five minutes and this leg is
+                    // bounded at twenty. A member retried across that gap would
+                    // walk away from the counter mid-leg, which is 47 of the 67
+                    // repair rows ever written, reproduced from inside the module
+                    // instead of from outside it.
+                    HoldAtTheCounter(bot, name);
+                    if (!RepairMemberHere(coord, name, bot, damaged, broken))
+                    {
+                        ++outstanding;
+                        if (!owed.empty())
+                            owed += ", ";
+                        owed += name + " (at a repairer, refused)";
+                    }
+                    break;
+
+                case OverseerDecisions::RepairLegStep::Walk:
+                    ++outstanding;
+                    if (!owed.empty())
+                        owed += ", ";
+                    owed += name + " (" + std::to_string(damaged) + " damaged, " +
+                            std::to_string(broken) + " broken)";
+                    if (SayRepairLegOnce(coord, name, "walking"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' carries {} damaged item(s), {} of them at "
+                                 "zero durability, so the repair leg walks it to a repairer "
+                                 "before the next run opens. The aim is the role rather than "
+                                 "a place, so the walk picks a counter this character may "
+                                 "actually trade with and is not standing in hostile ground",
+                                 name, damaged, broken);
+                    // EscortPurpose::Assemble and not LeaveInstance: nobody is
+                    // inside anything. The purpose is read by DriveDungeonClear to
+                    // decide whether to stand the dungeon brain down, and standing
+                    // it down for a party that is already outside would be this leg
+                    // asserting something about a run that is over.
+                    EscortToward(name, "repair", "REPAIR", EscortPurpose::Assemble);
+                    break;
+            }
+        }
+
+        time_t const heldFor =
+            coord.repairSince ? std::time(nullptr) - coord.repairSince : 0;
+
+        switch (OverseerDecisions::RepairLegStatus(outstanding, heldFor,
+                                                   DUNGEON_REPAIR_BACKSTOP_SECONDS))
+        {
+            case OverseerDecisions::RepairLegVerdict::Working:
+                return;
+
+            case OverseerDecisions::RepairLegVerdict::Finished:
+                LOG_INFO("module.overseer",
+                         "overseer: the repair leg for '{}'s party is done after {}s - every "
+                         "member is repaired or had nothing to repair, so the next run opens "
+                         "on gear that works. RESET goes next",
+                         leaderName, uint32(heldFor));
+                break;
+
+            case OverseerDecisions::RepairLegVerdict::Overdue:
+                // SAID EVERY TIME AND NOT ONCE, exactly as the maintenance hold's
+                // own overdue line is. This is not narration of a steady state, it
+                // is the bound firing and the next run opening on broken gear on
+                // the same poll. An operator reading it is reading a party about
+                // to fight without some of its armour.
+                LOG_ERROR("module.overseer",
+                          "overseer: the repair leg for '{}'s party has run {} minutes, past "
+                          "the {} minute bound, and {} member(s) are still owed a repair: {}. "
+                          "The next run opens anyway, because a campaign that waits forever "
+                          "costs the campaign while a run on worn gear costs one run - but a "
+                          "member listed as broken here is fighting with slots that give no "
+                          "armour at all. The walk to the counter is the thing to look at",
+                          leaderName, uint32(heldFor / 60),
+                          uint32(DUNGEON_REPAIR_BACKSTOP_SECONDS / 60), outstanding, owed);
+                break;
+        }
+
+        EndRepairLeg(coord, members);
     }
 
     void DriveDungeonRun()
@@ -23657,6 +24121,18 @@ private:
                                 coord.phase == DungeonRunPhase::Barrier;
         if (assembling && !coord.stagingSince)
             coord.stagingSince = std::time(nullptr);
+
+        // THE GEAR IS PUT BACK BEFORE THE NEXT RUN OPENS (#391). Above
+        // RESETTING because it comes before it in time, and because
+        // everything below this line is about a run that is starting: RESET
+        // throws away the instance the party is bound to and GATHERING
+        // claims the leader's aim, and that claim is exactly what has
+        // always taken a repair errand away from whoever was mid-trip.
+        if (coord.phase == DungeonRunPhase::Repairing)
+        {
+            DriveRepairLeg(coord, leaderName, members);
+            return;
+        }
 
         if (coord.phase == DungeonRunPhase::Resetting)
         {
@@ -29248,7 +29724,12 @@ private:
             // not heard of - a missing DurabilityCosts row, or the
             // OnPlayerBeforeDurabilityRepair script hook.
             if (ev.quoted >= 0 && ev.moneyBefore < ev.quoted)
-                return refuse("cannot afford the repair");
+                // THE LITERAL LIVES IN THE PURE HEADER NOW (#391), because it
+                // has three readers that must agree: this row's `detail`,
+                // RepairRefusalRetry's table, and the post-run repair leg,
+                // which has to recognise an empty purse as the one wall it
+                // cannot get past by asking again.
+                return refuse(OverseerDecisions::REPAIR_CANNOT_AFFORD);
             return refuse("the core repaired nothing");
         }
 
