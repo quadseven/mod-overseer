@@ -1963,6 +1963,54 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_STAGING_RATCHET{
 constexpr time_t DUNGEON_STAGING_BACKSTOP_SECONDS =
     2 * (OverseerDecisions::STAGING_NUDGE_STEPS + 1) * DUNGEON_STAGING_STALL_SECONDS;
 
+// ---------------- a home the campaign's own dungeon can be reached from (#348) --
+
+// HOW FAR A HOME MAY BE FROM THE CAMPAIGN'S OWN INN AND STILL BE THAT INN.
+//
+// The same argument BIND_SAME_SPOT_YARDS makes, one scale up. That one is ten
+// yards, because a character that stepped across a common room between two
+// binds has not moved house. This is the question one level out: is this home
+// THIS TOWN, or is it somewhere else entirely. Nothing turns on the exact value,
+// because on the map this fires for there is no third answer within a thousand
+// yards of it - the next innkeeper is 940 yards off and belongs to the other
+// faction, and every other settlement is farther still. Two hundred and fifty
+// yards is comfortably wider than a town and far narrower than the gap to the
+// next one, which is precisely the property wanted.
+//
+// AND IT IS THE HALF OF THE RULE THAT DOES NOT FIRE TODAY. Every home on this
+// roster is either the anchor itself, to the yard, or on the other continent, so
+// the map test answers all five. The distance test is here for the shape every
+// later roster starts in: a member bound at SOME inn on the right map, which is
+// on the right continent and still not somewhere the door can be walked to from.
+constexpr float CAMPAIGN_HOME_TOWN_YARDS = 250.0f;
+
+// HOW LONG A MEMBER MAY BE WALKING TO THAT INN BEFORE THE ERRAND IS GIVEN UP.
+//
+// BORROWED RATHER THAN PICKED, from the one clock in this file that already
+// bounds this exact journey. DUNGEON_STAGING_BACKSTOP_SECONDS is how long a
+// whole run may spend getting itself to this door's approach, and for the one
+// door that names a town, the town IS where that approach begins - the corridor
+// opens on the innkeeper's own spawn point. A trip that has already taken longer
+// than the run it exists to make possible is not a trip that is about to arrive.
+//
+// IT IS ALSO THE ANSWER TO THE THING THE CATCH-UP WALK GOT WRONG (#298). That
+// walk claimed a lease with no timer at all, which made every deference to "the
+// claimant answers for it" a deference to nobody. This errand claims the same
+// lease, so it arrives owing the same clock, and this is it.
+constexpr time_t HOME_BIND_BACKSTOP_SECONDS = DUNGEON_STAGING_BACKSTOP_SECONDS;
+
+// AND HOW LONG NOTHING WALKS THAT MEMBER ANYWHERE AFTERWARDS.
+//
+// The same fifteen minutes CATCH_UP_STANDDOWN_SECONDS holds a catch-up walk down
+// for, read from it rather than written a second time: the two answer one
+// question - this walk was killing the character, or was never going to get
+// there, so leave it alone for a while - about two walks that share a lease. A
+// home errand that resumed while the aim it walks to was still refused would be
+// a walk to a column cleared on every poll. The argument for the number, and for
+// it being bounded rather than permanent, is on
+// OverseerDecisions::ErrandDeathLimits::cooloffSeconds.
+constexpr time_t HOME_BIND_STANDDOWN_SECONDS = CATCH_UP_STANDDOWN_SECONDS;
+
 // How close a character must be to the portal's own areatrigger before ENTER
 // will knock on it for the whole party (mod-overseer#88).
 //
@@ -4290,6 +4338,19 @@ public:
         {
             _partyTimer = 0;
             KeepRosterGrouped();
+            // Same cadence, deliberately, and reusing this timer rather than
+            // adding another - the same choice DriveStuckRevival made on the
+            // engagement clock. Where a character's HOME is changes at most once
+            // per trip to an inn, so nothing is gained by asking faster; and this
+            // is the party's own clock, which is what the answer is about.
+            //
+            // AFTER KeepRosterGrouped and BEFORE the dungeon run and travel
+            // blocks below, which is the order that makes the aim it writes
+            // usable on the same tick: SweepCatchUps has already run inside the
+            // party poll, so an escort this drive takes over is one nothing else
+            // is still marking, and DriveTravel picks the claim up a few lines
+            // further down instead of a whole poll later.
+            DriveHomeBind();
         }
         if (_trainTimer >= TRAIN_POLL_MS)
         {
@@ -11741,6 +11802,24 @@ private:
         // takes an entry over unconditionally, CatchUpToward never touches an
         // entry that is not its own.
         bool catchUp{false};
+        // ...AND THE THIRD OWNER (#348). True: the home errand's, marked by
+        // EscortHomeToward and swept by SweepHomeBindEscorts on its own drive's
+        // clock. A third kind rather than a third mechanism, for the reason the
+        // second one already gives: the lease, the hand-back, the travel focus
+        // and the backstop under all of them are one machine, and a parallel
+        // copy of it is the scatter this module has already fixed three times.
+        //
+        // MUTUALLY EXCLUSIVE WITH `catchUp`, and both give way to a run. A
+        // member being walked to an inn is a member that is not where the family
+        // is, so the moment a run wants it EscortToward takes the entry over
+        // unconditionally and clears both flags - the run's staging point is the
+        // authority on where anybody should be while a run exists, which is why
+        // the home errand only ever starts while the coordinator is IDLE.
+        bool homeBind{false};
+        // WHEN THE HOME ERRAND STARTED, so it can be given up on. Meaningful
+        // only while `homeBind`; see HOME_BIND_BACKSTOP_SECONDS for why a walk
+        // that claims this lease has to bring its own clock.
+        time_t homeSince{0};
         // WHETHER THIS CATCH-UP MAY STILL DECIDE TO FLY (#138). Set by
         // CatchUpToward on the poll that STARTS the walk and spent by
         // ConsiderFlight the first time flying is genuinely on the table,
@@ -11764,6 +11843,26 @@ private:
     {
         auto const it = _dungeonEscorts.find(name);
         return it != _dungeonEscorts.end() && it->second.catchUp;
+    }
+
+    bool IsWalkingHome(std::string const& name) const
+    {
+        auto const it = _dungeonEscorts.find(name);
+        return it != _dungeonEscorts.end() && it->second.homeBind;
+    }
+
+    // WHOSE WALK THIS IS, IN THE WORDS AN OPERATOR READS. Three owners share one
+    // lease and every line about it used to be a two-way ternary written at the
+    // call site, which is how the third owner would have arrived reported as the
+    // first. Asked once, here, so a fourth cannot be added without this
+    // answering for it.
+    char const* EscortOwnerName(std::string const& name) const
+    {
+        if (IsCatchingUp(name))
+            return "follow drive";
+        if (IsWalkingHome(name))
+            return "home errand";
+        return "run";
     }
 
     // WHICH FOLLOWERS MAY NOT BE WALKED TO THEIR LEADER YET, AND SINCE WHEN
@@ -11792,6 +11891,25 @@ private:
         if (std::time(nullptr) - it->second < CATCH_UP_STANDDOWN_SECONDS)
             return true;
         _catchUpStandDown.erase(it);
+        return false;
+    }
+
+    // THE SAME REGISTER FOR THE OTHER WALK THAT SHARES THIS LEASE (#348), and a
+    // separate one on purpose - see the death breaker's own EndCatchUp branch
+    // for why. Written when a home errand is called off, either because it was
+    // killing the character or because it had run past
+    // HOME_BIND_BACKSTOP_SECONDS without arriving; read by DriveHomeBind before
+    // it starts another. Sweeps itself, the same shape as the one above.
+    std::map<std::string, time_t> _homeBindStandDown;
+
+    bool WithinHomeBindStandDown(std::string const& name)
+    {
+        auto const it = _homeBindStandDown.find(name);
+        if (it == _homeBindStandDown.end())
+            return false;
+        if (std::time(nullptr) - it->second < HOME_BIND_STANDDOWN_SECONDS)
+            return true;
+        _homeBindStandDown.erase(it);
         return false;
     }
 
@@ -11904,13 +12022,21 @@ private:
         // knows where the family is going, and the lease it inherits -
         // `granted` - is handed back by the run's own sweep exactly as if the
         // run had granted it.
-        if (escort.catchUp)
+        if (escort.catchUp || escort.homeBind)
         {
+            // ...AND OVER A HOME ERRAND ON THE SAME TERMS (#348). The errand
+            // walks a member away from the family to an inn, which is exactly
+            // what a run cannot have happening while it gathers, and the errand
+            // is restartable: its drive only ever begins one from IDLE, so it
+            // will pick this member up again after the run is over.
+            char const* const from = escort.catchUp ? "catch-up walk" : "home errand";
             escort.catchUp = false;
+            escort.homeBind = false;
+            escort.homeSince = 0;
             LOG_INFO("module.overseer",
-                     "overseer: dungeon run {} takes over '{}' from its catch-up walk - "
+                     "overseer: dungeon run {} takes over '{}' from its {} - "
                      "the run's staging point is where the leader is going anyway",
-                     what, name);
+                     what, name, from);
         }
         _travelAims.Claim(name, aim);
         if (escort.aim == aim)
@@ -11935,6 +12061,12 @@ private:
     bool CatchUpToward(std::string const& name, Player* leader)
     {
         DungeonEscort& escort = _dungeonEscorts[name];
+        // A HOME ERRAND IS NOT A WALK TO INTERRUPT (#348). It is walking this
+        // member to the inn that stops it being dragged back across an ocean
+        // every time it hearths, and its own drive is the authority on when it
+        // ends - the same standing a run's escort already has here.
+        if (escort.homeBind)
+            return false;
         bool const started = escort.aim.empty();
         if (!started && !escort.catchUp)
             return false;
@@ -12285,8 +12417,10 @@ private:
         {
             // A catch-up is marked on the party's clock and swept by
             // SweepCatchUps; this sweep would end it five seconds after it
-            // started (#138).
-            if (it->second.catchUp)
+            // started (#138). A home errand is marked on its own drive's clock
+            // and swept by SweepHomeBindEscorts, for exactly the same reason
+            // (#348).
+            if (it->second.catchUp || it->second.homeBind)
             {
                 ++it;
                 continue;
@@ -12881,7 +13015,16 @@ private:
                 // and has not been since #138. Free, off a map this drive
                 // already reads fifty lines below for the re-aim log line. See
                 // OverseerDecisions::ErrandDeathToll::catchUp.
-                toll.catchUp = IsCatchingUp(name);
+                //
+                // AND THE HOME ERRAND IS A THIRD CLAIMANT ON THE SAME FOOTING
+                // (#348). The field's own comment already says the name is the
+                // older half of the truth: what it really asks is whether the
+                // claim is one a RELEASE would be inert against, which is true
+                // of anything that re-Claims from its own escort entry on its
+                // next poll. Both walks do. Both therefore have to be ENDED
+                // rather than released, and neither may be deferred to as if a
+                // run's phase timer were going to finish it.
+                toll.catchUp = IsCatchingUp(name) || IsWalkingHome(name);
 
                 // THE SECOND REASON TO CALL AN ERRAND OFF, CHARGED HERE AND
                 // ANSWERED BY THE RULE BELOW. The breaker asks whether an
@@ -13050,21 +13193,35 @@ private:
                         // above gives (infra#2846).
                         std::string const killer = WorstRecentKiller(name, window);
 
+                        // WHICH OF THE TWO WALKS THIS IS (#348). Both claim the
+                        // same lease and both re-Claim from their own escort
+                        // entry, which is why they share this remedy; they are
+                        // ended by different drives and stood down separately,
+                        // so a line that named the wrong one would send a reader
+                        // to the wrong drive. Read from the entry rather than
+                        // guessed - EscortOwnerName is the one answer to this.
+                        bool const homeWalk = IsWalkingHome(name);
+                        char const* const walkName =
+                            homeWalk ? "home errand" : "catch-up walk";
+
                         LOG_WARN("module.overseer",
-                                 // "ending the catch-up walk" on ONE source
-                                 // line, the same discipline every other release
-                                 // path in this function keeps.
+                                 // "ending the {}" on ONE source line, the same
+                                 // discipline every other release path in this
+                                 // function keeps.
                                  "overseer: '{}' has died {} times in the last {}s on the "
-                                 "catch-up walk to '{}'{} - ending the catch-up walk, "
-                                 "because nothing else will: it is not a dungeon run, it "
-                                 "re-aims itself at the leader every poll, and clearing "
-                                 "the column alone is undone by the next party poll. "
-                                 "`follow` has it from here, and it is not walked to its "
-                                 "leader again for {} minutes",
-                                 name, toll.deaths, window, target,
+                                 "{} to '{}'{} - ending the {}, "
+                                 "because nothing else will: it is not a dungeon run, the "
+                                 "drive that issued it re-aims it every poll, and clearing "
+                                 "the column alone is undone by that drive's next poll. "
+                                 "`follow` has it from here, and nothing walks it away "
+                                 "again for {} minutes",
+                                 name, toll.deaths, window, walkName, target,
                                  killer.empty() ? std::string()
                                                 : ", mostly to '" + killer + "'",
-                                 static_cast<uint32>(CATCH_UP_STANDDOWN_SECONDS / 60));
+                                 walkName,
+                                 static_cast<uint32>(
+                                     (homeWalk ? HOME_BIND_STANDDOWN_SECONDS
+                                               : CATCH_UP_STANDDOWN_SECONDS) / 60));
 
                         // REFUSED AS WELL AS ENDED. The walk is not the only
                         // writer of this column, and only the refusal survives
@@ -13076,17 +13233,28 @@ private:
                         // CATCH_UP_STANDDOWN_SECONDS: without this the next
                         // party poll reads the same gap over the same ground and
                         // starts the walk again, at a new aim whose toll is zero.
-                        _catchUpStandDown[name] = std::time(nullptr);
+                        //
+                        // TWO REGISTERS AND NOT ONE, because the two walks are
+                        // restarted by two drives reading two different facts
+                        // (#348). A single register would have this rule stand a
+                        // catch-up down because a home errand died, which is the
+                        // one thing worse than not standing anything down: it
+                        // would leave a follower unable to walk to its leader for
+                        // fifteen minutes for something that never involved it.
+                        if (homeWalk)
+                            _homeBindStandDown[name] = std::time(nullptr);
+                        else
+                            _catchUpStandDown[name] = std::time(nullptr);
 
                         // THE LEASE AND THE ENTRY END TOGETHER. EndOneEscort
                         // clears the column and hands `new rpg` back, which is
                         // what stops the follower standing under no aim with the
-                        // strategy still on; erasing the entry is what stops
-                        // DriveCatchUp re-Claiming from it. The entry is there by
-                        // construction - `toll.catchUp` IS IsCatchingUp(name),
-                        // read this same poll - and asked for rather than
-                        // assumed, because a crash is not a better answer than a
-                        // release.
+                        // strategy still on; erasing the entry is what stops the
+                        // drive that owns the walk re-Claiming from it. The entry
+                        // is there by construction - `toll.catchUp` IS
+                        // IsCatchingUp(name) or IsWalkingHome(name), read this
+                        // same poll - and asked for rather than assumed, because
+                        // a crash is not a better answer than a release.
                         //
                         // `state` IS DEAD AFTER THIS LINE: Release erases the
                         // errand memory that reference points into, exactly as it
@@ -13390,8 +13558,7 @@ private:
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' has reached its escort point '{}' and holds "
                                  "there - the {} releases it, not the arrival",
-                                 name, target,
-                                 IsCatchingUp(name) ? "follow drive" : "run");
+                                 name, target, EscortOwnerName(name));
                     }
                 }
                 else if (plan && !TrainOnArrival(name, bot, entry, *plan))
@@ -16076,6 +16243,45 @@ private:
         // and turned a 408 yard hop into 2238 yards of surveyed leg. So this
         // REPLACES the planned route for that one walk; see PlanRoute.
         std::vector<OverseerDecisions::RoutePoint> approach;
+
+        // AND WHERE THE FAMILY RUNNING THIS DOOR KEEPS ITS HOMES (#348).
+        //
+        // WHAT THIS IS. The inn a member of this campaign is bound at, on
+        // `outsideMapId` - the map is not repeated here, because a home a
+        // hearthstone lands on has to be on the map the door is approached from
+        // or it is not a home for this campaign at all. Three zeros mean "no
+        // town has been measured for this door", exactly as they do for the
+        // approach corridor's origin above, and the test for it is the same one:
+        // OverseerDecisions::StagingPointCheck, this module's own "that is not a
+        // place". A row that says nothing here judges nobody's home and walks
+        // nobody anywhere.
+        //
+        // WHY THE DOOR GETS TO SAY, rather than a drive picking the nearest
+        // innkeeper when it needs one. Measured against the innkeepers on map 1,
+        // by distance from the Wailing Caverns door at (-733.7, -2214.9):
+        //
+        //     3934  Innkeeper Boorand Plainswind   540 yards  Horde, the Crossroads
+        //     6791  Innkeeper Wiley               1484 yards  neutral, Ratchet
+        //     7714  Innkeeper Byula               1657 yards  Horde
+        //
+        // This family is Alliance. Player::GetNPCIfCanInteractWith refuses an
+        // unfriendly creature however close a character stands (Player.cpp:2147),
+        // so the nearest innkeeper can never set any of these homes - and the
+        // walk to it walks into a Horde town, where a member has already died
+        // three times to guards. A nearest-first rule would therefore send
+        // characters to be killed at an innkeeper that would then turn them
+        // down. The town is a property of the DUNGEON, so it is written where
+        // the door is.
+        //
+        // AND IT IS NOT A SECOND MEASUREMENT OF THE SAME THING. For `wailing`
+        // these three floats are the corridor's own first waypoint, to the yard,
+        // and they are also Innkeeper Wiley's spawn point and also the one home
+        // on this roster that was already correct. The corridor was measured
+        // starting from that bind; this row is the other half of the same fact,
+        // said out loud so a drive can act on it.
+        float homeX;
+        float homeY;
+        float homeZ;
     };
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
@@ -16301,9 +16507,52 @@ private:
                  // formats are the same place; endsAtYards is what checks that
                  // they still are.
                  { -733.7f, -2214.9f,  17.30f},
-             }},
+             },
+             // THE TOWN THIS CAMPAIGN BINDS IN, AND IT IS THE FIRST WAYPOINT
+             // ABOVE REPEATED ON PURPOSE (#348). Innkeeper Wiley, creature 6791,
+             // stands at (-1050.04, -3664.80, 23.97) in Ratchet; the corridor's
+             // opening point is that spawn to the yard, because the corridor was
+             // measured out from the one home on this roster that was already
+             // right. Ratchet is a goblin port and its innkeeper is neutral,
+             // which is the whole reason it and not the Crossroads inn 940 yards
+             // nearer the door is what an Alliance family can be bound at.
+             //
+             // WRITTEN OUT RATHER THAN READ FROM `approach.front()`, and that is
+             // a deliberate refusal to be clever. A corridor's first point is
+             // where a walk starts; an inn is where a hearthstone lands. They
+             // are the same place here and there is no reason a future door's
+             // corridor should begin at an innkeeper, so a rule that derived one
+             // from the other would be true of this row and a trap on the next.
+             -1050.0f, -3664.8f, 24.36f},
         };
         return portals;
+    }
+
+    // THE CAMPAIGN'S OWN INN, AS THE PURE DECISION READS IT (#348).
+    //
+    // `known` IS DECIDED BY StagingPointCheck AND NOT BY A FOURTH FLOAT, so
+    // "three zeros are not a place" is answered in one place for a corridor's
+    // origin and for a town alike. A row that names no town produces an anchor
+    // nobody is judged against, which is what makes this safe to ask of every
+    // portal rather than only of the one that carries one.
+    //
+    // THE MAP IS THE PORTAL'S OWN `outsideMapId` AND IS NOT WRITTEN TWICE. A
+    // home a hearthstone lands on has to be on the map the door is approached
+    // from or it is not a home for this campaign at all, so there is nothing for
+    // a second copy to disagree with.
+    static OverseerDecisions::CampaignHomeAnchor DungeonHomeAnchor(
+        DungeonPortal const& portal)
+    {
+        OverseerDecisions::CampaignHomeAnchor anchor;
+        if (!OverseerDecisions::StagingPointUsable(portal.homeX, portal.homeY,
+                                                   portal.homeZ))
+            return anchor;
+        anchor.known = true;
+        anchor.mapId = portal.outsideMapId;
+        anchor.x = portal.homeX;
+        anchor.y = portal.homeY;
+        anchor.z = portal.homeZ;
+        return anchor;
     }
 
     static bool IsDungeonJob(std::string const& job)
@@ -16325,6 +16574,460 @@ private:
             return {};
         std::string const keyword = job.substr(sizeof(prefix) - 1);
         return FindDungeonPortal(keyword) ? keyword : std::string();
+    }
+
+    // ------------------------- a home the campaign's own dungeon can be
+    //                           reached from (#348) --
+    //
+    // WHAT WAS WRONG. Read out of `character_homebind`, three of the five
+    // members of a family whose campaign runs Wailing Caverns - a dungeon
+    // approached from map 1 - were bound on map 0, in the human starting zone:
+    //
+    //     Bork  map 0 zone 12   Elwynn Forest
+    //     Grug  map 0 zone 12   Elwynn Forest
+    //     Ugga  map 0 zone 12   Elwynn Forest
+    //     Grog  map 1 zone 392  Ratchet
+    //     Og    map 1 zone 467  Kalimdor
+    //
+    // The hearthstone is this module's reliable way of sending somebody home,
+    // and it resolves TARGET_DEST_HOME, which IS m_homebind*. So for those three
+    // "go home" meant "cross an ocean away from the door", and nothing here
+    // could undo it: `follow` cannot cross a map, DriveCatchUp returns on a
+    // cross-map gap, and an `at:` aim cannot name a coordinate on another one.
+    // One member spent hours stranded that way, and the only route back is a
+    // meeting-stone summon needing two others standing on the stone. The barrier
+    // wants five characters outside one door; a member that keeps being posted
+    // back to Elwynn is one it can never count.
+    //
+    // #286 GAVE THE MODULE A VERB AND NOT A DECISION. That issue built an
+    // executor that binds a character at the innkeeper it is standing beside,
+    // and said in its own comment that "send everybody home" against this roster
+    // "would have gathered all five neatly in the wrong hemisphere". Nothing
+    // ever asked WHERE a home should be. This is that question, and this drive
+    // is the only thing in the module that answers it.
+    //
+    // AND IT IS ANSWERED BY WALKING, WHICH IS THE WHOLE POINT. Player::SetHomebind
+    // is public and would move all three homes in a line of code; so would an
+    // operator command. AGENTS.md's standing instruction is to always fix the
+    // code and never reach for one of those, and #286's migration already named
+    // the rule for this exact function: it "is public and would work, and that
+    // is exactly the problem". So the member walks to the inn under an ordinary
+    // travel errand and the bind goes through the core's own binder handler,
+    // which re-checks range, hostility and the innkeeper flag itself. Nothing
+    // here can bind anybody anywhere a character did not walk to and stand
+    // beside.
+    //
+    // WHY THE TOWN COMES FROM THE DOOR AND NOT FROM A SEARCH. Measured against
+    // the innkeepers on map 1, by distance from the Wailing Caverns door:
+    // Innkeeper Boorand Plainswind at 540 yards is Horde, Innkeeper Wiley at
+    // 1484 is neutral, Innkeeper Byula at 1657 is Horde. This family is
+    // Alliance. A nearest-first rule would walk them into the Crossroads, where
+    // a member has already died three times to guards, to be turned down by
+    // GetNPCIfCanInteractWith for being unfriendly. So the inn is a property of
+    // the campaign's dungeon, written in the portal row beside the door and the
+    // corridor - and for `wailing` it is the corridor's own first waypoint,
+    // which is also the one home on this roster that was already right.
+    //
+    // WHAT THIS IS WORTH WITH NO HEARTHSTONE INVOLVED AT ALL, which matters
+    // because the hearth verb is not casting today (#337: six consecutive
+    // attempts on the party leader reported a cast that never started). A
+    // homebind is not only where a hearthstone goes. FOUR revival escalations in
+    // this file teleport a character to m_homebind* - the repeat-at-one-
+    // graveyard exit, the no-graveyard-on-this-map exit, the every-graveyard-is-
+    // dangerous exit and the hostile-zone one - and every one of them fires on
+    // its own, with no item, no cast and no cooldown. They are how a leader
+    // ended up in Duskwood while four followers stood in the Barrens (#241), and
+    // RevivalMayCrossMaps now REFUSES three of the four whenever the bind is off
+    // the party's map, which leaves a character reviving beside whatever killed
+    // it because the alternative is worse. All four read RevivalHome, which is
+    // the LEADER's bind for a grouped character, so one corrected home turns
+    // them back into the recovery they were written to be for the whole family.
+    // The hearthstone is the second dividend here, not the first.
+    //
+    // AND IT DOES NOT RESCUE ANYBODY WHO IS ALREADY STRANDED. This makes the
+    // NEXT hearth, and the next revival, land somewhere useful; it cannot walk a
+    // character that is already on the wrong continent, because nothing here
+    // can, and pretending otherwise would be the "mechanism reporting something
+    // it did not observe" this file keeps catching itself at. A member on the
+    // wrong map is named once, skipped, and left to the one thing in this module
+    // that crosses an ocean - `kind='summon'`, which needs two other members
+    // standing on the dungeon's meeting stone. It is rebound the moment it is
+    // back, and from then on it stops being sent away again.
+    //
+    // WHAT IT COSTS THE CAMPAIGN, AND WHY THAT IS THE CHEAPER MISTAKE. The
+    // coordinator holds the next run open while this is outstanding, because a
+    // run opened around a member being walked to an inn is a run whose barrier
+    // waits for somebody deliberately elsewhere. The hold is bounded by
+    // construction rather than by a clock of its own: a member that arrives
+    // stops being owed a home, and one this drive gives up on is stood down and
+    // stops being counted. At worst the campaign spends one staging window and
+    // buys a member that stops being posted to another continent.
+
+    // WHAT THIS DRIVE LAST SAID ABOUT A MEMBER, so a condition that lasts an
+    // hour is one line and a condition that CHANGES is said again. Keyed on a
+    // short reason rather than on the sentence, because the sentences carry live
+    // numbers and would repeat themselves every poll. World thread only and
+    // unguarded, like every other register on these loops.
+    std::map<std::string, std::string> _homeBindSaid;
+
+    bool SayHomeBindOnce(std::string const& name, std::string const& why)
+    {
+        auto const it = _homeBindSaid.find(name);
+        if (it != _homeBindSaid.end() && it->second == why)
+            return false;
+        _homeBindSaid[name] = why;
+        return true;
+    }
+
+    // WHO IS NOT BOUND WHERE THIS CAMPAIGN RUNS, AND COULD STILL BE WALKED
+    // THERE ON THIS POLL. THE ONE READING, taken the same way by both of its
+    // callers: this drive, which does the walking, and the run coordinator,
+    // which must not open a run around it. Two expressions over the same roster
+    // would be two chances to disagree, and the pair that disagreed in #241 is
+    // the reason this module writes readings once.
+    //
+    // THREE THINGS EXCLUDE A MEMBER, and each of them is "nothing can be done
+    // here" rather than "nothing is wrong":
+    //
+    //   * NOT ON THE INN'S MAP. An `at:` aim cannot name a coordinate on another
+    //     map and nothing in this module can walk anybody across a continent -
+    //     which is the very failure this drive exists to stop happening AGAIN,
+    //     not one it can reverse. Such a member is named once and left to the
+    //     crossing, the summon, or the run that brings it back.
+    //   * STANDING DOWN. The walk was called off for killing it or for never
+    //     arriving; see WithinHomeBindStandDown.
+    //   * NOT STEERABLE. Offline, mid-login or mid-teardown. Its home is read
+    //     off a live Player and there is nothing to read.
+    std::vector<std::string> MembersOwedAHome(std::vector<std::string> const& members,
+                                              DungeonPortal const& portal)
+    {
+        std::vector<std::string> owed;
+
+        OverseerDecisions::CampaignHomeAnchor const anchor = DungeonHomeAnchor(portal);
+        if (!anchor.known)
+            return owed;   // this door names no town: nothing is judged
+
+        for (std::string const& name : members)
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(bot))
+                continue;
+
+            OverseerDecisions::HomeBind const home = ReadHomeBind(bot);
+            OverseerDecisions::CampaignHome const verdict =
+                OverseerDecisions::ReadCampaignHome(home, anchor,
+                                                    CAMPAIGN_HOME_TOWN_YARDS);
+            if (!OverseerDecisions::CampaignHomeNeedsRebinding(verdict))
+                continue;
+
+            uint32 const standingOn = bot->GetMapId();
+            if (standingOn != anchor.mapId)
+            {
+                if (SayHomeBindOnce(name, "off the inn's map"))
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' reads '{}' against the home this campaign "
+                             "wants - it is bound on map {} and the '{}' door is approached "
+                             "from map {}, so every hearth and every bind-point revival "
+                             "puts it a continent away. AND IT CANNOT BE WALKED TO THE INN "
+                             "FROM WHERE IT IS STANDING, on map {}: nothing in this module "
+                             "crosses a map on foot, so THIS DRIVE DOES NOT RESCUE IT. "
+                             "Getting it back is a kind='summon' at the dungeon's meeting "
+                             "stone with two other members standing on it; it is rebound "
+                             "the moment it is on map {} again, and stops being sent away "
+                             "after that",
+                             name, OverseerDecisions::CampaignHomeName(verdict),
+                             home.mapId, portal.keyword, anchor.mapId, standingOn,
+                             anchor.mapId);
+                continue;
+            }
+
+            if (WithinHomeBindStandDown(name))
+                continue;
+
+            owed.push_back(name);
+        }
+        return owed;
+    }
+
+    // Ask for a member to be walked to the campaign's inn, and say so once.
+    // Idempotent against the walk already in flight, exactly as EscortToward is
+    // and for the same reason: TravelAimBook::Claim refuses to disturb a walk it
+    // is already holding the memory for.
+    //
+    // IT NEVER TAKES A WALK OFF ANOTHER OWNER. A run's escort and a catch-up
+    // both walk a member toward the family, which is where it has to be for
+    // anything else to work, and both are short. A home errand can wait a poll;
+    // it is the only one of the three that has somewhere to be that is nobody
+    // else's business.
+    void EscortHomeToward(std::string const& name, std::string const& aim)
+    {
+        DungeonEscort& escort = _dungeonEscorts[name];
+        if (!escort.homeBind && !escort.aim.empty())
+        {
+            if (SayHomeBindOnce(name, "another walk owns it"))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' owes its campaign a home but is already being "
+                         "walked to {} by the {} - the trip to the inn waits for that to "
+                         "finish rather than turning it round mid-walk",
+                         name, escort.aim, EscortOwnerName(name));
+            return;
+        }
+
+        escort.homeBind = true;
+        escort.wanted = true;
+        if (!escort.homeSince)
+            escort.homeSince = std::time(nullptr);
+
+        _travelAims.Claim(name, aim);
+        if (escort.aim == aim)
+            return;
+
+        escort.aim = aim;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is walked to {} to be bound at the inn its campaign's "
+                 "dungeon is approached from - a home on the other continent is a "
+                 "hearthstone that scatters this party, and only walking to an innkeeper "
+                 "can move one", name, aim);
+    }
+
+    // The ordinary end, taken at the point the errand is finished rather than
+    // left to the sweep - the same discipline DriveCatchUp keeps, and for the
+    // same reason: a lease held thirty seconds longer than it is wanted is
+    // thirty seconds of a follower that could be following.
+    void EndHomeEscort(std::string const& name)
+    {
+        auto const it = _dungeonEscorts.find(name);
+        if (it == _dungeonEscorts.end() || !it->second.homeBind)
+            return;
+        EndOneEscort(name, it->second.granted);
+        _dungeonEscorts.erase(it);
+    }
+
+    // The leak guard under all of it, on this drive's own clock, for the same
+    // reason SweepCatchUps has one of its own: DriveHomeBind has a dozen ways to
+    // decide it has nothing to do and a `return` cannot be made to run an
+    // epilogue. Entries belonging to the other two owners are left alone here,
+    // exactly as this one's are left alone by their sweeps.
+    void SweepHomeBindEscorts()
+    {
+        for (auto it = _dungeonEscorts.begin(); it != _dungeonEscorts.end(); )
+        {
+            if (!it->second.homeBind)
+            {
+                ++it;
+                continue;
+            }
+            if (it->second.wanted)
+            {
+                it->second.wanted = false;
+                ++it;
+                continue;
+            }
+            EndOneEscort(it->first, it->second.granted);
+            it = _dungeonEscorts.erase(it);
+        }
+    }
+
+    void DriveHomeBind()
+    {
+        // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN, exactly as
+        // DriveDungeonRun's own sweep is and for exactly the same reason.
+        SweepHomeBindEscorts();
+
+        // A REBIND IS A TRIP AWAY FROM THE FAMILY, SO IT IS ONLY EVER TAKEN
+        // BETWEEN RUNS. Once a run exists the coordinator owns where every
+        // member should be, and this drive has no business walking one of them
+        // to an inn. The sweep above has already ended anything outstanding by
+        // the time this returns, so a run opening mid-errand takes the member
+        // back within one poll rather than leaving two owners for one walk.
+        if (_dungeonRunCoordinator.phase != DungeonRunPhase::Idle)
+            return;
+
+        // `job` through the same guarded loader DriveDungeonRun uses, for the
+        // reason it gives: a schema older than one of these columns must cost
+        // that column and not the whole roster read (infra#2846).
+        std::map<std::string, std::string> const jobs = LoadJobs();
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        std::vector<std::string> members;
+        std::string leaderName;
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            members.push_back(name);
+            if (fields[1].Get<uint8>() != 0)
+                leaderName = name;
+        } while (result->NextRow());
+
+        if (leaderName.empty())
+            return;
+
+        auto const jobIt = jobs.find(leaderName);
+        std::string const leaderJob =
+            jobIt == jobs.end() ? std::string("quest") : jobIt->second;
+
+        // THE CAMPAIGN IS WHAT ASKS THE QUESTION, and a roster that is questing
+        // is not asking it. Where a family lives is the operator's business
+        // until a dungeon says otherwise; deciding it on no evidence would be
+        // this module moving five homes because it had an opinion.
+        if (!IsDungeonJob(leaderJob))
+            return;
+
+        DungeonPortal const* portal = FindDungeonPortal(DungeonKeywordForJob(leaderJob));
+        if (!portal)
+            return;
+
+        OverseerDecisions::CampaignHomeAnchor const anchor = DungeonHomeAnchor(*portal);
+        if (!anchor.known)
+            return;   // this door names no town: nothing is judged, nobody walks
+
+        // The aim is the inn's own position, formatted the way every other
+        // place-aim in this module is. It is not a `trigger:` and not a role
+        // keyword: "innkeeper" would resolve to the NEAREST one, which on this
+        // map belongs to the other faction and would be walked to and then
+        // refused.
+        std::ostringstream aimOut;
+        aimOut << "at:" << anchor.mapId << ':' << anchor.x << ',' << anchor.y << ','
+               << anchor.z;
+        std::string const aim = aimOut.str();
+
+        for (std::string const& name : MembersOwedAHome(members, *portal))
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(bot))
+                continue;   // logged out between the census and here
+
+            // THE BACKSTOP THIS WALK OWES BECAUSE OF THE LEASE IT CLAIMS (#298).
+            // A claim that nothing ends is a claim every other rule in this file
+            // defers to for ever, so this one brings its own clock. Asked before
+            // the arrival test on purpose: a member standing AT the inn and
+            // unable to bind - a despawned innkeeper, a phase, a fight it keeps
+            // being pulled into - is exactly as stuck as one that never got
+            // there, and needs the same way out.
+            auto const walking = _dungeonEscorts.find(name);
+            if (walking != _dungeonEscorts.end() && walking->second.homeBind &&
+                walking->second.homeSince &&
+                std::time(nullptr) - walking->second.homeSince >
+                    HOME_BIND_BACKSTOP_SECONDS)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been walking to the inn at {} for {} minutes "
+                         "and is not bound there - giving the trip up and standing it down "
+                         "for {} minutes. Its home is still on the wrong side of this "
+                         "campaign's door, so the next hearth still scatters it; the walk "
+                         "is what to look at",
+                         name, aim,
+                         uint32((std::time(nullptr) - walking->second.homeSince) / 60),
+                         uint32(HOME_BIND_STANDDOWN_SECONDS / 60));
+                _homeBindStandDown[name] = std::time(nullptr);
+                EndHomeEscort(name);
+                _homeBindSaid.erase(name);
+                continue;
+            }
+
+            // ARE WE THERE? Measured against the inn with the same tolerance the
+            // travel drive calls a POSITION aim arrived at - five yards, which is
+            // inside the 5.5 the core will talk to an NPC from, so a member this
+            // reads as arrived is one GetNPCIfCanInteractWith can accept. The
+            // bind is attempted where it can work rather than hopefully along the
+            // way: a bind taken at some inn passed en route would be a home on
+            // the right map and the wrong side of the zone, which is the other
+            // half of the defect.
+            if (bot->GetDistance2d(anchor.x, anchor.y) > TRAVEL_ARRIVED_POSITION_YARDS)
+            {
+                EscortHomeToward(name, aim);
+                continue;
+            }
+
+            BindEvidence ev;
+            if (char const* const refusal = BindAtInnkeeperInReach(bot, ev))
+            {
+                if (SayHomeBindOnce(name, refusal))
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is standing at the inn its campaign binds in "
+                             "and cannot be bound - {}. The nearest innkeeper-flagged "
+                             "creature in the sweep was {} yards off, a negative distance "
+                             "meaning none at all, and {} of them passed the core's own "
+                             "interact gate - which is where an unfriendly one is turned "
+                             "down however close it stands. It holds here and is asked "
+                             "again next poll",
+                             name, refusal, ev.nearestYards, ev.innkeepersInReach);
+                // STILL MARKED, so the member holds where it is instead of
+                // wandering off between polls, and the backstop above is what
+                // ends this if the refusal never clears.
+                EscortHomeToward(name, aim);
+                continue;
+            }
+
+            switch (ev.outcome)
+            {
+                case OverseerDecisions::BindOutcome::Moved:
+                case OverseerDecisions::BindOutcome::SameSpot:
+                    // READ BACK RATHER THAN ASSUMED. `delivered` is not `done`
+                    // anywhere in this module, and this packet is one the core
+                    // can accept and act on to no effect; BindReadBack comparing
+                    // the home before, the home after and the place the character
+                    // is standing is the only thing that knows which happened.
+                    //
+                    // SameSpot CANNOT BE REACHED FROM HERE and is answered
+                    // anyway. It means the home did not move AND is where the
+                    // character stands, which contradicts the verdict that sent
+                    // it walking; the two readings come from the same poll, so
+                    // reaching it would be a fact about this module rather than
+                    // about the world. It is grouped with success rather than
+                    // invented into a failure, because a home that is already
+                    // where this drive wanted it is not something to walk about.
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is now bound at {} ({}) - its home {} and it "
+                             "is the town this campaign's door is approached from, so a "
+                             "hearthstone now lands where the walk to that door begins "
+                             "instead of on the other continent",
+                             name, ev.innkeeperName, ev.innkeeperEntry,
+                             ev.outcome == OverseerDecisions::BindOutcome::Moved
+                                 ? "moved to this inn"
+                                 : "was already here");
+                    RecordEvent(bot, "bind", ev.innkeeperEntry, ev.innkeeperName,
+                                "bound at the inn its campaign's dungeon is approached from");
+                    EndHomeEscort(name);
+                    _homeBindSaid.erase(name);
+                    break;
+
+                case OverseerDecisions::BindOutcome::Unchanged:
+                case OverseerDecisions::BindOutcome::Unreadable:
+                    // THE FAILURE #286's EXECUTOR EXISTS TO MAKE VISIBLE, reached
+                    // from a drive rather than from a row. The packet went to a
+                    // handler that accepted an innkeeper in reach and the home
+                    // did not move. Not retried differently and not worked
+                    // around: the member holds at the inn, the line says so once,
+                    // and the backstop above is the way out.
+                    //
+                    // Unreadable is grouped with it for the reason DoBind gives
+                    // at the same fork: it cannot happen from a path that took
+                    // all three readings, and a branch that fell through it
+                    // silently would be inventing an outcome. The map it prints
+                    // is the one that came back, which for an Unreadable reading
+                    // is the zero this file elsewhere refuses to mistake for
+                    // Eastern Kingdoms - said here beside the verdict word so
+                    // the two are read together.
+                    if (SayHomeBindOnce(name,
+                                        OverseerDecisions::BindOutcomeWord(ev.outcome)))
+                        LOG_ERROR("module.overseer",
+                                  "overseer: '{}' was bound at {} ({}) and its home reads "
+                                  "'{}' - the core took the packet and moved no home. The "
+                                  "campaign's door is on map {} and this character's home "
+                                  "is still on map {}",
+                                  name, ev.innkeeperName, ev.innkeeperEntry,
+                                  OverseerDecisions::BindOutcomeWord(ev.outcome),
+                                  anchor.mapId, ev.after.mapId);
+                    EscortHomeToward(name, aim);
+                    break;
+            }
+        }
     }
 
     // WHERE THE PARTY WAITS, DERIVED FROM THE DOOR INSTEAD OF WRITTEN DOWN
@@ -16707,6 +17410,13 @@ private:
         // and the log line says how long it has been.
         time_t holdSince{0};
         bool loggedHold{false};
+        // AND WHETHER THE OTHER PRE-RUN HOLD HAS BEEN SAID (#348): the one for a
+        // family that is not bound where this campaign runs. It carries no clock
+        // of its own on purpose, unlike `holdSince` above - the thing it waits
+        // for is bounded by DriveHomeBind's own backstop and stand-down, so a
+        // second timer here would be a bound on a bound, and the one that fired
+        // first would be the one nobody had reasoned about.
+        bool loggedHomeHold{false};
         // Said once, on the idle coordinator, for the same reason
         // `loggedCampaignOver` is: a portal the leader cannot walk to is a
         // standing fact about the job column rather than a transient, so it is
@@ -19257,6 +19967,54 @@ private:
             DungeonPortal const* portal = FindDungeonPortal(dungeonKeyword);
             if (!portal)
                 return;  // no known portal for this job yet - nothing to gather toward
+
+            // IS THIS FAMILY BOUND WHERE IT CAN RUN THIS DOOR (#348)?
+            //
+            // ASKED HERE FOR THE REASON THE MAINTENANCE HOLD ABOVE IS ASKED
+            // WHERE IT IS, and it is the same shape: everything below this line
+            // is paid for, and a run opened around a member that is being walked
+            // to an inn is a run whose barrier waits for somebody deliberately
+            // elsewhere. It needs the portal, which is why it sits below the
+            // lookup rather than beside the other hold.
+            //
+            // WHY A RUN IS WORTH DELAYING FOR A HOME. Three of five members were
+            // bound on the continent this door is not on, so every hearthstone
+            // posted one of them an ocean away with no walk back - and the
+            // barrier needs all five. The runs were not being lost to the
+            // rebinding; they were being lost to its absence. One staging window
+            // spent walking a member to an innkeeper buys every later run of the
+            // campaign a member that stays on this continent.
+            //
+            // AND THE WAIT IS BOUNDED BY CONSTRUCTION RATHER THAN BY A CLOCK.
+            // MembersOwedAHome counts only members that can still be walked to
+            // the inn on this poll, so it empties three ways and every one of
+            // them is reached without anything here counting seconds: the member
+            // is bound (DriveHomeBind), the walk is given up on and stood down
+            // (its backstop, or the death breaker), or the member is somewhere
+            // nothing can walk it from. A hold that could only be ended by a
+            // timer of its own is the thing this deliberately is not.
+            std::vector<std::string> const owedAHome = MembersOwedAHome(members, *portal);
+            if (!owedAHome.empty())
+            {
+                // SAID ONCE PER HOLD, on the idle coordinator's own flag, the
+                // same discipline `loggedHold` and `loggedCampaignOver` keep: a
+                // walk to an inn is minutes of five-second polls.
+                if (!coord.loggedHomeHold)
+                {
+                    coord.loggedHomeHold = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: the next dungeon run for '{}' waits - {} of this "
+                             "family are not bound where the '{}' door is approached from, "
+                             "so a hearthstone puts them on the other continent and the "
+                             "barrier can never assemble five. They are being walked to the "
+                             "inn this campaign binds at; the run opens as soon as they are "
+                             "bound, or as soon as the trip is given up on",
+                             leaderName, static_cast<uint32>(owedAHome.size()),
+                             portal->keyword);
+                }
+                return;
+            }
+            coord.loggedHomeHold = false;
 
             // CAN THE LEADER GET TO THIS DOOR AT ALL? ASKED BEFORE THE RESET,
             // WHICH IS THE ONLY PLACE IT IS STILL FREE TO ASK (#158).
@@ -25961,40 +26719,146 @@ private:
         return here;
     }
 
+    // Everything a bind can be answered with, gathered as it becomes known and
+    // written by EVERY exit, refusals included. An unmeasured distance stays -1
+    // because 0 yards is a real distance, and an unread home says so through
+    // HomeBind::known because map 0 is a real map and 0.0 is a real coordinate.
+    //
+    // LIFTED OUT OF DoBind SO A SECOND CALLER CAN HAVE IT (#348). The home
+    // errand binds a member at the campaign's inn when it gets there, and it has
+    // to be the same act, judged the same way: one copy of the sweep, one copy
+    // of the core's own gate, one read-back. Two would be two chances to bind by
+    // a rule the command queue does not use.
+    struct BindEvidence
+    {
+        bool haveInnkeeper = false;
+        uint32 innkeeperEntry = 0;
+        std::string innkeeperName;
+        float innkeeperYards = -1.f;
+        float nearestYards = -1.f;
+        int32 innkeepersInReach = 0;
+        OverseerDecisions::HomeBind before;
+        OverseerDecisions::HomeBind after;
+        OverseerDecisions::HomeBind standing;
+        OverseerDecisions::BindOutcome outcome = OverseerDecisions::BindOutcome::Unreadable;
+    };
+
+    // BIND THIS CHARACTER WHERE IT IS STANDING, AND FILL IN WHAT HAPPENED.
+    // Returns the refusal literal, or nullptr when the packet went out - in
+    // which case `ev.outcome` is the read-back and is the thing to act on.
+    //
+    // THIS MOVES NOBODY AND CHOOSES NOTHING BUT THE CREATURE. Every refusal
+    // below is one the core would make silently, named on this side first, and
+    // the one choice made here - which innkeeper, when more than one is in reach
+    // - is made after the core's own gate has already thrown out everyone it
+    // would not talk to.
+    static char const* BindAtInnkeeperInReach(Player* who, BindEvidence& ev)
+    {
+        using OverseerDecisions::BindReadBack;
+        using OverseerDecisions::ChooseInnkeeper;
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return "character has no session";
+        if (!who->IsInWorld())
+            return "character is not in the world";
+
+        // HandleBinderActivateOpcode asks IsAlive() before anything else and
+        // returns silently when it is false, so it is asked here instead.
+        if (!who->IsAlive())
+            return "character is dead";
+        if (who->IsInFlight())
+            return "character is in flight";
+
+        Map const* map = who->GetMap();
+        if (!map)
+            return "character is not on a map";
+        if (map->Instanceable())
+            return "character is inside an instance";
+
+        ev.standing = ReadStandingPlace(who);
+        ev.before = ReadHomeBind(who);
+
+        // ---- who is in reach -------------------------------------------------
+        //
+        // A sweep wider than the interaction distance on purpose, the same way
+        // DoRepair's is: the gate is the core's own GetNPCIfCanInteractWith and
+        // it decides who counts; the wider sweep exists only so a refusal can
+        // say how far the nearest innkeeper WAS. "innkeeper not in range" with
+        // "9.2 yards" beside it is an aim error the sender can correct, and
+        // without the number it is a mystery. It is also how the refusal this
+        // family cannot avoid gets named: the innkeeper nearest their dungeon
+        // belongs to the other faction, and GetNPCIfCanInteractWith turns that
+        // one down for being unfriendly however close the character stands.
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        InnkeeperNearbyCheck check{who, SWEEP_YARDS};
+        Acore::CreatureListSearcher<InnkeeperNearbyCheck> searcher(who, nearby, check);
+        Cell::VisitObjects(who, searcher, SWEEP_YARDS);
+
+        std::vector<float> yards;
+        std::vector<Creature*> reachable;
+        for (Creature* creature : nearby)
+        {
+            float const distance = who->GetDistance(creature);
+            if (ev.nearestYards < 0.f || distance < ev.nearestYards)
+                ev.nearestYards = distance;
+
+            // THE GATE. The same call HandleBinderActivateOpcode makes with the
+            // same flag, so a creature this accepts is one the handler will.
+            if (!who->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_INNKEEPER))
+                continue;
+
+            yards.push_back(distance);
+            reachable.push_back(creature);
+        }
+
+        ev.innkeepersInReach = static_cast<int32>(reachable.size());
+        if (reachable.empty())
+            return "innkeeper not in range";
+
+        int const choice = ChooseInnkeeper(yards);
+        Creature* innkeeper = reachable[static_cast<size_t>(choice)];
+        ev.haveInnkeeper = true;
+        ev.innkeeperEntry = innkeeper->GetEntry();
+        ev.innkeeperName = innkeeper->GetName();
+        ev.innkeeperYards = yards[static_cast<size_t>(choice)];
+
+        // ---- drive the core's own handler ------------------------------------
+        //
+        // CMSG_BINDER_ACTIVATE is one guid and nothing else (NPCHandler.cpp).
+        // This handler takes a raw WorldPacket rather than a typed one, like the
+        // areatrigger and repair handlers and unlike the sell and bank ones, so
+        // there is no Read() to call - only the rpos(0) rewind, because the
+        // handler reads with >> from a packet this side has just written to.
+        {
+            WorldPacket raw(CMSG_BINDER_ACTIVATE, 8);
+            raw << innkeeper->GetGUID();
+            raw.rpos(0);
+            session->HandleBinderActivateOpcode(raw);
+        }
+
+        // ---- believe nothing; read the home back ------------------------------
+        ev.after = ReadHomeBind(who);
+        ev.outcome = BindReadBack(ev.before, ev.after, ev.standing, BIND_SAME_SPOT_YARDS);
+        return nullptr;
+    }
+
     static char const* DoBind(Player* who, std::string const& command, char const*& status,
                               std::string& out)
     {
         using OverseerDecisions::BindOutcome;
         using OverseerDecisions::BindOutcomeWord;
-        using OverseerDecisions::BindReadBack;
         using OverseerDecisions::BindRefusalRetry;
         using OverseerDecisions::BindRequest;
         using OverseerDecisions::BindVerb;
-        using OverseerDecisions::ChooseInnkeeper;
         using OverseerDecisions::HomeBind;
         using OverseerDecisions::ParseBindRequest;
         using OverseerDecisions::TownRetryWord;
 
         BindRequest const request = ParseBindRequest(command);
 
-        // Everything a row can be answered with, gathered as it becomes known
-        // and written by EVERY exit, refusals included. An unmeasured distance
-        // stays -1 because 0 yards is a real distance, and an unread home says
-        // so through HomeBind::known because map 0 is a real map and 0.0 is a
-        // real coordinate.
-        struct Evidence
-        {
-            bool haveInnkeeper = false;
-            uint32 innkeeperEntry = 0;
-            std::string innkeeperName;
-            float innkeeperYards = -1.f;
-            float nearestYards = -1.f;
-            int32 innkeepersInReach = 0;
-            HomeBind before;
-            HomeBind after;
-            HomeBind standing;
-            BindOutcome outcome = BindOutcome::Unreadable;
-        } ev;
+        BindEvidence ev;
 
         auto place = [](std::ostringstream& o, HomeBind const& home)
         {
@@ -26051,90 +26915,13 @@ private:
             return "malformed bind request";
         }
 
-        WorldSession* session = who->GetSession();
-        if (!session)
-            return refuse("character has no session");
-        if (!who->IsInWorld())
-            return refuse("character is not in the world");
-
-        // HandleBinderActivateOpcode asks IsAlive() before anything else and
-        // returns silently when it is false, so it is asked here instead.
-        if (!who->IsAlive())
-            return refuse("character is dead");
-        if (who->IsInFlight())
-            return refuse("character is in flight");
-
-        Map const* map = who->GetMap();
-        if (!map)
-            return refuse("character is not on a map");
-        if (map->Instanceable())
-            return refuse("character is inside an instance");
-
-        ev.standing = ReadStandingPlace(who);
-        ev.before = ReadHomeBind(who);
-
-        // ---- who is in reach -------------------------------------------------
-        //
-        // A sweep wider than the interaction distance on purpose, the same way
-        // DoRepair's is: the gate is the core's own GetNPCIfCanInteractWith and
-        // it decides who counts; the wider sweep exists only so a refusal can
-        // say how far the nearest innkeeper WAS. "innkeeper not in range" with
-        // "9.2 yards" beside it is an aim error the sender can correct, and
-        // without the number it is a mystery. It is also how the refusal this
-        // family cannot avoid gets named: the innkeeper nearest their dungeon
-        // belongs to the other faction, and GetNPCIfCanInteractWith turns that
-        // one down for being unfriendly however close the character stands.
-        float const SWEEP_YARDS = 30.f;
-        std::list<Creature*> nearby;
-        InnkeeperNearbyCheck check{who, SWEEP_YARDS};
-        Acore::CreatureListSearcher<InnkeeperNearbyCheck> searcher(who, nearby, check);
-        Cell::VisitObjects(who, searcher, SWEEP_YARDS);
-
-        std::vector<float> yards;
-        std::vector<Creature*> reachable;
-        for (Creature* creature : nearby)
-        {
-            float const distance = who->GetDistance(creature);
-            if (ev.nearestYards < 0.f || distance < ev.nearestYards)
-                ev.nearestYards = distance;
-
-            // THE GATE. The same call HandleBinderActivateOpcode makes with the
-            // same flag, so a creature this accepts is one the handler will.
-            if (!who->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_INNKEEPER))
-                continue;
-
-            yards.push_back(distance);
-            reachable.push_back(creature);
-        }
-
-        ev.innkeepersInReach = static_cast<int32>(reachable.size());
-        if (reachable.empty())
-            return refuse("innkeeper not in range");
-
-        int const choice = ChooseInnkeeper(yards);
-        Creature* innkeeper = reachable[static_cast<size_t>(choice)];
-        ev.haveInnkeeper = true;
-        ev.innkeeperEntry = innkeeper->GetEntry();
-        ev.innkeeperName = innkeeper->GetName();
-        ev.innkeeperYards = yards[static_cast<size_t>(choice)];
-
-        // ---- drive the core's own handler ------------------------------------
-        //
-        // CMSG_BINDER_ACTIVATE is one guid and nothing else (NPCHandler.cpp).
-        // This handler takes a raw WorldPacket rather than a typed one, like the
-        // areatrigger and repair handlers and unlike the sell and bank ones, so
-        // there is no Read() to call - only the rpos(0) rewind, because the
-        // handler reads with >> from a packet this side has just written to.
-        {
-            WorldPacket raw(CMSG_BINDER_ACTIVATE, 8);
-            raw << innkeeper->GetGUID();
-            raw.rpos(0);
-            session->HandleBinderActivateOpcode(raw);
-        }
-
-        // ---- believe nothing; read the home back ------------------------------
-        ev.after = ReadHomeBind(who);
-        ev.outcome = BindReadBack(ev.before, ev.after, ev.standing, BIND_SAME_SPOT_YARDS);
+        // THE ACT ITSELF IS SHARED WITH THE HOME ERRAND (#348) AND THE ROW IS
+        // NOT. Everything above this line is about a command row - its grammar,
+        // its `detail`, its JSON - and everything below is about what came back.
+        // The bind in between is one act with one set of refusals, and it is
+        // written once.
+        if (char const* const refusal = BindAtInnkeeperInReach(who, ev))
+            return refuse(refusal);
 
         switch (ev.outcome)
         {

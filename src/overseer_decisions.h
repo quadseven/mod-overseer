@@ -5301,6 +5301,117 @@ int ChooseInnkeeper(std::vector<float> const& yards);
 // heard of is more likely a new transient than a new permanent.
 TownRetry BindRefusalRetry(std::string const& detail);
 
+// ------------------- a home the campaign's own dungeon can be reached from --
+//
+// WHAT IS WRONG, READ OUT OF character_homebind RATHER THAN REMEMBERED (#348).
+// The family is asked to run Wailing Caverns, which is approached from map 1,
+// and three of the five are bound on map 0:
+//
+//     Bork  map 0 zone 12   Elwynn Forest, Eastern Kingdoms
+//     Grug  map 0 zone 12   Elwynn Forest, Eastern Kingdoms
+//     Ugga  map 0 zone 12   Elwynn Forest, Eastern Kingdoms
+//     Grog  map 1 zone 392  Ratchet, Kalimdor
+//     Og    map 1 zone 467  Kalimdor
+//
+// The hearthstone is the module's reliable way of sending somebody home and it
+// resolves TARGET_DEST_HOME, which IS m_homebind*, so for those three "go home"
+// means "cross an ocean away from the door". Nothing here can undo that:
+// `follow` cannot cross a map, the catch-up walk returns on a cross-map gap,
+// and an `at:` aim cannot name a coordinate on another one. The barrier needs
+// all five outside the door, and a member that keeps being posted back to
+// Elwynn is one it can never count.
+//
+// AND THE ONE BIND THAT WORKS SAYS WHAT THE RULE IS. Grog's home at
+// (-1050, -3665, 24) is exactly the first waypoint of this module's own
+// measured corridor to that door, because the corridor was measured starting
+// from the one bind that happened to be right. So the question a drive has to
+// ask is not "is this home somewhere" but "is this home where the campaign's
+// own approach begins".
+//
+// WHY THE ANSWER IS NOT "THE NEAREST INNKEEPER". Measured from the door at
+// (-733.7, -2214.9) against the innkeepers on that map:
+//
+//     3934  Innkeeper Boorand Plainswind   540 yards   Horde, the Crossroads
+//     6791  Innkeeper Wiley               1484 yards   neutral, Ratchet
+//     7714  Innkeeper Byula               1657 yards   Horde
+//
+// This family is Alliance. GetNPCIfCanInteractWith refuses an unfriendly
+// creature however close a character stands, so the nearest one can never set
+// anybody's home - and walking up to it walks into a Horde town, where one
+// member has already died three times to guards. A rule that sorted by distance
+// would send characters to be killed at an innkeeper that would then refuse
+// them. So the town is named by the DUNGEON, in the portal row beside the door
+// and the corridor, and the faction question is answered by the core's own gate
+// at the moment of the bind rather than by arithmetic here.
+//
+// AND IT IS TWO QUESTIONS, NOT ONE. The map is the fatal half - a home on the
+// wrong continent cannot be walked back from at all - but a home on the right
+// map and a thousand yards of unmeasured ground from the door is a hearth that
+// lands nowhere useful either, and the same remedy answers both.
+enum class CampaignHome : std::uint8_t
+{
+    // The home could not be read. Says nothing about whether it suits, and must
+    // never be acted on: the same discipline BindReadBack keeps for the three
+    // readings it compares.
+    Unreadable,
+    // This campaign names no town, so nothing was asked and nothing is wrong.
+    // The answer for every portal row that carries no home of its own, which is
+    // the same "not measured, so not invented" rule the three zeros in an
+    // approach corridor already stand for.
+    NotAsked,
+    // The home is the campaign's own town. Nothing to do.
+    Suits,
+    // The home is on a different map from the one this dungeon is approached
+    // from. The failure this decision exists for.
+    OffTheDungeonsMap,
+    // The right map, and far enough from the town that hearthing to it lands
+    // the character somewhere the module has not measured a way to the door
+    // from.
+    TooFarFromTheTown,
+};
+
+// "unreadable", "not-asked", "suits", "off-the-dungeons-map", "too-far". Here
+// rather than in the drive so the word a test pins is the word a log line
+// carries.
+char const* CampaignHomeName(CampaignHome verdict);
+
+// WHERE A CAMPAIGN KEEPS ITS HOMES, as the adapter reads it off the portal row.
+//
+// `known` IS NOT `zero`, for the reason HomeBind gives above: map 0 is a real
+// map and 0.0 is a real coordinate, so a row that names no town has to say so
+// in a field of its own. The adapter sets it from the module's own existing
+// StagingPointCheck rather than from a fourth float, so "that is not a place"
+// is decided in one place for corridors and for towns alike.
+struct CampaignHomeAnchor
+{
+    bool known{false};
+    std::uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// Does this member's home suit the dungeon its campaign runs?
+//
+// THE ANCHOR IS ASKED ABOUT FIRST, before the home is even looked at: a
+// campaign that names no town is not judging anybody, and an unreadable home is
+// only worth reporting where there was something to compare it against.
+//
+// MEASURED IN TWO DIMENSIONS, unlike BindReadBack directly above it, and the
+// difference is the question rather than an oversight. That one asks whether a
+// character moved between two binds and an inn has floors, so it counts height.
+// This one asks whether a home is in the right TOWN, and every distance this
+// module measures against a place on a map - the barrier circle, the arrival
+// check, the staging watchdog - is a 2D one.
+CampaignHome ReadCampaignHome(HomeBind const& home, CampaignHomeAnchor const& anchor,
+                              float townYards);
+
+// Is this a verdict a drive should answer by walking the member to an inn? The
+// form the call site asks, so "does this home need moving" reads as a question
+// rather than as a comparison against two enumerators - and so a fifth verdict
+// added later cannot be silently left out of one of the two readings.
+bool CampaignHomeNeedsRebinding(CampaignHome verdict);
+
 // WHY THE FALL BASELINE GUARD DECLINED, AS A NUMBER THAT CAN BE COUNTED.
 //
 // #266 deployed the invariant that a character which is not falling is
