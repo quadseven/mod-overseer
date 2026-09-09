@@ -3013,8 +3013,12 @@ struct GearVerdict
     // an automatic swap or a Need roll - it is said out loud instead.
     //
     // KEPT AS IT WAS, and it is exactly `confidence == GearConfidence::Exact`.
-    // The Need vote and the sibling hand-off both read it and both want the
-    // strict answer; only the swap needed the finer one.
+    // The sibling hand-off reads it and wants the strict answer; only the swap
+    // needed the finer one. The Need vote wanted the strict answer too, and is
+    // why this is the strict one, but it no longer lives in this repository
+    // (#374): the vote is cast upstream, on the packet that opens the roll, and
+    // nothing here could reach one first. This field is written for the rule
+    // rather than for one caller, so it is unchanged.
     bool judged{false};
 
     // The same answer, told apart. See GearConfidence above.
