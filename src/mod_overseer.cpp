@@ -4871,6 +4871,7 @@ private:
         bool removedFollow{false};
         bool removedNewRpg{false};
         bool stoodItUp{false};
+        bool dismountedIt{false};
         time_t until{0};
         std::string verb;
     };
@@ -4993,7 +4994,7 @@ private:
     static bool HoldCharacterStill(Player* who, PlayerbotAI* botAI, std::string const& name,
                                    char const* verb,
                                    uint32 ceilingSeconds = CAST_HOLD_CEILING_SECONDS,
-                                   bool standItUp = true)
+                                   bool readyToCast = true)
     {
         if (!who || !botAI)
             return false;
@@ -5057,9 +5058,53 @@ private:
         // The flag is a parameter rather than a test on the verb so that the
         // caller says what it wants and this function does not have to know the
         // reasons by name.
-        bool const wasSitting = standItUp && !who->IsStandState();
+        bool const wasSitting = readyToCast && !who->IsStandState();
         if (wasSitting)
             who->SetStandState(UNIT_STAND_STATE_STAND);
+
+        // AND IT TAKES THE CHARACTER OFF ITS MOUNT, WHICH IS THE OTHER HALF OF
+        // THE SAME ARGUMENT AND THE ONE THAT WAS STILL COSTING CASTS (#337).
+        //
+        // WHAT THE CORE DOES, read at the pinned SHA. Spell::CheckCast refuses
+        // any non-passive spell cast by a mounted player that does not carry
+        // SPELL_ATTR0_ALLOW_WHILE_MOUNTED (Spell.cpp:6018), answering
+        // SPELL_FAILED_NOT_ON_TAXI in flight and SPELL_FAILED_NOT_MOUNTED on a
+        // ground mount. It is reported to a client, so for a bot it is silent,
+        // and no precondition this module asked could see it: `IsInFlight` is
+        // the OTHER branch of that same check.
+        //
+        // WHY A CLIENT NEVER HITS IT. The client sends CMSG_CANCEL_MOUNT_AURA
+        // before it sends the use, so a player is on foot by the time the cast
+        // is checked. That is the areatrigger's argument word for word: walking
+        // in like a player depends on a part of the player a bot does not have,
+        // and the packet has to be sent deliberately, to the same handler.
+        //
+        // SO THE HANDLER IS DRIVEN RATHER THAN Dismount() BEING CALLED HERE.
+        // WorldSession::HandleCancelMountAuraOpcode (MiscHandler.cpp:1475)
+        // re-checks IsMounted and IsInFlight itself and then does BOTH halves,
+        // Dismount() and RemoveAurasByType(SPELL_AURA_MOUNTED). Calling only the
+        // first would clear the flag and leave the aura to put it back.
+        //
+        // AND IT IS IN THE HOLD RATHER THAN IN A VERB for the reason the stand
+        // state is: three verbs cast, all three are driven at handlers that a
+        // client would have dismounted for, and one place to fix is the point of
+        // there being one hold. A staging hold asks for none of this, the same
+        // way it asks not to be stood up, because a party waiting at a door is
+        // not about to cast anything.
+        //
+        // IN FLIGHT IS LEFT ALONE ON PURPOSE. The handler refuses it anyway, and
+        // a hearth already refuses a character in flight before it gets here;
+        // taking somebody off a taxi mid-route would be this module cancelling
+        // an errand it was not asked to cancel.
+        bool const wasMounted = readyToCast && who->IsMounted() && !who->IsInFlight();
+        if (wasMounted)
+        {
+            if (WorldSession* session = who->GetSession())
+            {
+                WorldPacket cancelMount(CMSG_CANCEL_MOUNT_AURA, 0);
+                session->HandleCancelMountAuraOpcode(cancelMount);
+            }
+        }
 
         if (fresh)
         {
@@ -5070,10 +5115,11 @@ private:
             record.until = time(nullptr) + ceilingSeconds;
             record.verb = verb ? verb : "";
             record.stoodItUp = wasSitting;
+            record.dismountedIt = wasMounted;
             holds[name] = record;
             LOG_INFO("module.overseer",
                      "overseer: '{}' is held still to {} for at most {}s (stay {}, follow {}, "
-                     "new rpg {}, {}); it walks again the moment the hold is lifted, "
+                     "new rpg {}, {}, {}); it walks again the moment the hold is lifted, "
                      "however it is lifted",
                      name, record.verb, ceilingSeconds,
                      plan.addStay ? "added" : "already on",
@@ -5084,9 +5130,16 @@ private:
                      // did not take. "already standing" about a character
                      // sitting down to eat is the same false confidence
                      // WhyHeldStill was written to end.
-                     !standItUp   ? "stand state left alone, so it may eat"
+                     !readyToCast ? "stand state left alone, so it may eat"
                      : wasSitting ? "stood up from sitting"
-                                  : "already standing");
+                                  : "already standing",
+                     // ...and the same three for the mount, which is the reading
+                     // the six rows of #337 did not have. "already standing" was
+                     // being read as "so there is nothing left to stop it", and
+                     // there was: a leader the travel drive had put on a mount.
+                     !readyToCast ? "mount left alone"
+                     : wasMounted ? "taken off its mount"
+                                  : "not mounted");
             return true;
         }
 
@@ -5094,6 +5147,12 @@ private:
         // carrying, because it is the `food` strategy winning between polls.
         if (wasSitting)
             existing->second.stoodItUp = true;
+        // Same for a re-mount, and it is the likelier of the two to happen
+        // mid-hold: CheckMountStateAction re-mounts a bot whose travel target is
+        // still further away than its mount distance, and the hold does not
+        // cancel the errand that says so (#163).
+        if (wasMounted)
+            existing->second.dismountedIt = true;
 
         // AN EXTENDED HOLD IS STILL BOUNDED BY THE CEILING FROM WHEN IT STARTED.
         // The deadline is not pushed out by re-assertion, or a verb that polls
@@ -5109,6 +5168,12 @@ private:
             LOG_INFO("module.overseer",
                      "overseer: '{}' had sat down mid-{} and is stood up again - a held "
                      "character out of combat is one its own `food` strategy will feed",
+                     name, existing->second.verb);
+        if (wasMounted)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' had got back on a mount mid-{} and is taken off it again - "
+                     "the core refuses a mounted caster and reports it to a client this "
+                     "character does not have",
                      name, existing->second.verb);
         return false;
     }
@@ -5203,6 +5268,11 @@ private:
         bool tookFollow{false};
         bool tookNewRpg{false};
         bool stoodItUp{false};
+        // AND WHETHER IT HAD TO TAKE THE CHARACTER OFF A MOUNT (#337). The row
+        // that reported `already standing` and then a cast that never started
+        // was missing exactly this reading: the character was standing and
+        // mounted, and the core refuses a mounted caster silently.
+        bool dismountedIt{false};
     };
 
     // Hold, and tell the row what the hold in force actually took. The two
@@ -5226,6 +5296,7 @@ private:
         report.tookFollow = record->second.removedFollow;
         report.tookNewRpg = record->second.removedNewRpg;
         report.stoodItUp = record->second.stoodItUp;
+        report.dismountedIt = record->second.dismountedIt;
     }
 
     // THE BACKSTOP UNDER EVERY VERB'S OWN RELEASE, on its own clock.
@@ -5340,9 +5411,12 @@ private:
         PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
         if (!botAI)
             return;
-        // `false` IS THE STAND STATE, AND IT IS THE ONE THING THIS HOLD ASKS
-        // FOR DIFFERENTLY. A party waiting at a door should be eating; see
-        // HoldCharacterStill's stand-state block.
+        // `false` IS "THIS HOLD IS NOT FOR A CAST", AND IT IS THE ONE THING THIS
+        // HOLD ASKS FOR DIFFERENTLY. It covers the two things a client does
+        // before a cast and nothing else does for a bot: standing the character
+        // up, and taking it off its mount. A party waiting at a door should be
+        // eating rather than standing, and is not about to cast anything, so it
+        // wants neither; see HoldCharacterStill's stand-state and mount blocks.
         HoldCharacterStill(member, botAI, name, STAGE_HOLD_VERB,
                            STAGE_HOLD_CEILING_SECONDS, false);
     }
@@ -28009,9 +28083,21 @@ private:
     //     walking character and changing nothing took fourteen consecutive asks
     //     on one character to land a single cast. So this verb now places the
     //     shared hold - `+stay`, `-follow`, `-new rpg`, StopMoving, clear the
-    //     chase and follow unit states, nothing else - and still refuses the
-    //     row with `later`. The hold outlives the row by its own ceiling, so
-    //     the sender's next ask arrives at a character that is standing.
+    //     chase and follow unit states, stand it up, take it off its mount,
+    //     nothing else - and still refuses the row with `later`. The hold
+    //     outlives the row by its own ceiling, so the sender's next ask arrives
+    //     at a character that is standing.
+    //
+    //   * IT DOES TAKE A CHARACTER OFF ITS MOUNT, AND THAT IS WHAT WAS LEFT
+    //     AFTER THE HOLD STARTED WORKING (#337). Spell::CheckCast refuses a
+    //     mounted player's spell with SPELL_FAILED_NOT_MOUNTED (Spell.cpp:6018)
+    //     and reports it to a client, which is silence for a bot. A real player
+    //     never meets that line, because the client sends CMSG_CANCEL_MOUNT_AURA
+    //     before it sends the use. So this verb sends that too, at the same
+    //     handler, exactly as it sends the areatrigger a client would have sent.
+    //     It is not a diverter and it cancels no errand: the bot's own AI puts a
+    //     mount back on the next tick it wants one, and the core asks the
+    //     question once, at Spell::prepare.
     //
     //   * IT DOES REFUSE A CHARACTER WITH NO BOT AI, which is not a taste
     //     decision. A cross-map teleport waits on MSG_MOVE_WORLDPORT_ACK, a
@@ -28101,6 +28187,11 @@ private:
         uint32 windowMs{0};
         uint32 waitedMs{0};
         int32 castingAfterCall{-1};   // -1 never asked, 0 no, 1 yes
+        // AND WHETHER THE CORE PARKED IT RATHER THAN REFUSING IT (#337). The
+        // one reading that turns an absent cast from a failure into a wait, and
+        // the row could not take it: see CastWall::Queued for why "the spell
+        // queue is indistinguishable from here" was not true.
+        int32 queuedAfterCall{-1};    // -1 never asked, 0 no, 1 parked on the queue
         int32 cooldownAtVerdict{-1};  // -1 never asked, 0 ready, 1 on cooldown
         int32 teleportWasStillInFlight{-1};  // -1 never asked, 0 no, 1 yes
         // WHAT THE HOLD TOOK, IF THIS ROW PLACED ONE (#335). A hearth that finds
@@ -28196,7 +28287,13 @@ private:
           << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
           << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
           << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
+          << ",\"hold_dismounted_it\":" << (ev.hold.dismountedIt ? "true" : "false")
           << ",\"cast_blocker\":" << J(ev.castBlocker);
+        o << ",\"queued_after_call\":";
+        if (ev.queuedAfterCall < 0)
+            o << "null";
+        else
+            o << (ev.queuedAfterCall ? "true" : "false");
         o << ",\"home\":";
         HearthPlace(o, ev.home);
         o << ",\"from\":";
@@ -28384,10 +28481,27 @@ private:
         // always had.
         //
         // So the hold goes on HERE too, immediately before the packet, where it
-        // also stands a sitting character up. Placed this late rather than at the
-        // top of the executor so the refusals in between - no hearthstone, on
-        // cooldown, already home - do not stop a character for 45 seconds over
-        // something standing still cannot fix.
+        // also stands a sitting character up and takes it off its mount. Placed
+        // this late rather than at the top of the executor so the refusals in
+        // between - no hearthstone, on cooldown, already home - do not stop a
+        // character for 45 seconds over something standing still cannot fix.
+        //
+        // AND THE MOUNT IS WHY THIS ROW WAS STILL FAILING AFTER THE HOLD WORKED.
+        // Six rows on the party leader, the hold reporting the character already
+        // standing every time, the cooldown clear at every verdict, and no cast:
+        // Spell::CheckCast refuses a mounted caster and reports it to a client
+        // that a bot does not have (Spell.cpp:6018). The leader is the mounted
+        // one because it is the character the travel drive walks across a
+        // continent, which is exactly why the same verb worked first try on a
+        // follower standing at an inn the same evening. See HoldCharacterStill's
+        // mount block for what is sent and why it is sent rather than called.
+        //
+        // IT IS PLACED IN THE SAME BREATH AS THE PACKET, and that is load
+        // bearing rather than tidy: nothing else in this module runs between
+        // these two statements, so no poll, no sweep and no bot AI tick can put
+        // the character back on a mount or back on the ground before the core
+        // checks. What happens a tick later cannot undo a cast that has started,
+        // because the mount is checked once, at Spell::prepare.
         HoldStillAndReport(who, ev.character, "hearth", ev.hold);
 
         {
@@ -28422,27 +28536,66 @@ private:
         // nothing anywhere could say why.
         //
         // A CAST IN FLIGHT IS STILL NOT A SUCCESS and an absent one is still not
-        // a failure, which is the rule the paragraph above already sets: the
-        // handler may have parked the packet on the spell queue for the global
-        // cooldown. So this NAMES a wall rather than judging on one, and the
+        // a failure. So this NAMES a wall rather than judging on one, and the
         // verdict still comes from where the character is when the window is up.
+        //
+        // THE QUEUE IS ASKED FIRST AND IT IS NOT A WALL. HandleUseItemOpcode
+        // copies the packet onto Player::SpellQueue and returns when
+        // CanExecutePendingSpellCastRequest says no and CanRequestSpellCast says
+        // it may wait (SpellHandler.cpp:110 at the pinned SHA); Player::Update
+        // replays it within the queue window. Nothing is casting at that instant
+        // and nothing has failed either, and the comment above used to call that
+        // indistinguishable from here. It is distinguishable: the deque is
+        // public and the entries carry the spell id, so the row looks.
+        for (PendingSpellCastRequest const& parked : who->SpellQueue)
+        {
+            if (parked.spellId != ev.spellId)
+                continue;
+            ev.queuedAfterCall = 1;
+            break;
+        }
+        if (ev.queuedAfterCall < 0)
+            ev.queuedAfterCall = 0;
+
         if (!ev.castingAfterCall)
         {
-            OverseerDecisions::CastWallGate gate;
-            gate.grounded = !who->IsInFlight();
-            gate.standing = who->IsStandState();
-            gate.still = !who->isMoving();
-            gate.ready = !who->HasSpellCooldown(ev.spellId);
-            gate.free = !who->IsNonMeleeSpellCast(false);
-            char const* const wall = OverseerDecisions::CastWallBlocker(gate);
-            ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+            if (ev.queuedAfterCall)
+            {
+                ev.castBlocker = OverseerDecisions::CastWall::Queued;
+            }
+            else
+            {
+                OverseerDecisions::CastWallGate gate;
+                gate.grounded = !who->IsInFlight();
+                // THE OTHER BRANCH OF THE SAME CORE CHECK, AND THE ONE THAT WAS
+                // COSTING THE CASTS (#337). Read AFTER the packet like the rest
+                // of this gate, which also means it reads the world the hold has
+                // already dismounted: a `true` here on a row whose hold reports
+                // `hold_dismounted_it` is a character that got back on a mount
+                // between the two statements, and that is worth knowing on its
+                // own.
+                gate.unmounted = !who->IsMounted();
+                gate.standing = who->IsStandState();
+                gate.still = !who->isMoving();
+                gate.ready = !who->HasSpellCooldown(ev.spellId);
+                // Spell::CheckCast:5711 returns SPELL_FAILED_NOT_READY on this
+                // and HasSpellCooldown above cannot see it. `conjure` has asked
+                // it since #330; this gate had never been given the question.
+                gate.globalReady = !who->GetGlobalCooldownMgr().HasGlobalCooldown(spell);
+                gate.free = !who->IsNonMeleeSpellCast(false);
+                char const* const wall = OverseerDecisions::CastWallBlocker(gate);
+                ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+            }
         }
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is using its hearthstone ({}, spell {}) - a {}ms cast for "
-                 "map {}; judging in {}ms, not now. {}",
+                 "map {}; judging in {}ms, not now. It was {} for the cast "
+                 "(stand state {}, mount {}). {}",
                  ev.character, ev.itemEntry, ev.spellId, ev.castMs, ev.home.mapId,
-                 ev.windowMs,
+                 ev.windowMs, ev.hold.applied ? "held" : "NOT held",
+                 ev.hold.stoodItUp ? "stood up" : "left as it was",
+                 ev.hold.dismountedIt ? "taken off" : "left as it was",
                  ev.castingAfterCall ? "A cast is running." : ev.castBlocker);
 
         HearthCheck check;
@@ -28595,7 +28748,8 @@ private:
                     // looking for a failed teleport when the failure is that
                     // nothing was ever cast.
                     status = "unchanged";
-                    detail = HearthStayedDetail(check.ev.castingAfterCall == 1);
+                    detail = HearthStayedDetail(check.ev.castingAfterCall == 1,
+                                                check.ev.queuedAfterCall == 1);
                     LOG_WARN("module.overseer",
                              "overseer: hearth {} - '{}' NEVER LEFT: still on map {} after "
                              "{}ms, its hearthstone cooldown reads {}, and {}; see "
@@ -28903,12 +29057,18 @@ private:
           << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
           << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
           << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
+          // THE SAME FIELDS FOR ALL THREE VERBS, which is what CastHoldReport is
+          // for: a reader that has learned to read one hold can read the others.
+          // A summoner is mounted for the same reason a hearthing leader is, and
+          // the ritual is refused at the same line of the core (#337).
+          << ",\"hold_dismounted_it\":" << (ev.hold.dismountedIt ? "true" : "false")
           << ",\"held_helper\":" << J(ev.heldHelper)
           << ",\"helper_hold_applied\":" << (ev.helperHold.applied ? "true" : "false")
           << ",\"helper_hold_took_stay\":" << (ev.helperHold.tookStay ? "true" : "false")
           << ",\"helper_hold_took_follow\":" << (ev.helperHold.tookFollow ? "true" : "false")
-          << ",\"helper_hold_took_new_rpg\":"
-          << (ev.helperHold.tookNewRpg ? "true" : "false");
+          << ",\"helper_hold_took_new_rpg\":" << (ev.helperHold.tookNewRpg ? "true" : "false")
+          << ",\"helper_hold_dismounted_it\":"
+          << (ev.helperHold.dismountedIt ? "true" : "false");
         o << ",\"at\":";
         SummonPlace(o, ev.at);
         o << ",\"from\":";
