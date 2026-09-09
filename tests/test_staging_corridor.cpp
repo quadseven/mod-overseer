@@ -312,19 +312,86 @@ void AnInterruptedWalkRejoinsWhereItStopped()
 }
 
 // The join hop is the one stretch of a corridor walk that nobody measured, so it
-// is bounded. Past the bound the honest answer is "not this character's
-// corridor" and today's routing stands.
+// is bounded. Past the bound this function hands back no walk, because it has
+// measured nothing between the character and the corridor.
 void ACharacterNowhereNearItDoesNotJoinIt()
 {
     StagingCorridorLimits const limits;
     // The guard post itself, which is where the survey route puts the party and
-    // is 540 yards from the nearest corridor point.
+    // is 481 yards from the nearest corridor point.
     StagingCorridorPlan const plan =
         PlanStagingCorridor(Corridor(), TERRACE_X, TERRACE_Y, -360.0f, -2634.0f, limits);
     CheckVerdict("too far off to join", plan.verdict,
                  StagingCorridorVerdict::TooFarToJoin);
     CheckUInt("and nothing is offered to walk",
               static_cast<unsigned>(plan.route.size()), 0u);
+}
+
+// ...BUT IT DOES SAY WHERE THE MEASURED GROUND BEGINS (#356). This is the reach
+// half of that issue, and the half #359 left open. "Too far to step onto" is a
+// reading about one hop; reading it as "this corridor is not yours" is what sent
+// a character down the surveyed road for the WHOLE journey, the corridor's own
+// ground included, which is the one stretch that road is known to walk past a
+// guard post at five yards. So the nearest point is reported under this verdict
+// exactly as it is under a join that succeeded, and a caller with a way of
+// covering ground can walk TO the corridor rather than give it up.
+void TooFarToJoinStillSaysWhereTheCorridorBegins()
+{
+    StagingCorridorLimits const limits;
+    StagingCorridorPlan const plan =
+        PlanStagingCorridor(Corridor(), TERRACE_X, TERRACE_Y, -360.0f, -2634.0f, limits);
+    CheckVerdict("still too far off to join", plan.verdict,
+                 StagingCorridorVerdict::TooFarToJoin);
+    CheckUInt("and the point to make for is the nearest one",
+              static_cast<unsigned>(plan.joinIndex), 7u);
+    CheckNear("with the distance it was refused on", plan.joinYards, 481.f, 2.f);
+    CheckUInt("and still no walk is claimed between here and there",
+              static_cast<unsigned>(plan.route.size()), 0u);
+}
+
+// AND THE READING IS THE SAME ONE THE JOIN WOULD HAVE USED, which is what makes
+// it safe to act on: widening the bound over that distance turns the identical
+// call into a join at the identical point. A second nearest-point rule, written
+// for the refusal alone, could disagree with the one that joins, and this is the
+// test that says there is only one.
+void TheRefusedReadingIsTheJoinsOwnReading()
+{
+    StagingCorridorPlan const refused =
+        PlanStagingCorridor(Corridor(), TERRACE_X, TERRACE_Y, -360.0f, -2634.0f,
+                            StagingCorridorLimits{});
+    StagingCorridorLimits wider;
+    wider.joinYards = 600.f;
+    StagingCorridorPlan const joined =
+        PlanStagingCorridor(Corridor(), TERRACE_X, TERRACE_Y, -360.0f, -2634.0f, wider);
+
+    CheckVerdict("the narrow bound refuses", refused.verdict,
+                 StagingCorridorVerdict::TooFarToJoin);
+    CheckVerdict("the wide one joins", joined.verdict, StagingCorridorVerdict::Joined);
+    CheckUInt("at the same point the refusal named",
+              static_cast<unsigned>(refused.joinIndex),
+              static_cast<unsigned>(joined.joinIndex));
+    CheckNear("at the same distance", refused.joinYards, joined.joinYards, 0.01f);
+}
+
+// AND A REFUSAL THAT NEVER LOOKED FOR A NEAREST POINT STILL SAYS SO. `joinYards`
+// is negative for those, which is the "no reading" convention this module uses
+// everywhere, and it matters here more than usual: a caller acting on the reach
+// fix must be able to tell "the corridor starts 481 yards that way" from "I never
+// got as far as measuring", and a zero would look like the first.
+void ARefusalThatMeasuredNothingSaysNothing()
+{
+    StagingCorridorLimits const limits;
+    // Not this walk's corridor at all, so the join scan never runs.
+    StagingCorridorPlan const elsewhere =
+        PlanStagingCorridor(Corridor(), -11208.2f, 1665.34f, BIND_X, BIND_Y, limits);
+    CheckVerdict("somebody else's corridor", elsewhere.verdict,
+                 StagingCorridorVerdict::NotThisAim);
+    Check("and no join was looked for", elsewhere.joinYards < 0.f, true);
+
+    StagingCorridorPlan const none =
+        PlanStagingCorridor({}, TERRACE_X, TERRACE_Y, BIND_X, BIND_Y, limits);
+    CheckVerdict("no corridor at all", none.verdict, StagingCorridorVerdict::NoCorridor);
+    Check("and nothing measured for it either", none.joinYards < 0.f, true);
 }
 
 // ...and the bound is a bound, not a suggestion: widen it and the same character
@@ -548,6 +615,9 @@ int main()
     NoCorridorIsAnAnswerAndNotAnError();
     AnInterruptedWalkRejoinsWhereItStopped();
     ACharacterNowhereNearItDoesNotJoinIt();
+    TooFarToJoinStillSaysWhereTheCorridorBegins();
+    TheRefusedReadingIsTheJoinsOwnReading();
+    ARefusalThatMeasuredNothingSaysNothing();
     TheJoinBoundIsTheOnlyThingRefusingHim();
     PointsMoreThanOneLookaheadApartAreRefused();
     TheWholeCorridorIsMeasuredAndNotOnlyTheTail();
