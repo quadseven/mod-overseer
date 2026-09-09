@@ -352,15 +352,36 @@ enum class TerrainRemedy
     // and it moves it in z alone (#188).
     LiftToSurface,
 
-    // Say it once, loudly, and stop trying. A repeated identical condition is
-    // a bug in this rule or in the world, and either way silence is worse
-    // than one warning a person can go and look at.
+    // Say it once, loudly, and stop trying FOR NOW. A repeated identical
+    // condition is a bug in this rule or in the world, and either way silence
+    // is worse than one warning a person can go and look at.
     //
-    // This is now the END OF THE LADDER as well as the answer to a live
-    // polygon. When a lift has not stuck, this module cannot fix the character
-    // where it stands, and saying so is the whole remedy: the escalation that
-    // used to be here relocated the failure to another continent instead, and
-    // the character was still below the world when it arrived (#188).
+    // This is the END OF THE LADDER as well as the answer to a live polygon.
+    // When a lift has not stuck, this module cannot fix the character where it
+    // stands, and saying so is the whole remedy: the escalation that used to
+    // be here relocated the failure to another continent instead, and the
+    // character was still below the world when it arrived (#188).
+    //
+    // BUT IT IS A COOLDOWN AND NOT AN ABANDONMENT, and that distinction is
+    // what tonight's four deaths were bought with. The sentence this drives
+    // has always read "GIVING UP until it has been clear for 600s", and for a
+    // character that is genuinely under the world the condition never goes
+    // clear, so the window never opened and the give-up was permanent. Three
+    // hours on the dev realm 2026-09-09: 47 reports, 5 give-ups, and 4 deaths
+    // at the kill plane at full health, out of combat, with nothing steering
+    // them. Every one of those characters was in the state this rung had
+    // stopped looking at.
+    //
+    // AND THAT STATE IS THE ONLY ONE A REMEDY CAN REACH. Once a character is
+    // in free fall out of the world, the ordinary surface probe reaches sixty
+    // yards and finds nothing, so there is no height to lift it to and no
+    // remedy to apply; see the void catch on TerrainRecoveryStep for the one
+    // narrow exception. A character sitting still under the terrain is the
+    // last state in which anything can be done, and it is precisely the state
+    // this rung used to abandon forever. So the ladder is re-armed once the
+    // forget window has passed since the last remedy, whether or not the
+    // condition ever went clear: one lift per ten minutes rather than one lift
+    // and then silence until the character dies.
     GiveUp,
 };
 
@@ -457,6 +478,31 @@ struct TerrainRecoveryLimits
     // toward. ZERO DISABLES IT and restores the behaviour this drive had
     // before #296, which is why it is a limit and not a literal.
     float footingReach{0.f};
+    // HOW FAR ABOVE THE KILL PLANE THE LADDER'S BOUND STOPS APPLYING (#188).
+    //
+    // Everything else on this struct is a bound on how much this module may
+    // do to a character that is probably fine. This one is the opposite: it
+    // names the band in which a character is certainly NOT fine, because
+    // VOID_PLANE_Z is where the core deals it max health outright and no
+    // aura, immunity or fall arithmetic touches that. Inside the band the
+    // bound is lifted, since the only thing the bound can buy there is a
+    // corpse.
+    //
+    // DERIVED FROM THE POLL, NOT PICKED. The band has to be at least as deep
+    // as a free fall covers between two polls, or a falling character steps
+    // straight over it and is dead before the next reading. Measured on the
+    // six void deaths of 2026-09-08/09, from the last sampled position to the
+    // recorded one: 241, 60, 150, 241, 211 and 151 yards in one poll
+    // interval. The worst is 241.
+    //
+    // AND BOUNDED ABOVE BY WHERE THE ROSTER CAN LEGITIMATELY STAND. Two
+    // hundred and fifty yards over the plane is z -250, and the deepest floor
+    // any of these characters has been measured standing on is -105.83, the
+    // bottom of the Wailing Caverns shaft mod-dungeon-clear drops the party
+    // down. So the band cannot contain a place a character is meant to be,
+    // which is what lets the bound be lifted inside it without lifting it
+    // anywhere a scripted traversal happens. ZERO DISABLES IT.
+    float voidCatchYards{0.f};
 };
 
 // What one character's terrain recovery remembers between polls. Kept inside
@@ -502,6 +548,16 @@ struct TerrainRecoveryState
     // character been FINE for a while", and a module that is out of remedies
     // and has gone quiet is not evidence that anything got better.
     time_t lastHeld{0};
+    // ONE CATCH PER ENTRY INTO THE BAND ABOVE THE KILL PLANE (#188), and this
+    // is the whole of that rung's bound. It is set when the catch fires and
+    // cleared by any poll that reads the character above the band, so a
+    // character that falls, is caught, and falls again is caught again, while
+    // one the catch could not move is not teleported once a second for the
+    // rest of its life. The core's gravity covers under ten yards in the first
+    // second of a fall, so a catch that worked always leaves the band before
+    // the next poll and a catch that did nothing never does: the bound
+    // separates the two without needing a clock.
+    bool caughtBelow{false};
     // WHERE THIS EPISODE STARTED. Anchored on the first poll that holds, and
     // the episode is abandoned when the character turns up on another map or
     // more than `episodeRadius` away.
@@ -600,6 +656,67 @@ bool FloorUnderfoot(float currentZ, float floorBelowZ, bool floorBelowValid,
 // path and not the other.
 bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach);
 
+// DID ANY INSTRUMENT FIND GROUND HERE AT ALL?
+//
+// THE SAME TWO INSTRUMENTS, WITH THE #262 CORRECTION TAKEN OFF, and that is
+// the entire difference from ReadingStandsOnTheGround above. It exists
+// because the correction is only sound in one direction and was being read in
+// both.
+//
+// WHAT THE CORRECTION IS FOR. The footing fan answers "can this character
+// walk out of here". A polygon nobody can step off is not ground this
+// character is standing on, so the fan may take an "on the ground" away and
+// open the ladder, which is right: a character sealed in a pocket beside the
+// Wailing Caverns ramp needs SOMETHING tried, and four of them sat for 24
+// minutes because nothing was (#262).
+//
+// WHAT IT IS NOT FOR. The far end of that same ladder is a sentence saying
+// the character is below the world, this module is out of remedies, and
+// somebody needs to look at what is under these coordinates. A refused
+// footing fan is not evidence for any of that. It says the character cannot
+// WALK; it says nothing about whether the ground under it exists.
+//
+// MEASURED, ON TWO CHARACTERS THIRTY YARDS APART, INSIDE THE SAME FIFTEEN
+// MINUTES on 2026-09-09:
+//
+//   'Grog' at map 1 (1396.5, -2797.9, 119.7), surface z 140.8, a local
+//          polygon, but no direction out of here holds. OUT OF REMEDIES.
+//   'Og'   at map 1 (1392.9, -2823.3, 110.1), surface z 141.7, ground at its
+//          own feet. STANDING ON THE GROUND, nothing is being moved.
+//
+// Detour reported a polygon for both. The only thing that separated them was
+// the fan, and the one it refused is the one that was declared below the
+// world and left. So the loud sentence is spoken only where BOTH instruments
+// came back empty, and where one of them did not, the give-up says which and
+// names #262 rather than asserting a fall through the world it cannot
+// support.
+//
+// IT DOES NOT SUPPRESS THE GIVE-UP, and it must not: a character in a pocket
+// nothing can move is exactly what a person needs told. What it suppresses is
+// a claim about the world that the readings do not carry.
+bool SomeInstrumentFoundGround(TerrainReading const& reading,
+                               float footingReach);
+
+// IS THIS CHARACTER IN THE LAST STRETCH ABOVE THE KILL PLANE (#188)?
+//
+// VOID_PLANE_Z is where the core stops treating a character as a character:
+// max health of DAMAGE_FALL_TO_VOID, dealt outright, past every immunity,
+// with the combat log calling it a fall. Nothing this module knows about fall
+// damage applies and nothing it can do afterwards helps, because what follows
+// is a corpse and a graveyard - and on 2026-09-09 one of those graveyards was
+// on a different continent from the rest of the family, which is the outcome
+// the whole no-cross-map rule exists to prevent.
+//
+// SO THE BAND IS WHERE THE ARITHMETIC OF THE LADDER CHANGES SIGN. Above it,
+// the risk of a remedy is that a character which was fine gets displaced;
+// #188 measured 204 of those in six hours and the bound is the fix. Inside
+// it, the risk of NOT applying a remedy is a certain death, and a character
+// two hundred yards below anything the world has at its own x and y is not
+// one of the false positives the bound was built for. `catchYards` is the
+// depth of the band; zero means the caller is not asking, the same "zero
+// disables" every other optional bound in this file uses.
+bool NearTheVoidPlane(float currentZ, float catchYards);
+
 // One poll, for one character. Reads the two predicates above for the
 // condition and this character's own history for the remedy, and updates that
 // history in place.
@@ -624,6 +741,32 @@ bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach)
 // changed: the correction can only ever take an "on the ground" away, never
 // add one, so a false is still a false and the ladder below is still the
 // bound.
+//
+// AND THE LADDER IS NO LONGER A ONE-WAY DOOR (#188). Two changes, and both
+// come from the same measurement: on 2026-09-09 five characters reached the
+// end of this ladder and four of them were dead at the kill plane within the
+// hour, at full health, out of combat, with nothing steering them.
+//
+// FIRST, THE GIVE-UP EXPIRES. It used to end the episode's remedies for as
+// long as the condition held, and the condition holds forever where a
+// character really is under the world, so "giving up until it has been clear
+// for 600s" meant "giving up" for exactly the population it was said about.
+// The ladder is re-armed once the forget window has passed since the last
+// remedy, so the worst case is one lift every ten minutes rather than one
+// lift and then nothing. That is a fifth of the rate the unbounded loop of
+// #188 ran at, and it is measured against a different population: the 204
+// displacements that bound was built for were characters standing on the
+// ground under an arch, and every one of those is now stopped by the
+// on-the-ground gate above before it ever reaches a rung.
+//
+// SECOND, THE BAND ABOVE THE KILL PLANE IS NOT SUBJECT TO THE BOUND AT ALL.
+// See NearTheVoidPlane. A character inside it is hundreds of yards below
+// anything at its own x and y, is seconds from a max-health kill it cannot be
+// healed out of, and is none of the false positives the ladder bounds. It
+// gets the lift whether or not the ladder has anything left, once per entry
+// into the band. The remedy is still a lift, so it is still same map, same x,
+// same y: catching a character above the plane cannot split the family, and
+// letting it cross the plane demonstrably can.
 TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
                                            TerrainReading const& reading,
                                            TerrainRecoveryLimits const& limits,

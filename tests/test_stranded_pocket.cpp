@@ -244,9 +244,18 @@ void ThePocketBesideTheRampIsRecoveredRatherThanCongratulated()
 }
 
 // A stranding is 12 minutes of nothing followed by a backstop. One poll a
-// second for those twelve minutes must produce one lift, one give-up and then
+// second for those twelve minutes must produce a bounded ladder and then
 // silence, exactly like every other episode: the fix is a correction to a
 // reading, not a new licence to move people.
+//
+// ONE LADDER PER TEN MINUTES, NOT ONE PER CHARACTER (#188). This asserted
+// exactly one lift for the whole attempt until 2026-09-09, when the same
+// "said once and then never again" shape was measured killing characters: the
+// condition never goes clear for a character that is genuinely stuck, so the
+// give-up's own 600 second window could not open and the ladder was spent for
+// good. A pocket nothing can step out of is precisely a character that should
+// be offered another go rather than left, so twelve minutes is one ladder and
+// then a second one, which is still nothing like the loop #188 stopped.
 void TwelveMinutesInThePocketIsStillABoundedLadder()
 {
     TerrainRecoveryState state;
@@ -260,8 +269,10 @@ void TwelveMinutesInThePocketIsStillABoundedLadder()
             case TerrainRemedy::Nothing:       ++nothings; break;
         }
     }
-    Check("one lift for the whole staging attempt", lifts == 1, true);
-    Check("one give-up for the whole staging attempt", giveUps == 1, true);
+    // 720 seconds is one full forget window and a little over, so the ladder
+    // is climbed twice and no more.
+    Check("one ladder per forget window and no more", lifts == 2, true);
+    Check("and a give-up for each of them", giveUps == 2, true);
     Check("and silence for the rest of it", nothings > 700, true);
 }
 

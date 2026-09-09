@@ -20,7 +20,10 @@ using OverseerDecisions::BelowTerrainNeedsRecovery;
 using OverseerDecisions::FloorUnderfoot;
 using OverseerDecisions::LargeSurfaceMismatchNeedsRecovery;
 using OverseerDecisions::MeasuredToBeFalling;
+using OverseerDecisions::NearTheVoidPlane;
 using OverseerDecisions::ReadingStandsOnTheGround;
+using OverseerDecisions::SomeInstrumentFoundGround;
+using OverseerDecisions::VOID_PLANE_Z;
 using OverseerDecisions::TerrainRecoveryMayInspect;
 using OverseerDecisions::TerrainReading;
 using OverseerDecisions::TerrainRecoveryState;
@@ -197,7 +200,8 @@ OverseerDecisions::TerrainRecoveryLimits const LIVE_LIMITS{
     0.5f,   // liftClearance
     600,    // forgetSeconds
     250.f,  // episodeRadius
-    2.f     // footingReach, as the adapter passes (#296)
+    2.f,    // footingReach, as the adapter passes (#296)
+    250.f   // voidCatchYards, as the adapter passes (#188)
 };
 
 // THE READING EVERY CASE BELOW USES UNLESS IT SAYS OTHERWISE: no floor was
@@ -318,6 +322,16 @@ void TheVendorUnderTheTowerIsNeverDisplaced()
 
 // THE REGRESSION THIS WHOLE CHANGE EXISTS FOR. The condition that fired 204
 // times, presented 204 times, must not produce 204 remedies.
+//
+// AND THE BOUND IS A RATE, NOT A TOTAL (#188). This used to assert exactly one
+// lift for the whole six hours, which is what killed four characters on
+// 2026-09-09: the condition never goes clear for a character genuinely under
+// the world, so the forget window never opened and "one lift ever" was the
+// real policy. The rate is what #188 was actually about - 204 remedies in 396
+// minutes, one every 1.9 minutes - so the rate is what is pinned. One per ten
+// minutes is a fifth of the loop that had to be stopped, and every one of
+// those 204 was a character standing on the ground, which the gate above now
+// declines before a rung is ever reached.
 void ARepeatedConditionIsABoundedSeriesAndThenSilence()
 {
     TerrainRecoveryState state;
@@ -334,9 +348,15 @@ void ARepeatedConditionIsABoundedSeriesAndThenSilence()
             case TerrainRemedy::Nothing:       ++nothings; break;
         }
     }
-    Check("at most one lift for an unbroken episode", lifts == 1, true);
-    Check("at most one give-up for an unbroken episode", giveUps == 1, true);
-    Check("and silence for the rest of the six hours", nothings > 1600, true);
+    // 396 minutes, one ladder per ten of them, so at most forty of each and
+    // nowhere near the 204 that had to be stopped.
+    Check("the series is bounded well under the live loop", lifts <= 40, true);
+    Check("and the give-up never outruns the lift", giveUps <= lifts, true);
+    Check("and it is silent between the ladders", nothings > 1600, true);
+    // AND IT DOES COME BACK, which is the half the old assertion forbade. A
+    // character under the world for six hours is offered a remedy through all
+    // six, not once at the start and then never again.
+    Check("the ladder is re-armed rather than retired", lifts > 20, true);
 }
 
 // The memory must survive the clean poll that every remedy itself produces,
@@ -478,12 +498,22 @@ void AWarningDoesNotSpendTheLiftARealFallWouldNeed()
 // Written out here so the live shape can be asked as ONE question - what does
 // this module DO about a character in this state - which is the question that
 // was got wrong.
+//
+// THE FIFTH ARGUMENT IS `descending && !nearThePlane` (#188), which is what
+// the adapter now passes. A measured descent stands this drive down
+// everywhere except the last stretch above the kill plane, where standing
+// down is the death: six characters fell through that stand-down on
+// 2026-09-08/09 and the core killed every one of them at full health. The
+// other seven stand-downs are untouched and are still asked here in the same
+// order.
 TerrainRecoveryVerdict Poll(TerrainRecoveryState& state, bool falling,
                             TerrainReading const& reading, time_t now)
 {
+    bool const nearThePlane =
+        NearTheVoidPlane(reading.z, LIVE_LIMITS.voidCatchYards);
     if (!TerrainRecoveryMayInspect(/*alive*/ true, /*teleporting*/ false,
                                    /*inFlight*/ false, /*flying*/ false,
-                                   falling, /*inWater*/ false,
+                                   falling && !nearThePlane, /*inWater*/ false,
                                    /*onTransport*/ false, /*onVehicle*/ false))
         return TerrainRecoveryVerdict{};
     return TerrainRecoveryStep(state, reading, LIVE_LIMITS, now);
@@ -903,6 +933,410 @@ void NoRecoveryMayEverChangeAMap()
     // are not passing because nothing ever happened.
     Check("the lift did fire during that run", moves > 0, true);
 }
+
+// ---------------------------------------------------------------------------
+// #188, 2026-09-09. THE GIVE-UP WAS AN ABANDONMENT AND IT KILLED FOUR.
+//
+// Three hours on the dev realm: 47 below-the-world reports, 5 escalations to
+// "OUT OF REMEDIES ... GIVING UP until it has been clear for 600s", and 4
+// deaths recorded as crossing the void plane. The five give-up coordinates,
+// all map 1:
+//
+//   (  412.5, -2117.4, 147.6)  surface z 185.0   37.3 under
+//   (  252.9, -2253.9, 205.2)  surface z 217.6   12.4 under
+//   ( 1396.5, -2797.9, 119.7)  surface z 140.8   21.1 under
+//   ( 1370.0, -2823.6, 191.2)  surface z 202.7   11.5 under
+//   ( -747.8, -2056.5, 106.8)  surface z 127.4   20.6 under
+//
+// The last is about 40 yards from (-705.0, -2045.0, 66.45), the approach point
+// the Wailing Caverns staging corridor ends at, so this sits on the campaign's
+// own route rather than somewhere the family has no business being.
+// ---------------------------------------------------------------------------
+
+// The give-up's own sentence promised a 600 second window, and for the one
+// population it was ever said about that window could not open: `lastHeld` is
+// refreshed by every poll the condition is true on, and the condition is
+// permanently true under the world. So "giving up until it has been clear"
+// meant "giving up".
+void TheGiveUpIsACooldownAndNotAnAbandonment()
+{
+    // (412.5, -2117.4, 147.6), surface z 185.0. The largest of the five.
+    TerrainReading const there =
+        Floorless(Here(147.6f, 185.0f, false, 1, 412.5f, -2117.4f));
+
+    TerrainRecoveryState state;
+    CheckRemedy("the first occurrence gets its lift",
+                TerrainRecoveryStep(state, there, LIVE_LIMITS, 0).remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckRemedy("the lift did not stick, so the ladder ends",
+                TerrainRecoveryStep(state, there, LIVE_LIMITS, 14).remedy,
+                TerrainRemedy::GiveUp);
+
+    // Ten minutes of the condition being true every second, which is what a
+    // character actually under the world produces. Not one poll of it may be
+    // a remedy, and not one of them may push the window ahead of itself.
+    int remedies = 0;
+    for (time_t t = 15; t < 614; ++t)
+        if (TerrainRecoveryStep(state, there, LIVE_LIMITS, t).remedy !=
+            TerrainRemedy::Nothing)
+            ++remedies;
+    Check("it stays quiet for the whole window", remedies == 0, true);
+
+    // AND THEN IT COMES BACK. This is the assertion the four deaths bought.
+    CheckRemedy("ten minutes after the give-up, the ladder is re-armed",
+                TerrainRecoveryStep(state, there, LIVE_LIMITS, 614).remedy,
+                TerrainRemedy::LiftToSurface);
+}
+
+// The window is measured from the last REMEDY and not from the last time the
+// condition held, which is the whole of the bug. A rule keyed on `lastHeld`
+// re-reads a permanently true condition as permanently recent.
+void TheWindowIsMeasuredFromTheLastRemedyAndNotTheLastHold()
+{
+    TerrainReading const there =
+        Floorless(Here(106.8f, 127.4f, false, 1, -747.8f, -2056.5f));
+
+    TerrainRecoveryState state;
+    TerrainRecoveryStep(state, there, LIVE_LIMITS, 0);    // lift
+    TerrainRecoveryStep(state, there, LIVE_LIMITS, 14);   // give-up
+    // Every single poll for ten minutes holds, so `lastHeld` is always now.
+    // A window keyed on it can never elapse, which is what happened live.
+    for (time_t t = 15; t < 614; ++t)
+        TerrainRecoveryStep(state, there, LIVE_LIMITS, t);
+    // Under the old rule this character was still out of remedies here, and
+    // stayed that way for as long as it lived.
+    CheckRemedy("a continuously true condition still gets another ladder",
+                TerrainRecoveryStep(state, there, LIVE_LIMITS, 614).remedy,
+                TerrainRemedy::LiftToSurface);
+}
+
+// The Wailing Caverns approach, which is why this is a campaign blocker and
+// not an occasional loss: the staging corridor ends at (-705.0, -2045.0) and
+// this give-up is 40 yards from it, so the family walks members past here
+// every run by design.
+void TheGiveUpOnTheCampaignRouteIsRetriedRatherThanLeft()
+{
+    TerrainReading const there =
+        Floorless(Here(106.8f, 127.4f, false, 1, -747.8f, -2056.5f));
+    TerrainRecoveryState state;
+    int lifts = 0;
+    // One hour of standing under the world beside the approach point.
+    for (time_t t = 0; t < 3600; ++t)
+        if (TerrainRecoveryStep(state, there, LIVE_LIMITS, t).remedy ==
+            TerrainRemedy::LiftToSurface)
+            ++lifts;
+    Check("an hour under the world is six chances and not one", lifts == 6,
+          true);
+}
+
+// A warning about an arch is not a remedy, so the re-arm has nothing to give
+// back there. Repeating that line every ten minutes would have cost a reader
+// 79 lines a night at one Northshire coordinate and bought them nothing.
+void TheReArmGivesBackTheRemedyAndNotTheWarning()
+{
+    TerrainRecoveryState state;
+    CheckRemedy("the arch, said once",
+                TerrainRecoveryStep(state, Here(88.6f, 116.8f, true),
+                                    LIVE_LIMITS, 0).remedy,
+                TerrainRemedy::GiveUp);
+    int said = 0;
+    for (time_t t = 1; t < 3600; ++t)
+        if (TerrainRecoveryStep(state, Here(88.6f, 116.8f, true), LIVE_LIMITS, t)
+                .remedy != TerrainRemedy::Nothing)
+            ++said;
+    Check("and never said again for the whole hour", said == 0, true);
+}
+
+// ---------------------------------------------------------------------------
+// #188 / #262. TWO CHARACTERS THIRTY YARDS APART, OPPOSITE VERDICTS.
+//
+//   'Grog' at (1396.5, -2797.9, 119.7), surface z 140.8, a local polygon but
+//          no direction out of here holds. OUT OF REMEDIES, and then dead.
+//   'Og'   at (1392.9, -2823.3, 110.1), surface z 141.7, ground at its own
+//          feet. STANDING ON THE GROUND, nothing is being moved.
+//
+// Detour reported a polygon for both. The footing fan is the only instrument
+// that separated them, and the fan answers a question about walking.
+// ---------------------------------------------------------------------------
+
+void AFootingRefusalIsNotEvidenceThatTheGroundIsMissing()
+{
+    // Grog. A polygon Detour found, and no bearing out of it that holds.
+    TerrainReading grog =
+        Floorless(Here(119.7f, 140.8f, true, 1, 1396.5f, -2797.9f));
+    grog.footingHolds = false;
+    Check("the #262 correction still takes the 'on the ground' away",
+          ReadingStandsOnTheGround(grog, 2.f), false);
+    Check("but an instrument did find ground here",
+          SomeInstrumentFoundGround(grog, 2.f), true);
+
+    // Og, thirty yards away, with the fan holding.
+    TerrainReading const og =
+        Floorless(Here(110.1f, 141.7f, true, 1, 1392.9f, -2823.3f));
+    Check("and its neighbour reads as on the ground",
+          ReadingStandsOnTheGround(og, 2.f), true);
+    Check("by the same instrument", SomeInstrumentFoundGround(og, 2.f), true);
+
+    // A character genuinely under the world: neither instrument carries it,
+    // so the loud sentence is still available for the case it was written for.
+    TerrainReading const void_ =
+        Floorless(Here(427.7f, 483.2f, false, 0, -4776.7f, -901.7f));
+    Check("nothing found ground for a character under the world",
+          SomeInstrumentFoundGround(void_, 2.f), false);
+
+    // A floor alone carries it, with no Detour answer at all.
+    Check("a floor at the feet is an instrument finding ground",
+          SomeInstrumentFoundGround(
+              OnAFloor(Floorless(Here(10.1f, 26.1f, false)), 0.1f), 2.f),
+          true);
+}
+
+// THE ASYMMETRY, PINNED. This can only ever be weaker than the corrected
+// answer, never stronger: anything the corrected rule calls on the ground,
+// this one does too. A version that could disagree the other way would be a
+// second, quieter "on the ground" test, which is exactly the drift the fold
+// on ReadingStandsOnTheGround exists to prevent.
+void TheUncorrectedAnswerIsNeverStrongerThanTheCorrectedOne()
+{
+    for (int mesh = 0; mesh < 2; ++mesh)
+        for (int footing = 0; footing < 2; ++footing)
+            for (int floor = 0; floor < 2; ++floor)
+            {
+                TerrainReading r = Here(88.6f, 116.8f, mesh != 0);
+                r.footingHolds = footing != 0;
+                r.floorBelowValid = floor != 0;
+                r.floorBelowZ = r.z - 0.1f;
+                if (ReadingStandsOnTheGround(r, 2.f))
+                    Check("on the ground implies an instrument found ground",
+                          SomeInstrumentFoundGround(r, 2.f), true);
+            }
+}
+
+// And Grog still gets the ladder. Suppressing the give-up outright would put
+// this character back in #262's pocket, where four sat for 24 minutes while
+// the module congratulated them. What must not happen is the abandonment.
+void TheCharacterTheDetectorIsWrongAboutStillGetsItsLift()
+{
+    TerrainReading grog =
+        Floorless(Here(119.7f, 140.8f, true, 1, 1396.5f, -2797.9f));
+    grog.footingHolds = false;
+
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v =
+        TerrainRecoveryStep(state, grog, LIVE_LIMITS, 0);
+    CheckRemedy("a pocket is still worth a lift", v.remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckNear("straight up, at its own x and y", v.liftZ, 141.3f);
+    CheckRemedy("and the ladder still ends in a give-up",
+                TerrainRecoveryStep(state, grog, LIVE_LIMITS, 14).remedy,
+                TerrainRemedy::GiveUp);
+    CheckRemedy("which expires like every other one",
+                TerrainRecoveryStep(state, grog, LIVE_LIMITS, 614).remedy,
+                TerrainRemedy::LiftToSurface);
+}
+
+// ---------------------------------------------------------------------------
+// #188. THE KILL PLANE, AND THE WINDOW BEFORE IT.
+//
+// Six void deaths on map 1, 2026-09-08/09, one character, killer 'self', every
+// one at full health and out of combat:
+//
+//   time      x      y       z at death   last sampled z
+//   03:57:14  1400   -2800   -528         -287
+//   03:51:26  1397   -2798   -528         -468
+//   03:44:37   418   -2121   -509         -359
+//   02:37:54  1541   -2411   -506         -265
+//   23:13:00  -792   -2037   -524         -313
+//   23:08:23  -597   -2292   -517         -366
+//
+// The last sampled column is the point: there is a poll at which the character
+// is hundreds of yards below the world and STILL ALIVE. The module was
+// standing down through every one of them.
+// ---------------------------------------------------------------------------
+
+void TheBandIsTheLastStretchAboveThePlaneAndNothingElse()
+{
+    Check("the plane itself", NearTheVoidPlane(VOID_PLANE_Z, 250.f), true);
+    Check("below the plane, not yet killed", NearTheVoidPlane(-528.f, 250.f),
+          true);
+    Check("the top of the band is inclusive", NearTheVoidPlane(-250.f, 250.f),
+          true);
+    Check("and one yard above it is not in it",
+          NearTheVoidPlane(-249.f, 250.f), false);
+    // Every one of the six last-sampled positions is inside the band, which is
+    // what the depth was chosen to guarantee: the worst measured fall between
+    // two polls was 241 yards.
+    float const lastSampled[] = {-287.f, -468.f, -359.f, -265.f, -313.f, -366.f};
+    for (float z : lastSampled)
+        Check("the last sample before a void death is inside the band",
+              NearTheVoidPlane(z, 250.f), true);
+    // AND NOTHING THE ROSTER LEGITIMATELY STANDS ON IS. The deepest measured
+    // floor is the bottom of the Wailing Caverns shaft mod-dungeon-clear drops
+    // the party down.
+    Check("the bottom of the scripted shaft is not in the band",
+          NearTheVoidPlane(-105.83f, 250.f), false);
+    Check("nor the lip it is dropped from", NearTheVoidPlane(-29.0f, 250.f),
+          false);
+    Check("nor anywhere overland", NearTheVoidPlane(119.7f, 250.f), false);
+    Check("a zero band is a caller not asking",
+          NearTheVoidPlane(-468.f, 0.f), false);
+}
+
+// 03:51:26. The character was at -468 with the terrain at its own x and y
+// around 140. The ordinary sixty-yard probe finds nothing from there, which is
+// why there was never a height to lift it to; the adapter's deep probe is what
+// supplies this reading, and this is what the rule does with it.
+void ACharacterFallingOutOfTheWorldIsCaughtAboveThePlane()
+{
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
+        state, Floorless(Here(-468.f, 140.8f, false, 1, 1397.f, -2798.f)),
+        LIVE_LIMITS, 0);
+    CheckRemedy("caught above the plane", v.remedy, TerrainRemedy::LiftToSurface);
+    CheckNear("onto the surface at its own x and y", v.liftZ, 141.3f);
+}
+
+// AND THE LADDER'S BOUND DOES NOT APPLY DOWN THERE. This is the shape that
+// actually happened: the character reaches the give-up standing under the
+// world, and then falls. Under the old rule it was out of remedies before the
+// fall began.
+void ASpentLadderStillCatchesTheFall()
+{
+    TerrainReading const above =
+        Floorless(Here(119.7f, 140.8f, false, 1, 1396.5f, -2797.9f));
+    TerrainRecoveryState state;
+    CheckRemedy("the lift", TerrainRecoveryStep(state, above, LIVE_LIMITS, 0).remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckRemedy("the give-up",
+                TerrainRecoveryStep(state, above, LIVE_LIMITS, 14).remedy,
+                TerrainRemedy::GiveUp);
+    CheckRemedy("and nothing while it stands there",
+                TerrainRecoveryStep(state, above, LIVE_LIMITS, 20).remedy,
+                TerrainRemedy::Nothing);
+
+    // It falls. Same x and y, so the episode and its spent ladder are intact.
+    TerrainRecoveryVerdict const caught = TerrainRecoveryStep(
+        state, Floorless(Here(-359.f, 140.8f, false, 1, 1396.5f, -2797.9f)),
+        LIVE_LIMITS, 25);
+    CheckRemedy("an out-of-remedies character is still caught", caught.remedy,
+                TerrainRemedy::LiftToSurface);
+    CheckNear("onto the surface at its own x and y", caught.liftZ, 141.3f);
+}
+
+// ONE CATCH PER ENTRY INTO THE BAND, which is the whole of that rung's bound.
+// A catch that worked leaves the band before the next poll, because the core's
+// gravity covers under ten yards in the first second of a fall. A catch that
+// moved nothing does not, and must not become a teleport a second.
+void TheCatchFiresOncePerEntryIntoTheBand()
+{
+    TerrainReading const deep =
+        Floorless(Here(-359.f, 140.8f, false, 1, 1396.5f, -2797.9f));
+
+    TerrainRecoveryState state;
+    CheckRemedy("the catch", TerrainRecoveryStep(state, deep, LIVE_LIMITS, 0).remedy,
+                TerrainRemedy::LiftToSurface);
+    // It did not move: a hundred more polls at the same depth.
+    int again = 0;
+    for (time_t t = 1; t < 100; ++t)
+        if (TerrainRecoveryStep(state, deep, LIVE_LIMITS, t).remedy !=
+            TerrainRemedy::Nothing)
+            ++again;
+    Check("a catch that changed nothing is not repeated", again == 0, true);
+
+    // It worked: one poll on the surface, and the character is out of the
+    // band. The next fall is a new entry and gets its own catch.
+    TerrainRecoveryStep(state, Floorless(Here(131.f, 140.8f, true, 1, 1396.5f,
+                                              -2797.9f)),
+                        LIVE_LIMITS, 100);
+    CheckRemedy("a second fall is caught again",
+                TerrainRecoveryStep(state, deep, LIVE_LIMITS, 101).remedy,
+                TerrainRemedy::LiftToSurface);
+}
+
+// THE ORDERING THAT KEEPS THE CATCH FROM BEING A LICENCE. A character with a
+// floor at its own feet at that depth is standing on a legitimate deep
+// interior, and the on-the-ground gate is read BEFORE the band.
+void ACharacterStandingOnADeepFloorIsNeverCaught()
+{
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const v = TerrainRecoveryStep(
+        state, OnAFloor(Here(-359.f, 140.8f, false, 1, 1396.5f, -2797.9f), 0.1f),
+        LIVE_LIMITS, 0);
+    Check("a floor at the feet beats the band",
+          v.remedy != TerrainRemedy::LiftToSurface, true);
+    Check("and no catch is remembered against it", !state.caughtBelow, true);
+}
+
+// AND THE SCRIPTED DROP IS UNTOUCHED, which is the stand-down this band is
+// carved out of. mod-dungeon-clear's shaft runs from -29.0 to -105.83, so no
+// part of it is inside the band and the drive's own falling stand-down still
+// covers all of it.
+void TheScriptedShaftDropIsNowhereNearTheBand()
+{
+    for (float z = -29.0f; z > -105.83f; z -= 10.8f)
+        Check("no second of the Wailing Caverns drop is in the band",
+              NearTheVoidPlane(z, 250.f), false);
+    // So the drive still declines it, exactly as before, through the whole
+    // drop and not only at its start.
+    TerrainRecoveryState falling;
+    for (float z = -29.0f; z > -105.83f; z -= 10.8f)
+        CheckRemedy("and the stand-down still holds through the whole drop",
+                    Poll(falling, true, Shaft(z), 1000).remedy,
+                    TerrainRemedy::Nothing);
+}
+
+// AND THE STAND-DOWN IS WHAT WAS KILLING THEM, asked through the adapter's own
+// composition so the two halves of the change are tested together: a character
+// measured falling, which this drive has always declined to look at, inside the
+// band, which is the one place declining is fatal.
+void AFallingCharacterInsideTheBandIsLookedAtAndCaught()
+{
+    TerrainRecoveryState state;
+    TerrainReading const deep =
+        Floorless(Here(-359.f, 140.8f, false, 1, 418.f, -2121.f));
+
+    // Before this change the fifth argument was `descending` alone, so the
+    // drive returned here without ever taking a reading.
+    Check("the drive is allowed to look inside the band",
+          TerrainRecoveryMayInspect(true, false, false, false,
+                                    /*descending && !nearThePlane*/ false,
+                                    false, false, false),
+          true);
+    CheckRemedy("and it catches the fall", Poll(state, true, deep, 0).remedy,
+                TerrainRemedy::LiftToSurface);
+
+    // The same character at the same instant, one yard above the band, is
+    // still declined. The band is the whole of what changed.
+    TerrainRecoveryState above;
+    CheckRemedy("one yard above the band it is declined as before",
+                Poll(above, true,
+                     Floorless(Here(-249.f, 140.8f, false, 1, 418.f, -2121.f)), 0)
+                    .remedy,
+                TerrainRemedy::Nothing);
+}
+
+// THE INVARIANT AGAIN, THROUGH THE NEW RUNG. A catch is a lift and a lift is a
+// change of z. Nothing #188 forbade is reachable from here.
+void ACatchIsStillOnlyAChangeOfHeight()
+{
+    float const zs[] = {-287.f, -468.f, -359.f, -265.f, -313.f, -366.f};
+    float const xs[] = {1400.f, 1397.f, 418.f, 1541.f, -792.f, -597.f};
+    float const ys[] = {-2800.f, -2798.f, -2121.f, -2411.f, -2037.f, -2292.f};
+
+    for (size_t i = 0; i < 6; ++i)
+    {
+        TerrainRecoveryState state;
+        Where at{1, xs[i], ys[i], zs[i]};
+        Where const after = Apply(
+            at, TerrainRecoveryStep(
+                    state, Floorless(Here(zs[i], 140.8f, false, 1, xs[i], ys[i])),
+                    LIVE_LIMITS, 0));
+        Check("a catch never changes the map", after.mapId == at.mapId, true);
+        Check("a catch never changes x", after.x == at.x, true);
+        Check("a catch never changes y", after.y == at.y, true);
+        Check("and it did move the character upward", after.z > at.z, true);
+    }
+}
 }  // namespace
 
 int main()
@@ -951,6 +1385,24 @@ int main()
     ACharacterWithNothingUnderItStillGetsItsLift();
     GroundFarBelowDoesNotDeclineARecovery();
     AZeroFootingReachIsTheOldBehaviourAndSaysSo();
+
+    TheGiveUpIsACooldownAndNotAnAbandonment();
+    TheWindowIsMeasuredFromTheLastRemedyAndNotTheLastHold();
+    TheGiveUpOnTheCampaignRouteIsRetriedRatherThanLeft();
+    TheReArmGivesBackTheRemedyAndNotTheWarning();
+
+    AFootingRefusalIsNotEvidenceThatTheGroundIsMissing();
+    TheUncorrectedAnswerIsNeverStrongerThanTheCorrectedOne();
+    TheCharacterTheDetectorIsWrongAboutStillGetsItsLift();
+
+    TheBandIsTheLastStretchAboveThePlaneAndNothingElse();
+    ACharacterFallingOutOfTheWorldIsCaughtAboveThePlane();
+    ASpentLadderStillCatchesTheFall();
+    TheCatchFiresOncePerEntryIntoTheBand();
+    ACharacterStandingOnADeepFloorIsNeverCaught();
+    TheScriptedShaftDropIsNowhereNearTheBand();
+    AFallingCharacterInsideTheBandIsLookedAtAndCaught();
+    ACatchIsStillOnlyAChangeOfHeight();
 
     if (failures)
     {
