@@ -1598,6 +1598,71 @@ bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members);
 std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
                                     float doorstepYards);
 
+// ------------------------------------------- getting one member back out --
+//
+// A CROSSING WALKS A PARTY THROUGH A DOOR TOGETHER. THIS IS THE OTHER CASE,
+// AND IT HAS NO PARTY LEFT IN IT: one or two members standing inside an
+// instance whose run is over, with the leader outside, and nothing that owns
+// them.
+//
+// WHAT IT COST, MEASURED ON INSTANCE MAP 43. Two members at
+// (-163.5, 132.9, -73.7) - the entrance trigger's own landing point, to the
+// decimal - unmoved for over an hour. An instance cannot be reset while
+// anybody is in it, so those two characters were the whole campaign: every run
+// after them ended `reset_failed` five minutes after it opened, over and over,
+// with the run number never leaving 1.
+//
+// AND THE DOOR THEY COULD NOT FIND WAS OPEN. The way out is an areatrigger at
+// (-172.2, 139.0, -66.6) with a radius of 12, and the straight-line distance
+// from where they stood is 12.7 yards - which reads as outside it, and is why
+// this looked like a walking problem. It is not what the server measures.
+// Player::IsInAreaTriggerRadius compares the radius against
+// WorldObject::GetDistance, which subtracts the character's own combat reach
+// (scale * DEFAULT_COMBAT_REACH, 1.5 for a player at scale 1), so the reading
+// that decides is 12.7 - 1.5 = 11.2, and 11.2 is INSIDE 12. They had been
+// standing in their own exit for an hour. Nothing had asked it.
+//
+// ASKED OF THE SAME CENSUS THE CROSSING USES, taken against the EXIT door, so
+// `through` means "out on the map outside" and a negative distance means "not
+// on the door's map at all". A member on some third map is not what holds a
+// reset and is not this decision's business; a member this poll could not find
+// is not counted either, on the same terms the adapter's own reset blockers
+// already use - not in the world, and therefore not on the map.
+//
+// TWO ANSWERS RATHER THAN ONE LIST, because they are acted on differently and
+// the difference is the whole reason to name it: one of them can be walked out
+// right now, and the other holds the instance open just as hard and cannot be
+// walked at all.
+struct DungeonEvacuation
+{
+    // Alive, inside, and reachable by an aim. Escort each of these at the exit
+    // trigger itself.
+    std::vector<std::string> walk;
+    // Inside and dead. No aim moves a corpse, the revival drive owns it, and
+    // the reset it is holding open waits for it either way - so it is NAMED
+    // rather than walked, and named separately rather than being quietly
+    // missing from a line about who is still in there.
+    std::vector<std::string> wait;
+};
+
+DungeonEvacuation DungeonRunEvacuation(std::vector<DungeonRunEntryState> const& members);
+
+// CAN AN AIM AT A DOORWAY EVER OPEN IT?
+//
+// An arrival tolerance is the distance at which a walk STOPS: the errand reads
+// as finished and nothing carries the character any nearer. An areatrigger
+// fires on the server's own radius check and on nothing else. So a tolerance
+// that is not strictly tighter than the radius it is aimed at is a character
+// parked outside its own door with the walk reported as a success, which is
+// the failure the adapter's TRAVEL_ARRIVED_POSITION_YARDS was written for:
+// arriving within twelve yards of a seven yard trigger is arriving OUTSIDE it.
+//
+// ASKED OF THE DOOR BEING AIMED AT rather than asserted once against the
+// smallest trigger anybody remembered. The radius is a row in the world
+// database, this module aims at four of them, and that row is the only thing
+// that knows.
+bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards);
+
 // ------------------------------------------------------------- the ratchet --
 //
 // "HAS IT GOT ANYWHERE, AND IF NOT, FOR HOW LONG?" - a question this module

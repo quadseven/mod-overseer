@@ -1005,6 +1005,42 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
     return blockers;
 }
 
+DungeonEvacuation DungeonRunEvacuation(std::vector<DungeonRunEntryState> const& members)
+{
+    DungeonEvacuation evacuation;
+    for (DungeonRunEntryState const& member : members)
+    {
+        // Out already, or not in the world this poll. See the header for why
+        // the second is not counted as inside rather than counted and then not
+        // walked: a name that does not resolve is not on the map either.
+        if (member.through || !member.seen)
+            continue;
+        // Not on the door's map, and the exit door's map is the inside one -
+        // so this member is somewhere else entirely and is not what holds the
+        // reset. The same negative sentinel the crossing predicates read.
+        if (member.distanceFromDoor < 0.f)
+            continue;
+        if (member.alive)
+            evacuation.walk.push_back(member.name);
+        else
+            evacuation.wait.push_back(member.name);
+    }
+    return evacuation;
+}
+
+bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards)
+{
+    // A tolerance of zero or less is not a tolerance, and a trigger with no
+    // radius is a BOX rather than a circle - the areatrigger table carries
+    // both shapes - so neither is a door this question has an answer for.
+    // Refusing both is deliberate rather than defensive: the caller's remedy is
+    // to say so and aim nobody, which is better than a walk that reports
+    // arriving somewhere it cannot open.
+    if (arrivalYards <= 0.f || triggerRadiusYards <= 0.f)
+        return false;
+    return arrivalYards < triggerRadiusYards;
+}
+
 bool RatchetProgressed(float reading, float best, RatchetLimits const& limits,
                        bool seen)
 {
