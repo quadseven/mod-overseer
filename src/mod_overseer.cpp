@@ -6664,11 +6664,18 @@ private:
     // NOT `readyToCast`. Nothing is being cast, and a family standing still is
     // a family that should be eating - #346's argument for the staging hold,
     // word for word.
-    void HoldForTheFamily(Player* leader, std::string const& name)
+    //
+    // ANSWERS WHETHER THE HOLD IS ACTUALLY STANDING, which the caller has to
+    // know rather than assume. A leader with no steerable AI - logged out,
+    // mid-teardown, or a worldserver that bounced - cannot be held, and a wait
+    // recorded over a hold that was never placed would be this drive believing
+    // a leader is standing still while it walks away. The same read-back
+    // discipline every grant in this file already applies.
+    bool HoldForTheFamily(Player* leader, std::string const& name)
     {
         PlayerbotAI* botAI = SteerableAI(leader);
         if (!botAI)
-            return;
+            return false;
         HoldCharacterStill(leader, botAI, name, REGROUP_HOLD_VERB,
                            REGROUP_HOLD_CEILING_SECONDS, false);
         // Idempotent and cheap, exactly as it is for a traveller: it reads the
@@ -6683,6 +6690,7 @@ private:
                      "when the wait ends. A held leader that still picks targets is a "
                      "leader the member behind it is still chasing",
                      name, took);
+        return HasRegroupHold(name);
     }
 
     static void ReleaseRegroupHold(std::string const& name, char const* why)
@@ -14731,6 +14739,19 @@ private:
             // and is not this family's to wait for.
             if (p->GetGroup() != group)
                 continue;
+            // AND THE SAME TWO THE FOLLOW LOOP APPLIES BEFORE IT CALLS
+            // DriveCatchUp AT ALL, which is what makes them load-bearing here
+            // rather than tidy. A member with no PlayerbotAI, and a member a
+            // real person is playing, both take a `continue` up there, so
+            // neither ever gets a catch-up walk - and the whole invariant this
+            // wait rests on is that the family only ever waits for a walk that
+            // is actually happening. Waiting for a character somebody is at the
+            // keyboard of would also be this module freezing four bots because
+            // a person walked off, which is the opposite of "a human at the
+            // keyboard wins, and owns this character outright".
+            PlayerbotAI* const memberAI = GET_PLAYERBOT_AI(p);
+            if (!memberAI || IsRealPlayer(memberAI->GetMaster()))
+                continue;
             OverseerDecisions::RegroupMember member;
             member.name = p->GetName();
             member.seen = p->IsInWorld();
@@ -14823,18 +14844,33 @@ private:
             return;
         }
 
+        // THE HOLD GOES ON BEFORE THE WAIT IS RECORDED, and the wait is only
+        // recorded if it took. A wait remembered over a hold that is not
+        // standing would keep the near hysteresis line in force for a leader
+        // that is walking, which is a family that thinks it is waiting and is
+        // not - the exact shape of the failures this file has three comments
+        // about, where a grant that did not take was reported as one that did.
+        if (!HoldForTheFamily(leader, leaderName))
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' is {} yards behind '{}' and the leader "
+                      "cannot be held still for it - so nothing waits, and that "
+                      "member will keep chasing a leader that keeps moving",
+                      verdict.waitingFor,
+                      static_cast<uint32>(verdict.worstYards), leaderName);
+            EndTheRegroupWait("the leader could not be held");
+            return;
+        }
         bool const fresh = !_regroupWaiting;
         _regroupWaiting = true;
         _regroupWanted = true;
         _regroupLeader = leaderName;
         _regroupWaitingFor = verdict.waitingFor;
-        // RE-ASSERTED EVERY POLL, exactly as the staging hold is. The register
-        // stops this module's own hand-back sites and it stops nothing else, so
-        // a strategy the hold took can be put back by anything running on its
-        // own cycle; re-asserting is what takes it off again. The deadline is
-        // not pushed out by doing so.
-        HoldForTheFamily(leader, leaderName);
-
+        // RE-ASSERTED EVERY POLL, which is what the call above is on the polls
+        // after the first. The register stops this module's own hand-back sites
+        // and it stops nothing else, so a strategy the hold took can be put
+        // back by anything running on its own cycle; re-asserting is what takes
+        // it off again, and the deadline is not pushed out by doing so.
         if (!fresh)
             return;
         LOG_WARN("module.overseer",
