@@ -10028,6 +10028,235 @@ char const* TownTripProofWord(TownTripProof proof);
 // about every roster member, and "we could not look" is not a way of meeting it.
 bool TownTripMemberAccepted(TownNeed const& after);
 
+
+// -------------------------------------------------------------- cast (#408) --
+//
+// WHAT A kind='cast' ROW MAY SAY, AND WHY THIS VERB HAD TO EXIST.
+//
+//     <spell id>                 cast it on the caster itself
+//     <spell id> on:self         the same thing, said out loud
+//     <spell id> on:<name>       cast it at a named character
+//
+// THE HOLE THIS FILLS. Nothing in this module could make a character cast a
+// spell. `kind='bot'` looked like it could and never was: it is the queue's
+// fall-through, it ends in PlayerbotAI::HandleCommand, and every row of that
+// kind this realm has ever carried is a strategy toggle. A row reading
+// `cast 10059` went through that path, was accepted, cast nothing, and was
+// answered `delivered`. That is the exact failure AGENTS.md has a paragraph
+// about, arriving through the one verb that had no post-condition to read.
+//
+// WHY IT MATTERS MORE THAN ITS SIZE. #395 enumerated every mechanic in the
+// pinned build that moves a character from map 1 to map 0 and found that this
+// roster has none: no areatrigger on map 1 targets map 0, no flightPath link
+// crosses, the ship is out by standing rule, and the cheapest summon in the
+// data needs two grouped bodies on the far side when only one character can
+// self-cross. Its own recommendation was the party's mage learning Portal:
+// Stormwind, whose object is party only and therefore carries everybody in one
+// cast. The levels have since been earned and the spell is known. The cast was
+// the only missing piece.
+//
+// NO SPELL NAMES, DELIBERATELY. A spell name is a localisation, it does not say
+// which rank, and upstream's own conjure branch matches on one - which is the
+// thing the conjure migration already argues against. An id is what the core
+// indexes and what a row can be checked against afterwards.
+//
+// Column re-use, no new columns:
+//   target_name  the character that will cast
+//   command      the grammar above
+//   target_arg   unused
+//   detail       short refusal literal, or empty
+//   result       JSON: outcome (casting|made|moved|spent|nothing|refused|
+//                unreadable), reason, retry (never|elsewhere|later - see
+//                CastRefusalRetry), character, spell, target, cast_ms,
+//                window_ms, waited_ms, the object the spell made if it made
+//                one, the reagent and power deltas, from and now, request
+//   status       'verifying' from the moment the packet goes out, then
+//                'applied', 'unchanged' or 'error'. NEVER 'delivered'.
+enum class CastTargetKind
+{
+    Self,   // no target block on the packet; the spell's own targeting decides
+    Named,  // an explicit unit target, which the executor resolves by name
+};
+
+struct CastRequest
+{
+    bool ok{false};
+    uint32_t spellId{0};
+    CastTargetKind target{CastTargetKind::Self};
+    std::string targetName;  // empty unless target is Named
+    // THE REFUSAL LITERAL WHEN ok IS FALSE, and a pointer into the table below
+    // rather than a copy of it. The executor puts this straight into the row's
+    // `detail`, where the retry table keys on it, so a parser sentence that was
+    // a std::string would either have to be re-matched against the constants or
+    // would arrive as an unkeyed literal answering `later` for a row that can
+    // never succeed. Empty when ok is true.
+    char const* error{""};
+};
+
+// Whitespace-tolerant, otherwise literal. The first word is the spell id and
+// must be digits; an optional second word is `on:self` or `on:<name>`. Anything
+// else is refused with a sentence that says what the grammar is, because a
+// parser that shrugs is the thing this verb was built to stop doing.
+CastRequest ParseCastRequest(std::string const& command);
+
+// THE FOUR THINGS A CAST ROW CAN HONESTLY CLAIM, and they are ordered by how
+// specific the reading behind them is.
+enum class CastOutcome
+{
+    // Nothing about this cast could be read back: the caster left the world, or
+    // the spell makes no object, moves nobody, costs nothing and has no
+    // cooldown, so no reading taken afterwards could tell a cast from a
+    // refusal. Says nothing about whether anything happened and must never be
+    // reported as any of the three below.
+    Unreadable,
+    // The object the spell creates is standing there, owned by this caster and
+    // carrying this spell's id. The strongest reading available and the one the
+    // portal needs.
+    Made,
+    // The caster's map changed, or it is more than a pace from where it stood.
+    // What a self-teleport looks like from here.
+    Moved,
+    // Neither of those applies to this spell, but the cast visibly cost
+    // something: a reagent left the bags, power was spent, or the spell's own
+    // cooldown is now running. All three only happen on a cast that completed,
+    // so this is evidence and not an assumption.
+    Spent,
+    // A post-condition was readable and it does not hold. THE FAILURE THIS VERB
+    // EXISTS TO MAKE VISIBLE: an interrupt, a refusal reported to a client that
+    // is not there, or a cast that never started. From the queue all three look
+    // identical and not one of them is `applied`.
+    Nothing,
+};
+
+// "unreadable", "made", "moved", "spent", "nothing". Here rather than in the
+// executor so the word a test pins is the word a row carries.
+char const* CastOutcomeWord(CastOutcome outcome);
+
+// EVERYTHING THE EXECUTOR MEASURED, HANDED OVER AS FACTS. The `...Expected`
+// flags come from the spell's own effects read at runtime, never from a list
+// this file writes down: a spell that creates an object carries
+// SPELL_EFFECT_TRANS_DOOR, and the core's own EffectTransmitted stamps the
+// created object with the caster's guid and the spell's id, so the object half
+// of this is exact rather than a guess about entries.
+struct CastReadBack
+{
+    bool casterReadable{true};   // the caster could be found when the window closed
+    bool objectExpected{false};  // the spell creates a game object
+    bool objectFound{false};     // ...and one owned by this caster is standing there
+    bool teleportExpected{false};  // the spell moves the caster
+    bool placeChanged{false};      // ...and the caster is not where it was
+    bool costExpected{false};      // the spell takes a reagent, power, or a cooldown
+    bool costPaid{false};          // ...and at least one of those was actually taken
+};
+
+// WHICH CLAIM THE READINGS SUPPORT. Ordered most specific first, so a portal
+// spell that also costs a reagent is judged on the object it was asked to make
+// and not on the reagent it happened to spend. The reagent is still reported;
+// it is simply not what the row is about.
+CastOutcome JudgeCast(CastReadBack const& read);
+
+// DID THE CASTER GO ANYWHERE. A different map is a move whatever the
+// coordinates say, which is not pedantry here: this family is split across two
+// continents that share a coordinate space, and a comparison that forgot the
+// map would call a crossing a failure. Within one map it is a three dimensional
+// distance against a tolerance, because a bot with a drive of its own drifts a
+// pace or two between the cast and the verdict and that is not a teleport.
+bool CastPlaceChanged(HomeBind const& from, HomeBind const& now, float movedYards);
+
+// HOW LONG TO WAIT BEFORE JUDGING. Same argument as HearthVerifyWindowMs, plus
+// a ceiling that verb does not need. `castMs` is SpellInfo's own, read at
+// runtime; `marginMs` is what the world needs after the cast ends, because the
+// effect lands on a later tick and this module only looks every
+// COMMAND_POLL_MS; `floorMs` answers a cast time that reads as zero, which
+// would otherwise produce a window that judges instantly and therefore always
+// answers `nothing`.
+//
+// AND THE CEILING IS THE HOLD, WHICH IS THE PART WORTH READING TWICE. This verb
+// stops the character for the length of the cast, and the hold register's own
+// ceiling is wall clock while this window is accumulated poll time. A window
+// allowed to exceed the hold would have the expiry sweep hand the character
+// back mid-cast and leave the row judging a caster nothing was holding. So the
+// caller passes a ceiling strictly below CAST_HOLD_CEILING_SECONDS and this
+// saturates into it. The ceiling wins over the floor when a caller passes a
+// nonsensical pair, because a hold that outlives its ceiling is the worse bug.
+uint32_t CastVerifyWindowMs(uint32_t castMs, uint32_t marginMs, uint32_t floorMs,
+                            uint32_t ceilingMs);
+
+// THE REFUSAL LITERALS. They go straight into an UPDATE, so none may carry a
+// quote character - the rule every executor in this file keeps. They are worded
+// as refusals taken BEFORE anything was sent, and are deliberately distinct
+// from the CastWall sentences above, which are readings taken AFTER a packet
+// went out and describe a cast that was driven and came to nothing. A row that
+// says `character is moving` sent nothing; one that says `the character was
+// moving when the cast was driven` sent the packet and watched it die.
+namespace CastRefusal
+{
+constexpr char const* NoSession = "character has no session";
+constexpr char const* NotInWorld = "character is not in the world";
+// The teleport half of a portal, and the reason this is not merely tidiness:
+// without a bot AI there is nothing in the world to answer
+// MSG_MOVE_WORLDPORT_ACK, and the hold below is a strategy change that needs an
+// engine to change. Costs this family nothing; every character it steers is a
+// bot.
+constexpr char const* NoBotAI = "character has no bot AI to acknowledge the cast";
+// HandleCastSpellOpcode's first branch, and it returns with no feedback of any
+// kind (SpellHandler.cpp:394). Asked here so a mind-controlled character gets a
+// reason rather than a window and a `nothing`.
+constexpr char const* NotOwnMover = "character is not its own mover";
+constexpr char const* Dead = "character is dead";
+constexpr char const* InFlight = "character is in flight";
+constexpr char const* InCombat = "character is in combat";
+constexpr char const* Stunned = "character is stunned";
+constexpr char const* LoggingOut = "character is logging out";
+constexpr char const* Trading = "character is in a trade";
+constexpr char const* OnTransport = "character is on a transport";
+constexpr char const* AlreadyCasting = "character is already casting";
+// Spell::prepare refuses a moving caster outright when the spell has a cast
+// time (Spell.cpp:3560) and Spell::update cancels one the moment the caster
+// moves (Spell.cpp:4410). Refused rather than driven, and the executor places
+// the hold on its way out so the next ask finds a character standing.
+constexpr char const* Moving = "character is moving";
+constexpr char const* UnknownSpell = "the core does not know that spell";
+// HandleCastSpellOpcode returns silently for a spell the player does not have
+// in its spellbook (SpellHandler.cpp:444). Named here, because a silent return
+// is exactly what this whole verb exists to stop producing.
+constexpr char const* NotLearned = "the character has not learned that spell";
+constexpr char const* Passive = "that spell is passive and cannot be cast";
+constexpr char const* OnCooldown = "the spell is on cooldown";
+// Spell::CheckCast:5711 returns SPELL_FAILED_NOT_READY on this and
+// Player::HasSpellCooldown cannot see it. The conjure gate has asked it since
+// #330; a pre-flight refusal had never been given the question.
+constexpr char const* OnGlobalCooldown = "the global cooldown is still running";
+constexpr char const* NotEnoughPower = "the character has too little mana for that spell";
+// The one that would otherwise cost a portal. Portal: Stormwind takes a Rune of
+// Portals, and a caster without one reaches CheckCast, is refused with
+// SPELL_FAILED_REAGENTS, and is told about it through a client a bot does not
+// have.
+constexpr char const* MissingReagent = "the character is missing a reagent for that spell";
+constexpr char const* NoSuchTarget = "no character of that name is in the world";
+constexpr char const* TargetOtherMap = "the target is on another map";
+constexpr char const* TargetDead = "the target is dead";
+constexpr char const* TargetOutOfRange = "the target is out of range for that spell";
+// ONE CAST ROW PER CHARACTER AT A TIME, and it is about the hold rather than
+// about the spell. Two rows would both hold the same character and the first to
+// finish would release it under the second, which then spends its window
+// watching a character walk away. Refused as `later`, which it is: the running
+// row ends inside its own window.
+constexpr char const* AlreadyRunning = "a cast row is already running for that character";
+// The parser's own sentences. They are refusals like any other and go into the
+// same column, so they live in the same table.
+constexpr char const* NoSpellId = "a cast row must begin with a spell id";
+constexpr char const* NotANumber = "the first word of a cast row must be a spell id and not a name";
+constexpr char const* SpellIdTooBig = "that spell id is too large to be a spell id";
+constexpr char const* BadTarget = "a cast row takes a spell id and an optional on:self or on:name";
+constexpr char const* BadTargetName = "a character name is letters only";
+}  // namespace CastRefusal
+
+// Keyed on the `detail` literal the executor returns, grouped by what would have
+// to change for the same row to succeed. Unknown is `Later`, the same call the
+// bind, sell, repair and hearth tables make: a refusal this table has never
+// heard of is more likely a new transient than a new permanent.
+TownRetry CastRefusalRetry(std::string const& detail);
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

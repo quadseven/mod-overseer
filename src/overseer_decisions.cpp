@@ -7799,4 +7799,232 @@ bool TownTripMemberAccepted(TownNeed const& after)
     return after.present && after.damagedItems == 0;
 }
 
+
+// -------------------------------------------------------------- cast (#408) --
+
+namespace
+{
+// Digits only, saturating rather than wrapping, and it refuses a run of digits
+// long enough to be somebody's mistake instead of quietly becoming a small
+// number. `ok` is false on anything that is not a non-empty run of digits.
+bool ReadSpellId(std::string const& word, uint32_t& out)
+{
+    out = 0;
+    if (word.empty() || word.size() > 9)
+        return false;
+    uint32_t value = 0;
+    for (char const c : word)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        value = value * 10 + uint32_t(c - '0');
+    }
+    out = value;
+    return true;
+}
+
+// Server-enforced: a character name is letters. Asked here so a row that names
+// a target this module could never find is refused with a sentence rather than
+// with `no character of that name is in the world`, which would send a reader
+// looking for a character that was never asked for.
+bool LooksLikeACharacterName(std::string const& name)
+{
+    if (name.empty() || name.size() > 12)
+        return false;
+    for (char const c : name)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+            return false;
+    return true;
+}
+}  // namespace
+
+CastRequest ParseCastRequest(std::string const& command)
+{
+    CastRequest request;
+
+    std::vector<std::string> words;
+    std::string::size_type at = 0;
+    while (at < command.size())
+    {
+        std::string::size_type const start = command.find_first_not_of(" \t", at);
+        if (start == std::string::npos)
+            break;
+        std::string::size_type const end = command.find_first_of(" \t", start);
+        words.push_back(command.substr(
+            start, end == std::string::npos ? std::string::npos : end - start));
+        at = (end == std::string::npos) ? command.size() : end;
+    }
+
+    if (words.empty())
+    {
+        request.error = CastRefusal::NoSpellId;
+        return request;
+    }
+    if (words.size() > 2)
+    {
+        request.error = CastRefusal::BadTarget;
+        return request;
+    }
+
+    if (!ReadSpellId(words[0], request.spellId))
+    {
+        // TWO DIFFERENT MISTAKES AND THEY ARE NAMED APART. A word that is all
+        // digits and too long is somebody who pasted the wrong column; a word
+        // that is not digits at all is somebody who typed a spell name, which
+        // is the mistake this verb expects and has an opinion about.
+        bool allDigits = !words[0].empty();
+        for (char const c : words[0])
+            if (c < '0' || c > '9')
+                allDigits = false;
+        request.error = allDigits ? CastRefusal::SpellIdTooBig : CastRefusal::NotANumber;
+        return request;
+    }
+    if (request.spellId == 0)
+    {
+        // Zero is a legal run of digits and is not a spell. Named as the same
+        // mistake as a name rather than as its own sentence, because what the
+        // sender has to do about it is identical.
+        request.error = CastRefusal::NotANumber;
+        return request;
+    }
+
+    if (words.size() == 2)
+    {
+        std::string const& second = words[1];
+        std::string const prefix = "on:";
+        if (second.size() <= prefix.size() || second.compare(0, prefix.size(), prefix) != 0)
+        {
+            request.error = CastRefusal::BadTarget;
+            return request;
+        }
+        std::string const who = second.substr(prefix.size());
+
+        // `on:self` is the bare form said out loud, and it is worth having: a
+        // sender that always writes a target does not have to special-case the
+        // one row that has none.
+        std::string lowered = who;
+        for (char& c : lowered)
+            if (c >= 'A' && c <= 'Z')
+                c = char(c - 'A' + 'a');
+        if (lowered == "self")
+        {
+            request.target = CastTargetKind::Self;
+            request.ok = true;
+            return request;
+        }
+
+        if (!LooksLikeACharacterName(who))
+        {
+            request.error = CastRefusal::BadTargetName;
+            return request;
+        }
+        request.target = CastTargetKind::Named;
+        request.targetName = who;
+    }
+
+    request.ok = true;
+    return request;
+}
+
+char const* CastOutcomeWord(CastOutcome outcome)
+{
+    switch (outcome)
+    {
+        case CastOutcome::Made:
+            return "made";
+        case CastOutcome::Moved:
+            return "moved";
+        case CastOutcome::Spent:
+            return "spent";
+        case CastOutcome::Nothing:
+            return "nothing";
+        case CastOutcome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
+CastOutcome JudgeCast(CastReadBack const& read)
+{
+    // A CASTER THAT CANNOT BE READ ANSWERS NOTHING ELSE. Every reading below is
+    // about a character that has to be there to be measured, so this is not a
+    // guard in front of the rule; it is the first branch of it.
+    if (!read.casterReadable)
+        return CastOutcome::Unreadable;
+
+    // MOST SPECIFIC FIRST. The object is what a portal row asked for, so a
+    // portal that also spent a reagent is judged on the object. Anything else
+    // would let a row report `spent` about a cast whose whole purpose failed.
+    if (read.objectExpected)
+        return read.objectFound ? CastOutcome::Made : CastOutcome::Nothing;
+
+    if (read.teleportExpected)
+        return read.placeChanged ? CastOutcome::Moved : CastOutcome::Nothing;
+
+    if (read.costExpected)
+        return read.costPaid ? CastOutcome::Spent : CastOutcome::Nothing;
+
+    // NO OBJECT, NO TELEPORT, NO COST AND NO COOLDOWN. There is no reading this
+    // module can take that separates a cast that worked from one that never
+    // started, and saying so is the only honest answer available. It is
+    // deliberately NOT `nothing`, which is a claim about the world.
+    return CastOutcome::Unreadable;
+}
+
+bool CastPlaceChanged(HomeBind const& from, HomeBind const& now, float movedYards)
+{
+    if (!from.known || !now.known)
+        return false;
+    if (from.mapId != now.mapId)
+        return true;
+    float const dx = now.x - from.x;
+    float const dy = now.y - from.y;
+    float const dz = now.z - from.z;
+    return (dx * dx + dy * dy + dz * dz) > (movedYards * movedYards);
+}
+
+uint32_t CastVerifyWindowMs(uint32_t castMs, uint32_t marginMs, uint32_t floorMs,
+                            uint32_t ceilingMs)
+{
+    uint32_t window = castMs + marginMs;
+    // Saturating, not wrapping. A nonsense cast time out of the DBC must not
+    // become a short window by overflowing, which would judge instantly and
+    // therefore always answer `nothing`.
+    if (window < castMs)
+        window = 0xFFFFFFFFu;
+    if (window < floorMs)
+        window = floorMs;
+    // THE CEILING WINS, INCLUDING OVER THE FLOOR. See the header: a window
+    // longer than the hold that covers it is the worse of the two bugs, because
+    // it ends with the expiry sweep handing the character back mid-cast.
+    if (window > ceilingMs)
+        window = ceilingMs;
+    return window;
+}
+
+TownRetry CastRefusalRetry(std::string const& detail)
+{
+    // NEVER. The spell, the character's spellbook, or the row itself is the
+    // wall, and no amount of waiting or walking changes any of them.
+    if (detail == CastRefusal::UnknownSpell || detail == CastRefusal::NotLearned
+        || detail == CastRefusal::Passive || detail == CastRefusal::NoBotAI
+        || detail == CastRefusal::NoSpellId || detail == CastRefusal::NotANumber
+        || detail == CastRefusal::SpellIdTooBig || detail == CastRefusal::BadTarget
+        || detail == CastRefusal::BadTargetName)
+        return TownRetry::Never;
+
+    // ELSEWHERE. Being somewhere else, or having been somewhere else, is what
+    // answers these. The reagent is here rather than under `later` on purpose:
+    // nothing about standing still produces a Rune of Portals, and the thing
+    // that does is a trip to a vendor, which is exactly what this class means
+    // everywhere else in this file.
+    if (detail == CastRefusal::TargetOutOfRange || detail == CastRefusal::TargetOtherMap
+        || detail == CastRefusal::MissingReagent)
+        return TownRetry::Elsewhere;
+
+    // LATER, and everything this table has never heard of. The character's own
+    // state is the wall: it is moving, fighting, dead, drinking a cooldown down
+    // or already running a row, and all of those end by themselves.
+    return TownRetry::Later;
+}
 }  // namespace OverseerDecisions

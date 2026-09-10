@@ -6217,7 +6217,7 @@ private:
     //
     // A STAGING HOLD IS DELIBERATELY NOT ASKED ABOUT HERE (#346), and that is
     // the difference between a ceiling that bounds a race and one that bounds a
-    // forgotten hold. The three rows below can outlive their own ceiling under
+    // forgotten hold. The four kinds of row below can outlive their own ceiling under
     // poll jitter, because a row's window is accumulated poll time and a hold's
     // deadline is wall clock. A staging hold cannot: its ceiling is the run's
     // own staging backstop and its clock starts strictly later, so the run
@@ -6230,6 +6230,9 @@ private:
             if (check.targetName == name)
                 return true;
         for (HearthCheck const& check : _pendingHearths)
+            if (check.targetName == name)
+                return true;
+        for (CastCheck const& check : _pendingCasts)
             if (check.targetName == name)
                 return true;
         for (SummonCheck const& check : _pendingSummons)
@@ -28334,13 +28337,19 @@ private:
         // and the teleport that follows crosses a map (#313).
         ResolveSummonChecks(sincePollMs);
 
-        // ...and the conjures, which wait longest of all four and are the only
+        // ...and the conjures, which wait longest of all five and are the only
         // ones this poll also DRIVES: a stack is ten three second casts and no
         // single call can wait that out (#147).
         ResolveConjureChecks(sincePollMs);
 
+        // ...and the casts, which wait out one cast time each and then read
+        // the world for the thing the spell was supposed to do (#408). After
+        // the conjures for no deeper reason than that a poll should end the
+        // rows it can before it hands out new work.
+        ResolveCastChecks(sincePollMs);
+
         // Then end any cast hold that outlived the row that placed it (#335).
-        // AFTER the four above, so a hold a resolver is about to release itself
+        // AFTER the five above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
         // this only ever picks up the ones nothing came back for.
         ReleaseExpiredHolds();
@@ -28426,14 +28435,14 @@ private:
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
             // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth',
-            // 'summon', 'conjure' and 'mail' do not go through
+            // 'summon', 'conjure', 'cast' and 'mail' do not go through
             // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
                 && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
                 && kind != "bank" && kind != "auction" && kind != "bind"
-                && kind != "hearth" && kind != "conjure"
+                && kind != "hearth" && kind != "conjure" && kind != "cast"
                 && kind != "summon"
                 && kind != "mail")
             {
@@ -28564,6 +28573,8 @@ private:
                                   _pendingSummons, id);
             else if (kind == "conjure")
                 detail = DoConjure(player, command, status, rowResult, _pendingConjures, id);
+            else if (kind == "cast")
+                detail = DoCast(player, command, status, rowResult, _pendingCasts, id);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -34230,6 +34241,850 @@ private:
         _pendingHearths.swap(stillCasting);
     }
 
+
+    // ---------------------------------------------------------------- cast --
+    //
+    // Make a character cast a spell it already knows, through the game's own
+    // handler, and read the world back to find out whether anything happened
+    // (#408).
+    //
+    // WHY THIS EXISTS. Nothing in this module could cast. `kind='bot'` looked
+    // like it could and never was: it is the queue's fall-through into
+    // PlayerbotAI::HandleCommand, every row of that kind this realm has ever
+    // carried is a strategy toggle (`nc +follow`, `co +flee`, `nc -mount`), and
+    // a row reading `cast 10059` was accepted, cast nothing, and was answered
+    // `delivered`. ParseStrategyChange above returns false for any first word
+    // that is not `nc` or `co`, so there was no post-condition to read and the
+    // row claimed delivery of something that never happened. That is precisely
+    // the failure AGENTS.md has a paragraph about, arriving through the one
+    // verb with nothing to read back.
+    //
+    // WHY IT IS THE PIECE THAT MATTERS. #395 enumerated every mechanic in the
+    // pinned build that moves a character from map 1 to map 0 and found this
+    // roster has none: no areatrigger on map 1 targets map 0, no flightPath
+    // link crosses, the ship is out by standing rule, and the cheapest summon
+    // in the data needs two grouped bodies on the far side when only one
+    // character can self-cross. The recommendation was the party's mage
+    // learning Portal: Stormwind, whose object is party only and therefore
+    // carries the whole roster in one cast. The levels are earned and the spell
+    // is known. The cast was the last missing piece.
+    //
+    // WHY THE PACKET AND NOT A CALL. Driven into
+    // WorldSession::HandleCastSpellOpcode the same way `hearth` drives
+    // CMSG_USE_ITEM, and for a stronger reason than symmetry. The handler ends
+    // in Spell::prepare (SpellHandler.cpp:548), so Spell::CheckCast runs in
+    // full: the reagent, the power, the range, the mount, the movement and the
+    // cooldown are the CORE's answers, and Spell::TakeReagents is what removes
+    // the Rune of Portals. Nothing here imitates any of that, and nothing here
+    // can cast a spell a character has not got.
+    //
+    // NOT PlayerbotAI::CastSpell, WHICH IS WHAT `conjure` USES. That verb has a
+    // specific reason written down in its own migration: upstream's
+    // CastConjureFoodAction ends in the same call, so a row and the bot's own
+    // trigger exercise one cast path rather than two that can drift apart.
+    // There is no upstream action for an arbitrary spell id, so the argument
+    // does not transfer, and the handler is both the more honest target and the
+    // one that runs the spellbook check.
+
+    // WHAT ONE CAST NEEDS BEYOND ITS OWN CAST TIME: the tick the effect lands
+    // on and the poll that notices it. The same shape of number
+    // HEARTH_MARGIN_MS is, and for the same reason.
+    static constexpr uint32 CAST_MARGIN_MS = 5000;
+
+    // A cast time that reads as zero must not produce a window that judges
+    // instantly, because an instant judgement always answers `nothing`.
+    static constexpr uint32 CAST_FLOOR_MS = 8000;
+
+    // AND THE LONGEST A ROW MAY RUN, WHICH IS SET BY THE HOLD AND NOT BY THE
+    // SPELL. CAST_HOLD_CEILING_SECONDS is 45 seconds of wall clock from the
+    // moment a hold is placed; this window is accumulated poll time. A window
+    // allowed to reach the ceiling would, under any poll jitter, have
+    // ReleaseExpiredHolds hand the character back mid-cast and leave this row
+    // judging a caster nothing was holding. Forty seconds is four times the
+    // longest cast this family has any use for.
+    static constexpr uint32 CAST_WINDOW_CEILING_MS = 40000;
+
+    // Drift, not a teleport. A bot with a drive of its own takes a step or two
+    // between the cast and the verdict; the same number HEARTH_MOVED_YARDS is.
+    static constexpr float CAST_MOVED_YARDS = 10.f;
+
+    // How far to look for the object a spell made. Spell::EffectTransmitted
+    // places it within the spell's own range of the caster, which for a portal
+    // is a few yards; this is the same sweep SUMMON_SWEEP_YARDS uses and is
+    // wide enough that a caster which drifted a pace still finds its own
+    // portal.
+    static constexpr float CAST_OBJECT_SWEEP_YARDS = 40.f;
+
+    // THE OBJECT THIS CAST MADE, MATCHED ON THE TWO THINGS THE CORE STAMPS ON
+    // IT. Spell::EffectTransmitted calls SetOwnerGUID(caster) at
+    // SpellEffects.cpp:5489 and SetSpellId(spell) at :5491, so this is exact
+    // and needs no hardcoded entry anywhere in this module. Matching on the
+    // entry alone would hand one caster another caster's portal when two mages
+    // cast at the same stone in the same minute; matching on the owner alone
+    // would pick up a fishing bobber.
+    struct CastMadeObjectCheck
+    {
+        uint32 spellId;
+        ObjectGuid owner;
+        bool operator()(GameObject* go) const
+        {
+            return go->GetSpellId() == spellId && go->GetOwnerGUID() == owner;
+        }
+    };
+
+    static GameObject* FindObjectThisCastMade(Player* caster, uint32 spellId)
+    {
+        if (!caster || !spellId)
+            return nullptr;
+        std::list<GameObject*> made;
+        CastMadeObjectCheck check{spellId, caster->GetGUID()};
+        Acore::GameObjectListSearcher<CastMadeObjectCheck> searcher(caster, made, check);
+        Cell::VisitObjects(caster, searcher, CAST_OBJECT_SWEEP_YARDS);
+        return made.empty() ? nullptr : made.front();
+    }
+
+    // WHAT A CAST ROW KNOWS, IN ONE PLACE, so every exit writes the same shape
+    // and a row that ends says what it was judged on. Numbers that were never
+    // taken stay negative, because 0 is a real reading.
+    struct CastEvidence
+    {
+        std::string character;
+        std::string request;
+        uint32 spellId{0};
+        std::string targetName;  // empty means the caster itself
+        uint32 castMs{0};
+        uint32 windowMs{0};
+        uint32 waitedMs{0};
+
+        // WHAT THIS SPELL IS EXPECTED TO DO, read off SpellInfo at runtime and
+        // never written down in this module. These are what decide which
+        // post-condition the verdict is taken on.
+        bool objectExpected{false};
+        uint32 objectEntryWanted{0};  // the effect's MiscValue, for the log
+        bool teleportExpected{false};
+        bool costExpected{false};
+
+        // ...AND WHAT WAS FOUND. The object block is reported in full because
+        // an operator driving the clicks by hand needs every field of it: the
+        // guid to name it, the type and its spellcaster spell to know it is
+        // clickable, and the position to walk to.
+        int32 objectFound{-1};  // -1 never asked, 0 no, 1 yes
+        uint32 objectEntry{0};
+        uint32 objectType{0};
+        uint32 objectGuid{0};
+        uint32 objectCastsSpell{0};
+        int32 objectPartyOnly{-1};
+        OverseerDecisions::HomeBind objectAt;
+
+        // THE COST, WHICH IS THE POST-CONDITION FOR EVERY SPELL THAT NEITHER
+        // MAKES AN OBJECT NOR MOVES ANYBODY, and is worth reporting even when
+        // it is not what the verdict was taken on: one Rune of Portals fewer is
+        // the acceptance criterion this verb was asked for.
+        uint32 reagentEntry{0};
+        int32 reagentBefore{-1};
+        int32 reagentAfter{-1};
+        int32 powerBefore{-1};
+        int32 powerAfter{-1};
+        int32 cooldownAtVerdict{-1};
+
+        int32 castingAfterCall{-1};  // -1 never asked, 0 no, 1 yes
+        int32 queuedAfterCall{-1};   // ...and whether the core parked it instead
+        char const* castBlocker{""}; // why the cast did not start, when it did not
+
+        CastHoldReport hold;
+        OverseerDecisions::HomeBind from;
+        OverseerDecisions::HomeBind now;
+        OverseerDecisions::CastOutcome verdict{OverseerDecisions::CastOutcome::Unreadable};
+    };
+
+    // A cast waiting out its own cast time. Held on the world thread beside
+    // _pendingHearths and bounded the same way.
+    struct CastCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        CastEvidence ev;
+    };
+
+    // CASTS WAITING OUT THEIR OWN CAST. World thread only, exactly like
+    // _pendingHearths and for the same reason, and bounded the same way: at
+    // most COMMANDS_PER_POLL are added per poll and every one is resolved
+    // within its own window. Declared here rather than beside _pendingChecks
+    // because a member's TYPE has to be complete where the member is declared.
+    std::vector<CastCheck> _pendingCasts;
+
+    static void CastPlace(std::ostringstream& o, OverseerDecisions::HomeBind const& p)
+    {
+        if (!p.known)
+        {
+            o << "null";
+            return;
+        }
+        o << "{\"map\":" << p.mapId << ",\"area\":" << p.areaId << ",\"x\":" << p.x
+          << ",\"y\":" << p.y << ",\"z\":" << p.z << "}";
+    }
+
+    // ONE SHAPE FOR EVERY EXIT, refusals and verdicts alike, and written by all
+    // of them. A row that ends without saying what it was judged on is the
+    // thing this whole verb exists to stop producing.
+    static std::string CastJson(CastEvidence const& ev, char const* outcome,
+                                char const* reason)
+    {
+        using OverseerDecisions::CastOutcomeWord;
+        using OverseerDecisions::CastRefusalRetry;
+        using OverseerDecisions::TownRetryWord;
+
+        auto tri = [](std::ostringstream& out, int32 value)
+        {
+            if (value < 0)
+                out << "null";
+            else
+                out << (value ? "true" : "false");
+        };
+        auto num = [](std::ostringstream& out, int32 value)
+        {
+            if (value < 0)
+                out << "null";
+            else
+                out << value;
+        };
+
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(*reason ? TownRetryWord(CastRefusalRetry(reason)) : "")
+          << ",\"character\":" << J(ev.character)
+          << ",\"verdict\":" << J(CastOutcomeWord(ev.verdict))
+          << ",\"spell\":" << ev.spellId
+          << ",\"target\":" << J(ev.targetName)
+          << ",\"cast_ms\":" << ev.castMs
+          << ",\"window_ms\":" << ev.windowMs
+          << ",\"waited_ms\":" << ev.waitedMs
+          << ",\"object_expected\":" << (ev.objectExpected ? "true" : "false")
+          << ",\"object_entry_wanted\":" << ev.objectEntryWanted
+          << ",\"teleport_expected\":" << (ev.teleportExpected ? "true" : "false")
+          << ",\"cost_expected\":" << (ev.costExpected ? "true" : "false");
+        o << ",\"object\":";
+        if (ev.objectFound > 0)
+        {
+            o << "{\"guid\":" << ev.objectGuid << ",\"entry\":" << ev.objectEntry
+              << ",\"type\":" << ev.objectType << ",\"casts_spell\":" << ev.objectCastsSpell
+              << ",\"party_only\":";
+            tri(o, ev.objectPartyOnly);
+            o << ",\"at\":";
+            CastPlace(o, ev.objectAt);
+            o << "}";
+        }
+        else
+            o << "null";
+        o << ",\"object_found\":";
+        tri(o, ev.objectFound);
+        o << ",\"reagent\":" << ev.reagentEntry
+          << ",\"reagent_before\":";
+        num(o, ev.reagentBefore);
+        o << ",\"reagent_after\":";
+        num(o, ev.reagentAfter);
+        o << ",\"power_before\":";
+        num(o, ev.powerBefore);
+        o << ",\"power_after\":";
+        num(o, ev.powerAfter);
+        o << ",\"cooldown_at_verdict\":";
+        tri(o, ev.cooldownAtVerdict);
+        o << ",\"casting_after_call\":";
+        tri(o, ev.castingAfterCall);
+        o << ",\"queued_after_call\":";
+        tri(o, ev.queuedAfterCall);
+        o << ",\"cast_blocker\":" << J(ev.castBlocker)
+          << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
+          << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
+          << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
+          << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
+          << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
+          << ",\"hold_dismounted_it\":" << (ev.hold.dismountedIt ? "true" : "false");
+        o << ",\"from\":";
+        CastPlace(o, ev.from);
+        o << ",\"now\":";
+        CastPlace(o, ev.now);
+        o << ",\"request\":" << J(ev.request) << "}";
+        return o.str();
+    }
+
+    // The first reagent this spell takes, and how many of it. Only the first is
+    // tracked: it is enough to answer "was a reagent consumed", which is what
+    // the verdict needs, and the whole list goes into no decision.
+    static void ReadFirstReagent(SpellInfo const* spell, uint32& entry, uint32& count)
+    {
+        entry = 0;
+        count = 0;
+        if (!spell)
+            return;
+        for (std::size_t i = 0; i < spell->Reagent.size(); ++i)
+        {
+            if (spell->Reagent[i] <= 0 || spell->ReagentCount[i] == 0)
+                continue;
+            entry = uint32(spell->Reagent[i]);
+            count = spell->ReagentCount[i];
+            return;
+        }
+    }
+
+    static char const* DoCast(Player* who, std::string const& command, char const*& status,
+                              std::string& out, std::vector<CastCheck>& parked, uint32 id)
+    {
+        using OverseerDecisions::CastOutcome;
+        using OverseerDecisions::CastRequest;
+        using OverseerDecisions::CastTargetKind;
+        using OverseerDecisions::CastVerifyWindowMs;
+        using OverseerDecisions::ParseCastRequest;
+        namespace Refusal = OverseerDecisions::CastRefusal;
+
+        CastEvidence ev;
+        ev.character = who->GetName();
+        ev.request = command;
+
+        // The refusal literals go straight into the UPDATE, so none may carry a
+        // quote character - the rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = CastJson(ev, "refused", reason);
+            return reason;
+        };
+
+        CastRequest const request = ParseCastRequest(command);
+        if (!request.ok)
+        {
+            // The parser's exact words are pinned in tests/test_cast.cpp, and
+            // they are pointers into the same refusal table every wall below
+            // uses, so the `detail` column gets a literal CastRefusalRetry keys
+            // on rather than an unrecognised sentence that would answer `later`
+            // for a row that can never succeed. That is also why the parse error
+            // is a `char const*` and not a std::string: it has to outlive this
+            // call.
+            out = CastJson(ev, "refused", request.error);
+            return request.error;
+        }
+        ev.spellId = request.spellId;
+        ev.targetName = request.targetName;
+
+        // ONE CAST ROW PER CHARACTER AT A TIME, and this one is about the hold
+        // rather than about the spell. Two rows would both hold the same
+        // character and the first to finish would release it under the second,
+        // which then spends its window watching a character walk away. Refused
+        // as `later`, which it is: the running row ends inside its own window.
+        for (CastCheck const& running : parked)
+            if (running.targetName == who->GetName())
+                return refuse(Refusal::AlreadyRunning);
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse(Refusal::NoSession);
+        if (!who->IsInWorld())
+            return refuse(Refusal::NotInWorld);
+
+        // THE REFUSAL THAT IS ABOUT THE TELEPORT AND NOT THE CAST, and the same
+        // one `hearth` makes. Without a bot AI there is nothing in the world to
+        // answer MSG_MOVE_WORLDPORT_ACK and a cross-map teleport would wedge the
+        // character mid-crossing; the hold below is also a strategy change,
+        // which needs an engine to change.
+        if (!GET_PLAYERBOT_AI(who))
+            return refuse(Refusal::NoBotAI);
+
+        // HandleCastSpellOpcode's first branch, and it returns with no feedback
+        // of any kind (SpellHandler.cpp:394).
+        if (who->m_mover != who)
+            return refuse(Refusal::NotOwnMover);
+
+        if (!who->IsAlive())
+            return refuse(Refusal::Dead);
+        if (who->IsInFlight())
+            return refuse(Refusal::InFlight);
+        if (who->IsInCombat())
+            return refuse(Refusal::InCombat);
+        if (who->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse(Refusal::Stunned);
+        if (session->isLogingOut())
+            return refuse(Refusal::LoggingOut);
+        if (who->GetTradeData())
+            return refuse(Refusal::Trading);
+        if (who->GetTransport())
+            return refuse(Refusal::OnTransport);
+        if (who->IsNonMeleeSpellCast(false))
+            return refuse(Refusal::AlreadyCasting);
+
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(ev.spellId);
+        if (!spell)
+            return refuse(Refusal::UnknownSpell);
+
+        // BOTH OF THESE ARE SILENT RETURNS IN THE HANDLER
+        // (SpellHandler.cpp:444), which is exactly the shape of failure this
+        // verb exists to stop producing. Asked here so the row names them.
+        if (spell->IsPassive())
+            return refuse(Refusal::Passive);
+        if (!who->HasActiveSpell(ev.spellId))
+            return refuse(Refusal::NotLearned);
+
+        if (who->HasSpellCooldown(ev.spellId))
+            return refuse(Refusal::OnCooldown);
+        // Spell::CheckCast:5711 returns SPELL_FAILED_NOT_READY on this and
+        // HasSpellCooldown above cannot see it.
+        if (who->GetGlobalCooldownMgr().HasGlobalCooldown(spell))
+            return refuse(Refusal::OnGlobalCooldown);
+
+        // WHAT IT COSTS, ASKED WITH THE CORE'S OWN ARITHMETIC, AND ONLY WHERE
+        // THE ANSWER IS READABLE. Mana is the one power this row can measure
+        // either side of a cast and have the difference mean something. Rage
+        // and energy move on their own between two polls - rage decays out of
+        // combat and energy ticks back up - so a delta in one of them is not
+        // evidence that a cast happened, and treating it as evidence would let
+        // a warrior's row claim `spent` for a cast that never went out. So a
+        // non-mana cost is NOT counted as a post-condition below, and a row for
+        // such a spell that also makes no object, moves nobody and has no
+        // reagent or cooldown honestly ends `unreadable`.
+        int32 const powerCost = spell->CalcPowerCost(who, spell->GetSchoolMask());
+        bool const powerIsReadable = powerCost > 0 && spell->PowerType == uint32(POWER_MANA);
+        if (powerIsReadable)
+        {
+            ev.powerBefore = int32(who->GetPower(POWER_MANA));
+            if (ev.powerBefore < powerCost)
+                return refuse(Refusal::NotEnoughPower);
+        }
+
+        // THE ONE THAT WOULD OTHERWISE COST A PORTAL. Spell::CheckCast refuses a
+        // caster without its reagent with SPELL_FAILED_REAGENTS and reports it
+        // to a client a bot has not got.
+        uint32 reagentCount = 0;
+        ReadFirstReagent(spell, ev.reagentEntry, reagentCount);
+        if (ev.reagentEntry)
+        {
+            ev.reagentBefore = int32(who->GetItemCount(ev.reagentEntry, false));
+            if (uint32(ev.reagentBefore) < reagentCount)
+                return refuse(Refusal::MissingReagent);
+        }
+
+        // ---- who is being cast at ---------------------------------------------
+        Player* target = who;
+        if (request.target == CastTargetKind::Named)
+        {
+            target = ObjectAccessor::FindPlayerByName(request.targetName, true);
+            if (!target)
+                return refuse(Refusal::NoSuchTarget);
+            if (target->GetMapId() != who->GetMapId())
+                return refuse(Refusal::TargetOtherMap);
+            if (!target->IsAlive())
+                return refuse(Refusal::TargetDead);
+            // Asked with the spell's own range rather than with a number this
+            // module chose. A self-cast skips it: the caster is always in range
+            // of itself and a spell with no range at all would otherwise refuse
+            // every row.
+            if (target != who
+                && !who->IsWithinDistInMap(target, spell->GetMaxRange(spell->IsPositive(), who)))
+                return refuse(Refusal::TargetOutOfRange);
+            ev.targetName = target->GetName();
+        }
+
+        // Spell::prepare answers a moving caster with SPELL_FAILED_MOVING when
+        // the spell has a cast time (Spell.cpp:3560) and Spell::update cancels
+        // one already preparing the moment the caster moves (Spell.cpp:4410).
+        //
+        // REFUSED, AND THE HOLD GOES ON ANYWAY, which is what `hearth` learned
+        // in #335. The row does not grow a settle loop of its own - #230 is the
+        // rule it keeps, a row that recycles in place holds the head of a FIFO -
+        // so the SENDER re-asks with a fresh row at the tail. What changes is
+        // that the re-ask arrives at a character that is standing, because the
+        // hold outlives this row by its own ceiling.
+        if (who->isMoving())
+        {
+            HoldStillAndReport(who, ev.character, "cast", ev.hold);
+            return refuse(Refusal::Moving);
+        }
+
+        // ---- what this spell is expected to DO, read off its own effects ------
+        //
+        // NOTHING HERE IS WRITTEN DOWN. A spell that creates a game object
+        // carries SPELL_EFFECT_TRANS_DOOR and names the object in that effect's
+        // MiscValue (SpellEffects.cpp:5384), and the core stamps the created
+        // object with the caster's guid and the spell's id, so the post-
+        // condition is exact and this module needs no entry constant. A spell
+        // that moves the caster carries SPELL_EFFECT_TELEPORT_UNITS. Everything
+        // else is judged on what the cast cost.
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            uint32 const effect = spell->Effects[i].Effect;
+            if (effect == SPELL_EFFECT_TRANS_DOOR)
+            {
+                ev.objectExpected = true;
+                // Reported for the log only; the sweep below matches on the
+                // spell id the core stamps on what it made, so a MiscValue that
+                // is nonsense costs a wrong number in one JSON field and
+                // nothing else.
+                if (!ev.objectEntryWanted && spell->Effects[i].MiscValue > 0)
+                    ev.objectEntryWanted = uint32(spell->Effects[i].MiscValue);
+            }
+            else if (effect == SPELL_EFFECT_TELEPORT_UNITS
+                     || effect == SPELL_EFFECT_TELEPORT_UNITS_FACE_CASTER)
+            {
+                // Only when the caster is the one being moved. A teleport aimed
+                // at somebody else moves a character this row is not watching,
+                // and reading the caster's position back would answer `nothing`
+                // about a cast that worked.
+                if (target == who)
+                    ev.teleportExpected = true;
+            }
+        }
+        ev.costExpected =
+            ev.reagentEntry != 0 || powerIsReadable || spell->GetRecoveryTime() > 0;
+
+        ev.from = ReadStandingPlace(who);
+        ev.castMs = spell->CalcCastTime(who);
+        ev.windowMs = CastVerifyWindowMs(ev.castMs, CAST_MARGIN_MS, CAST_FLOOR_MS,
+                                         CAST_WINDOW_CEILING_MS);
+        // `powerBefore` is DELIBERATELY LEFT UNREAD for a spell whose cost this
+        // row cannot measure, and that is what makes the pair mean something: a
+        // reading taken here and compared at the verdict would otherwise pick up
+        // ordinary mana regeneration and report it as a cast that paid for
+        // itself. A null in the JSON says the question was not asked, which is
+        // the truth, and the verdict then rests on the reagent or the cooldown.
+
+        // ---- hold it FOR the cast, in the same breath as the packet -----------
+        //
+        // The refusal above places a hold so the sender's next ask finds a
+        // character standing. This is the one that covers the cast itself, and
+        // it is placed here rather than at the top of the executor so the
+        // refusals in between - unknown spell, not learned, on cooldown - do not
+        // stop a character for 45 seconds over something standing still cannot
+        // fix. It also stands a sitting caster up and takes it off a mount,
+        // which are two more of the walls Spell::CheckCast refuses a bot for
+        // silently (Spell.cpp:6018).
+        //
+        // IT IS IN THE SAME BREATH AS THE PACKET, and that is load bearing
+        // rather than tidy: nothing else in this module runs between these two
+        // statements, so no poll, no sweep and no bot AI tick can put the
+        // character back on a mount before the core checks.
+        HoldStillAndReport(who, ev.character, "cast", ev.hold);
+
+        {
+            // CMSG_CAST_SPELL is castCount, spellId, castFlags, and then a
+            // target block (SpellHandler.cpp:384). Like the hearth, areatrigger
+            // and repair handlers it takes a raw WorldPacket, so there is no
+            // Read() to call - only the rpos(0) rewind, because the handler
+            // reads with >> from a packet this side has just written to.
+            //
+            // TARGET_FLAG_NONE ends the packet: SpellCastTargets::Read returns
+            // the moment it sees it (Spell.cpp:129), and the spell's own
+            // implicit targeting then picks the caster, which is what a portal
+            // and a self-teleport both want. A named target is one packed guid
+            // after TARGET_FLAG_UNIT, which is what the same Read expects
+            // (Spell.cpp:133).
+            //
+            // castFlags of 0 keeps HandleClientCastFlags a no-op, exactly as the
+            // hearth's CMSG_USE_ITEM does.
+            WorldPacket raw(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9);
+            raw << uint8(1);  // castCount
+            raw << uint32(ev.spellId);
+            raw << uint8(0);  // castFlags
+            if (target != who)
+            {
+                raw << uint32(TARGET_FLAG_UNIT);
+                raw << target->GetGUID().WriteAsPacked();
+            }
+            else
+                raw << uint32(TARGET_FLAG_NONE);
+            raw.rpos(0);
+            session->HandleCastSpellOpcode(raw);
+        }
+
+        // ---- believe nothing, and do not judge yet ---------------------------
+        //
+        // EVIDENCE, NOT A VERDICT, and the same reasoning DoHearth writes out at
+        // length. A cast in progress here is a good sign and not a success, and
+        // its absence is not a failure either: the handler may have parked the
+        // packet on Player::SpellQueue to replay on a later tick
+        // (SpellHandler.cpp:423). So both are recorded and the verdict still
+        // comes from the world when the window is up.
+        ev.castingAfterCall = who->IsNonMeleeSpellCast(false) ? 1 : 0;
+        ev.queuedAfterCall = 0;
+        for (PendingSpellCastRequest const& waiting : who->SpellQueue)
+        {
+            if (waiting.spellId != ev.spellId)
+                continue;
+            ev.queuedAfterCall = 1;
+            break;
+        }
+
+        // AND WHEN NOTHING IS CASTING, THE ROW SAYS WHICH WALL. The same gate
+        // `hearth` and `summon` ask, reused rather than copied, read in the
+        // core's own order and AFTER the packet so it reads the world the hold
+        // has already dismounted.
+        if (!ev.castingAfterCall)
+        {
+            if (ev.queuedAfterCall)
+            {
+                ev.castBlocker = OverseerDecisions::CastWall::Queued;
+            }
+            else
+            {
+                OverseerDecisions::CastWallGate gate;
+                gate.grounded = !who->IsInFlight();
+                gate.unmounted = !who->IsMounted();
+                gate.standing = who->IsStandState();
+                gate.still = !who->isMoving();
+                gate.ready = !who->HasSpellCooldown(ev.spellId);
+                gate.globalReady = !who->GetGlobalCooldownMgr().HasGlobalCooldown(spell);
+                gate.free = !who->IsNonMeleeSpellCast(false);
+                char const* const wall = OverseerDecisions::CastWallBlocker(gate);
+                ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+            }
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is casting spell {} at {} - a {}ms cast; judging in {}ms, "
+                 "not now. Expecting {}. It was {} for the cast (stand state {}, mount {}). {}",
+                 ev.character, ev.spellId,
+                 ev.targetName.empty() ? "itself" : ev.targetName.c_str(), ev.castMs,
+                 ev.windowMs,
+                 ev.objectExpected     ? "an object"
+                 : ev.teleportExpected ? "a teleport"
+                 : ev.costExpected     ? "a cost"
+                                       : "nothing this row can read",
+                 ev.hold.applied ? "held" : "NOT held",
+                 ev.hold.stoodItUp ? "stood up" : "left as it was",
+                 ev.hold.dismountedIt ? "taken off" : "left as it was",
+                 ev.castingAfterCall ? "A cast is running." : ev.castBlocker);
+
+        CastCheck check;
+        check.id = id;
+        check.targetName = who->GetName();
+        check.ev = ev;
+        parked.push_back(check);
+
+        // THE ONE HONEST STATUS FOR A CAST THAT HAS NOT FINISHED. Not
+        // 'delivered', which is the exact claim that made this issue, and not
+        // 'applied', which nothing has earned yet.
+        status = "verifying";
+        ev.verdict = CastOutcome::Unreadable;
+        out = CastJson(ev, "casting", "");
+        return "";
+    }
+
+    // WHERE A CAST IS ACTUALLY ANSWERED. Runs from the same poll as
+    // ResolveHearthChecks and for the same reason: the thing being judged
+    // happens on the world's clock, not on the queue's.
+    void ResolveCastChecks(uint32 elapsedMs)
+    {
+        using OverseerDecisions::CastOutcome;
+        using OverseerDecisions::CastOutcomeWord;
+        using OverseerDecisions::CastPlaceChanged;
+        using OverseerDecisions::CastReadBack;
+        using OverseerDecisions::JudgeCast;
+        using OverseerDecisions::ReadTeleportFlight;
+        using OverseerDecisions::TeleportFlight;
+
+        std::vector<CastCheck> stillCasting;
+        stillCasting.reserve(_pendingCasts.size());
+
+        for (CastCheck& check : _pendingCasts)
+        {
+            check.ev.waitedMs += elapsedMs;
+
+            // ASKED WITH checkInWorld FALSE, and that single argument is #310's
+            // lesson: Player::TeleportTo takes a character OUT OF THE WORLD for
+            // the whole length of a map change, so the default answers null for
+            // a portal cast that is working.
+            uint32 const ceilingMs = check.ev.windowMs + HEARTH_SETTLE_CEILING_MS;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+            TeleportFlight const flight =
+                ReadTeleportFlight(bot != nullptr, bot && bot->IsInWorld(),
+                                   bot && bot->IsBeingTeleported(), check.ev.waitedMs,
+                                   ceilingMs);
+
+            if (flight == TeleportFlight::Gone)
+            {
+                char const* const gone =
+                    "left the world before the cast could be read back";
+                LOG_WARN("module.overseer",
+                         "overseer: cast {} for '{}' cannot be judged - the character is no "
+                         "longer in the world and is not crossing one",
+                         check.id, check.targetName);
+                check.ev.verdict = CastOutcome::Unreadable;
+                // The register entry goes even though there is nobody to release
+                // it on: a relog rebuilds a character's strategies, and a record
+                // left standing would keep this module's own sweeps off a
+                // character nothing is holding any more (#335).
+                ReleaseHold(check.targetName, bot,
+                            "the character left the world mid-cast", "cast");
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    gone, EscLong(CastJson(check.ev, "unreadable", gone)), check.id,
+                    g_runToken);
+                continue;
+            }
+
+            // NOT JUDGED WHILE IT IS STILL WORKING.
+            if (check.ev.waitedMs < check.ev.windowMs)
+            {
+                stillCasting.push_back(check);
+                continue;
+            }
+
+            // STILL ARRIVING IS NOT STILL STANDING THERE. A cross-map teleport
+            // that has not been acknowledged yet would read back at the position
+            // the character is leaving. Given more time, up to a ceiling.
+            if (flight == TeleportFlight::InFlight)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: cast {} for '{}' is past its {}ms window but a teleport "
+                         "has not landed yet; waiting rather than calling it a failure",
+                         check.id, check.targetName, check.ev.windowMs);
+                stillCasting.push_back(check);
+                continue;
+            }
+
+            // ---- read the world back ------------------------------------------
+            CastReadBack read;
+            read.casterReadable = bot != nullptr;
+            read.objectExpected = check.ev.objectExpected;
+            read.teleportExpected = check.ev.teleportExpected;
+            read.costExpected = check.ev.costExpected;
+
+            if (bot)
+            {
+                check.ev.now = ReadStandingPlace(bot);
+                read.placeChanged =
+                    CastPlaceChanged(check.ev.from, check.ev.now, CAST_MOVED_YARDS);
+
+                if (check.ev.objectExpected)
+                {
+                    check.ev.objectFound = 0;
+                    if (GameObject* made = FindObjectThisCastMade(bot, check.ev.spellId))
+                    {
+                        check.ev.objectFound = 1;
+                        read.objectFound = true;
+                        check.ev.objectEntry = made->GetEntry();
+                        check.ev.objectGuid = made->GetGUID().GetCounter();
+                        check.ev.objectAt.known = true;
+                        check.ev.objectAt.mapId = made->GetMapId();
+                        check.ev.objectAt.areaId = made->GetAreaId();
+                        check.ev.objectAt.x = made->GetPositionX();
+                        check.ev.objectAt.y = made->GetPositionY();
+                        check.ev.objectAt.z = made->GetPositionZ();
+                        // REPORTED IN FULL BECAUSE SOMEBODY HAS TO CLICK IT.
+                        // This module does not click a mage portal yet; the type
+                        // and the spell it casts are what say whether it can be,
+                        // and the position is where to walk to.
+                        if (GameObjectTemplate const* info = made->GetGOInfo())
+                        {
+                            check.ev.objectType = uint32(info->type);
+                            if (info->type == GAMEOBJECT_TYPE_SPELLCASTER)
+                            {
+                                check.ev.objectCastsSpell = info->spellcaster.spellId;
+                                check.ev.objectPartyOnly =
+                                    info->spellcaster.partyOnly ? 1 : 0;
+                            }
+                        }
+                    }
+                }
+
+                if (check.ev.reagentEntry)
+                {
+                    check.ev.reagentAfter =
+                        int32(bot->GetItemCount(check.ev.reagentEntry, false));
+                    if (check.ev.reagentBefore >= 0
+                        && check.ev.reagentAfter < check.ev.reagentBefore)
+                        read.costPaid = true;
+                }
+                // ASKED ONLY IF IT WAS ASKED BEFORE THE CAST. See DoCast: a
+                // power reading this row could not take then is not a reading
+                // it may invent now.
+                if (check.ev.powerBefore >= 0)
+                {
+                    check.ev.powerAfter = int32(bot->GetPower(POWER_MANA));
+                    if (check.ev.powerAfter < check.ev.powerBefore)
+                        read.costPaid = true;
+                }
+                check.ev.cooldownAtVerdict = bot->HasSpellCooldown(check.ev.spellId) ? 1 : 0;
+                if (check.ev.cooldownAtVerdict)
+                    read.costPaid = true;
+            }
+
+            // The hold comes off before the verdict is written, so a character
+            // that cast does not stand there waiting out a ceiling (#335).
+            ReleaseHold(check.targetName, bot, "the cast row ended", "cast");
+
+            check.ev.verdict = JudgeCast(read);
+
+            char const* status = "error";
+            char const* detail = "";
+            char const* outcome = CastOutcomeWord(check.ev.verdict);
+
+            switch (check.ev.verdict)
+            {
+                case CastOutcome::Made:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: cast {} - '{}' made object {} (guid {}, type {}) with "
+                             "spell {}, read back after {}ms",
+                             check.id, check.targetName, check.ev.objectEntry,
+                             check.ev.objectGuid, check.ev.objectType, check.ev.spellId,
+                             check.ev.waitedMs);
+                    break;
+                case CastOutcome::Moved:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: cast {} - '{}' moved: map {} to map {}, read back "
+                             "after {}ms",
+                             check.id, check.targetName, check.ev.from.mapId,
+                             check.ev.now.mapId, check.ev.waitedMs);
+                    break;
+                case CastOutcome::Spent:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: cast {} - '{}' cast spell {}; it cost something "
+                             "(reagent {} went {} to {}, mana {} to {}, cooldown {}), which is "
+                             "all this row can read of that spell",
+                             check.id, check.targetName, check.ev.spellId,
+                             check.ev.reagentEntry, check.ev.reagentBefore,
+                             check.ev.reagentAfter, check.ev.powerBefore,
+                             check.ev.powerAfter,
+                             check.ev.cooldownAtVerdict > 0 ? "running" : "clear");
+                    break;
+                case CastOutcome::Nothing:
+                    // THE ROW THIS VERB EXISTS TO BE ABLE TO WRITE. `unchanged`
+                    // and not `error`: nothing broke, the cast simply did not
+                    // happen, and the sentence says which reading was taken.
+                    status = "unchanged";
+                    detail = check.ev.objectExpected
+                                 ? "the cast went out and the object it makes is not there"
+                             : check.ev.teleportExpected
+                                 ? "the cast went out and the character never moved"
+                                 : "the cast went out and it cost the character nothing";
+                    LOG_WARN("module.overseer",
+                             "overseer: cast {} - '{}' cast spell {} and nothing came of it: "
+                             "{} (the wall named at the packet was: {})",
+                             check.id, check.targetName, check.ev.spellId, detail,
+                             *check.ev.castBlocker ? check.ev.castBlocker : "none");
+                    break;
+                case CastOutcome::Unreadable:
+                    status = "error";
+                    detail = read.casterReadable
+                                 ? "that spell makes nothing this row can read back"
+                                 : "the character could not be read back after the cast";
+                    LOG_WARN("module.overseer",
+                             "overseer: cast {} - '{}' and spell {}: {}", check.id,
+                             check.targetName, check.ev.spellId, detail);
+                    break;
+            }
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(CastJson(check.ev, outcome, detail)), check.id,
+                g_runToken);
+        }
+
+        _pendingCasts.swap(stillCasting);
+    }
 
     // -------------------------------------------------------------- summon --
     //
