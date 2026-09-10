@@ -6675,6 +6675,20 @@ struct RouteLink
     // 647, and the leg the party actually died on twice is in both. The
     // narrower one is used because it is the question the deaths asked.
     bool guardedGround{false};
+    // ...AND WHAT AVOIDING IT IS WORTH, IN YARDS (#400). `guardedGround` says
+    // the other side stands on this leg; this says how much that matters to the
+    // party asking, which is a different question with a different answer for a
+    // family of 28 and a family of 60. Set by the same pass that sets the flag,
+    // out of ScoreGroundDanger above, and NEVER non-zero on a leg whose flag is
+    // false: the search below reads it only for legs the flag already selected,
+    // so the two disagreeing would be a silent hole rather than a compromise.
+    //
+    // ZERO IS THE WHOLE OF THE BACKWARD COMPATIBILITY ARGUMENT. Left at zero -
+    // by a caller that has not measured, by a realm with no spawn data, by
+    // every one of this file's existing tests - the budget it feeds is zero,
+    // the reach comparison is arithmetically what it was before #400, and the
+    // plan is the plan this planner has always produced.
+    float detourWorthYards{0.f};
 };
 
 // One point along a leg. No id and no map: a route is walked on one map by
@@ -6747,6 +6761,17 @@ struct RoutePlan
     // false also means "there was nothing to go round", which is the common
     // case and the one that must cost nothing.
     bool wentRound{false};
+    // WHAT THE GUARDED LEGS OF THE WAY THROUGH WERE WORTH (#400), summed off
+    // `RouteLink::detourWorthYards`. This is the number the round-versus-through
+    // comparison actually spent, and it is reported for the same reason
+    // `guardedLegs` is: a refusal or an acceptance that names its price is one
+    // somebody can argue with, and "it walks it" on its own is not.
+    //
+    // It is what was ON OFFER, not what was taken. A plan with `wentRound` true
+    // is one where this bought the detour; a plan with `guardedLegs` non-zero is
+    // one where it was not enough, and the difference between this and the extra
+    // yards the way round would have cost is exactly how short it fell.
+    float detourBudgetYards{0.f};
 };
 
 struct RoutePlanLimits
@@ -6973,6 +6998,218 @@ struct RouteLegLimits
 RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
                       float x, float y, RouteLegLimits const& limits);
 
+
+// ---------------------- what the ground itself costs to walk across (#400) --
+//
+// THE ROUTE ALREADY KNOWS WHICH LEGS THE OTHER SIDE GUARDS AND PRICES THEM AT
+// ZERO. `RouteLink::guardedGround` above is a bool, and the only thing it buys
+// is the second search in PlanFootRoute, which is adopted only when going round
+// is NOT ONE YARD LONGER than going through. One yard longer and the party
+// walks into the guard post. That rule treats a yard of open Barrens and a yard
+// inside five level 40 guards as the same yard, and the death table is what
+// disagrees: three characters at 28 to 34 against a level 40 guard post, over
+// and over, on the leg the planner kept choosing because it was shorter.
+//
+// So this section is not a new reading of the world. It is a PRICE for the
+// reading that already exists, and the price is in yards so the comparison that
+// already exists can spend it without learning a second currency.
+//
+// EVERYTHING BELOW IS THE CORE'S OWN ARITHMETIC. Not one of these numbers is
+// tuned. That is deliberate and it is the argument for the whole model: a rule
+// made of constants somebody chose has to be defended every time the party's
+// levels change, and a rule made of the core's own formulas does not.
+
+// HOW FAR A CREATURE REACHES FOR A CHARACTER, AND IT IS NOT A CONSTANT.
+//
+// `Creature::GetAggroRange`, Creature.cpp:3402 at the pinned core, is the one
+// that decides: `Creature::CanStartAttack` calls it at Creature.cpp:1936, and
+// `Creature::GetAttackDistance` (Creature.cpp:3612) - the function that says
+// `float retDistance = 20.0f` and is therefore where every summary's "20 yard
+// base" comes from - has NO CALLER in that file at all. Reduced to the terms a
+// spawn row can supply, with the live branches kept and the ones needing a
+// loaded unit (detect-range auras, pets) dropped:
+//
+//     levelDiff = playerLevel - creatureLevel        clamped at >= -25
+//     aggro     = detectionRange - levelDiff
+//     aggro     = min(aggro, 45)                     MAX_AGGRO_RADIUS, Unit.h:44
+//     aggro     = max(aggro, 5)                      combat range
+//     return      aggro * Rate.Creature.Aggro
+//
+// WATCH THE SIGN, BECAUSE UPSTREAM'S TWO LOCALS ARE NAMED FOR THE WRONG THINGS.
+// In `GetAggroRange` the local called `creatureLevel` is assigned the TARGET's
+// level and the local called `playerLevel` is assigned the CREATURE's, so
+// `levelDiff` is player minus creature however it reads. The behaviour is
+// right; only the names are backwards. Anybody re-deriving this from the source
+// gets the sign inverted unless they notice, which is why it is written down.
+//
+// `detectionRange` is `creature_template.detection_range` (CreatureData.h:205),
+// applied at Creature.cpp:689 and defaulting to 20.0f at Creature.cpp:266. The
+// core returns 0 when it is under 1 BEFORE the level term is applied, and so
+// does this.
+//
+// This one function is most of what makes the model level-relative for free: a
+// level 40 guard reaches 32 yards for a level 28 character and 5 for a level 60
+// one, which is 41 times the area, with nobody writing a rule about guards.
+float AggroRadiusYards(std::uint32_t creatureLevel, std::uint32_t playerLevel,
+                       float detectionRange, float aggroRate);
+
+// The core's own gray level, Formulas.h `Acore::XP::GetGrayLevel`, copied
+// rather than approximated. This is the line under which the core itself says a
+// creature is beneath a character's notice - it awards no experience - and it
+// is what lets "a mob far below the party is not danger" be a citation instead
+// of an opinion.
+std::uint32_t GreyLevel(std::uint32_t playerLevel);
+
+// HOW BADLY A FIGHT WITH THIS SPAWN GOES, IN THE CORE'S OWN BANDS.
+//
+// Grey through Red are `Acore::XP::GetColorCode` (Formulas.h) exactly, edges
+// included. `Skull` is NOT in that function and is not pretended to be: it is
+// the client's `??`, which begins at a gap of CON_COLOR_UNKNOWN_LEVEL_DIFF (10)
+// and is already this module's own line elsewhere - see the constant of that
+// name in src/mod_overseer.cpp, which the guarded-ground reading has used as
+// its level floor since #326. It sits above Red because a fight this module
+// cannot win and a fight it merely loses are worth separating.
+//
+// Ordered least to worst on purpose, so a caller can keep the worst one it has
+// seen with a single comparison.
+enum class ConBand : std::uint8_t
+{
+    Grey,
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Skull,
+};
+
+ConBand ConBandOf(std::uint32_t playerLevel, std::uint32_t creatureLevel);
+char const* ConBandName(ConBand band);
+
+// WHAT ONE YARD OF EXPOSURE TO EACH BAND IS WORTH, IN YARDS OF WALKING ROUND.
+//
+// The one place in this model where a number is chosen rather than read, and it
+// is chosen as a RATIO between bands rather than as a magnitude, because the
+// magnitude is supplied by the aggro radius above. Grey is 0, which is the
+// property the whole model turns on: a party that has outgrown a stretch of
+// ground pays nothing to walk it and the planner returns to pure distance.
+// Yellow is 1, so the sentence the model can be argued with is "one yard inside
+// an even-level enemy's reach is worth one yard of walking round". The rest
+// double: orange 2, red 4, skull 8.
+float ConBandWeight(ConBand band);
+
+// ONE SPAWN, AS MUCH OF IT AS A DANGER READING NEEDS.
+//
+// SPAWN DATA AND NOT A LIVE CREATURE, for the reason StanceOf already gives in
+// the adapter: a route is planned across grids that are not loaded, and an
+// unloaded grid reads as "no creatures", which is the worst possible wrong
+// answer to this question.
+//
+// `level` is `creature_template.maxlevel`, the same field the shipped
+// guarded-ground reading uses, so the two cannot disagree about how tall a
+// spawn is.
+struct DangerSpawn
+{
+    float x{0.f};
+    float y{0.f};
+    std::uint32_t level{0};
+    // `creature_template.detection_range`. Zero is not "no reach": the adapter
+    // passes what the row holds and AggroRadiusYards applies the core's own
+    // under-1 rule to it, so a row that has never been filled in reads as the
+    // core reads it rather than as this module would prefer.
+    float detectionRange{20.f};
+    // The three #302 unit_flags, already answered by the adapter's CanBeFought
+    // so the two callers of that rule cannot drift apart.
+    bool canBeFought{true};
+    // CREATURE_FLAG_EXTRA_TRIGGER, CreatureData.h:53. The invisible anchors
+    // that spell visuals and sound emitters hang on. The brief's own sweep near
+    // a flight master turned up an "OLDWorld Trigger (DO NOT DELETE)" at level
+    // 60 among six false hostiles.
+    bool trigger{false};
+    // CREATURE_FLAG_EXTRA_CIVILIAN, CreatureData.h:47, and this is the core's
+    // FIRST word on the subject rather than an extra opinion:
+    // `Creature::CanStartAttack` opens with `if (IsCivilian()) return false;`.
+    // A civilian never pulls, whatever its faction or its level, which is what
+    // a level 80 holiday event host standing in a neutral town is.
+    bool civilian{false};
+};
+
+// Whether this spawn can start a fight at all. Three refusals, each the core's
+// own, and none of them a name pattern: `[DND]`, `Trigger`, `Bunny` and `Dummy`
+// are conventions the world database mostly follows and is not obliged to.
+bool SpawnCanAggro(DangerSpawn const& spawn);
+
+struct DangerLimits
+{
+    // `Rate.Creature.Aggro`, the worldserver's own multiplier on every aggro
+    // radius. Passed in rather than assumed so a realm that has changed it gets
+    // routes that match the world its characters are walking in.
+    float aggroRate{1.f};
+    // What one weighted yard of exposure buys in yards of detour. One, so the
+    // model has a plain-English statement and the bands above carry the whole
+    // of the shape. A caller that wants the family to take more or fewer risks
+    // turns this and nothing else.
+    float yardsPerExposedYard{1.f};
+    // AND A CEILING, SO A PATHOLOGICAL CLUSTER CANNOT BUY AN UNBOUNDED WALK.
+    // The other failure mode of a long detour - handing thousands of yards to
+    // the greedy stepper, which is what #316 exists because it cannot do - is
+    // already bounded independently by RoutePlanLimits::roundHandoverYards and
+    // is not this number's job. This one bounds the BUDGET: six thousand is
+    // more than the longest journey measured on one continent for this family
+    // (7874 yards of walking legs, of which the detour was 3788), so it never
+    // binds on a real route and it does bind on a decorated town square.
+    float maxDetourYards{6000.f};
+};
+
+// WHAT A STRETCH OF GROUND COSTS, AND WHAT AVOIDING IT IS WORTH.
+struct GroundDanger
+{
+    // Yards of the path that lie inside some hostile creature's aggro radius,
+    // summed over creatures, so two guards covering the same fifty yards cost
+    // twice what one does. That is deliberate: two guards on one stretch really
+    // are twice the fight.
+    float exposedYards{0.f};
+    // The same, weighted by con band and priced. THIS IS THE ANSWER, and it is
+    // in yards so the route planner can add it to a distance.
+    float detourYards{0.f};
+    // How many spawns actually reached the path, for the log line. Not how many
+    // were considered.
+    std::uint32_t spawns{0};
+    std::uint32_t worstLevel{0};
+    ConBand worstBand{ConBand::Grey};
+    // How close the path comes to the nearest spawn that reached it. Negative
+    // when none did.
+    float closestYards{-1.f};
+};
+
+// SCORE A PATH AGAINST WHAT STANDS BESIDE IT.
+//
+// `path` is the leg's OWN WAYPOINTS, not the straight line between its nodes,
+// and the difference is the whole reason #326 marks legs rather than nodes: the
+// waypoints of the leg this family died on bend a median 112 and a maximum 274
+// yards off that chord, and the guard that killed them twice is 5 yards from
+// the waypoints and 66 from the chord.
+//
+// MEASURED AS A POLYLINE AGAINST A CIRCLE, NOT BY SAMPLING. The shipped reading
+// asks a yes-or-no question every thirty yards, so a 5 yard aggro radius is
+// usually invisible to it and a 32 yard one is worth two samples or three
+// depending on where the sampling phase happens to fall. Intersecting each
+// segment with each circle is exact, has no phase, and does not silently depend
+// on a spacing chosen for a different question.
+//
+// `partyLevels` is the whole party and the LOWEST is what is used. A party
+// walks as far as its weakest member survives, and the lowest member has both
+// the widest aggro circle and the worst con band, so one member carries both
+// halves of the question. The whole list is taken rather than the minimum so
+// the signature stays honest about what the decision is entitled to look at.
+// Zero levels are ignored: a level 0 is a row that has not been read, not a
+// character.
+//
+// A path of fewer than two points scores nothing. There is no ground between
+// one point and itself.
+GroundDanger ScoreGroundDanger(std::vector<DangerSpawn> const& spawns,
+                               std::vector<RoutePoint> const& path,
+                               std::vector<std::uint32_t> const& partyLevels,
+                               DangerLimits const& limits);
 
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //

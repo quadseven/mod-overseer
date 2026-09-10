@@ -1611,6 +1611,25 @@ constexpr unsigned TRAVEL_ROUTE_GUARDED_PASSES = 6;
 // number tuned for one cannot silently mean something else in the other.
 constexpr float TRAVEL_ROUTE_GUARDED_SPACING_YARDS = 30.0f;
 
+// HOW WIDE TO GATHER SPAWNS WHEN PRICING A GUARDED LEG (#400).
+//
+// NOT AN AGGRO RADIUS AND NOT A THREAT RADIUS. It is a bound on the sweep, and
+// the only property it needs is that it cannot drop a spawn the scorer would
+// have counted. The scorer runs against a leg's FULL waypoint list, about five
+// yards apart; the sweep runs against the SAMPLED points, up to
+// TRAVEL_ROUTE_GUARDED_SPACING_YARDS apart. So a spawn sitting the largest
+// possible aggro radius from some waypoint - MAX_AGGRO_RADIUS, 45.0f at the
+// pinned core's Unit.h:44 - can be up to half a sample spacing further from the
+// nearest sampled point, which is 45 + 15 = 60. Eighty is that with a third
+// again of margin, and it costs nothing: the sweep is one pass over the map's
+// spawns, run only for a route that already has a guarded leg, and the answer
+// is kept for the process.
+//
+// Deliberately NOT expressed as GRAVEYARD_THREAT_RADIUS. That number answers a
+// different question (what is standing at this spot) and tying this to it would
+// mean a change tuned for one silently moving the other.
+constexpr float TRAVEL_DANGER_GATHER_YARDS = 80.0f;
+
 // A follower that has stopped, and never closes the gap (#70).
 //
 // Two followers stopped at a zone border on the dev world 2026-08-30 and
@@ -12530,12 +12549,136 @@ private:
     // BOTH DIRECTIONS, BECAUSE THE GROUND DOES NOT CARE WHICH WAY IT IS WALKED.
     // The survey stores each leg twice, once per direction, and a guard standing
     // beside it guards both.
-    static void MarkLegGuarded(TravelSurvey& survey, uint32 from, uint32 to)
+    static void MarkLegGuarded(TravelSurvey& survey, uint32 from, uint32 to,
+                               float detourWorthYards)
     {
         for (OverseerDecisions::RouteLink& link : survey.links)
             if ((link.from == from && link.to == to) ||
                 (link.from == to && link.to == from))
+            {
                 link.guardedGround = true;
+                // AND WHAT IT IS WORTH AVOIDING, IN YARDS (#400). The flag on
+                // its own has been priced at zero since #326, which is why the
+                // planner walked this family into a level 40 guard post every
+                // time going round was one yard longer. Written here, beside
+                // the flag and in the same pass, so a leg can never be marked
+                // guarded without also carrying its price.
+                link.detourWorthYards = detourWorthYards;
+            }
+    }
+
+    // THE LEVELS THE GROUND IS PRICED AGAINST (#400).
+    //
+    // The PARTY and not the walker. Every member walks this leg - the four that
+    // are not carrying the errand step straight at the leader with no aim and no
+    // gate of their own, which is the thing #300 measured - so the danger is a
+    // question about the group. OverseerDecisions::ScoreGroundDanger takes the
+    // whole list and uses the lowest, and it is handed the whole list rather
+    // than the minimum so the decision stays entitled to look at the spread if a
+    // later rule wants to.
+    //
+    // A character with no group is a party of one, which is the honest reading
+    // and not a special case.
+    static std::vector<std::uint32_t> PartyLevelsFor(Player* bot)
+    {
+        std::vector<std::uint32_t> levels;
+        if (!bot)
+            return levels;
+        levels.push_back(bot->GetLevel());
+        if (Group* group = bot->GetGroup())
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                // A dead member is left in on purpose: it is about to be alive
+                // again and walking this same ground, and pricing the road for
+                // the survivors only is how the corpse run finds the guards.
+                if (member && member != bot)
+                    levels.push_back(member->GetLevel());
+            }
+        return levels;
+    }
+
+    // EVERY SPAWN THAT COULD PULL ON THIS ROUTE, WITH NO LEVEL FLOOR (#400).
+    //
+    // The sweep beside this one, HostileSpawnsNearEach, answers "is this the
+    // other side's ground" and answers it with a level FLOOR, which is right for
+    // a boolean and wrong for a price: a floor makes a spawn one level under it
+    // free and one level over it total. This collects the rows and lets the pure
+    // model decide what each one is worth, which is where the core's own con
+    // bands and aggro radius live.
+    //
+    // ONE PASS, AND ONLY FOR A ROUTE THAT ALREADY HAS A GUARDED LEG. The caller
+    // runs this after the boolean sweep and only when that sweep found
+    // something, so a journey with no guarded leg pays nothing for this and the
+    // "today's answer for today's cost" property of #326 survives intact.
+    //
+    // THE GATHER RADIUS IS NOT THE AGGRO RADIUS. `points` are the sampled
+    // points, TRAVEL_ROUTE_GUARDED_SPACING_YARDS apart, but the scoring runs
+    // against the leg's FULL waypoint list. A spawn MAX_AGGRO_RADIUS (45) from
+    // some waypoint can therefore be up to half a sample spacing further from
+    // the nearest sample, so anything under 60 would silently drop spawns the
+    // scorer would have counted. See TRAVEL_DANGER_GATHER_YARDS.
+    static void DangerSpawnsNear(Player* bot, uint32 mapId,
+                                 std::vector<std::pair<float, float>> const& points,
+                                 float radius,
+                                 std::vector<OverseerDecisions::DangerSpawn>& out)
+    {
+        out.clear();
+        FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
+        if (!mine || points.empty())
+            return;
+
+        float const r2 = radius * radius;
+        for (auto const& itr : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureData const& data = itr.second;
+            if (data.mapid != mapId)
+                continue;
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
+            if (!tmpl)
+                continue;
+            FactionTemplateEntry const* theirs =
+                sFactionTemplateStore.LookupEntry(tmpl->faction);
+            if (!theirs || !theirs->IsHostileTo(*mine))
+                continue;
+            // The same narrowing the boolean sweep uses, and for the same
+            // reason: this prices a TOWN, and a wild beast hostile to everybody
+            // is the walk's ordinary business rather than the other side's
+            // people. Keeping the two readings on the same population is what
+            // stops a leg being marked by one question and priced by another.
+            if (!IsTheOtherSidesGround(*theirs, *mine))
+                continue;
+
+            bool reaches = false;
+            for (auto const& point : points)
+            {
+                float const dx = data.posX - point.first;
+                float const dy = data.posY - point.second;
+                if (dx * dx + dy * dy <= r2)
+                {
+                    reaches = true;
+                    break;
+                }
+            }
+            if (!reaches)
+                continue;
+
+            OverseerDecisions::DangerSpawn danger;
+            danger.x = data.posX;
+            danger.y = data.posY;
+            danger.level = tmpl->maxlevel;
+            danger.detectionRange = tmpl->detection_range;
+            // #302's three unit_flags, asked through the one function that
+            // already answers them so this and the boolean sweep cannot drift.
+            danger.canBeFought = CanBeFought(data, tmpl);
+            // CreatureData.h:53 and :47. Neither is in `unit_flags` and neither
+            // is covered by CanBeFought: a trigger is an anchor for a spell
+            // visual, and a civilian is refused by Creature::CanStartAttack
+            // before faction, level or distance are even looked at.
+            danger.trigger = (tmpl->flags_extra & CREATURE_FLAG_EXTRA_TRIGGER) != 0;
+            danger.civilian = (tmpl->flags_extra & CREATURE_FLAG_EXTRA_CIVILIAN) != 0;
+            out.push_back(danger);
+        }
     }
 
     // WHAT THIS ROUTE'S LEGS CROSS, READ ONCE PER LEG PER PROCESS (#326).
@@ -12562,6 +12705,13 @@ private:
         std::vector<std::pair<float, float>> points;
         std::vector<std::size_t> legOfPoint;
         std::vector<std::pair<uint32, uint32>> legs;
+        // THE FULL WAYPOINT LIST OF EACH LEG, KEPT (#400). The sampled `points`
+        // above are enough to answer the boolean "is anybody standing here", and
+        // are not enough to answer "how much of this leg is inside somebody's
+        // reach": a 5 yard aggro circle falls between two samples 30 apart, and
+        // a 32 yard one is worth two samples or three depending on where the
+        // sampling phase happens to land. Index for index with `legs`.
+        std::vector<std::vector<OverseerDecisions::RoutePoint>> legPoints;
         for (std::size_t i = 0; i + 1 < nodes.size(); ++i)
         {
             uint32 const from = nodes[i];
@@ -12598,6 +12748,9 @@ private:
                 points.emplace_back(leg[p].x, leg[p].y);
                 legOfPoint.push_back(index);
             }
+            // Moved rather than copied: a leg is up to a few hundred points and
+            // this loop runs over every unmeasured leg of a route.
+            legPoints.push_back(std::move(leg));
         }
         if (legs.empty())
             return false;
@@ -12614,6 +12767,24 @@ private:
                     guarded[legOfPoint[p]] = true;
         }
 
+        // AND WHAT THE GUARDED ONES ARE WORTH AVOIDING (#400).
+        //
+        // Gathered ONCE, and only when the boolean sweep above actually found a
+        // guard: a route with nothing marked never reaches this and pays nothing
+        // for it, which is the same bargain #326 struck with its second search.
+        std::vector<OverseerDecisions::DangerSpawn> dangerous;
+        std::vector<std::uint32_t> const partyLevels = PartyLevelsFor(bot);
+        bool const anythingGuarded =
+            std::find(guarded.begin(), guarded.end(), true) != guarded.end();
+        if (anythingGuarded)
+            DangerSpawnsNear(bot, mapId, points, TRAVEL_DANGER_GATHER_YARDS, dangerous);
+
+        // The realm's own aggro multiplier, so a route matches the world the
+        // characters are actually walking in. sWorld->getRate is what
+        // Creature::GetAggroRange itself reads (Creature.cpp:3406).
+        OverseerDecisions::DangerLimits dangerLimits;
+        dangerLimits.aggroRate = sWorld->getRate(RATE_CREATURE_AGGRO);
+
         bool learnedSomethingGuarded = false;
         for (std::size_t i = 0; i < legs.size(); ++i)
         {
@@ -12621,8 +12792,27 @@ private:
             survey.measuredLegs.insert(LegKey(legs[i].second, legs[i].first));
             if (!guarded[i])
                 continue;
-            MarkLegGuarded(survey, legs[i].first, legs[i].second);
+            OverseerDecisions::GroundDanger const danger =
+                OverseerDecisions::ScoreGroundDanger(dangerous, legPoints[i],
+                                                     partyLevels, dangerLimits);
+            MarkLegGuarded(survey, legs[i].first, legs[i].second, danger.detourYards);
             learnedSomethingGuarded = true;
+            // SAID PER LEG AND ONLY FOR A LEG THAT COST SOMETHING, because this
+            // is where the number a route is about to be decided on is actually
+            // produced, and a budget that appears at the decision with no
+            // derivation behind it is one nobody can check. A leg whose spawns
+            // are all grey to this party prices at zero and says nothing, which
+            // is the common case for a family that has outgrown its road.
+            if (danger.detourYards > 0.f)
+                LOG_INFO("module.overseer",
+                         "overseer: the leg {} to {} is priced at {:.0f} yards of detour - "
+                         "{} spawn(s) of the other side reach it, worst level {} which is "
+                         "{} to this party, {:.0f} yards of it inside somebody's aggro "
+                         "radius and the nearest {:.0f} yards off (#400)",
+                         legs[i].first, legs[i].second, danger.detourYards,
+                         danger.spawns, danger.worstLevel,
+                         OverseerDecisions::ConBandName(danger.worstBand),
+                         danger.exposedYards, danger.closestYards);
         }
         return learnedSomethingGuarded;
     }
@@ -13022,6 +13212,27 @@ private:
                      "errand and not a different route (#326)",
                      name, target, plan.guardedLegs,
                      static_cast<uint32>(plan.nodes.size() ? plan.nodes.size() - 1 : 0));
+        // AND WHAT THAT GROUND WAS PRICED AT, SAID SEPARATELY (#400), for the
+        // same reason the guarded note above is separate from the route note
+        // above it: the two lines have meant one thing each since #316 and #326,
+        // and an operator reading either of them for a death must not have to
+        // work out from context whether a number in it is a distance or a price.
+        //
+        // THIS IS THE LINE THAT MAKES THE TRADE ARGUABLE. Before it, "with no
+        // way round that is not farther" was the whole explanation, and it
+        // concealed that the comparison had no danger term at all. Now the
+        // budget the party's own levels bought is on the record beside the
+        // decision it lost or won, so "it walked into the guards anyway" is a
+        // sentence with a number in it.
+        if (plan.detourBudgetYards > 0.f)
+            LOG_INFO("module.overseer",
+                     "overseer: the guarded ground on that route was worth {:.0f} yards of "
+                     "detour to a party of these levels, and the way round {}. A party that "
+                     "has outgrown this road prices it at zero and gets the short way back "
+                     "(#400)",
+                     plan.detourBudgetYards,
+                     plan.wentRound ? "came in under that and was taken"
+                                    : "still cost more than that, so it was not");
         return route;
     }
 
