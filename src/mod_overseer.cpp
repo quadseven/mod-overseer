@@ -11655,6 +11655,16 @@ private:
         who.mail = bot->HasSkill(SKILL_MAIL);
         who.plate = bot->HasSkill(SKILL_PLATE_MAIL);
         who.shield = bot->HasSkill(SKILL_SHIELD);
+
+        // AND WHETHER THIS CHARACTER MAY HOLD A SECOND WEAPON AT ALL (#411).
+        // Player::CanDualWield is the same fact the core's own equip check
+        // reads (PlayerStorage.cpp:2034-2038) and the same one FindEquipSlot
+        // consults before it will even suggest the off-hand slot for a
+        // one-hander (PlayerStorage.cpp:186-187), so this and the core agree by
+        // construction rather than by coincidence. Read off the character, like
+        // every other line here: a warrior learns it at 20, and a class table
+        // would say yes for a level 12 one.
+        who.canDualWield = bot->CanDualWield();
         return who;
     }
 
@@ -11813,11 +11823,33 @@ private:
     // here, from the core, and handed in: whether the character is allowed the
     // item at all, and whether it holds the weapon skill this particular weapon
     // needs. Player::CanUseItem(ItemTemplate const*) answers the first
-    // (PlayerStorage.cpp:2377-2421: faction, class mask, race, RequiredSkill,
-    // RequiredSpell, level) and notably does NOT answer armour proficiency -
-    // that check lives only in the Item* overload, which is exactly why a
-    // priest sails through it holding a pair of leather boots. The scorer makes
-    // that test itself, from the five booleans above.
+    // (PlayerStorage.cpp:2378-2436 in the pinned core: faction flags, class
+    // mask, race mask, the item's own RequiredSkill and RequiredSkillRank,
+    // RequiredSpell, RequiredLevel, a holiday gate and a script hook).
+    //
+    // AND IT DOES NOT ANSWER PROFICIENCY, WHICH IS THE WHOLE OF #411, so the
+    // pinned core was read rather than assumed. That overload DOES return
+    // EQUIP_ERR_NO_REQUIRED_PROFICIENCY, which makes it look like the one call
+    // that settles this - but only for the item's own RequiredSkill and
+    // RequiredSpell columns, and an ordinary weapon carries 0 in both. It never
+    // looks at the weapon skill, and it never looks at armour class either;
+    // both of those live in the Item* overload at PlayerStorage.cpp:2343-2367,
+    // which is why a priest sails through the template overload holding a pair
+    // of leather boots, and why a rogue sails through it holding a staff.
+    //
+    // THE ITEM* OVERLOAD'S TEST IS REPRODUCIBLE FROM A TEMPLATE, which is the
+    // fact that makes this cheap: Item::GetSkill is `return
+    // GetTemplate()->GetSkill();` (Item.cpp:556-559), so the skill line is a
+    // property of the template after all, mapped off the core's own two tables
+    // in ItemTemplate::GetSkill (ItemTemplate.h:782-815). The test below is
+    // therefore the core's own line - `GetSkillValue(itemSkill) == 0`
+    // (PlayerStorage.cpp:2364-2366) - and not a table of what each class may
+    // hold, which would be wrong for the character that has not trained the
+    // thing yet and would rot the first time the realm changed.
+    //
+    // Armour stays with the five booleans above for the same reason it always
+    // did: they are read off character_skills, which is the same place
+    // GetSkillValue reads.
     static OverseerDecisions::GearVerdict GearScoreFor(Player* bot,
                                                        OverseerDecisions::GearWearer who,
                                                        ItemTemplate const* proto,
@@ -11825,7 +11857,7 @@ private:
     {
         who.classAllowed = bot->CanUseItem(proto) == EQUIP_ERR_OK;
         who.weaponProficient = proto->Class != ITEM_CLASS_WEAPON || proto->GetSkill() == 0 ||
-                               bot->HasSkill(proto->GetSkill());
+                               bot->GetSkillValue(proto->GetSkill()) != 0;
         return OverseerDecisions::GearScore(GearItemFor(proto, random), who);
     }
 
@@ -11884,6 +11916,22 @@ private:
     }
     std::map<std::string, std::set<uint32>> _gearSaid;
 
+    // WHY A REFUSAL KEEPS ITS OWN BUDGET (#411). The same once-per-character-
+    // and-item guard, on a separate memory, because the two say different
+    // things about the same entry at different times. "Not a candidate" is said
+    // while the character cannot use the item at all; "the server refused the
+    // swap" is said once it can and something else went wrong. A warrior
+    // learning plate at 40 moves an item from the first state to the second,
+    // and sharing one budget would mean the second line - the one that reports
+    // an actual failure - was silently already spent. Same terms as `_gearSaid`
+    // otherwise: bounded by roster times distinct entries, unguarded because
+    // DriveGear runs only from OnUpdate on the world thread, lost on a restart.
+    bool SayRefusalOnce(std::string const& name, uint32 entry)
+    {
+        return _gearRefusalSaid[name].insert(entry).second;
+    }
+    std::map<std::string, std::set<uint32>> _gearRefusalSaid;
+
     // WHAT THIS DRIVE PUT WHERE (#221), keyed by character and equipment slot.
     // The same terms as `_gearSaid` above and every other per-character memory
     // in this file: bounded by the roster times the equipment slots, unguarded
@@ -11929,11 +11977,31 @@ private:
             OverseerDecisions::GearVerdict const candidate =
                 GearScoreFor(bot, who, proto, GearRandomPropertyOf(item));
 
-            // Not wearable is not news. It is the ordinary state of most of
-            // what a party carries out of a dungeon, and saying so once per
-            // item per character would bury the lines that matter.
+            // A NAME THAT DISAPPEARS WITHOUT A REASON IS THE NEXT BUG (#411).
+            //
+            // This used to be a bare `continue` on the grounds that a refusal
+            // is the ordinary state of most of what a party carries, which is
+            // true, and that saying so would bury the lines that matter, which
+            // was true only of saying it on EVERY poll - once every five
+            // seconds, for ever. Said once per character and item, it is
+            // bounded by the number of distinct entries the family ever picks
+            // up, and it is the only record anywhere of why a character is not
+            // a candidate for something.
+            //
+            // The visible half of #411 was a character wrongly ON a list: a
+            // staff offered to a rogue, loudly, with a number beside it. The
+            // quiet half is a character wrongly OFF one, and it is worse,
+            // because there is nothing there to disagree with. GearVerdict::why
+            // names the gate that answered; this prints it.
             if (!candidate.wearable)
+            {
+                if (SayRefusalOnce(who.name, item->GetEntry()))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is carrying {} and is not a candidate for it - "
+                             "{} - so it stays in the bags",
+                             who.name, proto->Name1, candidate.why);
                 continue;
+            }
 
             // A HAND THAT IS ALREADY SPOKEN FOR (#145). FindEquipSlot answers
             // "where does this go", and for a shield, an off-hand weapon or a
@@ -11984,13 +12052,30 @@ private:
             OverseerDecisions::GearIncumbentScore incumbent =
                 GearWornIncumbent(bot, who, found);
 
+            // WHAT THE OFF HAND COSTS, AND WHETHER IT IS BEING CHARGED (#411).
+            // The pair has been priced since #14; what was missing is that the
+            // resulting number does not SAY it is a pair, so a reader could not
+            // tell whether the off hand had been counted at all.
+            //
+            // INVTYPE_RANGEDRIGHT (26) is deliberately not in this test even
+            // though it is a two-handed thing to hold. In 3.3.5 it goes to
+            // EQUIPMENT_SLOT_RANGED (PlayerStorage.cpp:195-199), not to the main
+            // hand, and it displaces neither hand - a hunter holds a bow and a
+            // pair of melee weapons at once. Charging it for an off hand it does
+            // not take would be the mirror of the error being fixed.
+            bool emptiesTheOffHand = false;
+            float offHandGiven = 0.f;
+
             // A TWO-HANDER HAS TO BEAT BOTH HANDS (#14, the Severing Axe): the
             // off hand is emptied to make room for it, so what it is really
             // being compared against is the pair.
             if (proto->InventoryType == INVTYPE_2HWEAPON && found == EQUIPMENT_SLOT_MAINHAND)
             {
-                incumbent = OverseerDecisions::GearIncumbentPair(
-                    incumbent, GearWornIncumbent(bot, who, EQUIPMENT_SLOT_OFFHAND));
+                OverseerDecisions::GearIncumbentScore const offHand =
+                    GearWornIncumbent(bot, who, EQUIPMENT_SLOT_OFFHAND);
+                emptiesTheOffHand = true;
+                offHandGiven = offHand.score;
+                incumbent = OverseerDecisions::GearIncumbentPair(incumbent, offHand);
             }
             // A RING OR A TRINKET HAS TWO HOMES, and the one worth taking is
             // the worse of them. FindEquipSlot names the first; this picks.
@@ -12005,6 +12090,11 @@ private:
                     incumbent = second;
                 }
             }
+
+            // What every line below prints as "against", said so the off hand
+            // is visible in it rather than folded silently into a total (#411).
+            std::string const incumbentSaid = OverseerDecisions::GearIncumbentSaid(
+                incumbent, emptiesTheOffHand, offHandGiven);
 
             // THE THREE-WAY ANSWER (#221). NotBetter is the ordinary state of
             // most of what a party carries and is said about nothing.
@@ -12084,7 +12174,7 @@ private:
                          "overseer: '{}' puts on {} in the {} slot over {} - {} against {} "
                          "for what it was wearing",
                          who.name, itemName, GearSlotName(target), replaced, candidate.why,
-                         static_cast<int>(incumbent.score));
+                         incumbentSaid);
             }
             else if (SayGearOnce(who.name, entry))
             {
@@ -12093,7 +12183,7 @@ private:
                          "against {} - and the server refused the swap, so it stays in the "
                          "bags",
                          who.name, itemName, GearSlotName(target), replaced, candidate.why,
-                         static_cast<int>(incumbent.score));
+                         incumbentSaid);
             }
         }
     }
@@ -31514,6 +31604,39 @@ private:
         // something that can then never be sold, given away or traded.
         if (!(proto->AllowableClass & buyer->getClassMask()) && proto->Bonding == BIND_WHEN_PICKED_UP)
             return refuse("item is not for this class");
+
+        // AND `AllowableClass` IS NOT THE SAME QUESTION AS "CAN THIS CHARACTER
+        // HOLD IT" (#411). This was the other place in the module using the
+        // class mask as a proficiency proxy, and it fails for exactly the item
+        // that started that issue: a staff carries AllowableClass -1, which
+        // restricts nobody, so the gate above waves it through for a rogue who
+        // can never hold one. Whether a character may hold a weapon, or wear a
+        // grade of armour, is a SKILL that character either has or does not,
+        // recorded in character_skills and absent from item_template entirely.
+        //
+        // The test is the core's own, from the overload that actually makes it:
+        // `GetSkillValue(itemSkill) == 0` against ItemTemplate::GetSkill
+        // (PlayerStorage.cpp:2343-2367, ItemTemplate.h:782-815). Same rule the
+        // gear drive uses, so the two cannot drift.
+        //
+        // AND IT SAYS SO RATHER THAN REFUSING, which is the one place this
+        // treatment differs from the gear drive's, deliberately. A class mask
+        // is permanent - nothing a character can do makes an item its class was
+        // never given fit - so refusing on it costs nothing. A missing skill is
+        // NOT permanent: a warrior learns plate at 40, and a weapon master will
+        // teach a polearm to a character that walks up to one. Refusing here
+        // would turn "buy the thing they will train for" into an error, and
+        // this verb is an explicit instruction naming an exact entry rather
+        // than a judgement the module reached on its own. So the purchase goes
+        // through and the log carries the fact, which is what an operator
+        // reading back a row full of unwearable gear actually needs.
+        if (proto->Bonding == BIND_WHEN_PICKED_UP && proto->GetSkill() != 0 &&
+            buyer->GetSkillValue(proto->GetSkill()) == 0)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' is buying {}, which binds on pickup and needs a "
+                     "proficiency this character does not hold - it will not be wearable "
+                     "until that skill is trained, and cannot be sold or given away",
+                     buyer->GetName(), proto->Name1);
         if ((proto->HasFlag2(ITEM_FLAG2_FACTION_HORDE) && buyer->GetTeamId(true) == TeamId::TEAM_ALLIANCE) ||
             (proto->HasFlag2(ITEM_FLAG2_FACTION_ALLIANCE) && buyer->GetTeamId(true) == TeamId::TEAM_HORDE))
             return refuse("item is for the other faction");

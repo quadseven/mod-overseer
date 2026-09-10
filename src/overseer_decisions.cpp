@@ -1881,6 +1881,10 @@ constexpr int ARMOUR_SHIELD = 6;
 constexpr int INV_CLOAK = 16;
 constexpr int INV_TABARD = 19;
 constexpr int INV_BODY = 4;
+// A weapon that can go in the OFF HAND AND NOWHERE ELSE (#411). The core sends
+// this InventoryType straight to EQUIPMENT_SLOT_OFFHAND (PlayerStorage.cpp:
+// 191-194) and then refuses it there without dual wield (:2034-2038).
+constexpr int INV_WEAPON_OFF_HAND = 22;
 
 // Item level's whole remaining influence. See the header for why it is a
 // tiebreak and not an answer.
@@ -2167,6 +2171,106 @@ GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const
     return resolved;
 }
 
+// The core's own word for a weapon subclass. ItemTemplate.h:344-364, in its own
+// order, including the two the core itself only calls "exotic" and the one it
+// spells `obsolete`. NOTHING DECIDES ON THIS - it exists so a refusal reads as
+// "no proficiency with this weapon (staff)" rather than as a number, which is
+// the difference between a reader who can check the answer and one who cannot.
+std::string GearWeaponKindName(GearItem const& item)
+{
+    if (item.itemClass != CLASS_WEAPON)
+        return "";
+    switch (item.subClass)
+    {
+        case 0:  return "one-hand axe";
+        case 1:  return "two-hand axe";
+        case 2:  return "bow";
+        case 3:  return "gun";
+        case 4:  return "one-hand mace";
+        case 5:  return "two-hand mace";
+        case 6:  return "polearm";
+        case 7:  return "one-hand sword";
+        case 8:  return "two-hand sword";
+        case 10: return "staff";
+        case 13: return "fist weapon";
+        case 15: return "dagger";
+        case 16: return "thrown";
+        case 18: return "crossbow";
+        case 19: return "wand";
+        case 20: return "fishing pole";
+        default: return "";
+    }
+}
+
+GearUsability GearUsable(GearItem const& item, GearWearer const& who)
+{
+    GearUsability answer;
+
+    // THE CORE'S OWN ORDER, and the order is not cosmetic: each of these is
+    // final, and which one answers first is what the caller is told. See the
+    // header for what the two Player::CanUseItem overloads in the pinned core
+    // do and do not cover, and why `AllowableClass` alone is not this question.
+
+    // The class and race masks, plus whatever else the core refused it for.
+    if (!who.classAllowed)
+    {
+        answer.refusal = GearRefusal::WrongClass;
+        answer.why = "wrong class for this item";
+        return answer;
+    }
+
+    // TEMPORARY, AND THE SENTENCE SAYS SO. A character grows into this one, so
+    // it is told apart from the refusals that never change.
+    if (item.requiredLevel > who.level)
+    {
+        answer.refusal = GearRefusal::BelowRequiredLevel;
+        answer.why = "requires level " + std::to_string(item.requiredLevel);
+        return answer;
+    }
+
+    if (item.itemClass == CLASS_ARMOUR && !ArmourProficient(item, who, answer.why))
+    {
+        answer.refusal = GearRefusal::NoArmourProficiency;
+        return answer;
+    }
+
+    // #411, AND THE WHOLE OF IT. The staff carried no class restriction at all,
+    // so every gate above admits it; the only thing that refuses it is the
+    // weapon skill the character does not hold, which is nowhere on the item.
+    if (item.itemClass == CLASS_WEAPON && !who.weaponProficient)
+    {
+        answer.refusal = GearRefusal::NoWeaponProficiency;
+        std::string const kind = GearWeaponKindName(item);
+        answer.why = "no proficiency with this weapon";
+        if (!kind.empty())
+            answer.why += " (" + kind + ")";
+        return answer;
+    }
+
+    // AN ITEM WITH ONLY ONE HOME, AND A CHARACTER WHO CANNOT LIVE THERE.
+    // INVTYPE_WEAPONOFFHAND goes to the off hand and nowhere else
+    // (PlayerStorage.cpp:191-194), and the core refuses it there without dual
+    // wield (PlayerStorage.cpp:2034-2038). Refusing it HERE is what stops the
+    // drive scoring it against an off hand that only looks empty and then
+    // re-attempting the swap every poll for ever.
+    //
+    // INVTYPE_WEAPON is deliberately NOT refused: it has a main hand to go to,
+    // and the core already declines to offer the off-hand slot for one without
+    // dual wield, so a rule here could only take away an item the character can
+    // genuinely hold. A shield and an INVTYPE_HOLDABLE need no dual wield at
+    // all, which is why neither is named.
+    if (item.itemClass == CLASS_WEAPON && item.inventoryType == INV_WEAPON_OFF_HAND &&
+        !who.canDualWield)
+    {
+        answer.refusal = GearRefusal::NeedsDualWield;
+        answer.why = "an off-hand weapon, and this character cannot dual wield";
+        return answer;
+    }
+
+    answer.usable = true;
+    return answer;
+}
+
 GearVerdict GearScore(GearItem const& item, GearWearer const& who)
 {
     GearVerdict verdict;
@@ -2186,21 +2290,15 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
     verdict.judged = true;
     verdict.confidence = GearConfidence::Exact;
 
-    if (!who.classAllowed)
+    // ONE GATE, AND IT NAMES ITSELF (#411). Every refusal this file can make
+    // lives in GearUsable now, so a caller that wants to say why a character is
+    // not on a list has the answer in its hand rather than having to re-derive
+    // it - which is how the rogue ended up silently ON one.
+    GearUsability const may = GearUsable(item, who);
+    if (!may.usable)
     {
-        verdict.why = "wrong class for this item";
-        return verdict;
-    }
-    if (item.requiredLevel > who.level)
-    {
-        verdict.why = "requires level " + std::to_string(item.requiredLevel);
-        return verdict;
-    }
-    if (item.itemClass == CLASS_ARMOUR && !ArmourProficient(item, who, verdict.why))
-        return verdict;
-    if (item.itemClass == CLASS_WEAPON && !who.weaponProficient)
-    {
-        verdict.why = "no proficiency with this weapon";
+        verdict.why = may.why;
+        verdict.refusal = may.refusal;
         return verdict;
     }
 
@@ -2311,6 +2409,22 @@ GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
     else
         pair.confidence = GearConfidence::Exact;
     return pair;
+}
+
+std::string GearIncumbentSaid(GearIncumbentScore const& incumbent,
+                              bool emptiesTheOffHand, float offHandGiven)
+{
+    std::string said = std::to_string(static_cast<int>(incumbent.score));
+    if (!emptiesTheOffHand)
+        return said;
+
+    // SAY IT EVEN WHEN IT COSTS NOTHING. "Both hands, and the off hand is
+    // empty" is the sentence that tells a reader the off hand WAS looked at,
+    // which is exactly what nobody could tell from the number on its own.
+    if (offHandGiven <= 0.f)
+        return said + " for both hands, and the off hand was empty";
+    return said + " for both hands, " + std::to_string(static_cast<int>(offHandGiven)) +
+           " of it the off hand this would empty";
 }
 
 GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore const& worn)
