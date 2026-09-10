@@ -5625,7 +5625,293 @@ std::uint32_t GuardedLegsOn(FootReach const& reach,
     return guarded;
 }
 
+// What the guarded legs of one reached path are worth avoiding, summed (#400).
+// Deliberately the same unwind as GuardedLegsOn beside it rather than a second
+// walk of the chain: the count and the price are two readings of one path and
+// must never be able to describe different paths.
+float DetourWorthOn(FootReach const& reach,
+                    std::vector<float> const& edgeDetour,
+                    std::uint32_t entry, std::uint32_t goal)
+{
+    float worth = 0.f;
+    std::uint32_t at = goal;
+    while (at != entry)
+    {
+        float const leg = edgeDetour[reach.cameEdge[at]];
+        // A NEGATIVE PRICE IS NOT A DISCOUNT. Nothing should ever write one,
+        // and a sign typo that quietly SHRANK the budget would be invisible in
+        // every log line this produces, so it is refused here rather than
+        // trusted upstream. Same rule the link-cost loop already applies to
+        // `link.yards`.
+        if (leg > 0.f)
+            worth += leg;
+        at = reach.came[at];
+    }
+    return worth;
+}
+
+// ------------------------------ the ground's own price, in yards (#400) --
+
+// HOW MUCH OF ONE SEGMENT LIES INSIDE ONE CIRCLE. The whole of the exposure
+// measurement, and it is exact rather than sampled: the quadratic below is the
+// standard segment-against-circle intersection, solved on the segment's own
+// parameter and clamped to it, so a circle that swallows the segment scores its
+// full length and one the segment merely clips scores the clipped part.
+//
+// Doubles inside for the same reason PlaneDistance uses them: the coordinates
+// are world positions in the thousands and the radii are tens, so the
+// difference of squares loses most of its significant figures in float.
+float SegmentInsideCircle(RoutePoint const& from, RoutePoint const& to,
+                          float cx, float cy, float radius)
+{
+    if (!(radius > 0.f))
+        return 0.f;
+    double const dx = static_cast<double>(to.x) - static_cast<double>(from.x);
+    double const dy = static_cast<double>(to.y) - static_cast<double>(from.y);
+    double const a = dx * dx + dy * dy;
+    // A zero-length segment has no ground on it. Two identical waypoints are
+    // ordinary in a surveyed leg and are not an error.
+    if (!(a > 0.0))
+        return 0.f;
+    double const fx = static_cast<double>(from.x) - static_cast<double>(cx);
+    double const fy = static_cast<double>(from.y) - static_cast<double>(cy);
+    double const b = 2.0 * (fx * dx + fy * dy);
+    double const c = fx * fx + fy * fy -
+                     static_cast<double>(radius) * static_cast<double>(radius);
+    double const disc = b * b - 4.0 * a * c;
+    // Tangent counts as a miss: a path that grazes a circle at one point
+    // crosses no ground inside it.
+    if (!(disc > 0.0))
+        return 0.f;
+    double const root = SquareRoot(disc);
+    double t0 = (-b - root) / (2.0 * a);
+    double t1 = (-b + root) / (2.0 * a);
+    if (t0 < 0.0)
+        t0 = 0.0;
+    if (t1 > 1.0)
+        t1 = 1.0;
+    if (t1 <= t0)
+        return 0.f;
+    return static_cast<float>((t1 - t0) * SquareRoot(a));
+}
+
+// How near one segment comes to one point. Only ever used for the log line's
+// "how close did it get", so it answers in yards and not in squares.
+float SegmentDistance(RoutePoint const& from, RoutePoint const& to,
+                      float cx, float cy)
+{
+    double const dx = static_cast<double>(to.x) - static_cast<double>(from.x);
+    double const dy = static_cast<double>(to.y) - static_cast<double>(from.y);
+    double const a = dx * dx + dy * dy;
+    if (!(a > 0.0))
+        return PlaneDistance(from.x, from.y, cx, cy);
+    double const fx = static_cast<double>(cx) - static_cast<double>(from.x);
+    double const fy = static_cast<double>(cy) - static_cast<double>(from.y);
+    double t = (fx * dx + fy * dy) / a;
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 1.0)
+        t = 1.0;
+    double const nx = static_cast<double>(from.x) + t * dx;
+    double const ny = static_cast<double>(from.y) + t * dy;
+    return PlaneDistance(static_cast<float>(nx), static_cast<float>(ny), cx, cy);
+}
+
 }  // namespace
+
+float AggroRadiusYards(std::uint32_t creatureLevel, std::uint32_t playerLevel,
+                       float detectionRange, float aggroRate)
+{
+    // Creature.cpp:3407 - the core answers 0 for a rate of 0 before it reads
+    // anything else, and a negative rate is a configuration nobody meant.
+    if (!(aggroRate > 0.f))
+        return 0.f;
+    // Creature.cpp:3421 - `if (aggroRadius < 1) return 0.0f;`, asked of the
+    // detection range BEFORE the level term, which is why it is asked here and
+    // not of the result.
+    if (!(detectionRange >= 1.f))
+        return 0.f;
+
+    // Creature.cpp:3410-3416. See the header on the swapped local names
+    // upstream: the quantity is player minus creature.
+    std::int32_t levelDiff =
+        static_cast<std::int32_t>(playerLevel) - static_cast<std::int32_t>(creatureLevel);
+    if (levelDiff < -25)
+        levelDiff = -25;
+
+    float radius = detectionRange - static_cast<float>(levelDiff);
+    // Creature.cpp:3434, MAX_AGGRO_RADIUS at Unit.h:44.
+    if (radius > 45.f)
+        radius = 45.f;
+    // Creature.cpp:3439-3442. The pet floor of 10 is not reproduced: nothing
+    // this module routes past is a pet, and a branch with no caller is a branch
+    // nobody maintains.
+    if (radius < 5.f)
+        radius = 5.f;
+    return radius * aggroRate;
+}
+
+std::uint32_t GreyLevel(std::uint32_t playerLevel)
+{
+    // Formulas.h `Acore::XP::GetGrayLevel`, branch for branch.
+    if (playerLevel <= 5)
+        return 0;
+    if (playerLevel <= 39)
+        return playerLevel - 5 - playerLevel / 10;
+    if (playerLevel <= 59)
+        return playerLevel - 1 - playerLevel / 5;
+    return playerLevel - 9;
+}
+
+ConBand ConBandOf(std::uint32_t playerLevel, std::uint32_t creatureLevel)
+{
+    // SIGNED THROUGHOUT, because `playerLevel - 2` on an unsigned level 1
+    // character is four billion and would read every creature in the world as
+    // yellow. The core writes this against uint8 where the same trap exists and
+    // is dodged only by the order of its branches; this does not rely on that.
+    std::int32_t const pl = static_cast<std::int32_t>(playerLevel);
+    std::int32_t const mob = static_cast<std::int32_t>(creatureLevel);
+
+    // Not in Formulas.h. See the header: this is the client's `??`, at the same
+    // gap CON_COLOR_UNKNOWN_LEVEL_DIFF has meant in this module since #326.
+    if (mob >= pl + 10)
+        return ConBand::Skull;
+    // Formulas.h `GetColorCode`, edges included.
+    if (mob >= pl + 5)
+        return ConBand::Red;
+    if (mob >= pl + 3)
+        return ConBand::Orange;
+    if (mob >= pl - 2)
+        return ConBand::Yellow;
+    if (mob > static_cast<std::int32_t>(GreyLevel(playerLevel)))
+        return ConBand::Green;
+    return ConBand::Grey;
+}
+
+char const* ConBandName(ConBand band)
+{
+    switch (band)
+    {
+        case ConBand::Grey:   return "grey";
+        case ConBand::Green:  return "green";
+        case ConBand::Yellow: return "yellow";
+        case ConBand::Orange: return "orange";
+        case ConBand::Red:    return "red";
+        case ConBand::Skull:  return "skull";
+    }
+    return "unknown";
+}
+
+float ConBandWeight(ConBand band)
+{
+    switch (band)
+    {
+        // THE ONE THAT MATTERS. Grey is free, so a party that has outgrown a
+        // stretch of ground pays nothing to walk it and the planner is returned
+        // to pure distance without a special case saying so.
+        case ConBand::Grey:   return 0.f;
+        case ConBand::Green:  return 0.25f;
+        case ConBand::Yellow: return 1.f;
+        case ConBand::Orange: return 2.f;
+        case ConBand::Red:    return 4.f;
+        case ConBand::Skull:  return 8.f;
+    }
+    return 0.f;
+}
+
+bool SpawnCanAggro(DangerSpawn const& spawn)
+{
+    // #302's three unit_flags, already answered by the adapter's CanBeFought so
+    // this rule and the shipped guarded-ground reading cannot drift apart.
+    if (!spawn.canBeFought)
+        return false;
+    // CREATURE_FLAG_EXTRA_TRIGGER, CreatureData.h:53.
+    if (spawn.trigger)
+        return false;
+    // CREATURE_FLAG_EXTRA_CIVILIAN, CreatureData.h:47. `Creature::CanStartAttack`
+    // opens with this refusal, ahead of faction, level, distance and line of
+    // sight, so a civilian is not a quiet threat: it is not a threat.
+    if (spawn.civilian)
+        return false;
+    return true;
+}
+
+GroundDanger ScoreGroundDanger(std::vector<DangerSpawn> const& spawns,
+                               std::vector<RoutePoint> const& path,
+                               std::vector<std::uint32_t> const& partyLevels,
+                               DangerLimits const& limits)
+{
+    GroundDanger out;
+    // NONSENSE LIMITS SCORE NOTHING RATHER THAN BEING CLAMPED, the same refusal
+    // PlanFootRoute makes of its own: a sign typo must not quietly become a rule
+    // more permissive than the one written, and here "scores nothing" means the
+    // route keeps today's distance-only answer, which is the safe direction.
+    if (!(limits.aggroRate > 0.f) || !(limits.yardsPerExposedYard >= 0.f) ||
+        !(limits.maxDetourYards >= 0.f))
+        return out;
+    // There is no ground between one point and itself.
+    if (path.size() < 2 || spawns.empty())
+        return out;
+
+    // THE LOWEST MEMBER, AND A ZERO IS NOT A MEMBER. See the header: the lowest
+    // carries both halves of the question, and a level 0 is a row that has not
+    // been read.
+    std::uint32_t lowest = 0;
+    for (std::uint32_t level : partyLevels)
+        if (level && (!lowest || level < lowest))
+            lowest = level;
+    if (!lowest)
+        return out;
+
+    for (DangerSpawn const& spawn : spawns)
+    {
+        if (!SpawnCanAggro(spawn))
+            continue;
+
+        ConBand const band = ConBandOf(lowest, spawn.level);
+        float const weight = ConBandWeight(band);
+        // Grey costs nothing and is skipped before the geometry rather than
+        // after it, so the common case of a road lined with wildlife the party
+        // has outgrown is also the cheap case.
+        if (!(weight > 0.f))
+            continue;
+
+        float const radius = AggroRadiusYards(spawn.level, lowest,
+                                              spawn.detectionRange, limits.aggroRate);
+        if (!(radius > 0.f))
+            continue;
+
+        float inside = 0.f;
+        float closest = -1.f;
+        for (std::size_t i = 0; i + 1 < path.size(); ++i)
+        {
+            inside += SegmentInsideCircle(path[i], path[i + 1], spawn.x, spawn.y, radius);
+            float const gap = SegmentDistance(path[i], path[i + 1], spawn.x, spawn.y);
+            if (closest < 0.f || gap < closest)
+                closest = gap;
+        }
+        // A spawn whose circle the path never enters is not on this ground. It
+        // may be five yards past the end of the leg and it is the next leg's
+        // business, which is the whole reason legs are marked one at a time.
+        if (!(inside > 0.f))
+            continue;
+
+        ++out.spawns;
+        out.exposedYards += inside;
+        out.detourYards += inside * weight;
+        if (spawn.level > out.worstLevel)
+            out.worstLevel = spawn.level;
+        if (band > out.worstBand)
+            out.worstBand = band;
+        if (out.closestYards < 0.f || closest < out.closestYards)
+            out.closestYards = closest;
+    }
+
+    out.detourYards *= limits.yardsPerExposedYard;
+    if (out.detourYards > limits.maxDetourYards)
+        out.detourYards = limits.maxDetourYards;
+    return out;
+}
 
 RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                         std::vector<RouteLink> const& links,
@@ -5688,6 +5974,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     std::vector<std::uint32_t> edgeTo;
     std::vector<float> edgeCost;
     std::vector<bool> edgeGuarded;
+    std::vector<float> edgeDetour;
     // Nothing marked means nothing to go round, and then the second search
     // below is not run at all. That is not only an economy: it is what makes
     // "a journey with no guarded leg gets today's answer, for today's cost"
@@ -5710,6 +5997,11 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
         edgeTo.push_back(to->second);
         edgeCost.push_back(link.yards);
         edgeGuarded.push_back(link.guardedGround);
+        // WHAT THIS LEG IS WORTH AVOIDING (#400), carried beside the flag and
+        // read only where the flag already selected the leg. A price on an
+        // unflagged leg is not an error and is simply never reached, because
+        // the budget below is summed over the guarded legs of the plan.
+        edgeDetour.push_back(link.detourWorthYards);
         anyGuarded = anyGuarded || link.guardedGround;
     }
 
@@ -5759,7 +6051,32 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     std::uint32_t guardedOnPlan = GuardedLegsOn(straight, edgeGuarded, entry, goal);
     if (anyGuarded && guardedOnPlan > 0)
     {
-        float const reach = straight.best[goal] + goalDistance;
+        // AND THE ONE RULE #400 CHANGES: THE GUARDS COST SOMETHING NOW.
+        //
+        // Until this line the comparison below was `round <= through`, in pure
+        // yards, so a way round was taken only when it was NOT ONE YARD LONGER
+        // than the way through the guard post. That is a real rule and it is
+        // backwards: it treats a yard of open Barrens and a yard inside five
+        // level 40 guards as the same yard, and this family walked the second
+        // kind repeatedly because it was the shorter kind.
+        //
+        // The budget is what the guarded legs of the way through are worth
+        // avoiding, in yards, summed off RouteLink::detourWorthYards, which the
+        // caller measured with ScoreGroundDanger against the party's own
+        // levels. So the trade is now: GO ROUND WHEN GOING ROUND COSTS LESS
+        // THAN GOING THROUGH PLUS WHAT GOING THROUGH COSTS THE PARTY. A level
+        // 40 guard post is worth thousands of yards to a party of 28 and
+        // exactly zero to a party of 60, because every band of it is grey to
+        // the second one, and at zero this whole expression collapses back to
+        // the comparison that was here before.
+        //
+        // WHICH IS ALSO WHY NOTHING ELSE IN THIS FUNCTION MOVES. An unmeasured
+        // graph prices every leg at zero, the budget is zero, and the plan is
+        // byte for byte the plan this planner produced before #400 existed.
+        // That is a property of the arithmetic rather than a claim about it.
+        float const budget = DetourWorthOn(straight, edgeDetour, entry, goal);
+        plan.detourBudgetYards = budget;
+        float const reach = straight.best[goal] + goalDistance + budget;
         WalkOnFoot(firstEdge, edgeTo, edgeCost, edgeGuarded, true, entry, round);
         std::uint32_t roundGoal = entry;
         float roundDistance = -1.f;
