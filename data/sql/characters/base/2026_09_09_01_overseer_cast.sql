@@ -1,0 +1,158 @@
+-- Make a character cast a spell it already knows, through the game's own
+-- handler, and read the world back afterwards (#408).
+--
+-- THE HOLE THIS FILLS, AND HOW IT WAS FOUND. Nothing in this module could make
+-- a character cast. The queue carried sixteen kinds and not one of them was a
+-- cast. `kind='bot'` looked like it was and never was: it is the drain's
+-- fall-through into PlayerbotAI::HandleCommand, and every row of that kind this
+-- realm has ever carried is a strategy toggle - `nc +follow`, `co +flee`,
+-- `nc +stay`, `nc -mount`, `nc +new rpg`.
+--
+-- Two rows were sent through it on 2026-09-09 to find out: `cast portal:
+-- stormwind` and `cast 10059`. Both came back `delivered`. Neither cast
+-- anything. The reason is three lines of the drain, and it is worth writing out
+-- because the same shape can be built again by accident:
+--
+--   * ParseStrategyChange splits on the first space and returns false for any
+--     first word that is not `nc` or `co`, so `checkable` is false;
+--   * the raw string is handed to PlayerbotAI::HandleCommand anyway, where
+--     upstream has no `cast` command and drops it with no feedback of any kind;
+--   * with no post-condition to read, the drain writes `delivered`.
+--
+-- The one thing the module DID say is a `handed command ... no post-condition
+-- to read back` line, which is true and is not about a cast. So the row was
+-- accepted, nothing happened, and the queue reported success. That is precisely
+-- the failure AGENTS.md has a paragraph about, arriving through the one verb
+-- with nothing to read back.
+--
+-- WHY THIS IS WORTH A VERB AND NOT A WORKAROUND. #395 enumerated every mechanic
+-- in the pinned build that moves a character from map 1 to map 0 and found this
+-- roster has none: no areatrigger on map 1 targets map 0, no `flightPath` link
+-- in the playerbots travel graph crosses, the ship crossings are out by
+-- standing rule, and the cheapest summon in the world data - the meeting stone,
+-- entry 179944, `reqParticipants = 2` - needs two grouped bodies on the far
+-- side when only one character can self-cross. Its own recommendation, cheapest
+-- first, was levels on the party's mage to buy Portal: Stormwind, spell 10059,
+-- whose created object is party only and therefore carries the whole roster in
+-- one cast. Those levels have since been earned and the spell is known. The
+-- cast was the last missing piece, and there is no legitimate substitute for
+-- it: an operator command that teleports is exactly the shortcut AGENTS.md
+-- refuses, and the whole reason this verb exists is that the honest path did
+-- not.
+--
+-- HOW THE CAST GOES OUT, AND WHY IT IS A PACKET. CMSG_CAST_SPELL driven into
+-- WorldSession::HandleCastSpellOpcode, the same way kind='hearth' drives
+-- CMSG_USE_ITEM. Read at the pinned core SHA, that handler does three things
+-- this verb wants and could not get any other way:
+--
+--   * it refuses a spell the character does not have in its spellbook, and a
+--     passive one, by returning with no feedback at all (SpellHandler.cpp:444).
+--     The executor asks both questions itself first so that a row can NAME
+--     them rather than time out;
+--   * it parks the packet on Player::SpellQueue when the cast cannot run yet
+--     (SpellHandler.cpp:423) rather than failing, which is a wait and not a
+--     wall. kind='hearth' already reads that deque back for the same reason;
+--   * it ends in Spell::prepare (SpellHandler.cpp:548), so Spell::CheckCast
+--     runs in full. The reagent, the power cost, the range, the mount, the
+--     movement and the cooldown are all the CORE's answers, and
+--     Spell::TakeReagents is what removes the Rune of Portals. Nothing in this
+--     module imitates any of that, and nothing in it can cast a spell a
+--     character has not got.
+--
+-- NOT PlayerbotAI::CastSpell, which is what kind='conjure' uses. That verb has
+-- a specific reason recorded in its own migration: upstream's
+-- CastConjureFoodAction ends in the same call, so a row and the bot's own
+-- trigger exercise ONE cast path rather than two that can drift apart. There is
+-- no upstream action for an arbitrary spell id, so the argument does not carry
+-- over, and the handler is both the more honest target and the one that runs
+-- the spellbook check.
+--
+-- WHY A CAST CANNOT BE ANSWERED BY THE POLL THAT SENT IT. Nothing has happened
+-- when the call returns: the spell is preparing, with a timer the world tick
+-- decrements, and Portal: Stormwind is a ten second cast at this build. Reading
+-- the world back inside the call - which is what kind='sell', kind='repair' and
+-- kind='mail' all do - would look for a portal that does not exist yet and be
+-- right, ten seconds too early. So the row parks in `verifying` exactly as
+-- kind='hearth' does, and the verdict comes from the world when the window is
+-- up.
+--
+-- WHAT THE POST-CONDITION IS, WHICH DEPENDS ON THE SPELL AND IS READ OFF THE
+-- SPELL. There is no list of spell ids anywhere in this verb:
+--
+--   * a spell that CREATES AN OBJECT carries SPELL_EFFECT_TRANS_DOOR. The
+--     core's Spell::EffectTransmitted stamps the created object with the
+--     caster's guid (SpellEffects.cpp:5489) and the spell's id (:5491), so the
+--     read-back is an exact match on both and needs no hardcoded entry. Verdict
+--     `made`, or `nothing`.
+--   * a spell that MOVES THE CASTER carries SPELL_EFFECT_TELEPORT_UNITS. The
+--     read-back is the character's map and position. A different map is a move
+--     whatever the coordinates say, which matters here rather than being
+--     pedantry: this family is split across two continents that share a
+--     coordinate space. Verdict `moved`, or `nothing`.
+--   * anything else is judged on WHAT THE CAST COST: a reagent gone from the
+--     bags, power spent, or the spell's own cooldown now running. All three are
+--     taken by a cast that completed and by nothing else. Verdict `spent`, or
+--     `nothing`.
+--   * a free instant spell with no cooldown leaves no trace this module can
+--     read, so no reading afterwards separates a cast that worked from one that
+--     never started. That row is `unreadable` and says so. It is deliberately
+--     NOT `nothing`, which would be asserting a failure nobody measured.
+--
+-- NO PATH WRITES `delivered`, which is the whole point of the issue.
+--
+-- THE CAST HOLD IS REUSED AND NOT REINVENTED. A ten second cast at a walking,
+-- sitting or mounted character never starts, and all three of those are silent
+-- refusals inside Spell::CheckCast (Spell.cpp:3560 for movement, Spell.cpp:6018
+-- for the mount) reported to a client a bot has not got. So the executor places
+-- the same hold kind='hearth' and kind='summon' place, with the verb string
+-- `cast`, in the same breath as the packet. The row's verify window is capped
+-- BELOW the hold register's own ceiling, because a window that outlived its
+-- hold would end with the expiry sweep handing the character back mid-cast.
+--
+-- Column re-use, no new columns:
+--   target_name  the character that will cast
+--   command      `<spell id>`, optionally ` on:self` or ` on:<name>`. There is
+--                deliberately no way to name a spell by NAME: a name is a
+--                localisation and says nothing about which rank, which is the
+--                same argument the conjure migration makes about upstream's own
+--                name matching.
+--   target_arg   unused
+--   detail       short refusal literal, or empty
+--   result       JSON: outcome (casting|made|moved|spent|nothing|refused|
+--                unreadable), reason, retry (never|elsewhere|later - see
+--                CastRefusalRetry in overseer_decisions.h), character, spell,
+--                target, cast_ms, window_ms, waited_ms, what the spell was
+--                expected to do, the object it made if it made one (guid,
+--                entry, type, the spell that object casts, party_only and its
+--                position), reagent and power before and after, the cast hold,
+--                from and now, request
+--   status       'verifying' from the moment the packet goes out, then
+--                'applied', 'unchanged' or 'error'. NOT 'delivered', for the
+--                reason kind='hearth' is not.
+--
+-- NO STATUS VALUES ARE ADDED. 'verifying', 'applied' and 'unchanged' have been
+-- in the status enum since 2026_08_24_04_overseer_outcome.sql and mean here
+-- exactly what they mean there. This migration touches one column.
+--
+-- WHAT THIS VERB DOES NOT DO, said here so nobody reads a promise into it.
+-- It does not click the portal it creates. Four characters still have to walk
+-- into range and click, and this module has the machinery for that - the object
+-- is `gameobject_template` entry 176296, `type = 22`
+-- (GAMEOBJECT_TYPE_SPELLCASTER), which IS in GameObject::Use's switch, and
+-- DriveGameObjectUse already sends CMSG_GAMEOBJ_USE. That is a separate verb
+-- and a separate change. What this row does instead is report the created
+-- object's guid, entry, type, the spell it casts and its position, so the
+-- clicks can be driven by hand in the meantime.
+--
+-- THE ENUM LISTS THE FULL UNION, for the reason the bind, repair, buy, hearth,
+-- summon and conjure migrations all spell out: parallel branches are adding
+-- values, an ALTER that MODIFYs an ENUM replaces the whole list rather than
+-- adding to it, and the base CREATE TABLE is `IF NOT EXISTS` so it can never
+-- add one. So the migration that runs LAST owns naming every value that exists
+-- by then, and one that lands later and forgets a value DELETES that verb from
+-- the schema silently, after which every row of that kind fails to insert.
+-- 'conjure' is last in the list below because it was the last one added; the
+-- order inside the ENUM is not meaningful and the completeness of the list is.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon','conjure','cast')
+        NOT NULL DEFAULT 'bot';
