@@ -4923,6 +4923,18 @@ public:
         {
             _dungeonRunTimer = 0;
             DriveDungeonRun();
+            // ON THE COORDINATOR'S OWN CLOCK AND IMMEDIATELY AFTER IT, sharing
+            // this timer rather than adding another - the same choice
+            // DriveHomeBind and DriveStuckRevival each made, and here it is not
+            // a preference but the contract this drive's escorts live under.
+            // SweepDungeonEscorts runs as DriveDungeonRun's FIRST statement and
+            // ends any escort the previous poll did not re-mark, so a town trip
+            // marking on the thirty-second party clock would have every walk it
+            // started ended five seconds later. AFTER rather than before, so a
+            // run that opened on this very tick has already set its phase and
+            // the trip hands the party straight back instead of steering it for
+            // one poll alongside the coordinator.
+            DriveTownTrip();
         }
         // AND THE TRAVEL DRIVE POLLS FASTER WHILE A RUN IS ESCORTING (#122).
         //
@@ -24182,6 +24194,648 @@ private:
 
         EndRepairLeg(coord, members);
     }
+
+    // ------------------- the town trip, owed by a need rather than a phase --
+    //
+    // WHAT WAS MEASURED, OFF THE WHOLE COMMAND HISTORY. sell: 17200 "vendor not
+    // in range" against 1608 delivered. repair: 47 "repairer not in range"
+    // against 15. The auction leg has never written a row at all, and no flight
+    // node has ever been learned. Those are one fault: DoSell sweeps the
+    // creatures around wherever the character is already standing, DoRepair does
+    // the same over 30 yards, and NOTHING WALKS THE CHARACTER TO THE COUNTER. A
+    // live test settles it - a repair vendor 47 yards off, four repair commands,
+    // all four refused inside one second.
+    //
+    // #397 BUILT THE WALK AND SCOPED IT TO ONE PHASE. DriveRepairLeg above is
+    // driven only from DungeonRunPhase::Repairing, which is reached only when a
+    // run closes. The family is grinding rather than running dungeons, so that
+    // phase is never entered, and the walk that exists has never run. Everything
+    // that leg decides is right; the mistake is that a phase of a run is the only
+    // thing able to ask for it.
+    //
+    // SO THIS IS THE SAME MACHINERY WITH THE TRIGGER MOVED OFF THE PHASE AND ONTO
+    // THE NEED, AND THE DESTINATION GENERALISED FROM A REPAIRER TO ANY COUNTER.
+    // Nothing here is new except who asks: the aim is the role keyword
+    // ResolveTravelTarget already narrows to counters this character may interact
+    // with (#234), away from ones in hostile ground (#267) and away from routes
+    // that sample lethal; the last few yards and the standing still are
+    // CounterArrivalStep's hold (#378, #402); the repair is DoRepair, called
+    // rather than copied.
+    //
+    // AND THE FAMILY TRAVELS AS A FAMILY, WHICH IS THE HALF A HAND TEST PROVED
+    // WAS MISSING. Aiming the leader at a repair vendor 154 yards away worked -
+    // he arrived. The other four ended up between 945 and 2,184 yards behind and
+    // never arrived at all. Aiming all five independently is five walks. So on
+    // the JOURNEY only the leader is aimed, and the family is brought by the
+    // regroup wait and the catch-up walk that already exist (#404): nothing here
+    // re-implements following or takes a second opinion about a gap. Only once
+    // the leader is standing at the counter is every member aimed, and that is a
+    // walk of tens of yards from where the family is already standing, needed
+    // because the catch-up hands back at FOLLOW_CATCH_UP_DONE_YARDS and the
+    // core's interact gate is five and a half.
+    //
+    // WHAT IT DOES NOT DO, AND THE REFUSAL IS DELIBERATE. It does not choose what
+    // to sell. DoSell's own comment gives the reason at length: what counts as
+    // junk depends on all five bag lists, the professions and the quest logs at
+    // once, and that rule lives in the bridge outside the worldserver. A second
+    // copy of it compiled into a module nobody can watch would disagree with the
+    // first, silently, from inside the world. So at a vendor, a banker or an
+    // auctioneer this trip PUTS THE CHARACTER THERE AND KEEPS IT THERE, and the
+    // rows that have been failing for want of five and a half yards land while it
+    // stands. That is what TownVisitStep's dwell is.
+    static constexpr OverseerDecisions::TownTripLimits TOWN_TRIP_LIMITS{
+        // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds
+        3, 1, 15 * 60, 20 * 60, 60};
+
+    // The role keyword ResolveTravelTarget takes, for the counter this trip is
+    // going to. NOT a creature name and never one: an aim that is a name is
+    // accepted, matches no spawn, and is released with "there is no such spawn on
+    // map N", which is #398 and is how 47 of the 67 repair rows died.
+    static char const* TownTripAimFor(OverseerDecisions::CounterRole role)
+    {
+        switch (role)
+        {
+            case OverseerDecisions::CounterRole::Repairer:   return "repair";
+            case OverseerDecisions::CounterRole::Vendor:     return "vendor";
+            case OverseerDecisions::CounterRole::Banker:     return "banker";
+            case OverseerDecisions::CounterRole::Auctioneer: return "auctioneer";
+            case OverseerDecisions::CounterRole::None:       break;
+        }
+        return "";
+    }
+
+    // Everything one poll needs to know about one member, taken with the SAME
+    // functions the executors use at the other end of the trip so that "damaged"
+    // and "in reach" cannot come to mean two things.
+    //
+    // ReadRepairNeed IS ALREADY CORRECT ABOUT THE ITEMS THAT CANNOT WEAR, and
+    // that is worth saying because a reading taken outside this module was not: a
+    // query counting durability = 0 counts shirts, rings, amulets, trinkets and
+    // most cloaks, which ship with MaxDurability 0 and read zero for ever. It
+    // reported four broken items on a character whose every wearable item was at
+    // full. ReadCarriedDurability returns early on a zero maximum, so every count
+    // that reaches a decision here is over the slots that can actually wear.
+    OverseerDecisions::TownNeed ReadTownNeed(Player* bot)
+    {
+        OverseerDecisions::TownNeed need;
+        if (!SteerableAI(bot) || !bot->IsInWorld())
+            return need;
+        need.present = true;
+        uint32 damaged = 0;
+        uint32 broken = 0;
+        ReadRepairNeed(bot, damaged, broken);
+        need.damagedItems = damaged;
+        need.brokenItems = broken;
+        need.freeBagSlots = CountFreeBagSlots(bot);
+        return need;
+    }
+
+    // Said once per member per reason, the same discipline SayRepairLegOnce and
+    // SayHomeBindOnce keep: a walk to a town is minutes of five-second polls, and
+    // a line carrying live counts would otherwise be printed sixty times.
+    bool SayTownTripOnce(std::string const& name, std::string const& why)
+    {
+        auto const it = _townTripSaid.find(name);
+        if (it != _townTripSaid.end() && it->second == why)
+            return false;
+        _townTripSaid[name] = why;
+        return true;
+    }
+
+    // THE TRIP IS FINISHED WITH THIS MEMBER, whichever of the ways it got there.
+    // Ended HERE rather than at the sweep, the discipline EndHomeEscort keeps: a
+    // lease held thirty seconds longer than it is wanted is thirty seconds of a
+    // follower that could be following.
+    void SettleTownTripMember(std::string const& name)
+    {
+        _townTripSettled.insert(name);
+        if (HasCounterHold(name))
+            ReleaseCounterHold(name, "the town trip is finished with it");
+        _travelAims.Release(name);
+    }
+
+    // Everything the trip claimed, handed back in one place so that every way out
+    // of it lets go of the same things - and the cooldown starts HERE, at the end
+    // of a trip rather than at the start of one, so a trip that ran its whole
+    // bound is not immediately followed by another.
+    void EndTownTrip(std::vector<std::string> const& members, char const* why)
+    {
+        if (!_townTripActive)
+            return;
+        for (std::string const& name : members)
+        {
+            // EVERY MEMBER GETS EXACTLY ONE READING PER TRIP, INCLUDING THE ONES
+            // THE TRIP FAILED. A member settled at the counter already has its
+            // row; one still walking, still following, or standing when the bound
+            // fired has none, and "the family went to town and this character
+            // came back with nothing changed" is precisely the fact seventeen
+            // thousand refusals never put in a table.
+            if (!_townTripSettled.count(name))
+                ProveAndRecordTownTrip(name, ObjectAccessor::FindPlayerByName(name));
+            if (HasCounterHold(name))
+                ReleaseCounterHold(name, why);
+            _travelAims.Release(name);
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: the town trip to a '{}' is over after {}s - {}",
+                 TownTripAimFor(_townTripRole),
+                 uint32(_townTripSince ? std::time(nullptr) - _townTripSince : 0), why);
+        _townTripActive = false;
+        _townTripRole = OverseerDecisions::CounterRole::None;
+        _townTripSince = 0;
+        _townTripEndedAt = std::time(nullptr);
+        _townTripLeader.clear();
+        _townTripSettled.clear();
+        _townTripSaid.clear();
+        _townTripStoodSince.clear();
+        _townTripBefore.clear();
+        _townTripCopperBefore.clear();
+    }
+
+    // WHAT THE TRIP PROVED ABOUT ONE MEMBER, READ OFF THE WORLD AND NOT OFF A
+    // ROW. `delivered` is not `done` anywhere in this module and it is doubly not
+    // here: DoRepair writes the same EMPTY detail whether it left nothing damaged
+    // or half a set, and a sell row says nothing at all about whether the bags
+    // are habitable afterwards. So the same four numbers are read at both ends
+    // and ProveTownTrip says which of the five things happened.
+    //
+    // THE ROW IS WRITTEN FOR A TRIP THAT ACHIEVED NOTHING EXACTLY AS FOR ONE THAT
+    // WORKED. "The family stood at the counter and nothing happened" is the fact
+    // seventeen thousand refusals never produced, and it is the one an operator
+    // needs in a table.
+    void ProveAndRecordTownTrip(std::string const& name, Player* bot)
+    {
+        auto const beforeIt = _townTripBefore.find(name);
+        if (beforeIt == _townTripBefore.end())
+            return;
+
+        OverseerDecisions::TownNeed const after = ReadTownNeed(bot);
+        uint64 const copperBefore = _townTripCopperBefore.count(name)
+                                        ? _townTripCopperBefore[name]
+                                        : uint64(0);
+        uint64 const copperAfter = bot ? uint64(bot->GetMoney()) : uint64(0);
+
+        OverseerDecisions::TownTripProof const proof = OverseerDecisions::ProveTownTrip(
+            beforeIt->second, after, copperBefore, copperAfter);
+
+        std::ostringstream detail;
+        detail << TownTripAimFor(_townTripRole) << ": "
+               << OverseerDecisions::TownTripProofWord(proof) << "; "
+               << beforeIt->second.damagedItems << " damaged ("
+               << beforeIt->second.brokenItems << " at zero) and "
+               << beforeIt->second.freeBagSlots << " free slots before, "
+               << after.damagedItems << " (" << after.brokenItems << ") and "
+               << after.freeBagSlots << " after; purse " << copperBefore << " to "
+               << copperAfter;
+        RecordEvent(bot, "town_trip", uint32(proof), name, detail.str());
+
+        // THE ACCEPTANCE LINE, AND IT IS ASKED OF THE GEAR THAT CAN WEAR. "No
+        // item at durability 0" is a criterion that can never pass, because four
+        // of the leader's thirteen equipped items read zero for ever and always
+        // will. "Nothing with a maximum is below it" is the same sentence written
+        // so that it can.
+        if (proof == OverseerDecisions::TownTripProof::NothingHappened)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' stood at the '{}' the town trip walked it to and "
+                     "NOTHING CHANGED - {} damaged item(s), {} free bag slot(s) and {} "
+                     "copper, the same at both ends. The walk worked and the transaction "
+                     "did not, which is the half this trip cannot do for itself: it holds "
+                     "the character in range and the rows have to arrive",
+                     name, TownTripAimFor(_townTripRole), after.damagedItems,
+                     after.freeBagSlots, copperAfter);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is {} after the town trip to a '{}' - {} damaged "
+                     "item(s) against {} before, {} free bag slot(s) against {}, purse {} "
+                     "against {}. Nothing it carries that can wear is below its maximum: "
+                     "{}",
+                     name, OverseerDecisions::TownTripProofWord(proof),
+                     TownTripAimFor(_townTripRole), after.damagedItems,
+                     beforeIt->second.damagedItems, after.freeBagSlots,
+                     beforeIt->second.freeBagSlots, copperAfter, copperBefore,
+                     OverseerDecisions::TownTripMemberAccepted(after) ? "yes" : "NO");
+    }
+
+    // A COUNTER THIS MODULE DOES NOT TRANSACT AT: stand there, and be finished
+    // when the visit has been long enough. Returns true when the trip is done
+    // with this member.
+    bool VisitTheCounter(std::string const& name, Player* bot)
+    {
+        if (!_townTripStoodSince.count(name))
+        {
+            _townTripStoodSince[name] = std::time(nullptr);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is standing at the '{}' the town trip walked it to, "
+                     "and is held there for {}s so the rows that have been refusing with "
+                     "'not in range' find it in range. This module does not choose what to "
+                     "sell - that decision is the bridge's, and always was; what was "
+                     "missing was the character being here when it arrives",
+                     name, TownTripAimFor(_townTripRole),
+                     uint32(TOWN_TRIP_LIMITS.dwellSeconds));
+        }
+
+        time_t const stood = std::time(nullptr) - _townTripStoodSince[name];
+        switch (OverseerDecisions::TownVisitStep(true, stood,
+                                                 TOWN_TRIP_LIMITS.dwellSeconds))
+        {
+            case OverseerDecisions::TownVisit::Served:
+                ProveAndRecordTownTrip(name, bot);
+                SettleTownTripMember(name);
+                return true;
+            case OverseerDecisions::TownVisit::Standing:
+            case OverseerDecisions::TownVisit::Travelling:
+                break;
+        }
+        return false;
+    }
+
+    // A REPAIRER, WHERE THIS MODULE DOES OWN THE TRANSACTION. The packet is
+    // DoRepair's, called rather than copied, for the reason #348 gave when it
+    // lifted the bind out of DoBind instead of writing a second one beside it.
+    // Its answer is evidence; the verdict is the durability read back.
+    bool RepairAtTheCounter(std::string const& name, Player* bot)
+    {
+        char const* status = "error";
+        std::string evidence;
+        // GUARDED RATHER THAN TRUSTED, exactly as the repair leg guards it: every
+        // return in DoRepair today is a literal or the empty string, but the
+        // sibling executor DoBind returns nullptr on its success path and a
+        // std::string built from one is undefined behaviour rather than a crash
+        // anybody would find.
+        char const* const answer = DoRepair(bot, "all", status, evidence);
+        std::string const refusal = answer ? answer : "";
+
+        // A REFUSAL WORTH ANOTHER POLL IS LEFT OUTSTANDING, and it proves nothing
+        // yet. The classification is the pure one, so the literals live in one
+        // place and this cannot drift from the table the command queue keys on -
+        // see RepairLegMayTryAgain for why the leg's question is narrower than
+        // the queue's. Nothing is recorded here: a spin that wrote its reading on
+        // every poll would write the same one twenty times.
+        if (!refusal.empty() && OverseerDecisions::RepairLegMayTryAgain(refusal))
+        {
+            if (SayTownTripOnce(name, refusal))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is at a repairer and the repair was refused - "
+                         "{}. It is asked again next poll, until the {} minute bound",
+                         name, refusal, uint32(TOWN_TRIP_LIMITS.boundSeconds / 60));
+            return false;
+        }
+
+        ProveAndRecordTownTrip(name, bot);
+        if (!refusal.empty() && SayTownTripOnce(name, refusal))
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' is standing at a repairer the core's own gate "
+                      "accepts and the repair was refused - {}. The town trip has "
+                      "nothing else to try for it",
+                      name, refusal);
+        SettleTownTripMember(name);
+        return true;
+    }
+
+    // Does this member still want something from THIS counter? A repair trip has
+    // a completion test and a selling trip does not - see TownVisitStep for why -
+    // so the two are asked differently and the difference lives here rather than
+    // in the pure layer, which has no idea which executor this module owns.
+    bool OwedAtThisCounter(std::string const& name,
+                           OverseerDecisions::TownNeed const& need)
+    {
+        if (_townTripRole == OverseerDecisions::CounterRole::Repairer)
+            return need.damagedItems > 0;
+        // A visit is over when it has been long enough, and until then this
+        // member is owed one. `_townTripSettled` is what records that it has had
+        // it; a member that has not started standing yet is owed by definition.
+        return !_townTripSettled.count(name);
+    }
+
+    void DriveTownTrip()
+    {
+        // A ROSTER THAT IS ON A RUN IS NOT THIS DRIVE'S, and the check is first
+        // so that a run opening mid-trip takes the party back on the very next
+        // poll rather than leaving two owners for five walks. Same rule
+        // DriveHomeBind states for the same reason.
+        std::vector<std::string> members;
+        std::string leaderName;
+        {
+            QueryResult result = CharacterDatabase.Query(
+                "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1");
+            if (!result)
+                return;
+            do
+            {
+                Field* fields = result->Fetch();
+                std::string const name = fields[0].Get<std::string>();
+                members.push_back(name);
+                if (fields[1].Get<uint8>() != 0)
+                    leaderName = name;
+            } while (result->NextRow());
+        }
+
+        if (_dungeonRunCoordinator.phase != DungeonRunPhase::Idle)
+        {
+            EndTownTrip(members, "a dungeon run owns the party now");
+            return;
+        }
+
+        if (leaderName.empty())
+        {
+            EndTownTrip(members, "the roster has no leader");
+            return;
+        }
+
+        // A LEADERSHIP CHANGE ENDS THE TRIP RATHER THAN INHERITING IT, the rule
+        // DriveRegroup states about its own hold: the destination was resolved
+        // from one character's position and the aims were issued under it.
+        if (_townTripActive && _townTripLeader != leaderName)
+        {
+            EndTownTrip(members, "the party changed leader mid-trip");
+            return;
+        }
+
+        std::map<std::string, Player*> present;
+        std::vector<OverseerDecisions::TownNeed> needs;
+        needs.reserve(members.size());
+        for (std::string const& name : members)
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            present[name] = bot;
+            needs.push_back(ReadTownNeed(bot));
+        }
+
+        Player* leader = present[leaderName];
+
+        if (!_townTripActive)
+        {
+            // `busy` IS ONE FLAG BY DESIGN. The pure rule refuses to keep a
+            // second opinion about who owns the party, so everything that means
+            // "not now" is collapsed here: no leader in the world, a leader that
+            // cannot be steered, a dead leader walking to its corpse, or a leader
+            // already held still by somebody else's verb.
+            bool const busy = !SteerableAI(leader) || !leader->IsAlive() ||
+                              HeldStill(leaderName);
+
+            OverseerDecisions::TownTripPlan const plan = OverseerDecisions::PlanTownTrip(
+                needs, TOWN_TRIP_LIMITS,
+                _townTripEndedAt ? std::time(nullptr) - _townTripEndedAt
+                                 : TOWN_TRIP_LIMITS.cooldownSeconds,
+                busy);
+            if (!plan.go)
+                return;
+
+            // THE DESTINATION IS RESOLVED ONCE, FROM THE LEADER, BEFORE ANYBODY
+            // WALKS. Not to write a coordinate down - every member is aimed with
+            // the role keyword, so each one's own faction, guard and route gates
+            // are applied to it - but so that a trip with nowhere to go is
+            // refused HERE, with a line naming the map, instead of five
+            // characters each discovering it separately twenty minutes later.
+            // That is the one failure the repair leg's overdue line says it
+            // cannot see for itself.
+            uint32 counterEntry = 0;
+            WorldPosition counterPos;
+            std::string said;
+            char const* const aim = TownTripAimFor(plan.role);
+            if (!ResolveTravelTarget(leader, aim, counterEntry, counterPos, 0, &said))
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: the family is owed a town trip to a '{}' - {} member(s) "
+                         "want one and {} of them cannot carry on without it - and there is "
+                         "no such counter it may deal with on map {}: {}. Nobody is walked "
+                         "anywhere, and this is asked again in {} minutes",
+                         aim, plan.membersOwed, plan.membersDriving,
+                         uint32(leader->GetMapId()),
+                         said.empty() ? std::string("there is no such spawn") : said,
+                         uint32(TOWN_TRIP_LIMITS.cooldownSeconds / 60));
+                _townTripEndedAt = std::time(nullptr);
+                return;
+            }
+
+            _townTripActive = true;
+            _townTripRole = plan.role;
+            _townTripLeader = leaderName;
+            _townTripSince = std::time(nullptr);
+            _townTripSettled.clear();
+            _townTripSaid.clear();
+            _townTripStoodSince.clear();
+            _townTripBefore.clear();
+            _townTripCopperBefore.clear();
+            for (size_t i = 0; i < members.size(); ++i)
+            {
+                _townTripBefore[members[i]] = needs[i];
+                Player* bot = present[members[i]];
+                _townTripCopperBefore[members[i]] = bot ? uint64(bot->GetMoney()) : uint64(0);
+            }
+
+            LOG_INFO("module.overseer",
+                     "overseer: the family is walking to a '{}' - {} of {} member(s) want "
+                     "one and {} of those cannot carry on without it ({}). The nearest one "
+                     "'{}' may deal with is creature {} at {:.0f} yards on map {}. Only the "
+                     "leader is aimed: the family is brought by the regroup wait and the "
+                     "catch-up walk, and everybody is aimed at the counter once the leader "
+                     "is standing at it",
+                     aim, plan.membersOwed, uint32(members.size()), plan.membersDriving,
+                     OverseerDecisions::TownReasonWord(plan.reason), leaderName,
+                     counterEntry,
+                     leader->GetDistance2d(counterPos.GetPositionX(),
+                                           counterPos.GetPositionY()),
+                     uint32(leader->GetMapId()));
+        }
+
+        char const* const aim = TownTripAimFor(_townTripRole);
+
+        // HAS THE PARTY'S ANCHOR ARRIVED? Asked once and given to every member,
+        // so the party cannot half-believe it has got there. It is the core's own
+        // interact gate and not a distance, for CounterArrivalStep's reason.
+        bool leaderAtTheCounter = false;
+        if (SteerableAI(leader))
+        {
+            bool oneIsNearby = false;
+            float nearestYards = -1.f;
+            leaderAtTheCounter =
+                CounterInReach(leader, _townTripRole, oneIsNearby, nearestYards);
+        }
+
+        unsigned outstanding = 0;
+        std::string owed;
+
+        for (std::string const& name : members)
+        {
+            if (_townTripSettled.count(name))
+                continue;
+
+            Player* bot = present[name];
+            OverseerDecisions::TownNeed const need = ReadTownNeed(bot);
+
+            OverseerDecisions::TownStopFacts facts;
+            facts.present = need.present;
+            facts.owed = need.present && OwedAtThisCounter(name, need);
+            facts.isLeader = name == leaderName;
+            facts.leaderAtTheCounter = leaderAtTheCounter;
+            if (facts.present && facts.owed)
+            {
+                // A TOWN TRIP IS NOT A CROSSING. There is no navmesh across an
+                // ocean, so a member on another map is left where it is rather
+                // than aimed at a coordinate it cannot path to.
+                if (OverseerDecisions::TownTripFormationFor(bot->GetMapId(),
+                                                            leader ? leader->GetMapId()
+                                                                   : bot->GetMapId()) ==
+                    OverseerDecisions::TownTripFormation::LeftBehind)
+                {
+                    if (SayTownTripOnce(name, "another map"))
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is on map {} and the town trip is on map "
+                                 "{}. A trip to a counter is not a crossing - there is no "
+                                 "navmesh across an ocean - so it is left where it is and "
+                                 "the trip carries on without it",
+                                 name, uint32(bot->GetMapId()),
+                                 uint32(leader ? leader->GetMapId() : 0));
+                    SettleTownTripMember(name);
+                    continue;
+                }
+                bool oneIsNearby = false;
+                float nearestYards = -1.f;
+                facts.atTheCounter =
+                    CounterInReach(bot, _townTripRole, oneIsNearby, nearestYards);
+            }
+
+            switch (OverseerDecisions::TownTripMemberStop(facts))
+            {
+                case OverseerDecisions::TownStop::Wait:
+                    ++outstanding;
+                    if (!owed.empty())
+                        owed += ", ";
+                    owed += name + " (not in the world)";
+                    if (SayTownTripOnce(name, "not in the world"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: the town trip cannot read '{}' - it is not in "
+                                 "the world, so what it needs is unknown rather than "
+                                 "nothing. It is waited for, up to the {} minute bound",
+                                 name, uint32(TOWN_TRIP_LIMITS.boundSeconds / 60));
+                    break;
+
+                case OverseerDecisions::TownStop::Done:
+                    if (SayTownTripOnce(name, "wants nothing here"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' wants nothing from a '{}', so the town "
+                                 "trip is finished with it without walking it anywhere",
+                                 name, aim);
+                    SettleTownTripMember(name);
+                    break;
+
+                case OverseerDecisions::TownStop::Trade:
+                {
+                    // THE HOLD IS RE-ASSERTED ON EVERY POLL, and the counter
+                    // hold's own comment says why it could not be before: it is
+                    // taken once, on arrival, because until now nothing looked at
+                    // the character again. This drive IS such a poll, so it takes
+                    // the half that was missing - without it,
+                    // RestoreTravelFocus hands `grind` back the moment an aim
+                    // stops coming back and the character walks away from the
+                    // counter mid-visit, which is 17200 refusals reproduced from
+                    // inside the module instead of from outside it.
+                    HoldAtTheCounter(bot, name);
+                    bool const finished =
+                        _townTripRole == OverseerDecisions::CounterRole::Repairer
+                            ? RepairAtTheCounter(name, bot)
+                            : VisitTheCounter(name, bot);
+                    if (!finished)
+                    {
+                        ++outstanding;
+                        if (!owed.empty())
+                            owed += ", ";
+                        owed += name + " (at the counter)";
+                    }
+                    break;
+                }
+
+                case OverseerDecisions::TownStop::Walk:
+                    ++outstanding;
+                    if (!owed.empty())
+                        owed += ", ";
+                    owed += name + " (walking)";
+                    if (SayTownTripOnce(name, "walking"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' is walked to a '{}'. The aim is the ROLE "
+                                 "and never a creature name (#398): it resolves out of the "
+                                 "spawn tables to a real spawn's own coordinates, having "
+                                 "already dropped every counter this character may not "
+                                 "deal with, every one standing in hostile ground, and "
+                                 "every one whose route samples lethal",
+                                 name, aim);
+                    // EscortPurpose::Assemble and not LeaveInstance: nobody is
+                    // inside anything, and the purpose is what DriveDungeonClear
+                    // reads to decide whether to stand the dungeon brain down.
+                    EscortToward(name, aim, "TOWN", EscortPurpose::Assemble);
+                    break;
+
+                case OverseerDecisions::TownStop::Follow:
+                    // NOT AIMED, ON PURPOSE, AND THIS IS THE MEASURED HALF. The
+                    // journey is the leader's; a follower is brought by the
+                    // catch-up walk and held for by the regroup wait (#404).
+                    // Aiming it here would be a second owner for one walk and
+                    // would throw away the surveyed route that drive keeps.
+                    ++outstanding;
+                    if (!owed.empty())
+                        owed += ", ";
+                    owed += name + " (following)";
+                    if (SayTownTripOnce(name, "following"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' follows the leader to the '{}' rather "
+                                 "than being aimed at one of its own - the family travels "
+                                 "together, and it is aimed at the counter once the leader "
+                                 "is standing at it",
+                                 name, aim);
+                    break;
+            }
+        }
+
+        time_t const heldFor =
+            _townTripSince ? std::time(nullptr) - _townTripSince : 0;
+
+        // THE SAME BOUND RULE THE REPAIR LEG USES, ASKED RATHER THAN COPIED. Its
+        // three answers are exactly this leg's three, its argument about a
+        // finished leg never being reported as overdue is exactly this leg's
+        // argument, and a second function with the same body is the drift this
+        // module has paid for before.
+        switch (OverseerDecisions::RepairLegStatus(outstanding, heldFor,
+                                                   TOWN_TRIP_LIMITS.boundSeconds))
+        {
+            case OverseerDecisions::RepairLegVerdict::Working:
+                return;
+
+            case OverseerDecisions::RepairLegVerdict::Finished:
+                EndTownTrip(members, "every member has been served or wanted nothing");
+                return;
+
+            case OverseerDecisions::RepairLegVerdict::Overdue:
+                LOG_ERROR("module.overseer",
+                          "overseer: the town trip to a '{}' has run {} minutes, past the "
+                          "{} minute bound, and {} member(s) never got there: {}. The "
+                          "family goes back to what it was doing, and the walk is the "
+                          "thing to look at - a line reading 'there is no such spawn on "
+                          "map N' means no counter of that role passed the faction, guard "
+                          "and route gates, and no amount of waiting was going to help",
+                          aim, uint32(heldFor / 60),
+                          uint32(TOWN_TRIP_LIMITS.boundSeconds / 60), outstanding, owed);
+                EndTownTrip(members, "the bound fired");
+                return;
+        }
+    }
+
+    // The town trip's own register. Not on the dungeon coordinator, deliberately:
+    // this trip outlives no run and belongs to no run, and putting it there is
+    // what scoped #397's leg to a phase in the first place.
+    bool _townTripActive{false};
+    OverseerDecisions::CounterRole _townTripRole{OverseerDecisions::CounterRole::None};
+    std::string _townTripLeader;
+    time_t _townTripSince{0};
+    // WHEN THE LAST TRIP ENDED, which is what the cooldown is measured from.
+    // Zero means "never", and PlanTownTrip is handed the cooldown itself in that
+    // case so a worldserver that has just started does not refuse the first trip.
+    time_t _townTripEndedAt{0};
+    std::set<std::string> _townTripSettled;
+    std::map<std::string, std::string> _townTripSaid;
+    std::map<std::string, time_t> _townTripStoodSince;
+    std::map<std::string, OverseerDecisions::TownNeed> _townTripBefore;
+    std::map<std::string, uint64> _townTripCopperBefore;
 
     void DriveDungeonRun()
     {

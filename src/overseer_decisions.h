@@ -9620,6 +9620,414 @@ constexpr char REPAIR_CANNOT_AFFORD[] = "cannot afford the repair";
 // likely a new transient than a new permanent.
 bool RepairLegMayTryAgain(std::string const& detail);
 
+// --- the town trip that is owed by a NEED rather than by a phase (#406) --
+//
+// ONE MISSING CAPABILITY WEARING FOUR COSTUMES. Read off the realm's whole
+// command history, grouped by outcome:
+//
+//   sell    "vendor not in range"   17200 | delivered 1608 | "target not
+//                                           online" 4395 | "item not carried"
+//                                           883 | "seller is dead" 415 |
+//                                           "seller is in flight" 104
+//   repair  "repairer not in range"    47 | delivered   15 | "nothing is
+//                                           damaged" 3 | "target not online" 2
+//
+// 17200 and 47 are the same fault. DoSell sweeps the creatures around wherever
+// the character already stands and DoRepair does the same over 30 yards;
+// neither is a walker and neither was ever meant to be. A live test settles it:
+// with a repair vendor 47 yards off, four repair commands all refused
+// "repairer not in range" inside one second. The executors are correct.
+// Nothing walks the character to the counter.
+//
+// THE SAME SHAPE IS WHY TWO OTHER LEGS HAVE NEVER PRODUCED A ROW. The auction
+// leg has never written one at all, and no flight node has ever been learned -
+// and that second one is the proof that the walk is the whole of the missing
+// half, because DiscoverFlightPointOnArrival in the adapter already learns a
+// node the moment a character arrives at a flight master. It has simply never
+// arrived at one.
+//
+// WHY THE LEG ABOVE DOES NOT COVER THIS, AND IT IS ONE WORD.
+// RepairLegMemberStep is driven only from the dungeon coordinator's REPAIRING
+// phase, which is reached only when a run closes. The family is grinding rather
+// than running dungeons, so that phase is never entered and the leg never
+// fires. Everything it decides is right; what is wrong is that a phase of a run
+// is the only thing that can ask for it. So the trigger moves off the phase and
+// onto the NEED, and the destination generalises from a repairer to any of the
+// four counters CounterRole already names.
+//
+// ---- AND A MEASUREMENT THAT WAS WRONG, WRITTEN DOWN SO IT IS NOT TAKEN AGAIN
+//
+// The first reading of this said all five characters carried three or four
+// EQUIPPED items at durability ZERO, and it was an artefact of the query rather
+// than a fact about the family. Counting durability = 0 counts every item that
+// cannot hold durability AT ALL: shirts, rings, amulets, trinkets and most
+// cloaks ship with MaxDurability 0 and read zero for ever. Of the leader's
+// thirteen equipped items, four are of that kind and the other nine are at full
+// - 50/50, 120/120, 85/85 and so on. Nothing was broken.
+//
+// The correct question is MaxDurability > 0 AND durability < MaxDurability, and
+// the adapter has always asked it correctly: ReadCarriedDurability returns early
+// on a zero maximum, so every count fed into these decisions is already over the
+// slots that can wear. "nothing is damaged" was therefore a CORRECT answer and
+// is not a defect to fix, which was confirmed live by standing the leader four
+// yards from a repair vendor and getting it again.
+//
+// TWO THINGS SURVIVE THE CORRECTION AND ONE DOES NOT. The 17200 and the 47
+// stand: nothing walks a character to a counter, which is still the whole
+// defect. What does not survive is the urgency it was dressed in - the family
+// was never fighting unarmoured, so REPAIR is the leg that matters over a
+// hundred-run campaign rather than the leg that matters tonight. Tonight's leg
+// is SELLING, which is the big number anyway, and the bags that fill with loot
+// behind it (#363).
+
+// What one roster member needs from a town, read off the live character this
+// poll. Every field is a reading and not an inference: a member that cannot be
+// read is present = false and NOTHING else here is true about it.
+struct TownNeed
+{
+    // In the world and steerable. A name that resolves to nothing is a member
+    // mid-login, logged out or crossing a map, and its durability lives on a
+    // live Player and nowhere else - so an absent member is UNKNOWN rather than
+    // fine, exactly as RepairLegFacts::present already argues.
+    bool present{false};
+    // Carried items below their maximum, OVER THE SLOTS THAT CAN WEAR ONLY.
+    // ReadCarriedDurability drops every item whose MaxDurability is zero before
+    // it ever gets here, which is what makes this number mean what its name
+    // says and is the half the bad query above skipped.
+    unsigned damagedItems{0};
+    // The subset of those at durability ZERO, which the game treats differently:
+    // no armour at all, and minimal damage on a weapon. Counted separately
+    // because it is worth a different word in a log line, NOT because it is a
+    // different question - the trip's own acceptance is asked of damagedItems.
+    unsigned brokenItems{0};
+    // Empty slots across the bags. Zero is a character that cannot pick anything
+    // up, which is measured and not hypothetical: one of the five is at zero
+    // free slots of 46 and a second at five of 62 (#363).
+    unsigned freeBagSlots{0};
+};
+
+// The numbers a trip is judged against, in one struct so that moving one of them
+// is not a new overload and so the adapter has a single place to name them.
+struct TownTripLimits
+{
+    // AT OR BELOW this many free slots, the bags are a reason to go (#363).
+    // Above zero on purpose: a character discovers it cannot loot by failing to
+    // loot, and a trip that only starts at zero starts one drop late.
+    unsigned freeBagSlotsToGo{3};
+    // ANY item at zero opens a trip. Not a fraction and not a count above one:
+    // an item at zero gives nothing at all, so one of them is already the state
+    // worth a walk.
+    unsigned brokenToGo{1};
+    // NO SECOND TRIP INSIDE THIS. The bound below ends a trip that cannot
+    // finish; this is what stops the next poll opening the identical one.
+    // Without it a family whose need cannot be met - no counter of that role on
+    // the map, an empty purse, a bridge that never writes the rows - walks to
+    // town for ever, which is the failure mode every bounded wait in this file
+    // is written to avoid.
+    time_t cooldownSeconds{900};
+    // How long one trip may run before the family goes back to what it was
+    // doing. Failing in the direction DungeonRunMaintenanceHold already argues
+    // for: a missed trip costs some durability and some bag space, a trip that
+    // never ends costs everything the family was doing instead.
+    time_t boundSeconds{1200};
+    // HOW LONG A MEMBER STANDS AT A COUNTER THIS MODULE DOES NOT TRANSACT AT.
+    // See TownVisitStep for the whole argument. Sixty seconds is thirty drains
+    // of the command queue at COMMANDS_PER_POLL every COMMAND_POLL_MS, which is
+    // six hundred rows, and it is a fifth of the counter hold's own ceiling - so
+    // a member is let go well before the hold it is standing under expires.
+    time_t dwellSeconds{60};
+};
+
+// WHY THIS MEMBER WANTS A COUNTER. Ordered, and the order is the content.
+enum class TownReason : std::uint8_t
+{
+    None,    // it wants nothing a counter can give it
+    Worn,    // something that can wear is below its maximum, and none is at zero
+    Bags,    // free slots at or under the floor: it has stopped being able to loot
+    Broken,  // something is at ZERO durability: a slot giving no armour at all
+};
+
+// "none", "worn", "bags", "broken".
+char const* TownReasonWord(TownReason reason);
+
+// BROKEN OUTRANKS BAGS OUTRANKS WORN, and none of the three is a degree of
+// another. Broken gear is a slot contributing nothing; full bags are a character
+// that has stopped being able to earn; worn gear is a character that is fine.
+//
+// A MEMBER NOBODY CAN READ HAS NO REASON, and that is deliberately not the same
+// as "no need". Nothing about an absent member is known, so it contributes
+// nothing to the decision to go - the trip's own per-member step is where an
+// absent member is waited for, on a clock, and inventing a reason for one here
+// would open trips for a character that is logged out.
+TownReason TownTripMemberReason(TownNeed const& need, TownTripLimits const& limits);
+
+// IS THIS REASON WORTH WALKING THE FAMILY TO TOWN FOR?
+//
+// Worn IS THE ONE THAT IS NOT, AND THAT IS THE WHOLE OF THIS FUNCTION.
+// Durability falls on every hit taken, so a family that goes to town whenever
+// anything is below maximum is a family permanently in town: the reason would be
+// true again within a minute of the trip that cleared it. Broken and full bags
+// are different in kind - both are states in which a character has stopped being
+// able to do the thing it is doing, and both are cleared by one visit.
+//
+// WHICH IS ALSO WHY THE TRIGGER IS NOT A DURABILITY PERCENTAGE. A threshold like
+// "below 40 percent" is a number nobody here has measured anything about, and it
+// has the same defect as Worn: it is crossed again on the walk home. A count of
+// items that are actually at zero, and a count of bag slots that are actually
+// gone, are readings rather than tunings - and the cooldown above, not a
+// threshold, is what stops a trip repeating.
+//
+// A WORN MEMBER IS STILL REPAIRED ONCE THE TRIP EXISTS, which is the other half
+// of the same argument and is why this is a separate question from the reason
+// itself. The party is standing at the counter for somebody else, the purse is
+// roughly 150 gold a head, and a repair-all costs a fraction of it. Walking a
+// worn character home unrepaired because its own reason would not have opened
+// the trip would be this module being precious about a decision already made.
+bool TownReasonOpensATrip(TownReason reason);
+
+// WHICH COUNTER THE FAMILY WALKS TO, for a reason that opens a trip.
+//
+// ONE ROLE PER TRIP, NOT ONE PER MEMBER, because the point of the trip is that
+// the family arrives somewhere together. The role is read off the strongest
+// reason anybody has, and the roles are the four CounterRole already names, so a
+// trip's destination is resolvable by the aim vocabulary that already exists:
+// "repair", "vendor", "banker", "auctioneer".
+//
+// AND A REPAIRER IS USUALLY A VENDOR TOO. The repair vendor this module has
+// stood next to carries npcflags 4224, which is vendor and repair together, so a
+// party sent to a repairer for its broken gear is standing at a counter that
+// also buys - which is why Broken winning does not cost the bags anything in the
+// common case, and why the trip does not need a second destination to serve a
+// second reason.
+CounterRole TownTripRoleFor(TownReason reason);
+
+// The party-level answer: is a trip owed, and to what.
+struct TownTripPlan
+{
+    bool go{false};
+    CounterRole role{CounterRole::None};
+    TownReason reason{TownReason::None};
+    // How many members have a reason of any kind, Worn included - which is who
+    // the trip is FOR once it is happening, not who opened it.
+    unsigned membersOwed{0};
+    // How many have a reason that would have opened it on its own. Reported so a
+    // log line can say "two for their bags, three along for the ride" rather
+    // than one number that means two things.
+    unsigned membersDriving{0};
+};
+
+// SHOULD THE FAMILY GO, AND WHERE.
+//
+// busy IS ONE FLAG AND NOT A LIST, and it is the adapter's whole answer to
+// "somebody else owns this party". A dungeon run in any phase owns where every
+// member should be; so does a crossing; so does a leader that cannot be steered.
+// Enumerating those here would be this file keeping a second opinion about a
+// question the coordinator already answers, and would go stale the first time a
+// phase was added.
+//
+// THE COOLDOWN IS ASKED BEFORE THE NEEDS AND NOT AFTER. A trip that has just
+// ended and left somebody owed has left them owed for a reason - no counter of
+// that role on this map, a purse that could not pay, a bridge that wrote no rows
+// - and none of those change between two polls five seconds apart. The other
+// order re-opens the identical trip on the very next poll, for ever.
+//
+// A COOLDOWN OF ZERO IS NOT "NO COOLDOWN". It is a cooldown that has always
+// expired, which is what an operator who genuinely wants back-to-back trips is
+// asking for. Reading a zero as "disabled" is how a brake somebody meant to
+// release becomes a brake that is never applied.
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy);
+
+// ONE DESTINATION, AND WHAT HAPPENS TO A MEMBER THAT CANNOT REACH IT.
+//
+// The family walks to a counter the LEADER resolved, once, rather than five
+// members each resolving "the nearest vendor to me" and five walks fanning out
+// across a zone. It is also the only shape in which the arrival machinery means
+// anything: the hold is taken per member against the live creature, and members
+// converging on one creature are members that can all be held at it.
+//
+// AND A MEMBER ON ANOTHER MAP IS LEFT WHERE IT IS, which is a refusal rather
+// than a gap. ResolveTravelTarget is same-map only because there is no navmesh
+// across an ocean; a town trip that tried to cross one would be a crossing, and
+// crossings have their own leg with their own boats and portals.
+enum class TownTripFormation : std::uint8_t
+{
+    Together,    // the counter is on this member's map: it walks to the party's aim
+    LeftBehind,  // it is somewhere else: a town trip is not a crossing
+};
+
+TownTripFormation TownTripFormationFor(std::uint32_t memberMapId,
+                                       std::uint32_t counterMapId);
+
+// ------------------ what the trip does with one member on one poll --
+//
+// THE JOURNEY IS THE LEADER'S AND THE COUNTER IS EVERYBODY'S, which is the one
+// thing this had to get right and the thing a hand test proved it had to.
+// Aiming the leader at a repair vendor 154 yards away worked: he arrived. The
+// other four ended up between 945 and 2,184 yards behind and never arrived at
+// all. So a town trip that aims only the leader does not move the family, and a
+// town trip that aims all five independently is five walks.
+//
+// IT IS NEITHER, AND THE MACHINERY FOR THE MIDDLE ALREADY EXISTS (#404). The
+// regroup wait holds the leader where it stands while a straggler closes the
+// gap under the catch-up walk, and stops waiting at the distance that walk
+// itself hands back at. So on the journey only the LEADER is aimed and the
+// family is brought by the drive whose job that is; nothing here re-implements
+// following, re-aims a follower, or takes a second opinion about a gap.
+//
+// ONCE THE LEADER IS AT THE COUNTER the party has arrived somewhere and the
+// remaining yards are the last few. Only then is every member aimed at the same
+// resolved spawn, which is a walk of tens of yards from where the family is
+// already standing rather than a journey - and it is needed, because the
+// catch-up hands back at FOLLOW_CATCH_UP_DONE_YARDS and the interact gate is
+// five and a half.
+struct TownStopFacts
+{
+    bool present{false};
+    // Does this member still want something from THIS counter? Asked as a
+    // question about the member rather than re-derived from a TownNeed, because
+    // a vendor trip and a repair trip mean different things by "owed" and the
+    // adapter is the side that knows which trip is running.
+    bool owed{false};
+    // The core's own GetNPCIfCanInteractWith accepts a creature of the trip's
+    // role from where this member is standing. DELIBERATELY NOT A DISTANCE, for
+    // CounterArrivalStep's reason: arrival is twelve yards measured against a
+    // spawn row while the gate is five and a half measured against a creature
+    // that has feet, and every "not in range" refusal in the measurement above
+    // died in the gap between those two numbers.
+    bool atTheCounter{false};
+    // Is this the character the journey is aimed with?
+    bool isLeader{false};
+    // Has the party's anchor arrived? False for the whole journey, and it is
+    // what separates "the family is travelling" from "the family is at the
+    // shop". The caller passes the same reading for everybody, so the party
+    // cannot half-believe it has arrived.
+    bool leaderAtTheCounter{false};
+};
+
+enum class TownStop : std::uint8_t
+{
+    Wait,    // nothing can be read or done about this member on this poll
+    Done,    // it wants nothing from this counter: the trip is finished with it
+    Trade,   // it is at the counter on the core's terms: hold it and transact
+    Walk,    // aim it at the party's counter
+    Follow,  // do NOT aim it: the journey is the leader's and follow brings this one
+};
+
+// THE ORDER OF THE FIVE TESTS IS THE MEANING, and each one makes the ones below
+// it unaskable. It is RepairLegMemberStep's order with one test inserted, and
+// the three it kept are unchanged for the reasons that function already gives:
+// an unreadable member is not finished, a member that wants nothing is finished
+// wherever it stands, and the poll on which a member is in reach of the counter
+// is the poll to spend because nothing guarantees there will be another one.
+//
+// Follow IS INSERTED LAST OF THE FIVE, BELOW Trade, which is the whole reason it
+// is safe. A follower that has wandered within reach of the counter during the
+// journey transacts on that poll rather than being told to keep following - the
+// same "spend the poll you have" rule, applied to a member that got lucky.
+TownStop TownTripMemberStop(TownStopFacts const& facts);
+
+// "wait", "done", "trade", "walk", "follow". Here rather than in the adapter so
+// the word a log line carries is the word a test pins.
+char const* TownStopWord(TownStop stop);
+
+// ------- WHEN A VISIT IS OVER, AT A COUNTER THIS MODULE DOES NOT TRANSACT AT --
+//
+// A REPAIR TRIP HAS A COMPLETION TEST AND A SELLING TRIP DOES NOT, and pretending
+// otherwise is the trap this function exists to avoid. DoRepair is called by this
+// module, so "is anything still damaged" answers whether the repair leg is done.
+// Nothing equivalent is true of selling: the executor DELIBERATELY never chooses
+// the item, because what counts as junk depends on all five bag lists, the
+// professions and the quest logs at once, and that rule lives in the bridge
+// outside the worldserver. So this module cannot ask "is there anything left to
+// sell" without building the second copy of a decision it has already refused to
+// own.
+//
+// WHAT IT CAN DO IS BE PRESENT. The 17200 refusals are not refusals to sell
+// something, they are refusals to sell ANYTHING, because the character was never
+// in range when the row arrived. So the trip's job at a vendor, a banker or an
+// auctioneer is to put the character at the counter and keep it there long enough
+// for rows to find it - and a visit is therefore judged on TIME rather than on an
+// outcome this module has no business deciding.
+//
+// AND A TIMED VISIT IS WHY THE TRIP DOES NOT REPORT ITS OWN BOUND AS A FAILURE.
+// A leg that stayed open until it was overdue would put an ERROR in the log after
+// every successful shopping trip, and an ERROR that fires on success is how a
+// real one gets ignored.
+enum class TownVisit : std::uint8_t
+{
+    Travelling,  // not at the counter yet; the dwell has not started
+    Standing,    // at the counter, and the visit is not long enough yet
+    Served,      // it has stood there long enough: the trip is finished with it
+};
+
+// A DWELL OF ZERO IS A VISIT THAT IS OVER ON ARRIVAL, which is a legitimate thing
+// to ask for - it is the behaviour every counter aim had before this trip existed
+// - and is not read as "no dwell". The same rule every bound in this file keeps.
+TownVisit TownVisitStep(bool atTheCounter, time_t stoodForSeconds,
+                        time_t dwellSeconds);
+
+// "travelling", "standing", "served".
+char const* TownVisitWord(TownVisit visit);
+
+// ------------------------------- and the trip is judged on the world --
+//
+// delivered IS NOT done ANYWHERE IN THIS MODULE, and a town trip is the worst
+// place to forget it. DoRepair writes the same EMPTY detail whether it left
+// nothing damaged or half a set, because Player::DurabilityRepair charges per
+// item and simply returns when the purse is short; DoSell reports the sale the
+// bridge asked for and says nothing about whether the bags are habitable
+// afterwards. So the trip reads the same numbers before and after and says what
+// actually changed.
+//
+// THIS IS THE ACCEPTANCE TEST, AND IT HAS NEVER PASSED. NothingHappened is what
+// every trip taken before this one would have reported, and it is a distinct
+// answer from every other one here precisely so that a trip which achieved
+// nothing cannot be read as a trip that ran.
+enum class TownTripProof : std::uint8_t
+{
+    NothingHappened,     // the world reads the same as it did before the trip
+    Unloaded,            // slots were freed or the purse rose; the gear is no better
+    PartlyRepaired,      // fewer items damaged than before, and some still are
+    Repaired,            // nothing that can wear is below its maximum, and something was
+    RepairedAndUnloaded, // both, which is what a town trip is supposed to do
+};
+
+// A REPAIR IS PROVED ON damagedItems AND NOT ON brokenItems, which is the
+// correction the bad query above cost. Zero durability is a severity, not the
+// question: an item at 1 of 120 is damaged, is repaired by the same call, and
+// would be invisible to a proof written in broken counts. Both readings are
+// taken at the counter on the same poll as the packet, so nothing has had a
+// chance to wear again between them.
+//
+// A SALE IS PROVED BY EITHER SLOTS OR MONEY, because the two can each move
+// alone. Auctioning frees slots and takes a deposit, so the purse can FALL on a
+// successful unload; banking frees slots and moves no money at all. Requiring
+// both would report every auction as a failure.
+//
+// AND THE PURSE FALLING IS NOT EVIDENCE OF A SALE, which is why the money half
+// only ever looks for a RISE. A repair spends money, and a trip that repaired
+// and sold nothing must not be able to claim a sale because its purse moved.
+TownTripProof ProveTownTrip(TownNeed const& before, TownNeed const& after,
+                            std::uint64_t copperBefore, std::uint64_t copperAfter);
+
+// "nothing happened", "unloaded", "partly repaired", "repaired",
+// "repaired and unloaded".
+char const* TownTripProofWord(TownTripProof proof);
+
+// DID THIS TRIP MEET THE CRITERION, FOR THIS MEMBER? One function rather than
+// four callers each remembering which of the five words count.
+//
+// IT IS ASKED OF THE GEAR THAT CAN WEAR AND OF NOTHING ELSE. "No item at
+// durability 0" is the criterion that can never pass, because a shirt and three
+// rings will read zero for ever; "nothing with a maximum is below it" is the
+// same sentence written so that it can.
+//
+// AND A MEMBER NOBODY CAN READ HAS NOT PASSED. The criterion is a statement
+// about every roster member, and "we could not look" is not a way of meeting it.
+bool TownTripMemberAccepted(TownNeed const& after);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
