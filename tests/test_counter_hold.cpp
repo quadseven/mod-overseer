@@ -77,6 +77,7 @@ char const* Name(CounterRole role)
         case CounterRole::Vendor:   return "vendor";
         case CounterRole::Banker:   return "banker";
         case CounterRole::Repairer: return "repairer";
+        case CounterRole::Auctioneer: return "auctioneer";
     }
     return "unknown";
 }
@@ -208,13 +209,24 @@ void OnlyACounterEverDeclinesToRelease()
 }
 
 // THE VOCABULARY, WHICH IS THE OTHER THING THIS CHANGE OWNS. `travel_npc` also
-// carries `at:` and `trigger:` aims and ten other role keywords, and reading any
+// carries `at:` and `trigger:` aims and nine other role keywords, and reading any
 // of those as a counter would put a hold on a character that has to keep walking.
-void OnlyTheThreeEconomyKeywordsAreCounters()
+//
+// AND IT IS FOUR KEYWORDS NOW, NOT THREE (#402). `auctioneer` was asserted here
+// as NOT a counter, and that assertion was wrong rather than the code being
+// right: it is one of the keywords TravelRoles() resolves, so a character could
+// always be sent to one and did arrive, and answering None meant
+// CounterArrivalStep said Done on its first line, no hold was taken, and the
+// errand released before the auction rows could find the character still
+// standing at the counter. This test was pinning the defect in place. The header
+// note below about a FOURTH economy errand needing to reach both readers is
+// exactly this case arriving.
+void OnlyTheFourEconomyKeywordsAreCounters()
 {
     CheckRole("vendor", CounterRoleForAim("vendor"), CounterRole::Vendor);
     CheckRole("banker", CounterRoleForAim("banker"), CounterRole::Banker);
     CheckRole("repair", CounterRoleForAim("repair"), CounterRole::Repairer);
+    CheckRole("auctioneer", CounterRoleForAim("auctioneer"), CounterRole::Auctioneer);
 
     char const* const notCounters[] = {
         "",
@@ -222,7 +234,6 @@ void OnlyTheThreeEconomyKeywordsAreCounters()
         "class trainer",
         "profession trainer",
         "guild banker",
-        "auctioneer",
         "petitioner",
         "tabard designer",
         "innkeeper",
@@ -273,7 +284,7 @@ int main()
     EveryCombinationIsWhatItSays();
     NothingOutOfReachIsEverHeld();
     OnlyACounterEverDeclinesToRelease();
-    OnlyTheThreeEconomyKeywordsAreCounters();
+    OnlyTheFourEconomyKeywordsAreCounters();
     TheRunGateAndTheArrivalBranchAgree();
 
     if (failures)

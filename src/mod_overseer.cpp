@@ -6552,6 +6552,8 @@ private:
                 return UNIT_NPC_FLAG_BANKER;
             case OverseerDecisions::CounterRole::Repairer:
                 return UNIT_NPC_FLAG_REPAIR;
+            case OverseerDecisions::CounterRole::Auctioneer:
+                return UNIT_NPC_FLAG_AUCTIONEER;
             case OverseerDecisions::CounterRole::None:
                 break;
         }
@@ -6587,6 +6589,39 @@ private:
     // be this module keeping a second opinion about a question the core has
     // already answered, and a second opinion about exactly that question is what
     // a twelve yard arrival radius already is.
+    // WHAT THE CREATURE THIS ERRAND NAMED ACTUALLY IS (#402).
+    //
+    // Read off the LIVE creature rather than the spawn row, because that is the
+    // thing the arrival is standing next to and because the core's own npcflags
+    // are what every gate downstream will be judged by. Same lookup and same
+    // radius DiscoverFlightPointOnArrival and TrainOnArrival already use, so all
+    // three arrival handlers agree about which creature they are talking about.
+    //
+    // Zero for an `at:` or `trigger:` aim, which names no creature, and zero
+    // when nothing of that entry is standing here - both of which read
+    // downstream as "no counter role and no trainer", which is the safe answer
+    // and is exactly today's behaviour.
+    static uint32 NpcFlagsAtArrival(Player* bot, uint32 entry)
+    {
+        if (!bot || !entry)
+            return 0;
+        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+        if (!npc || !npc->IsAlive())
+            return 0;
+        // Unit.h:763.
+        return static_cast<uint32>(npc->GetNpcFlags());
+    }
+
+    // Whether the aim itself named a trainer, which is the other half of
+    // OverseerDecisions::ArrivalAnswersLearnAim. The three trainer keywords are
+    // TravelRoles()' own, matched whole the same way CounterRoleForAim matches
+    // its own: an aim is a whole keyword or it is not this.
+    static bool AimNamesATrainer(std::string const& target)
+    {
+        return target == "trainer" || target == "class trainer" ||
+               target == "profession trainer";
+    }
+
     static bool CounterInReach(Player* who, OverseerDecisions::CounterRole role,
                                bool& outOneIsNearby, float& outNearestYards)
     {
@@ -10318,12 +10353,42 @@ private:
             bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
             bot->GetMapId(), bot->GetTeamId(true));
         if (!node)
-            return;   // no taxi node registered this close - nothing to learn
+        {
+            // SAID RATHER THAN SILENT (#402). A flight master with no node of
+            // this character's own team near it is a real state - a contested
+            // zone where the nearest node belongs to the other side - and it is
+            // indistinguishable from every other silent return unless it says
+            // so. See the "already known" note below for what that silence
+            // cost.
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' stood at flight master '{}' (creature {}) and there is "
+                     "no taxi node of its own team near enough to learn - nothing was "
+                     "discovered here", name, npc->GetName(), entry);
+            return;
+        }
 
         // Player.h:1160 (m_taxi is a public member), PlayerTaxi.h:35
         // (IsTaximaskNodeKnown).
         if (bot->m_taxi.IsTaximaskNodeKnown(node))
-            return;   // already known - the ordinary case after the first visit
+        {
+            // THE ORDINARY CASE, AND IT HAS TO SAY SO (#402). This silence cost
+            // a night. A character was walked to a flight master to prove the
+            // errand worked, the node was already in its mask, this returned
+            // without a word, and the only lines in the log were an unrelated
+            // trainer warning and "errand done, releasing" - which reads
+            // exactly like a discovery that never ran. A correct no-op and a
+            // broken mechanism must not look the same.
+            //
+            // INFO rather than WARN: nothing is wrong here. It is the expected
+            // answer every time after the first visit, and the reason to print
+            // it is that "already known" is a FACT ABOUT THE CHARACTER somebody
+            // choosing who to send needs.
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is at flight master '{}' (creature {}) and already "
+                     "knows node {} - nothing to learn, which is the ordinary answer after "
+                     "the first visit", name, npc->GetName(), entry, node);
+            return;
+        }
 
         // PlayerTaxi.h:42 (SetTaximaskNode) - the same function
         // SendLearnNewTaxiNode calls from the packet handler a real client
@@ -15621,6 +15686,25 @@ private:
                 // going through IS the errand and everything below is about
                 // errands that end where the character is standing.
                 bool const doorway = target.rfind("trigger:", 0) == 0;
+
+                // WHAT THIS CREATURE IS, ASKED ONCE FOR ALL THE HANDLERS BELOW
+                // (#402), and asked HERE so it is in scope for the whole chain
+                // rather than declared inside it - a declaration between two
+                // links of an `else if` chain would silently end the chain and
+                // let the doorway and escort branches fall into the ones after
+                // them.
+                //
+                // Every handler below used to ask the AIM STRING what the
+                // arrival meant, and an aim that names a creature by entry
+                // answers none of their questions: "16227" is not "repair" and
+                // it is not "profession trainer". Discovery is the one handler
+                // that already asked the creature, and it is the one handler
+                // that works for an entry aim. This is that same question,
+                // hoisted so the others can use it too.
+                uint32 const arrivedFlags = NpcFlagsAtArrival(bot, entry);
+                bool const creatureTrains =
+                    (arrivedFlags & OverseerDecisions::NPC_FLAG_TRAINER) != 0;
+
                 if (doorway && StepThroughAreaTrigger(name, bot, target))
                 {
                     _travelAims.Release(name);
@@ -15732,7 +15816,27 @@ private:
                                            "standing there is not what gets it bound");
                     }
                 }
-                else if (plan && !TrainOnArrival(name, bot, entry, *plan))
+                // A LEARN AIM IS NOT ANSWERED BY AN ARRIVAL IT WAS NOT ABOUT
+                // (#402), and until now it was. TrainOnArrival ran on every
+                // creature arrival for which a learn plan existed, and on a
+                // creature that is not a trainer it warned about an errand
+                // nobody issued and called ClearLearnAim. So walking a
+                // character to a flight master cancelled its profession, and an
+                // errand that visits flight masters on purpose would have done
+                // that once per trip.
+                //
+                // THE GUARD GOES IN THIS CONDITION RATHER THAN IN A BRANCH OF
+                // ITS OWN, and the difference is not cosmetic: a separate
+                // `else if` taken with an empty body would skip the `else`
+                // below as well, so a character that arrived at a flight master
+                // with a profession queued would neither train nor discover nor
+                // release. Folded in here, an arrival with nothing to do with
+                // training simply never calls TrainOnArrival and goes on to do
+                // whatever the errand WAS about.
+                else if (plan &&
+                         OverseerDecisions::ArrivalAnswersLearnAim(
+                             AimNamesATrainer(target), creatureTrains) &&
+                         !TrainOnArrival(name, bot, entry, *plan))
                 {
                     // NOT RELEASED, AND DELIBERATELY NOT `continue`. Falling
                     // through reaches the re-issue guard below, which renews
@@ -15774,8 +15878,25 @@ private:
                     // own gate accept somebody standing here", and the answer
                     // decides between three different things to do rather than
                     // two. See OverseerDecisions::CounterArrivalStep.
-                    OverseerDecisions::CounterRole const counter =
+                    OverseerDecisions::CounterRole const aimRole =
                         OverseerDecisions::CounterRoleForAim(target);
+                    OverseerDecisions::CounterRole const counter =
+                        // AND THE CREATURE ITSELF WHEN THE AIM SAYS NOTHING
+                        // (#402). `travel_npc` also accepts a bare creature
+                        // entry, and "16227" is not "repair", so the same errand
+                        // spelled two ways behaved two ways: a repair vendor
+                        // reached by keyword was held at its counter and the
+                        // same vendor reached by entry was not.
+                        //
+                        // THE KEYWORD IS ASKED FIRST AND STILL WINS, so every
+                        // aim that resolves today keeps meaning exactly what it
+                        // means today and this only answers the aims that used
+                        // to answer nothing. It also keeps INTENT above
+                        // capability: a character sent to "vendor" is held as a
+                        // vendor even at a spawn that also repairs.
+                        aimRole != OverseerDecisions::CounterRole::None
+                            ? aimRole
+                            : OverseerDecisions::CounterRoleForNpcFlags(arrivedFlags);
                     bool oneIsNearby = false;
                     float nearestYards = -1.f;
                     // NOT ASKED AT ALL FOR AN AIM THAT IS NOT A COUNTER, which

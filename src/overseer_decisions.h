@@ -2382,9 +2382,96 @@ enum class CounterRole : std::uint8_t
     Vendor,    // "vendor" - what `sell` and `buy` need
     Banker,    // "banker" - what `bank` needs
     Repairer,  // "repair" - what `repair` needs
+    // "auctioneer" - what the auction pass needs, and it has been missing from
+    // this enum since it was written (#402). `auctioneer` is one of the
+    // thirteen keywords TravelRoles() resolves, so a character has always been
+    // able to be SENT to one; the role came back None, CounterArrivalStep
+    // answered Done on its first line, no hold was taken, and the errand
+    // released. The release is the signal the outside pass reads as "arrived"
+    // before it writes a row, so the character had an AI tick to walk away
+    // before the rows landed. That is the whole explanation for the auction leg
+    // never having produced one.
+    Auctioneer,
 };
 
 CounterRole CounterRoleForAim(std::string const& aim);
+
+// ...AND THE SAME QUESTION ASKED OF THE CREATURE INSTEAD OF THE AIM (#402).
+//
+// WHY THERE HAS TO BE A SECOND WAY TO ASK. CounterRoleForAim matches whole
+// keyword strings, which is right and is not enough: `travel_npc` also accepts
+// a bare creature ENTRY, and "16227" is not "repair". So the identical errand
+// spelled two ways behaves two ways - a repair vendor reached by keyword is
+// held at its counter and the same vendor reached by entry is not - and only
+// the keyword form has ever been exercised.
+//
+// This is the pattern DiscoverFlightPointOnArrival already uses and is the only
+// arrival handler that works for an entry aim: it asks the creature
+// (`HasNpcFlag(UNIT_NPC_FLAG_FLIGHTMASTER)`) rather than the string. A
+// creature's own flags are what decide what standing next to it can MEAN; the
+// aim only says why the character was sent.
+//
+// PRECEDENCE IS DOCUMENTED RATHER THAN INCIDENTAL, because real spawns carry
+// several of these bits at once - the repair vendor this was measured against
+// carries 4224, which is vendor and repair together. Narrow capabilities win
+// over broad ones: repairer, then banker, then auctioneer, then vendor. Vendor
+// is last because it is the bit the other three usually co-occur WITH, so
+// letting it win would mean a repairer is never held as a repairer.
+//
+// A creature carrying no counter flag at all is None, which is the answer for a
+// trainer, an innkeeper, a stable master and - the case this was written for -
+// a flight master. An arrival that is only a discovery must not be given a hold
+// it has no rows to send.
+//
+// `npcFlags` is the EFFECTIVE flags: `creature.npcflag` where the spawn carries
+// an override and the template's otherwise, which is the rule BuildTravelIndex
+// already applies and the reason a flight master whose spawn row reads 0 is
+// still found.
+// THE FLAG VALUES, RESTATED HERE BECAUSE THIS FILE COMPILES WITHOUT A CORE.
+//
+// That isolation is half of what the `decisions` job is for, so the pure layer
+// cannot include UnitDefines.h and these have to be written down. Copied from
+// the pinned core at src/server/game/Entities/Unit/UnitDefines.h:321-344 and
+// checked against two spawns the module has actually stood next to: a repair
+// vendor reading 4224, which is 4096 | 128, and a flight master reading 8195,
+// which is 8192 | 2 | 1. A test asserts the arithmetic of both, so a value
+// mistyped here fails rather than silently routing an errand at the wrong sort
+// of creature.
+constexpr std::uint32_t NPC_FLAG_TRAINER      = 0x00000010;  // UnitDefines.h:326
+constexpr std::uint32_t NPC_FLAG_VENDOR       = 0x00000080;  // UnitDefines.h:329
+constexpr std::uint32_t NPC_FLAG_REPAIR       = 0x00001000;  // UnitDefines.h:334
+constexpr std::uint32_t NPC_FLAG_FLIGHTMASTER = 0x00002000;  // UnitDefines.h:335
+constexpr std::uint32_t NPC_FLAG_BANKER       = 0x00020000;  // UnitDefines.h:339
+constexpr std::uint32_t NPC_FLAG_AUCTIONEER   = 0x00200000;  // UnitDefines.h:343
+
+CounterRole CounterRoleForNpcFlags(std::uint32_t npcFlags);
+
+// IS THIS ARRIVAL ENTITLED TO CONSUME THE CHARACTER'S LEARN AIM (#402)?
+//
+// WHAT WENT WRONG. TrainOnArrival is called on EVERY creature arrival for which
+// the character holds a learn plan, with no regard for what the travel errand
+// was actually for. When the creature is not a trainer it logs a warning about
+// an errand nobody issued and calls ClearLearnAim. So walking a character to a
+// flight master silently cancelled its profession, and the first thing an
+// errand that visits flight masters on purpose would have done is destroy a
+// training plan once per trip.
+//
+// The learn aim is a SEPARATE COLUMN from the travel aim. Nothing entitles an
+// arrival to answer a question the arrival was not about.
+//
+// THE RULE, AND BOTH HALVES OF IT KEEP TODAY'S BEHAVIOUR WHERE TODAY IS RIGHT:
+//
+//   * the aim named a trainer role, so the errand WAS about training, and
+//     whatever happened at the far end answers it - including "this trainer
+//     cannot teach me", which is a real answer and correctly clears the plan so
+//     a fresh errand can pick a trainer that can; or
+//   * the creature actually trains, so the character is standing at a trainer
+//     whatever it was sent for, and trying is free and is what a character
+//     standing at a trainer should do.
+//
+// Otherwise this arrival has nothing to do with training and the learn aim
+// survives it untouched.
+bool ArrivalAnswersLearnAim(bool aimNamesTrainerRole, bool creatureTrains);
 
 // Is this travel aim one of the economy passes' errands?
 //

@@ -1425,7 +1425,39 @@ CounterRole CounterRoleForAim(std::string const& aim)
         return CounterRole::Banker;
     if (aim == "repair")
         return CounterRole::Repairer;
+    // MISSING SINCE THIS FUNCTION WAS WRITTEN (#402). `auctioneer` has always
+    // been one of the keywords TravelRoles() resolves, so a character could be
+    // sent to one and did arrive; the role came back None and the arrival
+    // released without a hold, which is why no auction row has ever found its
+    // character still standing at the counter.
+    if (aim == "auctioneer")
+        return CounterRole::Auctioneer;
     return CounterRole::None;
+}
+
+CounterRole CounterRoleForNpcFlags(std::uint32_t npcFlags)
+{
+    // NARROW BEFORE BROAD, and the order is the whole of the rule. See the
+    // header: a real repair vendor carries vendor and repair together, so a
+    // vendor-first test would mean no repairer is ever held as a repairer.
+    if (npcFlags & NPC_FLAG_REPAIR)
+        return CounterRole::Repairer;
+    if (npcFlags & NPC_FLAG_BANKER)
+        return CounterRole::Banker;
+    if (npcFlags & NPC_FLAG_AUCTIONEER)
+        return CounterRole::Auctioneer;
+    if (npcFlags & NPC_FLAG_VENDOR)
+        return CounterRole::Vendor;
+    // A trainer, an innkeeper, a stable master and - the case this was written
+    // for - a flight master. None of them has rows waiting on a counter hold,
+    // and giving one a hold it cannot use would pin a character for the hold's
+    // whole ceiling for nothing.
+    return CounterRole::None;
+}
+
+bool ArrivalAnswersLearnAim(bool aimNamesTrainerRole, bool creatureTrains)
+{
+    return aimNamesTrainerRole || creatureTrains;
 }
 
 bool IsMaintenanceErrand(std::string const& aim)
