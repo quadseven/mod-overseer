@@ -3415,6 +3415,129 @@ bool SplitFollowerDrivesItself(std::string const& target)
     return ReadSplitErrand(target) != SplitErrand::NeedsTheFamily;
 }
 
+char const* RegroupClaimName(RegroupClaim claim)
+{
+    switch (claim)
+    {
+        case RegroupClaim::InFormation:   return "in formation";
+        case RegroupClaim::Rejoining:     return "rejoining";
+        case RegroupClaim::NotInTheWorld: return "not in the world";
+        case RegroupClaim::AnotherMap:    return "on another map";
+        case RegroupClaim::Dead:          return "dead";
+        case RegroupClaim::OnARun:        return "on a dungeon run";
+        case RegroupClaim::StoodDown:     return "stood down";
+    }
+    return "unknown";
+}
+
+bool RegroupClaimIsWaitedFor(RegroupClaim claim)
+{
+    return claim == RegroupClaim::Rejoining;
+}
+
+RegroupClaim ReadRegroupClaim(RegroupMember const& member,
+                              RegroupLimits const& limits, bool alreadyWaiting)
+{
+    // ASKED FIRST AND ANSWERED ALONE, both of them. A member that is not in the
+    // world has no position, and one on another map has two coordinate systems
+    // rather than a distance. Neither may reach the comparison below, and the
+    // caller may hand a number in anyway without changing the answer.
+    if (!member.seen)
+        return RegroupClaim::NotInTheWorld;
+    if (!member.sameMap)
+        return RegroupClaim::AnotherMap;
+    // A negative distance is the caller saying it did not measure one, which is
+    // the same amount of information as not being on the map. Answered as the
+    // map case rather than invented into a small number, because a member whose
+    // position nothing read is not a member standing next to anybody.
+    if (member.yards < 0.f)
+        return RegroupClaim::AnotherMap;
+
+    // THE HYSTERESIS. Not yet waiting, so the far line; already waiting, so the
+    // near one - and the near one is where the catch-up walk itself hands back,
+    // which is what makes "the family stops waiting" and "the walk ends" one
+    // event rather than two that can disagree.
+    float const line = alreadyWaiting ? limits.rejoinYards : limits.splitYards;
+    if (member.yards <= line)
+        return RegroupClaim::InFormation;
+
+    // PAST THE LINE. Now the reasons the family must NOT wait, each of which is
+    // a member nothing is walking anywhere - so waiting for it is waiting for a
+    // walk that is not happening, which is the deadlock this whole rule has to
+    // be incapable of.
+    if (!member.alive)
+        return RegroupClaim::Dead;
+    if (member.ownedByARun)
+        return RegroupClaim::OnARun;
+    if (member.stoodDown)
+        return RegroupClaim::StoodDown;
+    return RegroupClaim::Rejoining;
+}
+
+FamilyRegroup ReadFamilyRegroup(std::vector<RegroupMember> const& members,
+                                RegroupLimits const& limits, bool alreadyWaiting)
+{
+    FamilyRegroup verdict;
+    for (RegroupMember const& member : members)
+    {
+        RegroupClaim const claim = ReadRegroupClaim(member, limits, alreadyWaiting);
+        if (claim == RegroupClaim::InFormation)
+            continue;
+        if (!RegroupClaimIsWaitedFor(claim))
+        {
+            ++verdict.notWaitedFor;
+            continue;
+        }
+        // THE FURTHEST BACK, because that is the member the wait is actually
+        // about and because the backstop ratchets on this number: a wait that
+        // reported the nearest straggler would look like it was making progress
+        // while the one that needs the wait fell further behind.
+        if (verdict.wait && member.yards <= verdict.worstYards)
+            continue;
+        verdict.wait = true;
+        verdict.waitingFor = member.name;
+        verdict.worstYards = member.yards;
+    }
+    return verdict;
+}
+
+std::string RegroupCarriedOnWithout(std::vector<RegroupMember> const& members,
+                                    RegroupLimits const& limits,
+                                    bool alreadyWaiting)
+{
+    std::string said;
+    for (RegroupMember const& member : members)
+    {
+        RegroupClaim const claim = ReadRegroupClaim(member, limits, alreadyWaiting);
+        if (claim == RegroupClaim::InFormation || RegroupClaimIsWaitedFor(claim))
+            continue;
+        if (!said.empty())
+            said += ", ";
+        said += member.name;
+        said += " (";
+        said += RegroupClaimName(claim);
+        said += ")";
+    }
+    return said;
+}
+
+bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits)
+{
+    // UNCHANGED, AND ASKED FIRST. A leader in the air is not somewhere a
+    // follower can be sent, so the aim it already has - the last place the
+    // leader could stand - is the right one however stale it is.
+    if (!facts.leaderOnTheGround)
+        return false;
+
+    // WHICH REGIME. Past TRAVEL_ROUTE_MIN_YARDS the walk is a surveyed route
+    // and an aim change discards it; inside, there is no route and the original
+    // rule applies untouched, which is what restores its arrival arithmetic for
+    // every poll that can actually end the walk.
+    bool const hasARoute = facts.followerGapToLeader > limits.routeYards;
+    float const allowance = hasARoute ? limits.routeGainYards : limits.reaimYards;
+    return facts.leaderDriftFromAim > allowance;
+}
+
 bool WalkAlreadyInFlight(bool reissueForced, bool canAct, bool atSameDestination)
 {
     // The watchdog's override first, because it is the one input that means
