@@ -4464,6 +4464,264 @@ bool ErrandRunsAlone(std::string const& target);
 // the driving side of that line instead of the frozen one.
 bool SplitFollowerDrivesItself(std::string const& target);
 
+// -------------- the family waits for the member it left behind (#404) -------
+//
+// THE MEASUREMENT, AND IT IS NOT A NAVIGATION FAULT. Four of five characters
+// were within fifteen yards of the leader and the fifth was 2,101 yards back.
+// Three consecutive party polls, thirty seconds apart, sent that fifth
+// character somewhere different each time, because each aimed it at where the
+// leader was standing at that instant and the leader was still grinding:
+//
+//   01:25:14  sent to 'at:1:1972.61,-761.447,98.0276'  ... 410 waypoints
+//   01:25:44  sent to 'at:1:1973.41,-706.982,109.223'  ... 563 waypoints
+//   01:26:44  sent to 'at:1:1953.2,-593.484,112.2'     ... 410 waypoints
+//
+// The walking is not what it cost. The experience over that same window is:
+//
+//   the three standing beside the leader   +10577, +7212, +5820
+//   the leader                             a level
+//   the one left behind                    +910
+//
+// An order of magnitude, entirely from being behind, and it lands on whichever
+// character is likeliest to fall behind and die. When a campaign depends on one
+// named character reaching a level, that design guarantees the character that
+// must level is the one that cannot.
+//
+// SO THIS IS THE HALF OF A CONCEPT THIS MODULE ONLY EVER HAD ON ONE SIDE. A
+// dungeon run will not proceed while the roster is apart: DungeonRunBarrierMet
+// above holds the run at the door until every member is at the staging point.
+// Ordinary activity has never had an equivalent, so the leader grinds across a
+// zone while a member is two thousand yards back and nothing anywhere says to
+// wait for it.
+//
+// AND IT IS DELIBERATELY NOT THE BARRIER GENERALISED, WHICH WAS THE FIRST THING
+// TRIED. The barrier is a reading about a POINT - a staging position a run has
+// resolved, with a footing test on the last step onto it - and the census that
+// fills it is read off a run's coordinator: the stage coordinates, the portal's
+// inside and outside maps, the approach corridor, the watchdog. Ordinary
+// activity has no point. It has a leader who is walking, and the reading that
+// already exists for how far a member is from a walking leader is FollowGap. So
+// this is written over FollowGap's own two lines rather than over the barrier's
+// radius, and the barrier is left exactly as it is.
+//
+// NOTHING HERE IS TUNED, AND THAT IS THE ARGUMENT FOR IT. A member is behind
+// enough to wait for at exactly the distance past which `follow` has already
+// given up on it, and it has rejoined at exactly the distance the catch-up walk
+// itself hands back at. The family therefore waits for precisely the walk this
+// module already starts, and stops waiting on the poll that walk would end.
+struct RegroupLimits
+{
+    // FOLLOW_CATCH_UP_YARDS. Past this a member is stranded rather than
+    // following and the catch-up walk starts, so this is the distance at which
+    // there is something for the family to wait for.
+    float splitYards{0.f};
+    // FOLLOW_CATCH_UP_DONE_YARDS. Inside this the catch-up walk hands back to
+    // `follow`, which is the module's own definition of rejoined.
+    //
+    // THE TWO ARE DIFFERENT NUMBERS ON PURPOSE AND THAT IS THE HYSTERESIS. A
+    // family that started waiting at the same distance it stopped waiting at
+    // would start and stop every poll while a member hovered on the line, and
+    // each of those stops is the leader walking off again. Waiting begins at
+    // the far line and ends at the near one, so a straggler can only make the
+    // family wait once.
+    float rejoinYards{0.f};
+};
+
+// One member of the family, as this poll found it. Every field is a fact the
+// caller has already gathered for its own reasons; nothing here needs a world.
+struct RegroupMember
+{
+    std::string name;
+    // Found in the world this poll. A name that resolves to nobody is logged
+    // out or mid-teleport, and neither is a distance.
+    bool seen{false};
+    // On the leader's map. UNMEASURED IS NOT ZERO: `yards` means nothing when
+    // this is false, exactly as FollowGap's own SplitAcrossMaps says.
+    bool sameMap{false};
+    bool alive{false};
+    // A dungeon run holds this member. The run's own gates are the authority on
+    // where it should be and when, and DriveCatchUp already refuses to touch
+    // one; a second opinion here would be two drives steering one character.
+    bool ownedByARun{false};
+    // THE FAMILY ALREADY WAITED FOR THIS ONE AND GAVE UP. Carried as a fact
+    // rather than decided here, because how long a stand-down lasts is a clock
+    // the caller keeps and this file has no clock.
+    bool stoodDown{false};
+    // How far behind the leader, when `sameMap` is true. Negative means the
+    // caller did not measure it, and is answered the same way as not being on
+    // the leader's map at all.
+    float yards{-1.f};
+};
+
+// What one member asks of the family, and each value is a separate answer
+// because each is a different sentence in the log an operator reads. The five
+// refusals are not folded into one "cannot" for the reason FollowGap does not
+// fold a map boundary into a large number: an operator has to be able to tell
+// "it is walking, wait for it" from "nothing in this module will ever bring it
+// back", and those two have opposite remedies.
+enum class RegroupClaim : std::uint8_t
+{
+    // Near enough that it asks nothing. `follow` has it.
+    InFormation,
+    // Behind, on the leader's map, alive, and able to close the gap under the
+    // catch-up walk. THIS IS THE ONLY VALUE THE FAMILY WAITS FOR.
+    Rejoining,
+    // Not in the world this poll. Logged out, or mid-teleport.
+    NotInTheWorld,
+    // On another map. `follow` cannot cross one, an `at:` aim cannot name a
+    // coordinate on one, and this module says so at length elsewhere - so there
+    // is no walk in progress for the family to be waiting on.
+    AnotherMap,
+    // A ghost walking to its corpse, which is the revival drive's business and
+    // not a distance from anybody. DriveCatchUp will not walk a dead member, so
+    // waiting for one is waiting for a walk that is not happening.
+    Dead,
+    // A dungeon run owns it.
+    OnARun,
+    // The family already waited for this one and that wait was given up on.
+    StoodDown,
+};
+
+char const* RegroupClaimName(RegroupClaim claim);
+
+// Is this the one value the family waits for?
+bool RegroupClaimIsWaitedFor(RegroupClaim claim);
+
+// ONE MEMBER, ONE POLL.
+//
+// `alreadyWaiting` IS THE HYSTERESIS AND IT IS AN INPUT RATHER THAN A SECOND
+// FUNCTION. A family that is not yet waiting starts at `splitYards`; a family
+// that already is keeps waiting until `rejoinYards`. Both are the same question
+// asked of the same member, and splitting them into two predicates is how two
+// predicates come to disagree - which is the whole of what #241 cost.
+//
+// THE ORDER IS THE POINT. Presence and the map are asked before the distance,
+// because there is no distance without them. The distance is asked before every
+// remaining refusal, because a member standing beside the leader is InFormation
+// whether or not it is dead, on a run, or stood down: the family is not waiting
+// for it either way, and reporting a corpse at three yards as a reason the
+// family carried on would be a sentence about nothing.
+RegroupClaim ReadRegroupClaim(RegroupMember const& member,
+                              RegroupLimits const& limits, bool alreadyWaiting);
+
+// THE WHOLE FAMILY, ONE POLL.
+struct FamilyRegroup
+{
+    // Does the leader hold where it stands?
+    bool wait{false};
+    // Which member the family is waiting for: the one furthest back of those it
+    // is waiting for at all. Empty when `wait` is false.
+    std::string waitingFor;
+    // ...and how far back that member is. THIS IS THE READING THE BACKSTOP
+    // RATCHETS ON, and it is returned rather than left for the caller to
+    // recompute so that the number the family waits on and the number it gives
+    // up on can never be two different measurements.
+    float worstYards{0.f};
+    // How many members are behind, or unreadable, and are NOT being waited for.
+    // Zero is the ordinary answer, and a non-zero one is the sentence
+    // RegroupCarriedOnWithout below writes out.
+    unsigned notWaitedFor{0};
+};
+
+FamilyRegroup ReadFamilyRegroup(std::vector<RegroupMember> const& members,
+                                RegroupLimits const& limits, bool alreadyWaiting);
+
+// Why the family is carrying on without somebody, named member by member, for
+// the one log line that reports it. Kept separate from the predicate above for
+// the reason DungeonRunBarrierBlockers is kept separate from
+// DungeonRunBarrierMet: a pure function that also builds strings is a pure
+// function that is harder to test twice. Empty when there is nothing to say.
+std::string RegroupCarriedOnWithout(std::vector<RegroupMember> const& members,
+                                    RegroupLimits const& limits,
+                                    bool alreadyWaiting);
+
+
+// ------------ when a catching-up follower's aim is worth rewriting (#404) ---
+//
+// THE SECOND HALF OF THE SAME ISSUE, AND IT IS THE CHEAPER ONE. The catch-up
+// walk aims a follower at the leader's live position and re-aims it whenever
+// the leader has walked FOLLOW_CATCH_UP_REAIM_YARDS - fifty yards - from that
+// point. At a leader's running pace fifty yards is about seven seconds, so on a
+// party poll of thirty the aim changed on EVERY poll of the walk measured
+// above, which is what the three lines in the section above are.
+//
+// AND AN AIM CHANGE IS NOT A CHEAP THING. TravelAimBook::Claim erases the whole
+// errand record the moment the target string moves, and that record is where
+// the surveyed route lives. So each of those re-aims threw away a plan of 400
+// to 560 waypoints and bought another: a rebuild of the 3,781 node and 15,041
+// link travel graph, one or two Dijkstras over it, and one
+// `playerbots_travelnode_path` query per leg, on the world thread, repeated
+// across up to seven passes while the guarded-ground pricing converges. It also
+// threw away the route CURSOR, which is how far along that plan the follower
+// had got, so the walk restarted at the beginning of a different route every
+// time.
+//
+// THREE MORE THINGS DIE WITH IT AND ONE OF THEM IS ANOTHER FIX. The
+// twenty-minute unreachable backstop is a clock in that same record, so a chase
+// that re-aims every poll can never be declared unreachable and runs until
+// something else stops it. The per-errand flight budget resets with it. And so
+// does the footing refusal bound, whose own comment in the adapter says it is
+// "DELIBERATELY NOT CLEARED WITH THE ERRAND" precisely because "for a catch-up
+// walk it is rewritten every poll with the leader's own live position" - that
+// fix is defeated by the erase underneath it, and re-aiming less often is what
+// puts it back.
+//
+// SO WHEN IS A NEW AIM ACTUALLY A NEW DESTINATION? The route is planned by a
+// survey, and the survey has its own resolution. TRAVEL_ROUTE_GAIN_YARDS is how
+// much nearer the aim a surveyed route has to finish before it is worth walking
+// at all - under that, the adapter's own comment says, "the character is already
+// as close as the survey gets". A leader who has moved less than that has not
+// moved the destination by as much as the planner can tell, so the plan that
+// would come back is the plan already in hand. Re-aiming there buys a different
+// list of waypoints to the same place at the cost of every field above.
+//
+// AND IT ONLY APPLIES WHERE THERE IS A ROUTE AT ALL. TRAVEL_ROUTE_MIN_YARDS is
+// the length under which no surveyed route is planned and the greedy stepper
+// walks the whole journey. Inside it there is nothing to discard, the fifty
+// yard rule costs nothing, and - this is the load-bearing half - the arithmetic
+// that rule exists for is restored exactly: an aim within fifty yards of the
+// leader is one a follower can arrive at and still be inside
+// FOLLOW_CATCH_UP_DONE_YARDS, so the walk can always end.
+//
+// WHICH IS ALSO WHY THE LOOSER ALLOWANCE CANNOT STRAND ANYBODY. It is capped at
+// TRAVEL_ROUTE_GAIN_YARDS rather than scaled with the gap, so the aim is never
+// more than two hundred yards from where the leader is standing - less than one
+// TRAVEL_ROUTE_LOOKAHEAD_YARDS, which is how far ahead a route is aimed anyway.
+// A follower that walks the whole way to a stale aim is therefore at most two
+// hundred yards out, which is inside TRAVEL_ROUTE_MIN_YARDS, which is the near
+// regime, where the fifty yard rule fires on the next poll and closes it. The
+// worst case this can produce is one party poll spent standing two hundred
+// yards away. The case it replaces is a route discarded every poll forever.
+struct CatchUpAimLimits
+{
+    // FOLLOW_CATCH_UP_REAIM_YARDS. The rule as it stands, and what still
+    // applies once the follower is close enough that no route is planned.
+    float reaimYards{0.f};
+    // TRAVEL_ROUTE_MIN_YARDS. Under this length no surveyed route exists, so
+    // there is nothing for an aim change to throw away.
+    float routeYards{0.f};
+    // TRAVEL_ROUTE_GAIN_YARDS. The survey's own resolution: a destination that
+    // has moved less than this is one the planner cannot tell apart from the
+    // destination it has already planned to.
+    float routeGainYards{0.f};
+};
+
+struct CatchUpAimFacts
+{
+    // A position in the air is not an aim. Unchanged from the rule this
+    // replaces, and asked first for the same reason it was asked first there:
+    // the follower keeps walking to the last place the leader could stand.
+    bool leaderOnTheGround{false};
+    // How far the leader has walked from the point the follower is aimed at.
+    float leaderDriftFromAim{0.f};
+    // How far the follower still has to come. This is what decides whether a
+    // surveyed route is in play, and therefore which allowance applies.
+    float followerGapToLeader{0.f};
+};
+
+// Is the aim stale enough to be worth the route that rewriting it costs?
+bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits);
+
 // ------------------------- is the walk this drive would issue already running --
 //
 // THE GUARD THIS ANSWERS FOR, AND THE ONE THING IT USED TO GET WRONG (#293).

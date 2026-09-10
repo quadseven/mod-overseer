@@ -1754,6 +1754,64 @@ constexpr float FOLLOW_CATCH_UP_REAIM_YARDS = FOLLOW_CATCH_UP_DONE_YARDS / 2.0f;
 constexpr time_t CATCH_UP_STANDDOWN_SECONDS =
     static_cast<time_t>(ERRAND_DEATH_LIMITS.cooloffSeconds);
 
+// WHEN A CATCHING-UP FOLLOWER'S AIM IS WORTH REWRITING (#404), which is not the
+// same question as whether the leader has moved.
+//
+// THREE NUMBERS AND NOT ONE OF THEM IS NEW. The rule is
+// OverseerDecisions::CatchUpAimIsStale and the whole argument for it is on that
+// declaration; what this line does is hand it the three constants the argument
+// is made of. FOLLOW_CATCH_UP_REAIM_YARDS is the rule exactly as it stood, and
+// still governs the last four hundred yards of every walk - which is the
+// stretch the walk actually ends in, so its arrival arithmetic is untouched.
+// TRAVEL_ROUTE_MIN_YARDS is where a surveyed route starts existing and
+// therefore where an aim change starts costing one. TRAVEL_ROUTE_GAIN_YARDS is
+// that survey's own resolution: a destination that has moved less than this is
+// one the planner cannot tell apart from the destination already in hand, so
+// the plan it would hand back is the plan being thrown away to ask for it.
+constexpr OverseerDecisions::CatchUpAimLimits FOLLOW_CATCH_UP_AIM_LIMITS{
+    FOLLOW_CATCH_UP_REAIM_YARDS, TRAVEL_ROUTE_MIN_YARDS, TRAVEL_ROUTE_GAIN_YARDS};
+
+// THE TWO LINES THE FAMILY WAITS BETWEEN (#404), and neither of them is new
+// either. A member is behind enough to wait for at exactly the distance past
+// which `follow` has already given up on it and the catch-up walk starts, and
+// it has rejoined at exactly the distance that walk hands back at. The family
+// therefore waits for precisely the walk this module already issues, and stops
+// on the poll that walk would end - which is what stops "the family is together
+// again" and "the walk is over" from being two readings that can disagree.
+constexpr OverseerDecisions::RegroupLimits REGROUP_LIMITS{
+    FOLLOW_CATCH_UP_YARDS, FOLLOW_CATCH_UP_DONE_YARDS};
+
+// IS THE STRAGGLER ACTUALLY CLOSING THE GAP, AND FOR HOW LONG MAY IT NOT BE?
+//
+// THE SAME RATCHET THE TRAVEL BACKSTOP RUNS ON, READ FROM IT RATHER THAN
+// WRITTEN AGAIN. TRAVEL_RATCHET is "has this distance to a target got
+// TRAVEL_PROGRESS_YARDS nearer inside TRAVEL_BACKSTOP_SECONDS", measured
+// against the closest the reading has ever been rather than against the
+// previous poll. That is word for word the question a wait has to keep
+// answering yes to, asked about the one distance that matters: how far the
+// straggler still is from the leader it is walking to.
+//
+// AND THE TWENTY MINUTES IS THE RIGHT NUMBER BECAUSE IT IS THE WALK'S OWN. The
+// errand the family is waiting on is released as unreachable at
+// TRAVEL_BACKSTOP_SECONDS, so a wait allowed to outlive it would be a family
+// standing still for a walk that had already been given up on - the same
+// argument #393 made about a lease outliving its errand.
+constexpr OverseerDecisions::RatchetLimits REGROUP_RATCHET = TRAVEL_RATCHET;
+
+// HOW LONG A MEMBER THE FAMILY GAVE UP WAITING FOR IS LEFT ALONE BEFORE IT MAY
+// HOLD THE FAMILY AGAIN.
+//
+// BORROWED FROM THE WALK, LIKE EVERY OTHER NUMBER HERE. This is the same
+// fifteen minutes CATCH_UP_STANDDOWN_SECONDS holds a catch-up walk down for
+// after one killed its follower, and it answers the same question about the
+// same character: this did not work, leave it alone for a while. Without it the
+// poll after the ratchet gives up reads the identical gap, decides the family
+// should wait, and takes the hold straight back - a give-up that gives nothing
+// up. It is bounded rather than permanent for the reason that one is: the
+// member may yet be moved by something else, and when it is, the family should
+// wait for it again.
+constexpr time_t REGROUP_STANDDOWN_SECONDS = CATCH_UP_STANDDOWN_SECONDS;
+
 // Upstream's own fuse on MoveFarTo's stuck teleport: `stuckTime`, 90 seconds
 // (NewRpgBaseAction.h:76). Named here so the log line that reports the
 // teleport being kept out of reach can say what it was kept from, and so a
@@ -5201,6 +5259,13 @@ private:
         // was catching up to has gone.
         SweepCatchUps();
 
+        // ...AND THE FAMILY'S OWN WAIT, ON THE SAME STATEMENT AND FOR THE SAME
+        // REASON (#404). KeepTheFamilyTogether marks the wait at the bottom of
+        // this poll, and every early exit above it - no roster, fewer than two
+        // present, no group - has to end a wait nothing is marking any more, or
+        // a leader stands still in a field waiting for a family that is gone.
+        SweepRegroupWait();
+
         // AND THE FOURTH OWNER'S, ON THE SAME STATEMENT AND FOR A DIFFERENT
         // REASON (#393). The three sweeps above and beside it end a lease the
         // poll after its own drive stops marking it. This one has no drive
@@ -6514,6 +6579,118 @@ private:
                     COUNTER_HOLD_VERB);
     }
 
+    // ------- the family waits for the member it left behind (#404) ----------
+    //
+    // THE SEVENTH REASON TO HOLD A CHARACTER STILL, AND THE FIRST THAT IS ABOUT
+    // SOMEBODY ELSE. Every hold above this one is placed on the character that
+    // needs to stand still: a caster mid-spell, a member at a barrier, a
+    // character being bound at an inn, a buyer at a counter. This one is placed
+    // on the LEADER, and what needs it is a different character two thousand
+    // yards away.
+    //
+    // WHY THE LEADER AND NOT THE STRAGGLER. The straggler is already walking.
+    // The catch-up walk starts the moment it passes FOLLOW_CATCH_UP_YARDS, it
+    // is aimed correctly, and its route is planned round whatever is in the
+    // way. What it cannot do is ARRIVE, because the thing it is aimed at keeps
+    // moving and moves faster than it does. Nothing that can be done to a
+    // follower fixes a destination that walks away from it; the only character
+    // whose standing still ends the chase is the one being chased.
+    //
+    // AND THE HOLD ALREADY REACHES HIM. This is not a new capability being
+    // opened up: KeepRosterFollowing's own `new rpg` grant for the leader is
+    // already written `!HeldStill(leader->GetName())`, ReadAimedMover already
+    // ranks HeldOnPurpose above GrantToLeader, and the staging hold already
+    // pins the leader beside the rest of the party at a dungeon door. What is
+    // new is a verb, so that no other hand-back can lift this hold and this one
+    // can lift nobody else's.
+    static constexpr char const* REGROUP_HOLD_VERB = "regroup";
+
+    // ...AND ITS CEILING IS BORROWED RATHER THAN PICKED, from the errand the
+    // wait exists to let finish. TRAVEL_BACKSTOP_SECONDS is how long the
+    // catch-up walk itself may run before the travel drive declares its target
+    // unreachable and releases the aim, and a wait that outlived that walk
+    // would be a family standing still for a walk already given up on.
+    //
+    // IT IS A HARD CEILING AND NOT THE PRIMARY RELEASE, WHICH IS THE POINT OF
+    // HAVING THREE. The wait normally ends on the poll the straggler is back
+    // inside FOLLOW_CATCH_UP_DONE_YARDS. It is ended early by the ratchet the
+    // moment the gap stops closing. This is the bound under both of those, for
+    // the case neither can reach: the party poll not running at all.
+    // HoldCharacterStill does not push a deadline out on re-assertion, so this
+    // is a ceiling on the whole wait rather than on one poll of it, and
+    // ReleaseExpiredHolds collects it whether or not anything comes back.
+    static constexpr uint32 REGROUP_HOLD_CEILING_SECONDS =
+        static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS);
+
+    static bool HasRegroupHold(std::string const& name)
+    {
+        auto const hold = HoldsInForce().find(name);
+        return hold != HoldsInForce().end() &&
+               hold->second.verb == REGROUP_HOLD_VERB;
+    }
+
+    // HOLD THE LEADER WHERE IT STANDS, AND TAKE THE DIVERTERS WITH IT.
+    //
+    // THE REGISTER ON ITS OWN IS NOT ENOUGH HERE, WHICH IS THE ONE WAY THIS
+    // VERB DIFFERS FROM THE SIX ABOVE. A hold adds `stay`, takes `new rpg`, and
+    // pins the active motion slot on every world tick, and that is the whole of
+    // what a character needs when its engine is otherwise quiet - which is true
+    // of a caster at an inn and false of a leader in the middle of an ordinary
+    // afternoon. `grind` is "no target -> attack anything" at relevance 4.0,
+    // and `rpg`, `travel` and `move random` each pick a destination of their
+    // own. Those are exactly the strategies ESCORT_DIVERT_STRATEGIES already
+    // names and for exactly this reason - "a strategy is here if it can send
+    // the character somewhere the escort did not choose" - and a leader that
+    // goes on choosing is a leader the straggler is still chasing.
+    //
+    // SO IT IS THE SAME STAND-DOWN WITH A SECOND OWNER, NOT A SECOND MECHANISM.
+    // TakeDownDiverters records exactly what came off, RestoreTravelFocus puts
+    // exactly that back and reads it back to prove it, and this borrows both
+    // rather than growing a parallel list that can drift from the one above.
+    // What is new is only whose clock the focus is swept on: SweepTravelFocus
+    // ends a focus whose ERRAND has vanished, and this leader may have no
+    // errand at all, so that sweep is taught to spare a character this hold is
+    // holding. The same answer #393 gave the walk back in, for the same reason.
+    //
+    // AND THE RESTORE IS LEFT TO THAT SWEEP RATHER THAN DONE HERE. A leader can
+    // be on an errand of its own while the family waits, in which case the
+    // focus is the errand's and handing it back would be this verb ending
+    // somebody else's stand-down. The sweep already answers that correctly: it
+    // keeps a focus whose name is still aimed and collects one whose name is
+    // not, and once this hold is gone the leader falls into whichever of those
+    // it belongs in. The cost is the sweep's own documented lag of one travel
+    // poll, which its comment already argues is the right trade.
+    //
+    // NOT `readyToCast`. Nothing is being cast, and a family standing still is
+    // a family that should be eating - #346's argument for the staging hold,
+    // word for word.
+    void HoldForTheFamily(Player* leader, std::string const& name)
+    {
+        PlayerbotAI* botAI = SteerableAI(leader);
+        if (!botAI)
+            return;
+        HoldCharacterStill(leader, botAI, name, REGROUP_HOLD_VERB,
+                           REGROUP_HOLD_CEILING_SECONDS, false);
+        // Idempotent and cheap, exactly as it is for a traveller: it reads the
+        // live strategy list and writes only when something is there to take,
+        // so this is a no-op on every poll after the first unless something put
+        // a strategy back - which is the case it exists to catch.
+        std::string const took = TakeDownDiverters(name, botAI);
+        if (!took.empty())
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' stops choosing where to go while the family "
+                     "regroups - {} taken off its non-combat engine, and given back "
+                     "when the wait ends. A held leader that still picks targets is a "
+                     "leader the member behind it is still chasing",
+                     name, took);
+    }
+
+    static void ReleaseRegroupHold(std::string const& name, char const* why)
+    {
+        ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
+                    REGROUP_HOLD_VERB);
+    }
+
     // The predicate the counter sweep runs over each creature in the visited
     // cells: alive, carrying the role's own npcflag, and within `range`. The
     // same shape VendorNearbyCheck already gives Acore::CreatureListSearcher
@@ -7373,6 +7550,14 @@ private:
             // FOLLOW_CATCH_UP_YARDS and DriveCatchUp.
             DriveCatchUp(p, leader);
         }
+
+        // AND THE OTHER HALF OF THE SAME ANSWER (#404). Everything above walks a
+        // follower toward its leader; this is the poll's opinion on whether the
+        // leader should still be moving while it does. It runs after the loop
+        // because it needs every member's gap and not one at a time, and it is
+        // the last statement in this function because the hold it may place is
+        // read by the grants above on the NEXT poll rather than on this one.
+        KeepTheFamilyTogether(group, leader, present);
     }
 
     // Point the roster at the quests they keep talking about.
@@ -14244,8 +14429,33 @@ private:
             // releases a walk as unreachable. Without this the follower would
             // keep `new rpg` with no aim under it, and a `new rpg` with no aim
             // goes IDLE and then wherever NewRpgStatusUpdateAction rolls.
-            if (OnTheGround(leader) &&
-                leader->GetDistance2d(it->second.x, it->second.y) > FOLLOW_CATCH_UP_REAIM_YARDS)
+            //
+            // ...AND ONLY WHEN THE LEADER HAS ACTUALLY MOVED THE DESTINATION
+            // (#404). This used to re-aim whenever the leader had walked
+            // FOLLOW_CATCH_UP_REAIM_YARDS from the aim, and fifty yards at a
+            // running pace is about seven seconds - so on a thirty second party
+            // poll it re-aimed on EVERY poll of every long walk. Each of those
+            // rewrites the aim column, and TravelAimBook::Claim erases the whole
+            // errand record when that column moves: measured on a 2,101 yard
+            // chase, a surveyed route of 400 to 560 waypoints discarded and
+            // replanned every poll, along with how far along it the follower had
+            // got, the twenty-minute unreachable backstop clock, the errand's
+            // flight budget, and the footing refusal bound that is deliberately
+            // not scoped to an errand precisely because of this walk.
+            //
+            // CatchUpAimIsStale is the same fifty yard rule for the last four
+            // hundred yards, which is the stretch the walk ends in, and the
+            // survey's own resolution before that. The whole argument is on its
+            // declaration; FOLLOW_CATCH_UP_AIM_LIMITS is where the three numbers
+            // it reads come from, and none of them is new.
+            OverseerDecisions::CatchUpAimFacts aim;
+            aim.leaderOnTheGround = OnTheGround(leader);
+            aim.leaderDriftFromAim =
+                leader->GetDistance2d(it->second.x, it->second.y);
+            // `gap` is a real reading here: the cross-map case returned several
+            // statements above, so this branch is only ever on one map.
+            aim.followerGapToLeader = gap;
+            if (OverseerDecisions::CatchUpAimIsStale(aim, FOLLOW_CATCH_UP_AIM_LIMITS))
                 CatchUpToward(name, leader);
             else
                 _travelAims.Claim(name, it->second.aim);
@@ -14338,6 +14548,306 @@ private:
                      stranded ? "past anything `follow` will do for it"
                               : "the step `follow` would take from there goes over a drop",
                      static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS));
+    }
+
+    // ---- THE FAMILY WAITS FOR THE MEMBER IT LEFT BEHIND, ONE POLL (#404) ----
+    //
+    // WHAT THIS IS FOR, IN ONE MEASUREMENT. Four of five characters were within
+    // fifteen yards of the leader and the fifth was 2,101 yards back. Over one
+    // window the three beside the leader gained 10577, 7212 and 5820
+    // experience, the leader gained a level, and the one behind gained 910. An
+    // order of magnitude, entirely from being behind, and it falls on whichever
+    // character is likeliest to fall behind - which is the squishiest one,
+    // which is the one a campaign is most likely to be waiting on.
+    //
+    // THE HALF OF THE ANSWER THAT IS NOT HERE IS THE AIM DAMPER IN DriveCatchUp
+    // ABOVE, and the two are not alternatives. Damping the aim stops a chase
+    // throwing away its route on every poll, which is what makes the walk
+    // capable of finishing; holding the leader is what makes it SHORT, and
+    // short is where the experience is. A follower that walks a clean route for
+    // thirteen minutes has still earned nothing for thirteen minutes. Each one
+    // also covers a case the other cannot: the damper is what the straggler has
+    // once this wait's backstop fires and the family deliberately carries on,
+    // and this wait is what a damped aim cannot supply, because an aim that is
+    // never rewritten still points at a leader who is walking away.
+    //
+    // WHAT ENDS IT, AND THERE ARE FIVE THINGS, WHICH IS THE WHOLE OF WHY THIS
+    // IS SAFE TO SHIP. A hold that never releases is worse than the defect:
+    //
+    //   1. THE STRAGGLER REJOINS. The ordinary end, on the poll it is back
+    //      inside FOLLOW_CATCH_UP_DONE_YARDS - the same line the catch-up walk
+    //      hands back at, so the wait and the walk end together.
+    //   2. THE GAP STOPS CLOSING. REGROUP_RATCHET, the travel backstop's own
+    //      ratchet, asked about the straggler's gap. A member that is walking
+    //      beats it every poll; one wedged against scenery, one whose route
+    //      cannot be walked, or one killed and released to a graveyard further
+    //      away never beats it again, and the family carries on.
+    //   3. THE MEMBER STOPS BEING ONE THIS MODULE CAN WALK. Dead, on another
+    //      map, gone from the world, or taken over by a dungeon run: every one
+    //      of those is a member nothing is walking anywhere, so waiting for it
+    //      is waiting for a walk that is not happening. ReadRegroupClaim
+    //      answers each by name and none of them is ever waited for. THIS IS
+    //      THE ANSWER TO THE OFF-MAP AND DEAD CASES SPECIFICALLY: they do not
+    //      need the backstop, because they never start a wait at all.
+    //   4. THE CEILING. REGROUP_HOLD_CEILING_SECONDS, collected by
+    //      ReleaseExpiredHolds whether or not anything comes back for it.
+    //   5. NOTHING MARKED IT. SweepRegroupWait, on the party's own clock,
+    //      for the party that dissolved or the leader that logged out.
+    //
+    // AND ONE THING THAT DELIBERATELY DOES NOT END IT: the leader being in
+    // combat. `stay` and `follow` are non-combat strategies and the pin sweep
+    // leaves a fighting character alone, so a held leader still fights and
+    // still flees. That is the same line #330 drew about `flee` and it applies
+    // with more force here, where the hold may stand for minutes.
+    //
+    // WORLD-THREAD ONLY AND UNGUARDED, like every other register in this file,
+    // and lost on a restart - which costs one restarted clock and no
+    // correctness, because the hold register it drives is lost with it.
+    bool _regroupWaiting{false};
+    // Marked by this drive and swept by SweepRegroupWait, exactly as
+    // DungeonEscort::wanted is marked and swept. See that sweep.
+    bool _regroupWanted{false};
+    // Who is being held, and who the family is waiting for. Both are needed:
+    // the first is whose hold has to be released and the second is whose gap
+    // the ratchet below is a memory of.
+    std::string _regroupLeader;
+    std::string _regroupWaitingFor;
+    OverseerDecisions::RatchetState _regroupProgress{};
+    // Members the family waited for and gave up on, and when. See
+    // REGROUP_STANDDOWN_SECONDS.
+    std::map<std::string, time_t> _regroupStandDown;
+    // The last thing said about carrying on without somebody. A split can last
+    // an hour and the party poll runs every thirty seconds, so this is said
+    // once per state rather than once per poll - the same discipline
+    // SayPartySplit already applies to the same class of condition.
+    std::string _regroupCarriedOnSaid;
+
+    bool WithinRegroupStandDown(std::string const& name)
+    {
+        auto const it = _regroupStandDown.find(name);
+        if (it == _regroupStandDown.end())
+            return false;
+        if (std::time(nullptr) - it->second < REGROUP_STANDDOWN_SECONDS)
+            return true;
+        _regroupStandDown.erase(it);
+        return false;
+    }
+
+    // END THE WAIT, HOWEVER IT ENDED. The one terminal path, for the reason
+    // TravelAimBook::Release is one and EndOneEscort is one: a hand-back that
+    // only happens on the path that took it is a hand-back an unforeseen
+    // `return` can skip.
+    void EndTheRegroupWait(std::string const& why)
+    {
+        if (!_regroupWaiting)
+            return;
+        std::string const held = _regroupLeader;
+        std::string const waitedFor = _regroupWaitingFor;
+        _regroupWaiting = false;
+        _regroupWanted = false;
+        _regroupLeader.clear();
+        _regroupWaitingFor.clear();
+        _regroupProgress = OverseerDecisions::RatchetState{};
+        _regroupCarriedOnSaid.clear();
+        ReleaseRegroupHold(held, why.c_str());
+        LOG_INFO("module.overseer",
+                 "overseer: the family stops waiting for '{}' and '{}' walks again - {}",
+                 waitedFor, held, why);
+    }
+
+    // THE BACKSTOP UNDER THE WAIT ITSELF, on the party's own clock and run
+    // before any `return` in the poll can leak one - the same first-statement
+    // discipline SweepCatchUps beside it has, and for the same reason. A party
+    // that dissolves, a leader that logs out, a roster that shrinks to one: all
+    // of those reach the next poll with nothing marked, and the leader walks
+    // again rather than standing in a field waiting for a family that is gone.
+    //
+    // TWO POLLS OF LAG AT WORST, exactly as SweepCatchUps has, because the mark
+    // is cleared here and re-set by the drive later in the same poll.
+    void SweepRegroupWait()
+    {
+        if (!_regroupWaiting)
+            return;
+        if (_regroupWanted)
+        {
+            _regroupWanted = false;
+            return;
+        }
+        EndTheRegroupWait("nothing marked it this poll, so the party this wait was "
+                          "about is gone");
+    }
+
+    void KeepTheFamilyTogether(Group* group, Player* leader,
+                               std::vector<Player*> const& present)
+    {
+        if (!group || !leader)
+            return;
+        std::string const leaderName = leader->GetName();
+
+        // A LEADERSHIP CHANGE ENDS THE WAIT RATHER THAN INHERITING IT. The hold
+        // is on one character and the ratchet is a memory of one gap; moving
+        // either onto a new leader would hold the wrong character to a number
+        // measured from somebody else.
+        if (_regroupWaiting && _regroupLeader != leaderName)
+            EndTheRegroupWait("the party changed leader");
+
+        // A RUN OWNS THE LEADER, OR THE LEADER IS A CORPSE. The run's own gates
+        // decide where the leader should be and when, and a second opinion here
+        // would be two drives steering one character; a dead leader is walking
+        // away from nobody and is the revival drive's business. Neither is a
+        // family this wait has anything to say about.
+        if (InDungeonRun(leader) || !leader->IsAlive())
+        {
+            EndTheRegroupWait(InDungeonRun(leader)
+                                  ? "a dungeon run has the leader now"
+                                  : "the leader is dead, and a corpse walks away "
+                                    "from nobody");
+            return;
+        }
+
+        // ANOTHER VERB IS ALREADY HOLDING THIS LEADER STILL, AND ITS HOLD IS
+        // ITS OWN TO LIFT. A cast, a bind, a barrier: each takes the leader off
+        // its movers for its own reasons and hands them back on its own terms,
+        // and a second verb re-asserting over that record would leave one
+        // release owed to two owners. It also does not matter, which is the
+        // reason this is a plain `return` rather than a negotiation: a leader
+        // held by anything at all is a leader standing still, which is the
+        // whole of what this wait wants. The wait simply does not start while
+        // something else is doing its job, and starts on the first poll after.
+        if ((HeldStill(leaderName) && !HasRegroupHold(leaderName)) ||
+            HeldAfterRevival(leaderName))
+        {
+            EndTheRegroupWait("another hold has the leader, and it is that one's to lift");
+            return;
+        }
+
+        std::vector<OverseerDecisions::RegroupMember> members;
+        for (Player* p : present)
+        {
+            if (!p || p == leader)
+                continue;
+            // The same filter the follow loop uses one function above: a roster
+            // member left out because the party was full is not in this group
+            // and is not this family's to wait for.
+            if (p->GetGroup() != group)
+                continue;
+            OverseerDecisions::RegroupMember member;
+            member.name = p->GetName();
+            member.seen = p->IsInWorld();
+            member.sameMap = member.seen && p->GetMapId() == leader->GetMapId();
+            member.alive = p->IsAlive();
+            member.ownedByARun = InDungeonRun(p);
+            member.stoodDown = WithinRegroupStandDown(member.name);
+            // WRITTEN ONLY WHEN IT MEANS SOMETHING, which is the discipline
+            // ReadGap already applies to the same pair of players: a cross-map
+            // distance is two coordinate systems subtracted from each other and
+            // the rule refuses to look at one, so leaving it at its unmeasured
+            // default is the honest value rather than a defensive one.
+            if (member.sameMap)
+                member.yards = p->GetDistance2d(leader);
+            members.push_back(member);
+        }
+
+        OverseerDecisions::FamilyRegroup const verdict =
+            OverseerDecisions::ReadFamilyRegroup(members, REGROUP_LIMITS,
+                                                 _regroupWaiting);
+
+        // SAID ONCE PER STATE, NOT ONCE PER POLL. A member on another map can
+        // stay there for an hour, which at a thirty second party poll is a
+        // hundred and twenty copies of the same warning burying whatever else
+        // was worth reading. The string itself is the state: it changes when a
+        // member joins the list, leaves it, or changes its reason for being on
+        // it, and only then is it said again.
+        std::string const carriedOn = OverseerDecisions::RegroupCarriedOnWithout(
+            members, REGROUP_LIMITS, _regroupWaiting);
+        if (carriedOn != _regroupCarriedOnSaid)
+        {
+            _regroupCarriedOnSaid = carriedOn;
+            if (!carriedOn.empty())
+                LOG_WARN("module.overseer",
+                         "overseer: the family is NOT waiting for {} - the catch-up "
+                         "walk cannot move any of them, so holding the leader for one "
+                         "would be a family standing still for a walk that is not "
+                         "happening. They are behind and the family carries on",
+                         carriedOn);
+        }
+
+        if (!verdict.wait)
+        {
+            EndTheRegroupWait("everybody is back within " +
+                              std::to_string(static_cast<uint32>(
+                                  REGROUP_LIMITS.rejoinYards)) +
+                              " yards of the leader");
+            return;
+        }
+
+        // THE MEMBER BEING WAITED FOR CHANGED, SO THE CLOCK DOES TOO. The
+        // ratchet remembers the closest one gap has ever been, and reading a
+        // different member's gap against that memory would count one
+        // character's progress as another's - and, worse, would make a second
+        // straggler appearing look like the first one falling back.
+        if (verdict.waitingFor != _regroupWaitingFor)
+            _regroupProgress = OverseerDecisions::RatchetState{};
+
+        // IS IT ACTUALLY CLOSING? See REGROUP_RATCHET. This is the backstop
+        // that makes the wait safe to place at all, and it is measured against
+        // the closest the straggler has ever been rather than against the
+        // previous poll, so a character circling or jammed against scenery
+        // cannot keep beating it while one that is really walking beats it
+        // every time.
+        OverseerDecisions::RatchetVerdict const closing =
+            OverseerDecisions::Ratchet(_regroupProgress, verdict.worstYards,
+                                       std::time(nullptr), REGROUP_RATCHET);
+        if (closing.stalled)
+        {
+            _regroupStandDown[verdict.waitingFor] = std::time(nullptr);
+            // ERROR, because a member that cannot close a gap under a leader
+            // that is standing perfectly still is not slow, it is stuck, and
+            // nothing below this line is going to fix it. The family carrying
+            // on is the least bad answer available here and it is not a good
+            // one: it is the defect this whole section exists to stop,
+            // deliberately accepted for one member rather than deadlocking
+            // four.
+            LOG_ERROR("module.overseer",
+                      "overseer: the family waited up to {} minutes for '{}' with the "
+                      "leader holding still, and it is {} yards back having made up no "
+                      "ground - so the wait ends, '{}' is left alone for {} minutes, "
+                      "and the family carries on without it. A member that cannot close "
+                      "a gap against a stationary leader needs something other than "
+                      "walking",
+                      static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60),
+                      verdict.waitingFor, static_cast<uint32>(verdict.worstYards),
+                      verdict.waitingFor,
+                      static_cast<uint32>(REGROUP_STANDDOWN_SECONDS / 60));
+            EndTheRegroupWait("the gap stopped closing and the backstop gave up on it");
+            return;
+        }
+
+        bool const fresh = !_regroupWaiting;
+        _regroupWaiting = true;
+        _regroupWanted = true;
+        _regroupLeader = leaderName;
+        _regroupWaitingFor = verdict.waitingFor;
+        // RE-ASSERTED EVERY POLL, exactly as the staging hold is. The register
+        // stops this module's own hand-back sites and it stops nothing else, so
+        // a strategy the hold took can be put back by anything running on its
+        // own cycle; re-asserting is what takes it off again. The deadline is
+        // not pushed out by doing so.
+        HoldForTheFamily(leader, leaderName);
+
+        if (!fresh)
+            return;
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' is {} yards behind '{}', which is past anything "
+                 "`follow` will do for it - so '{}' HOLDS WHERE IT STANDS until that "
+                 "member is back within {} yards. A member chasing a leader that keeps "
+                 "moving has its route discarded and replanned every poll and earns "
+                 "nothing while it tries; the family waits at most {} minutes, and less "
+                 "than that if the gap stops closing",
+                 verdict.waitingFor, static_cast<uint32>(verdict.worstYards),
+                 leaderName, leaderName,
+                 static_cast<uint32>(REGROUP_LIMITS.rejoinYards),
+                 static_cast<uint32>(REGROUP_HOLD_CEILING_SECONDS / 60));
     }
 
     // Recorded by DriveTravel at the instant it grants the strategy, so the
@@ -14898,6 +15408,21 @@ private:
         for (auto it = _travelFocus.begin(); it != _travelFocus.end(); )
         {
             if (stillAimed.count(it->first))
+            {
+                ++it;
+                continue;
+            }
+            // ...OR THE FAMILY IS WAITING FOR SOMEBODY AND THIS IS THE LEADER
+            // IT IS HOLDING STILL TO DO IT (#404). A regroup hold takes the same
+            // diverters down for the same reason an errand does - a leader that
+            // goes on choosing where to go is a leader the member behind it is
+            // still chasing - and it is the one owner of this record that may
+            // have no errand at all for `stillAimed` to carry. Without this the
+            // sweep would hand `grind` back within one travel poll and the wait
+            // would be a hold on a character that walks anyway. It cannot leak:
+            // the hold has a ceiling of its own and ReleaseExpiredHolds collects
+            // it, after which this sweep takes the focus on the very next poll.
+            if (HasRegroupHold(it->first))
             {
                 ++it;
                 continue;
