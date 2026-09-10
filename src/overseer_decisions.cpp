@@ -7576,4 +7576,227 @@ bool RepairLegMayTryAgain(std::string const& detail)
         return false;
     return RepairRefusalRetry(detail) != TownRetry::Never;
 }
+// ------------------------------------------------- the town trip (#406) --
+
+char const* TownReasonWord(TownReason reason)
+{
+    switch (reason)
+    {
+        case TownReason::None:   return "none";
+        case TownReason::Worn:   return "worn";
+        case TownReason::Bags:   return "bags";
+        case TownReason::Broken: return "broken";
+    }
+    return "unknown";
+}
+
+TownReason TownTripMemberReason(TownNeed const& need, TownTripLimits const& limits)
+{
+    // Nothing about an absent member is readable, so it has no reason. See the
+    // header for why that is not the same as having no need.
+    if (!need.present)
+        return TownReason::None;
+
+    // THE FIRST TEST IS ALSO A GUARD. A count is never below zero, so a
+    // brokenToGo of zero without the left-hand test would make every member
+    // broken for ever - including the four of the leader's thirteen items that
+    // read zero because they cannot hold durability at all, if a future caller
+    // ever fed those in.
+    if (need.brokenItems && need.brokenItems >= limits.brokenToGo)
+        return TownReason::Broken;
+
+    if (need.freeBagSlots <= limits.freeBagSlotsToGo)
+        return TownReason::Bags;
+
+    // The broken ones are counted in `damagedItems` as well, but a member with
+    // any of those has already returned above, so reaching this line means
+    // damaged and not broken.
+    if (need.damagedItems)
+        return TownReason::Worn;
+
+    return TownReason::None;
+}
+
+bool TownReasonOpensATrip(TownReason reason)
+{
+    return reason == TownReason::Broken || reason == TownReason::Bags;
+}
+
+CounterRole TownTripRoleFor(TownReason reason)
+{
+    switch (reason)
+    {
+        case TownReason::Broken:
+            return CounterRole::Repairer;
+        case TownReason::Bags:
+            return CounterRole::Vendor;
+        // NEITHER OF THESE OPENS A TRIP, so neither has a destination, and
+        // answering None is what makes PlanTownTrip unable to send a family
+        // somewhere for a reason it has already decided is not worth going for.
+        case TownReason::Worn:
+        case TownReason::None:
+            break;
+    }
+    return CounterRole::None;
+}
+
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy)
+{
+    TownTripPlan plan;
+
+    if (busy)
+        return plan;
+
+    // Before the needs, deliberately. See the header: a trip that ended leaving
+    // somebody owed left them owed for a reason that does not change between two
+    // polls five seconds apart.
+    if (secondsSinceLastTrip < limits.cooldownSeconds)
+        return plan;
+
+    for (TownNeed const& need : members)
+    {
+        TownReason const reason = TownTripMemberReason(need, limits);
+        if (reason == TownReason::None)
+            continue;
+
+        ++plan.membersOwed;
+        if (!TownReasonOpensATrip(reason))
+            continue;
+
+        ++plan.membersDriving;
+        // THE STRONGEST REASON ANYBODY HAS WINS, and the enum's own order is
+        // that ranking rather than a second table that could disagree with it.
+        if (reason > plan.reason)
+            plan.reason = reason;
+    }
+
+    if (!plan.membersDriving)
+    {
+        // Somebody may still be merely worn, which is a real reading and is
+        // reported in membersOwed, but it is not a trip. The reason is cleared
+        // so that a caller cannot mistake a count for a decision.
+        plan.reason = TownReason::None;
+        return plan;
+    }
+
+    plan.role = TownTripRoleFor(plan.reason);
+    // A reason that opens a trip and resolves to no counter would be a trip with
+    // nowhere to go. It cannot happen from the table above, and it is answered
+    // anyway, because inventing a destination is worse than not going.
+    plan.go = plan.role != CounterRole::None;
+    return plan;
+}
+
+TownTripFormation TownTripFormationFor(std::uint32_t memberMapId,
+                                       std::uint32_t counterMapId)
+{
+    return memberMapId == counterMapId ? TownTripFormation::Together
+                                       : TownTripFormation::LeftBehind;
+}
+
+TownStop TownTripMemberStop(TownStopFacts const& facts)
+{
+    if (!facts.present)
+        return TownStop::Wait;
+    if (!facts.owed)
+        return TownStop::Done;
+    if (facts.atTheCounter)
+        return TownStop::Trade;
+    // The journey is the leader's. A follower is brought by the catch-up walk
+    // and the regroup wait (#404), not by an aim of this trip's own.
+    if (!facts.isLeader && !facts.leaderAtTheCounter)
+        return TownStop::Follow;
+    return TownStop::Walk;
+}
+
+TownVisit TownVisitStep(bool atTheCounter, time_t stoodForSeconds,
+                        time_t dwellSeconds)
+{
+    if (!atTheCounter)
+        return TownVisit::Travelling;
+    return stoodForSeconds >= dwellSeconds ? TownVisit::Served : TownVisit::Standing;
+}
+
+char const* TownVisitWord(TownVisit visit)
+{
+    switch (visit)
+    {
+        case TownVisit::Travelling: return "travelling";
+        case TownVisit::Standing:   return "standing";
+        case TownVisit::Served:     return "served";
+    }
+    return "unknown";
+}
+
+char const* TownStopWord(TownStop stop)
+{
+    switch (stop)
+    {
+        case TownStop::Wait:   return "wait";
+        case TownStop::Done:   return "done";
+        case TownStop::Trade:  return "trade";
+        case TownStop::Walk:   return "walk";
+        case TownStop::Follow: return "follow";
+    }
+    return "unknown";
+}
+
+TownTripProof ProveTownTrip(TownNeed const& before, TownNeed const& after,
+                            std::uint64_t copperBefore, std::uint64_t copperAfter)
+{
+    // A READING THAT COULD NOT BE TAKEN PROVES NOTHING. A member that was not in
+    // the world at either end has no numbers to compare, and reporting a repair
+    // for one would be this module asserting something about a character it
+    // never saw.
+    if (!before.present || !after.present)
+        return TownTripProof::NothingHappened;
+
+    bool const wasDamaged = before.damagedItems > 0;
+    bool const fewerDamaged = after.damagedItems < before.damagedItems;
+    bool const nothingDamaged = after.damagedItems == 0;
+
+    bool const repaired = wasDamaged && nothingDamaged;
+    bool const partly = wasDamaged && fewerDamaged && !nothingDamaged;
+
+    // Either half alone is a sale: auctioning frees slots and takes a deposit,
+    // banking frees slots and moves no money. Only a RISE counts on the money
+    // side, so a repair's spending cannot be read as a sale.
+    bool const unloaded = after.freeBagSlots > before.freeBagSlots ||
+                          copperAfter > copperBefore;
+
+    if (repaired && unloaded)
+        return TownTripProof::RepairedAndUnloaded;
+    if (repaired)
+        return TownTripProof::Repaired;
+    if (partly)
+        // REPORTED AS THE PARTIAL IT IS EVEN WHEN SOMETHING ALSO SOLD, because
+        // the sentence an operator needs out of this word is about the gear: a
+        // member still carrying a slot below its maximum is a member the trip
+        // did not finish with, whatever else it achieved.
+        return TownTripProof::PartlyRepaired;
+    if (unloaded)
+        return TownTripProof::Unloaded;
+    return TownTripProof::NothingHappened;
+}
+
+char const* TownTripProofWord(TownTripProof proof)
+{
+    switch (proof)
+    {
+        case TownTripProof::NothingHappened:     return "nothing happened";
+        case TownTripProof::Unloaded:            return "unloaded";
+        case TownTripProof::PartlyRepaired:      return "partly repaired";
+        case TownTripProof::Repaired:            return "repaired";
+        case TownTripProof::RepairedAndUnloaded: return "repaired and unloaded";
+    }
+    return "unknown";
+}
+
+bool TownTripMemberAccepted(TownNeed const& after)
+{
+    return after.present && after.damagedItems == 0;
+}
+
 }  // namespace OverseerDecisions
