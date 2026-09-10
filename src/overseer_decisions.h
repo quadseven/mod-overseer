@@ -3104,6 +3104,20 @@ struct GearWearer
     // Does the item's AllowableClass admit this character? Resolved by the
     // caller against the class mask.
     bool classAllowed{true};
+
+    // May this character hold a weapon in the off hand at all (#411)? A class
+    // fact, not an item one: the core suggests the off-hand slot for a
+    // one-hander ONLY when CanDualWield is true (PlayerStorage.cpp:186-187),
+    // and refuses an INVTYPE_WEAPONOFFHAND put there when it is false
+    // (PlayerStorage.cpp:2034-2038, EQUIP_ERR_CANT_DUAL_WIELD). An item that
+    // can go NOWHERE ELSE therefore has to be refused here rather than offered,
+    // scored against an off hand that only looks empty, and re-attempted every
+    // poll forever - which is #145's bug pointing the other way.
+    //
+    // Defaulted true because that is the answer for every caller that has not
+    // measured it, and a false default would silently refuse off-hand weapons
+    // for characters that can hold them.
+    bool canDualWield{true};
 };
 
 // An item, reduced to what the score actually reads.
@@ -3257,6 +3271,73 @@ enum class GearConfidence
     Opinion,
 };
 
+// ---------------------------------------- may this character use it (#411) --
+//
+// THE ONE GATE, SO A NAME NEVER GOES MISSING WITHOUT A REASON. Every refusal
+// GearScore can make is made here and comes back named, because the failure
+// this exists to stop has two halves and only one of them is loud. A character
+// wrongly ADMITTED to a candidate list is the visible half: a staff was ranked
+// for a rogue, who can never hold one, and the ranking said so out loud by
+// printing a number. A character wrongly EXCLUDED is the quiet half, and it is
+// the worse one - a name simply is not in the list, nothing says why, and there
+// is nothing to disagree with.
+//
+// WHY `AllowableClass` IS NOT THE ANSWER, and this is the whole of #411. The
+// staff carried `AllowableClass = -1`, which means the ITEM restricts nobody.
+// Whether a character can HOLD a weapon is not on the item at all: it is a
+// proficiency, granted by spells a class learns, recorded in that character's
+// own skills, and absent from `item_template` entirely. So an item-level
+// comparison plus a class mask will keep offering staves and polearms to
+// rogues and plate to mages forever, and each time it will look right.
+//
+// WHAT THE PINNED CORE ACTUALLY DOES, checked rather than assumed, because the
+// obvious call is not the one that answers this:
+//
+//   Player::CanUseItem(ItemTemplate const*)  PlayerStorage.cpp:2378-2436
+//       Faction flags, AllowableClass, AllowableRace, the item's own
+//       RequiredSkill and RequiredSkillRank, RequiredSpell, RequiredLevel, a
+//       holiday gate and a script hook. It DOES return
+//       EQUIP_ERR_NO_REQUIRED_PROFICIENCY - but only for RequiredSkill and
+//       RequiredSpell, which are the item's own columns and are 0 on an
+//       ordinary weapon. It never looks at the weapon skill. A staff passes it.
+//
+//   Player::CanUseItem(Item*, bool)          PlayerStorage.cpp:2322-2375
+//       Calls the above, and THEN does the proficiency test at :2343-2367:
+//       `pItem->GetSkill()`, and EQUIP_ERR_NO_REQUIRED_PROFICIENCY whenever
+//       `GetSkillValue(itemSkill) == 0`. This is the overload that answers the
+//       question, and it needs a real Item.
+//
+//   Item::GetSkill()                         Item.cpp:556-559
+//       `return GetTemplate()->GetSkill();` - so the skill line is a property
+//       of the TEMPLATE after all, and ItemTemplate::GetSkill
+//       (ItemTemplate.h:782-815) maps subclass to skill off the core's own two
+//       tables. A caller holding only a template can therefore make exactly the
+//       test the Item overload makes, and an adapter must, because a drop that
+//       has not been created yet has no Item to ask about.
+//
+// So the adapter asks the core both questions and hands the two answers in as
+// `classAllowed` and `weaponProficient`; nothing in this file reasons from a
+// class id, and no class-to-subclass table is written down anywhere, because
+// one would be wrong for the character that has not trained the thing yet - a
+// warrior learns plate at 40 - and would rot the first time the realm changed.
+enum class GearRefusal
+{
+    None,
+    // The item's own class or race mask shuts this character out, or the core
+    // refused it for a reason of its own. `classAllowed` false.
+    WrongClass,
+    // RequiredLevel is above this character's level. Temporary, and says so.
+    BelowRequiredLevel,
+    // Armour of a subclass whose skill this character does not hold.
+    NoArmourProficiency,
+    // A weapon whose skill line this character does not hold. The rogue and
+    // the staff.
+    NoWeaponProficiency,
+    // A weapon that can go in the off hand and nowhere else, for a character
+    // that cannot dual wield.
+    NeedsDualWield,
+};
+
 struct GearVerdict
 {
     // May this character put it on at all? False is final: no score, no
@@ -3286,9 +3367,29 @@ struct GearVerdict
     // One clause, for the line the caller prints: "mail, 113 armour", or
     // "no leather proficiency".
     std::string why;
+
+    // WHICH GATE SAID NO (#411), machine-readable. `why` is the sentence a
+    // person reads; this is the same answer a caller can count, group or
+    // branch on without matching on prose. None whenever `wearable`.
+    GearRefusal refusal{GearRefusal::None};
 };
 
 GearVerdict GearScore(GearItem const& item, GearWearer const& who);
+
+struct GearUsability
+{
+    bool usable{false};
+    GearRefusal refusal{GearRefusal::None};
+    // The sentence, in the same voice GearVerdict::why uses.
+    std::string why;
+};
+
+GearUsability GearUsable(GearItem const& item, GearWearer const& who);
+
+// The core's own word for a weapon subclass, for the sentence only - it decides
+// nothing. ItemTemplate.h:344-364. Empty for anything that is not a weapon, and
+// for the two subclasses the core itself has no name for.
+std::string GearWeaponKindName(GearItem const& item);
 
 // What a candidate actually has to beat in the slot it would go into.
 //
@@ -3371,6 +3472,16 @@ GearIncumbentScore GearWorn(GearVerdict const& worn);
 // both halves are.
 GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
                                      GearIncumbentScore const& offHand);
+
+// HOW TO SAY WHAT A CANDIDATE WAS MEASURED AGAINST (#411), for the line the
+// drive prints. A two-hander is scored against the PAIR, and the number alone
+// does not say so: a reader seeing "37" next to a main-hand weapon has no way
+// to tell whether the off hand was counted, and the ranking that started #411
+// counted a 3 item-level "gain" for a character who would have given up a whole
+// second weapon to take it. So the sentence names the cost when there is one,
+// and says nothing extra when the off hand was empty and there was none.
+std::string GearIncumbentSaid(GearIncumbentScore const& incumbent,
+                              bool emptiesTheOffHand, float offHandGiven);
 
 // The rule itself. `GearIsUpgrade` is the margin it uses and is unchanged, so
 // the two never disagree about where the line is - only about what to say when
