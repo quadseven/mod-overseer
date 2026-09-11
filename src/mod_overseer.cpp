@@ -32594,12 +32594,22 @@ private:
         std::vector<OverseerDecisions::RecruitCandidate> candidates;
         std::map<uint32, size_t> byGuid;
 
+        // THE SQL BAND AND THE RULE'S BAND HAVE TO BE THE SAME BAND.
+        // GuildLevelBand answers {0, 0} for a guild with no members, and
+        // RecruitVerdictFor reads that as `no level gate applies` rather than
+        // as a band of zero. `BETWEEN 0 AND 0` is the opposite: it matches
+        // nobody. Left as it was, the query would quietly answer `there is
+        // nobody to recruit` in exactly the case the rule means `anybody`.
+        // 255 is the ceiling of `characters`.`level`, a TINYINT UNSIGNED.
+        uint32 const floorLevel = band.highest ? band.lowest : 1u;
+        uint32 const ceilLevel = band.highest ? band.highest : 255u;
+
         QueryResult rows = CharacterDatabase.Query(
             "SELECT c.guid, c.name, c.race, c.class, c.level FROM characters c "
             "LEFT JOIN guild_member gm ON gm.guid = c.guid "
             "WHERE gm.guid IS NULL AND c.deleteDate IS NULL "
             "AND c.level BETWEEN {} AND {} ORDER BY c.name LIMIT {}",
-            band.lowest, band.highest, GUILD_CANDIDATE_CAP);
+            floorLevel, ceilLevel, GUILD_CANDIDATE_CAP);
         if (!rows)
             return candidates;
 
@@ -32616,21 +32626,31 @@ private:
             candidates.push_back(candidate);
         } while (rows->NextRow());
 
+        // THE SECOND QUERY IS BOUND BY THE FIRST QUERY'S ANSWER, NOT BY ITS
+        // WHERE CLAUSE. Repeating the band and the guild join here would
+        // repeat the FILTER without repeating the LIMIT, so a band matching
+        // fifty thousand characters would drag fifty thousand characters'
+        // skills across for a sweep that had already cut itself to two
+        // thousand, and throw all but a fraction away on the far side. The
+        // guid list is exactly the pool that was taken, so the cap is spent
+        // once and both queries carry the same bound. The list is built from
+        // integers this function read out of the database itself, so nothing
+        // a person typed reaches it.
+        std::ostringstream pool;
+        for (std::map<uint32, size_t>::const_iterator it = byGuid.begin();
+             it != byGuid.end(); ++it)
+            pool << (it == byGuid.begin() ? "" : ",") << it->first;
+
         if (QueryResult skills = CharacterDatabase.Query(
-                "SELECT cs.guid, cs.skill, cs.value FROM character_skills cs "
-                "JOIN characters c ON c.guid = cs.guid "
-                "LEFT JOIN guild_member gm ON gm.guid = c.guid "
-                "WHERE gm.guid IS NULL AND c.deleteDate IS NULL "
-                "AND c.level BETWEEN {} AND {} AND cs.skill IN ({})",
-                band.lowest, band.highest, PrimaryProfessionIdList()))
+                "SELECT guid, skill, value FROM character_skills "
+                "WHERE guid IN ({}) AND skill IN ({})",
+                pool.str(), PrimaryProfessionIdList()))
         {
             do
             {
                 Field* row = skills->Fetch();
                 std::map<uint32, size_t>::const_iterator at =
                     byGuid.find(row[0].Get<uint32>());
-                // Past the LIMIT above, and therefore not a candidate this
-                // sweep is considering. Skipped rather than counted.
                 if (at == byGuid.end())
                     continue;
                 OverseerDecisions::ProfessionHolding holding;
@@ -32905,6 +32925,38 @@ private:
             return refuse("that character is in no guild");
 
         std::vector<GuildMemberFacts> const members = GuildRosterFacts(guild->GetId());
+
+        // A SHORT ROSTER READ IS NOT AN EMPTY GUILD, AND THE DIFFERENCE IS THE
+        // WHOLE ANSWER. Every question below is computed from `members`, and a
+        // member who is missing from that vector is a profession nobody holds,
+        // a role nobody can fill and a service nobody brings. So a read that
+        // came back short does not produce a cautious answer, it produces a
+        // confident wrong one: a profession view showing holes that are not
+        // there, and a shortlist recruiting against them.
+        //
+        // CharacterDatabase.Query answers a null result for a failed read and
+        // for an empty one alike, so the read cannot say which it was. The
+        // world can. Guild::GetMemberCount is the count held in memory by the
+        // object the core itself is serving, and it is authoritative here for
+        // the same reason the rest of this module prefers the world to the
+        // save file: the rows are written through a transaction that commits
+        // on another thread, so a SELECT taken moments after a join can
+        // legitimately be behind. Either way - a failed read, a lagging
+        // commit, or a `guild_member` row whose character has gone - the
+        // honest answer is to say so and be asked again, not to answer from a
+        // roster that is missing people.
+        //
+        // This is the same distinction QuestAimsAfterRead makes at the top of
+        // overseer_decisions.h: a failed read is not a successful read of
+        // nothing.
+        if (members.size() != guild->GetMemberCount())
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: guild '{}' ({}) read back {} member rows and the world holds {}",
+                     guild->GetName(), guild->GetId(), members.size(),
+                     guild->GetMemberCount());
+            return refuse("the guild roster read back a different size from the world");
+        }
 
         if (request.verb == GuildVerb::View)
         {
