@@ -28525,7 +28525,7 @@ private:
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
             // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth',
-            // 'summon', 'conjure', 'cast' and 'mail' do not go through
+            // 'summon', 'conjure', 'cast', 'guild' and 'mail' do not go through
             // PlayerbotAI::HandleCommand and share no
             // trigger, so nothing they do can be overwritten by the row
             // after them.
@@ -28534,6 +28534,7 @@ private:
                 && kind != "bank" && kind != "auction" && kind != "bind"
                 && kind != "hearth" && kind != "conjure" && kind != "cast"
                 && kind != "summon"
+                && kind != "guild"
                 && kind != "mail")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
@@ -28665,6 +28666,8 @@ private:
                 detail = DoConjure(player, command, status, rowResult, _pendingConjures, id);
             else if (kind == "cast")
                 detail = DoCast(player, command, status, rowResult, _pendingCasts, id);
+            else if (kind == "guild")
+                detail = DoGuild(player, command, targetArg, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -32490,6 +32493,594 @@ private:
         ev.after = ReadHomeBind(who);
         ev.outcome = BindReadBack(ev.before, ev.after, ev.standing, BIND_SAME_SPOT_YARDS);
         return nullptr;
+    }
+
+    // THE POOL THIS SWEEP WILL READ AT MOST, and it is a bound rather than a
+    // target. The level band in the pure rule already does most of the
+    // narrowing; this is the backstop that stops a badly configured band from
+    // turning one command row into a full table scan of every character on a
+    // realm. Ordered by name so that the pool a re-run reads is the same pool,
+    // which is the other half of the shortlist's own tie-break rule: a stable
+    // answer needs a stable input as well as a stable comparison.
+    static constexpr uint32 GUILD_CANDIDATE_CAP = 2000;
+
+    // The primary profession ids as a SQL IN list, built from the decisions
+    // layer's own array rather than typed out again here. Two lists of eleven
+    // numbers is exactly the thing that drifts silently: the day somebody adds
+    // a profession to that array, a hand-written copy here would go on
+    // reporting the guild as fully covered in a profession nobody could see.
+    static std::string PrimaryProfessionIdList()
+    {
+        std::ostringstream o;
+        for (unsigned i = 0; i < OverseerDecisions::GUILD_PROFESSION_COUNT; ++i)
+            o << (i ? "," : "") << OverseerDecisions::GUILD_PROFESSIONS[i];
+        return o.str();
+    }
+
+    // The guild's roster, as the pure layer wants it.
+    //
+    // READ OUT OF `guild_member` RATHER THAN OFF THE Guild OBJECT, and that is
+    // forced rather than chosen. Guild::m_members is protected and the core
+    // exposes no public way to walk it; the one iteration it does offer,
+    // Guild::BroadcastWorker, calls Member::FindPlayer and therefore skips
+    // every member who is not logged in. A profession view that silently
+    // omitted the offline half of a guild would be worse than no view at all,
+    // because the holes it showed would be invented.
+    //
+    // TWO QUERIES, NOT ONE PER MEMBER. The second is joined back through
+    // guild_member so it needs no IN list of guids, and a member with no
+    // primary profession simply produces no rows in it.
+    static std::vector<OverseerDecisions::GuildMemberFacts> GuildRosterFacts(uint32 guildId)
+    {
+        std::vector<OverseerDecisions::GuildMemberFacts> members;
+        std::map<uint32, size_t> byGuid;
+
+        QueryResult rows = CharacterDatabase.Query(
+            "SELECT c.guid, c.name, c.class, c.level FROM guild_member gm "
+            "JOIN characters c ON c.guid = gm.guid WHERE gm.guildid = {} "
+            "ORDER BY c.name",
+            guildId);
+        if (!rows)
+            return members;
+
+        do
+        {
+            Field* row = rows->Fetch();
+            OverseerDecisions::GuildMemberFacts member;
+            member.name = row[1].Get<std::string>();
+            member.classId = row[2].Get<uint8>();
+            member.level = row[3].Get<uint8>();
+            byGuid[row[0].Get<uint32>()] = members.size();
+            members.push_back(member);
+        } while (rows->NextRow());
+
+        if (QueryResult skills = CharacterDatabase.Query(
+                "SELECT cs.guid, cs.skill, cs.value FROM character_skills cs "
+                "JOIN guild_member gm ON gm.guid = cs.guid "
+                "WHERE gm.guildid = {} AND cs.skill IN ({})",
+                guildId, PrimaryProfessionIdList()))
+        {
+            do
+            {
+                Field* row = skills->Fetch();
+                std::map<uint32, size_t>::const_iterator at =
+                    byGuid.find(row[0].Get<uint32>());
+                if (at == byGuid.end())
+                    continue;
+                OverseerDecisions::ProfessionHolding holding;
+                holding.skill = row[1].Get<uint16>();
+                holding.value = row[2].Get<uint16>();
+                members[at->second].professions.push_back(holding);
+            } while (skills->NextRow());
+        }
+
+        return members;
+    }
+
+    // Everybody who could be asked, before any of them is judged.
+    //
+    // WHAT SQL FILTERS AND WHAT IT DOES NOT, because the split is deliberate.
+    // SQL takes the three things it can take cheaply and exactly: the character
+    // is in no guild (a LEFT JOIN with no matching guild_member row), is not
+    // flagged for deletion, and is inside the level band. Everything that is a
+    // JUDGEMENT - the faction, which hole is closed, whether that hole is still
+    // open after an earlier pick - is left to the pure layer, where it can be
+    // read and tested. The WHERE clause is a way of not fetching two thousand
+    // rows nobody will look at; it is not where the rule lives, and it must not
+    // become where the rule lives.
+    static std::vector<OverseerDecisions::RecruitCandidate> GuildCandidateFacts(
+        OverseerDecisions::RecruitBand const& band)
+    {
+        std::vector<OverseerDecisions::RecruitCandidate> candidates;
+        std::map<uint32, size_t> byGuid;
+
+        QueryResult rows = CharacterDatabase.Query(
+            "SELECT c.guid, c.name, c.race, c.class, c.level FROM characters c "
+            "LEFT JOIN guild_member gm ON gm.guid = c.guid "
+            "WHERE gm.guid IS NULL AND c.deleteDate IS NULL "
+            "AND c.level BETWEEN {} AND {} ORDER BY c.name LIMIT {}",
+            band.lowest, band.highest, GUILD_CANDIDATE_CAP);
+        if (!rows)
+            return candidates;
+
+        do
+        {
+            Field* row = rows->Fetch();
+            OverseerDecisions::RecruitCandidate candidate;
+            candidate.name = row[1].Get<std::string>();
+            candidate.teamId =
+                static_cast<unsigned>(Player::TeamIdForRace(row[2].Get<uint8>()));
+            candidate.classId = row[3].Get<uint8>();
+            candidate.level = row[4].Get<uint8>();
+            byGuid[row[0].Get<uint32>()] = candidates.size();
+            candidates.push_back(candidate);
+        } while (rows->NextRow());
+
+        if (QueryResult skills = CharacterDatabase.Query(
+                "SELECT cs.guid, cs.skill, cs.value FROM character_skills cs "
+                "JOIN characters c ON c.guid = cs.guid "
+                "LEFT JOIN guild_member gm ON gm.guid = c.guid "
+                "WHERE gm.guid IS NULL AND c.deleteDate IS NULL "
+                "AND c.level BETWEEN {} AND {} AND cs.skill IN ({})",
+                band.lowest, band.highest, PrimaryProfessionIdList()))
+        {
+            do
+            {
+                Field* row = skills->Fetch();
+                std::map<uint32, size_t>::const_iterator at =
+                    byGuid.find(row[0].Get<uint32>());
+                // Past the LIMIT above, and therefore not a candidate this
+                // sweep is considering. Skipped rather than counted.
+                if (at == byGuid.end())
+                    continue;
+                OverseerDecisions::ProfessionHolding holding;
+                holding.skill = row[1].Get<uint16>();
+                holding.value = row[2].Get<uint16>();
+                candidates[at->second].professions.push_back(holding);
+            } while (skills->NextRow());
+        }
+
+        return candidates;
+    }
+
+    // The guild the roster means, and the size it is aiming at.
+    //
+    // TARGET SIZE IS A CONSTANT HERE AND NOT A COLUMN, deliberately, because a
+    // number nothing reads is worse than a number in one place. Fifteen is
+    // roughly what the guilds already on this realm carry, so it is a shape
+    // that has been observed rather than one that was picked; when something
+    // needs to change it, it becomes a column then, with a migration, rather
+    // than being guessed at now.
+    static constexpr uint32 GUILD_TARGET_SIZE = 15;
+    // The band the recruiting rule is asked for. Five is about the family's own
+    // spread, so a recruit is no further from the guild than its members
+    // already are from each other. See GuildLevelBand: the number is a policy,
+    // not a measurement, and this is where the policy is written down.
+    static constexpr uint32 GUILD_BAND_SPREAD = 5;
+
+    // Form a guild, look at what it covers, find who would fill the holes, and
+    // ask one of them in (#413).
+    //
+    // WHY Guild::Create AND NOT A CHARTER. The player's road to a guild in
+    // 3.3.5a is to buy a charter from a `petitioner` and collect signatures -
+    // nine of them by default, CONFIG_MIN_PETITION_SIGNS - and every signature
+    // arrives as CMSG_PETITION_SIGN from a client. This family is five. To sign
+    // its own charter it would need four strangers who are not in it yet, which
+    // is the recruiting problem it is trying to solve, from the wrong side. The
+    // charter path is genuinely closed to a bot family until the guild exists.
+    //
+    // SO THE CORE'S OWN GUILD API IS THE PATH, AND IT IS NOT A SHORTCUT. This
+    // writes no row itself: Guild::Create is the same call the core's own guild
+    // command makes, it lays down the five default ranks, it inserts the guild
+    // and adds the founder as guild master, and sGuildMgr->AddGuild puts the
+    // object in the store the rest of the server reads. Member::SaveToDB is the
+    // core's, the character cache update is the core's, the guild event log
+    // entry is the core's. Writing `guild` and `guild_member` by hand would
+    // produce rows that looked right and a world that had never heard of them,
+    // which is the failure AGENTS.md is about.
+    static char const* DoGuild(Player* who, std::string const& command,
+                               std::string const& targetArg, char const*& status,
+                               std::string& out)
+    {
+        using OverseerDecisions::GuildFormationAction;
+        using OverseerDecisions::GuildFormationFacts;
+        using OverseerDecisions::GuildFormationState;
+        using OverseerDecisions::GuildFormationStep;
+        using OverseerDecisions::GuildMemberFacts;
+        using OverseerDecisions::GuildNeeds;
+        using OverseerDecisions::GuildNeedsFrom;
+        using OverseerDecisions::GuildProfessionView;
+        using OverseerDecisions::GuildRequest;
+        using OverseerDecisions::GuildRoleName;
+        using OverseerDecisions::GuildServiceName;
+        using OverseerDecisions::GuildVerb;
+        using OverseerDecisions::NextGuildFormationStep;
+        using OverseerDecisions::ParseGuildRequest;
+        using OverseerDecisions::ProfessionCover;
+        using OverseerDecisions::RecruitCandidate;
+        using OverseerDecisions::RecruitNeed;
+        using OverseerDecisions::RecruitNeedName;
+        using OverseerDecisions::RecruitPick;
+        using OverseerDecisions::RecruitVerdict;
+        using OverseerDecisions::RecruitVerdictFor;
+        using OverseerDecisions::RecruitShortlist;
+
+        GuildRequest const request = ParseGuildRequest(command);
+
+        std::string note;
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"character\":" << J(who->GetName())
+              << ",\"request\":" << J(command);
+            if (!note.empty())
+                o << ',' << note;
+            o << '}';
+            out = o.str();
+        };
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (request.verb == GuildVerb::None)
+        {
+            // The parser's exact words are pinned in tests/test_guild.cpp and
+            // go into the JSON. `detail` has to outlive this call, so the
+            // column gets the literal the parser chose, which has static
+            // storage for exactly that reason.
+            return refuse(request.error.c_str());
+        }
+
+        // WHICH GUILD THIS IS ABOUT. For `form` it is the name in the row,
+        // because the guild may not exist yet. For everything else it is the
+        // guild the acting character is actually in, because a view of a guild
+        // this family is not in, or an invitation into one, is not this verb's
+        // business.
+        Guild* guild = request.verb == GuildVerb::Form
+                           ? sGuildMgr->GetGuildByName(request.name)
+                           : (who->GetGuildId() ? sGuildMgr->GetGuildById(who->GetGuildId())
+                                                : nullptr);
+
+        if (request.verb == GuildVerb::Form)
+        {
+            if (!sObjectMgr->IsValidCharterName(request.name))
+                return refuse("the core will not accept that as a guild name");
+
+            // THE FOUNDER IS THE ROSTER'S LEAD, NOT WHOEVER CARRIES THE ROW.
+            // The row runs on a character that happens to be online; the guild
+            // master is a decision the roster already records, and the same
+            // `lead` column the party drive reads. Backticked because it is a
+            // reserved word in MySQL 8 - see KeepRosterGrouped, which took the
+            // worldserver down in a crash loop over exactly this.
+            GuildFormationState state;
+            state.wantedName = request.name;
+            if (QueryResult roster = CharacterDatabase.Query(
+                    "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
+                    "ORDER BY `lead` DESC, name"))
+            {
+                do
+                {
+                    Field* row = roster->Fetch();
+                    std::string const name = row[0].Get<std::string>();
+                    if (row[1].Get<uint8>() && state.founderName.empty())
+                        state.founderName = name;
+                    state.founders.push_back(name);
+                } while (roster->NextRow());
+            }
+            if (state.founderName.empty())
+                return refuse("no enabled roster character is marked as the lead");
+
+            GuildFormationFacts facts;
+            ObjectGuid const founderGuid =
+                sCharacterCache->GetCharacterGuidByName(state.founderName);
+            if (!founderGuid)
+                return refuse("the lead roster character does not exist");
+
+            uint32 const founderGuild =
+                sCharacterCache->GetCharacterGuildIdByGuid(founderGuid);
+            facts.ours = guild && guild->GetLeaderGUID() == founderGuid;
+            facts.nameTakenByAnother = guild && !facts.ours;
+            facts.founderInAnotherGuild =
+                founderGuild != 0 && (!guild || founderGuild != guild->GetId());
+            Player* founder = ObjectAccessor::FindPlayerByName(state.founderName);
+            facts.founderOnline = ClientAttached(founder);
+            // WHO IS ALREADY IN, ASKED OF THE GUILD OBJECT AND NOT OF
+            // `guild_member`. Guild::Create and Guild::AddMember write their
+            // rows through a CharacterDatabase transaction, which commits on
+            // its own thread, so a SELECT taken on the poll straight after an
+            // add can still answer without the member it just gained. The
+            // formation machine would then be told to add somebody who is
+            // already in, AddMember would refuse, and the row would carry an
+            // error nothing was actually wrong about. The Guild object was
+            // updated synchronously and is the truth here, which is the same
+            // argument the rest of this module makes about the world's memory
+            // against its save file. Guild::GetMember(std::string_view) is the
+            // core's own by-name lookup over that memory (Guild.h:393).
+            if (guild)
+                for (std::string const& name : state.founders)
+                    if (guild->GetMember(name))
+                        facts.alreadyIn.push_back(name);
+
+            GuildFormationAction const action = NextGuildFormationStep(state, facts);
+
+            {
+                std::ostringstream o;
+                o << "\"guild\":" << J(state.wantedName)
+                  << ",\"founder\":" << J(state.founderName)
+                  << ",\"step\":" << J(OverseerDecisions::GuildFormationStepName(action.step))
+                  << ",\"members_before\":" << (guild ? guild->GetMemberCount() : 0u);
+                note = o.str();
+            }
+
+            switch (action.step)
+            {
+                case GuildFormationStep::Blocked:
+                    return refuse(action.said);
+
+                case GuildFormationStep::WaitForFounder:
+                    // Nothing failed and nothing changed. The founder logs in
+                    // and the next row gets further; that is the whole remedy.
+                    describe("waiting", action.said);
+                    status = "unchanged";
+                    return "";
+
+                case GuildFormationStep::Nothing:
+                    describe("formed", "");
+                    status = "unchanged";
+                    return "";
+
+                case GuildFormationStep::Create:
+                {
+                    // The step is only ever Create when facts.founderOnline
+                    // was true, which required a live session; asked again
+                    // here because Guild::Create dereferences this pointer
+                    // on its second line and a null would take the
+                    // worldserver down rather than fail a command row.
+                    if (!founder)
+                        return refuse("the founder was gone by the time the guild was made");
+                    Guild* made = new Guild();
+                    if (!made->Create(founder, state.wantedName))
+                    {
+                        delete made;
+                        return refuse("the core refused to create the guild");
+                    }
+                    sGuildMgr->AddGuild(made);
+                    break;
+                }
+
+                case GuildFormationStep::Add:
+                {
+                    ObjectGuid const addGuid =
+                        sCharacterCache->GetCharacterGuidByName(action.who);
+                    if (!addGuid)
+                        return refuse("a roster character named in the guild does not exist");
+                    if (!guild || !guild->AddMember(addGuid, uint8(action.rank)))
+                        return refuse("the core refused to add that character to the guild");
+                    break;
+                }
+            }
+
+            // DELIVERED IS NOT DONE: ASK THE WORLD. Guild::Create returns a
+            // bool and Guild::AddMember returns a bool, and neither of them is
+            // the question. The question is whether sGuildMgr now answers with
+            // a guild of this name that holds the character the step named,
+            // which is what the rest of the server will see.
+            Guild* after = sGuildMgr->GetGuildByName(state.wantedName);
+            if (!after)
+                return refuse("the guild was not there when it was read back");
+
+            std::string const whoAdded =
+                action.step == GuildFormationStep::Create ? state.founderName : action.who;
+            ObjectGuid const addedGuid = sCharacterCache->GetCharacterGuidByName(whoAdded);
+            if (!after->GetMember(addedGuid))
+                return refuse("the character was not in the guild when it was read back");
+
+            {
+                std::ostringstream o;
+                o << note << ",\"added\":" << J(whoAdded)
+                  << ",\"rank\":" << action.rank
+                  << ",\"guild_id\":" << after->GetId()
+                  << ",\"members_after\":" << after->GetMemberCount();
+                note = o.str();
+            }
+
+            LOG_INFO("module.overseer",
+                     "overseer: guild '{}' ({}) - {} '{}' at rank {}, {} members now",
+                     after->GetName(), after->GetId(),
+                     action.step == GuildFormationStep::Create ? "founded by" : "added",
+                     whoAdded, action.rank, after->GetMemberCount());
+
+            describe(action.step == GuildFormationStep::Create ? "created" : "added", "");
+            status = "applied";
+            return "";
+        }
+
+        if (!guild)
+            return refuse("that character is in no guild");
+
+        std::vector<GuildMemberFacts> const members = GuildRosterFacts(guild->GetId());
+
+        if (request.verb == GuildVerb::View)
+        {
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"members\":" << members.size()
+              << ",\"professions\":[";
+            std::vector<ProfessionCover> const view = GuildProfessionView(members);
+            for (size_t i = 0; i < view.size(); ++i)
+            {
+                o << (i ? "," : "") << "{\"skill\":" << view[i].skill
+                  << ",\"name\":" << J(view[i].name)
+                  << ",\"best\":" << view[i].best << ",\"holders\":[";
+                for (size_t h = 0; h < view[i].holders.size(); ++h)
+                    o << (h ? "," : "") << J(view[i].holders[h]);
+                o << "]}";
+            }
+            o << ']';
+
+            // THE HOLES, SAID OUT LOUD RATHER THAN LEFT TO BE COUNTED. The
+            // empty rows above already carry the answer, and a reader should
+            // not have to notice an absence to find it.
+            GuildNeeds const needs =
+                GuildNeedsFrom(members, static_cast<unsigned>(who->GetTeamId()),
+                               GUILD_TARGET_SIZE, GUILD_BAND_SPREAD);
+            o << ",\"missing_professions\":[";
+            for (size_t i = 0; i < needs.professionGaps.size(); ++i)
+                o << (i ? "," : "") << J(OverseerDecisions::ProfessionName(needs.professionGaps[i]));
+            o << "],\"missing_services\":[";
+            for (size_t i = 0; i < needs.serviceGaps.size(); ++i)
+                o << (i ? "," : "") << J(GuildServiceName(needs.serviceGaps[i]));
+            o << "],\"missing_roles\":[";
+            for (size_t i = 0; i < needs.roleGaps.size(); ++i)
+                o << (i ? "," : "") << J(GuildRoleName(needs.roleGaps[i]));
+            o << "]";
+            note = o.str();
+
+            describe("read", "");
+            status = "delivered";
+            return "";
+        }
+
+        GuildNeeds const needs =
+            GuildNeedsFrom(members, static_cast<unsigned>(who->GetTeamId()),
+                           GUILD_TARGET_SIZE, GUILD_BAND_SPREAD);
+
+        if (request.verb == GuildVerb::Shortlist)
+        {
+            // READ-ONLY. This verb invites nobody and changes nothing; it
+            // answers who WOULD be worth asking and why, so that the judgement
+            // can be read before it is acted on.
+            std::vector<RecruitCandidate> const candidates = GuildCandidateFacts(needs.band);
+            std::vector<RecruitPick> const picks =
+                RecruitShortlist(candidates, needs, request.atMost);
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"members\":" << members.size()
+              << ",\"target_size\":" << GUILD_TARGET_SIZE
+              << ",\"band\":{\"lowest\":" << needs.band.lowest
+              << ",\"highest\":" << needs.band.highest << '}'
+              << ",\"considered\":" << candidates.size()
+              << ",\"shortlist\":[";
+            for (size_t i = 0; i < picks.size(); ++i)
+            {
+                RecruitCandidate const& candidate = candidates[picks[i].index];
+                o << (i ? "," : "") << "{\"name\":" << J(candidate.name)
+                  << ",\"class\":" << candidate.classId
+                  << ",\"level\":" << candidate.level
+                  << ",\"need\":" << J(RecruitNeedName(picks[i].verdict.need))
+                  << ",\"why\":" << J(picks[i].verdict.said) << '}';
+            }
+            o << ']';
+            note = o.str();
+
+            describe("read", "");
+            status = "delivered";
+            return "";
+        }
+
+        // GuildVerb::Invite. One named character, judged by the same rule the
+        // shortlist uses, so that an invitation sent by hand cannot bypass the
+        // gates an invitation off a shortlist went through.
+        if (targetArg.empty())
+            return refuse("no character to invite (put the name in target_arg)");
+
+        ObjectGuid const inviteeGuid = sCharacterCache->GetCharacterGuidByName(targetArg);
+        if (!inviteeGuid)
+            return refuse("no character of that name exists");
+
+        RecruitCandidate candidate;
+        candidate.name = targetArg;
+        candidate.guildId = sCharacterCache->GetCharacterGuildIdByGuid(inviteeGuid);
+        if (QueryResult row = CharacterDatabase.Query(
+                "SELECT race, class, level, deleteDate FROM characters WHERE guid = {}",
+                inviteeGuid.GetCounter()))
+        {
+            Field* fields = row->Fetch();
+            candidate.teamId =
+                static_cast<unsigned>(Player::TeamIdForRace(fields[0].Get<uint8>()));
+            candidate.classId = fields[1].Get<uint8>();
+            candidate.level = fields[2].Get<uint8>();
+            candidate.gone = !fields[3].IsNull();
+        }
+        else
+            return refuse("that character has no row to read");
+
+        if (QueryResult skills = CharacterDatabase.Query(
+                "SELECT skill, value FROM character_skills WHERE guid = {} AND skill IN ({})",
+                inviteeGuid.GetCounter(), PrimaryProfessionIdList()))
+        {
+            do
+            {
+                Field* fields = skills->Fetch();
+                OverseerDecisions::ProfessionHolding holding;
+                holding.skill = fields[0].Get<uint16>();
+                holding.value = fields[1].Get<uint16>();
+                candidate.professions.push_back(holding);
+            } while (skills->NextRow());
+        }
+
+        RecruitVerdict const verdict = RecruitVerdictFor(candidate, needs);
+        {
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"candidate\":" << J(candidate.name)
+              << ",\"need\":" << J(RecruitNeedName(verdict.need))
+              << ",\"why\":" << J(verdict.said)
+              << ",\"members_before\":" << guild->GetMemberCount();
+            note = o.str();
+        }
+
+        if (!verdict.invite)
+        {
+            // The rule's own sentence goes into the JSON; the column gets the
+            // literal keyed on the refusal, which has static storage.
+            describe("refused", OverseerDecisions::RecruitRefusalSaid(verdict.refusal));
+            status = "unchanged";
+            return "";
+        }
+
+        // THE INVITATION IS Guild::AddMember AND NOT THE INVITE PACKET, and
+        // that is the same call the core's own guild command makes for the same
+        // reason. Guild::HandleInviteMember sends CMSG_GUILD_INVITE's answer to
+        // a client and then waits for CMSG_GUILD_ACCEPT to come back from it; a
+        // bot has no client to draw the dialog or to answer it, so the pair
+        // would hang on every candidate who is not itself driven by this
+        // module. AddMember is the core's own offline-capable path: it reads
+        // the character's stats out of `characters` when there is no Player,
+        // updates the character cache, writes the member row through the
+        // core's own Member::SaveToDB, and logs the join in the guild event
+        // log. It also re-checks, itself, that the character is in no guild.
+        if (!guild->AddMember(inviteeGuid, uint8(OverseerDecisions::GUILD_RANK_RECRUIT)))
+            return refuse("the core refused to add that character to the guild");
+
+        // Read the world back rather than believing the bool.
+        Guild* after = sGuildMgr->GetGuildById(guild->GetId());
+        if (!after || !after->GetMember(inviteeGuid))
+            return refuse("the character was not in the guild when it was read back");
+
+        {
+            std::ostringstream o;
+            o << note << ",\"rank\":" << OverseerDecisions::GUILD_RANK_RECRUIT
+              << ",\"members_after\":" << after->GetMemberCount();
+            note = o.str();
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' joined guild '{}' ({}) as a recruit - {}; {} members now",
+                 candidate.name, after->GetName(), after->GetId(), verdict.said,
+                 after->GetMemberCount());
+
+        describe("joined", "");
+        status = "applied";
+        return "";
     }
 
     static char const* DoBind(Player* who, std::string const& command, char const*& status,
