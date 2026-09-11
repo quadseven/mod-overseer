@@ -209,6 +209,7 @@
 // without anybody having to declare it (mod-overseer#184).
 #include "GitRevision.h"
 #include "Group.h"
+#include "LootRollAction.h"
 #include "GroupMgr.h"
 #include "Guild.h"
 #include "Item.h"
@@ -12195,6 +12196,26 @@ private:
         OverseerDecisions::GearWearer who;
     };
 
+    // A roster character can be in combat when a group-loot window opens.
+    // mod-playerbots normally reaches LootRollAction from its non-combat
+    // engine, so the tank can miss the only deadline that matters. Invoke the
+    // stock action from this world-thread drive for every eligible member;
+    // LootRollAction keeps the upstream need/greed/pass policy and skips votes
+    // that were already emitted. This is deliberately a reaction, not a
+    // second loot policy in the overseer module.
+    void AnswerOpenRolls(std::vector<GearMember> const& members)
+    {
+        for (GearMember const& member : members)
+        {
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(member.bot);
+            if (!botAI)
+                continue;
+
+            LootRollAction action(botAI);
+            action.Execute(Event("overseer loot roll", "", member.bot));
+        }
+    }
+
     // WHY THIS DRIVE CASTS NO NEED/GREED VOTE (#10, #145, #374).
     //
     // It used to. The vote scored a drop against the incumbent in the slot it
@@ -12280,6 +12301,8 @@ private:
         }
         if (members.empty())
             return;
+
+        AnswerOpenRolls(members);
 
         for (GearMember& member : members)
             SweepGear(member.bot, member.who);
