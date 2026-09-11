@@ -25050,7 +25050,14 @@ private:
             // job != 'dungeon' is the ordinary case - most polls, this drive
             // has nothing to do, same as every other job-gated drive in this
             // file when the roster is questing.
-            if (!IsDungeonJob(leaderJob))
+            // A cancelled job must not prevent adoption of a run that is
+            // already open and already has a roster member inside. Without
+            // this exception a worldserver restart (or the urgent bag
+            // maintenance pass) leaves the run row active while the idle
+            // coordinator returns before it can reach EXIT.
+            Player* currentLeader = ObjectAccessor::FindPlayerByName(leaderName);
+            if (!IsDungeonJob(leaderJob) &&
+                !(currentLeader && InDungeonRun(currentLeader)))
                 return;
 
             Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
