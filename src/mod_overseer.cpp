@@ -25739,7 +25739,14 @@ private:
         // characters standing in an instance with every other drive stood down
         // on them - the stranding shape this epic exists to end, reached by the
         // one path that was supposed to end a run cleanly.
-        if (!IsDungeonJob(leaderJob) && coord.phase != DungeonRunPhase::Exiting)
+        // The campaign cap is durable operator state. It must also cancel an
+        // active run when leadership or job propagation lags behind the
+        // command row; otherwise a finished campaign can be re-adopted and
+        // keep the party in an instance forever.
+        DungeonCampaignCap const liveCap = LoadCampaignCap(leaderName);
+        bool const campaignOver = liveCap.known && liveCap.done >= liveCap.wanted;
+        if ((!IsDungeonJob(leaderJob) || campaignOver) &&
+            coord.phase != DungeonRunPhase::Exiting)
         {
             bool const inside = coord.phase == DungeonRunPhase::StagedInside ||
                                 coord.phase == DungeonRunPhase::Clearing;
