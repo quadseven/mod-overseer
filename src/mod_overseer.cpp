@@ -9539,6 +9539,7 @@ private:
 
             TravelSpawn spawn;
             spawn.entry = data.id;
+            spawn.name = creatureTemplate->Name;
             spawn.mapId = data.mapid;
             spawn.x = data.posX;
             spawn.y = data.posY;
@@ -9668,6 +9669,7 @@ private:
 
         uint32 wantedEntry = 0;
         uint32 wantedFlag = 0;
+        std::string wantedName;
         bool const numeric = !target.empty() &&
                              target.find_first_not_of("0123456789") == std::string::npos;
         if (numeric)
@@ -9686,8 +9688,14 @@ private:
                     break;
                 }
             }
+            // A creature name is deliberately resolved through the same
+            // candidate and safety gates as a role keyword. Names are not
+            // unique, so the normal nearest usable spawn choice is the one
+            // source of truth for which copy is meant. Keep the exact world
+            // spelling here: it is the spelling shown by the core and avoids
+            // silently choosing a different localized creature name.
             if (!wantedFlag)
-                return false;
+                wantedName = target;
         }
 
         // ONLY A TRAINER ROLE IS NARROWED, and the restraint is deliberate. A
@@ -9716,7 +9724,17 @@ private:
         {
             if (spawn.mapId != mapId)
                 continue;
-            if (wantedEntry ? spawn.entry != wantedEntry : !(spawn.npcFlags & wantedFlag))
+            if (wantedEntry)
+            {
+                if (spawn.entry != wantedEntry)
+                    continue;
+            }
+            else if (!wantedName.empty())
+            {
+                if (spawn.name != wantedName)
+                    continue;
+            }
+            else if (!(spawn.npcFlags & wantedFlag))
                 continue;
             if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
                 continue;
@@ -24234,12 +24252,11 @@ private:
                                  "a place, so the walk picks a counter this character may "
                                  "actually trade with and is not standing in hostile ground",
                                  name, damaged, broken);
-                    // THE AIM IS THE ROLE KEYWORD `repair`, AND IT MUST NEVER
-                    // BECOME A CREATURE NAME (#398). ResolveTravelTarget takes
-                    // an `at:` place, a `trigger:` id, a numeric creature entry,
-                    // or one of the role keywords in TravelRoles. It does NOT
-                    // take a name: such an aim is accepted, matches no spawn, and
-                    // is released with "there is no such spawn on map N".
+                    // THE AIM IS THE ROLE KEYWORD `repair`, not a name (#398).
+                    // A named aim is supported now, but the role is still the
+                    // right choice for an automated repair leg: it resolves to
+                    // a counter this character may actually use and lets the
+                    // arrival path identify the repair interaction.
                     //
                     // THAT IS THE WHOLE OF WHY 47 OF THE 67 REPAIR ROWS EVER
                     // WRITTEN SAY "repairer not in range". Measured on the dev
@@ -24363,10 +24380,10 @@ private:
         // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds
         3, 1, 15 * 60, 20 * 60, 60};
 
-    // The role keyword ResolveTravelTarget takes, for the counter this trip is
-    // going to. NOT a creature name and never one: an aim that is a name is
-    // accepted, matches no spawn, and is released with "there is no such spawn on
-    // map N", which is #398 and is how 47 of the 67 repair rows died.
+    // The role keyword ResolveTravelTarget takes for the counter this trip is
+    // going to. Role aims remain preferable here because the trip already
+    // knows the interaction it owes; named aims are available for deliberate
+    // operator routing and resolve through the same safety gates.
     static char const* TownTripAimFor(OverseerDecisions::CounterRole role)
     {
         switch (role)
@@ -24870,7 +24887,7 @@ private:
                     if (SayTownTripOnce(name, "walking"))
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' is walked to a '{}'. The aim is the ROLE "
-                                 "and never a creature name (#398): it resolves out of the "
+                                 "rather than a creature name (#398): it resolves out of the "
                                  "spawn tables to a real spawn's own coordinates, having "
                                  "already dropped every counter this character may not "
                                  "deal with, every one standing in hostile ground, and "
@@ -38540,6 +38557,7 @@ private:
     struct TravelSpawn
     {
         uint32 entry{0};
+        std::string name;
         uint32 mapId{0};
         float x{0.f};
         float y{0.f};
