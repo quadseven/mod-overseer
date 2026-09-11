@@ -25170,6 +25170,26 @@ private:
                 coord.capKnown = adoptedCap.known;
                 coord.runsWanted = adoptedCap.wanted;
 
+                // A restart can discover an active instance after the durable
+                // campaign counter has already reached its cap. Adoption must
+                // not turn that stale run into another clearing pass: send the
+                // party through the known exit before any new work is armed.
+                // This is the adopted-run counterpart to the cap check below,
+                // which only runs when the leader is outside an instance.
+                if (adoptedCap.known && adoptedCap.done >= adoptedCap.wanted)
+                {
+                    coord.phase = DungeonRunPhase::Exiting;
+                    coord.crossing.best = 0.f;
+                    coord.crossing.since = std::time(nullptr);
+                    coord.loggedCrossingAim = false;
+                    coord.loggedCrossingWaiting = false;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' adopted a run after its campaign was already "
+                             "complete ({} of {}); EXIT will clear the stale instance "
+                             "before vendor maintenance resumes",
+                             leaderName, adoptedCap.done, adoptedCap.wanted);
+                }
+
                 // A RUN WITH NO NUMBER STILL HAS A PLACE IN THE SEQUENCE. An
                 // unstamped row (campaign_id 0 - somebody walked in by a path
                 // this coordinator did not drive) reads back as run 0, and
