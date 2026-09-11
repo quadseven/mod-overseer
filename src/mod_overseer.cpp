@@ -25074,8 +25074,7 @@ private:
         // happens after the roster census and before job/campaign decisions,
         // so it also catches runs created by mod-dungeon-clear and runs whose
         // leader never received the bridge's stand-down row.
-        if (coord.phase != DungeonRunPhase::Idle &&
-            coord.phase != DungeonRunPhase::Exiting &&
+        if (coord.phase != DungeonRunPhase::Exiting &&
             AnyInsideMemberNeedsTownRun(members))
         {
             coord.phase = DungeonRunPhase::Exiting;
