@@ -32734,7 +32734,7 @@ private:
             // go into the JSON. `detail` has to outlive this call, so the
             // column gets the literal the parser chose, which has static
             // storage for exactly that reason.
-            return refuse(request.error.c_str());
+            return refuse(request.error);
         }
 
         // WHICH GUILD THIS IS ABOUT. For `form` it is the name in the row,
