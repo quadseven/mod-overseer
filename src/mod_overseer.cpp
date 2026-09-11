@@ -20223,8 +20223,12 @@ private:
         // is not asking it. Where a family lives is the operator's business
         // until a dungeon says otherwise; deciding it on no evidence would be
         // this module moving five homes because it had an opinion.
-        if (!IsDungeonJob(leaderJob))
-            return;
+            // An active instance must be adopted even after the operator has
+            // changed the job away from dungeon. The exit path is what clears
+            // a stale run; returning here would leave the party inside it
+            // forever and prevent vendor maintenance from ever starting.
+            if (!IsDungeonJob(leaderJob) && !InDungeonRun(leader))
+                return;
 
         DungeonPortal const* portal = FindDungeonPortal(DungeonKeywordForJob(leaderJob));
         if (!portal)
