@@ -24978,6 +24978,23 @@ private:
     std::map<std::string, OverseerDecisions::TownNeed> _townTripBefore;
     std::map<std::string, uint64> _townTripCopperBefore;
 
+    // A full inventory is a run-ending safety condition, not merely a
+    // bridge hint. The bridge can request quest mode, but a dungeon-clear
+    // run may have been opened by another module and keep the job column at
+    // `dungeon`; in that case the coordinator must still protect loot.
+    static bool AnyInsideMemberNeedsTownRun(std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!member || !InDungeonRun(member))
+                continue;
+            if (member->GetFreeInventorySpace() <= 2)
+                return true;
+        }
+        return false;
+    }
+
     void DriveDungeonRun()
     {
         // WHAT RELEASES A STAGING HOLD, AND IT IS THE PHASE RATHER THAN A LIST
@@ -25052,6 +25069,26 @@ private:
         std::string const leaderJob = jobIt == jobs.end() ? std::string("quest") : jobIt->second;
 
         DungeonRunCoordinatorState& coord = _dungeonRunCoordinator;
+
+        // Bag pressure outranks dungeon progress. This check deliberately
+        // happens after the roster census and before job/campaign decisions,
+        // so it also catches runs created by mod-dungeon-clear and runs whose
+        // leader never received the bridge's stand-down row.
+        if (coord.phase != DungeonRunPhase::Idle &&
+            coord.phase != DungeonRunPhase::Exiting &&
+            AnyInsideMemberNeedsTownRun(members))
+        {
+            coord.phase = DungeonRunPhase::Exiting;
+            coord.crossing.best = 0.f;
+            coord.crossing.since = std::time(nullptr);
+            coord.loggedCrossingAim = false;
+            coord.loggedCrossingWaiting = false;
+            _travelAims.Release(leaderName);
+            LOG_WARN("module.overseer",
+                     "overseer: an active dungeon run is being evacuated because "
+                     "an inside family member has two or fewer free inventory slots");
+            return;
+        }
 
         if (coord.phase == DungeonRunPhase::Idle)
         {
