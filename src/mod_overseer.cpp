@@ -20223,8 +20223,8 @@ private:
         // is not asking it. Where a family lives is the operator's business
         // until a dungeon says otherwise; deciding it on no evidence would be
         // this module moving five homes because it had an opinion.
-        if (!IsDungeonJob(leaderJob))
-            return;
+            if (!IsDungeonJob(leaderJob))
+                return;
 
         DungeonPortal const* portal = FindDungeonPortal(DungeonKeywordForJob(leaderJob));
         if (!portal)
@@ -25056,8 +25056,20 @@ private:
             // maintenance pass) leaves the run row active while the idle
             // coordinator returns before it can reach EXIT.
             Player* currentLeader = ObjectAccessor::FindPlayerByName(leaderName);
-            if (!IsDungeonJob(leaderJob) &&
-                !(currentLeader && InDungeonRun(currentLeader)))
+            Player* activeInside = currentLeader && InDungeonRun(currentLeader)
+                                       ? currentLeader
+                                       : nullptr;
+            if (!activeInside)
+                for (std::string const& member : members)
+                {
+                    Player* candidate = ObjectAccessor::FindPlayerByName(member);
+                    if (candidate && InDungeonRun(candidate))
+                    {
+                        activeInside = candidate;
+                        break;
+                    }
+                }
+            if (!IsDungeonJob(leaderJob) && !activeInside)
                 return;
 
             Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
@@ -25087,11 +25099,11 @@ private:
             // row for is adopted, and a portal row carries the exit trigger. A
             // leader standing in some other instance is a run this coordinator
             // could not finish, so it still stands clear of it and says so.
-            if (InDungeonRun(leader))
+            if (activeInside)
             {
                 // GetMapId  Position.h:281  uint32 GetMapId() const
                 DungeonPortal const* inside =
-                    FindDungeonPortalByInsideMap(leader->GetMapId());
+                    FindDungeonPortalByInsideMap(activeInside->GetMapId());
                 if (!inside)
                 {
                     LOG_INFO("module.overseer",
