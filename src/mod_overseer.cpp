@@ -19663,6 +19663,14 @@ private:
             // areatrigger.sql: (194,33,-230.953,2105.06,79.7533,5,0,0,0,0)
             // areatrigger_teleport.sql: (194,'Shadowfang keep - Entrance',0,-232.796,1568.28,76.8909,4.398)
             {"shadowfang", 0, 145, 33, 194, 0.f, 0.f, 0.f},
+            // areatrigger.sql: (45,0,2924.38,-798.429,161.611,8,0,0,0,0)
+            // areatrigger_teleport.sql: (45,'Scarlet Monastery - Graveyard (Entrance)',189,1688.99,1053.48,18.6775,0.00117)
+            // areatrigger.sql: (602,189,1687.57,1040.09,20.9829,8,0,0,0,0)
+            // areatrigger_teleport.sql: (602,'Scarlet Monastery - Graveyard (Exit)',0,2913.92,-802.404,160.333,3.50405)
+            // This row covers the graveyard wing, which is the measured
+            // entrance for the current family run. Other Scarlet wings have
+            // distinct doors and need their own measured rows.
+            {"scarlet", 0, 45, 189, 602, 0.f, 0.f, 0.f},
             // areatrigger.sql: (101,0,-8761.85,848.557,87.8052,0,4.972,9.694,7.444,0.6632)
             // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
             // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
