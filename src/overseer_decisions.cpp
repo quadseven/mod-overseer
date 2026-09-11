@@ -8141,4 +8141,630 @@ TownRetry CastRefusalRetry(std::string const& detail)
     // or already running a row, and all of those end by themselves.
     return TownRetry::Later;
 }
+
+namespace
+{
+
+// The character classes of 3.3.5a, by the core's own ids, read at the revision
+// build.yml pins (SharedDefines.h:126-136). In the anonymous namespace rather
+// than the header for the same reason the skill ids in the profession test are
+// local to it: nothing outside this file decides anything by class id, and a
+// second public list of core constants is a second thing to keep in step.
+unsigned const CLASS_WARRIOR = 1;
+unsigned const CLASS_PALADIN = 2;
+unsigned const CLASS_HUNTER = 3;
+unsigned const CLASS_ROGUE = 4;
+unsigned const CLASS_PRIEST = 5;
+unsigned const CLASS_DEATH_KNIGHT = 6;
+unsigned const CLASS_SHAMAN = 7;
+unsigned const CLASS_MAGE = 8;
+unsigned const CLASS_WARLOCK = 9;
+unsigned const CLASS_DRUID = 11;
+
+bool HoldsSkill(std::vector<ProfessionHolding> const& held, unsigned skill)
+{
+    for (std::size_t i = 0; i < held.size(); ++i)
+        if (held[i].skill == skill)
+            return true;
+    return false;
+}
+
+template <typename T>
+bool Contains(std::vector<T> const& haystack, T const& needle)
+{
+    for (std::size_t i = 0; i < haystack.size(); ++i)
+        if (haystack[i] == needle)
+            return true;
+    return false;
+}
+
+template <typename T>
+void Drop(std::vector<T>& haystack, T const& needle)
+{
+    for (std::size_t i = 0; i < haystack.size(); ++i)
+    {
+        if (!(haystack[i] == needle))
+            continue;
+        haystack.erase(haystack.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
+    }
+}
+
+}  // namespace
+
+char const* ProfessionName(unsigned skill)
+{
+    switch (skill)
+    {
+        case 171: return "Alchemy";
+        case 164: return "Blacksmithing";
+        case 333: return "Enchanting";
+        case 202: return "Engineering";
+        case 182: return "Herbalism";
+        case 773: return "Inscription";
+        case 755: return "Jewelcrafting";
+        case 165: return "Leatherworking";
+        case 186: return "Mining";
+        case 393: return "Skinning";
+        case 197: return "Tailoring";
+        default: break;
+    }
+    return "";
+}
+
+std::vector<ProfessionCover> GuildProfessionView(
+    std::vector<GuildMemberFacts> const& members)
+{
+    std::vector<ProfessionCover> view;
+    for (unsigned slot = 0; slot < GUILD_PROFESSION_COUNT; ++slot)
+    {
+        ProfessionCover cover;
+        cover.skill = GUILD_PROFESSIONS[slot];
+        cover.name = ProfessionName(cover.skill);
+        for (std::size_t m = 0; m < members.size(); ++m)
+        {
+            GuildMemberFacts const& member = members[m];
+            for (std::size_t p = 0; p < member.professions.size(); ++p)
+            {
+                if (member.professions[p].skill != cover.skill)
+                    continue;
+                cover.holders.push_back(member.name);
+                if (member.professions[p].value > cover.best)
+                    cover.best = member.professions[p].value;
+            }
+        }
+        view.push_back(cover);
+    }
+    return view;
+}
+
+std::vector<unsigned> GuildProfessionGaps(std::vector<ProfessionCover> const& view)
+{
+    std::vector<unsigned> gaps;
+    for (std::size_t i = 0; i < view.size(); ++i)
+        if (view[i].holders.empty())
+            gaps.push_back(view[i].skill);
+    return gaps;
+}
+
+char const* GuildRoleName(GuildRole role)
+{
+    switch (role)
+    {
+        case GuildRole::Tank:   return "Tank";
+        case GuildRole::Healer: return "Healer";
+        case GuildRole::Ranged: return "Ranged";
+        case GuildRole::Melee:  return "Melee";
+    }
+    return "";
+}
+
+bool ClassCanFill(unsigned classId, GuildRole role)
+{
+    switch (role)
+    {
+        // Plate and a shield, or a bear. Every one of these has a tanking tree
+        // in 3.3.5a.
+        case GuildRole::Tank:
+            return classId == CLASS_WARRIOR || classId == CLASS_PALADIN
+                   || classId == CLASS_DRUID || classId == CLASS_DEATH_KNIGHT;
+        // The four classes with a healing tree.
+        case GuildRole::Healer:
+            return classId == CLASS_PALADIN || classId == CLASS_PRIEST
+                   || classId == CLASS_SHAMAN || classId == CLASS_DRUID;
+        // Damage from outside the fight. The hybrids appear here AND under
+        // Healer on purpose: the question this answers is what the class could
+        // be asked to do, and a priest can be asked to do either.
+        case GuildRole::Ranged:
+            return classId == CLASS_HUNTER || classId == CLASS_MAGE
+                   || classId == CLASS_WARLOCK || classId == CLASS_PRIEST
+                   || classId == CLASS_SHAMAN || classId == CLASS_DRUID;
+        // Damage from inside it.
+        case GuildRole::Melee:
+            return classId == CLASS_WARRIOR || classId == CLASS_ROGUE
+                   || classId == CLASS_PALADIN || classId == CLASS_SHAMAN
+                   || classId == CLASS_DEATH_KNIGHT || classId == CLASS_DRUID;
+    }
+    return false;
+}
+
+std::vector<GuildRole> GuildRoleGaps(std::vector<GuildMemberFacts> const& members)
+{
+    GuildRole const all[GUILD_ROLE_COUNT] = {GuildRole::Tank, GuildRole::Healer,
+                                             GuildRole::Ranged, GuildRole::Melee};
+    std::vector<GuildRole> gaps;
+    for (unsigned slot = 0; slot < GUILD_ROLE_COUNT; ++slot)
+    {
+        bool covered = false;
+        for (std::size_t m = 0; m < members.size() && !covered; ++m)
+            covered = ClassCanFill(members[m].classId, all[slot]);
+        if (!covered)
+            gaps.push_back(all[slot]);
+    }
+    return gaps;
+}
+
+char const* GuildServiceName(GuildService service)
+{
+    switch (service)
+    {
+        case GuildService::None:      return "";
+        case GuildService::Summoning: return "Summoning";
+        case GuildService::BattleRes: return "BattleRes";
+        case GuildService::Bloodlust: return "Bloodlust";
+    }
+    return "";
+}
+
+GuildService ClassService(unsigned classId)
+{
+    if (classId == CLASS_WARLOCK)
+        return GuildService::Summoning;
+    if (classId == CLASS_DRUID)
+        return GuildService::BattleRes;
+    if (classId == CLASS_SHAMAN)
+        return GuildService::Bloodlust;
+    return GuildService::None;
+}
+
+std::vector<GuildService> GuildServiceGaps(
+    std::vector<GuildMemberFacts> const& members)
+{
+    GuildService const all[3] = {GuildService::Summoning, GuildService::BattleRes,
+                                 GuildService::Bloodlust};
+    std::vector<GuildService> gaps;
+    for (unsigned slot = 0; slot < 3; ++slot)
+    {
+        bool covered = false;
+        for (std::size_t m = 0; m < members.size() && !covered; ++m)
+            covered = ClassService(members[m].classId) == all[slot];
+        if (!covered)
+            gaps.push_back(all[slot]);
+    }
+    return gaps;
+}
+
+char const* GuildFormationStepName(GuildFormationStep step)
+{
+    switch (step)
+    {
+        case GuildFormationStep::Nothing:        return "nothing";
+        case GuildFormationStep::WaitForFounder: return "wait for founder";
+        case GuildFormationStep::Create:         return "create";
+        case GuildFormationStep::Add:            return "add";
+        case GuildFormationStep::Blocked:        return "blocked";
+    }
+    return "";
+}
+
+GuildFormationAction NextGuildFormationStep(GuildFormationState const& state,
+                                            GuildFormationFacts const& facts)
+{
+    GuildFormationAction action;
+
+    // Rule 1. Blocked first, because every branch below it would do something
+    // wrong in front of one of these.
+    if (facts.nameTakenByAnother)
+    {
+        action.step = GuildFormationStep::Blocked;
+        action.said = GuildSaid::NameTaken;
+        return action;
+    }
+    if (facts.founderInAnotherGuild)
+    {
+        action.step = GuildFormationStep::Blocked;
+        action.said = GuildSaid::FounderElsewhere;
+        return action;
+    }
+    if (state.wantedName.empty())
+    {
+        action.step = GuildFormationStep::Blocked;
+        action.said = GuildSaid::NoName;
+        return action;
+    }
+    if (state.founderName.empty())
+    {
+        action.step = GuildFormationStep::Blocked;
+        action.said = GuildSaid::NoFounder;
+        return action;
+    }
+
+    // Rule 2. Create, and wait for a session before trying.
+    if (!facts.ours)
+    {
+        if (!facts.founderOnline)
+        {
+            action.step = GuildFormationStep::WaitForFounder;
+            action.said = GuildSaid::FounderOffline;
+            return action;
+        }
+        action.step = GuildFormationStep::Create;
+        action.who = state.founderName;
+        action.rank = GUILD_RANK_MASTER;
+        action.said = GuildSaid::Creating;
+        return action;
+    }
+
+    // Rules 3 and 4. One add per call, in the order given, skipping anybody
+    // already in rather than adding them twice.
+    for (std::size_t i = 0; i < state.founders.size(); ++i)
+    {
+        std::string const& who = state.founders[i];
+        if (who.empty() || who == state.founderName)
+            continue;
+        if (Contains(facts.alreadyIn, who))
+            continue;
+        action.step = GuildFormationStep::Add;
+        action.who = who;
+        action.rank = GUILD_RANK_FOUNDER;
+        action.said = GuildSaid::Adding;
+        return action;
+    }
+
+    action.step = GuildFormationStep::Nothing;
+    action.said = GuildSaid::Formed;
+    return action;
+}
+
+RecruitBand GuildLevelBand(std::vector<GuildMemberFacts> const& members,
+                           unsigned spread)
+{
+    RecruitBand band;
+    if (members.empty())
+        return band;
+
+    unsigned lowest = members[0].level;
+    unsigned highest = members[0].level;
+    for (std::size_t i = 1; i < members.size(); ++i)
+    {
+        if (members[i].level < lowest)
+            lowest = members[i].level;
+        if (members[i].level > highest)
+            highest = members[i].level;
+    }
+
+    // The floor is clamped at 1 rather than allowed to wrap. `lowest` is
+    // unsigned and a spread wider than the guild's own lowest level would
+    // otherwise produce a band starting near four billion, which admits
+    // nobody at all - a gate that silently refuses everything is exactly the
+    // failure this file keeps finding elsewhere.
+    band.lowest = (lowest > spread) ? (lowest - spread) : 1u;
+    band.highest = highest + spread;
+    return band;
+}
+
+char const* RecruitRefusalSaid(RecruitRefusal refusal)
+{
+    switch (refusal)
+    {
+        case RecruitRefusal::None:
+            return "";
+        case RecruitRefusal::AlreadyGuilded:
+            return "already in a guild, and this one does not take other guilds members";
+        case RecruitRefusal::OtherFaction:
+            return "the other faction, which the core refuses to put in one guild";
+        case RecruitRefusal::Gone:
+            return "the character is flagged for deletion";
+        case RecruitRefusal::BelowBand:
+            return "too far below the guild to go where it goes";
+        case RecruitRefusal::AboveBand:
+            return "too far above the guild to be doing what it does";
+        case RecruitRefusal::NothingMissing:
+            return "joinable, and brings nothing this guild has not got";
+        case RecruitRefusal::RosterFull:
+            return "the roster is at its target size";
+    }
+    return "";
+}
+
+char const* RecruitNeedName(RecruitNeed need)
+{
+    switch (need)
+    {
+        case RecruitNeed::None:       return "";
+        case RecruitNeed::Depth:      return "Depth";
+        case RecruitNeed::Role:       return "Role";
+        case RecruitNeed::Service:    return "Service";
+        case RecruitNeed::Profession: return "Profession";
+    }
+    return "";
+}
+
+GuildNeeds GuildNeedsFrom(std::vector<GuildMemberFacts> const& members,
+                          unsigned teamId, unsigned targetSize,
+                          unsigned bandSpread)
+{
+    GuildNeeds needs;
+    needs.professionGaps = GuildProfessionGaps(GuildProfessionView(members));
+    needs.serviceGaps = GuildServiceGaps(members);
+    needs.roleGaps = GuildRoleGaps(members);
+    needs.band = GuildLevelBand(members, bandSpread);
+    needs.teamId = teamId;
+    needs.memberCount = static_cast<unsigned>(members.size());
+    needs.targetSize = targetSize;
+    return needs;
+}
+
+RecruitVerdict RecruitVerdictFor(RecruitCandidate const& candidate,
+                                 GuildNeeds const& needs)
+{
+    RecruitVerdict verdict;
+
+    // THE GATES, IN ORDER. Already-guilded is asked first and on its own line,
+    // which is the poaching rule made structural.
+    RecruitRefusal refusal = RecruitRefusal::None;
+    if (candidate.guildId != 0)
+        refusal = RecruitRefusal::AlreadyGuilded;
+    else if (candidate.gone)
+        refusal = RecruitRefusal::Gone;
+    else if (candidate.teamId != needs.teamId)
+        refusal = RecruitRefusal::OtherFaction;
+    // A band of {0, 0} is an empty guild, which has nobody to be near, so the
+    // level gate does not apply rather than refusing everybody.
+    else if (needs.band.highest != 0 && candidate.level < needs.band.lowest)
+        refusal = RecruitRefusal::BelowBand;
+    else if (needs.band.highest != 0 && candidate.level > needs.band.highest)
+        refusal = RecruitRefusal::AboveBand;
+    else if (needs.targetSize != 0 && needs.memberCount >= needs.targetSize)
+        refusal = RecruitRefusal::RosterFull;
+
+    if (refusal != RecruitRefusal::None)
+    {
+        verdict.refusal = refusal;
+        verdict.said = RecruitRefusalSaid(refusal);
+        return verdict;
+    }
+
+    // THE REASONS, IN THE ORDER RecruitNeed DECLARES THEM. The first hit wins
+    // and the rest are not asked, because a verdict carries one reason: the
+    // shortlist is what handles a candidate who closes more than one hole, and
+    // it does it by consuming all of them rather than by printing all of them.
+    for (std::size_t i = 0; i < needs.professionGaps.size(); ++i)
+    {
+        if (!HoldsSkill(candidate.professions, needs.professionGaps[i]))
+            continue;
+        verdict.invite = true;
+        verdict.need = RecruitNeed::Profession;
+        verdict.closes = needs.professionGaps[i];
+        verdict.said = std::string("holds ") + ProfessionName(verdict.closes)
+                       + ", which nobody in the guild does";
+        return verdict;
+    }
+
+    GuildService const service = ClassService(candidate.classId);
+    if (service != GuildService::None && Contains(needs.serviceGaps, service))
+    {
+        verdict.invite = true;
+        verdict.need = RecruitNeed::Service;
+        verdict.closes = static_cast<unsigned>(service);
+        verdict.said = std::string("brings ") + GuildServiceName(service)
+                       + ", which no class in the guild can";
+        return verdict;
+    }
+
+    for (std::size_t i = 0; i < needs.roleGaps.size(); ++i)
+    {
+        if (!ClassCanFill(candidate.classId, needs.roleGaps[i]))
+            continue;
+        verdict.invite = true;
+        verdict.need = RecruitNeed::Role;
+        verdict.closes = static_cast<unsigned>(needs.roleGaps[i]);
+        verdict.said = std::string("can fill ") + GuildRoleName(needs.roleGaps[i])
+                       + ", which nobody in the guild can";
+        return verdict;
+    }
+
+    if (needs.targetSize != 0 && needs.memberCount < needs.targetSize)
+    {
+        verdict.invite = true;
+        verdict.need = RecruitNeed::Depth;
+        verdict.said = "no hole to close, but the roster is under its target size";
+        return verdict;
+    }
+
+    verdict.refusal = RecruitRefusal::NothingMissing;
+    verdict.said = RecruitRefusalSaid(RecruitRefusal::NothingMissing);
+    return verdict;
+}
+
+std::vector<RecruitPick> RecruitShortlist(
+    std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
+    unsigned atMost)
+{
+    std::vector<RecruitPick> picks;
+    if (atMost == 0)
+        return picks;
+
+    // The working copy. Gaps come out of THIS as they are filled, which is what
+    // stops three engineers being invited for one engineering hole.
+    GuildNeeds open = needs;
+    std::vector<bool> taken(candidates.size(), false);
+
+    while (picks.size() < atMost)
+    {
+        bool found = false;
+        std::size_t best = 0;
+        RecruitVerdict bestVerdict;
+
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+        {
+            if (taken[i])
+                continue;
+            RecruitVerdict const verdict = RecruitVerdictFor(candidates[i], open);
+            if (!verdict.invite)
+                continue;
+            if (!found)
+            {
+                found = true;
+                best = i;
+                bestVerdict = verdict;
+                continue;
+            }
+            // Higher need first. Then name, ascending, which is the admission
+            // in the header rather than an algorithm: nothing here can tell two
+            // otherwise identical candidates apart, so the tie is broken the
+            // one way that makes a re-run give the same answer.
+            if (verdict.need > bestVerdict.need
+                || (verdict.need == bestVerdict.need
+                    && candidates[i].name < candidates[best].name))
+            {
+                best = i;
+                bestVerdict = verdict;
+            }
+        }
+
+        if (!found)
+            break;
+
+        RecruitPick pick;
+        pick.index = best;
+        pick.verdict = bestVerdict;
+        picks.push_back(pick);
+        taken[best] = true;
+
+        // A PICK CONSUMES EVERY HOLE IT CLOSES, NOT ONLY THE ONE IT WAS NAMED
+        // FOR. An engineer who is also a warlock was picked for the profession
+        // because that tier is higher, and taking the summoning gap off the
+        // list as well is what stops the next warlock being invited for a hole
+        // this character already fills.
+        RecruitCandidate const& chosen = candidates[best];
+        for (std::size_t p = 0; p < chosen.professions.size(); ++p)
+            Drop(open.professionGaps, chosen.professions[p].skill);
+        GuildService const service = ClassService(chosen.classId);
+        if (service != GuildService::None)
+            Drop(open.serviceGaps, service);
+        for (unsigned slot = 0; slot < GUILD_ROLE_COUNT; ++slot)
+        {
+            GuildRole const role = static_cast<GuildRole>(slot);
+            if (ClassCanFill(chosen.classId, role))
+                Drop(open.roleGaps, role);
+        }
+        ++open.memberCount;
+    }
+
+    return picks;
+}
+
+GuildRequest ParseGuildRequest(std::string const& command)
+{
+    GuildRequest request;
+
+    std::size_t begin = 0;
+    while (begin < command.size() && command[begin] == ' ')
+        ++begin;
+    std::size_t end = begin;
+    while (end < command.size() && command[end] != ' ')
+        ++end;
+
+    std::string verb;
+    for (std::size_t i = begin; i < end; ++i)
+        verb.push_back(LowerAscii(command[i]));
+
+    std::string rest;
+    std::size_t restBegin = end;
+    while (restBegin < command.size() && command[restBegin] == ' ')
+        ++restBegin;
+    std::size_t restEnd = command.size();
+    while (restEnd > restBegin && command[restEnd - 1] == ' ')
+        --restEnd;
+    rest.assign(command, restBegin, restEnd - restBegin);
+
+    if (verb == "view")
+    {
+        request.verb = GuildVerb::View;
+        return request;
+    }
+
+    if (verb == "invite")
+    {
+        // The character goes in `target_arg`, so anything after the verb here
+        // is ignored rather than refused: a row that said `invite Cogwin` and
+        // ALSO put Cogwin in target_arg is not wrong, it is just saying it
+        // twice, and refusing that would be a trap rather than a check.
+        request.verb = GuildVerb::Invite;
+        return request;
+    }
+
+    if (verb == "form")
+    {
+        if (rest.empty())
+        {
+            request.error = GuildRefusal::NoName;
+            return request;
+        }
+        if (rest.size() > GUILD_NAME_MAX)
+        {
+            request.error = GuildRefusal::NameTooLong;
+            return request;
+        }
+        request.verb = GuildVerb::Form;
+        request.name = rest;
+        return request;
+    }
+
+    if (verb == "shortlist")
+    {
+        request.atMost = GUILD_SHORTLIST_DEFAULT;
+        if (rest.empty())
+        {
+            request.verb = GuildVerb::Shortlist;
+            return request;
+        }
+
+        unsigned count = 0;
+        for (std::size_t i = 0; i < rest.size(); ++i)
+        {
+            if (rest[i] < '0' || rest[i] > '9')
+            {
+                request.error = GuildRefusal::NotACount;
+                return request;
+            }
+            // Refused on the digit that overflows rather than after wrapping.
+            // The cast row learned this one: a count that wraps to something
+            // small reads as a deliberate answer.
+            if (count > GUILD_SHORTLIST_MAX)
+            {
+                request.error = GuildRefusal::CountTooBig;
+                return request;
+            }
+            count = count * 10 + static_cast<unsigned>(rest[i] - '0');
+        }
+        if (count == 0)
+        {
+            request.error = GuildRefusal::CountIsZero;
+            return request;
+        }
+        if (count > GUILD_SHORTLIST_MAX)
+        {
+            request.error = GuildRefusal::CountTooBig;
+            return request;
+        }
+        request.verb = GuildVerb::Shortlist;
+        request.atMost = count;
+        return request;
+    }
+
+    request.error = GuildRefusal::NoVerb;
+    return request;
+}
 }  // namespace OverseerDecisions

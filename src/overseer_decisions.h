@@ -10368,6 +10368,619 @@ constexpr char const* BadTargetName = "a character name is letters only";
 // bind, sell, repair and hearth tables make: a refusal this table has never
 // heard of is more likely a new transient than a new permanent.
 TownRetry CastRefusalRetry(std::string const& detail);
+
+// --------------------------------------------------------- the guild (#413) --
+//
+// THE FAMILY HAS NO GUILD, AND THIS FILE HAS SAID SO FOR A WHILE. The repair
+// note above reads "the family has no guild (that is its own open issue)", the
+// travel note reads "signing a guild charter at a `petitioner` is its own
+// command", and the roster's `job` column has listed `guild business` as a mode
+// since the day it was added without anything behind it. This section is that
+// issue.
+//
+// IT IS THREE QUESTIONS, NOT ONE.
+//
+//   1. WHAT DOES THE GUILD ALREADY COVER? One list of professions, one of
+//      roles, one of class-only services, every one of them read off the
+//      members it actually has.
+//   2. WHAT IS MISSING FROM THAT? The holes in those same three lists. This is
+//      not a second calculation. The gaps ARE the coverage read the other way
+//      round, which is why the profession view and the recruiter are two
+//      readers of one answer rather than two opinions that can drift.
+//   3. WHO OUTSIDE IT WOULD FILL A HOLE? The selection rule.
+//
+// AND ONE MORE THAT COMES FIRST IN TIME: how the guild gets made at all. That
+// is the formation machine at the bottom.
+//
+// THE HONEST LIMIT OF ALL OF IT, SAID ONCE HERE RATHER THAN APOLOGISED FOR
+// LATER. The ask was for "perfect players". Nothing in a character database
+// says whether a player is any good. There is no combat log here, no damage
+// meter, no wipe history, no record of anybody turning up when they said they
+// would. And the numbers that most LOOK like quality are the ones that mean
+// least on a realm of bots: gear is issued by PlayerbotFactory rather than
+// earned, money is spawned, and total played time measures how long the server
+// has been up. A score built out of those would sort confidently and mean
+// nothing, and the confidence is the harm, because somebody would believe it.
+//
+// SO THIS RULE DOES NOT SCORE ANYBODY. It asks one question the database can
+// genuinely answer: DOES THIS CHARACTER CLOSE A HOLE THIS GUILD ACTUALLY HAS?
+// A candidate is worth an invitation because of what the guild is missing, not
+// because of what the candidate is worth. Every verdict below therefore carries
+// the hole it closes, so a person reading a shortlist is reading a reason
+// rather than a ranking.
+
+// The primary professions of 3.3.5a, by the core's own skill ids, read at the
+// revision build.yml pins (SharedDefines.h:3142-3235).
+//
+// PRIMARY ONLY, WHICH IS A DELIBERATE OMISSION RATHER THAN AN OVERSIGHT.
+// Cooking (185), first aid (129) and fishing (356) are secondary: every
+// character may hold all three at once, so no guild can ever be short of one.
+// A row that can never be a gap does not belong in a list whose entire purpose
+// is to show gaps - it would sit in the profession view permanently covered,
+// and could never be a reason to recruit anybody.
+//
+// IN NAME ORDER RATHER THAN ID ORDER, because this list is also the order the
+// profession view prints in and a person reading it is looking for a name. The
+// ids do not sort the same way - 202 engineering falls between 197 tailoring
+// and 333 enchanting - and nothing here depends on them sorting at all.
+constexpr unsigned GUILD_PROFESSIONS[] = {
+    171,  // Alchemy
+    164,  // Blacksmithing
+    333,  // Enchanting
+    202,  // Engineering
+    182,  // Herbalism
+    773,  // Inscription
+    755,  // Jewelcrafting
+    165,  // Leatherworking
+    186,  // Mining
+    393,  // Skinning
+    197,  // Tailoring
+};
+constexpr unsigned GUILD_PROFESSION_COUNT =
+    sizeof(GUILD_PROFESSIONS) / sizeof(GUILD_PROFESSIONS[0]);
+
+// The display name of a primary profession, or "" for anything that is not one.
+//
+// THE EMPTY STRING IS AN ANSWER, NOT A FAILURE. It means "not a primary
+// profession". A character's skill list is mostly weapon skills, languages,
+// armour proficiencies and the three secondaries, and a caller sweeping that
+// list wants to skip them rather than handle an error eleven times over.
+char const* ProfessionName(unsigned skill);
+
+// One member of the guild, cut down to the facts these questions are answered
+// from. Deliberately NOT a character row: no guid, no position, no money, no
+// gear, no played time. If a fact is not in this struct it is because no
+// decision below is allowed to reach for it, and the struct is the enforcement.
+struct GuildMemberFacts
+{
+    std::string name;
+    unsigned classId{0};
+    unsigned level{0};
+    // Primary professions only, carrying the value, because the profession view
+    // shows it: "Blacksmithing 225" is a different answer from
+    // "Blacksmithing 1" to somebody asking who can make them a sword.
+    // ProfessionHolding is the pair the profession drive already uses for
+    // exactly this, reused rather than re-declared beside it.
+    std::vector<ProfessionHolding> professions;
+};
+
+// One row of the profession view: a profession, who in the guild holds it, and
+// the best value anybody has. A row with no holders is a hole.
+struct ProfessionCover
+{
+    unsigned skill{0};
+    char const* name{""};
+    std::vector<std::string> holders;  // member names, in the order given
+    unsigned best{0};                  // 0 when nobody holds it
+};
+
+// The guild's profession view: one row per primary profession, present whether
+// or not anybody holds it.
+//
+// THE ROWS NOBODY HOLDS ARE THE POINT OF IT. A view that listed only what the
+// guild can do would be the answer minus the part somebody actually needs, and
+// a reader would have to know all eleven by heart to notice what was missing.
+// So the absent row is printed, empty, and the recruiter reads those same rows
+// to decide what to go looking for. One list, two readers, no way for the view
+// a person reads and the gaps the rule acts on to disagree.
+std::vector<ProfessionCover> GuildProfessionView(
+    std::vector<GuildMemberFacts> const& members);
+
+// The skill ids from that view nobody holds, in view order.
+std::vector<unsigned> GuildProfessionGaps(std::vector<ProfessionCover> const& view);
+
+// What a group needs somebody to be doing. FOUR, not three, because "damage" is
+// not one job when the question is whether a party can function at all: a fight
+// that has to be done at range cannot be done by four rogues.
+enum class GuildRole : std::uint8_t
+{
+    Tank,
+    Healer,
+    Ranged,
+    Melee,
+};
+constexpr unsigned GUILD_ROLE_COUNT = 4;
+char const* GuildRoleName(GuildRole role);
+
+// Can a character of this class be trained to fill this role.
+//
+// READ THAT AGAIN, BECAUSE IT IS NOT "IS THIS CHARACTER DOING THIS JOB", AND
+// THE DIFFERENCE IS THE HONEST LIMIT OF THIS FUNCTION. A character's
+// specialisation lives in `character_talent`, and nothing in this module reads
+// that table; for a playerbot the spec is picked by PlayerbotFactory and is not
+// a column anybody here queries. So a shaman counted here as a healer may be
+// walking around as enhancement, and a druid counted as a tank may be a
+// moonkin.
+//
+// THE ALTERNATIVE WAS WORSE. Inferring a spec by counting talent points per
+// tree would be a guess that LOOKS like a measurement, and it would be wrong
+// quietly: a shortlist would print "healer" and no reviewer could tell whether
+// the word came from a fact or from arithmetic over a table nobody had checked.
+// Class capability is a fact about the class, it is true every time it is used
+// for what it claims, and it fails in the safe direction - it can recommend
+// somebody who then has to respec, never somebody who could not do the job at
+// all.
+bool ClassCanFill(unsigned classId, GuildRole role);
+
+// The roles no member of the guild could fill even after respeccing, in enum
+// order.
+std::vector<GuildRole> GuildRoleGaps(std::vector<GuildMemberFacts> const& members);
+
+// A thing exactly one class brings, that this module already has a MEASURED
+// problem without. The list is short on purpose: every entry has to name the
+// pain it removes or it is a list of class abilities dressed up as a
+// requirement.
+enum class GuildService : std::uint8_t
+{
+    None,
+    // Warlock. Ritual of Summoning moves a character to the group without the
+    // group walking to it. Travel is the largest body of code in this module
+    // and its hardest failures are all crossings; the summoning-stone path
+    // exists for exactly that and took six separate causes before it worked. A
+    // class that can do the same from anywhere, with no stone and no meeting
+    // place, removes the reason for most of it.
+    Summoning,
+    // Druid. Rebirth puts a dead member back on their feet where they fell.
+    // Every other answer to a death here is a corpse run, and the corpse run is
+    // where this module found that Player::GetCorpse is map-scoped and had been
+    // silently skipping everybody who released out of an instance.
+    BattleRes,
+    // Shaman. Bloodlust and Heroism are a party-wide haste the family has no
+    // other source of, and the dungeon drive's stall rule is written entirely
+    // around fights that take too long to end.
+    Bloodlust,
+};
+char const* GuildServiceName(GuildService service);
+
+// The service a class brings, or None.
+//
+// A CLASS BRINGS AT MOST ONE HERE, which is a simplification, and it is stated
+// rather than hidden. A mage brings portals and a warlock also brings a
+// soulstone; neither is listed, because the family already HAS a mage and a
+// soulstone is a weaker BattleRes that has to be cast before the death rather
+// than after it. The rule this list feeds picks ONE reason to invite somebody,
+// so a second service on the same class could never change an answer.
+GuildService ClassService(unsigned classId);
+
+// The services no member of the guild can bring, in enum order, None excluded.
+std::vector<GuildService> GuildServiceGaps(
+    std::vector<GuildMemberFacts> const& members);
+
+// The rank ids Guild::_CreateDefaultGuildRanks lays down, by the core's own
+// names (Guild.h:65-69 at the pinned revision).
+//
+// SPELLED OUT HERE BECAUSE THEY ARE LOAD-BEARING AND THIS FILE MAY NOT INCLUDE
+// THE HEADER THAT DECLARES THEM. A rank's id IS its rung: Guild::Create hands
+// the founder 0 directly, and Guild::AddMember given GUILD_RANK_NONE takes the
+// LOWEST id rather than a default written down anywhere. So a number here that
+// disagreed with the core would not fail to compile. It would put somebody on
+// the wrong rung and nothing would say so.
+constexpr unsigned GUILD_RANK_MASTER = 0;
+constexpr unsigned GUILD_RANK_OFFICER = 1;
+constexpr unsigned GUILD_RANK_VETERAN = 2;
+constexpr unsigned GUILD_RANK_MEMBER = 3;
+constexpr unsigned GUILD_RANK_INITIATE = 4;
+
+// WHY THE FOUNDERS GET OFFICER AND NOT MEMBER, and it is not ceremony. The chat
+// verb in the adapter refuses to speak on the guild or officer channel unless
+// the speaker's RANK carries the matching right - it mirrors
+// Guild::BroadcastToGuild's own recipient test rather than asking about
+// membership, because membership is not what that function asks either. A
+// founder left on a middle rank would be in the guild, visible in the roster,
+// and silently unable to use half the chat surface this module already has.
+// Officer is the lowest default rank whose rights include both.
+constexpr unsigned GUILD_RANK_FOUNDER = GUILD_RANK_OFFICER;
+// And a recruit starts at the bottom, which is also the rung the core would
+// pick on its own if it were handed no rank at all.
+constexpr unsigned GUILD_RANK_RECRUIT = GUILD_RANK_INITIATE;
+
+// What the formation machine wants done next.
+enum class GuildFormationStep : std::uint8_t
+{
+    // Formed, and everybody who should be in it is in it. The common answer
+    // once this has run once, and therefore the idempotence: re-running
+    // formation on a formed guild does nothing at all.
+    Nothing,
+    // The guild does not exist and cannot be made yet, because the founder is
+    // not online. THIS IS A CORE CONSTRAINT AND NOT A PREFERENCE.
+    // Guild::Create's third line is `WorldSession* pLeaderSession =
+    // pLeader->GetSession(); if (!pLeaderSession) return false;` - it needs a
+    // live session, because it asks that session for a locale to name the
+    // default ranks in. Waiting is the whole remedy and it costs one poll.
+    WaitForFounder,
+    // Make it, under the founder, with the wanted name.
+    Create,
+    // Add `who` at `rank`. Issued one member at a time so each add is a step
+    // somebody can read in a log, and so a single refusal does not take the
+    // rest of the family down with it.
+    Add,
+    // Something is in the way that polling will not clear: the name belongs to
+    // a guild this founder does not lead, or the founder is already in a
+    // different guild. Both need a person, and neither should be worked around
+    // silently.
+    Blocked,
+};
+char const* GuildFormationStepName(GuildFormationStep step);
+
+// What the caller wants to exist.
+struct GuildFormationState
+{
+    std::string wantedName;
+    std::string founderName;
+    // The founders, the founder included, in the order they should be added.
+    // The founder's own membership is not listed separately because
+    // Guild::Create adds them as guild master itself.
+    std::vector<std::string> founders;
+};
+
+// What the world currently says, read by the adapter and handed in. Every field
+// is something the adapter had to go and ask; none of it is inferred here.
+struct GuildFormationFacts
+{
+    // A guild of the wanted name exists AND this founder leads it.
+    bool ours{false};
+    // A guild of the wanted name exists and somebody else leads it.
+    bool nameTakenByAnother{false};
+    // The founder is already in a guild that is not the wanted one.
+    bool founderInAnotherGuild{false};
+    // The founder is online with a session. See WaitForFounder.
+    bool founderOnline{false};
+    // Names already in the guild, however they got there.
+    std::vector<std::string> alreadyIn;
+};
+
+// The sentences the formation machine answers with. THEY ARE LITERALS, WITH
+// STATIC STORAGE, AND THAT IS NOT TIDINESS. The adapter puts one of them in
+// the command row's `detail` column, which is written after the executor has
+// returned, so a sentence built on the executor's stack would be a dangling
+// pointer by the time it reached the UPDATE. They also go straight into that
+// UPDATE, so none may carry a quote character - the rule every executor in
+// this file keeps.
+namespace GuildSaid
+{
+constexpr char const* NoName = "a guild needs a name";
+constexpr char const* NoFounder = "a guild needs a founder";
+constexpr char const* NameTaken = "a guild of that name exists and this founder does not lead it";
+constexpr char const* FounderElsewhere = "the founder is already in another guild and has to leave it first";
+constexpr char const* FounderOffline = "the founder is not online, and creating a guild needs their session";
+constexpr char const* Creating = "create the guild under its founder";
+constexpr char const* Adding = "add a founder to the guild";
+constexpr char const* Formed = "the guild exists and every founder is in it";
+}  // namespace GuildSaid
+
+struct GuildFormationAction
+{
+    GuildFormationStep step{GuildFormationStep::Nothing};
+    std::string who;       // Add only
+    unsigned rank{0};      // Add only
+    // One of GuildSaid's literals. Always set, on every step.
+    char const* said{""};
+};
+
+// The next step from what exists towards the guild that should.
+//
+// THE RULES, IN THE ORDER THEY ARE APPLIED.
+//
+//   1. BLOCKED IS ASKED FIRST, because every other branch below would do
+//      something wrong in front of it. A name already held by a stranger's
+//      guild is not a name this can create, and a founder who has joined
+//      somebody else's guild cannot be handed a second one - Guild::AddMember
+//      refuses any character whose guild id is not 0, and Guild::Create would
+//      leave the founder's old membership behind it. Refusing loudly is the
+//      only honest answer to either.
+//
+//   2. CREATE BEFORE ADD, and WaitForFounder before Create. The order is forced
+//      by the core: Create needs a session, Add does not (Guild::AddMember has
+//      a whole offline branch that reads the character's stats out of
+//      `characters` and updates the character cache). So the guild waits for
+//      exactly one character to log in, once, and then absorbs the other four
+//      whether they are online or not.
+//
+//   3. ONE ADD PER CALL, in the order the caller listed. A loop that added four
+//      members inside one step would report one outcome for four acts, and the
+//      one that failed would be the one nobody could name afterwards.
+//
+//   4. ANYBODY ALREADY IN IS SKIPPED RATHER THAN RE-ADDED. This is the
+//      idempotence and it is the same shape as rule 2 of the profession step:
+//      only the MISSING half of the comparison can cause anything to happen, so
+//      a member who joined by some other route is left exactly where they are.
+GuildFormationAction NextGuildFormationStep(GuildFormationState const& state,
+                                            GuildFormationFacts const& facts);
+
+// The level band a recruit has to be inside.
+struct RecruitBand
+{
+    unsigned lowest{0};
+    unsigned highest{0};
+};
+
+// The band around a guild's own members, widened by `spread` at each end.
+//
+// WHY A BAND AT ALL. A level 6 cannot go where a level 36 goes and a level 70
+// will not be going there. The band is not about quality, it is about whether
+// the guild and the recruit are ever in the same place doing the same thing,
+// which is the one thing a guild is for and the one thing the level column can
+// honestly speak to.
+//
+// THE NUMBER IS A POLICY, NOT A MEASUREMENT, AND IT IS A PARAMETER SO THAT IT
+// READS AS ONE. It is not derived from anything in the database, because
+// nothing in the database knows it. The caller picks it; a spread near the
+// guild's own existing span is the obvious starting point, so that a recruit is
+// no further from the guild than its own members already are from each other.
+//
+// AN EMPTY GUILD HAS NO BAND, and that is returned as {0, 0} rather than as
+// something wide. A guild with no members has nobody to be near.
+RecruitBand GuildLevelBand(std::vector<GuildMemberFacts> const& members,
+                           unsigned spread);
+
+// A character outside the guild, cut down the same way a member is.
+struct RecruitCandidate
+{
+    std::string name;
+    unsigned classId{0};
+    unsigned level{0};
+    // 0 means unguilded. See RecruitRefusal::AlreadyGuilded for why this is a
+    // hard gate and not a preference.
+    unsigned guildId{0};
+    // 0 alliance, 1 horde, matching the core's own TeamId
+    // (SharedDefines.h:748-749). Kept as a plain unsigned because this file may
+    // not include the header that names it.
+    unsigned teamId{0};
+    // The character row is flagged for deletion.
+    bool gone{false};
+    std::vector<ProfessionHolding> professions;
+};
+
+// Why a candidate was not invited. Every one of these is a fact about the
+// candidate or the roster, never a judgement about the player.
+enum class RecruitRefusal : std::uint8_t
+{
+    None,
+    // ALREADY IN A GUILD. This is the poaching rule and it is deliberately the
+    // first gate, before anything is even looked at. See the note on
+    // RecruitVerdictFor.
+    AlreadyGuilded,
+    // The other faction. Guild::AddMember refuses this itself unless
+    // CONFIG_ALLOW_TWO_SIDE_INTERACTION_GUILD is on, so a rule that let it
+    // through would produce a shortlist of characters the core would then
+    // silently decline - the worst kind of wrong answer, because the list looks
+    // right and nothing happens.
+    OtherFaction,
+    // The character row is flagged for deletion. A deleted character is not a
+    // person who can be invited; it is a row waiting to be swept.
+    Gone,
+    BelowBand,
+    AboveBand,
+    // Joinable, and brings nothing the guild has not got. NOT A JUDGEMENT ON
+    // THE CHARACTER - it is a statement about the guild, and the same character
+    // becomes worth inviting the moment the guild loses whoever was covering
+    // them.
+    NothingMissing,
+    // The roster is at its target size. Asked last, so that a full guild still
+    // reports WHY each candidate was refused rather than collapsing every
+    // answer into "full".
+    RosterFull,
+};
+char const* RecruitRefusalSaid(RecruitRefusal refusal);
+
+// What a candidate brings, if anything. THE ORDER OF THESE VALUES IS THE ORDER
+// OF PREFERENCE, and that is the one genuinely contestable judgement in this
+// whole section, so it is written down here rather than buried in a comparison
+// function:
+//
+//   Profession beats Service beats Role beats Depth.
+//
+// THE ARGUMENT FOR IT. A profession hole is the narrowest kind: a character may
+// hold two primaries out of eleven, so covering the set at all takes bodies,
+// and a hole stays a hole until somebody specifically fills it. It is also the
+// hole the family has already decided it cares about - the five professions
+// were spread deliberately across ten of the eleven, which means somebody sat
+// down and planned the coverage, and exactly one gap was left. Filling it
+// finishes a plan that was already made rather than starting a new one.
+// Services come next because they are class-exclusive, so no amount of
+// recruiting the wrong class ever produces one. Roles come after that because
+// several classes can fill each one. Depth is last because it is not a hole at
+// all; it is a bench, and a bench is only worth anything once the holes are
+// filled.
+//
+// THIS IS A JUDGEMENT AND A REVIEWER MAY DISAGREE WITH IT. The tests pin the
+// order, so changing it is a visible change to a test rather than a quiet
+// change of behaviour.
+enum class RecruitNeed : std::uint8_t
+{
+    None,
+    Depth,
+    Role,
+    Service,
+    Profession,
+};
+char const* RecruitNeedName(RecruitNeed need);
+
+struct RecruitVerdict
+{
+    bool invite{false};
+    RecruitRefusal refusal{RecruitRefusal::None};
+    RecruitNeed need{RecruitNeed::None};
+    // What is closed. For Profession it is the skill id; for Service and Role
+    // it is the enum value cast to unsigned; for Depth and None it is 0.
+    unsigned closes{0};
+    // One line a person can read. ALWAYS SET, on an invite and on a refusal
+    // alike. A name that appears on a list without a reason, or disappears from
+    // one without a reason, is the next bug - the gear drive learned that the
+    // expensive half of a silent exclusion is the character wrongly left OFF a
+    // list, because there is nothing there to disagree with.
+    std::string said;
+};
+
+// What the guild is short of, and the shape it wants to be. Built once and
+// handed to every candidate, so that one sweep of a thousand characters asks
+// the same question of each.
+struct GuildNeeds
+{
+    std::vector<unsigned> professionGaps;
+    std::vector<GuildService> serviceGaps;
+    std::vector<GuildRole> roleGaps;
+    RecruitBand band;
+    unsigned teamId{0};
+    unsigned memberCount{0};
+    // The size the guild is aiming at. Depth is only ever a reason to invite
+    // somebody while the roster is under this.
+    unsigned targetSize{0};
+};
+
+GuildNeeds GuildNeedsFrom(std::vector<GuildMemberFacts> const& members,
+                          unsigned teamId, unsigned targetSize,
+                          unsigned bandSpread);
+
+// Is this one candidate worth inviting, and why or why not.
+//
+// THE GATES ARE ASKED BEFORE THE REASONS, AND ALREADY-GUILDED IS THE FIRST OF
+// THEM. That ordering is the poaching answer, made structural rather than left
+// to a caller's WHERE clause.
+//
+// WHY THIS RULE DOES NOT POACH. Three arguments, and the first is the one that
+// would still hold if the other two did not:
+//
+//   1. THE CORE REFUSES IT ANYWAY. Guild::AddMember's own second branch returns
+//      false for any character whose guild id is not 0, online or offline. A
+//      rule that shortlisted guilded characters would be producing a list of
+//      invitations that cannot be accepted, and the failure would be a silent
+//      false rather than an error anybody sees.
+//   2. TAKING A MEMBER OUT OF AN EXISTING GUILD IS NOT A GAIN, IT IS A
+//      TRANSFER. There are twenty guilds on this realm holding about three
+//      hundred characters between them. Emptying one of them to fill this one
+//      leaves the same number of guilded characters and one guild worse off,
+//      and it is the kind of thing that reads as malice from the other side of
+//      it.
+//   3. THE UNGUILDED POOL IS NOT SCARCE. Most characters on this realm are in
+//      no guild at all, which is a larger pool than this guild could absorb.
+//      There is no argument from necessity to be made here, and if there ever
+//      is, it should be made in an issue rather than discovered in a diff.
+//
+// AND THE CORRESPONDING LIMIT, STATED PLAINLY: this rule cannot tell an
+// abandoned character from an active one, so "unguilded" is not the same as
+// "looking for a guild". Nothing in the database records wanting to join
+// anything. What the rule can honestly claim is that it never takes anybody
+// who already has one.
+RecruitVerdict RecruitVerdictFor(RecruitCandidate const& candidate,
+                                 GuildNeeds const& needs);
+
+// One entry of a shortlist: which candidate, and the verdict that put them
+// there.
+struct RecruitPick
+{
+    std::size_t index{0};  // into the candidates vector as it was given
+    RecruitVerdict verdict{};
+};
+
+// The candidates worth inviting, best first, at most `atMost` of them.
+//
+// THE GAPS ARE CONSUMED AS THEY ARE FILLED, which is the property that makes
+// this a shortlist rather than a sorted list of verdicts. Three engineers
+// against one engineering hole is one Profession pick and two who have to earn
+// their place some other way, because after the first is picked the hole is no
+// longer open. Running RecruitVerdictFor over each candidate independently and
+// sorting the results would invite all three for the same reason and leave the
+// guild with three engineers and still no second healer.
+//
+// AND THE ROSTER FILLS AS IT GOES, so `atMost` and the target size both bind:
+// the sweep stops when either is reached.
+//
+// TIES ARE BROKEN BY NAME, AND THAT IS AN ADMISSION RATHER THAN AN ALGORITHM.
+// Two level 36 engineers of the same class are indistinguishable to every fact
+// this module has. There is no honest way to prefer one, so the rule refuses to
+// invent one and takes them in name order, which at least means the answer is
+// the same every time it is asked. A shortlist that reordered itself between
+// two runs over the same data would be the thing nobody could review.
+std::vector<RecruitPick> RecruitShortlist(
+    std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
+    unsigned atMost);
+
+// -- and the row that asks for any of it -------------------------------------
+//
+// THE GRAMMAR IS PARSED HERE RATHER THAN IN THE ADAPTER for the same reason the
+// bind, sell and cast rows are: a parser is the part of a verb most likely to
+// be wrong and the part least likely to need a world, so it is the cheapest
+// thing in the whole verb to put where a test can reach it.
+enum class GuildVerb : std::uint8_t
+{
+    None,
+    // `form <name>` - make the guild, or carry on making it. Idempotent, and
+    // safe to send at a guild that already exists: the formation machine
+    // answers Nothing.
+    Form,
+    // `view` - the profession view, which is also the gap list.
+    View,
+    // `shortlist` or `shortlist <n>` - who would be worth asking, and why.
+    // READ-ONLY: it invites nobody and changes nothing.
+    Shortlist,
+    // `invite` - invite the character named in the row's `target_arg`, the same
+    // column the give, share, trade and mail rows put a second character in.
+    Invite,
+};
+
+struct GuildRequest
+{
+    GuildVerb verb{GuildVerb::None};
+    std::string name;      // Form only: the guild name, as typed
+    unsigned atMost{0};    // Shortlist only, defaulted by the parser
+    // None only, and one of GuildRefusal's literals rather than a built
+    // string. The adapter puts this straight into the command row's
+    // `detail` column, which is written AFTER the executor has returned, so
+    // anything owned by the executor's stack would be a dangling pointer by
+    // the time it reached the UPDATE.
+    char const* error{""};
+};
+
+// The default size of a shortlist when the row does not say. Ten is a list a
+// person can read in one go; the point of the verb is a decision somebody makes
+// rather than a queue somebody drains.
+constexpr unsigned GUILD_SHORTLIST_DEFAULT = 10;
+// And the ceiling on one, because `shortlist 100000` against a realm of a few
+// thousand characters is a request for a JSON blob nobody will read, written
+// into a column with a size limit.
+constexpr unsigned GUILD_SHORTLIST_MAX = 100;
+// The core's own cap on a guild name (ObjectMgr.h:690 at the pinned revision).
+// CHECKED HERE AND CHECKED AGAIN BY THE CORE, deliberately: this catches the
+// length, which is the whole of what can be judged without a world, and
+// ObjectMgr::IsValidCharterName is still what decides, because the rest of that
+// test reads reserved names, profanity lists and a strictness mask that are all
+// configuration rather than code.
+constexpr unsigned GUILD_NAME_MAX = 24;
+
+// The refusal literals. They go straight into an UPDATE, so none may carry a
+// quote character - the rule every executor in this file keeps.
+namespace GuildRefusal
+{
+constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist or invite";
+constexpr char const* NoName = "form needs a guild name";
+constexpr char const* NameTooLong = "that guild name is longer than the core allows";
+constexpr char const* NotACount = "shortlist takes a count and nothing else";
+constexpr char const* CountTooBig = "that shortlist count is larger than this verb will answer";
+constexpr char const* CountIsZero = "a shortlist of nothing is not a question";
+}  // namespace GuildRefusal
+
+GuildRequest ParseGuildRequest(std::string const& command);
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

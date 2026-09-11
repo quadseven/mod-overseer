@@ -1,0 +1,150 @@
+-- Form the family's guild, look at what it covers, and decide who is worth
+-- asking into it (#413).
+--
+-- THE HOLE THIS FILLS. The family is in no guild. Every one of its five
+-- characters has no `guild_member` row, while the realm around it carries
+-- twenty guilds holding about three hundred characters between them. This
+-- module already had the pieces of a guild everywhere except the guild itself:
+-- `Guild.h` and `GuildMgr.h` have been included since the chat work, the chat
+-- verb already speaks on the `guild` and `officer` channels and refuses with
+-- `not in a guild`, the chat watcher already mirrors
+-- Guild::BroadcastToGuild's recipient test so a watcher can hear guild chat,
+-- `overseer_snapshot.guild_id` has been recording a zero for every character
+-- since the first migration, and the roster's `job` column has listed
+-- `guild business` as a mode since the day it was added with nothing behind it.
+-- None of that could ever fire, because nothing in this module had ever made a
+-- guild.
+--
+-- WHY Guild::Create AND NOT A CHARTER. The player's road to a guild in 3.3.5a
+-- is to buy a charter from a `petitioner` and collect signatures, nine of them
+-- by default, and every signature arrives as a packet from a client. This
+-- family is five characters. To sign its own charter it would need four
+-- strangers who are not in the guild yet, which is the recruiting problem it is
+-- trying to solve approached from the wrong end. The charter path is genuinely
+-- closed to a bot family until the guild already exists.
+--
+-- SO THE CORE'S OWN API IS THE PATH, AND IT IS NOT AN ADMIN SHORTCUT. The
+-- executor writes no row of its own. Guild::Create is the same call the core's
+-- own guild command makes: it lays down the five default ranks, inserts the
+-- guild, and adds the founder as guild master. sGuildMgr->AddGuild then puts
+-- the object into the store the rest of the server reads from, so the world's
+-- memory and the tables agree because the core wrote both. Writing `guild` and
+-- `guild_member` by hand would have produced rows that looked correct beside a
+-- running world that had never heard of them.
+--
+-- WHAT DECIDES WHO IS WORTH ASKING, and this is the part worth reading twice.
+-- The ask was for perfect players. NOTHING IN A CHARACTER DATABASE SAYS WHETHER
+-- A PLAYER IS ANY GOOD. There is no combat log here, no damage meter, no wipe
+-- history, no record of anybody turning up when they said they would. The
+-- numbers that most LOOK like quality are the ones that mean least on a realm
+-- of bots: gear is issued by the bot factory rather than earned, money is
+-- spawned, and total played time measures how long the server has been up. A
+-- score built out of those would sort confidently and mean nothing, and the
+-- confidence would be the harm, because somebody would believe it.
+--
+-- So the rule scores nobody. It asks one question the database can genuinely
+-- answer: DOES THIS CHARACTER CLOSE A HOLE THIS GUILD ACTUALLY HAS? Three kinds
+-- of hole, in this order of preference, all of them computed in
+-- `src/overseer_decisions.{h,cpp}` where a test can reach them:
+--
+--   1. A PRIMARY PROFESSION NOBODY IN THE GUILD HOLDS. The family's five
+--      characters carry two primaries each, spread deliberately across ten of
+--      the eleven that exist. Exactly one is missing: Engineering, which is the
+--      only source of a repair bot or a portable mailbox, and this module has
+--      17,200 logged refusals of the form `vendor not in range` behind the work
+--      that walks characters to counters.
+--   2. A SERVICE EXACTLY ONE CLASS BRINGS, where this module already has a
+--      measured problem without it. Three: a warlock's summoning, which is what
+--      the six-cause meeting-stone work was reaching for; a druid's battle
+--      resurrection, whose only alternative here is the corpse run that hid a
+--      map-scoped GetCorpse bug for a week; and a shaman's bloodlust, against a
+--      dungeon stall rule written entirely around fights that take too long.
+--      The family brings none of the three.
+--   3. A COMBAT ROLE NOBODY COULD FILL. The family covers all four already, so
+--      this is not a reason to recruit anybody today. It is in the rule because
+--      a guild that loses its only tank should not have to be told.
+--
+-- Then bench depth, which is not a hole at all and is only ever a reason while
+-- the roster is under its target size.
+--
+-- THIS RULE DOES NOT POACH, AND THAT IS THE FIRST GATE RATHER THAN A FILTER
+-- SOMEBODY REMEMBERED. A character already in a guild is refused before
+-- anything else about them is looked at. Three reasons, and the first would
+-- hold on its own: Guild::AddMember returns false for any character whose guild
+-- id is not 0, so a shortlist of guilded characters would be a list of
+-- invitations that cannot be accepted, failing as a silent false rather than an
+-- error anybody sees. Second, taking a member out of an existing guild is a
+-- transfer and not a gain: it leaves the same number of guilded characters and
+-- one guild worse off. Third, there is no argument from necessity, because most
+-- characters on this realm are in no guild at all.
+--
+-- AND THE LIMIT OF THAT, SAID PLAINLY: this rule cannot tell an abandoned
+-- character from an active one. Unguilded is not the same as looking for a
+-- guild, and nothing in the database records wanting to join anything. What the
+-- rule can honestly claim is that it never takes anybody who already has one.
+--
+-- Column re-use, no new columns, the same shape as kind='share' and kind='mail':
+--   target_name  a character of this family, who carries the row. For `form`
+--                it need NOT be the founder: the founder is whichever enabled
+--                roster row is marked `lead`, the same column the party drive
+--                reads, because who leads is a decision the roster already
+--                records and not an accident of who was online.
+--   command      one of:
+--                  `form <guild name>`  make it, or carry on making it. Safe to
+--                                       repeat: a formed guild answers nothing.
+--                  `view`               the profession view, which is also the
+--                                       gap list. Read-only.
+--                  `shortlist [n]`      who would be worth asking, and why, at
+--                                       most n of them (default 10, cap 100).
+--                                       READ-ONLY: it invites nobody.
+--                  `invite`             invite the character in target_arg.
+--   target_arg   the character to invite, for `invite`. Unused otherwise.
+--   detail       short refusal literal, or empty
+--   result       JSON: outcome (created|added|formed|waiting|read|joined|
+--                refused), reason, character, request, and per verb the guild
+--                and its id, the formation step, the eleven profession rows
+--                with their holders and best values, the missing professions,
+--                services and roles, the level band, how many characters were
+--                considered, and for each shortlisted name the hole it closes
+--                and the sentence saying why.
+--   status       'applied' when the world changed and was read back saying so,
+--                'unchanged' when nothing needed doing or the rule declined,
+--                'delivered' for the two read-only verbs, 'error' otherwise.
+--
+-- DELIVERED IS NOT DONE, AND THIS VERB TREATS IT THAT WAY. Guild::Create
+-- returns a bool and Guild::AddMember returns a bool, and neither is the
+-- question. After every act the executor asks sGuildMgr for the guild by name
+-- or id and asks THAT guild for the member it just added. A row reads 'applied'
+-- only when the world answered.
+--
+-- THE FOUNDERS ARE OFFICERS AND THE RECRUITS ARE INITIATES, which is not
+-- ceremony. The chat verb in this module refuses to speak on the guild or
+-- officer channel unless the speaker's RANK carries the matching right, because
+-- it mirrors Guild::BroadcastToGuild's own test rather than asking about
+-- membership. A founder left on a middle rank would be in the guild, visible in
+-- the roster, and silently unable to use half the chat surface that already
+-- exists here.
+--
+-- NO NEW TABLE AND NO NEW COLUMN. The guild's own membership lives in the
+-- core's `guild` and `guild_member`, which are the core's to write, and every
+-- question this verb answers is computed from those plus `characters` and
+-- `character_skills` at the moment it is asked. A cached copy in an overseer
+-- table would be a second answer that could disagree with the first, and the
+-- profession view exists precisely so that there is only one.
+--
+-- NO STATUS VALUES ARE ADDED. 'applied', 'unchanged' and 'delivered' have been
+-- in the status enum since 2026_08_24_04_overseer_outcome.sql and mean here
+-- exactly what they mean there. This migration touches one column.
+--
+-- THE ENUM LISTS THE FULL UNION, for the reason the bind, repair, buy, hearth,
+-- summon, conjure and cast migrations all spell out: parallel branches are
+-- adding values, an ALTER that MODIFYs an ENUM replaces the whole list rather
+-- than adding to it, and the base CREATE TABLE is `IF NOT EXISTS` so it can
+-- never add one. The migration that runs LAST owns naming every value that
+-- exists by then, and one that lands later and forgets a value DELETES that
+-- verb from the schema silently, after which every row of that kind fails to
+-- insert. 'guild' is last below because it was the last one added; the order
+-- inside the ENUM is not meaningful and the completeness of the list is.
+ALTER TABLE `overseer_command`
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon','conjure','cast','guild')
+        NOT NULL DEFAULT 'bot';
