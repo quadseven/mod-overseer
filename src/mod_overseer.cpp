@@ -25074,6 +25074,16 @@ private:
 
             Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
             PlayerbotAI* leaderAI = SteerableAI(leader);
+            if (!leaderAI && activeInside)
+            {
+                // A stale run can outlive a roster-leader reconnect.  The
+                // inside member is the only character who can make progress
+                // toward the known exit, so use that live member for cleanup
+                // instead of leaving the whole party trapped until the named
+                // leader returns.
+                leader = activeInside;
+                leaderAI = SteerableAI(leader);
+            }
             if (!leaderAI)
                 return;  // mid-login/mid-teardown - try again next poll
 
