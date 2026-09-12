@@ -11086,6 +11086,18 @@ std::vector<RecruitPick> RecruitShortlist(
 // bind, sell and cast rows are: a parser is the part of a verb most likely to
 // be wrong and the part least likely to need a world, so it is the cheapest
 // thing in the whole verb to put where a test can reach it.
+// A tabard is five integers and the core will not store a partial one, so the
+// parser takes all five or refuses.
+constexpr unsigned TABARD_FIELDS = 5;
+// AND EACH ONE IS A uint8 IN THE DATABASE. This is the pinned core's own
+// storage width, not a guess: `EmblemInfo::LoadFromDB`
+// (Guild.cpp:695-700 at the pinned revision) reads every one of the five with
+// `fields[n].Get<uint8>()`. So `tabard 300 0 0 0 0` does not fail anywhere -
+// it is accepted, written, read back as 44, and the guild quietly wears a
+// tabard nobody chose. Refusing above the width is the only place that can be
+// caught, because every layer after this one truncates in silence.
+constexpr unsigned TABARD_VALUE_MAX = 255;
+
 enum class GuildVerb : std::uint8_t
 {
     None,
@@ -11101,6 +11113,12 @@ enum class GuildVerb : std::uint8_t
     // `invite` - invite the character named in the row's `target_arg`, the same
     // column the give, share, trade and mail rows put a second character in.
     Invite,
+    // `tabard <style> <colour> <borderStyle> <borderColour> <background>` -
+    // five integers in the order the `guild` table stores them, which is the
+    // order `EmblemInfo::LoadFromDB` reads them in. Positional rather than
+    // named because the family decides all five together (infra#2831) and a
+    // partial tabard is not a thing the core can store.
+    Tabard,
 };
 
 struct GuildRequest
@@ -11108,6 +11126,10 @@ struct GuildRequest
     GuildVerb verb{GuildVerb::None};
     std::string name;      // Form only: the guild name, as typed
     unsigned atMost{0};    // Shortlist only, defaulted by the parser
+    // Tabard only, all five or none, in `guild` table order. Zero everywhere
+    // else, and zero is also a legal tabard value - which is why `verb` is
+    // what says whether to read them, never the values themselves.
+    unsigned emblem[TABARD_FIELDS]{};
     // None only, and one of GuildRefusal's literals rather than a built
     // string. The adapter puts this straight into the command row's
     // `detail` column, which is written AFTER the executor has returned, so
@@ -11136,7 +11158,10 @@ constexpr unsigned GUILD_NAME_MAX = 24;
 // quote character - the rule every executor in this file keeps.
 namespace GuildRefusal
 {
-constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist or invite";
+constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite or tabard";
+constexpr char const* TabardNeedsFive = "tabard takes five numbers: style, colour, border style, border colour, background";
+constexpr char const* TabardNotANumber = "tabard takes five numbers and nothing else";
+constexpr char const* TabardValueTooBig = "a tabard value is stored as one byte; 255 is the most any of the five can be";
 constexpr char const* NoName = "form needs a guild name";
 constexpr char const* NameTooLong = "that guild name is longer than the core allows";
 constexpr char const* NotACount = "shortlist takes a count and nothing else";

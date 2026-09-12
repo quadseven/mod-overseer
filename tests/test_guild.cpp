@@ -657,7 +657,7 @@ void FormationRefusesLoudlyRatherThanWorkingRound()
 
 // -- the row -----------------------------------------------------------------
 
-void TheFourVerbsParse()
+void TheFiveVerbsParse()
 {
     Check("view parses", ParseGuildRequest("view").verb == GuildVerb::View);
     Check("invite parses", ParseGuildRequest("invite").verb == GuildVerb::Invite);
@@ -685,6 +685,59 @@ void TheFourVerbsParse()
           ParseGuildRequest("   view   ").verb == GuildVerb::View);
     CheckString("a name is trimmed but not otherwise touched",
                 ParseGuildRequest("form   Stonefist Kin  ").name, "Stonefist Kin");
+
+    GuildRequest const tabard = ParseGuildRequest("tabard 40 8 1 11 39");
+    Check("tabard parses", tabard.verb == GuildVerb::Tabard);
+    // In `guild` table order, which is the order EmblemInfo::LoadFromDB reads
+    // them. Asserted one at a time rather than as a loop: a transposition
+    // between border colour and emblem colour is exactly the bug that would
+    // survive a loop comparing the array against itself.
+    CheckUnsigned("emblem style first", tabard.emblem[0], 40);
+    CheckUnsigned("then emblem colour", tabard.emblem[1], 8);
+    CheckUnsigned("then border style", tabard.emblem[2], 1);
+    CheckUnsigned("then border colour", tabard.emblem[3], 11);
+    CheckUnsigned("and background last", tabard.emblem[4], 39);
+}
+
+void ATabardIsFiveBytesOrItIsRefused()
+{
+    using namespace OverseerDecisions::GuildRefusal;
+
+    // ALL ZEROS IS A LEGAL TABARD and must not read as "no tabard given".
+    // It is also the shape a guild has before anybody designs one, so a
+    // parser that treated it as absent would make "reset it" unsayable.
+    GuildRequest const plain = ParseGuildRequest("tabard 0 0 0 0 0");
+    Check("all zeros is a tabard, not an empty row", plain.verb == GuildVerb::Tabard);
+    CheckString("and is refused by nothing", plain.error, "");
+
+    CheckString("four numbers is not a tabard",
+                ParseGuildRequest("tabard 1 2 3 4").error, TabardNeedsFive);
+    CheckString("nor is six", ParseGuildRequest("tabard 1 2 3 4 5 6").error,
+                TabardNeedsFive);
+    CheckString("nor is none at all", ParseGuildRequest("tabard").error,
+                TabardNeedsFive);
+    CheckString("a word among the numbers is refused",
+                ParseGuildRequest("tabard 1 2 red 4 5").error, TabardNotANumber);
+    CheckString("and so is a negative, which is the same refusal",
+                ParseGuildRequest("tabard -1 2 3 4 5").error, TabardNotANumber);
+
+    // THE ONE THAT MATTERS. The core stores each of these as a uint8, so 300
+    // is not rejected anywhere downstream - it is written, read back as 44,
+    // and the guild wears a tabard nobody chose.
+    CheckString("a value wider than the byte it is stored in is refused",
+                ParseGuildRequest("tabard 300 0 0 0 0").error, TabardValueTooBig);
+    CheckString("and the ceiling itself is allowed",
+                ParseGuildRequest("tabard 255 255 255 255 255").error, "");
+    // Refused on the digit that overflows, so a very long run does not wrap
+    // its way back into range before anybody looks at it.
+    CheckString("a long run of digits is refused, not wrapped",
+                ParseGuildRequest("tabard 4294967297 0 0 0 0").error,
+                TabardValueTooBig);
+
+    Check("extra blanks between the numbers do not matter",
+          ParseGuildRequest("tabard  1   2  3 4   5 ").verb == GuildVerb::Tabard);
+    Check("and the verb is case insensitive like the others",
+          ParseGuildRequest("TABARD 1 2 3 4 5").verb == GuildVerb::Tabard);
 }
 
 void ABadRowIsRefusedByNameAndNeverSilently()
@@ -746,7 +799,8 @@ int main()
     FormationWaitsForTheFounderBeforeItTriesToCreate();
     FormationAddsOneFounderAtATimeAndThenStops();
     FormationRefusesLoudlyRatherThanWorkingRound();
-    TheFourVerbsParse();
+    TheFiveVerbsParse();
+    ATabardIsFiveBytesOrItIsRefused();
     ABadRowIsRefusedByNameAndNeverSilently();
 
     if (failures)

@@ -215,6 +215,9 @@
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "GuildMgr.h"
+// WorldPackets::Guild::SaveGuildEmblem, which is the ONLY public way to
+// put values into an EmblemInfo - see the tabard branch in DoGuild.
+#include "GuildPackets.h"
 #include "InstanceSaveMgr.h"
 #include "ObjectAccessor.h"
 #include "Map.h"
@@ -33395,6 +33398,15 @@ private:
     // entry is the core's. Writing `guild` and `guild_member` by hand would
     // produce rows that looked right and a world that had never heard of them,
     // which is the failure AGENTS.md is about.
+    // The core's own price for an emblem, restated because it is not reachable.
+    // `EMBLEM_PRICE` is a #define in the core's Guild.cpp (line 42 at the
+    // pinned revision, `10 * GOLD`), not in Guild.h, so no amount of including
+    // brings it here. Restated values drift, so this one is checked by the
+    // world rather than trusted: if it were ever too low, HandleSetEmblem
+    // would refuse a command this branch had already called affordable, and
+    // the row would come back applied with an unchanged tabard.
+    static constexpr uint32 TABARD_COST = 10 * 10000;
+
     static char const* DoGuild(Player* who, std::string const& command,
                                std::string const& targetArg, char const*& status,
                                std::string& out)
@@ -33620,6 +33632,94 @@ private:
 
         if (!guild)
             return refuse("that character is in no guild");
+
+        if (request.verb == GuildVerb::Tabard)
+        {
+            // BEFORE THE ROSTER READ, on purpose: a tabard is five numbers and
+            // the guild object, and reading every member to set one would be a
+            // query nothing below it uses.
+            //
+            // EmblemInfo CANNOT BE CONSTRUCTED WITH VALUES, and this is the
+            // trap this branch exists to walk around rather than into. Its
+            // constructor at the pinned revision is
+            //   EmblemInfo(uint32 /*style*/ = 0, ... uint32 /*backgroundColor*/ = 0)
+            //     : m_style(0), m_color(0), m_borderStyle(0),
+            //       m_borderColor(0), m_backgroundColor(0) { }
+            // - five parameters, every one of them unnamed, and an initialiser
+            // list that hardcodes zero. `EmblemInfo(40, 8, 1, 11, 39)` compiles
+            // without a warning and yields a BLANK tabard, which on a guild
+            // that never had one is indistinguishable from this verb doing
+            // nothing at all. The five members are private and ReadPacket is
+            // the only public way to fill them, so the packet below is not
+            // ceremony - it is the whole of the API.
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to set a tabard with");
+
+            // ASKED BEFORE, BECAUSE IT CANNOT BE ASKED AFTER. Guild keeps
+            // `m_emblemInfo` private with no public getter at the pinned
+            // revision, and HandleSetEmblem returns void - it answers the
+            // CLIENT with a result packet. So there is no reading the tabard
+            // back out of the world to see whether it took, and the only
+            // honest report is one that checks the core's two conditions
+            // first and names which one failed. The core names neither.
+            //
+            // STRICTER THAN THE CORE ON PURPOSE. Guild::_IsLeader passes a
+            // character that either holds the leader guid OR sits at rank
+            // GR_GUILDMASTER; only the first has a public accessor. A rank-0
+            // member who is not the leader guid is therefore refused here and
+            // would have been allowed - which is the direction to be wrong in,
+            // because the alternative is reporting a tabard that was never set.
+            if (guild->GetLeaderGUID() != who->GetGUID())
+                return refuse("only the guild master may set the tabard, and "
+                              "this character does not lead it");
+            if (!who->HasEnoughMoney(TABARD_COST))
+                return refuse("the guild master cannot afford the emblem");
+
+            WorldPackets::Guild::SaveGuildEmblem packet(
+                WorldPacket(MSG_SAVE_GUILD_EMBLEM, 0));
+            packet.EStyle = static_cast<int32>(request.emblem[0]);
+            packet.EColor = static_cast<int32>(request.emblem[1]);
+            packet.BStyle = static_cast<int32>(request.emblem[2]);
+            packet.BColor = static_cast<int32>(request.emblem[3]);
+            packet.Bg     = static_cast<int32>(request.emblem[4]);
+
+            EmblemInfo emblem;
+            emblem.ReadPacket(packet);
+
+            // THE SESSION OVERLOAD, NOT THE BARE ONE. Guild.cpp carries two:
+            // `HandleSetEmblem(WorldSession*, EmblemInfo const&)` checks that
+            // the actor leads the guild and can pay, and
+            // `HandleSetEmblem(EmblemInfo const&)` checks neither. The second
+            // is shorter and would always appear to succeed, which is exactly
+            // why it is wrong here: the ten gold and the tabard being the
+            // guild master's to set are the rules of the thing they are doing,
+            // and a module that quietly skipped both would be dressing them in
+            // something they never earned.
+            guild->HandleSetEmblem(session, emblem);
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"emblem_style\":" << request.emblem[0]
+              << ",\"emblem_color\":" << request.emblem[1]
+              << ",\"border_style\":" << request.emblem[2]
+              << ",\"border_color\":" << request.emblem[3]
+              << ",\"background_color\":" << request.emblem[4]
+              << ",\"paid\":" << TABARD_COST;
+            note = o.str();
+
+            LOG_INFO("module.overseer",
+                     "overseer: guild '{}' ({}) wears {} {} {} {} {}, set by {} for {} copper",
+                     guild->GetName(), guild->GetId(),
+                     request.emblem[0], request.emblem[1], request.emblem[2],
+                     request.emblem[3], request.emblem[4], who->GetName(),
+                     TABARD_COST);
+
+            describe("set", "");
+            status = "applied";
+            return "";
+        }
 
         std::vector<GuildMemberFacts> const members = GuildRosterFacts(guild->GetId());
 
