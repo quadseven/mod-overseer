@@ -11119,6 +11119,16 @@ enum class GuildVerb : std::uint8_t
     // named because the family decides all five together (infra#2831) and a
     // partial tabard is not a thing the core can store.
     Tabard,
+    // `bank deposit <copper>` - move gold from the acting character's own
+    // purse into the guild bank. DEPOSIT ONLY: no withdraw verb exists yet
+    // (infra#2831 / mod-overseer#437) because a withdraw needs the per-rank
+    // permission read done on the PLANNING side, before an aim is even
+    // written - the core's own rank check happens at the wrong end of that
+    // problem for this module's purposes, and getting it wrong hands guild
+    // funds to the wrong character. Deposit alone has no such rank gate: any
+    // member may deposit, the core's own `HandleMemberDepositMoney` performs
+    // no rank check at all, only a bank-full ceiling.
+    Bank,
 };
 
 struct GuildRequest
@@ -11130,6 +11140,10 @@ struct GuildRequest
     // else, and zero is also a legal tabard value - which is why `verb` is
     // what says whether to read them, never the values themselves.
     unsigned emblem[TABARD_FIELDS]{};
+    // Bank only: copper to deposit. Never zero when verb is Bank - the
+    // parser refuses a zero amount the same way it refuses a missing one,
+    // because "deposit nothing" is not a request this verb can act on.
+    std::uint32_t depositCopper{0};
     // None only, and one of GuildRefusal's literals rather than a built
     // string. The adapter puts this straight into the command row's
     // `detail` column, which is written AFTER the executor has returned, so
@@ -11137,6 +11151,27 @@ struct GuildRequest
     // the time it reached the UPDATE.
     char const* error{""};
 };
+
+// The core's own ceiling on how much money a single Player can ever hold
+// (Player.h:924 at the pinned revision: `(0x7FFFFFFF-1)`). Duplicated here,
+// deliberately, rather than included from the core: this file has to keep
+// compiling with no core in its include path, and a deposit request above
+// this number cannot be a real one - `Player::ModifyMoney` takes a signed
+// int32, so a copper amount past INT32_MAX would wrap through the core's own
+// arithmetic rather than being refused.
+//
+// NAMED DIFFERENTLY FROM THE CORE'S OWN `MAX_MONEY_AMOUNT` ON PURPOSE. That
+// is a `#define` in Player.h, and mod_overseer.cpp already includes the core
+// and already uses it in several places. A `constexpr` here with the exact
+// same name would not shadow it or collide at link time - the preprocessor
+// would rewrite THIS declaration into `constexpr std::uint32_t (0x7FFFFFFF-1)
+// = ...;` before the compiler ever saw an identifier, which is a syntax
+// error with no useful mention of a macro anywhere in it. Caught by the
+// adapter's own CI compile, which is exactly the job this duplication is
+// for - this header cannot see the collision itself, having no core in its
+// include path, which is the whole reason to give it a name the core does
+// not also define.
+constexpr std::uint32_t GUILD_DEPOSIT_MAX_COPPER = 0x7FFFFFFFu - 1u;
 
 // The default size of a shortlist when the row does not say. Ten is a list a
 // person can read in one go; the point of the verb is a decision somebody makes
@@ -11158,7 +11193,11 @@ constexpr unsigned GUILD_NAME_MAX = 24;
 // quote character - the rule every executor in this file keeps.
 namespace GuildRefusal
 {
-constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite or tabard";
+constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard or bank";
+constexpr char const* BankNeedsDeposit = "bank takes exactly `deposit <copper>`";
+constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount and nothing else";
+constexpr char const* BankAmountIsZero = "a deposit of nothing is not a request";
+constexpr char const* BankAmountTooBig = "that deposit is larger than a character can ever carry";
 constexpr char const* TabardNeedsFive = "tabard takes five numbers: style, colour, border style, border colour, background";
 constexpr char const* TabardNotANumber = "tabard takes five numbers and nothing else";
 constexpr char const* TabardValueTooBig = "a tabard value is stored as one byte; 255 is the most any of the five can be";

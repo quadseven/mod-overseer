@@ -33652,6 +33652,53 @@ private:
     // comparison the row would come back applied with an unchanged tabard.
     static constexpr uint32 TABARD_COST = 10 * 10000;
 
+    // The guild bank's own vault predicate, the same shape
+    // MeetingStoneNearbyCheck keeps for a different gameobject type. A
+    // GUILD BANK IS A GAMEOBJECT, NOT A CREATURE - unlike the personal
+    // bank (a Creature carrying UNIT_NPC_FLAG_BANKER, see BankerInReach
+    // above), the guild bank deposit/withdraw packets the core actually
+    // ships (GuildHandler.cpp's HandleGuildBankDepositMoney et al., at
+    // the pinned core revision) are gated on
+    // `Player::GetGameObjectIfCanInteractWith(guid, GAMEOBJECT_TYPE_GUILD_BANK)`,
+    // never on a creature flag. `travel_npc='guild bank'` still resolves to
+    // walking the character toward the NPC-flagged guild banker (they are
+    // spawned together in every guild hall), but what this module actually
+    // interacts with on arrival is the vault object standing beside it.
+    struct GuildBankNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(GameObject* go) const
+        {
+            return go->GetGoType() == GAMEOBJECT_TYPE_GUILD_BANK
+                && go->isSpawned()
+                && from->IsWithinDistInMap(go, range);
+        }
+    };
+
+    // The guild bank vault this character can actually interact with, or
+    // nullptr. `anyInRange` distinguishes "no vault anywhere nearby" from
+    // "a vault nearby this character may not use" (out of world, dead,
+    // too far by the core's own stricter INTERACTION_DISTANCE gate) the
+    // same way BankerInReach's flag of the same name does.
+    static GameObject* GuildBankInReach(Player* who, bool& anyInRange)
+    {
+        anyInRange = false;
+
+        std::list<GameObject*> vaults;
+        GuildBankNearbyCheck check{who, INTERACTION_DISTANCE};
+        Acore::GameObjectListSearcher<GuildBankNearbyCheck> searcher(who, vaults, check);
+        Cell::VisitObjects(who, searcher, INTERACTION_DISTANCE);
+
+        for (GameObject* go : vaults)
+        {
+            anyInRange = true;
+            if (who->GetGameObjectIfCanInteractWith(go->GetGUID(), GAMEOBJECT_TYPE_GUILD_BANK))
+                return go;
+        }
+        return nullptr;
+    }
+
     static char const* DoGuild(Player* who, std::string const& command,
                                std::string const& targetArg, char const*& status,
                                std::string& out)
@@ -33996,6 +34043,72 @@ private:
                      TABARD_COST);
 
             describe("set", "");
+            status = "applied";
+            return "";
+        }
+
+        if (request.verb == GuildVerb::Bank)
+        {
+            // Travel to the vault is the existing errand - the same NPC-flag
+            // aim `travel_npc='guild bank'` already resolves - so this
+            // executor moves the money where the character already stands,
+            // or names why it cannot, exactly as DoBank does for the
+            // personal bank.
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to bank through");
+
+            bool anyVaultInRange = false;
+            GameObject* vault = GuildBankInReach(who, anyVaultInRange);
+            if (!vault)
+                return refuse(anyVaultInRange
+                                  ? "a guild bank is nearby but this character cannot use it"
+                                  : "no guild bank in reach");
+
+            if (!who->HasEnoughMoney(request.depositCopper))
+                return refuse("this character does not carry that much gold");
+
+            // READ BEFORE, so a refusal still reports the state of the world
+            // the row was judged against, and so success can be witnessed by
+            // the difference rather than trusted from the call having
+            // returned - the same discipline the tabard branch above keeps
+            // (HandleMemberDepositMoney is void; the guild's own bank money
+            // total is the synchronous, exact witness of whether it moved).
+            uint32 const purseBefore = who->GetMoney();
+            uint64 const bankMoneyBefore = guild->GetTotalBankMoney();
+
+            guild->HandleMemberDepositMoney(session, request.depositCopper);
+
+            uint32 const purseAfter = who->GetMoney();
+            uint64 const bankMoneyAfter = guild->GetTotalBankMoney();
+            uint32 const taken = purseBefore > purseAfter ? purseBefore - purseAfter : 0;
+
+            if (taken != request.depositCopper || bankMoneyAfter <= bankMoneyBefore)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) did not take a {} copper "
+                         "deposit from {} - {} copper moved, bank money {} -> {}",
+                         guild->GetName(), guild->GetId(), request.depositCopper,
+                         who->GetName(), taken, bankMoneyBefore, bankMoneyAfter);
+                return refuse("the core did not move the money - most likely "
+                              "the guild bank is full");
+            }
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"deposited\":" << request.depositCopper
+              << ",\"bank_money_before\":" << bankMoneyBefore
+              << ",\"bank_money_after\":" << bankMoneyAfter;
+            note = o.str();
+
+            LOG_INFO("module.overseer",
+                     "overseer: {} deposited {} copper into guild '{}' ({}) - "
+                     "bank now holds {}",
+                     who->GetName(), request.depositCopper, guild->GetName(),
+                     guild->GetId(), bankMoneyAfter);
+
+            describe("deposited", "");
             status = "applied";
             return "";
         }
