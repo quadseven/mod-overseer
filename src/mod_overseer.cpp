@@ -9802,10 +9802,10 @@ private:
                 // one nearest the character - a duplicate spawn row further
                 // from the node than another candidate is the wrong copy to
                 // send anybody to.
-                uint32 bestEntry = 0;
-                uint32 bestFaction = 0;
-                WorldPosition bestPos;
-                float bestDistSq = -1.f;
+                uint32 nodeSpawnEntry = 0;
+                uint32 nodeSpawnFaction = 0;
+                WorldPosition nodeSpawnPos;
+                float nodeSpawnDistSq = -1.f;
                 for (TravelSpawn const& spawn : _travelSpawns)
                 {
                     if (spawn.mapId != node->map_id)
@@ -9819,26 +9819,26 @@ private:
                     float const dx = spawn.x - node->x;
                     float const dy = spawn.y - node->y;
                     float const distSq = dx * dx + dy * dy;
-                    if (bestDistSq < 0.f || distSq < bestDistSq)
+                    if (nodeSpawnDistSq < 0.f || distSq < nodeSpawnDistSq)
                     {
-                        bestDistSq = distSq;
-                        bestEntry = spawn.entry;
-                        bestFaction = spawn.faction;
-                        bestPos = WorldPosition(spawn.mapId, spawn.x, spawn.y, spawn.z);
+                        nodeSpawnDistSq = distSq;
+                        nodeSpawnEntry = spawn.entry;
+                        nodeSpawnFaction = spawn.faction;
+                        nodeSpawnPos = WorldPosition(spawn.mapId, spawn.x, spawn.y, spawn.z);
                     }
                 }
-                if (!bestEntry)
+                if (!nodeSpawnEntry)
                     return false;   // the DBC has this node; nothing spawned answers for it
 
                 // THE SAME FACTION GATE EVERY OTHER KEYWORD HERE ALREADY
                 // ASKS (#234): a flight master this character is unfriendly
                 // to cannot teach it a node however well the walk goes.
                 if (!OverseerDecisions::MayInteractAt(
-                        ReactionTowardCharacter(bot, bestFaction)))
+                        ReactionTowardCharacter(bot, nodeSpawnFaction)))
                     return false;
 
-                outEntry = bestEntry;
-                outPos = bestPos;
+                outEntry = nodeSpawnEntry;
+                outPos = nodeSpawnPos;
                 return true;
             }
         }
