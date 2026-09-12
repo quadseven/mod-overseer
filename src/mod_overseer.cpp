@@ -19671,6 +19671,51 @@ private:
             // entrance for the current family run. Other Scarlet wings have
             // distinct doors and need their own measured rows.
             {"scarlet", 0, 45, 189, 602, 0.f, 0.f, 0.f},
+            // THE LIBRARY WING, AND THE ONE OF THE THREE BELOW THAT CAN BE RUN
+            // ON ITS OWN. Doan's Strongbox, gameobject 103821, stands inside it
+            // and drops item 7146 - the Scarlet Key - at 100%. Herod's Door and
+            // the High Inquisitor's Door, the entrances to the two rows below
+            // this one, will not open without that key, and nobody in the
+            // family holds one yet. This row does not acquire it; it only gets
+            // a party to the wing that has it. Run this one before either of
+            // the other two.
+            //
+            // areatrigger.sql: (614,0,2859.73,-824.91,162.083,8,0,0,0,0)
+            // areatrigger_teleport.sql: (614,'Scarlet Monastery - Library (Entrance)',189,255.35,-209.09,18.68,6.2666)
+            // areatrigger.sql: (608,189,253.601,-196.804,21.038,8,0,0,0,0)
+            // areatrigger_teleport.sql: (608,'Scarlet Monastery - Library (Exit)',0,2870.9,-820.16,160.33,0.3879)
+            {"scarlet-library", 0, 614, 189, 608, 0.f, 0.f, 0.f},
+            // THE ARMORY, BEHIND HEROD'S DOOR, which the Scarlet Key opens and
+            // nothing else does. A run aimed here before `scarlet-library` has
+            // acquired the key stands at a door that will not move; this module
+            // does not check for the key or order the two runs itself, so that
+            // ordering is on whoever starts the run.
+            //
+            // AND THE ONE RADIUS IN THIS TABLE THAT IS NOT 8: areatrigger 612 is
+            // 6. It is not a special case anywhere this table is read. Both
+            // places that ever compare against a trigger's radius -
+            // DUNGEON_STAGING_STANDOFF_YARDS's margin (20 > 10 + 6) and
+            // ArrivalReachesTrigger's check against TRAVEL_ARRIVED_POSITION_YARDS
+            // (5 < 6) - read `door->radius` out of the world at the time they run
+            // rather than assuming 8, and the Deadmines exit (areatrigger 119) is
+            // already radius 6 in this same table with the same margin to spare.
+            // Recorded here so the next reader does not go looking for a bug
+            // that is not there.
+            //
+            // areatrigger.sql: (612,0,2877.98,-839.267,163.049,6,0,0,0,0)
+            // areatrigger_teleport.sql: (612,'Scarlet Monastery - Armory (Entrance)',189,1610.83,-323.43,18.67,6.2802)
+            // areatrigger.sql: (606,189,1608.65,-308.97,20.782,8,0,0,0,0)
+            // areatrigger_teleport.sql: (606,'Scarlet Monastery - Armory (Exit)',0,2884.45,-822.01,160.33,1.9527)
+            {"scarlet-armory", 0, 612, 189, 606, 0.f, 0.f, 0.f},
+            // THE CATHEDRAL, BEHIND THE HIGH INQUISITOR'S DOOR - the other lock
+            // the Scarlet Key opens. Same constraint as the armory above and for
+            // the same reason: run `scarlet-library` first.
+            //
+            // areatrigger.sql: (610,0,2925.18,-820.545,161.634,8,0,0,0,0)
+            // areatrigger_teleport.sql: (610,'Scarlet Monastery - Cathedral (Entrance)',189,855.68,1321.5,18.67,0.0017)
+            // areatrigger.sql: (604,189,853.679,1308.1,19.671,8,0,0,0,0)
+            // areatrigger_teleport.sql: (604,'Scarlet Monastery - Cathedral (Exit)',0,2906.14,-813.77,160.33,1.9574)
+            {"scarlet-cathedral", 0, 610, 189, 604, 0.f, 0.f, 0.f},
             // areatrigger.sql: (101,0,-8761.85,848.557,87.8052,0,4.972,9.694,7.444,0.6632)
             // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
             // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
