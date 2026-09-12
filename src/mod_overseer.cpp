@@ -6715,6 +6715,66 @@ private:
                     REGROUP_HOLD_VERB);
     }
 
+    // --------------------- the flight discovery hold (#388) ------------------
+    //
+    // THE EIGHTH REASON IN THE REGISTER, AND IT IS THE COUNTER HOLD ABOVE
+    // APPLIED TO A DIFFERENT TRANSACTION. #93 made discovery a no-op that
+    // piggybacks on whatever errand ends beside a flight master and never
+    // holds anybody there on purpose. A DELIBERATE errand - `flight
+    // master:<nodeId>` - is asking specifically for the thing the opportunistic
+    // path treats as incidental, so it earns the same care #378 gave the town
+    // trip: arrival asked of the live creature through the same gate the core
+    // itself uses, not the loose spawn-radius `DiscoverFlightPointOnArrival`
+    // was written for.
+    //
+    // ITS OWN VERB, NOT `trade`. This is not one of the economy passes'
+    // errands - nothing outside the worldserver is waiting on a row - so
+    // folding it into COUNTER_HOLD_VERB would let IsMaintenanceErrand and the
+    // dungeon run gate read a flight-discovery aim as a trip the run has to
+    // wait for, which it is not.
+    static constexpr char const* FLIGHT_DISCOVERY_HOLD_VERB = "learn flight";
+
+    // BORROWED FROM THE SAME PLACE THE COUNTER HOLD BORROWS ITS OWN CEILING,
+    // for the identical reason: this hold is taken as the errand is released,
+    // so nothing is left looking at the character afterward to renew it, and
+    // upstream's own patience with a character standing at an aimed wander's
+    // target is the honest number to agree with rather than inventing one.
+    static constexpr uint32 FLIGHT_DISCOVERY_HOLD_CEILING_SECONDS =
+        static_cast<uint32>(UPSTREAM_WANDER_NPC_LEASE_SECONDS);
+
+    static bool HasFlightDiscoveryHold(std::string const& name)
+    {
+        auto const hold = HoldsInForce().find(name);
+        return hold != HoldsInForce().end() &&
+               hold->second.verb == FLIGHT_DISCOVERY_HOLD_VERB;
+    }
+
+    static void HoldAtTheFlightMaster(Player* member, std::string const& name)
+    {
+        PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        if (!botAI)
+            return;
+        // `false`: not a cast, for the identical reason the counter hold gives
+        // - `SetTaximaskNode` is a direct call into PlayerTaxi rather than a
+        // spell this character casts, and it cares about nothing but the live
+        // creature being in reach.
+        //
+        // TAKEN ONCE, LIKE THE COUNTER HOLD, AND FOR THE SAME REASON: the
+        // errand is released on the same statement that takes it, so no drive
+        // is left polling this character afterward to re-assert it.
+        // KeepHeldCharactersStill's per-tick sweep and the six hand-back sites
+        // that ask HeldStill before granting a mover are what carry it to its
+        // ceiling instead.
+        HoldCharacterStill(member, botAI, name, FLIGHT_DISCOVERY_HOLD_VERB,
+                           FLIGHT_DISCOVERY_HOLD_CEILING_SECONDS, false);
+    }
+
+    static void ReleaseFlightDiscoveryHold(std::string const& name, char const* why)
+    {
+        ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
+                    FLIGHT_DISCOVERY_HOLD_VERB);
+    }
+
     // The predicate the counter sweep runs over each creature in the visited
     // cells: alive, carrying the role's own npcflag, and within `range`. The
     // same shape VendorNearbyCheck already gives Acore::CreatureListSearcher
@@ -6869,6 +6929,43 @@ private:
         // Both radii are around the bot, so the two questions line up: a
         // creature this calls nearby is one upstream's own resolve would find
         // from where the character is standing right now.
+        outOneIsNearby =
+            outNearestYards >= 0.f && outNearestYards <= INTERACTION_DISTANCE * 3.f;
+        return inReach;
+    }
+
+    // THE SAME QUESTION, ASKED OF A FLIGHT MASTER (#388). Byte for byte
+    // CounterInReach's sweep and its "nearby means a gap upstream will
+    // actually close" reasoning, kept as its own function rather than folded
+    // into CounterRole: a deliberate flight-discovery errand is not one of
+    // the economy passes' errands, and IsMaintenanceErrand/
+    // DungeonRunMaintenanceHold's run-pacing semantics do not apply to it -
+    // there is no external row this hold is waiting on, only a call this
+    // module makes and reads back itself. Sharing CounterRole to save this
+    // dozen lines would put a flight-discovery aim into a vocabulary about
+    // command-table rows it has nothing to do with.
+    static bool FlightMasterInReach(Player* who, bool& outOneIsNearby, float& outNearestYards)
+    {
+        outOneIsNearby = false;
+        outNearestYards = -1.f;
+        if (!who)
+            return false;
+
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        CounterNearbyCheck check{who, SWEEP_YARDS, UNIT_NPC_FLAG_FLIGHTMASTER};
+        Acore::CreatureListSearcher<CounterNearbyCheck> searcher(who, nearby, check);
+        Cell::VisitObjects(who, searcher, SWEEP_YARDS);
+
+        bool inReach = false;
+        for (Creature* creature : nearby)
+        {
+            float const yards = who->GetDistance(creature);
+            if (outNearestYards < 0.f || yards < outNearestYards)
+                outNearestYards = yards;
+            if (who->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_FLIGHTMASTER))
+                inReach = true;
+        }
         outOneIsNearby =
             outNearestYards >= 0.f && outNearestYards <= INTERACTION_DISTANCE * 3.f;
         return inReach;
@@ -9665,6 +9762,87 @@ private:
             return true;
         }
 
+        // A SPECIFIC TAXI NODE: `flight master:<nodeId>` (#388). The bare
+        // `flight master` keyword handled by TravelRoles below still means
+        // "the nearest one", and that is the wrong answer for a deliberate
+        // discovery errand exactly as often as the nearest node is not the
+        // one missing from a route - #388's own measurement is Nijel's Point
+        // to Ratchet, where the missing hop, Theramore, is neither endpoint
+        // and is not necessarily near wherever the character sent to fetch
+        // it happens to be standing.
+        //
+        // Answered before BuildTravelIndex() is even reached for the numeric
+        // and role-keyword branches below, the same way `at:` and `trigger:`
+        // are: this aim names a fact read out of TaxiNodes.dbc, not a role
+        // this file's ordinary candidate search would know how to rank.
+        {
+            uint32 wantedNode = 0;
+            if (OverseerDecisions::ParseFlightMasterNodeAim(target, wantedNode))
+            {
+                // DBCStores.h, the same store ConsiderFlight and the flight
+                // refusal line already read `TaxiNodesEntry` out of.
+                TaxiNodesEntry const* const node = sTaxiNodesStore.LookupEntry(wantedNode);
+                if (!node)
+                    return false;   // not a row TaxiNodes.dbc actually has
+
+                // SAME MAP ONLY (#234's restraint, unchanged): a flight
+                // master is a physical creature this character has to walk
+                // to, and there is no navmesh across an ocean or into an
+                // instance for MoveFarTo to path through.
+                if (!bot || bot->GetMapId() != node->map_id)
+                    return false;
+
+                BuildTravelIndex();
+
+                // THE SAME NODE-TO-CREATURE AGREEMENT CONSIDERFLIGHT ALREADY
+                // REQUIRES (TRAVEL_FLIGHT_NODE_MATCH_YARDS), so a deliberate
+                // errand and an opportunistic flight can never come to two
+                // different answers about whose creature this node is. The
+                // candidate nearest the NODE's own DBC position wins, not the
+                // one nearest the character - a duplicate spawn row further
+                // from the node than another candidate is the wrong copy to
+                // send anybody to.
+                uint32 bestEntry = 0;
+                uint32 bestFaction = 0;
+                WorldPosition bestPos;
+                float bestDistSq = -1.f;
+                for (TravelSpawn const& spawn : _travelSpawns)
+                {
+                    if (spawn.mapId != node->map_id)
+                        continue;
+                    if (!(spawn.npcFlags & UNIT_NPC_FLAG_FLIGHTMASTER))
+                        continue;
+                    if (!OverseerDecisions::FlightMasterAnswersForNode(
+                            spawn.x, spawn.y, node->x, node->y,
+                            TRAVEL_FLIGHT_NODE_MATCH_YARDS))
+                        continue;
+                    float const dx = spawn.x - node->x;
+                    float const dy = spawn.y - node->y;
+                    float const distSq = dx * dx + dy * dy;
+                    if (bestDistSq < 0.f || distSq < bestDistSq)
+                    {
+                        bestDistSq = distSq;
+                        bestEntry = spawn.entry;
+                        bestFaction = spawn.faction;
+                        bestPos = WorldPosition(spawn.mapId, spawn.x, spawn.y, spawn.z);
+                    }
+                }
+                if (!bestEntry)
+                    return false;   // the DBC has this node; nothing spawned answers for it
+
+                // THE SAME FACTION GATE EVERY OTHER KEYWORD HERE ALREADY
+                // ASKS (#234): a flight master this character is unfriendly
+                // to cannot teach it a node however well the walk goes.
+                if (!OverseerDecisions::MayInteractAt(
+                        ReactionTowardCharacter(bot, bestFaction)))
+                    return false;
+
+                outEntry = bestEntry;
+                outPos = bestPos;
+                return true;
+            }
+        }
+
         BuildTravelIndex();
 
         uint32 wantedEntry = 0;
@@ -10639,6 +10817,84 @@ private:
                  name, node, npc->GetName(), entry);
     }
 
+    // A DELIBERATE ERRAND ASKS FOR ONE NODE AND HAS TO PROVE IT GOT THAT ONE
+    // (#388). `DiscoverFlightPointOnArrival` above answers "whatever node this
+    // spot happens to teach", which is right for an opportunistic visit that
+    // was never about a specific node in the first place. `flight
+    // master:<nodeId>` is not opportunistic - it exists because a SPECIFIC
+    // node is the one hop missing from a route - so this checks the taught
+    // node against the one that was actually asked for rather than trusting
+    // that standing at the resolved creature necessarily teaches it.
+    //
+    // WHY THAT CHECK CAN FAIL AT ALL, GIVEN ResolveTravelTarget ALREADY
+    // MATCHED THIS CREATURE TO THIS NODE. It can fail if a second node sits
+    // within TRAVEL_FLIGHT_NODE_MATCH_YARDS of the same flight master -
+    // TaxiNodes.dbc is not required to keep one node per creature - in which
+    // case GetNearestTaxiNode, asked from the character's OWN position rather
+    // than the node's DBC one, could answer the other one. Saying so rather
+    // than logging a discovery that silently was not the one asked for is the
+    // whole of #402's argument applied here.
+    //
+    // Returns true once the requested node is confirmed known, whether this
+    // call is what taught it or it was already known - both are success for a
+    // deliberate errand, and the caller uses this to decide whether the
+    // errand is finished.
+    bool LearnFlightNodeDeliberately(std::string const& name, Player* bot, Creature* npc,
+                                      uint32 entry, uint32 requestedNode)
+    {
+        if (!bot || !npc || !npc->IsAlive() || !requestedNode)
+            return false;
+
+        // ObjectMgr.h:817, Player.h:2142 - the same overload and the same
+        // GetTeamId(true) DiscoverFlightPointOnArrival and ConsiderFlight both
+        // read off the character's own position to answer "whose node is
+        // this".
+        uint32 const node = sObjectMgr->GetNearestTaxiNode(
+            bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+            bot->GetMapId(), bot->GetTeamId(true));
+        if (node != requestedNode)
+        {
+            // SAID RATHER THAN SILENT (#402). Standing at the right creature
+            // and learning the wrong node would otherwise look identical in
+            // every log to standing at the right creature and learning the
+            // right one.
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' stood at flight master '{}' (creature {}) sent to "
+                     "learn node {} but the nearest node from here reads {} - not "
+                     "learning it, the aim and the ground disagree",
+                     name, npc->GetName(), entry, requestedNode, node);
+            return false;
+        }
+
+        if (bot->m_taxi.IsTaximaskNodeKnown(node))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is at flight master '{}' (creature {}) sent to learn "
+                     "node {} and already knows it - nothing to learn", name, npc->GetName(),
+                     entry, node);
+            return true;
+        }
+
+        // PlayerTaxi.h:42 (SetTaximaskNode), read back rather than trusted -
+        // the same discipline DiscoverFlightPointOnArrival above and
+        // TrainOnArrival's HasSkill both apply, for the identical reason: this
+        // call has no client to report failure to.
+        bot->m_taxi.SetTaximaskNode(node);
+        if (!bot->m_taxi.IsTaximaskNodeKnown(node))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' stood at flight master '{}' (creature {}) but taxi "
+                     "node {} did not register as known afterward", name, npc->GetName(),
+                     entry, node);
+            return false;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' deliberately learned flight point {} at '{}' (creature {}), "
+                 "the node it was sent for", name, node, npc->GetName(), entry);
+        return true;
+    }
+
     // ONE MEMBER OF A PARTY FLIGHT, READ OUT OF THE WORLD (#360).
     //
     // `read` is the only thing the decision sees; everything beside it is what
@@ -11071,15 +11327,24 @@ private:
                 // never fly" into "they never fly BECAUSE nobody has walked to
                 // node N yet" - which is a fixable sentence and the other one
                 // is not.
+                //
+                // AND SINCE #388 IT IS AN ACTIONABLE ONE (infra#68's original
+                // ask, finished): the sentence used to end at the diagnosis.
+                // `FlightMasterNodeAim` builds the exact `travel_npc` value
+                // that would send a character to go learn the missing node, in
+                // the one place that string is built so this line and
+                // ResolveTravelTarget's parser can never drift out of step.
                 if (!state.flightSaid)
                 {
                     state.flightSaid = true;
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is sent to '{}' {} yards away and could fly "
                              "node {} to node {}, but has not discovered node {} on that "
-                             "route - trying the next node out, or walking",
+                             "route - trying the next node out, or walking. '{}' would go "
+                             "learn it",
                              name, state.target, static_cast<uint32>(walkYards),
-                             fromNode, toNode, unknownHop);
+                             fromNode, toNode, unknownHop,
+                             OverseerDecisions::FlightMasterNodeAim(unknownHop));
                 }
                 continue;
             }
@@ -11205,6 +11470,12 @@ private:
                     // that is the whole actionable content of it. "They will
                     // not fly because she has never discovered node 32" is a
                     // sentence somebody can act on; "they never fly" is not.
+                    //
+                    // AND SINCE #388 IT NAMES THE FIX TOO, when the block is a
+                    // specific node rather than a member fact like "cannot
+                    // pay" or "no route": `FlightMasterNodeAim` is the same
+                    // errand the leader's own refusal above would build for
+                    // the identical node.
                     if (!state.flightSaid)
                     {
                         state.flightSaid = true;
@@ -11219,7 +11490,10 @@ private:
                                                         : plan.blockedBy,
                                  OverseerDecisions::PartyFlightBlockWord(plan.block),
                                  plan.blockedNode
-                                     ? " (" + std::to_string(plan.blockedNode) + ")"
+                                     ? " (" + std::to_string(plan.blockedNode) + ", '" +
+                                           OverseerDecisions::FlightMasterNodeAim(
+                                               plan.blockedNode) +
+                                           "' would go learn it)"
                                      : std::string(),
                                  plan.verdict ==
                                          OverseerDecisions::PartyFlightVerdict::WaitForIt
@@ -16567,6 +16841,81 @@ private:
                                  "overseer: '{}' has reached '{}' (creature {}) and is "
                                  "holding position there - the errand is not finished yet",
                                  name, target, entry);
+                    }
+                }
+                // A DELIBERATE FLIGHT ERRAND IS AN INTERACTION, NOT A
+                // DESTINATION, FOR THE IDENTICAL REASON #378 GAVE A COUNTER
+                // (#388). `entry` here is already pinned to the ONE flight
+                // master ResolveTravelTarget matched to the requested node -
+                // see its `flight master:<nodeId>` branch - so this is asking
+                // whether that specific creature will actually teach that
+                // specific node, not whether the character has merely arrived
+                // within the loose radius the opportunistic path was written
+                // for.
+                else if (uint32 requestedNode = 0;
+                         OverseerDecisions::ParseFlightMasterNodeAim(target, requestedNode))
+                {
+                    bool oneIsNearby = false;
+                    float nearestYards = -1.f;
+                    bool const inReach = FlightMasterInReach(bot, oneIsNearby, nearestYards);
+                    OverseerDecisions::FlightDiscoveryArrival const arrival =
+                        OverseerDecisions::FlightDiscoveryArrivalStep(inReach, oneIsNearby);
+
+                    if (arrival == OverseerDecisions::FlightDiscoveryArrival::CloseTheGap)
+                    {
+                        // NOT RELEASED, AND DELIBERATELY NOT `continue` - the
+                        // walk below closes the last few yards, the same
+                        // reasoning the counter's own CloseTheGap branch
+                        // carries.
+                        if (!state.arrived)
+                        {
+                            state.arrived = true;
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' has reached '{}' (creature {}) and the "
+                                     "nearest flight master is {:.1f}y off, outside the "
+                                     "interact gate the discovery will be judged by - not "
+                                     "released, the walk closes the last few yards",
+                                     name, target, entry, nearestYards);
+                        }
+                    }
+                    else if (arrival == OverseerDecisions::FlightDiscoveryArrival::StandAndLearn)
+                    {
+                        // THE HOLD IS TAKEN BEFORE THE LEARN AND THE LEARN
+                        // BEFORE THE RELEASE, mirroring #378/#379's ordering
+                        // exactly: standing still is the promise, so it is
+                        // made before the transaction it is a promise about,
+                        // and the errand is not released until the transaction
+                        // - and its result - are both in hand.
+                        HoldAtTheFlightMaster(bot, name);
+                        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+                        bool const learned =
+                            LearnFlightNodeDeliberately(name, bot, npc, entry, requestedNode);
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' is at the flight master it was sent to "
+                                 "({:.1f}y, and the core's own interact gate accepts it) and "
+                                 "was held there for up to {}s while node {} was {} - errand "
+                                 "done, releasing",
+                                 name, nearestYards,
+                                 uint32(FLIGHT_DISCOVERY_HOLD_CEILING_SECONDS), requestedNode,
+                                 learned ? "learned" : "not learned - see the line above");
+                        _travelAims.Release(name);
+                        continue;
+                    }
+                    else
+                    {
+                        // NOTHING OF THE ROLE ANYWHERE NEAR (#402): the spawn
+                        // this errand was sent to is despawned, dead or
+                        // phased. Releasing hands the problem back to whatever
+                        // wrote the aim, which is the Python bridge and not
+                        // this drive.
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' reached the flight master spot it was sent "
+                                 "to for node {} (creature {}) and nothing of that role is "
+                                 "near enough to learn from - releasing, the aim is what to "
+                                 "look at",
+                                 name, requestedNode, entry);
+                        _travelAims.Release(name);
+                        continue;
                     }
                 }
                 else
