@@ -9203,6 +9203,67 @@ enum class CounterArrival : std::uint8_t
 CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby);
 
 
+// --------------- a deliberate errand: go learn THIS node (#388) -----------
+//
+// #93 already makes discovery a no-op that piggybacks on whatever errand ends
+// beside a flight master. Nothing has ever sent a character to one ON
+// PURPOSE, and the keyword vocabulary this file's `at:`/`trigger:` prefixes
+// already established is the precedent this follows: a plain travel role
+// names a KIND of creature, a prefixed one carries a value the role alone
+// cannot express. `flight master:<nodeId>` is that value - "go learn node
+// 32" rather than "go to the nearest flight master", which is a question
+// with a different answer whenever the nearest one is not the one missing
+// from the route.
+
+// The prefix itself, spelled once so the parser and anything that has to
+// build the same string - the actionable refusal line below - cannot drift
+// out of step with each other.
+constexpr char const* FLIGHT_MASTER_NODE_AIM_PREFIX = "flight master:";
+
+// Pulls `<nodeId>` out of a `flight master:<nodeId>` aim. `false` for
+// anything else, including the bare `flight master` keyword (that one still
+// means "nearest", unchanged) and a malformed or zero node id - a node id of
+// zero names no row in TaxiNodes.dbc, so treating it as "unparsed" rather
+// than "node 0" is one fewer state a caller has to consider.
+bool ParseFlightMasterNodeAim(std::string const& aim, uint32_t& outNodeId);
+
+// The aim string that would go and fetch a given node, kept as one function
+// so the refusal line and the parser above are reading and writing the same
+// format rather than two hand-typed copies of it.
+std::string FlightMasterNodeAim(uint32_t nodeId);
+
+// Does this flight master answer for this node? THE SAME AGREEMENT
+// `ConsiderFlight` ALREADY REQUIRES (`TRAVEL_FLIGHT_NODE_MATCH_YARDS`),
+// pulled out so a deliberate errand and an opportunistic flight cannot come
+// to two different answers about the one fact that matters here: in a
+// contested zone the nearest flight master and a given node's own DBC
+// position can be two different places, and this is the check that catches
+// that before either one is trusted as the other's creature.
+bool FlightMasterAnswersForNode(float fmX, float fmY, float nodeX, float nodeY,
+                                float matchYards);
+
+// The three-way arrival answer for a deliberate flight-master errand,
+// asked of the LIVE creature rather than the recorded spawn point - #378's
+// argument applies here unchanged. `false` (`inReach`) and `false`
+// (`oneIsNearby`) is not a state this errand should ever see next to each
+// other where `oneIsNearby` alone is true, because "nearby" is measured at
+// upstream's own resolve radius; see CounterArrivalStep's identical note.
+enum class FlightDiscoveryArrival : std::uint8_t
+{
+    // Nothing of the role in reach and nothing nearby either. The errand
+    // ends here exactly as any other creature errand with an empty spawn
+    // does - releasing hands the problem back to whatever wrote the aim.
+    Done,
+    // Nearby and out of reach: not yet. Do not release, so upstream's own
+    // aimed wander closes the last few yards the way it already does for a
+    // trainer or a counter.
+    CloseTheGap,
+    // At the counter on the core's own terms. Hold, learn, verify, release.
+    StandAndLearn,
+};
+
+FlightDiscoveryArrival FlightDiscoveryArrivalStep(bool inReach, bool oneIsNearby);
+
 // ------------------- and a hold that is taken once is not a hold (#358) --
 //
 // THE HOLD ABOVE STOPS A CHARACTER BEING SENT SOMEWHERE AND DOES NOT STOP ONE
