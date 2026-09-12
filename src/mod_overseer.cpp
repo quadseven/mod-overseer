@@ -336,6 +336,12 @@ constexpr uint32 TRAIN_POLL_MS = 60000;
 // standing there rather than a minute later.
 constexpr uint32 QUEST_POLL_MS = 20000;
 
+// How often a standing craft errand (job='craft', infra#440) is polled.
+// Same cadence as quests: one indexed SELECT against a column most
+// characters have zeroed, and a character short of reagents should not
+// wait longer than a minute for its own gathering to have caught up.
+constexpr uint32 CRAFT_POLL_MS = 20000;
+
 // How often a character sent to an NPC is pointed at it again (infra#2783).
 // RPG_WANDER_NPC self-expires to IDLE after statusWanderNpcDuration, which is
 // FIVE minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278) - six times
@@ -4905,6 +4911,7 @@ public:
         _partyTimer += diff;
         _trainTimer += diff;
         _questTimer += diff;
+        _craftTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
@@ -4983,6 +4990,19 @@ public:
         {
             _questTimer = 0;
             DriveQuests();
+        }
+        // AFTER DriveQuests, same reasoning DriveTravel's own placement
+        // documents nearby: independent drives that can both run in one
+        // OnUpdate are ordered so neither waits a full poll for the other's
+        // write. Craft and quest never touch the same character on the same
+        // tick in practice (a character is job='quest' XOR job='craft'), so
+        // this ordering is a convention, not a correctness requirement the
+        // way DriveTravel's is - kept anyway so every job-mode drive reads
+        // top to bottom in the order a roster row's `job` would name them.
+        if (_craftTimer >= CRAFT_POLL_MS)
+        {
+            _craftTimer = 0;
+            DriveCraft();
         }
         // BEFORE DriveTravel, so a staging aim this poll writes onto the
         // leader's travel_npc is picked up by DriveTravel the SAME tick
@@ -10773,6 +10793,161 @@ private:
                         : "learned this profession from a trainer it was sent to");
         ClearLearnAim(name);
         return true;
+    }
+
+    // ------------------------------------- job='craft' (infra#440) --------
+
+    // Every character with a standing craft errand, name -> recipe spell id.
+    // Zero (the schema default) means no errand, the same sentinel every
+    // other aim column uses, so the WHERE clause is the whole filter and
+    // absence from this map already means "nothing to craft" - no separate
+    // branch to keep in sync with the column's own DEFAULT.
+    //
+    // READ ON ITS OWN, same discipline as LoadQuestAims and TravelAimBook -
+    // a worldserver whose db-import has not yet shipped `craft_spell` sees
+    // an empty map here and DriveCraft below is a no-op, not a crash.
+    std::map<std::string, uint32> LoadCraftErrands()
+    {
+        std::map<std::string, uint32> errands;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, craft_spell FROM overseer_roster "
+            "WHERE enabled = 1 AND craft_spell <> 0");
+        if (!result)
+            return errands;  // nobody has one, or no such column - same answer
+        do
+        {
+            Field* fields = result->Fetch();
+            errands[fields[0].Get<std::string>()] = fields[1].Get<uint16>();
+        } while (result->NextRow());
+        return errands;
+    }
+
+    void ClearCraftAim(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET craft_spell = 0 WHERE name = '{}'", Esc(name));
+    }
+
+    // Casts ONE standing recipe spell against the bot's own inventory,
+    // repeatedly, for every enabled character whose `job` is 'craft' and
+    // whose `craft_spell` names a recipe. See docs/design/profession-
+    // crafting-drive.md for the full argument; this is the "why nothing was
+    // implemented" doc's own follow-up.
+    //
+    // WHY A DIRECT CastSpell AND NOT A REIMPLEMENTED REAGENT/SKILL-UP CHECK,
+    // the identical reasoning TrainOnArrival above holds for
+    // Trainer::TeachSpell. A tradeskill recipe is SPELL_EFFECT_CREATE_ITEM
+    // with its reagents declared on the SpellInfo itself
+    // (Reagent[]/ReagentCount[], SpellEffects.cpp) - the core's own CheckCast
+    // (Spell.cpp) is what actually decides whether this cast may proceed:
+    // reagents, cooldown, a nearby spell-focus object (RequiresSpellFocus,
+    // a forge/anvil and the like), everything a real player's own "Create"
+    // click would be refused for too. This function trusts that answer and
+    // does not duplicate it - reimplementing CheckCast is exactly the mistake
+    // TrainOnArrival's own comment warns against for TeachSpell, wearing a
+    // different verb.
+    //
+    // SPELL FOCUS IS A REAL REQUIREMENT THIS DRIVE DOES NOT SATISFY. Some
+    // recipes need a nearby gameobject (a forge, an anvil) and this function
+    // does not walk anyone to one - v1's scoping decision, per the design
+    // doc, is that the Python planner must only ever hand this column a
+    // recipe with no such requirement. A recipe that needs one anyway is not
+    // a crash here: CheckCast refuses it (SPELL_FAILED_REQUIRES_SPELL_FOCUS),
+    // this function logs the refusal and leaves the errand standing, and
+    // nothing is crafted out of thin air - the same "fail closed, not open"
+    // shape every other drive in this file holds to.
+    void DriveCraft()
+    {
+        std::map<std::string, std::string> const jobs = LoadJobs();
+        std::map<std::string, uint32> const errands = LoadCraftErrands();
+        if (errands.empty())
+            return;
+
+        for (auto const& entry : errands)
+        {
+            std::string const& name = entry.first;
+            uint32 const spellId = entry.second;
+
+            // job='craft' is a PERMISSION, not a hint - an errand may sit on
+            // the roster row while a character is off doing something else
+            // (job='quest', mid-dungeon, whatever), and this drive must not
+            // touch anyone it was not told to. See LoadJobs above.
+            auto const jobIt = jobs.find(name);
+            if (jobIt == jobs.end() || jobIt->second != "craft")
+                continue;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld())
+                continue;   // same "read on its own" discipline as every other drive
+
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has a craft errand for spell {} and no such "
+                         "spell exists. Dropping it - a bad id here is a planner bug, "
+                         "not a condition waiting to resolve", name, spellId);
+                ClearCraftAim(name);
+                continue;
+            }
+
+            if (!bot->HasSpell(spellId))
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has a craft errand for '{}' ({}) and does not "
+                         "know the recipe. Dropping it - the Python planner may only "
+                         "ever name a spell the character already holds, the same "
+                         "permission discipline professions.py holds for `learn_skill`",
+                         name, info->SpellName[LOCALE_enUS], spellId);
+                ClearCraftAim(name);
+                continue;
+            }
+
+            // A CHEAP PRE-FILTER, NOT A SECOND SOURCE OF TRUTH. Missing a
+            // reagent is the ORDINARY, expected way this errand waits - v1
+            // assumes materials come from the family's own gathering and
+            // buys nothing, so a gatherer running behind is not an error,
+            // it is the whole scoping decision. Skipping quietly here avoids
+            // logging an attempt CheckCast would refuse anyway on every
+            // single poll for however long that takes.
+            bool shortOfReagents = false;
+            for (uint32 x = 0; x < MAX_SPELL_REAGENTS; ++x)
+            {
+                if (info->Reagent[x] <= 0)
+                    continue;
+                if (!bot->HasItemCount(static_cast<uint32>(info->Reagent[x]),
+                                       static_cast<uint32>(info->ReagentCount[x])))
+                {
+                    shortOfReagents = true;
+                    break;
+                }
+            }
+            if (shortOfReagents)
+                continue;
+
+            SpellCastResult const result = bot->CastSpell(bot, spellId, false);
+            if (result == SPELL_CAST_OK)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' crafted '{}' ({})",
+                         name, info->SpellName[LOCALE_enUS], spellId);
+                RecordEvent(bot, "craft", spellId, info->SpellName[LOCALE_enUS],
+                            "crafted an item toward its profession");
+                continue;   // errand stays standing - Python re-asserts or replaces it
+            }
+
+            // NOT CLEARED. Every failure CheckCast can return here is either
+            // transient (cooldown, a focus object not currently in range) or
+            // this drive's own pre-filter already ruled out the one that
+            // is not (reagents) - so leaving the errand standing and trying
+            // again next poll is correct, the same shape TrainOnArrival's
+            // own `return false` holds for a full profession slot.
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' tried to craft '{}' ({}) and the cast was refused "
+                     "(SpellCastResult {}) - leaving the errand standing for the next "
+                     "poll", name, info->SpellName[LOCALE_enUS], spellId,
+                     static_cast<uint32>(result));
+        }
     }
 
     // FLIGHT POINT DISCOVERY ON ARRIVAL (#68). Discovering a flight point is
@@ -29912,10 +30087,10 @@ private:
     // module and a Python process share no schema. tests/test_job_mode.py
     // compares the two keys in both directions.
     //
-    // Only 'quest' does anything beyond writing the column - see the job gate
-    // in DriveQuests above. Every other name here is still a VALID thing to
-    // set: this list is what tells DoJob a name is real, not what tells it
-    // a name is built.
+    // 'quest' and 'craft' are the two modes with a real drive behind them -
+    // see the job gate in DriveQuests above, and DriveCraft (infra#440).
+    // Every other name here is still a VALID thing to set: this list is what
+    // tells DoJob a name is real, not what tells it a name is built.
     static std::vector<std::string> const& JobModes()
     {
         static std::vector<std::string> const modes = {
@@ -39978,6 +40153,7 @@ private:
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
+    uint32 _craftTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //
     // There is no ghost clock for this state - a corpse, and therefore a ghost
