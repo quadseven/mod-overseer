@@ -46,6 +46,7 @@ using OverseerDecisions::AimedMover;
 using OverseerDecisions::AimedMoverFacts;
 using OverseerDecisions::AimedMoverGrants;
 using OverseerDecisions::AimedMoverName;
+using OverseerDecisions::AimedMoverTravels;
 using OverseerDecisions::ReadAimedMover;
 
 namespace
@@ -309,6 +310,80 @@ void OnlyTheTwoGrantsGrant()
     Check("exactly two verdicts grant", grants == 2, true);
 }
 
+// WHAT THE ERRAND BUDGET IS ALLOWED TO CHARGE FOR, which is the question
+// AimedMoverTravels exists to answer and is NOT the question above it.
+//
+// The live failure: a bridge pass aimed all five of the family at 'vendor',
+// four of them followers. Every one of those four reaches RefuseInFormation,
+// is told to have its leader aimed instead and walks nowhere - and the drive
+// charged all four ERRAND_BUDGET_POLL_SECONDS on every poll anyway. A
+// follower's aim is never released either, because the arrival check that
+// releases it sits below the refusal that skips it, so the bucket filled to
+// the line without fail in about nine minutes and refused the family's vendor
+// errand for fifteen. All-time on the dev realm before this: 17,333 `vendor
+// not in range` against 1,689 delivered.
+void ARefusedCharacterIsNotChargedForAWalkItIsNotTaking()
+{
+    Check("a follower in formation travels nowhere",
+          AimedMoverTravels(AimedMover::RefuseInFormation), false);
+    Check("and neither does one cut off from its leader",
+          AimedMoverTravels(AimedMover::RefuseCutOff), false);
+}
+
+// A HOLD IS THIS MODULE MAKING THE CHARACTER WAIT, so this module may not then
+// bill it for waiting. A staging hold is minutes rather than seconds, which is
+// the difference between a rounding error and a refusal.
+void AHeldCharacterIsNotChargedEither()
+{
+    Check("a held character travels nowhere",
+          AimedMoverTravels(AimedMover::HeldOnPurpose), false);
+}
+
+// THE HALF THAT MUST NOT CHANGE. The budget was written for a LEADER running
+// errand after errand - nine of them in a measured half hour, every one
+// arriving cleanly, holding the quest drive down for 66.3% of the wall clock.
+// That character answers GrantToLeader on the poll it is handed the strategy
+// and Walks on every poll after, and both are charged exactly as before.
+void TheCharacterTheBudgetWasWrittenForIsStillCharged()
+{
+    Check("a character already walking is charged",
+          AimedMoverTravels(AimedMover::Walks), true);
+    Check("so is the leader being handed the strategy this poll",
+          AimedMoverTravels(AimedMover::GrantToLeader), true);
+    Check("so is a steerer being handed it",
+          AimedMoverTravels(AimedMover::GrantToSteerer), true);
+}
+
+// TRAVELS IS NOT GRANTS, AND THE ONE VERDICT THAT SEPARATES THEM IS THE WHOLE
+// REASON IT IS A SECOND FUNCTION. `Walks` means the character already carries
+// `new rpg`: nothing to grant, and the clearest case there is of a character
+// that really is spending its time on this errand. Reusing AimedMoverGrants at
+// the charge site would have exempted exactly the character walking furthest.
+void TravellingIsNotTheSameQuestionAsGranting()
+{
+    Check("Walks travels", AimedMoverTravels(AimedMover::Walks), true);
+    Check("Walks does not grant", AimedMoverGrants(AimedMover::Walks), false);
+
+    std::vector<AimedMover> const all = {
+        AimedMover::Walks,          AimedMover::HeldOnPurpose,
+        AimedMover::GrantToLeader,  AimedMover::GrantToSteerer,
+        AimedMover::RefuseInFormation, AimedMover::RefuseCutOff,
+    };
+    int travels = 0;
+    for (AimedMover verdict : all)
+    {
+        if (AimedMoverTravels(verdict))
+            ++travels;
+        // EVERY GRANT TRAVELS, asserted over the whole enum rather than on the
+        // three cases above, so a sixth verdict cannot be a grant here and a
+        // refusal there.
+        if (AimedMoverGrants(verdict))
+            Check("every granting verdict travels",
+                  AimedMoverTravels(verdict), true);
+    }
+    Check("exactly three verdicts travel", travels == 3, true);
+}
+
 }  // namespace
 
 int main()
@@ -329,6 +404,10 @@ int main()
     NothingKnownMovesNobody();
     EveryVerdictHasItsOwnName();
     OnlyTheTwoGrantsGrant();
+    ARefusedCharacterIsNotChargedForAWalkItIsNotTaking();
+    AHeldCharacterIsNotChargedEither();
+    TheCharacterTheBudgetWasWrittenForIsStillCharged();
+    TravellingIsNotTheSameQuestionAsGranting();
 
     if (failures)
     {

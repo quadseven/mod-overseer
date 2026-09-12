@@ -3719,6 +3719,15 @@ bool AimedMoverGrants(AimedMover verdict)
            verdict == AimedMover::GrantToSteerer;
 }
 
+bool AimedMoverTravels(AimedMover verdict)
+{
+    // Written over the GRANTS form rather than as a second list of enumerators,
+    // so that a sixth verdict added above cannot be travelling here while being
+    // a grant there, or the reverse. The only thing this adds to a grant is the
+    // character that needed no grant because it was already walking.
+    return verdict == AimedMover::Walks || AimedMoverGrants(verdict);
+}
+
 char const* CrossingLegName(CrossingLeg leg)
 {
     switch (leg)
