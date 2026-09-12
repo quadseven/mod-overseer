@@ -1334,8 +1334,17 @@ bool DungeonRunEnteredTheInstance(std::string const& outcome)
     // the run under way, and so is an empty outcome, which is what the
     // cold-heartbeat close leaves behind on a row that only exists because
     // somebody was seen in there.
+    //
+    // AND 'evacuated' (#429), which is the one member of this set written about
+    // a party that WAS inside with the run under way. It is here because the
+    // bar was never geography for its own sake: a run that cleared nothing did
+    // not fill a slot, which is the same sentence 'split_failed' joined on. The
+    // bag-pressure exit walks the party out within seconds of the door, with no
+    // encounter credited and nothing looted, and a campaign of twenty-five that
+    // spends its slots on those finishes in twenty minutes having cleared
+    // nothing.
     return outcome != "reset_failed" && outcome != "staging_failed" &&
-           outcome != "split_failed";
+           outcome != "split_failed" && outcome != "evacuated";
 }
 
 unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst)
@@ -1397,7 +1406,7 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
-char const* DungeonRunExitOutcome(bool provedComplete, bool stalled)
+char const* DungeonRunExitOutcome(bool provedComplete, bool stalled, bool evacuated)
 {
     // PROOF OUTRANKS SUSPICION. A run can be both: the clearing watchdog can
     // have spent its skips on the last pull of a dungeon that then finished, and
@@ -1405,7 +1414,53 @@ char const* DungeonRunExitOutcome(bool provedComplete, bool stalled)
     // an inference from not having moved.
     if (provedComplete)
         return "complete";
-    return stalled ? "stalled" : "left";
+    // AND A STALL OUTRANKS AN EVACUATION, which in practice never collide - the
+    // watchdog needs minutes of no progress to fire and the bags are read on
+    // every poll - but if they ever did, "this dungeon could not be cleared" is
+    // the finding worth chasing upstream and "the bags were full" is a thing
+    // the town trip fixes by itself.
+    if (stalled)
+        return "stalled";
+    // AND 'evacuated' IS NOT 'left' (#429). They were the same word until the
+    // campaign counter reached its cap on runs that killed nothing, and a row
+    // an operator cannot tell apart from a finished run is how that went
+    // unnoticed for a whole campaign.
+    return evacuated ? "evacuated" : "left";
+}
+
+DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlots,
+                                         unsigned freeSlotsFloor,
+                                         bool anyMemberInside,
+                                         bool alreadyLeaving)
+{
+    // SAID FIRST, BEFORE ANYTHING IS READ. A run already walking to the door is
+    // not re-decided here whatever the bags say: EXIT is the only thing that
+    // closes the run row and counts it, and taking the coordinator off that
+    // path mid-crossing leaves a row 'active' in a dungeon with nobody walking
+    // anybody out.
+    if (alreadyLeaving)
+        return DungeonBagPressure::None;
+
+    bool cannotLoot = false;
+    for (unsigned free : freeBagSlots)
+    {
+        if (free <= freeSlotsFloor)
+        {
+            cannotLoot = true;
+            break;
+        }
+    }
+
+    // An empty list lands here too, and that is the answer it should get: a
+    // poll that could read nobody has learned nothing about anybody's bags.
+    if (!cannotLoot)
+        return DungeonBagPressure::None;
+
+    // WHERE THE FAMILY IS STANDING IS THE WHOLE OF THE REMAINING DECISION.
+    // Inside, the only way out is the door. Outside, the run simply does not
+    // open - and that is the new half, because the old check could only ever be
+    // reached from inside and so could only ever answer with a walk back out.
+    return anyMemberInside ? DungeonBagPressure::Evacuate : DungeonBagPressure::HoldOut;
 }
 
 CounterRole CounterRoleForAim(std::string const& aim)

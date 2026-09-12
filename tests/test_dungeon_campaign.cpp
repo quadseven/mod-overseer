@@ -42,10 +42,19 @@ void CheckCount(char const* what, unsigned got, unsigned want)
     ++failures;
 }
 
-void OnlyTheTwoPreEntryFailuresAreNotRuns()
+void OnlyTheClosedSetOfOutcomesThatClearedNothingIsNotARun()
 {
     Check("reset_failed", DungeonRunEnteredTheInstance("reset_failed"), false);
     Check("staging_failed", DungeonRunEnteredTheInstance("staging_failed"), false);
+    // The party crossed but the census never reached everybody (#384), so the
+    // run was never handed to the clearing drive.
+    Check("split_failed", DungeonRunEnteredTheInstance("split_failed"), false);
+    // And the party was inside, with the run under way, and walked straight
+    // back out because a member had stopped being able to loot (#429). The bar
+    // was never geography for its own sake: a run that cleared nothing did not
+    // fill a slot. Measured at six seconds inside map 189, twice in a row, each
+    // one spending a slot of a twenty-five run campaign.
+    Check("evacuated", DungeonRunEnteredTheInstance("evacuated"), false);
 }
 
 void EveryOutcomeWrittenAboutAPartyInsideIsARun()
@@ -228,7 +237,7 @@ void AZeroCapStartsNothing()
 
 int main()
 {
-    OnlyTheTwoPreEntryFailuresAreNotRuns();
+    OnlyTheClosedSetOfOutcomesThatClearedNothingIsNotARun();
     EveryOutcomeWrittenAboutAPartyInsideIsARun();
     TheStreakStopsAtTheFirstRunThatHappened();
     ThreeInARowStopsTheCampaign();

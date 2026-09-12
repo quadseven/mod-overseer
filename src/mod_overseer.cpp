@@ -20873,6 +20873,18 @@ private:
         // stall and a completion can both be true of the same run, and
         // OverseerDecisions::DungeonRunExitOutcome owns which word wins.
         bool provedComplete{false};
+        // AND WHETHER THE FAMILY'S BAGS ENDED IT (#429). A third fact about the
+        // same exit, kept separate from the two above for the reason they are
+        // kept separate from each other: OverseerDecisions::DungeonRunExitOutcome
+        // owns which word wins, and the row has to be able to say 'evacuated'
+        // rather than 'left' or the campaign counter spends a slot on a run that
+        // killed nothing and nobody can tell afterwards that it did.
+        bool evacuated{false};
+        // Said once per hold rather than once per poll, the same log-once
+        // discipline as loggedCampaignOver beside it and for the same reason:
+        // full bags are true on every poll until a town trip clears them, and
+        // that is minutes of them.
+        bool loggedBagHold{false};
         // Said once per run rather than once per poll, the same log-once
         // discipline every other flag on this struct follows: a map with no
         // encounter rows answers Unknowable on every poll for the whole run.
@@ -23295,6 +23307,30 @@ private:
         float const stageY = coord.stageY;
         float const stageZ = coord.stageZ;
 
+        // THE BAGS OUTRANK THE COUNT TOO, AND FOR A SHARPER REASON THAN THE
+        // OPERATOR DOES (#429). Re-arming here sets REPAIRING, and a campaign
+        // that re-arms never returns to IDLE - which is the only phase
+        // DriveTownTrip will run in, and the town trip is the only thing that
+        // empties a bag. So "the run goes again" after an evacuation is a loop
+        // with its own cure locked out of it: the next run enters, finds the
+        // same full bags, and is evacuated on the poll after it opens. Measured
+        // as exactly that, twice in a row, six and eight seconds inside.
+        //
+        // IDLE IS THEREFORE THE ENDING, and the hold that keeps it there is at
+        // the top of this drive rather than here, so that every phase reaches
+        // the same verdict rather than only this one path out of a run.
+        if (coord.evacuated)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. It does not go again yet: "
+                     "the family has no bag room, this run spent no slot of campaign {}, "
+                     "and the coordinator returns to IDLE so the town trip that empties "
+                     "those bags is allowed to run at all",
+                     runId, outcome, reason, campaignId);
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
         // THE OPERATOR OUTRANKS THE COUNT. `job` leaving 'dungeon' is a person
         // (or the bridge) saying the family has something else to do, and it is
         // already the path by which a run inside the instance is walked back
@@ -25027,14 +25063,50 @@ private:
     // bridge hint. The bridge can request quest mode, but a dungeon-clear
     // run may have been opened by another module and keep the job column at
     // `dungeon`; in that case the coordinator must still protect loot.
-    static bool AnyInsideMemberNeedsTownRun(std::vector<std::string> const& members)
+    //
+    // WHOSE BAGS ARE READ, AND WHY IT DEPENDS ON WHERE THE PARTY IS (#429).
+    // One free-slot reading per member this poll could actually resolve to a
+    // live character. An absent member contributes NO entry rather than a zero,
+    // which is the rule TownNeed::present already states for the same fact: an
+    // absent member's bags are unknown, and unknown is not full.
+    //
+    // Once somebody is inside, only the members inside are read. They are the
+    // ones the run can still be spoiled for, and a member stranded OUTSIDE is
+    // #384's problem - evacuating a working run over the bags of somebody who
+    // is not in it would be this check inventing a second opinion about a party
+    // it is not part of. Before anybody is committed the whole family is read,
+    // because BARRIER is going to demand every one of them and a member that
+    // cannot loot is a member the run has no use for wherever it is standing.
+    //
+    // GetFreeInventorySpace  Player.h:1269  uint32 GetFreeInventorySpace() const
+    // - the core's own count of the backpack plus every equipped bag.
+    static std::vector<unsigned> RunBagRoom(std::vector<std::string> const& members,
+                                            bool anyMemberInside)
+    {
+        std::vector<unsigned> room;
+        room.reserve(members.size());
+        for (std::string const& name : members)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!member)
+                continue;
+            if (anyMemberInside && !InDungeonRun(member))
+                continue;
+            room.push_back(static_cast<unsigned>(member->GetFreeInventorySpace()));
+        }
+        return room;
+    }
+
+    // Is any roster member standing on an instance map that has a run open on
+    // it? The same question InDungeonRun answers per character, asked of the
+    // roster, because "is the party committed" is what decides whether full
+    // bags mean walk out or simply do not start.
+    static bool AnyMemberInsideRun(std::vector<std::string> const& members)
     {
         for (std::string const& name : members)
         {
             Player* member = ObjectAccessor::FindPlayerByName(name);
-            if (!member || !InDungeonRun(member))
-                continue;
-            if (member->GetFreeInventorySpace() <= 2)
+            if (member && InDungeonRun(member))
                 return true;
         }
         return false;
@@ -25119,19 +25191,82 @@ private:
         // happens after the roster census and before job/campaign decisions,
         // so it also catches runs created by mod-dungeon-clear and runs whose
         // leader never received the bridge's stand-down row.
-        if (coord.phase != DungeonRunPhase::Exiting &&
-            AnyInsideMemberNeedsTownRun(members))
+        //
+        // AND IT NO LONGER HAS ONLY ONE ANSWER (#429). Asked only of members
+        // already inside, this could not become true until after the party had
+        // crossed - and crossing a doorway does not change anybody's bags, so a
+        // family that could not loot entered and was evacuated on the next poll,
+        // every run, for ever, spending a campaign slot each time. Measured:
+        // six seconds on map 189 with nothing credited, twice in a row. The
+        // floor is the town trip's own freeBagSlotsToGo rather than a second
+        // number of this drive's own, because the condition that stops a run
+        // opening has to be the same condition that sends the family to the
+        // vendor that clears it - otherwise the coordinator waits for a trip
+        // the town drive does not think is owed.
         {
-            coord.phase = DungeonRunPhase::Exiting;
-            coord.crossing.best = 0.f;
-            coord.crossing.since = std::time(nullptr);
-            coord.loggedCrossingAim = false;
-            coord.loggedCrossingWaiting = false;
-            _travelAims.Release(leaderName);
-            LOG_WARN("module.overseer",
-                     "overseer: an active dungeon run is being evacuated because "
-                     "an inside family member has two or fewer free inventory slots");
-            return;
+            bool const anyInside = AnyMemberInsideRun(members);
+            switch (OverseerDecisions::DungeonRunBagPressure(
+                RunBagRoom(members, anyInside), TOWN_TRIP_LIMITS.freeBagSlotsToGo,
+                anyInside, coord.phase == DungeonRunPhase::Exiting))
+            {
+                case OverseerDecisions::DungeonBagPressure::None:
+                    // The latch is cleared the moment there is room again, so a
+                    // later episode says so too rather than holding silently -
+                    // the same discipline loggedCampaignOver follows.
+                    coord.loggedBagHold = false;
+                    break;
+
+                case OverseerDecisions::DungeonBagPressure::Evacuate:
+                    coord.evacuated = true;
+                    coord.phase = DungeonRunPhase::Exiting;
+                    coord.crossing.best = 0.f;
+                    coord.crossing.since = std::time(nullptr);
+                    coord.loggedCrossingAim = false;
+                    coord.loggedCrossingWaiting = false;
+                    _travelAims.Release(leaderName);
+                    LOG_WARN("module.overseer",
+                             "overseer: an active dungeon run is being evacuated because a "
+                             "family member inside has {} or fewer free inventory slots. The "
+                             "row will read 'evacuated' rather than 'left', and the run does "
+                             "NOT spend a slot of the campaign, because it cleared nothing",
+                             TOWN_TRIP_LIMITS.freeBagSlotsToGo);
+                    return;
+
+                case OverseerDecisions::DungeonBagPressure::HoldOut:
+                    // BACK TO IDLE, WHICH IS THE FIX AND NOT A TIDY-UP.
+                    // DriveTownTrip - the only thing in this module that empties
+                    // a bag - stands itself down on its first statement whenever
+                    // this coordinator's phase is anything but Idle, and a
+                    // campaign re-arms out of EndRunAndDecide straight into
+                    // REPAIRING without ever passing back through Idle. So
+                    // holding in any other phase would be holding for ever
+                    // against a cure that is not allowed to run.
+                    if (coord.phase != DungeonRunPhase::Idle)
+                    {
+                        _travelAims.Release(leaderName);
+                        coord = DungeonRunCoordinatorState();
+                    }
+                    // SAID ONLY WHEN THERE IS A RUN BEING HELD BACK. A family
+                    // that is questing with full bags is not waiting for
+                    // anything this drive owns, and a line about dungeon runs
+                    // on every one of those polls is noise an operator would
+                    // learn to scroll past. The latch is left unset in that
+                    // case on purpose, so the hold is announced once when the
+                    // operator does ask for a run.
+                    if (IsDungeonJob(leaderJob) && !coord.loggedBagHold)
+                    {
+                        coord.loggedBagHold = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: no dungeon run opens for '{}' while a family "
+                                 "member has {} or fewer free inventory slots - a party that "
+                                 "cannot pick anything up would walk in, be evacuated on the "
+                                 "next poll and spend a campaign slot having cleared nothing. "
+                                 "The coordinator holds at IDLE, which is the one state the "
+                                 "town trip that empties those bags is allowed to run in",
+                                 leaderName, TOWN_TRIP_LIMITS.freeBagSlotsToGo);
+                    }
+                    return;
+            }
         }
 
         if (coord.phase == DungeonRunPhase::Idle)
@@ -26603,10 +26738,20 @@ private:
                                        " credits was credited, and the party walked back "
                                        "out through areatrigger " +
                                        std::to_string(triggerId))
-                                    : coord.stalledReason.empty()
-                                          ? ("the party walked back out through "
-                                             "areatrigger " + std::to_string(triggerId))
-                                          : coord.stalledReason;
+                                : !coord.stalledReason.empty()
+                                    ? coord.stalledReason
+                                // AND THE BAG EXIT SAYS SO IN WORDS (#429).
+                                // 'left' with this sentence beside it was the
+                                // row an evacuated run wrote, and an operator
+                                // reading a campaign of them could not tell
+                                // them from runs that had simply finished.
+                                : coord.evacuated
+                                    ? ("a family member had no room left to loot, so the "
+                                       "party was walked back out through areatrigger " +
+                                       std::to_string(triggerId) +
+                                       " before the run cleared anything")
+                                    : ("the party walked back out through "
+                                       "areatrigger " + std::to_string(triggerId));
                             // AND THE ROW SAYS WHAT ACTUALLY HAPPENED (#171).
                             // 'stalled' was named and deliberately NOT written
                             // by the accounting migration, because this module
@@ -26619,7 +26764,8 @@ private:
                                                 : ActiveRunIdOnMap(portal->insideMapId),
                                             OverseerDecisions::DungeonRunExitOutcome(
                                                 coord.provedComplete,
-                                                !coord.stalledReason.empty()),
+                                                !coord.stalledReason.empty(),
+                                                coord.evacuated),
                                             reason, IsDungeonJob(leaderJob));
                         }
                         return;
