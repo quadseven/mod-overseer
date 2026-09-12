@@ -25080,36 +25080,53 @@ private:
     //
     // GetFreeInventorySpace  Player.h:1269  uint32 GetFreeInventorySpace() const
     // - the core's own count of the backpack plus every equipped bag.
-    static std::vector<unsigned> RunBagRoom(std::vector<std::string> const& members,
-                                            bool anyMemberInside)
+    struct RunBagReading
     {
-        std::vector<unsigned> room;
-        room.reserve(members.size());
+        // One free-slot count per member whose bags this poll could read, over
+        // whichever population the answer below selects.
+        std::vector<unsigned> freeSlots;
+        // Is the party committed? This is what selects that population, and it
+        // is also what DungeonRunBagPressure needs, so the two can never
+        // disagree about it.
+        bool anyMemberInside{false};
+    };
+
+    // ONE PASS, BECAUSE "WHO IS INSIDE" MUST BE ONE ANSWER. Resolving the
+    // roster twice - once to find out whether anybody is inside and again to
+    // collect the bags - would be two copies of a fact that must agree, which
+    // is the shape this file has paid for repeatedly, and it would ask
+    // InDungeonRun twice per member when that helper queries the run table.
+    static RunBagReading ReadRunBags(std::vector<std::string> const& members)
+    {
+        struct Seen
+        {
+            unsigned freeSlots;
+            bool inside;
+        };
+
+        std::vector<Seen> seen;
+        seen.reserve(members.size());
+
+        RunBagReading reading;
         for (std::string const& name : members)
         {
             Player* member = ObjectAccessor::FindPlayerByName(name);
             if (!member)
                 continue;
-            if (anyMemberInside && !InDungeonRun(member))
-                continue;
-            room.push_back(static_cast<unsigned>(member->GetFreeInventorySpace()));
+            bool const inside = InDungeonRun(member);
+            if (inside)
+                reading.anyMemberInside = true;
+            seen.push_back({static_cast<unsigned>(member->GetFreeInventorySpace()), inside});
         }
-        return room;
-    }
 
-    // Is any roster member standing on an instance map that has a run open on
-    // it? The same question InDungeonRun answers per character, asked of the
-    // roster, because "is the party committed" is what decides whether full
-    // bags mean walk out or simply do not start.
-    static bool AnyMemberInsideRun(std::vector<std::string> const& members)
-    {
-        for (std::string const& name : members)
-        {
-            Player* member = ObjectAccessor::FindPlayerByName(name);
-            if (member && InDungeonRun(member))
-                return true;
-        }
-        return false;
+        // The selection is made after the whole roster has been seen, because
+        // "is anybody inside" is a fact about the party and not about the
+        // member currently being read.
+        reading.freeSlots.reserve(seen.size());
+        for (Seen const& member : seen)
+            if (!reading.anyMemberInside || member.inside)
+                reading.freeSlots.push_back(member.freeSlots);
+        return reading;
     }
 
     void DriveDungeonRun()
@@ -25204,10 +25221,10 @@ private:
         // vendor that clears it - otherwise the coordinator waits for a trip
         // the town drive does not think is owed.
         {
-            bool const anyInside = AnyMemberInsideRun(members);
+            RunBagReading const bags = ReadRunBags(members);
             switch (OverseerDecisions::DungeonRunBagPressure(
-                RunBagRoom(members, anyInside), TOWN_TRIP_LIMITS.freeBagSlotsToGo,
-                anyInside, coord.phase == DungeonRunPhase::Exiting))
+                bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
+                bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting))
             {
                 case OverseerDecisions::DungeonBagPressure::None:
                     // The latch is cleared the moment there is room again, so a
