@@ -1,0 +1,41 @@
+-- The Fishing learn-flag (infra#2757's sibling, job='fish'). DriveFish is the
+-- C++ verb that runs a standing fishing errand; TrainFishingOnArrival is the
+-- one that teaches the skill in the first place. This is the single column
+-- between them and Python.
+--
+-- WHY FISHING NEEDS ITS OWN COLUMN AND NOT `learn_skill`. `learn_skill` and
+-- its trainer path (TrainOnArrival, 2026_08_26_00_overseer_roster_professions.sql)
+-- are built entirely around ProfessionPlan: a primary-profession slot capped
+-- at two, a declared end state in `professions`, and a give-up path priced by
+-- `unlearn_max`. Fishing is a SECONDARY skill - unlimited, no slot, nothing to
+-- give up, and mod-overseer's own SkillStartedBySpell already excludes it from
+-- that machinery on purpose (it calls IsPrimaryProfessionSkill and says so in
+-- its own comment: "it is what keeps cooking, fishing and first aid out of
+-- this"). Reusing `learn_skill` for Fishing would mean either lying about a
+-- slot cost Fishing does not have, or bending ProfessionPlan until it no
+-- longer means what its own name says. One boolean, one meaning.
+--
+-- WHY A BOOLEAN AND NOT A SKILL ID, unlike `learn_skill`/`craft_spell`. There
+-- is exactly one skill this column can ever mean - Fishing is not a choice a
+-- planner makes per character the way a recipe or a primary trade is - so a
+-- SMALLINT that could only ever hold one value would be a skill id in name
+-- only. See TrainFishingOnArrival in mod_overseer.cpp for what actually
+-- happens when this is set to 1.
+--
+-- WHY THIS DOES NOT NEED ITS OWN TRAVEL AIM. TrainFishingOnArrival is
+-- opportunistic, the same shape DiscoverFlightPointOnArrival already is: it
+-- runs on every creature arrival, for whatever reason that arrival happened,
+-- and is a no-op unless the creature actually turns out to be a trainer that
+-- teaches Fishing. So setting this to 1 does not by itself send anyone
+-- anywhere - it means "the next time this character ends up next to a
+-- trainer who can teach Fishing (a `travel_npc`='trainer' or
+-- ='profession trainer' errand, most naturally), take it." Python is still
+-- the one deciding WHEN to send a character to a trainer at all.
+--
+-- ZERO/FALSE MEANS NOTHING TO DO, and the module clears it back to 0 once the
+-- skill is confirmed learned (read back via HasSkill, never assumed from
+-- TeachSpell's own void return - see the design doc for why that read-back is
+-- not optional).
+ALTER TABLE `overseer_roster`
+    ADD COLUMN `learn_fishing` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0
+        COMMENT 'Learn Fishing from the next trainer this character reaches that offers it; 0 = nothing to learn, cleared once HasSkill(SKILL_FISHING) reads back true';

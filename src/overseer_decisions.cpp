@@ -1766,6 +1766,36 @@ ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
     return step;
 }
 
+FishDriveStep NextFishDriveStep(bool wantsFishing, bool strategyIsOn, bool knowsFishing)
+{
+    // RULE 1: A CHARACTER THAT SHOULD NOT BE FISHING NEVER GETS TurnOn,
+    // WHATEVER IT KNOWS. `job` outranks the skill: knowing Fishing is a
+    // precondition for fishing, not a reason to fish.
+    if (!wantsFishing)
+        return strategyIsOn ? FishDriveStep::TurnOff : FishDriveStep::Nothing;
+
+    // RULE 2: IDEMPOTENCE. Already running is already right - this is the
+    // steady state a character sits in for the rest of a standing errand,
+    // and it must be reached by "do nothing", not by re-sending a command
+    // mod-playerbots would have to notice is a no-op.
+    if (strategyIsOn)
+        return FishDriveStep::Nothing;
+
+    // RULE 3: NO SKILL, NO STRATEGY. CanFishValue::Calculate in
+    // mod-playerbots refuses outright when GetSkillValue(SKILL_FISHING) is
+    // 0 (FishValues.cpp), so turning the strategy on for a character that
+    // does not know Fishing yet would not make it fish - it would make
+    // "move near water"/"go fishing" poll `isUseful()` false forever,
+    // uselessly, every tick, for no visible effect. The right answer is to
+    // wait for TrainFishingOnArrival to teach it first, the same "wait,
+    // don't force" shape TrainOnArrival's own slot-full branch already
+    // holds to.
+    if (!knowsFishing)
+        return FishDriveStep::Nothing;
+
+    return FishDriveStep::TurnOn;
+}
+
 bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
                  time_t backoffSeconds, time_t forgetSeconds, std::string& reason)
 {

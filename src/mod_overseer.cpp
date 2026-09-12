@@ -342,6 +342,13 @@ constexpr uint32 QUEST_POLL_MS = 20000;
 // wait longer than a minute for its own gathering to have caught up.
 constexpr uint32 CRAFT_POLL_MS = 20000;
 
+// How often a standing fishing errand (job='fish') is polled. DriveFish is
+// even cheaper than DriveCraft's own poll - one LoadJobs query and a
+// HasStrategy/GetSkillValue check per character, no reagent walk - but the
+// same cadence keeps every job-mode drive legible as "checked roughly once
+// every twenty seconds" rather than each on its own unexplained number.
+constexpr uint32 FISH_POLL_MS = 20000;
+
 // How often a character sent to an NPC is pointed at it again (infra#2783).
 // RPG_WANDER_NPC self-expires to IDLE after statusWanderNpcDuration, which is
 // FIVE minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278) - six times
@@ -4912,6 +4919,7 @@ public:
         _trainTimer += diff;
         _questTimer += diff;
         _craftTimer += diff;
+        _fishTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
@@ -5003,6 +5011,15 @@ public:
         {
             _craftTimer = 0;
             DriveCraft();
+        }
+        // Same ordering convention as DriveCraft just above, and the same
+        // reason it is safe: a character is job='quest' XOR job='craft' XOR
+        // job='fish', never two at once, so this is legibility, not a
+        // correctness requirement.
+        if (_fishTimer >= FISH_POLL_MS)
+        {
+            _fishTimer = 0;
+            DriveFish();
         }
         // BEFORE DriveTravel, so a staging aim this poll writes onto the
         // leader's travel_npc is picked up by DriveTravel the SAME tick
@@ -10948,6 +10965,260 @@ private:
                      "poll", name, info->SpellName[LOCALE_enUS], spellId,
                      static_cast<uint32>(result));
         }
+    }
+
+    // ------------------------------------- job='fish' (sibling of infra#2757, infra#440's neighbour) --
+    //
+    // WHAT UPSTREAM ALREADY DOES (checked first, on purpose, same discipline
+    // as DriveCraft's own design pass). mod-playerbots' FishingAction.cpp is
+    // a COMPLETE fishing AI: EquipFishingPoleAction finds and equips a pole,
+    // MoveNearWaterAction searches a radius for fishable water (or a
+    // GAMEOBJECT_TYPE_FISHINGHOLE) and walks there, FishingAction casts the
+    // Fishing skill-spell (FISHING_SPELL, 7620), UseBobberAction lands the
+    // catch once the bobber (FISHING_BOBBER, 35591) is GO_READY, and
+    // EndMasterFishingAction stops the loop when there is no more fishable
+    // water in reach. All of it is gated behind ONE strategy,
+    // MasterFishingStrategy ("master fishing" - NonCombatStrategy.cpp), which
+    // upstream only ever turns on itself in one place: SeeSpellAction.cpp,
+    // when a bot SEES its own REAL, LOGGED-IN master cast Fishing nearby.
+    // That describes nobody on this roster - five server-side characters with
+    // an attended client only occasionally - so the strategy never turns
+    // itself on for them, even though every action underneath it already
+    // works. DriveFish is NOT a fishing implementation. It is the thing that
+    // was missing: turning that strategy on and off by job, the same "thin
+    // driver over the bot's own AI" shape DriveQuests already is for
+    // upstream's quest AI.
+    //
+    // THE ONE THING THE BOT'S OWN AI CANNOT DO FOR ITSELF is get the Fishing
+    // SKILL in the first place. CanFishValue::Calculate (FishValues.cpp)
+    // refuses outright when GetSkillValue(SKILL_FISHING) is 0, and the
+    // upstream code that would otherwise grant it -
+    // PlayerbotFactory::InitTradeSkills - opens with
+    // `if (!sRandomPlayerbotMgr.IsRandomBot(bot)) return;`. Every character on
+    // this roster runs on a named account and is therefore never a random
+    // bot, which is the SAME gate that has already been the answer for
+    // professions, talents, bag grants, trainer spells, the dungeon finder
+    // and the dead-bot rescue (see AGENTS.md). So this family starts with NO
+    // Fishing skill at all and needs a real trainer, same as every other
+    // skill in this file - see TrainFishingOnArrival below.
+    //
+    // WHY THIS IS A STRATEGY TOGGLE AND NOT ANOTHER STANDING-ERRAND COLUMN
+    // LIKE `craft_spell`. Crafting needs to name WHICH recipe; fishing does
+    // not - there is exactly one Fishing skill-spell and mod-playerbots'
+    // own AI already finds the water, so the only decision left is ON or
+    // OFF, and `job` already carries that. See docs/design/fishing-drive.md
+    // for the fuller argument, including what this defers (rank-up gates
+    // past Apprentice).
+    void DriveFish()
+    {
+        std::map<std::string, std::string> const jobs = LoadJobs();
+
+        for (auto const& entry : jobs)
+        {
+            std::string const& name = entry.first;
+            bool const wantsFishing = entry.second == "fish";
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld())
+                continue;   // same "read on its own" discipline as every other drive
+
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            if (!botAI)
+                continue;   // no bot AI, nothing this drive can toggle
+
+            bool const strategyIsOn = botAI->HasStrategy("master fishing", BOT_STATE_NON_COMBAT);
+            bool const knowsFishing = bot->GetSkillValue(SKILL_FISHING) != 0;
+
+            OverseerDecisions::FishDriveStep const step =
+                OverseerDecisions::NextFishDriveStep(wantsFishing, strategyIsOn, knowsFishing);
+
+            switch (step)
+            {
+                case OverseerDecisions::FishDriveStep::Nothing:
+                    // THE COMMON ANSWER, ON PURPOSE. Covers both steady
+                    // states (already fishing and should be; not fishing and
+                    // should not be) and the wait for TrainFishingOnArrival -
+                    // said once via _fishSkillMissingSaid below rather than
+                    // every poll.
+                    if (wantsFishing && !strategyIsOn && !knowsFishing)
+                    {
+                        if (_fishSkillMissingSaid.insert(name).second)
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' has job='fish' but does not know "
+                                     "Fishing yet. Set learn_fishing=1 and send it to a "
+                                     "trainer that teaches Fishing - DriveFish will start "
+                                     "the standing errand itself once the skill is there",
+                                     name);
+                    }
+                    else
+                        _fishSkillMissingSaid.erase(name);
+                    continue;
+
+                case OverseerDecisions::FishDriveStep::TurnOn:
+                    _fishSkillMissingSaid.erase(name);
+                    botAI->ChangeStrategy("+master fishing", BOT_STATE_NON_COMBAT);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' started fishing (job='fish', Fishing "
+                             "skill {}/{})",
+                             name, static_cast<uint32>(bot->GetSkillValue(SKILL_FISHING)),
+                             static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING)));
+                    RecordEvent(bot, "fish", SKILL_FISHING, "Fishing",
+                                "started a standing fishing errand");
+                    continue;
+
+                case OverseerDecisions::FishDriveStep::TurnOff:
+                    botAI->ChangeStrategy("-master fishing", BOT_STATE_NON_COMBAT);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' stopped fishing - job moved away from 'fish'",
+                             name);
+                    continue;
+            }
+        }
+    }
+
+    // Whether `spellId` teaches `wantedSkill`, either directly or through the
+    // SPELL_EFFECT_LEARN_SPELL wrapper shape a trainer_spell row commonly
+    // takes (Trainer::GetSpellState walks the identical second shape for the
+    // identical reason, Trainer.cpp). Returns `spellId` itself - the id
+    // TeachSpell wants - or 0.
+    //
+    // NOT SkillStartedBySpell. That helper exists to find PRIMARY profession
+    // trainers and calls IsPrimaryProfessionSkill on purpose - its own
+    // comment says plainly that this is "what keeps cooking, fishing and
+    // first aid out of this". Fishing needs the opposite filter: this module
+    // wants exactly the skills IsPrimaryProfessionSkill excludes, so this is
+    // a sibling, not a reuse.
+    static uint32 SpellTeachesSkill(uint32 spellId, uint32 wantedSkill)
+    {
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info)
+            return 0;
+
+        auto namesWantedSkill = [wantedSkill](uint32 candidate) -> bool
+        {
+            if (!candidate)
+                return false;
+            SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(candidate);
+            return node && node->skill == wantedSkill;
+        };
+
+        if (namesWantedSkill(spellId))
+            return spellId;
+
+        for (SpellEffectInfo const& effect : info->GetEffects())
+        {
+            if (!effect.IsEffect(SPELL_EFFECT_LEARN_SPELL))
+                continue;
+            if (namesWantedSkill(effect.TriggerSpell))
+                return spellId;
+        }
+        return 0;
+    }
+
+    // The spell THIS trainer would sell THIS bot to start Fishing, or 0 -
+    // the Fishing-only sibling of TrainerSpellForSkill above, for the reason
+    // SpellTeachesSkill's own comment gives.
+    static uint32 TrainerSpellForFishing(Trainer::Trainer* trainer, Player* bot)
+    {
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+        {
+            if (!SpellTeachesSkill(spell.SpellId, SKILL_FISHING))
+                continue;
+            if (!trainer->CanTeachSpell(bot, &spell))
+                continue;
+            return spell.SpellId;
+        }
+        return 0;
+    }
+
+    bool LoadLearnFishingFlag(std::string const& name)
+    {
+        // READ ON ITS OWN, same discipline as LoadCraftErrands: a worldserver
+        // whose db-import has not yet shipped `learn_fishing` sees no rows
+        // here and TrainFishingOnArrival below is a no-op, not a crash.
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT 1 FROM overseer_roster WHERE name = '{}' AND learn_fishing = 1",
+            Esc(name));
+        return result != nullptr;
+    }
+
+    void ClearLearnFishingFlag(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET learn_fishing = 0 WHERE name = '{}'", Esc(name));
+    }
+
+    // Teach Fishing to `bot` if it is standing at a trainer (creature `entry`)
+    // that offers it and `learn_fishing` asked for it. OPPORTUNISTIC, THE
+    // SAME SHAPE AS DiscoverFlightPointOnArrival, AND FOR THE SAME REASON:
+    // this needs no travel-aim plumbing of its own. A character sent
+    // anywhere for any reason that happens to arrive at a creature able to
+    // teach Fishing gets checked, and a creature that cannot (or a bot that
+    // already knows it) makes this a no-op. That sidesteps ProfessionPlan's
+    // aim/plan-matching machinery entirely - there is no NAMED target to
+    // match here the way TrainOnArrival's `learn_skill` has one, only "did
+    // this character just end up next to someone who could teach this."
+    //
+    // WHY Trainer::TeachSpell AND NOT A HAND-ROLLED GRANT, the identical
+    // reasoning TrainOnArrival's own comment gives for the identical
+    // question: this is the same core call a real player's trainer-window
+    // purchase makes, so money, level, race/class and "already known" are
+    // all enforced by the code that already enforces them for everyone else,
+    // not re-derived here.
+    void TrainFishingOnArrival(std::string const& name, Player* bot, uint32 entry)
+    {
+        if (!entry)
+            return;   // an `at:`/`trigger:` aim names no creature to check
+
+        if (bot->HasSkill(SKILL_FISHING))
+            return;   // nothing to teach - the ordinary, silent case on every visit after the first
+
+        if (!LoadLearnFishingFlag(name))
+            return;   // nobody asked this character to learn Fishing
+
+        // Same radius TrainOnArrival and DiscoverFlightPointOnArrival both
+        // measure "arrived" against - a spawn point turned back into the
+        // live creature standing near it.
+        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+        if (!npc || !npc->IsAlive())
+            return;
+
+        Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
+        if (!trainer || !trainer->IsTrainerValidForPlayer(bot))
+            return;   // not a trainer this character may use - opportunistic no-op, not an error
+
+        uint32 const spellId = TrainerSpellForFishing(trainer, bot);
+        if (!spellId)
+            return;   // this trainer does not teach Fishing - no-op, not an error
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is buying Fishing from '{}' (creature {}, spell {})",
+                 name, npc->GetName(), entry, spellId);
+
+        trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
+
+        // THE READ-BACK. TeachSpell returns void and reports failure only to
+        // a CLIENT (Trainer.cpp) - a packet no bot has anybody to show it to.
+        // "delivered is not worked": the only way to know Fishing was learned
+        // is to ask the character.
+        if (!bot->HasSkill(SKILL_FISHING))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was not taught Fishing by '{}'. TeachSpell reports "
+                     "its reason only to a client, so the likely one is money - it holds "
+                     "{} copper. Leaving learn_fishing standing for the next poll",
+                     name, npc->GetName(), bot->GetMoney());
+            return;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' LEARNED Fishing at {}/{} from '{}' - taught by a trainer "
+                 "it happened to reach, not granted out of thin air",
+                 name, static_cast<uint32>(bot->GetPureSkillValue(SKILL_FISHING)),
+                 static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING)), npc->GetName());
+        RecordEvent(bot, "learn", SKILL_FISHING, "Fishing",
+                    "learned Fishing from a trainer it happened to reach");
+        ClearLearnFishingFlag(name);
     }
 
     // FLIGHT POINT DISCOVERY ON ARRIVAL (#68). Discovering a flight point is
@@ -17295,6 +17566,13 @@ private:
                         // anything that is not a flight master. See
                         // DiscoverFlightPointOnArrival.
                         DiscoverFlightPointOnArrival(name, bot, entry);
+
+                        // Same opportunistic shape, same reason: this errand
+                        // may have had nothing to do with Fishing, and this
+                        // is a no-op unless `entry` also happens to be a
+                        // trainer that teaches it and `learn_fishing` asked
+                        // for it. See TrainFishingOnArrival.
+                        TrainFishingOnArrival(name, bot, entry);
 
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' reached '{}' (creature {}) - errand done, "
@@ -30087,14 +30365,15 @@ private:
     // module and a Python process share no schema. tests/test_job_mode.py
     // compares the two keys in both directions.
     //
-    // 'quest' and 'craft' are the two modes with a real drive behind them -
-    // see the job gate in DriveQuests above, and DriveCraft (infra#440).
-    // Every other name here is still a VALID thing to set: this list is what
-    // tells DoJob a name is real, not what tells it a name is built.
+    // 'quest', 'craft' and 'fish' are the modes with a real drive behind
+    // them - see the job gate in DriveQuests above, DriveCraft (infra#440),
+    // and DriveFish (the fishing drive, sibling of infra#2757). Every other
+    // name here is still a VALID thing to set: this list is what tells DoJob
+    // a name is real, not what tells it a name is built.
     static std::vector<std::string> const& JobModes()
     {
         static std::vector<std::string> const modes = {
-            "quest", "farm", "dungeon", "grind", "gear hunt", "craft",
+            "quest", "farm", "dungeon", "grind", "gear hunt", "craft", "fish",
             "town run", "train", "rest", "bank", "reputation", "guild business",
         };
         return modes;
@@ -40267,6 +40546,7 @@ private:
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
     uint32 _craftTimer = 0;
+    uint32 _fishTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //
     // There is no ghost clock for this state - a corpse, and therefore a ghost
@@ -40405,6 +40685,15 @@ private:
     // a piece of state anything decides on. Lost on restart, which costs one
     // repeated line, exactly like _unlearnRefused above.
     std::set<std::string> _assignmentTooBig;
+    // The characters DriveFish has already said "job='fish' but does not
+    // know Fishing yet" about, so that ordinary, expected wait (on
+    // `learn_fishing`/TrainFishingOnArrival, see docs/design/fishing-drive.md)
+    // is said once instead of once a poll forever - the identical discipline
+    // _unlearnRefused above keeps for the identical reason. Erased the moment
+    // the skill shows up, so a character that learns Fishing and is later
+    // reassigned away and back gets the line again rather than silence.
+    // Lost on restart, which costs one repeated line and nothing else.
+    std::set<std::string> _fishSkillMissingSaid;
     // What DriveQuests knew about each traveller's aim last time round, so a
     // standing complaint is logged once instead of three times a minute, an
     // aim that never lands can be given up on, and a turn-in of the WRONG
