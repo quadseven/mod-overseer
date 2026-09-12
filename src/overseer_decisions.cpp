@@ -8883,6 +8883,71 @@ GuildRequest ParseGuildRequest(std::string const& command)
         return request;
     }
 
+    if (verb == "tabard")
+    {
+        // Five numbers, space separated, in `guild` table order. Parsed here
+        // rather than in the adapter for the same reason every other verb is:
+        // this file compiles with no core in the include path, so the whole of
+        // what can be judged without a world gets judged where a test can
+        // reach it.
+        unsigned values[TABARD_FIELDS] = {};
+        unsigned found = 0;
+        std::size_t i = 0;
+        while (i < rest.size())
+        {
+            while (i < rest.size() && rest[i] == ' ')
+                ++i;
+            if (i >= rest.size())
+                break;
+            if (found == TABARD_FIELDS)
+            {
+                request.error = GuildRefusal::TabardNeedsFive;
+                return request;
+            }
+            unsigned value = 0;
+            while (i < rest.size() && rest[i] != ' ')
+            {
+                if (rest[i] < '0' || rest[i] > '9')
+                {
+                    request.error = GuildRefusal::TabardNotANumber;
+                    return request;
+                }
+                // Checked BEFORE the digit lands, so a long run of digits is
+                // refused rather than wrapped - the same rule the shortlist
+                // count above learned, and it matters more here because the
+                // truncation that follows is to one byte and is silent.
+                if (value > TABARD_VALUE_MAX)
+                {
+                    request.error = GuildRefusal::TabardValueTooBig;
+                    return request;
+                }
+                value = value * 10 + static_cast<unsigned>(rest[i] - '0');
+                ++i;
+            }
+            // No emptiness guard here, and it is not an oversight: the space
+            // skip above stopped on a non-space, and a non-digit has already
+            // returned TabardNotANumber, so the inner loop has consumed at
+            // least one digit by the time it ends. A `break` on !any would be
+            // unreachable, which is worse than absent - it reads as a case
+            // somebody considered.
+            if (value > TABARD_VALUE_MAX)
+            {
+                request.error = GuildRefusal::TabardValueTooBig;
+                return request;
+            }
+            values[found++] = value;
+        }
+        if (found != TABARD_FIELDS)
+        {
+            request.error = GuildRefusal::TabardNeedsFive;
+            return request;
+        }
+        request.verb = GuildVerb::Tabard;
+        for (unsigned n = 0; n < TABARD_FIELDS; ++n)
+            request.emblem[n] = values[n];
+        return request;
+    }
+
     request.error = GuildRefusal::NoVerb;
     return request;
 }
