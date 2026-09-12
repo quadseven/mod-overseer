@@ -7453,6 +7453,70 @@ CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNear
     return CounterArrival::Done;
 }
 
+// --------------- a deliberate errand: go learn THIS node (#388) -----------
+
+bool ParseFlightMasterNodeAim(std::string const& aim, uint32_t& outNodeId)
+{
+    std::string const prefix = FLIGHT_MASTER_NODE_AIM_PREFIX;
+    if (aim.size() <= prefix.size() || aim.compare(0, prefix.size(), prefix) != 0)
+        return false;
+
+    // A decimal field that fits a uint32 and nothing else - no leading '+',
+    // no sign, no trailing garbage. Every node id in TaxiNodes.dbc is small
+    // (the DBC this issue was opened about tops out in the low hundreds), but
+    // the same discipline `ParseDecimal` uses for an auction bid applies here
+    // for the same reason: a value this file cannot represent exactly is a
+    // value it must refuse rather than silently wrap.
+    std::string const digits = aim.substr(prefix.size());
+    if (digits.empty() || digits.size() > 10 ||
+        digits.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+
+    unsigned long long parsed = 0;
+    for (char c : digits)
+        parsed = parsed * 10 + static_cast<unsigned long long>(c - '0');
+    if (parsed == 0 || parsed > 4294967295ULL)
+        return false;   // node 0 names no row in TaxiNodes.dbc
+
+    outNodeId = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+std::string FlightMasterNodeAim(uint32_t nodeId)
+{
+    return std::string(FLIGHT_MASTER_NODE_AIM_PREFIX) + std::to_string(nodeId);
+}
+
+bool FlightMasterAnswersForNode(float fmX, float fmY, float nodeX, float nodeY,
+                                float matchYards)
+{
+    float const dx = fmX - nodeX;
+    float const dy = fmY - nodeY;
+    return dx * dx + dy * dy <= matchYards * matchYards;
+}
+
+FlightDiscoveryArrival FlightDiscoveryArrivalStep(bool inReach, bool oneIsNearby)
+{
+    // IN REACH OUTRANKS EVERYTHING ELSE, for the identical reason
+    // CounterArrivalStep gives: it is the only state in which the promise a
+    // hold makes - that standing still is what completes this errand - is
+    // true.
+    if (inReach)
+        return FlightDiscoveryArrival::StandAndLearn;
+
+    // NEARBY AND OUT OF REACH IS "NOT YET". A flight master eight yards off
+    // its spawn row is a walk with a few yards left in it, not an errand that
+    // is over.
+    if (oneIsNearby)
+        return FlightDiscoveryArrival::CloseTheGap;
+
+    // AND NOTHING NEAR IS "NEVER, FROM HERE" - the creature this errand named
+    // is despawned, dead or phased, and standing on an empty spawn point
+    // learns nothing. Releasing hands the problem back to whatever wrote the
+    // aim.
+    return FlightDiscoveryArrival::Done;
+}
+
 // ------------------- and a hold that is taken once is not a hold (#358) --
 
 bool RetakeTheHold(HeldStillFacts const& facts, float slackYards)
