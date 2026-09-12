@@ -740,6 +740,47 @@ void ATabardIsFiveBytesOrItIsRefused()
           ParseGuildRequest("TABARD 1 2 3 4 5").verb == GuildVerb::Tabard);
 }
 
+void BankDepositParses()
+{
+    using namespace OverseerDecisions::GuildRefusal;
+
+    GuildRequest const deposit = ParseGuildRequest("bank deposit 5000");
+    Check("bank deposit parses", deposit.verb == GuildVerb::Bank);
+    CheckUnsigned("and carries the copper amount", deposit.depositCopper, 5000);
+    CheckString("refused by nothing", deposit.error, "");
+
+    Check("the verb is case insensitive like the others",
+          ParseGuildRequest("BANK deposit 1").verb == GuildVerb::Bank);
+    Check("blanks around the numbers do not matter",
+          ParseGuildRequest("bank   deposit   1  ").verb == GuildVerb::Bank);
+
+    CheckString("bank alone is refused", ParseGuildRequest("bank").error,
+                BankNeedsDeposit);
+    CheckString("an unknown sub-verb is refused",
+                ParseGuildRequest("bank withdraw 5000").error, BankNeedsDeposit);
+    CheckString("deposit with nothing after it is refused",
+                ParseGuildRequest("bank deposit").error, BankAmountNotANumber);
+    CheckString("a word instead of a number is refused",
+                ParseGuildRequest("bank deposit lots").error, BankAmountNotANumber);
+    CheckString("a negative amount is the same refusal",
+                ParseGuildRequest("bank deposit -5").error, BankAmountNotANumber);
+    CheckString("trailing words after the amount are refused",
+                ParseGuildRequest("bank deposit 500 gold").error,
+                BankAmountNotANumber);
+    CheckString("a deposit of zero is refused", ParseGuildRequest("bank deposit 0").error,
+                BankAmountIsZero);
+    CheckString("an amount past what a character can hold is refused",
+                ParseGuildRequest("bank deposit 99999999999").error,
+                BankAmountTooBig);
+    // Refused on the digit that would overflow, not after wrapping to
+    // something small that would read like a deliberate deposit.
+    CheckString("a very long run of digits is refused, not wrapped",
+                ParseGuildRequest("bank deposit 999999999999999999999999").error,
+                BankAmountTooBig);
+    CheckString("exactly the ceiling is allowed",
+                ParseGuildRequest("bank deposit 2147483646").error, "");
+}
+
 void ABadRowIsRefusedByNameAndNeverSilently()
 {
     using namespace OverseerDecisions::GuildRefusal;
@@ -770,10 +811,12 @@ void ABadRowIsRefusedByNameAndNeverSilently()
 
     // Every refusal literal goes into a column through an UPDATE, so none of
     // them may carry a quote.
-    char const* const literals[] = {NoVerb,     NoName,      NameTooLong,
-                                    NotACount,  CountTooBig, CountIsZero};
+    char const* const literals[] = {NoVerb,          NoName,          NameTooLong,
+                                    NotACount,       CountTooBig,     CountIsZero,
+                                    BankNeedsDeposit, BankAmountNotANumber,
+                                    BankAmountIsZero, BankAmountTooBig};
     bool clean = true;
-    for (std::size_t i = 0; i < 6; ++i)
+    for (std::size_t i = 0; i < 10; ++i)
         for (char const* c = literals[i]; *c; ++c)
             clean = clean && *c != 0x27 && *c != 0x22 && *c != 0x5c;
     Check("no refusal literal carries a quote", clean);
@@ -801,6 +844,7 @@ int main()
     FormationRefusesLoudlyRatherThanWorkingRound();
     TheFiveVerbsParse();
     ATabardIsFiveBytesOrItIsRefused();
+    BankDepositParses();
     ABadRowIsRefusedByNameAndNeverSilently();
 
     if (failures)

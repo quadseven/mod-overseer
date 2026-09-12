@@ -8948,6 +8948,69 @@ GuildRequest ParseGuildRequest(std::string const& command)
         return request;
     }
 
+    if (verb == "bank")
+    {
+        // `bank deposit <copper>` and nothing else - see GuildVerb::Bank for
+        // why deposit is the only verb this reads today.
+        std::size_t i = 0;
+        while (i < rest.size() && rest[i] == ' ')
+            ++i;
+        std::size_t wordBegin = i;
+        while (i < rest.size() && rest[i] != ' ')
+            ++i;
+        std::string const sub = rest.substr(wordBegin, i - wordBegin);
+        if (sub != "deposit")
+        {
+            request.error = GuildRefusal::BankNeedsDeposit;
+            return request;
+        }
+        while (i < rest.size() && rest[i] == ' ')
+            ++i;
+        std::size_t const amountBegin = i;
+        std::uint64_t amount = 0;
+        for (; i < rest.size() && rest[i] != ' '; ++i)
+        {
+            if (rest[i] < '0' || rest[i] > '9')
+            {
+                request.error = GuildRefusal::BankAmountNotANumber;
+                return request;
+            }
+            // Overflow refused on the digit that would cause it, the same
+            // discipline the shortlist count above keeps: a wrapped amount
+            // reads as a smaller, deliberate deposit rather than a mistake.
+            if (amount > MAX_MONEY_AMOUNT)
+            {
+                request.error = GuildRefusal::BankAmountTooBig;
+                return request;
+            }
+            amount = amount * 10 + static_cast<std::uint64_t>(rest[i] - '0');
+        }
+        // A trailing word after the amount ("bank deposit 500 gold") is a
+        // malformed row, not an amount with something after it silently
+        // dropped - the same "say it once, correctly" rule tabard's five
+        // numbers keep.
+        while (i < rest.size() && rest[i] == ' ')
+            ++i;
+        if (amountBegin == rest.size() || amountBegin == i || i != rest.size())
+        {
+            request.error = GuildRefusal::BankAmountNotANumber;
+            return request;
+        }
+        if (amount == 0)
+        {
+            request.error = GuildRefusal::BankAmountIsZero;
+            return request;
+        }
+        if (amount > MAX_MONEY_AMOUNT)
+        {
+            request.error = GuildRefusal::BankAmountTooBig;
+            return request;
+        }
+        request.verb = GuildVerb::Bank;
+        request.depositCopper = static_cast<std::uint32_t>(amount);
+        return request;
+    }
+
     request.error = GuildRefusal::NoVerb;
     return request;
 }
