@@ -5116,6 +5116,50 @@ AimedMover ReadAimedMover(AimedMoverFacts const& facts);
 // acts on them - the same discipline ErrandRunsAlone keeps above.
 bool AimedMoverGrants(AimedMover verdict);
 
+// IS THIS CHARACTER ACTUALLY GOING ANYWHERE UNDER THIS AIM? The form the
+// ERRAND BUDGET asks, and the third reading of the same five facts rather than
+// a fourth rule about them.
+//
+// WHY THE BUDGET NEEDS ITS OWN QUESTION AND CANNOT USE AimedMoverGrants. That
+// one means "hand the strategy over", which is false for a character that
+// already carries it - and a character already walking is the single clearest
+// case of one that should be billed. The two answers are near-complements over
+// the same enum and neither is the other.
+//
+// THE RULE: an aim is costing this character time when the drive will walk it,
+// which is `Walks` (it carries `new rpg` and is on its way) plus the two grants
+// (it is about to be handed `new rpg` on this very poll). Every other verdict
+// is the drive declining to move it:
+//
+//   * RefuseInFormation and RefuseCutOff are refusals. The drive says so in the
+//     log and walks nobody - "Followers travel by following the leader; aim the
+//     leader instead" - and BILLING A CHARACTER FOR AN ERRAND THIS DRIVE HAS
+//     REFUSED TO RUN is the defect this predicate exists to end. It is the same
+//     argument the already-refused short-circuit beside the charge site already
+//     makes for a cool-off, and it was only ever made for that one: through a
+//     refusal "the character is NOT walking anywhere - and charging it for
+//     those polls would bill it for an errand it was refused".
+//
+//     Measured on the dev realm 2026-09-11: a bridge pass aimed all five at
+//     'vendor', four of them followers, and the four were charged
+//     ERRAND_BUDGET_POLL_SECONDS every poll for a walk that never started. A
+//     follower's aim is additionally never RELEASED, because the arrival check
+//     that releases it sits below the refusal that skips it, so the bucket
+//     filled to the line in about nine minutes without fail and refused the
+//     whole family's vendor errand for fifteen. All-time on that realm: 17,333
+//     `vendor not in range` against 1,689 delivered.
+//
+//   * HeldOnPurpose is this module holding the character still on purpose. It
+//     is standing where it was put, not walking, and a staging hold is minutes
+//     rather than seconds - so charging it is billing a character for the time
+//     this module spent making it wait.
+//
+// NOT A LICENCE TO STAND AT A COUNTER FOREVER. The character this rule was
+// written for - a LEADER genuinely walking errand after errand, 66.3% of a
+// measured half hour - answers GrantToLeader or Walks and is charged exactly as
+// it was before. Nothing that was being bounded stops being bounded.
+bool AimedMoverTravels(AimedMover verdict);
+
 // ------------------------------------- crossing a map boundary (#241, #158) --
 //
 // THE FAMILY CANNOT WALK BETWEEN CONTINENTS, AND THAT IS CORRECT. Every aim

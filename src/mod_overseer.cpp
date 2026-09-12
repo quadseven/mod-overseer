@@ -16220,8 +16220,35 @@ private:
                 // skips the charge entirely; the drain still covers that stretch
                 // on the next poll that does charge, because it runs from the
                 // last mark and not from the last call.
+                // AND A CHARACTER THIS DRIVE WILL NOT MOVE IS NOT CHARGED FOR
+                // THE WALK IT IS NOT TAKING. The same argument the already-
+                // refused test above makes, applied to the other way an
+                // outstanding aim can walk nobody: the drive reaches
+                // AimedMover::RefuseInFormation two hundred lines below, says
+                // "Followers travel by following the leader; aim the leader
+                // instead", and moves nothing - and for a FOLLOWER that refusal
+                // `continue`s above the arrival check, so the aim is never
+                // released either. The bucket therefore filled to the line on
+                // every such character without fail, in about nine minutes, and
+                // refused the errand for fifteen. Measured 2026-09-11: a bridge
+                // pass aimed all five at 'vendor', four of them followers.
+                //
+                // READ AFRESH HERE, which is ReadAimedMoverFor's own standing
+                // instruction - "READ AFRESH WHEREVER IT IS USED, AND
+                // DELIBERATELY NOT CACHED across the body of a travel poll",
+                // because the strategy comes and goes mid-errand from writers
+                // that do not know an errand exists (#293). Five predicate
+                // reads and no query, on a poll that already does a COUNT.
+                //
+                // THE LEADER IS UNAFFECTED AND THAT IS THE POINT. The measured
+                // case this budget was written for - one character holding the
+                // quest drive down for 66.3% of half an hour on errands that
+                // all arrived cleanly - answers GrantToLeader or Walks and is
+                // charged exactly as before.
                 if (!toll.runOwned && OverseerDecisions::IsMaintenanceErrand(target) &&
                     _travelAims.SecondsSinceRefused(name, target) < 0 &&
+                    OverseerDecisions::AimedMoverTravels(
+                        ReadAimedMoverFor(name, bot, botAI, steersItself)) &&
                     _travelAims.NoteEconomySpend(name, ERRAND_BUDGET_POLL_SECONDS))
                     _travelAims.Refuse(name, target,
                                        "economy errands had taken more than their share "
