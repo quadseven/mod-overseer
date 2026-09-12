@@ -4112,11 +4112,54 @@ public:
     // TRAVEL_POLL_MS behind the table, and the same is true in the other
     // direction: if the bridge overwrites or clears this column, the next
     // DriveTravel poll re-reads it and the poll after that claims again.
+
+    // IS A PROFESSION ERRAND OUTSTANDING FOR `name` RIGHT NOW (mod-overseer#435)?
+    // A single indexed-PK read, done only at the point Claim() or Release()
+    // is about to overwrite or erase this character's travel_npc - not on
+    // every poll, so it does not reintroduce the whole-roster cost Load()
+    // above was written to avoid. `learn_skill` is the bridge's own record of
+    // "somebody still needs to learn this"; it is cleared by mod-overseer
+    // itself when the trainer verb succeeds (see the unlearn-drive comment
+    // near infra#2757), so a non-zero answer here means the errand is real,
+    // not stale.
+    static uint32 LearnSkillPending(std::string const& name)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT learn_skill FROM overseer_roster WHERE name = '{}'", Esc(name));
+        if (!result)
+            return 0;  // no such row, or a schema without the column - same answer as "none"
+        return result->Fetch()[0].Get<uint32>();
+    }
+
     void Claim(std::string const& name, std::string const& target)
     {
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
             return;
+
+        // A STANDING PROFESSION ERRAND OUTRANKS ANY AIM THIS BOOK WOULD TAKE
+        // (mod-overseer#435). `learn_skill` non-zero means bridge.py's
+        // _write_trade_errand has sent this character to a trainer - a plan
+        // documented there as one that "outlives" a single poll, the same
+        // way it is already fenced off from the ECONOMY_ERRANDS town-trip
+        // pass on the Python side. Nothing on this side had the matching
+        // fence, so a dungeon leader mid-crossing could silently steal the
+        // column from underneath it: the errand vanished with no log line
+        // anywhere, and `learn_skill` sat on the roster row looking active
+        // while nothing was walking toward a trainer any more. This does not
+        // apply to a target this book already owns - the early return above
+        // has already handled every case where `name` is being re-claimed at
+        // the aim it already holds - so a legitimate dungeon-staging walk in
+        // progress is untouched by this check.
+        if (uint32 const learnSkill = LearnSkillPending(name))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: travel aim '{}' for '{}' refused - a profession "
+                     "errand (skill {}) is outstanding and this book did not "
+                     "issue it",
+                     target, name, learnSkill);
+            return;
+        }
 
         // Esc() rather than a bare interpolation, the same discipline every
         // other write in this file applies: the name came out of a table a
@@ -4140,8 +4183,32 @@ public:
     // drive, goes through here, which is why it does three things and not one.
     void Release(std::string const& name)
     {
-        CharacterDatabase.Execute(
-            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
+        // THE COLUMN WRITE IS THE ONE PART OF THIS THAT IS NOW CONDITIONAL
+        // (mod-overseer#435). `_claimed` already answers "did this book put
+        // the walker at its CURRENT aim" - so when it says no, this Release
+        // is cleaning up after a claim that either expired or was never this
+        // book's to begin with (PruneVanished's own comment describes the
+        // column having a second owner). Blanking the column on that path is
+        // fine when nothing else is standing on it, but not when a profession
+        // errand is outstanding: a crossing whose leader's job changed out
+        // from under it must not erase an aim bridge.py wrote, any more than
+        // Claim() above may overwrite one. Every other line in this function
+        // still runs unconditionally, exactly as before - only the DB write
+        // is gated, and a release that skips its write is still a release for
+        // this book's own bookkeeping.
+        if (!_claimed.count(name) && LearnSkillPending(name))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: travel release for '{}' skipped the column "
+                     "write - a profession errand is outstanding and this "
+                     "book never claimed the aim it would have erased",
+                     name);
+        }
+        else
+        {
+            CharacterDatabase.Execute(
+                "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
+        }
         // The run no longer owns what no longer exists. `_refused` is
         // deliberately NOT swept here: a refusal that died with the errand it
         // ended would be forgotten before whatever re-arms this column next
