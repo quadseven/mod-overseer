@@ -2189,6 +2189,18 @@ bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
 // hundred is exactly the defect #225 exists to have removed - a campaign that
 // reports success having cleared nothing - and it is the same argument, one
 // phase later.
+//
+// AND 'evacuated' JOINS IT FOR THE THIRD TIME, ONE PHASE LATER AGAIN (#429).
+// That outcome is written about a party that was on the instance map and had
+// the run under way, so by the letter of "the bar is the instance map" it is a
+// run. It is not one. It is written only by the bag-pressure exit, which walks
+// the party straight back out because a member has stopped being able to pick
+// anything up, and the measurement behind it is six seconds inside map 189
+// with `completedEncounters` reading zero. Spending a slot of a twenty-five
+// run campaign on that is the same sentence #225 and #384 were both written
+// about, and the same answer applies: a run that cleared nothing did not fill
+// a slot. It counts as a trailing failure for the same reason it always did -
+// something has to bound a family whose bags never drain.
 bool DungeonRunEnteredTheInstance(std::string const& outcome);
 
 // HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
@@ -2337,7 +2349,98 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
 // migration: the outcome column is VARCHAR(16) and was made one for exactly
 // this, its own migration naming 'complete' as the value to add "the moment a
 // run has a goal to complete".
-char const* DungeonRunExitOutcome(bool provedComplete, bool stalled);
+// 'evacuated' is the fourth word and the newest, and it needs no migration
+// either: nine characters into the same VARCHAR(16). It is deliberately NOT
+// 'left'. A run the family's bags ended and a run the family walked out of
+// having done what it came for are the same row today, which is how a campaign
+// counter reached its cap on runs that killed nothing. See
+// DungeonRunBagPressure below for the measurement.
+char const* DungeonRunExitOutcome(bool provedComplete, bool stalled, bool evacuated);
+
+// -------------------------------- a run the family has no room for (#429) --
+//
+// WHAT WAS MEASURED, AND IT IS A LOOP RATHER THAN A ONE-OFF. Two consecutive
+// runs into map 189 on the dev realm, from the worldserver's own log:
+//
+//     01:30:03  opened dungeon run 150435 on map 189
+//     01:30:09  an active dungeon run is being evacuated because an inside
+//               family member has two or fewer free inventory slots
+//     01:30:39  dungeon run 150435 ended 'left' ... That was run 1 of 25 in
+//               campaign 8, so the run goes again
+//
+// Six seconds on the instance map. `completedEncounters` zero, nothing killed,
+// nothing looted - and a slot of a twenty-five run campaign spent on it. The
+// run before it did the same thing in eight seconds. At that rate a campaign
+// of twenty-five finishes in about twenty minutes having cleared nothing,
+// which is precisely the failure #225 exists to have removed, two phases
+// later.
+//
+// WHY IT REPEATS FOR EVER, WHICH IS THE HALF WORTH READING. The bag check
+// itself is right: a member that cannot pick anything up should not be dragged
+// through a dungeon. What was wrong is WHEN it is asked. It is asked only of
+// members already standing on the instance map, so its answer cannot be known
+// until after the party has crossed - and crossing a doorway does not change
+// anybody's bags, so the answer was already fixed before the run opened.
+//
+// And the one thing that could change the answer is locked out by the
+// evacuation itself. DriveTownTrip - the drive that walks the family to a
+// vendor and empties the bags - begins by standing itself down whenever the
+// coordinator's phase is anything but Idle, and a campaign's second and every
+// later run is re-armed straight into REPAIRING and RESETTING without ever
+// passing back through Idle. So the cure runs only in a state the campaign
+// never reaches, the bags never drain, and every run evacuates on the poll
+// after it opens. The party walks in and out of the same door until the
+// counter runs out.
+//
+// THE FIX IS TO ASK IT BEFORE THE PARTY IS COMMITTED, and that turns one
+// yes/no into three answers, because what to DO about full bags depends
+// entirely on where the family is standing when the question is put.
+enum class DungeonBagPressure : std::uint8_t
+{
+    // Every member that could be read still has room. Nothing here applies and
+    // the run is not touched.
+    None,
+    // The family cannot loot and nobody is committed yet. No run opens, and one
+    // that is staging stands back down to IDLE - which is not merely "do
+    // nothing", it is the one state in which the town trip that fixes this is
+    // allowed to run at all.
+    HoldOut,
+    // The family cannot loot and somebody is already on the instance map. The
+    // party is walked out, which is what this check has always done and is
+    // still right: bags can fill DURING a run, and that is the case this answer
+    // was actually built for.
+    Evacuate,
+};
+
+// `freeBagSlots` is one reading per member the caller could actually read this
+// poll. A member that does not resolve to a live character contributes NO
+// entry rather than a zero, the same rule TownNeed::present already states: an
+// absent member's bags are unknown, and unknown is not full. An empty vector is
+// therefore None - a poll that could read nobody has learned nothing, and
+// standing a campaign down on that would stop a run every time the family
+// happens to be mid-relog.
+//
+// `freeSlotsFloor` is AT OR BELOW, and it should be handed
+// TownTripLimits::freeBagSlotsToGo rather than a number of its own. That is the
+// whole point of the parameter: the condition that stops a run opening must be
+// the same condition that sends the family to town, or the coordinator holds
+// out for a trip the town drive does not think is owed and the campaign waits
+// for ever. The two numbers were 2 here and 3 there when this was measured.
+//
+// A floor of ZERO is still a real bound and not "no bound", unlike the zero
+// limits elsewhere in this file: a character with zero free slots genuinely
+// cannot pick anything up, so "at or below zero" is a question worth asking and
+// is answered honestly.
+//
+// `alreadyLeaving` is asked FIRST and outranks everything. A run already walking
+// to the door must never be re-decided by this: EXIT is what closes the run row
+// and counts it, and a HoldOut that returned the coordinator to IDLE mid-EXIT
+// would leave a row 'active' inside a dungeon with nobody walking anybody out -
+// the stranding shape this drive family has already produced four times.
+DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlots,
+                                         unsigned freeSlotsFloor,
+                                         bool anyMemberInside,
+                                         bool alreadyLeaving);
 
 // --------------------------- the run yields to an errand it would trample --
 //

@@ -99,13 +99,17 @@ void BitsTheMapDoesNotCreditAreIgnored()
 
 void TheOutcomeWordPrefersProofOverInference()
 {
-    CheckWord("plain walk out", DungeonRunExitOutcome(false, false), "left");
-    CheckWord("watchdog gave up", DungeonRunExitOutcome(false, true), "stalled");
-    CheckWord("proved finished", DungeonRunExitOutcome(true, false), "complete");
+    CheckWord("plain walk out", DungeonRunExitOutcome(false, false, false), "left");
+    CheckWord("watchdog gave up", DungeonRunExitOutcome(false, true, false), "stalled");
+    CheckWord("proved finished", DungeonRunExitOutcome(true, false, false), "complete");
     // Both at once is real: the watchdog can spend its skips on the last pull
     // of a dungeon that then finishes. The mask is a fact, the stall is an
     // inference from not having moved, so the fact wins.
-    CheckWord("finished after a stall", DungeonRunExitOutcome(true, true), "complete");
+    CheckWord("finished after a stall", DungeonRunExitOutcome(true, true, false), "complete");
+    // The third input is #429's, and it does not disturb either of the two
+    // above: the bag exit only ever names a run nothing else had a word for.
+    // Its own cases live in tests/test_dungeon_bags.cpp.
+    CheckWord("bags ended it", DungeonRunExitOutcome(false, false, true), "evacuated");
 }
 
 void TheNewWordStillCountsAsARun()
