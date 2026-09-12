@@ -11159,7 +11159,19 @@ struct GuildRequest
 // this number cannot be a real one - `Player::ModifyMoney` takes a signed
 // int32, so a copper amount past INT32_MAX would wrap through the core's own
 // arithmetic rather than being refused.
-constexpr std::uint32_t MAX_MONEY_AMOUNT = 0x7FFFFFFFu - 1u;
+//
+// NAMED DIFFERENTLY FROM THE CORE'S OWN `MAX_MONEY_AMOUNT` ON PURPOSE. That
+// is a `#define` in Player.h, and mod_overseer.cpp already includes the core
+// and already uses it in several places. A `constexpr` here with the exact
+// same name would not shadow it or collide at link time - the preprocessor
+// would rewrite THIS declaration into `constexpr std::uint32_t (0x7FFFFFFF-1)
+// = ...;` before the compiler ever saw an identifier, which is a syntax
+// error with no useful mention of a macro anywhere in it. Caught by the
+// adapter's own CI compile, which is exactly the job this duplication is
+// for - this header cannot see the collision itself, having no core in its
+// include path, which is the whole reason to give it a name the core does
+// not also define.
+constexpr std::uint32_t GUILD_DEPOSIT_MAX_COPPER = 0x7FFFFFFFu - 1u;
 
 // The default size of a shortlist when the row does not say. Ten is a list a
 // person can read in one go; the point of the verb is a decision somebody makes

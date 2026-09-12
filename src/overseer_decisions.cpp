@@ -8978,7 +8978,7 @@ GuildRequest ParseGuildRequest(std::string const& command)
             // Overflow refused on the digit that would cause it, the same
             // discipline the shortlist count above keeps: a wrapped amount
             // reads as a smaller, deliberate deposit rather than a mistake.
-            if (amount > MAX_MONEY_AMOUNT)
+            if (amount > GUILD_DEPOSIT_MAX_COPPER)
             {
                 request.error = GuildRefusal::BankAmountTooBig;
                 return request;
@@ -9001,7 +9001,7 @@ GuildRequest ParseGuildRequest(std::string const& command)
             request.error = GuildRefusal::BankAmountIsZero;
             return request;
         }
-        if (amount > MAX_MONEY_AMOUNT)
+        if (amount > GUILD_DEPOSIT_MAX_COPPER)
         {
             request.error = GuildRefusal::BankAmountTooBig;
             return request;
