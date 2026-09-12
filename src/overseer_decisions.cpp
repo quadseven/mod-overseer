@@ -8905,7 +8905,6 @@ GuildRequest ParseGuildRequest(std::string const& command)
                 return request;
             }
             unsigned value = 0;
-            bool any = false;
             while (i < rest.size() && rest[i] != ' ')
             {
                 if (rest[i] < '0' || rest[i] > '9')
@@ -8923,11 +8922,14 @@ GuildRequest ParseGuildRequest(std::string const& command)
                     return request;
                 }
                 value = value * 10 + static_cast<unsigned>(rest[i] - '0');
-                any = true;
                 ++i;
             }
-            if (!any)
-                break;
+            // No emptiness guard here, and it is not an oversight: the space
+            // skip above stopped on a non-space, and a non-digit has already
+            // returned TabardNotANumber, so the inner loop has consumed at
+            // least one digit by the time it ends. A `break` on !any would be
+            // unreachable, which is worse than absent - it reads as a case
+            // somebody considered.
             if (value > TABARD_VALUE_MAX)
             {
                 request.error = GuildRefusal::TabardValueTooBig;

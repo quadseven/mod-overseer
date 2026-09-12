@@ -33398,13 +33398,16 @@ private:
     // entry is the core's. Writing `guild` and `guild_member` by hand would
     // produce rows that looked right and a world that had never heard of them,
     // which is the failure AGENTS.md is about.
+
     // The core's own price for an emblem, restated because it is not reachable.
     // `EMBLEM_PRICE` is a #define in the core's Guild.cpp (line 42 at the
     // pinned revision, `10 * GOLD`), not in Guild.h, so no amount of including
-    // brings it here. Restated values drift, so this one is checked by the
-    // world rather than trusted: if it were ever too low, HandleSetEmblem
-    // would refuse a command this branch had already called affordable, and
-    // the row would come back applied with an unchanged tabard.
+    // brings it here. Restated values drift, so this one is not trusted: the
+    // branch below compares it against the money the core actually took, and
+    // refuses when the two disagree. That is what catches a drifted copy -
+    // if this were ever lower than the core's EMBLEM_PRICE the affordability
+    // check would pass a command the core then refused, and without the
+    // comparison the row would come back applied with an unchanged tabard.
     static constexpr uint32 TABARD_COST = 10 * 10000;
 
     static char const* DoGuild(Player* who, std::string const& command,
@@ -33696,7 +33699,41 @@ private:
             // guild master's to set are the rules of the thing they are doing,
             // and a module that quietly skipped both would be dressing them in
             // something they never earned.
+            // READ THE WORLD BACK. AGENTS.md: after any command that should
+            // change the world, query the world - and the precondition checks
+            // above are NOT that, they are a prediction made before the fact.
+            //
+            // The obvious read is not available: `m_emblemInfo` is private
+            // with no getter, and `EmblemInfo::SaveToDB` hands its UPDATE to
+            // CharacterDatabase asynchronously, so the `guild` table has not
+            // necessarily changed by the time this returns and a SELECT here
+            // would race.
+            //
+            // The MONEY is the witness, and it is exact and synchronous.
+            // HandleSetEmblem's success branch is the only path that runs
+            // `player->ModifyMoney(-int32(EMBLEM_PRICE))`, and that lands in
+            // the Player object this thread is holding. So a purse that fell
+            // by exactly the price means the emblem was set, and a purse that
+            // did not means the core refused - including the case this branch
+            // cannot otherwise detect, where TABARD_COST has drifted below
+            // the core's own EMBLEM_PRICE and the affordability check above
+            // passed something the core then refused.
+            uint32 const purseBefore = who->GetMoney();
             guild->HandleSetEmblem(session, emblem);
+            uint32 const purseAfter = who->GetMoney();
+            uint32 const paid = purseBefore > purseAfter ? purseBefore - purseAfter : 0;
+
+            if (paid != TABARD_COST)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) did not take a tabard from {} - "
+                         "{} copper moved, expected {}",
+                         guild->GetName(), guild->GetId(), who->GetName(),
+                         paid, TABARD_COST);
+                return refuse("the core kept the old tabard: it charged "
+                              "nothing for the emblem, so it refused the "
+                              "change rather than making it");
+            }
 
             std::ostringstream o;
             o << "\"guild\":" << J(guild->GetName())
