@@ -129,6 +129,37 @@ void TheWailingCavernsPortalDerivesARealPlace()
     CheckBool("wailing is usable", StagingPointUsable(point.x, point.y, point.z), true);
 }
 
+// THE THREE SCARLET WINGS ADDED ALONGSIDE THE GRAVEYARD ROW. Each door and each
+// way-back-out landing point is copied from the same areatrigger and
+// areatrigger_teleport rows DungeonPortals() quotes next to `scarlet-library`,
+// `scarlet-armory` and `scarlet-cathedral`, so this is the same regression
+// protection the three rows above already have: a change to the derivation that
+// moved any of these would be a bug dressed up as a fix.
+//
+// `scarlet-armory`'s entry door, areatrigger 612, is the one radius in the
+// table that is not 8 - it is 6 - and that fact plays no part in this
+// derivation at all: DungeonStagingPoint never reads a radius, only the two
+// triggers' positions. The radius is exercised at the crossing instead, by
+// ArrivalReachesTrigger and the world's own IsInAreaTriggerRadius, neither of
+// which this file can reach without a running core.
+void TheThreeScarletWingsDeriveTheirOwnStagingPoints()
+{
+    // areatrigger 614 -> areatrigger_teleport 608's landing point, on map 0.
+    CheckPoint("scarlet-library",
+               DungeonStagingPoint(2859.73f, -824.91f, 2870.9f, -820.16f, 160.33f, 20.f),
+               2878.1350f, -817.0834f, 160.33f);
+
+    // areatrigger 612 -> areatrigger_teleport 606's landing point, on map 0.
+    CheckPoint("scarlet-armory",
+               DungeonStagingPoint(2877.98f, -839.267f, 2884.45f, -822.01f, 160.33f, 20.f),
+               2885.0012f, -820.5399f, 160.33f);
+
+    // areatrigger 610 -> areatrigger_teleport 604's landing point, on map 0.
+    CheckPoint("scarlet-cathedral",
+               DungeonStagingPoint(2925.18f, -820.545f, 2906.14f, -813.77f, 160.33f, 20.f),
+               2906.3373f, -813.8402f, 160.33f);
+}
+
 // A landing point on top of the door names no direction to stand off along.
 void ADoorWithNoCorridorIsRefused()
 {
@@ -258,6 +289,7 @@ int main()
 {
     TheWorkingPortalsDeriveWhatTheyAlreadyDerive();
     TheWailingCavernsPortalDerivesARealPlace();
+    TheThreeScarletWingsDeriveTheirOwnStagingPoints();
     ADoorWithNoCorridorIsRefused();
     TheOriginIsNeverAStagingPoint();
     APointOffTheWorldIsRefused();
