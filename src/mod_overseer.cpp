@@ -16275,6 +16275,40 @@ private:
         // deployed yet - degrades this loop to exactly what it did before:
         // travel, and no transaction.
         std::map<std::string, ProfessionPlan> const plans = LoadProfessionPlans();
+        // THE SAME JOB MAP DriveQuests READS (infra#2834/mod-overseer#449).
+        // ErrandBudgetLimits below was built to answer one question -
+        // "is this character's *leader-carried* town trip eating the time it
+        // should be questing" - and it answered it correctly for the family
+        // that measured it, because every character it was measured against
+        // had `job` absent (the schema default, 'quest') and picked up a
+        // vendor/banker/repair aim only incidentally, while carrying sale
+        // goods for siblings who were still out questing. A character on
+        // job='craft' is not incidentally near a counter; walking to a
+        // vendor for the one reagent craft_supply.py has decided it needs
+        // (infra#3613) IS its whole job right now, the same way DriveCraft
+        // above already treats job='craft' as a standing permission rather
+        // than a hint. Charging that walk against a budget invented to
+        // protect QUESTING time from being eaten calls the errand off and
+        // refuses it for ERRAND_DEATH_LIMITS.cooloffSeconds (15 minutes) -
+        // over and over, forever, because a character with no other job has
+        // no way to ever earn the budget back down. Measured live on Ugga
+        // (job='craft', infra#3613's own vendor aim): written, refused within
+        // minutes ("economy errands had taken more than their share of this
+        // character's time"), cleared, and re-written ten minutes later by
+        // the next craft_supply cycle only to be refused again - the vial
+        // never bought and the errand never allowed to run to completion.
+        //
+        // NOT A BLANKET EXEMPTION FOR job='craft'. Only the budget/refuse
+        // pair below is skipped; the death breaker just above it still
+        // releases a craft character being killed by its own vendor walk,
+        // and the counter arrival/arbitration logic is untouched - a
+        // job='craft' character's errand still ends normally on arrival.
+        // This is the same shape as Claim()'s LearnSkillPending fence
+        // (mod-overseer#435/#438): a standing errand this book did not
+        // reason about gets a specific, narrow exemption from the generic
+        // rule that would otherwise starve it, rather than the generic rule
+        // being weakened for everybody.
+        std::map<std::string, std::string> const jobs = LoadJobs();
         if (aims.empty())
         {
             // No errands anywhere, so nothing this loop remembers is still
@@ -16462,7 +16496,23 @@ private:
                 // skips the charge entirely; the drain still covers that stretch
                 // on the next poll that does charge, because it runs from the
                 // last mark and not from the last call.
-                if (!toll.runOwned && OverseerDecisions::IsMaintenanceErrand(target) &&
+                //
+                // AND ONLY WHEN THE BUDGET APPLIES TO THIS CHARACTER'S JOB
+                // (infra#3613, mod-overseer's own sibling of #435/#438 - see
+                // OverseerDecisions::MaintenanceBudgetApplies for the whole
+                // argument, and the comment above `jobs` at the top of this
+                // function for how this drive came to have LoadJobs()'s
+                // answer in hand at all). The rule this answers - "is a town
+                // trip eating the time this character should be questing" -
+                // has no meaning for a character whose job is not questing
+                // and never will be while craft_supply.py owns its vendor
+                // aim; charging it anyway is the mechanism reporting
+                // something it did not observe, the exact failure this
+                // file's own comments elsewhere refuse to allow.
+                auto const jobIt = jobs.find(name);
+                std::string const job = jobIt == jobs.end() ? std::string() : jobIt->second;
+                if (OverseerDecisions::MaintenanceBudgetApplies(job) && !toll.runOwned &&
+                    OverseerDecisions::IsMaintenanceErrand(target) &&
                     _travelAims.SecondsSinceRefused(name, target) < 0 &&
                     _travelAims.NoteEconomySpend(name, ERRAND_BUDGET_POLL_SECONDS))
                     _travelAims.Refuse(name, target,

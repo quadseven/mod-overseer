@@ -6236,6 +6236,37 @@ ErrandSpend ErrandSpendAfter(ErrandSpend const& before, time_t now, int64_t held
 // rule that waits to be sure spends the thing it is protecting.
 bool ErrandOverspent(ErrandSpend const& spend, ErrandBudgetLimits const& limits);
 
+// DOES THE BUDGET ABOVE EVEN APPLY TO THIS CHARACTER (infra#3613,
+// mod-overseer's own sibling of #435/#438)?
+//
+// THE QUESTION ErrandBudgetLimits ANSWERS IS "IS A TOWN TRIP EATING THE TIME
+// THIS CHARACTER SHOULD BE QUESTING", and it was built and measured against
+// characters whose `job` is the schema default - a family member who picks
+// up a vendor or repair aim only incidentally, while carrying sale goods for
+// siblings who are still out questing. It has no meaning for a character
+// whose `job` is 'craft': that character was never going to be questing
+// either way, and a standing vendor errand sent to it by craft_supply.py is
+// not incidental, it IS the job (the same permission DriveCraft already
+// grants job='craft' over `craft_spell`). Charging that walk against a
+// budget invented to protect QUESTING time calls the errand off and refuses
+// it for ERRAND_DEATH_LIMITS.cooloffSeconds - and because a craft-only
+// character has no other job to ever bring its spend back down, the refusal
+// recurs every time the cool-off lifts, forever, and the vendor errand is
+// never allowed to run to completion. Measured live on the dev realm: a
+// vendor aim written by craft_supply.py, refused by this rule within
+// minutes ("economy errands had taken more than their share of this
+// character's time"), and rewritten by the next ten-minute craft_supply
+// cycle only to be refused again.
+//
+// A NARROW EXEMPTION, NOT A WEAKENING OF THE RULE. Only this budget is
+// skipped for job='craft' - the death breaker beside it still releases a
+// craft character being killed by its own vendor walk, and every other
+// arrival/arbitration path is untouched. The same shape as Claim()'s
+// LearnSkillPending fence: a standing errand this rule did not reason about
+// gets carved out of it by name, rather than the rule being loosened for
+// everybody.
+bool MaintenanceBudgetApplies(std::string const& job);
+
 // ----------------------------------------------------------------- auction --
 //
 // THE PARTS OF kind='auction' THAT NEED NO WORLD: reading the command text,

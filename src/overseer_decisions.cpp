@@ -4732,6 +4732,16 @@ bool ErrandOverspent(ErrandSpend const& spend, ErrandBudgetLimits const& limits)
     return spend.seconds >= limits.spendSeconds;
 }
 
+bool MaintenanceBudgetApplies(std::string const& job)
+{
+    // See the declaration in overseer_decisions.h for the whole argument.
+    // Every OTHER job still charges the budget, including the schema
+    // default ('quest', which never reaches here because LoadJobs only
+    // returns non-quest rows - see the loader's own comment) and every mode
+    // that has not yet been given a reason of its own to stand outside it.
+    return job != "craft";
+}
+
 // ----------------------------------------------------------------- auction --
 
 namespace
