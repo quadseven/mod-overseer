@@ -4137,6 +4137,24 @@ public:
         return result->Fetch()[0].Get<uint32>();
     }
 
+    // `travel_npc`, READ FRESH, FOR THE SAME REASON LearnSkillPending READS
+    // `learn_skill` FRESH (infra#3655): the question is whether a python
+    // economy pass currently owns this column, not what this book last wrote
+    // to it. Unlike a profession errand, a vendor/banker/repair errand has no
+    // separate outstanding flag - the keyword itself, sitting in the column
+    // right now, IS bridge.py's record that _write_trade_errand (or
+    // craft_supply.py's own "get near any vendor first" write) put this
+    // character there and it has not yet resolved into a walk or a completed
+    // transaction.
+    static std::string CurrentTravelNpc(std::string const& name)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT travel_npc FROM overseer_roster WHERE name = '{}'", Esc(name));
+        if (!result)
+            return std::string();
+        return result->Fetch()[0].Get<std::string>();
+    }
+
     void Claim(std::string const& name, std::string const& target)
     {
         auto const it = _state.find(name);
@@ -4164,6 +4182,32 @@ public:
                      "errand (skill {}) is outstanding and this book did not "
                      "issue it",
                      target, name, learnSkill);
+            return;
+        }
+
+        // A STANDING ECONOMY ERRAND OUTRANKS A CATCH-UP WALK THE SAME WAY
+        // (infra#3655). Ugga (job='craft') fell far enough behind her party
+        // that DungeonEscort's catch-up walk re-Claims her onto her leader's
+        // live position every poll (CatchUpToward, below) - and every poll it
+        // wins the race against craft_supply.py's own "vendor" aim before that
+        // aim can resolve into an actual buy, so the vial errand that IS her
+        // whole job right now (DriveCraft already treats job='craft' the same
+        // way) never gets a sustained shot at completing. `travel_npc` itself
+        // is the only outstanding-errand signal a vendor/banker/repair pass
+        // has - IsMaintenanceErrand is the same three keywords bridge.py's own
+        // ECONOMY_ERRANDS guard and mod-overseer#450's budget exemption already
+        // agree on, kept as one vocabulary rather than a third copy of it. As
+        // with the profession-errand fence above, this does not apply to a
+        // target this book already owns - the early return has already handled
+        // every re-claim of an in-flight aim - so a legitimate dungeon-staging
+        // walk or an escort already under way is untouched.
+        if (OverseerDecisions::IsMaintenanceErrand(CurrentTravelNpc(name)))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: travel aim '{}' for '{}' refused - a vendor/"
+                     "banker/repair errand is outstanding and this book did "
+                     "not issue it",
+                     target, name);
             return;
         }
 
@@ -4202,12 +4246,19 @@ public:
         // still runs unconditionally, exactly as before - only the DB write
         // is gated, and a release that skips its write is still a release for
         // this book's own bookkeeping.
-        if (!_claimed.count(name) && LearnSkillPending(name))
+        // infra#3655 extends the same gate to a standing economy errand -
+        // see the identical reasoning on Claim() above. A crossing that
+        // releases a straggler mid-catch-up must not blank a vendor/banker/
+        // repair aim bridge.py wrote and has not resolved yet, any more than
+        // Claim() may overwrite one.
+        if (!_claimed.count(name) &&
+            (LearnSkillPending(name) || OverseerDecisions::IsMaintenanceErrand(CurrentTravelNpc(name))))
         {
             LOG_INFO("module.overseer",
                      "overseer: travel release for '{}' skipped the column "
-                     "write - a profession errand is outstanding and this "
-                     "book never claimed the aim it would have erased",
+                     "write - a profession or economy errand is outstanding "
+                     "and this book never claimed the aim it would have "
+                     "erased",
                      name);
         }
         else
