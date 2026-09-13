@@ -8969,6 +8969,67 @@ GuildRequest ParseGuildRequest(std::string const& command)
         while (i < rest.size() && rest[i] != ' ')
             ++i;
         std::string const sub = rest.substr(wordBegin, i - wordBegin);
+        if (sub == "deposit-item")
+        {
+            // `guid:<n>` or `entry:<n>`, the exact same shape DoGive's own
+            // item spec already parses (mod_overseer.cpp's ParseGiveSpec) -
+            // restated here rather than shared because this file has to keep
+            // compiling with no core in its include path and ParseGiveSpec
+            // lives in the adapter, next to the core types it hands the
+            // result to.
+            while (i < rest.size() && rest[i] == ' ')
+                ++i;
+            std::size_t const specBegin = i;
+            while (i < rest.size() && rest[i] != ' ')
+                ++i;
+            std::string const specWord = rest.substr(specBegin, i - specBegin);
+            while (i < rest.size() && rest[i] == ' ')
+                ++i;
+            // Trailing content after the spec ("deposit-item guid:5 extra")
+            // is refused, not silently dropped - the same rule the money
+            // amount above keeps.
+            if (i != rest.size())
+            {
+                request.error = GuildRefusal::BankItemSpecInvalid;
+                return request;
+            }
+            std::string::size_type const colon = specWord.find(':');
+            if (colon == std::string::npos)
+            {
+                request.error = GuildRefusal::BankItemSpecInvalid;
+                return request;
+            }
+            std::string const what = specWord.substr(0, colon);
+            std::string const value = specWord.substr(colon + 1);
+            bool const byGuid = (what == "guid");
+            if ((!byGuid && what != "entry") || value.empty()
+                || value.find_first_not_of("0123456789") != std::string::npos)
+            {
+                request.error = GuildRefusal::BankItemSpecInvalid;
+                return request;
+            }
+            // Overflow refused on the digit that would cause it, same
+            // discipline as the copper amount and the shortlist count.
+            std::uint64_t key = 0;
+            for (char const ch : value)
+            {
+                if (key > 0xFFFFFFFFull)
+                {
+                    request.error = GuildRefusal::BankItemSpecInvalid;
+                    return request;
+                }
+                key = key * 10 + static_cast<std::uint64_t>(ch - '0');
+            }
+            if (key == 0 || key > 0xFFFFFFFFull)
+            {
+                request.error = GuildRefusal::BankItemSpecInvalid;
+                return request;
+            }
+            request.verb = GuildVerb::BankDepositItem;
+            request.itemByGuid = byGuid;
+            request.itemKey = static_cast<std::uint32_t>(key);
+            return request;
+        }
         if (sub != "deposit")
         {
             request.error = GuildRefusal::BankNeedsDeposit;

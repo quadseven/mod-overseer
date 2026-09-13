@@ -34214,6 +34214,159 @@ private:
             return "";
         }
 
+        if (request.verb == GuildVerb::BankDepositItem)
+        {
+            // TAB 0 ONLY, v1 (infra#3647 - see GuildVerb::BankDepositItem's
+            // own comment). Multi-tab selection - "whichever tab has free
+            // slots and this rank can deposit into", the design doc's own
+            // phrasing (mod-overseer/docs/design/guild-bank-deposit.md) - is
+            // deferred rather than guessed at: it needs a real read of which
+            // tabs the family's guild has actually purchased, which this
+            // session had no way to verify against the live database.
+            static constexpr uint8 GUILD_BANK_DEPOSIT_TAB_V1 = 0;
+
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to bank through");
+
+            bool anyVaultInRange = false;
+            GameObject* vault = GuildBankInReach(who, anyVaultInRange);
+            if (!vault)
+                return refuse(anyVaultInRange
+                                  ? "a guild bank is nearby but this character cannot use it"
+                                  : "no guild bank in reach");
+
+            Item* item = FindCarriedItem(who, request.itemByGuid, request.itemKey);
+            if (!item)
+                return refuse(request.itemByGuid
+                                  ? "no carried item with that guid on this character"
+                                  : "no carried item with that entry on this character");
+
+            // Same two checks DoGive makes before moving an item off a
+            // character, and for the same reason: a guild bank deposit is
+            // still handing the item to something else, and the core's own
+            // Item::CanBeTraded is what actually knows about a non-empty bag,
+            // a worn bag, an item being looted, or a bind-on-enchant.
+            if (item->IsSoulBound())
+                return refuse("item is soulbound and can never be handed over");
+            if (!item->CanBeTraded())
+                return refuse("item cannot be traded (non-empty bag, worn bag, being "
+                              "looted, or bound by enchant)");
+
+            ItemTemplate const* proto = item->GetTemplate();
+            std::string const itemName = proto ? proto->Name1 : std::string();
+
+            // Captured BEFORE anything moves, same reasoning as DoGive:
+            // Guild::_MoveItems can merge this item into an existing stack in
+            // the bank tab, after which this Item* may no longer be valid.
+            ObjectGuid const itemGuid = item->GetGUID();
+            uint32 const itemEntry = item->GetEntry();
+            uint32 const itemCount = item->GetCount();
+            uint8 const srcBag = item->GetBagSlot();
+            uint8 const srcSlot = item->GetSlot();
+
+            // READ BEFORE / WITNESS AFTER, the same discipline the money
+            // branch above keeps. `SwapItemsWithInventory` is `void` and,
+            // verified at the pinned core revision (Guild.cpp), silently
+            // no-ops - moving nothing - when the tab does not exist yet
+            // (`tabId >= _GetPurchasedTabsSize()`) or when this rank lacks
+            // `GUILD_BANK_RIGHT_DEPOSIT_ITEM` on this tab
+            // (`BankMoveItemData::HasStoreRights`, checked inside the core's
+            // own `Guild::_MoveItems`). This module does not pre-check either
+            // of those itself; it calls the real API and reads whether the
+            // item actually left the character's bags, the only way to tell
+            // a real deposit from a refusal the core made without saying so.
+            guild->SwapItemsWithInventory(who, /*toChar=*/false,
+                                           GUILD_BANK_DEPOSIT_TAB_V1, NULL_SLOT,
+                                           srcBag, srcSlot, /*splitedAmount=*/0);
+
+            Item* stillCarried = FindCarriedItem(who, /*byGuid=*/true, itemGuid.GetCounter());
+            if (stillCarried)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) did not take item guid {} entry {} "
+                         "({}) x{} from {} into bank tab {} - most likely no purchased "
+                         "tab there yet, this rank cannot deposit into it, or the tab is "
+                         "full",
+                         guild->GetName(), guild->GetId(), itemGuid.GetCounter(), itemEntry,
+                         itemName, itemCount, who->GetName(),
+                         uint32(GUILD_BANK_DEPOSIT_TAB_V1));
+                return refuse("the core did not move the item - no purchased bank tab, "
+                              "this rank cannot deposit into it, or the tab is full");
+            }
+
+            // SECOND WITNESS (Grug - Elder, PR #452 review): absence from the
+            // character's bags is necessary but not sufficient - it does not
+            // prove the item landed IN the bank tab. A full tab or a
+            // rank-lacking deposit both no-op inside Guild::_MoveItems
+            // (Guild.cpp:2730 - an early `return` before either side is
+            // touched), so if the item is truly gone from both places this
+            // check is moot; the case this guards is the core leaving it
+            // somewhere neither of those two reads expects.
+            //
+            // The correct positive read would be the in-memory bank tab
+            // itself - Guild::GetBankTab(tabId)->GetItem(slotId) - but at the
+            // pinned core revision (mod-playerbots/azerothcore-wotlk@4796018)
+            // `GetBankTab` and `_GetItem` are both `private` on `Guild`
+            // (Guild.h:818 `private:`, :826, :863) with no `friend`
+            // declaration anywhere in the header (grepped, none). This module
+            // is not part of the core and cannot reach either one - there is
+            // no public Guild accessor that returns a bank tab's contents at
+            // this SHA.
+            //
+            // The only other read is `guild_bank_item`, the table this
+            // deposit's own INSERT (CHAR_INS_GUILD_BANK_ITEM) writes to. That
+            // INSERT rides the same CharacterDatabaseTransaction as the
+            // removal from the character and is committed through
+            // `DatabaseWorkerPool::CommitTransaction`, which *enqueues* the
+            // commit onto an async worker thread (DatabaseWorkerPool.cpp:257)
+            // rather than executing it before `SwapItemsWithInventory`
+            // returns. A query issued the instant control resumes here can
+            // race that commit, so a miss below is NOT proof the deposit
+            // failed - it is logged as unconfirmed, not refused on, and
+            // `status` stays "applied" on the absence check alone, exactly as
+            // it did before this check existed.
+            bool bankRowConfirmed = false;
+            if (QueryResult bankRow = CharacterDatabase.Query(
+                    "SELECT 1 FROM guild_bank_item WHERE guildid = {} AND TabId = {} "
+                    "AND item_guid = {}",
+                    guild->GetId(), uint32(GUILD_BANK_DEPOSIT_TAB_V1), itemGuid.GetCounter()))
+            {
+                bankRowConfirmed = true;
+            }
+            else
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) - item guid {} entry {} ({}) x{} left "
+                         "{}'s bags but guild_bank_item does not show it in tab {} yet - "
+                         "this deposit's own commit is async and may just be racing this "
+                         "read; reconcile manually if this guid never appears",
+                         guild->GetName(), guild->GetId(), itemGuid.GetCounter(), itemEntry,
+                         itemName, itemCount, who->GetName(),
+                         uint32(GUILD_BANK_DEPOSIT_TAB_V1));
+            }
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"item_guid\":" << itemGuid.GetCounter()
+              << ",\"entry\":" << itemEntry
+              << ",\"name\":" << J(itemName)
+              << ",\"count\":" << itemCount
+              << ",\"tab\":" << uint32(GUILD_BANK_DEPOSIT_TAB_V1)
+              << ",\"bank_row_confirmed\":" << (bankRowConfirmed ? "true" : "false");
+            note = o.str();
+
+            LOG_INFO("module.overseer",
+                     "overseer: {} deposited {} x{} (guid {}) into guild '{}' ({}) bank tab {}",
+                     who->GetName(), itemName, itemCount, itemGuid.GetCounter(),
+                     guild->GetName(), guild->GetId(), uint32(GUILD_BANK_DEPOSIT_TAB_V1));
+
+            describe("deposited", "");
+            status = "applied";
+            return "";
+        }
+
         std::vector<GuildMemberFacts> const members = GuildRosterFacts(guild->GetId());
 
         // A SHORT ROSTER READ IS NOT AN EMPTY GUILD, AND THE DIFFERENCE IS THE

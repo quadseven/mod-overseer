@@ -11160,6 +11160,25 @@ enum class GuildVerb : std::uint8_t
     // member may deposit, the core's own `HandleMemberDepositMoney` performs
     // no rank check at all, only a bank-full ceiling.
     Bank,
+    // `bank deposit-item guid:<item_instance.guid>` or `bank deposit-item
+    // entry:<item id>` - move one carried item (the whole stack found, no
+    // partial split in v1) into the guild's bank tab 0. DEPOSIT ONLY, and
+    // TAB 0 ONLY (infra#3647 v1 narrowing - see mod-overseer/docs/design/
+    // guild-bank-deposit.md): unlike gold, an item deposit DOES go through
+    // the core's own per-rank permission gate
+    // (`Guild::MemberHasTabRights(..., GUILD_BANK_RIGHT_DEPOSIT_ITEM)`,
+    // enforced inside `Guild::_MoveItems` -> `BankMoveItemData::
+    // HasStoreRights`, verified at the pinned core revision) - this module
+    // does not pre-check that rank right itself, it calls the real API and
+    // reads whether the item actually left the character's bags afterward,
+    // the same "read before/after, trust the witness" discipline the money
+    // branch already keeps. A rank without deposit rights on tab 0, or a
+    // guild with no purchased bank tab at all, both come back as an ordinary
+    // silent-safe refusal from the core (`Guild::SwapItemsWithInventory`
+    // itself no-ops when `tabId >= _GetPurchasedTabsSize()`), never a crash
+    // and never a partial move. Which tab, whether to try other tabs, and
+    // withdraw are all explicitly deferred - see the design doc.
+    BankDepositItem,
 };
 
 struct GuildRequest
@@ -11175,6 +11194,14 @@ struct GuildRequest
     // parser refuses a zero amount the same way it refuses a missing one,
     // because "deposit nothing" is not a request this verb can act on.
     std::uint32_t depositCopper{0};
+    // BankDepositItem only: which carried item, in the same `guid:`/`entry:`
+    // convention DoGive's own item spec already uses (guid names exactly one
+    // item_instance row; entry names a type and picks whichever the
+    // character happens to be carrying). itemKey is never zero when verb is
+    // BankDepositItem - 0 is not a legal guid or entry, so the parser refuses
+    // it the same way a missing spec is refused.
+    bool itemByGuid{false};
+    std::uint32_t itemKey{0};
     // None only, and one of GuildRefusal's literals rather than a built
     // string. The adapter puts this straight into the command row's
     // `detail` column, which is written AFTER the executor has returned, so
@@ -11225,10 +11252,11 @@ constexpr unsigned GUILD_NAME_MAX = 24;
 namespace GuildRefusal
 {
 constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard or bank";
-constexpr char const* BankNeedsDeposit = "bank takes exactly `deposit <copper>`";
+constexpr char const* BankNeedsDeposit = "bank takes exactly `deposit <copper>` or `deposit-item <guid:N|entry:N>`";
 constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount and nothing else";
 constexpr char const* BankAmountIsZero = "a deposit of nothing is not a request";
 constexpr char const* BankAmountTooBig = "that deposit is larger than a character can ever carry";
+constexpr char const* BankItemSpecInvalid = "bank deposit-item takes guid:<item_instance.guid> or entry:<item id> and nothing else";
 constexpr char const* TabardNeedsFive = "tabard takes five numbers: style, colour, border style, border colour, background";
 constexpr char const* TabardNotANumber = "tabard takes five numbers and nothing else";
 constexpr char const* TabardValueTooBig = "a tabard value is stored as one byte; 255 is the most any of the five can be";

@@ -781,6 +781,46 @@ void BankDepositParses()
                 ParseGuildRequest("bank deposit 2147483646").error, "");
 }
 
+void BankDepositItemParses()
+{
+    using namespace OverseerDecisions::GuildRefusal;
+
+    GuildRequest const byGuid = ParseGuildRequest("bank deposit-item guid:494263");
+    Check("deposit-item by guid parses", byGuid.verb == GuildVerb::BankDepositItem);
+    Check("and is marked as a guid", byGuid.itemByGuid);
+    CheckUnsigned("carrying the guid", byGuid.itemKey, 494263);
+    CheckString("refused by nothing", byGuid.error, "");
+
+    GuildRequest const byEntry = ParseGuildRequest("bank deposit-item entry:4562");
+    Check("deposit-item by entry parses", byEntry.verb == GuildVerb::BankDepositItem);
+    Check("and is NOT marked as a guid", !byEntry.itemByGuid);
+    CheckUnsigned("carrying the entry", byEntry.itemKey, 4562);
+
+    Check("the verb is case insensitive like the others",
+          ParseGuildRequest("BANK deposit-item guid:1").verb == GuildVerb::BankDepositItem);
+    Check("blanks around the spec do not matter",
+          ParseGuildRequest("bank   deposit-item   guid:1  ").verb
+              == GuildVerb::BankDepositItem);
+
+    CheckString("no colon at all is refused",
+                ParseGuildRequest("bank deposit-item 494263").error, BankItemSpecInvalid);
+    CheckString("neither guid nor entry is refused",
+                ParseGuildRequest("bank deposit-item stack:494263").error,
+                BankItemSpecInvalid);
+    CheckString("a non-numeric value is refused",
+                ParseGuildRequest("bank deposit-item guid:abc").error, BankItemSpecInvalid);
+    CheckString("a key of zero is refused",
+                ParseGuildRequest("bank deposit-item guid:0").error, BankItemSpecInvalid);
+    CheckString("no spec at all is refused",
+                ParseGuildRequest("bank deposit-item").error, BankItemSpecInvalid);
+    CheckString("trailing words after the spec are refused",
+                ParseGuildRequest("bank deposit-item guid:5 extra").error,
+                BankItemSpecInvalid);
+    CheckString("an amount past uint32 is refused, not wrapped",
+                ParseGuildRequest("bank deposit-item guid:99999999999").error,
+                BankItemSpecInvalid);
+}
+
 void ABadRowIsRefusedByNameAndNeverSilently()
 {
     using namespace OverseerDecisions::GuildRefusal;
@@ -845,6 +885,7 @@ int main()
     TheFiveVerbsParse();
     ATabardIsFiveBytesOrItIsRefused();
     BankDepositParses();
+    BankDepositItemParses();
     ABadRowIsRefusedByNameAndNeverSilently();
 
     if (failures)
