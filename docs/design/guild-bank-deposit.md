@@ -126,6 +126,26 @@ item left the character via `FindCarriedItem` (DoGive's own helper, reused).
 `guildbank.format_item_deposit()` is a pure Python formatter for the command
 text - it decides nothing.
 
+**Update 2026-09-13: second witness added, and its real limit (Grug - Elder,
+PR #452 review).** Absence from the character's bags proves the item left,
+not that it landed in the bank tab. The correct positive read - the in-memory
+bank tab itself, `Guild::GetBankTab(tabId)->GetItem(slotId)` - is `private`
+on `Guild` at the pinned core revision, with no `friend` declaration this
+module could use; there is no public accessor to a bank tab's contents at
+this SHA. The only other read, the `guild_bank_item` table, is written by
+the same transaction as the deposit but committed through
+`DatabaseWorkerPool::CommitTransaction`, which enqueues onto an async worker
+thread rather than committing before the call returns - a query issued right
+after the move can race that commit. `DoGuild` now issues that query anyway
+as a best-effort positive signal (`bank_row_confirmed` in the result JSON,
+`LOG_WARN` on a miss) but does not refuse on a miss, since a miss is not
+proof of failure. This is a real, honest improvement over the pure absence
+check, not a complete fix - a complete fix needs either a public core
+accessor for bank tab contents, or a deferred verification pass (like the
+`verifying` status the strategy-command queue uses) that reads
+`guild_bank_item` on a later poll instead of immediately, which is not
+shipped here.
+
 **Deliberately NOT shipped, and why:** an automatic policy for WHICH items a
 character should give up (the family's actual ask - pooling crafting
 materials). This session had no live database connection to the family's

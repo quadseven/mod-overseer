@@ -34295,6 +34295,57 @@ private:
                               "this rank cannot deposit into it, or the tab is full");
             }
 
+            // SECOND WITNESS (Grug - Elder, PR #452 review): absence from the
+            // character's bags is necessary but not sufficient - it does not
+            // prove the item landed IN the bank tab. A full tab or a
+            // rank-lacking deposit both no-op inside Guild::_MoveItems
+            // (Guild.cpp:2730 - an early `return` before either side is
+            // touched), so if the item is truly gone from both places this
+            // check is moot; the case this guards is the core leaving it
+            // somewhere neither of those two reads expects.
+            //
+            // The correct positive read would be the in-memory bank tab
+            // itself - Guild::GetBankTab(tabId)->GetItem(slotId) - but at the
+            // pinned core revision (mod-playerbots/azerothcore-wotlk@4796018)
+            // `GetBankTab` and `_GetItem` are both `private` on `Guild`
+            // (Guild.h:818 `private:`, :826, :863) with no `friend`
+            // declaration anywhere in the header (grepped, none). This module
+            // is not part of the core and cannot reach either one - there is
+            // no public Guild accessor that returns a bank tab's contents at
+            // this SHA.
+            //
+            // The only other read is `guild_bank_item`, the table this
+            // deposit's own INSERT (CHAR_INS_GUILD_BANK_ITEM) writes to. That
+            // INSERT rides the same CharacterDatabaseTransaction as the
+            // removal from the character and is committed through
+            // `DatabaseWorkerPool::CommitTransaction`, which *enqueues* the
+            // commit onto an async worker thread (DatabaseWorkerPool.cpp:257)
+            // rather than executing it before `SwapItemsWithInventory`
+            // returns. A query issued the instant control resumes here can
+            // race that commit, so a miss below is NOT proof the deposit
+            // failed - it is logged as unconfirmed, not refused on, and
+            // `status` stays "applied" on the absence check alone, exactly as
+            // it did before this check existed.
+            bool bankRowConfirmed = false;
+            if (QueryResult bankRow = CharacterDatabase.Query(
+                    "SELECT 1 FROM guild_bank_item WHERE guildid = {} AND TabId = {} "
+                    "AND item_guid = {}",
+                    guild->GetId(), uint32(GUILD_BANK_DEPOSIT_TAB_V1), itemGuid.GetCounter()))
+            {
+                bankRowConfirmed = true;
+            }
+            else
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) - item guid {} entry {} ({}) x{} left "
+                         "{}'s bags but guild_bank_item does not show it in tab {} yet - "
+                         "this deposit's own commit is async and may just be racing this "
+                         "read; reconcile manually if this guid never appears",
+                         guild->GetName(), guild->GetId(), itemGuid.GetCounter(), itemEntry,
+                         itemName, itemCount, who->GetName(),
+                         uint32(GUILD_BANK_DEPOSIT_TAB_V1));
+            }
+
             std::ostringstream o;
             o << "\"guild\":" << J(guild->GetName())
               << ",\"guild_id\":" << guild->GetId()
@@ -34302,7 +34353,8 @@ private:
               << ",\"entry\":" << itemEntry
               << ",\"name\":" << J(itemName)
               << ",\"count\":" << itemCount
-              << ",\"tab\":" << uint32(GUILD_BANK_DEPOSIT_TAB_V1);
+              << ",\"tab\":" << uint32(GUILD_BANK_DEPOSIT_TAB_V1)
+              << ",\"bank_row_confirmed\":" << (bankRowConfirmed ? "true" : "false");
             note = o.str();
 
             LOG_INFO("module.overseer",
