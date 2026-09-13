@@ -10909,7 +10909,49 @@ struct RecruitBand
     unsigned highest{0};
 };
 
-// The band around a guild's own members, widened by `spread` at each end.
+// What the guild recruits by. Deployment configuration, not a measurement, and
+// not derived from the roster.
+//
+// WHY THIS REPLACED A BAND BUILT ROUND THE ROSTER (infra#3744). Until this
+// struct existed the band was `[min(member level) - spread, max + spread]`,
+// which reads sensibly and fails in a way nothing reports. Measured on the live
+// realm 2026-09-13: the family stood at 43/45/47/47/48, so the band was
+// [38, 53]; the unguilded population had 353 characters between 10 and 37, 83
+// at exactly 55, and NOT ONE between 38 and 54. The band sat in the hole. A
+// `shortlist` returned `considered: 1, shortlist: []` and every branch behind
+// it was unreachable, silently, with no error anywhere.
+//
+// AND IT WOULD HAVE GOT WORSE BEFORE IT GOT BETTER. That band tracks the roster
+// upward. Two more levels on the highest member would have carried the ceiling
+// to 55 and made the entire candidate pool 83 Death Knights standing at their
+// starting level - one class, one level, filling every seat. A rule whose
+// answer swings from nobody to a monoculture on one member dinging is not a
+// rule anybody chose.
+//
+// SO THE BAND IS SAID OUT LOUD INSTEAD OF INFERRED. A guild recruiting toward
+// a raid tier wants an ABSOLUTE range, not a relative one: what the raid needs
+// is fixed, and where the guild happens to be standing this week is not an
+// argument about who belongs in it.
+//
+// EACH END IS INDEPENDENTLY OPTIONAL, and 0 means "no gate at this end" rather
+// than "level 0". A guild with no policy at all gates on nothing, which is what
+// the empty-guild case wants and what an operator who has set only a floor
+// wants too. See RecruitVerdictFor, which asks the two ends separately for
+// exactly this reason.
+struct RecruitPolicy
+{
+    // The lowest level worth asking. 0 for no floor.
+    unsigned levelMin{0};
+    // The highest. 0 for no ceiling.
+    unsigned levelMax{0};
+    // The roster size the guild is aiming at. 0 for no size gate. Depth is only
+    // ever a reason to invite somebody while the roster is under this, and
+    // RecruitVerdictFor refuses RosterFull at it, so this bounds the INVITE
+    // path and not merely the shortlist.
+    unsigned targetSize{0};
+};
+
+// The policy's two level ends, as the band every candidate is measured against.
 //
 // WHY A BAND AT ALL. A level 6 cannot go where a level 36 goes and a level 70
 // will not be going there. The band is not about quality, it is about whether
@@ -10917,16 +10959,11 @@ struct RecruitBand
 // which is the one thing a guild is for and the one thing the level column can
 // honestly speak to.
 //
-// THE NUMBER IS A POLICY, NOT A MEASUREMENT, AND IT IS A PARAMETER SO THAT IT
-// READS AS ONE. It is not derived from anything in the database, because
-// nothing in the database knows it. The caller picks it; a spread near the
-// guild's own existing span is the obvious starting point, so that a recruit is
-// no further from the guild than its own members already are from each other.
-//
-// AN EMPTY GUILD HAS NO BAND, and that is returned as {0, 0} rather than as
-// something wide. A guild with no members has nobody to be near.
-RecruitBand GuildLevelBand(std::vector<GuildMemberFacts> const& members,
-                           unsigned spread);
+// THIS FUNCTION IS DELIBERATELY TRIVIAL. It exists so that there is exactly one
+// place where a policy becomes a band, and so that the band a candidate is
+// judged against and the band an operator typed are provably the same two
+// numbers. The bug this file is fixing was a second derivation nobody read.
+RecruitBand RecruitBandFrom(RecruitPolicy const& policy);
 
 // A character outside the guild, cut down the same way a member is.
 struct RecruitCandidate
@@ -11043,9 +11080,16 @@ struct GuildNeeds
     unsigned targetSize{0};
 };
 
+// The holes read off the roster, and the policy read off configuration, in one
+// object handed to every candidate so that a sweep of a thousand characters
+// asks each of them the same question.
+//
+// THE TWO HALVES COME FROM DIFFERENT PLACES ON PURPOSE. What the guild is SHORT
+// OF is a fact about its members and is computed here. What the guild is AIMING
+// AT is a decision a person made and arrives as `policy`. Deriving the second
+// from the first is what infra#3744 is about.
 GuildNeeds GuildNeedsFrom(std::vector<GuildMemberFacts> const& members,
-                          unsigned teamId, unsigned targetSize,
-                          unsigned bandSpread);
+                          unsigned teamId, RecruitPolicy const& policy);
 
 // Is this one candidate worth inviting, and why or why not.
 //

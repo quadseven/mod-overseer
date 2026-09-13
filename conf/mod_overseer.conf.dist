@@ -1,0 +1,115 @@
+########################################
+# mod-overseer configuration
+#
+# EVERY KEY HERE IS OPTIONAL AND EVERY KEY HERE IS COMMENTED OUT. The module
+# compiles a default for each one and uses it when the key is absent, so a
+# worldserver that has never seen this file behaves exactly as a worldserver
+# that has copied it unedited. Uncomment a line only to disagree with the
+# default, and the value you type is then the one the module uses - there is no
+# second place it could come from.
+#
+# WHY THIS FILE EXISTS AT ALL. Until infra#3744 the recruit policy was three
+# `static constexpr` values in src/mod_overseer.cpp, which meant that changing
+# how big the guild should be, or which levels it would ask, was a source edit,
+# a pinned-SHA bump, an image build and a promote. AGENTS.md's reusability half
+# is explicit about that shape: "Every value specific to one deployment ... is a
+# variable, an environment variable, or a config file entry - never a literal
+# baked into source." How large a guild wants to be is as deployment-specific as
+# a hostname.
+#
+########################################
+
+########################################
+#
+#    GUILD RECRUITING
+#
+#    The module's `guild shortlist` and `guild invite` verbs judge a candidate
+#    against three things it cannot work out for itself: how big the guild is
+#    trying to be, and the two ends of the level range it will ask inside.
+#    Everything else the rule uses - which professions nobody holds, which
+#    services no class brings, which combat roles nobody can fill - is read off
+#    the guild's own members and is not configurable, because it is a
+#    measurement rather than a decision.
+#
+#    THESE THREE GATE THE INVITE AND NOT MERELY THE SHORTLIST. A candidate
+#    outside the band, or an invite issued once the roster has reached the
+#    target size, is refused by RecruitVerdictFor on both paths. Widening these
+#    is the only way to reach a candidate; it is not a display preference.
+#
+
+#
+#    Overseer.Recruit.TargetSize
+#        Description: The roster size the guild is recruiting toward. Once the
+#                     guild holds this many members every further invite is
+#                     refused `RosterFull`, and below it "the roster is under
+#                     its target size" becomes a reason to invite somebody who
+#                     closes no specific hole.
+#
+#                     40 is the size of a Molten Core or Blackwing Lair raid,
+#                     which is what this realm's family guild is recruiting
+#                     toward. It is deliberately not 15: the twenty other guilds
+#                     on this realm each hold exactly 15, which is a fact about
+#                     the neighbours and not a decision about this guild.
+#
+#                     0 disables the size gate entirely. Think before using it:
+#                     with no size gate, "bench depth" is a reason to invite
+#                     every eligible character on the realm, for ever.
+#
+#        Default:     40
+#
+#Overseer.Recruit.TargetSize = 40
+
+#
+#    Overseer.Recruit.LevelMin
+#        Description: The lowest character level worth asking. 0 for no floor.
+#
+#                     A floor exists because a guild is for going to the same
+#                     places and doing the same things, and the level column is
+#                     the one honest thing the database can say about that. It
+#                     is NOT a quality judgement: nothing in a character
+#                     database says whether a player is any good, and this
+#                     module scores nobody.
+#
+#                     10 is where a character has begun to be its class and has
+#                     picked up trades. Below it this realm is mostly level 1
+#                     characters that are barely characters yet.
+#
+#                     IT IS ALSO, TODAY, THE ONLY THING KEEPING TWO SERVICE
+#                     CHARACTERS OUT. The auction-house bot's `Auctioneer` and
+#                     the dungeon driver's `Dcdriver` are unguilded level 1
+#                     characters on non-random-bot accounts, and `Auctioneer` is
+#                     a Druid, which is the second-highest thing the recruit
+#                     rule looks for. That protection holds only while they stay
+#                     at level 1. infra#3648 is the real account-type filter.
+#
+#        Default:     10
+#
+#Overseer.Recruit.LevelMin = 10
+
+#
+#    Overseer.Recruit.LevelMax
+#        Description: The highest character level worth asking. 0 for no
+#                     ceiling.
+#
+#                     60 is this realm's MaxPlayerLevel, so the default gates on
+#                     the only ceiling that is a fact rather than a preference.
+#
+#                     A CEILING BELOW THE POPULATION IS A REAL LEVER AND WORTH
+#                     KNOWING ABOUT. On this realm 83 unguilded characters stand
+#                     at exactly level 55 and every one of them is a Death
+#                     Knight - one class at one level, large enough to fill a
+#                     roster on its own once "bench depth" starts picking names
+#                     alphabetically. Setting this to 54 excludes them; leaving
+#                     it at 60 admits them. Neither is wrong, and the module
+#                     cannot decide it, because what a raid should be composed
+#                     of is not written down anywhere it can read.
+#
+#                     A ceiling BELOW the floor would be a gate that admits
+#                     nobody, so it is not honoured: the module drops the
+#                     ceiling and says so by answering a band with no upper end,
+#                     because "recruits too widely" is a mistake somebody
+#                     notices and "recruits nobody" is one nobody does.
+#
+#        Default:     60
+#
+#Overseer.Recruit.LevelMax = 60
