@@ -8555,30 +8555,23 @@ GuildFormationAction NextGuildFormationStep(GuildFormationState const& state,
     return action;
 }
 
-RecruitBand GuildLevelBand(std::vector<GuildMemberFacts> const& members,
-                           unsigned spread)
+RecruitBand RecruitBandFrom(RecruitPolicy const& policy)
 {
     RecruitBand band;
-    if (members.empty())
-        return band;
+    band.lowest = policy.levelMin;
+    band.highest = policy.levelMax;
 
-    unsigned lowest = members[0].level;
-    unsigned highest = members[0].level;
-    for (std::size_t i = 1; i < members.size(); ++i)
-    {
-        if (members[i].level < lowest)
-            lowest = members[i].level;
-        if (members[i].level > highest)
-            highest = members[i].level;
-    }
+    // A FLOOR ABOVE THE CEILING IS A GATE THAT ADMITS NOBODY, so it is not
+    // quietly honoured. Both ends are typed by a person into configuration and
+    // the pair can be got the wrong way round; left alone, the two gates in
+    // RecruitVerdictFor would then refuse every candidate alive, and the only
+    // symptom would be an empty shortlist - which is the exact failure
+    // infra#3744 spent a day diagnosing. Dropping the ceiling turns a typo into
+    // "recruits too widely", which somebody notices, instead of "recruits
+    // nobody", which nobody does.
+    if (band.lowest != 0 && band.highest != 0 && band.lowest > band.highest)
+        band.highest = 0;
 
-    // The floor is clamped at 1 rather than allowed to wrap. `lowest` is
-    // unsigned and a spread wider than the guild's own lowest level would
-    // otherwise produce a band starting near four billion, which admits
-    // nobody at all - a gate that silently refuses everything is exactly the
-    // failure this file keeps finding elsewhere.
-    band.lowest = (lowest > spread) ? (lowest - spread) : 1u;
-    band.highest = highest + spread;
     return band;
 }
 
@@ -8620,17 +8613,16 @@ char const* RecruitNeedName(RecruitNeed need)
 }
 
 GuildNeeds GuildNeedsFrom(std::vector<GuildMemberFacts> const& members,
-                          unsigned teamId, unsigned targetSize,
-                          unsigned bandSpread)
+                          unsigned teamId, RecruitPolicy const& policy)
 {
     GuildNeeds needs;
     needs.professionGaps = GuildProfessionGaps(GuildProfessionView(members));
     needs.serviceGaps = GuildServiceGaps(members);
     needs.roleGaps = GuildRoleGaps(members);
-    needs.band = GuildLevelBand(members, bandSpread);
+    needs.band = RecruitBandFrom(policy);
     needs.teamId = teamId;
     needs.memberCount = static_cast<unsigned>(members.size());
-    needs.targetSize = targetSize;
+    needs.targetSize = policy.targetSize;
     return needs;
 }
 
@@ -8648,9 +8640,11 @@ RecruitVerdict RecruitVerdictFor(RecruitCandidate const& candidate,
         refusal = RecruitRefusal::Gone;
     else if (candidate.teamId != needs.teamId)
         refusal = RecruitRefusal::OtherFaction;
-    // A band of {0, 0} is an empty guild, which has nobody to be near, so the
-    // level gate does not apply rather than refusing everybody.
-    else if (needs.band.highest != 0 && candidate.level < needs.band.lowest)
+    // EACH END IS ASKED ON ITS OWN, and 0 at an end means that end does not
+    // gate. Both ends used to be conditional on the CEILING being set, which
+    // made a floor-only policy silently admit everybody below the floor - the
+    // ceiling is not evidence about the floor and must not stand in for it.
+    else if (needs.band.lowest != 0 && candidate.level < needs.band.lowest)
         refusal = RecruitRefusal::BelowBand;
     else if (needs.band.highest != 0 && candidate.level > needs.band.highest)
         refusal = RecruitRefusal::AboveBand;

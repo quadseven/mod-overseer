@@ -36,7 +36,6 @@ using OverseerDecisions::GuildFormationAction;
 using OverseerDecisions::GuildFormationFacts;
 using OverseerDecisions::GuildFormationState;
 using OverseerDecisions::GuildFormationStep;
-using OverseerDecisions::GuildLevelBand;
 using OverseerDecisions::GuildMemberFacts;
 using OverseerDecisions::GuildNeeds;
 using OverseerDecisions::GuildNeedsFrom;
@@ -54,9 +53,11 @@ using OverseerDecisions::ProfessionCover;
 using OverseerDecisions::ProfessionHolding;
 using OverseerDecisions::ProfessionName;
 using OverseerDecisions::RecruitBand;
+using OverseerDecisions::RecruitBandFrom;
 using OverseerDecisions::RecruitCandidate;
 using OverseerDecisions::RecruitNeed;
 using OverseerDecisions::RecruitPick;
+using OverseerDecisions::RecruitPolicy;
 using OverseerDecisions::RecruitRefusal;
 using OverseerDecisions::RecruitShortlist;
 using OverseerDecisions::RecruitVerdict;
@@ -183,11 +184,24 @@ RecruitCandidate Candidate(char const* name, unsigned classId, unsigned level,
     return candidate;
 }
 
-// The needs the family actually has, at a roster target of fifteen - about what
-// the guilds already on this realm carry.
+// The policy the family recruits by in these tests. Deliberately NOT derived
+// from the roster above: that derivation is the defect infra#3744 removed, and
+// a fixture that reintroduced it would make every case below agree with a rule
+// that no longer exists. The family sits at 34-38, and the band is written here
+// as two numbers a person could have typed.
+RecruitPolicy FamilyPolicy(unsigned targetSize = 15)
+{
+    RecruitPolicy policy;
+    policy.levelMin = 29;
+    policy.levelMax = 43;
+    policy.targetSize = targetSize;
+    return policy;
+}
+
+// The needs the family actually has, at a roster target of fifteen.
 GuildNeeds FamilyNeeds()
 {
-    return GuildNeedsFrom(TheFamily(), HORDE, 15, 5);
+    return GuildNeedsFrom(TheFamily(), HORDE, FamilyPolicy());
 }
 
 // -- the view ---------------------------------------------------------------
@@ -306,24 +320,122 @@ void TheFamilyBringsNoneOfTheThreeServices()
                   static_cast<unsigned>(GuildServiceGaps(withAWarlock).size()), 2);
 }
 
-void TheBandIsBuiltRoundTheGuildAndDoesNotWrap()
+void TheBandIsThePolicyAndNotTheRoster()
 {
-    RecruitBand const band = GuildLevelBand(TheFamily(), 5);
-    CheckUnsigned("the floor is the lowest member less the spread", band.lowest, 29);
-    CheckUnsigned("the ceiling is the highest plus it", band.highest, 43);
+    // THE WHOLE POINT OF infra#3744, asserted directly: the band is what the
+    // policy says, and the guild's own levels do not enter into it. The family
+    // used in these tests is levels 34-38; the policy below says 10-60 and the
+    // band that comes out says 10-60.
+    RecruitPolicy wide;
+    wide.levelMin = 10;
+    wide.levelMax = 60;
+    RecruitBand const band = RecruitBandFrom(wide);
+    CheckUnsigned("the floor is the configured floor", band.lowest, 10);
+    CheckUnsigned("the ceiling is the configured ceiling", band.highest, 60);
 
-    // The unsigned trap: a spread wider than the guild's own lowest level must
-    // clamp at 1 rather than wrapping to near four billion, which would be a
-    // gate that silently admits nobody.
-    std::vector<GuildMemberFacts> lowbies;
-    lowbies.push_back(Member("Pip", ROGUE, 3, SKINNING, 10, 0, 0));
-    RecruitBand const clamped = GuildLevelBand(lowbies, 10);
-    CheckUnsigned("the floor clamps at 1 rather than wrapping", clamped.lowest, 1);
-    CheckUnsigned("the ceiling is unaffected", clamped.highest, 13);
+    GuildNeeds const needs = GuildNeedsFrom(TheFamily(), HORDE, wide);
+    CheckUnsigned("and the needs carry that band, not one built from members",
+                  needs.band.lowest, 10);
+    CheckUnsigned("at the top end too", needs.band.highest, 60);
+    CheckUnsigned("the target size comes from the policy as well",
+                  needs.targetSize, wide.targetSize);
 
-    RecruitBand const none = GuildLevelBand({}, 5);
-    CheckUnsigned("an empty guild has no floor", none.lowest, 0);
+    RecruitBand const none = RecruitBandFrom(RecruitPolicy{});
+    CheckUnsigned("an unset policy has no floor", none.lowest, 0);
     CheckUnsigned("and no ceiling", none.highest, 0);
+}
+
+void AnUpsideDownBandAdmitsEverybodyRatherThanNobody()
+{
+    // A floor above the ceiling is a typo, and the two gates would refuse every
+    // character alive. The only symptom would be an empty shortlist, which is
+    // precisely the failure that took a day to find. So the ceiling is dropped:
+    // recruiting too widely is a mistake somebody notices.
+    RecruitPolicy inverted;
+    inverted.levelMin = 55;
+    inverted.levelMax = 20;
+    RecruitBand const band = RecruitBandFrom(inverted);
+    CheckUnsigned("the floor the operator typed is kept", band.lowest, 55);
+    CheckUnsigned("the impossible ceiling is dropped rather than honoured",
+                  band.highest, 0);
+}
+
+void EachEndOfTheBandGatesOnItsOwn()
+{
+    std::vector<GuildMemberFacts> const family = TheFamily();
+
+    // A FLOOR WITH NO CEILING STILL REFUSES BELOW THE FLOOR. This used to be
+    // wrong in the direction that matters: both gates hung off the CEILING
+    // being set, so a floor-only policy admitted every level 1 character on the
+    // realm - including, on the live realm, an unguilded level 1 DRUID
+    // belonging to the auction-house bot.
+    RecruitPolicy floorOnly;
+    floorOnly.levelMin = 10;
+    floorOnly.targetSize = 15;
+    GuildNeeds const open = GuildNeedsFrom(family, HORDE, floorOnly);
+
+    RecruitCandidate const tooLow = Candidate("Pip", DRUID, 1, 0, 0);
+    Check("a level 1 is refused by a floor-only policy",
+          RecruitVerdictFor(tooLow, open).refusal == RecruitRefusal::BelowBand);
+
+    RecruitCandidate const veryHigh = Candidate("Zug", DRUID, 200, 0, 0);
+    Check("and nothing is too high when no ceiling was set",
+          RecruitVerdictFor(veryHigh, open).invite);
+
+    // The mirror: a ceiling with no floor gates only at the top.
+    RecruitPolicy ceilingOnly;
+    ceilingOnly.levelMax = 60;
+    ceilingOnly.targetSize = 15;
+    GuildNeeds const capped = GuildNeedsFrom(family, HORDE, ceilingOnly);
+    Check("a level 1 is admitted when no floor was set",
+          RecruitVerdictFor(tooLow, capped).invite);
+    Check("and the ceiling still refuses above it",
+          RecruitVerdictFor(veryHigh, capped).refusal == RecruitRefusal::AboveBand);
+}
+
+void APolicyWideEnoughReachesThePopulationTheRosterRelativeBandMissed()
+{
+    // THE LIVE FAILURE, AS A TEST. Measured on wow-dev 2026-09-13: the family
+    // stood at 43/45/47/47/48, the old rule built [38, 53] from that, and the
+    // unguilded realm held 353 characters between 10 and 37 and NOT ONE between
+    // 38 and 54. Every one of those 353 was refused BelowBand, and the only
+    // thing anybody saw was an empty shortlist.
+    std::vector<GuildMemberFacts> cave;
+    cave.push_back(Member("Bork", ROGUE, 43, SKINNING, 12, 0, 0));
+    cave.push_back(Member("Grog", PALADIN, 45, MINING, 1, 0, 0));
+    cave.push_back(Member("Grug", WARRIOR, 47, MINING, 8, 0, 0));
+    cave.push_back(Member("Og", MAGE, 47, TAILORING, 100, ENCHANTING, 90));
+    cave.push_back(Member("Ugga", PRIEST, 48, HERBALISM, 132, 0, 0));
+
+    // A level 22 druid: the shape of most of that 353, and a class that closes
+    // one of the three service holes this family actually has.
+    RecruitCandidate const lowDruid = Candidate("Sprout", DRUID, 22, 0, 0);
+
+    RecruitPolicy asItWas;          // what [38, 53] amounted to
+    asItWas.levelMin = 38;
+    asItWas.levelMax = 53;
+    asItWas.targetSize = 15;
+    Check("the band that sat in the population hole refused them",
+          RecruitVerdictFor(lowDruid, GuildNeedsFrom(cave, HORDE, asItWas))
+              .refusal == RecruitRefusal::BelowBand);
+
+    RecruitPolicy asShipped;        // the defaults this change ships
+    asShipped.levelMin = 10;
+    asShipped.levelMax = 60;
+    asShipped.targetSize = 40;
+    RecruitVerdict const now =
+        RecruitVerdictFor(lowDruid, GuildNeedsFrom(cave, HORDE, asShipped));
+    Check("the shipped defaults invite them", now.invite);
+    Check("and for the battle resurrection nobody in the family brings",
+          now.need == RecruitNeed::Service);
+
+    // AND THE SIZE GATE MOVED WITH IT. Five members against a target of 15 left
+    // ten reachable seats; against 40 it leaves thirty-five. This gates the
+    // INVITE path, so it is the difference between a guild that can reach a
+    // raid roster and one that refuses at fifteen however often it is asked.
+    GuildNeeds const full = GuildNeedsFrom(cave, HORDE, asShipped);
+    CheckUnsigned("the roster is five", full.memberCount, 5);
+    CheckUnsigned("against a target of forty", full.targetSize, 40);
 }
 
 // -- the gates ---------------------------------------------------------------
@@ -432,7 +544,7 @@ void TheNeedTiersAreInTheOrderTheHeaderClaims()
     // is a role hole to close at all.
     std::vector<GuildMemberFacts> justAMage;
     justAMage.push_back(Member("Og", MAGE, 34, TAILORING, 165, ENCHANTING, 120));
-    GuildNeeds const thin = GuildNeedsFrom(justAMage, HORDE, 10, 5);
+    GuildNeeds const thin = GuildNeedsFrom(justAMage, HORDE, FamilyPolicy(10));
     RecruitCandidate const tank = Candidate("Grug", WARRIOR, 34, 0, 0);
     Check("a tank for a guild with none is invited for the role",
           RecruitVerdictFor(tank, thin).need == RecruitNeed::Role);
@@ -871,7 +983,10 @@ int main()
     TheFamilysOnlyProfessionHoleIsEngineering();
     TheFamilyAlreadyCoversEveryRole();
     TheFamilyBringsNoneOfTheThreeServices();
-    TheBandIsBuiltRoundTheGuildAndDoesNotWrap();
+    TheBandIsThePolicyAndNotTheRoster();
+    AnUpsideDownBandAdmitsEverybodyRatherThanNobody();
+    EachEndOfTheBandGatesOnItsOwn();
+    APolicyWideEnoughReachesThePopulationTheRosterRelativeBandMissed();
     SomebodyElsesGuildMemberIsNeverTaken();
     TheGatesAreAskedInOrderAndEveryRefusalNamesItself();
     TheNeedTiersAreInTheOrderTheHeaderClaims();

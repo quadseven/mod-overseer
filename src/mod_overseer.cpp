@@ -194,6 +194,14 @@
 #include "CellImpl.h"
 #include "CharacterCache.h"
 #include "Chat.h"
+// The guild recruit policy (infra#3744). This is the only configuration this
+// module reads, and it reads it here rather than baking the numbers in because
+// what size a guild is aiming at and which levels it will ask are decisions a
+// person makes about one deployment. AGENTS.md's reusability half says exactly
+// that: "Every value specific to one deployment ... is a variable, an
+// environment variable, or a config file entry - never a literal baked into
+// source." See conf/mod_overseer.conf.dist and RecruitPolicyFromConfig below.
+#include "Config.h"
 #include "Corpse.h"
 #include "Log.h"
 #include "DatabaseEnv.h"
@@ -33638,13 +33646,19 @@ private:
         std::map<uint32, size_t> byGuid;
 
         // THE SQL BAND AND THE RULE'S BAND HAVE TO BE THE SAME BAND.
-        // GuildLevelBand answers {0, 0} for a guild with no members, and
-        // RecruitVerdictFor reads that as `no level gate applies` rather than
-        // as a band of zero. `BETWEEN 0 AND 0` is the opposite: it matches
-        // nobody. Left as it was, the query would quietly answer `there is
-        // nobody to recruit` in exactly the case the rule means `anybody`.
-        // 255 is the ceiling of `characters`.`level`, a TINYINT UNSIGNED.
-        uint32 const floorLevel = band.highest ? band.lowest : 1u;
+        // A 0 at either end means `this end does not gate` to
+        // RecruitVerdictFor, and `BETWEEN 0 AND 0` is the opposite: it matches
+        // nobody. Left to translate literally, the query would quietly answer
+        // `there is nobody to recruit` in exactly the case the rule means
+        // `anybody`. So an unset end becomes the widest value the column can
+        // hold rather than a zero: 1 is the lowest level a character can be,
+        // and 255 is the ceiling of `characters`.`level`, a TINYINT UNSIGNED.
+        //
+        // THE TWO ENDS ARE TRANSLATED SEPARATELY, because they gate separately
+        // now. Deciding the floor from whether the CEILING was set is how a
+        // floor-only policy would have fetched - and then admitted - every
+        // level 1 character on the realm.
+        uint32 const floorLevel = band.lowest ? band.lowest : 1u;
         uint32 const ceilLevel = band.highest ? band.highest : 255u;
 
         QueryResult rows = CharacterDatabase.Query(
@@ -33706,20 +33720,57 @@ private:
         return candidates;
     }
 
-    // The guild the roster means, and the size it is aiming at.
+    // THE RECRUIT POLICY DEFAULTS, and why each is the number it is.
     //
-    // TARGET SIZE IS A CONSTANT HERE AND NOT A COLUMN, deliberately, because a
-    // number nothing reads is worse than a number in one place. Fifteen is
-    // roughly what the guilds already on this realm carry, so it is a shape
-    // that has been observed rather than one that was picked; when something
-    // needs to change it, it becomes a column then, with a migration, rather
-    // than being guessed at now.
-    static constexpr uint32 GUILD_TARGET_SIZE = 15;
-    // The band the recruiting rule is asked for. Five is about the family's own
-    // spread, so a recruit is no further from the guild than its members
-    // already are from each other. See GuildLevelBand: the number is a policy,
-    // not a measurement, and this is where the policy is written down.
-    static constexpr uint32 GUILD_BAND_SPREAD = 5;
+    // These are what the module does when nothing is configured. They are
+    // defaults and not the policy: `conf/mod_overseer.conf.dist` documents the
+    // three keys, and an operator who wants different numbers sets them there
+    // and restarts the worldserver. Nobody has to rebuild to change their mind
+    // about how big a guild should be.
+    //
+    // TARGET SIZE 40, because a guild recruiting toward Molten Core and
+    // Blackwing Lair is recruiting toward a 40-man raid, and that is the number
+    // the raid is. This was 15 - "roughly what the guilds already on this realm
+    // carry", which is true and measured (all twenty other guilds hold exactly
+    // 15) - but it is a description of the neighbours rather than a decision
+    // about this guild, and it gated the INVITE path, so the family could not
+    // have reached 40 however many times it was asked to.
+    //
+    // LEVEL FLOOR 10, and this one does real work. It is where a character has
+    // a class it has begun to be, has picked up trades, and is out of the
+    // starting zone; below it the realm is 227 characters at level 1 that are
+    // barely characters yet. It also happens to exclude the two non-bot service
+    // characters on this realm (`Auctioneer` on the AHBOT account and
+    // `Dcdriver` on DCDRIVER, both level 1, both unguilded, and the first of
+    // them a DRUID, which is the second-highest thing this rule looks for).
+    // THAT IS A HAPPY ACCIDENT AND NOT A RAIL: it holds only while those two
+    // stay at level 1. infra#3648 is the actual account-type filter and it is
+    // still needed.
+    //
+    // LEVEL CEILING 60, because that is this realm's MaxPlayerLevel, so it
+    // gates on the only ceiling that is a fact rather than a preference.
+    static constexpr uint32 GUILD_TARGET_SIZE_DEFAULT = 40;
+    static constexpr uint32 GUILD_LEVEL_MIN_DEFAULT = 10;
+    static constexpr uint32 GUILD_LEVEL_MAX_DEFAULT = 60;
+
+    // The policy as configured, read fresh each time a guild command runs.
+    //
+    // READ PER COMMAND AND NOT CACHED, on purpose. A guild verb runs at most a
+    // few times an hour, so three sConfigMgr lookups cost nothing measurable,
+    // and reading them at load time would mean a `.reload config` that changed
+    // the numbers and a module that went on using the old ones - a
+    // configuration that lies about itself is worse than one that is slow.
+    static OverseerDecisions::RecruitPolicy RecruitPolicyFromConfig()
+    {
+        OverseerDecisions::RecruitPolicy policy;
+        policy.levelMin = sConfigMgr->GetOption<uint32>(
+            "Overseer.Recruit.LevelMin", GUILD_LEVEL_MIN_DEFAULT);
+        policy.levelMax = sConfigMgr->GetOption<uint32>(
+            "Overseer.Recruit.LevelMax", GUILD_LEVEL_MAX_DEFAULT);
+        policy.targetSize = sConfigMgr->GetOption<uint32>(
+            "Overseer.Recruit.TargetSize", GUILD_TARGET_SIZE_DEFAULT);
+        return policy;
+    }
 
     // Form a guild, look at what it covers, find who would fill the holes, and
     // ask one of them in (#413).
@@ -34425,7 +34476,7 @@ private:
             // not have to notice an absence to find it.
             GuildNeeds const needs =
                 GuildNeedsFrom(members, static_cast<unsigned>(who->GetTeamId()),
-                               GUILD_TARGET_SIZE, GUILD_BAND_SPREAD);
+                               RecruitPolicyFromConfig());
             o << ",\"missing_professions\":[";
             for (size_t i = 0; i < needs.professionGaps.size(); ++i)
                 o << (i ? "," : "") << J(OverseerDecisions::ProfessionName(needs.professionGaps[i]));
@@ -34445,7 +34496,7 @@ private:
 
         GuildNeeds const needs =
             GuildNeedsFrom(members, static_cast<unsigned>(who->GetTeamId()),
-                           GUILD_TARGET_SIZE, GUILD_BAND_SPREAD);
+                           RecruitPolicyFromConfig());
 
         if (request.verb == GuildVerb::Shortlist)
         {
@@ -34459,7 +34510,7 @@ private:
             std::ostringstream o;
             o << "\"guild\":" << J(guild->GetName())
               << ",\"members\":" << members.size()
-              << ",\"target_size\":" << GUILD_TARGET_SIZE
+              << ",\"target_size\":" << needs.targetSize
               << ",\"band\":{\"lowest\":" << needs.band.lowest
               << ",\"highest\":" << needs.band.highest << '}'
               << ",\"considered\":" << candidates.size()
