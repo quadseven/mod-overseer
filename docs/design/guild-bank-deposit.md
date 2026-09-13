@@ -94,3 +94,47 @@ project constraint — it needs a full core+module build). Writing a plausible-l
 this project's own memory warns about repeatedly ("confident WRONG guidance beats
 missing guidance for danger") — better to hand the next implementer a specific,
 narrow, verified-safe target than a guess that reads as done.
+
+## Update 2026-09-13 (infra#3647): item deposit MECHANISM shipped
+
+A real AzerothCore core checkout was reachable this session via `gh api` against
+the pinned SHA (`AC_CORE_SHA` in `UPSTREAM-PINS.env`,
+`mod-playerbots/azerothcore-wotlk@4796018`), so the `Guild` item API predicted
+above is now verified rather than guessed:
+
+- `Guild::SwapItemsWithInventory(Player* player, bool toChar, uint8 tabId,
+  uint8 slotId, uint8 playerBag, uint8 playerSlotId, uint32 splitedAmount)`
+  (Guild.h:779, public) is the real call - it takes a `Player*`, not a
+  `WorldSession*`, so it is callable server-side exactly like `DoGive`'s
+  generic item move, with no client packet required.
+- It DOES go through the core's own per-rank permission gate -
+  `BankMoveItemData::HasStoreRights` (Guild.cpp:829) calls
+  `Guild::MemberHasTabRights(guid, tabId, GUILD_BANK_RIGHT_DEPOSIT_ITEM)` -
+  unlike gold, which has none. This module does not pre-check that right; it
+  calls the real API and reads whether the item actually left the character's
+  bags, the same read-before/witness-after discipline the gold branch already
+  uses. `Guild::_MoveItems` (Guild.cpp:2730) is silent-safe on any refusal -
+  an early `return` with no partial state - whether the cause is a missing
+  rank right, no purchased bank tab (`tabId >= _GetPurchasedTabsSize()`), or a
+  full tab.
+
+**What shipped (mechanism, not policy):** `GuildVerb::BankDepositItem` -
+`bank deposit-item guid:<item_instance.guid>` or `entry:<item id>`, tab 0
+only, whole-stack only (no partial split), deposit only. `DoGuild` in
+`mod_overseer.cpp` calls the real `SwapItemsWithInventory` and verifies the
+item left the character via `FindCarriedItem` (DoGive's own helper, reused).
+`guildbank.format_item_deposit()` is a pure Python formatter for the command
+text - it decides nothing.
+
+**Deliberately NOT shipped, and why:** an automatic policy for WHICH items a
+character should give up (the family's actual ask - pooling crafting
+materials). This session had no live database connection to the family's
+real inventory (`characters`/`item_instance` are only reachable from inside
+the running stack), so there was no measured data to size a threshold
+against - inventing one would repeat the exact "confident wrong guidance"
+mistake this doc already warned about for the API itself. Also not shipped:
+withdraw (per-rank slot budget, unchanged reasoning above), multi-tab
+selection (needs a real read of which tabs the guild has purchased - tab 0
+is a placeholder, not a decision), and wiring this into an automatic loop
+the way `_guild_bank_once` does for gold. See infra#3647 for the follow-up
+issue this is filed against.
