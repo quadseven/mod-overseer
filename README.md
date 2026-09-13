@@ -26,6 +26,30 @@ this way internally; this just makes the structure match the pin.
   database, applied in filename order at container startup. Each migration is
   guarded: a schema older than a given column degrades rather than crashing,
   so a build can run against a database that hasn't caught up yet.
+- `conf/mod_overseer.conf.dist` — the module's configuration, and the example
+  config file. See below; there is very little of it on purpose.
+
+## Configuring it
+
+Almost nothing here is configurable, and that is deliberate: most of what this
+module decides it works out from the database at the moment it is asked, and a
+setting duplicating something the database already knows would be a second
+answer that could disagree with the first.
+
+What IS configuration is the handful of values that are a **decision somebody
+made about one deployment** rather than a measurement — today, the guild
+recruit policy: how big the guild is recruiting toward, and the two ends of the
+level range it will ask inside. Nothing in a character database knows those.
+
+Every key is optional and has a compiled default, so a worldserver that has
+never seen `conf/mod_overseer.conf.dist` behaves exactly as one that copied it
+unedited. Copy it to `mod_overseer.conf` in your worldserver's module config
+directory and uncomment a line only to disagree with a default.
+
+**The core does not fall back to a `.conf.dist`.** If the copy is not made, the
+worldserver logs a missing-file line at startup and the module runs on its
+compiled defaults — harmless in effect, but none of the settings are then
+visible or tunable without a rebuild.
 
 ## Building it
 
