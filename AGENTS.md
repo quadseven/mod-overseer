@@ -112,6 +112,8 @@ beyond the README and an example config file to know what to change.
   exists — they're already written to take config as input rather than
   assume it.
 
+<!-- repo-specific below -->
+
 ## Working on this module: things learned the expensive way
 
 None of this is policy. It is the set of mistakes that have actually been

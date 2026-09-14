@@ -12,7 +12,7 @@ on:
 
 jobs:
   sync:
-    uses: quadseven/infra-public/.github/workflows/sync.public-repo-docs.yml@b51d47fc20b543158c4cc93f3e18f45e8597bb16
+    uses: quadseven/infra-public/.github/workflows/sync.public-repo-docs.yml@caa16ebe1116551eacd8ff9a74441b81525dd83a
     permissions:
       contents: write
       pull-requests: write
