@@ -961,14 +961,34 @@ void ABadRowIsRefusedByNameAndNeverSilently()
     CheckString("a count that would wrap is refused before it does",
                 ParseGuildRequest("shortlist 99999999999999999999").error, CountTooBig);
 
+    CheckString("raid with a word it does not know is refused",
+                ParseGuildRequest("raid disband").error, RaidTakesFormOrNothing);
+
     // Every refusal literal goes into a column through an UPDATE, so none of
     // them may carry a quote.
-    char const* const literals[] = {NoVerb,          NoName,          NameTooLong,
-                                    NotACount,       CountTooBig,     CountIsZero,
-                                    BankNeedsDeposit, BankAmountNotANumber,
-                                    BankAmountIsZero, BankAmountTooBig};
+    //
+    // THE COUNT IS TAKEN FROM THE ARRAY AND NOT WRITTEN OUT. It used to be a
+    // literal 10 beside an array of 10, which meant the four tabard literals
+    // and the deposit-item one were never swept and nothing said so - a loop
+    // bound that has to be kept in step with a list beside it is a loop bound
+    // that will not be.
+    char const* const literals[] = {NoVerb,
+                                    NoName,
+                                    NameTooLong,
+                                    NotACount,
+                                    CountTooBig,
+                                    CountIsZero,
+                                    BankNeedsDeposit,
+                                    BankAmountNotANumber,
+                                    BankAmountIsZero,
+                                    BankAmountTooBig,
+                                    BankItemSpecInvalid,
+                                    TabardNeedsFive,
+                                    TabardNotANumber,
+                                    TabardValueTooBig,
+                                    RaidTakesFormOrNothing};
     bool clean = true;
-    for (std::size_t i = 0; i < 10; ++i)
+    for (std::size_t i = 0; i < sizeof(literals) / sizeof(literals[0]); ++i)
         for (char const* c = literals[i]; *c; ++c)
             clean = clean && *c != 0x27 && *c != 0x22 && *c != 0x5c;
     Check("no refusal literal carries a quote", clean);
