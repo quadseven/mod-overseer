@@ -29489,6 +29489,13 @@ private:
         // rows it can before it hands out new work.
         ResolveCastChecks(sincePollMs);
 
+        // ...and the learns, which wait out spell 483's own three second cast
+        // and then ask Player::HasSpell whether the recipe arrived. Beside the
+        // casts because it is the same kind of row - a cast this module drove
+        // and cannot judge in the same breath - and after them for the same
+        // reason the casts come after the conjures.
+        ResolveLearnChecks(sincePollMs);
+
         // Then end any cast hold that outlived the row that placed it (#335).
         // AFTER the five above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
@@ -29715,6 +29722,16 @@ private:
                                   _pendingSummons, id);
             else if (kind == "conjure")
                 detail = DoConjure(player, command, status, rowResult, _pendingConjures, id);
+            else if (kind == "cast" && OverseerDecisions::IsLearnRow(command))
+                // THE SAME `kind`, TWO GRAMMARS, AND NOTHING ELSE HERE KNOWS IT.
+                // A cast row begins with a spell id, which is digits; a learn
+                // row begins with the word `use`. Routed on that and on nothing
+                // vaguer - a malformed spell id must keep reaching DoCast, whose
+                // own sentences say what a cast row looks like. Sharing the kind
+                // is what keeps this verb off an ENUM migration, which reaches a
+                // world only when db-import runs.
+                detail = DoLearnRecipe(player, command, status, rowResult,
+                                       _pendingLearns, id);
             else if (kind == "cast")
                 detail = DoCast(player, command, status, rowResult, _pendingCasts, id);
             else if (kind == "guild")
@@ -31605,6 +31622,12 @@ private:
             case EQUIP_ERR_CANT_CARRY_MORE_OF_THIS:     return "EQUIP_ERR_CANT_CARRY_MORE_OF_THIS";
             case EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT:      return "EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT";
             case EQUIP_ERR_MUST_PURCHASE_THAT_BAG_SLOT: return "EQUIP_ERR_MUST_PURCHASE_THAT_BAG_SLOT";
+            // The two Player::CanUseItem produces for a profession wall
+            // (PlayerStorage.cpp:2402-2412), named for the same reason as the
+            // rest: `learn` refuses on exactly these, and a recipe a character
+            // cannot yet use is the commonest thing that verb has to say.
+            case EQUIP_ERR_CANT_EQUIP_SKILL:            return "EQUIP_ERR_CANT_EQUIP_SKILL";
+            case EQUIP_ERR_NO_REQUIRED_PROFICIENCY:     return "EQUIP_ERR_NO_REQUIRED_PROFICIENCY";
             default:                                    return "";
         }
     }
@@ -37747,6 +37770,593 @@ private:
         }
 
         _pendingCasts.swap(stillCasting);
+    }
+
+    // --------------------------------------------------------------- learn --
+    //
+    // Learn a crafting recipe by USING the item that teaches it - a Pattern, a
+    // Formula, a Manual, a Recipe, Plans, a Schematic or a Design, every one of
+    // them item_template.class 9.
+    //
+    // WHY THIS IS NOT THE TRAINER PROBLEM. A recipe reaches a character by one
+    // of two unrelated routes. A trainer teaches some of them, and that route
+    // is blocked: TrainerSpellForSkill returns only a skill's RANK spells and
+    // never the recipes a trainer also sells. An ITEM teaches the others, and
+    // that route was not blocked so much as absent - nothing in this module
+    // could use an item for anything except a hearthstone. This verb is that
+    // route. It does not fix the trainer one and does not try to.
+    //
+    // WHY IT IS NOT `cast`, WHICH LOOKS LIKE IT SHOULD COVER IT. Reading the
+    // pinned core rather than the item table is what settles this, and the
+    // wrong answer would have been a silent no-op rather than an error:
+    //
+    //   Such an item carries spell 483 ("Learning") in slot 1 at spelltrigger 0
+    //   and the recipe itself in slot 2 at spelltrigger 6. NOTHING IN THE CORE
+    //   SWITCHES ON TRIGGER 6 - ItemTemplate.h names it
+    //   ITEM_SPELLTRIGGER_LEARN_SPELL_ID and that is the whole of its use. The
+    //   mechanism is a hardcoded special case at the top of
+    //   Player::CastItemUseSpell (Player.cpp:7591-7611): it builds spell 483 by
+    //   hand, sets m_CastItem, and calls
+    //   SetSpellValue(SPELLVALUE_BASE_POINT0, Spells[1].SpellId). Spell 483's
+    //   one effect is SPELL_EFFECT_LEARN_SPELL, and EffectLearnSpell
+    //   (SpellEffects.cpp:2582) reads that base point back rather than the
+    //   effect's TriggerSpell, for spell 483 and 55884 only.
+    //
+    //   So casting 483 BY SPELL ID runs the same effect with `damage` taken
+    //   from the spell's own EffectBasePoints, which Spell.dbc records as 0.
+    //   That is learnSpell(0), which teaches nothing and says nothing. The item
+    //   has to be the cast item, which means the item-use handler.
+    //
+    // AND IT IS NOT INSTANT. Spell.dbc gives 483 CastingTimeIndex 14, which
+    // SpellCastTimes.dbc resolves to 3000ms. The learn has therefore NOT
+    // happened when the handler returns, the character has to be held still for
+    // the duration exactly as `cast` holds one, and the verdict is taken later
+    // from this row's own window. A verb that read HasSpell straight back would
+    // report every successful learn as a failure.
+    //
+    // THE REFUSAL THAT SAVES THE ITEM. spellcharges_1 is -1 on these items, so
+    // Spell::TakeCastItem decrements to zero and destroys the item. Nothing in
+    // the core asks whether the recipe was already known - EffectLearnSpell has
+    // no such check and Spell::CheckCast has none for a player-targeted learn -
+    // so using a Pattern a character already knows BURNS IT FOR NOTHING. That
+    // question is asked here, before the packet, against Player::HasSpell.
+    //
+    // AND HasSpell IS THE ONLY HONEST WAY TO ASK IT. character_spell cannot
+    // answer: Player::_SaveSpells writes only spells whose state is not
+    // UNCHANGED, so a recipe a playerbot was granted at runtime never reaches
+    // that table at all. The verdict below is HasSpell before against HasSpell
+    // after, both taken by the worldserver on itself.
+    //
+    // WHY IT RIDES ON kind='cast'. A new `kind` value is an ENUM migration in
+    // data/sql, which reaches a world only when db-import runs - a different
+    // clock from the module image, and one more thing to be behind. The two
+    // grammars cannot collide: a cast row begins with a spell id, which is
+    // digits, and this one begins with the word `use`. OverseerDecisions::
+    // IsLearnRow is the whole of the dispatch's knowledge that this verb exists.
+
+    // The core's own generic learning spells, and the ONLY two ids
+    // Player::CastItemUseSpell's special case fires for (Player.cpp:7592). Not
+    // written down as "the learn spell" in the singular because the core tests
+    // both, and an item carrying the other one is just as much a recipe.
+    static constexpr uint32 GENERIC_LEARN_SPELL_ID = 483;
+    static constexpr uint32 GENERIC_LEARN_SPELL_ID_ALT = 55884;
+
+    // Spell 483 is a 3000ms cast and the recipe lands on the tick the effect
+    // resolves; this is what the world needs on top of that before the answer
+    // is readable, and the same shape of number CAST_MARGIN_MS is.
+    static constexpr uint32 LEARN_MARGIN_MS = 5000;
+
+    // A cast time that reads as zero must not produce a window that judges
+    // instantly, because an instant judgement always answers `not learned`.
+    static constexpr uint32 LEARN_FLOOR_MS = 8000;
+
+    // The same ceiling and the same reason CAST_WINDOW_CEILING_MS carries: this
+    // is accumulated poll time and the hold register's ceiling is wall clock, so
+    // a window allowed to reach it would have the expiry sweep hand the
+    // character back mid-cast.
+    static constexpr uint32 LEARN_WINDOW_CEILING_MS = 40000;
+
+    // WHAT A LEARN ROW KNOWS, IN ONE PLACE, so every exit writes the same shape.
+    // Numbers that were never taken stay negative, because 0 is a real reading.
+    struct LearnEvidence
+    {
+        std::string character;
+        std::string request;
+
+        uint32 itemGuid{0};
+        uint32 itemEntry{0};
+        std::string itemName;
+        uint32 useSpellId{0};    // the generic learning spell, 483 or 55884
+        uint32 recipeSpellId{0}; // what the item teaches, from Spells[1]
+        uint32 requiredSkill{0};
+        uint32 requiredSkillRank{0};
+        int32 skillValue{-1};    // the character's own value in that skill
+
+        uint32 castMs{0};
+        uint32 windowMs{0};
+        uint32 waitedMs{0};
+
+        // THE POST-CONDITION, TAKEN BY THE WORLDSERVER ON ITSELF, both sides of
+        // the use. `knewBefore` is what makes `knowsAfter` mean anything: a row
+        // that only read afterwards could not tell a learn from a recipe the
+        // character already had.
+        int32 knewBefore{-1};
+        int32 knowsAfter{-1};
+        int32 carriedBefore{-1};
+        int32 carriedAfter{-1};
+
+        // What the core said about this character using this item, reported
+        // even on success so a row that worked and a row that was refused are
+        // comparable. EQUIP_ERR_OK on a refusal that happened earlier means the
+        // question was never asked.
+        InventoryResult canUse{EQUIP_ERR_OK};
+
+        int32 castingAfterCall{-1};  // -1 never asked, 0 no, 1 yes
+        char const* castBlocker{""};
+
+        CastHoldReport hold;
+        OverseerDecisions::LearnOutcome verdict{OverseerDecisions::LearnOutcome::Unreadable};
+    };
+
+    // A learn waiting out spell 483's own cast time. Held on the world thread
+    // beside _pendingCasts and bounded the same way.
+    struct LearnCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        LearnEvidence ev;
+    };
+
+    std::vector<LearnCheck> _pendingLearns;
+
+    // ONE SHAPE FOR EVERY EXIT, refusals and verdicts alike.
+    static std::string LearnJson(LearnEvidence const& ev, char const* outcome,
+                                 char const* reason)
+    {
+        using OverseerDecisions::LearnOutcomeWord;
+        using OverseerDecisions::LearnRefusalRetry;
+        using OverseerDecisions::TownRetryWord;
+
+        auto tri = [](std::ostringstream& out, int32 value)
+        {
+            if (value < 0)
+                out << "null";
+            else
+                out << (value ? "true" : "false");
+        };
+        auto num = [](std::ostringstream& out, int32 value)
+        {
+            if (value < 0)
+                out << "null";
+            else
+                out << value;
+        };
+
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(*reason ? TownRetryWord(LearnRefusalRetry(reason)) : "")
+          << ",\"character\":" << J(ev.character)
+          << ",\"verdict\":" << J(LearnOutcomeWord(ev.verdict))
+          << ",\"item_guid\":" << ev.itemGuid
+          << ",\"entry\":" << ev.itemEntry
+          << ",\"name\":" << J(ev.itemName)
+          << ",\"use_spell\":" << ev.useSpellId
+          << ",\"recipe_spell\":" << ev.recipeSpellId
+          << ",\"required_skill\":" << ev.requiredSkill
+          << ",\"required_skill_rank\":" << ev.requiredSkillRank
+          << ",\"skill_value\":";
+        num(o, ev.skillValue);
+        o << ",\"cast_ms\":" << ev.castMs
+          << ",\"window_ms\":" << ev.windowMs
+          << ",\"waited_ms\":" << ev.waitedMs
+          << ",\"knew_before\":";
+        tri(o, ev.knewBefore);
+        o << ",\"knows_after\":";
+        tri(o, ev.knowsAfter);
+        o << ",\"carried_before\":";
+        num(o, ev.carriedBefore);
+        o << ",\"carried_after\":";
+        num(o, ev.carriedAfter);
+        o << ",\"can_use\":" << int32(ev.canUse)
+          << ",\"can_use_name\":" << J(InventoryResultName(ev.canUse))
+          << ",\"casting_after_call\":";
+        tri(o, ev.castingAfterCall);
+        o << ",\"cast_blocker\":" << J(ev.castBlocker)
+          << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
+          << ",\"hold_stood_it_up\":" << (ev.hold.stoodItUp ? "true" : "false")
+          << ",\"hold_dismounted_it\":" << (ev.hold.dismountedIt ? "true" : "false")
+          << ",\"request\":" << J(ev.request) << "}";
+        return o.str();
+    }
+
+    // The recipe this item teaches when it is used, or 0 if it teaches none.
+    //
+    // ASKED THE WAY THE CORE ASKS IT, which is slot 1 for the generic learning
+    // spell and slot 2 for what to teach - NOT a search for the slot carrying
+    // ITEM_SPELLTRIGGER_LEARN_SPELL_ID. Player::CastItemUseSpell reads
+    // Spells[0] and Spells[1] by index and never looks at the trigger at all,
+    // so an item whose trigger says 6 in some other slot would be matched here
+    // and refused by the core, which is a row that promises something it cannot
+    // do. The trigger is checked as well, because an item that disagrees with
+    // itself is one this module should decline rather than drive.
+    static uint32 RecipeTaughtByItem(ItemTemplate const* proto, uint32& useSpellId)
+    {
+        static_assert(MAX_ITEM_PROTO_SPELLS >= 2,
+                      "an item with fewer than two spell slots cannot carry a recipe");
+        useSpellId = 0;
+        if (!proto)
+            return 0;
+        // static_cast because _Spell::SpellId is int32 in the core's own struct,
+        // the same cast the hearth makes on the slot it reads.
+        uint32 const first = static_cast<uint32>(proto->Spells[0].SpellId);
+        if (first != GENERIC_LEARN_SPELL_ID && first != GENERIC_LEARN_SPELL_ID_ALT)
+            return 0;
+        if (proto->Spells[1].SpellTrigger != ITEM_SPELLTRIGGER_LEARN_SPELL_ID)
+            return 0;
+        useSpellId = first;
+        return static_cast<uint32>(proto->Spells[1].SpellId);
+    }
+
+    static char const* DoLearnRecipe(Player* who, std::string const& command,
+                                     char const*& status, std::string& out,
+                                     std::vector<LearnCheck>& parked, uint32 id)
+    {
+        using OverseerDecisions::CastVerifyWindowMs;
+        using OverseerDecisions::LearnOutcome;
+        using OverseerDecisions::LearnRequest;
+        using OverseerDecisions::ParseLearnRequest;
+        namespace Refusal = OverseerDecisions::LearnRefusal;
+
+        LearnEvidence ev;
+        ev.character = who->GetName();
+        ev.request = command;
+
+        // The refusal literals go straight into the UPDATE, so none may carry a
+        // quote character - the rule every executor in this file keeps.
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = LearnJson(ev, "refused", reason);
+            return reason;
+        };
+
+        LearnRequest const request = ParseLearnRequest(command);
+        if (!request.ok)
+        {
+            out = LearnJson(ev, "refused", request.error);
+            return request.error;
+        }
+
+        // ONE LEARN ROW PER CHARACTER AT A TIME, and this one is about the hold
+        // rather than about the item, exactly as the cast one is: two rows would
+        // both hold the same character and the first to finish would release it
+        // under the second.
+        for (LearnCheck const& running : parked)
+            if (running.targetName == who->GetName())
+                return refuse(Refusal::AlreadyRunning);
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse(Refusal::NoSession);
+        if (!who->IsInWorld())
+            return refuse(Refusal::NotInWorld);
+        // The hold below is a strategy change, which needs an engine to change.
+        if (!GET_PLAYERBOT_AI(who))
+            return refuse(Refusal::NoBotAI);
+        // HandleUseItemOpcode's first branch, and it returns with no feedback of
+        // any kind (SpellHandler.cpp:64).
+        if (who->m_mover != who)
+            return refuse(Refusal::NotOwnMover);
+        if (!who->IsAlive())
+            return refuse(Refusal::Dead);
+        if (who->IsInFlight())
+            return refuse(Refusal::InFlight);
+        // HandleUseItemOpcode refuses an item use in combat when any of the
+        // item's spells cannot be used in combat (SpellHandler.cpp:167-180).
+        if (who->IsInCombat())
+            return refuse(Refusal::InCombat);
+        if (who->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse(Refusal::Stunned);
+        if (session->isLogingOut())
+            return refuse(Refusal::LoggingOut);
+        if (who->GetTradeData())
+            return refuse(Refusal::Trading);
+        if (who->GetTransport())
+            return refuse(Refusal::OnTransport);
+        if (who->IsNonMeleeSpellCast(false))
+            return refuse(Refusal::AlreadyCasting);
+
+        // ---- the item ---------------------------------------------------------
+        //
+        // The same reach every other item verb uses: worn gear, the backpack and
+        // equipped bags, and deliberately not the bank.
+        Item* item = FindCarriedItem(who, request.byGuid, request.key);
+        if (!item)
+            return refuse(Refusal::NotCarried);
+
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return refuse(Refusal::NoTemplate);
+
+        ev.itemGuid = item->GetGUID().GetCounter();
+        ev.itemEntry = item->GetEntry();
+        ev.itemName = proto->Name1;
+        ev.requiredSkill = proto->RequiredSkill;
+        ev.requiredSkillRank = proto->RequiredSkillRank;
+        if (proto->RequiredSkill)
+            ev.skillValue = int32(who->GetSkillValue(proto->RequiredSkill));
+
+        ev.recipeSpellId = RecipeTaughtByItem(proto, ev.useSpellId);
+        if (!ev.useSpellId)
+            return refuse(Refusal::NotARecipeItem);
+        if (!ev.recipeSpellId)
+            return refuse(Refusal::NoLearnSpell);
+
+        // BOTH SPELLS ASKED FOR, because the two failures are different rows.
+        // CastItemUseSpell bails with a log line and no feedback when the
+        // generic one is missing (Player.cpp:7598); the recipe being unknown to
+        // the core would be learnSpell on an id nothing can teach.
+        if (!sSpellMgr->GetSpellInfo(ev.useSpellId))
+            return refuse(Refusal::NoGenericLearn);
+        SpellInfo const* recipe = sSpellMgr->GetSpellInfo(ev.recipeSpellId);
+        if (!recipe)
+            return refuse(Refusal::UnknownLearnSpell);
+
+        // THE REFUSAL THAT SAVES THE ITEM, and the one the core does not make.
+        // See this section's header: the item is destroyed on use whether or not
+        // anything was learned.
+        ev.knewBefore = who->HasSpell(ev.recipeSpellId) ? 1 : 0;
+        if (ev.knewBefore)
+            return refuse(Refusal::AlreadyKnown);
+
+        if (item->IsBindedNotWith(who))
+            return refuse(Refusal::BoundToSomebodyElse);
+
+        // THE CORE'S OWN GATE, asked with the core's own call so this answer and
+        // the handler's are the same answer (SpellHandler.cpp:146). It is also
+        // where the profession wall lives: GetSkillValue(RequiredSkill) below
+        // RequiredSkillRank is EQUIP_ERR_CANT_EQUIP_SKILL, and a skill the
+        // character does not have at all is EQUIP_ERR_NO_REQUIRED_PROFICIENCY
+        // (PlayerStorage.cpp:2402-2412). Separated from the general refusal so a
+        // row that a shopping pass has to plan around says so in one sentence
+        // rather than in a number.
+        ev.canUse = who->CanUseItem(item);
+        if (ev.canUse == EQUIP_ERR_CANT_EQUIP_SKILL
+            || ev.canUse == EQUIP_ERR_NO_REQUIRED_PROFICIENCY)
+            return refuse(Refusal::SkillTooLow);
+        if (ev.canUse != EQUIP_ERR_OK)
+            return refuse(Refusal::CannotUse);
+
+        // Spell::prepare refuses a moving caster when the spell has a cast time
+        // and 483 has 3000ms of one. Refused rather than driven, and the hold
+        // goes on anyway so the sender's next ask finds a character standing -
+        // the same thing `cast` learned in #335.
+        if (who->isMoving())
+        {
+            HoldStillAndReport(who, ev.character, "learn", ev.hold);
+            return refuse(Refusal::Moving);
+        }
+
+        SpellInfo const* learning = sSpellMgr->GetSpellInfo(ev.useSpellId);
+        ev.castMs = learning->CalcCastTime(who);
+        ev.windowMs = CastVerifyWindowMs(ev.castMs, LEARN_MARGIN_MS, LEARN_FLOOR_MS,
+                                         LEARN_WINDOW_CEILING_MS);
+        ev.carriedBefore = int32(who->GetItemCount(ev.itemEntry, false));
+
+        // Captured before the packet: Spell::TakeCastItem destroys the item on a
+        // completed use, so the Item* is not safe to read at the verdict and the
+        // slots it sat in are rewritten.
+        uint8 const bagSlot = item->GetBagSlot();
+        uint8 const slot = item->GetSlot();
+        ObjectGuid const itemGuid = item->GetGUID();
+
+        // ---- hold it FOR the cast, in the same breath as the packet -----------
+        //
+        // Placed here rather than at the top of the executor so the refusals in
+        // between - not carried, already known, skill too low - do not stop a
+        // character for 45 seconds over something standing still cannot fix. It
+        // also stands a sitting character up and takes it off a mount, which
+        // Spell::CheckCast refuses silently.
+        HoldStillAndReport(who, ev.character, "learn", ev.hold);
+
+        {
+            // CMSG_USE_ITEM is bagIndex, slot, castCount, spellId, item guid,
+            // glyphIndex, castFlags, and then a target block
+            // (SpellHandler.cpp:73), written exactly as the hearth writes it.
+            // TARGET_FLAG_NONE ends the packet and spell 483's own targeting
+            // then picks the caster. The glyph index must stay under
+            // MAX_GLYPH_SLOT_INDEX or the handler refuses the whole thing as a
+            // missing item.
+            //
+            // THE SPELL ID ON THE PACKET IS THE GENERIC ONE AND NOT THE RECIPE.
+            // The handler looks it up only to decide whether to queue the cast;
+            // CastItemUseSpell then ignores it entirely and reads Spells[0] off
+            // the item itself. Sending the recipe id here would be a spell the
+            // character does not know, which HandleUseItemOpcode has no reason
+            // to refuse and which would then be discarded anyway.
+            WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
+            raw << uint8(bagSlot);
+            raw << uint8(slot);
+            raw << uint8(1);  // castCount
+            raw << uint32(ev.useSpellId);
+            raw << itemGuid;
+            raw << uint32(0);  // glyphIndex
+            raw << uint8(0);   // castFlags; 0 keeps HandleClientCastFlags a no-op
+            raw << uint32(TARGET_FLAG_NONE);
+            raw.rpos(0);
+            session->HandleUseItemOpcode(raw);
+        }
+
+        // ---- believe nothing, and do not judge yet ---------------------------
+        //
+        // EVIDENCE, NOT A VERDICT. Spell 483 is a 3000ms cast, so HasSpell is
+        // still false here on a use that is working perfectly, and reading it
+        // now would call every success a failure.
+        ev.castingAfterCall = who->IsNonMeleeSpellCast(false) ? 1 : 0;
+        if (!ev.castingAfterCall)
+        {
+            OverseerDecisions::CastWallGate gate;
+            gate.grounded = !who->IsInFlight();
+            gate.unmounted = !who->IsMounted();
+            gate.standing = who->IsStandState();
+            gate.still = !who->isMoving();
+            gate.ready = true;   // a recipe item has no spell cooldown of its own
+            gate.globalReady = true;
+            gate.free = !who->IsNonMeleeSpellCast(false);
+            char const* const wall = OverseerDecisions::CastWallBlocker(gate);
+            ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is using '{}' (item {}, entry {}) to learn recipe {} - a "
+                 "{}ms cast; judging in {}ms, not now. It was {} for the cast (stand state "
+                 "{}, mount {}). {}",
+                 ev.character, ev.itemName, ev.itemGuid, ev.itemEntry, ev.recipeSpellId,
+                 ev.castMs, ev.windowMs,
+                 ev.hold.applied ? "held" : "NOT held",
+                 ev.hold.stoodItUp ? "stood up" : "left as it was",
+                 ev.hold.dismountedIt ? "taken off" : "left as it was",
+                 ev.castingAfterCall ? "A cast is running." : ev.castBlocker);
+
+        LearnCheck check;
+        check.id = id;
+        check.targetName = who->GetName();
+        check.ev = ev;
+        parked.push_back(check);
+
+        // THE ONE HONEST STATUS FOR A LEARN THAT HAS NOT FINISHED. Not
+        // 'delivered', which would be a postmark and not a delivery.
+        status = "verifying";
+        ev.verdict = LearnOutcome::Unreadable;
+        out = LearnJson(ev, "using", "");
+        return "";
+    }
+
+    // WHERE A LEARN IS ACTUALLY ANSWERED. Runs from the same poll as
+    // ResolveCastChecks and for the same reason: the thing being judged happens
+    // on the world's clock, not on the queue's.
+    void ResolveLearnChecks(uint32 elapsedMs)
+    {
+        using OverseerDecisions::JudgeLearn;
+        using OverseerDecisions::LearnOutcome;
+        using OverseerDecisions::LearnOutcomeWord;
+        using OverseerDecisions::LearnReadBack;
+
+        std::vector<LearnCheck> stillLearning;
+        stillLearning.reserve(_pendingLearns.size());
+
+        for (LearnCheck& check : _pendingLearns)
+        {
+            check.ev.waitedMs += elapsedMs;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+
+            // NO TELEPORT BRANCH HERE, and the absence is deliberate rather than
+            // an omission copied around: nothing about learning a recipe moves
+            // the character, so a learner that has left the world has left it,
+            // and waiting out a crossing that cannot be happening would only
+            // delay an honest `unreadable`.
+            if (!bot)
+            {
+                char const* const gone =
+                    "left the world before the learn could be read back";
+                LOG_WARN("module.overseer",
+                         "overseer: learn {} for '{}' cannot be judged - the character is no "
+                         "longer in the world",
+                         check.id, check.targetName);
+                check.ev.verdict = LearnOutcome::Unreadable;
+                // The register entry goes even though there is nobody to release
+                // it on, for the reason ResolveCastChecks gives: a record left
+                // standing would keep this module's own sweeps off a character
+                // nothing is holding any more.
+                ReleaseHold(check.targetName, bot,
+                            "the character left the world mid-learn", "learn");
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    gone, EscLong(LearnJson(check.ev, "unreadable", gone)), check.id,
+                    g_runToken);
+                continue;
+            }
+
+            // NOT JUDGED WHILE IT IS STILL CASTING.
+            if (check.ev.waitedMs < check.ev.windowMs)
+            {
+                stillLearning.push_back(check);
+                continue;
+            }
+
+            // ---- read the world back ------------------------------------------
+            //
+            // Player::HasSpell, which is the worldserver's own answer and the
+            // same one every gate in the core consults. NOT character_spell: a
+            // recipe granted at runtime is written only when its state is not
+            // UNCHANGED, so that table is permanently wrong about a bot rather
+            // than merely late.
+            LearnReadBack read;
+            read.learnerReadable = true;
+            read.knowsItNow = bot->HasSpell(check.ev.recipeSpellId);
+            check.ev.knowsAfter = read.knowsItNow ? 1 : 0;
+            check.ev.carriedAfter = int32(bot->GetItemCount(check.ev.itemEntry, false));
+            read.itemStillCarried =
+                check.ev.carriedBefore >= 0 && check.ev.carriedAfter >= check.ev.carriedBefore;
+
+            // The hold comes off before the verdict is written, so a character
+            // that has learned does not stand there waiting out a ceiling.
+            ReleaseHold(check.targetName, bot, "the learn row ended", "learn");
+
+            check.ev.verdict = JudgeLearn(read);
+
+            char const* status = "error";
+            char const* detail = "";
+            char const* outcome = LearnOutcomeWord(check.ev.verdict);
+
+            switch (check.ev.verdict)
+            {
+                case LearnOutcome::Learned:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: learn {} - '{}' used '{}' (entry {}) and now knows "
+                             "recipe {}; the item went from {} to {} in the bags, read back "
+                             "after {}ms",
+                             check.id, check.targetName, check.ev.itemName,
+                             check.ev.itemEntry, check.ev.recipeSpellId,
+                             check.ev.carriedBefore, check.ev.carriedAfter,
+                             check.ev.waitedMs);
+                    break;
+                case LearnOutcome::NotLearned:
+                    // `unchanged` and not `error`: nothing broke, the recipe
+                    // simply was not learned, and the sentence separates the two
+                    // ways that happens. A consumed item that taught nothing is
+                    // the worse of the two and says so.
+                    status = "unchanged";
+                    detail = read.itemStillCarried
+                                 ? "the use never ran and the item is still in the bags"
+                                 : "the item was consumed and the recipe is still not known";
+                    LOG_WARN("module.overseer",
+                             "overseer: learn {} - '{}' used '{}' (entry {}) and does not know "
+                             "recipe {}: {} (the wall named at the packet was: {})",
+                             check.id, check.targetName, check.ev.itemName,
+                             check.ev.itemEntry, check.ev.recipeSpellId, detail,
+                             *check.ev.castBlocker ? check.ev.castBlocker : "none");
+                    break;
+                case LearnOutcome::Unreadable:
+                    status = "error";
+                    detail = "the character could not be read back after the use";
+                    LOG_WARN("module.overseer", "overseer: learn {} - '{}': {}", check.id,
+                             check.targetName, detail);
+                    break;
+            }
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, detail, EscLong(LearnJson(check.ev, outcome, detail)), check.id,
+                g_runToken);
+        }
+
+        _pendingLearns.swap(stillLearning);
     }
 
     // -------------------------------------------------------------- summon --
