@@ -22,12 +22,31 @@ name: Build against the pinned core
 # CACHED, deliberately, on GitHub's own cache storage - NOT the self-hosted
 # buildkitd/registry this module used to depend on. A GitHub-hosted runner is
 # a fresh VM every run; without this every build here would be full-cold
-# (~40-90 min going by this org's own infra history) forever. The cache is a
-# buildx LOCAL exporter, which is what actually persists the Dockerfile's own
-# `--mount=type=cache,target=/ccache` contents across runs - restoring the
-# directory alone would not do that; the cache lives in buildx's own metadata,
-# not just the raw ccache files. Keyed on the two pinned SHAs, so a version
-# bump correctly starts cold rather than silently reusing a stale cache.
+# (~40-90 min going by this org's own infra history) forever.
+#
+# THE CCACHE CACHE-MOUNT AND THE LAYER CACHE ARE TWO DIFFERENT MECHANISMS
+# (fixed 2026-09-14, quadseven/mod-overseer#471). This used to claim the
+# `--cache-to type=local` layer exporter below "actually persists the
+# Dockerfile's own `--mount=type=cache,target=/ccache` contents across runs".
+# It does not, and never did - verified live: the restored cache entry for
+# this key was a 213-byte stub on every one of dozens of runs, and the build
+# step still ran fully cold every time. A `RUN --mount=type=cache` volume is
+# scratch space that lives in the BuildKit daemon's own local state; the
+# `type=local`/`type=gha` cache exporters capture RUN-instruction *layer
+# results* only, never a cache mount's live contents (moby/buildkit#3011,
+# docker/build-push-action#1011) - and this Dockerfile's compile layer is
+# invalidated on every run anyway, since it is downstream of `COPY modules`,
+# which changes with this module's own source on every commit. So the layer
+# cache below was never able to help the compile step; it survives here only
+# because it still saves some of the early apt-get/base layers. The ccache
+# mount is warmed separately: `reproducible-containers/buildkit-cache-dance`
+# copies the mount's contents in and out of the buildx builder using a
+# throwaway container (no Dockerfile change needed), and `actions/cache`
+# persists that directory across runs the normal way. ccache itself hashes
+# preprocessed source content, not the Docker layer that produced it, so it
+# still hits even though `modules/mod-overseer` differs on every build. Both
+# caches are keyed on the two pinned SHAs, so a version bump correctly starts
+# cold rather than silently reusing a stale cache.
 #
 # PUBLISHES TO GHCR (2026-08-27, the operator's explicit ask). The compile-check build
 # above stays exactly as it was - proven, unchanged, --load into a local-only
@@ -91,12 +110,13 @@ on:
 # 60 throws away both the answer and the hour, and leaves the commit looking
 # untested for precisely the reason this change exists to remove.
 #
-# THE CACHE DOES NOT ARGUE FOR A SHARED GROUP. Read the two cache steps below
-# before believing that it does. The key is `buildx-$CORE_SHA-$MODULE_SHA`: no
-# ref, no commit of this repository, no run id, so it is byte-identical under
-# every possible grouping. It is also written at most once per pin pair, since
-# the save step is skipped when `cache-hit == 'true'`, so after the first run
-# on a pin pair every later run only ever reads it. Serialising the whole
+# THE CACHE DOES NOT ARGUE FOR A SHARED GROUP. Read the cache steps below
+# before believing that it does. Both cache keys (`buildx-$CORE_SHA-$MODULE_SHA`
+# and `buildx-ccache-$CORE_SHA-$MODULE_SHA`) have no ref, no commit of this
+# repository, no run id, so they are byte-identical under every possible
+# grouping. Each is also written at most once per pin pair, since the save is
+# skipped once there is already an exact-key hit, so after the first run on a
+# pin pair every later run only ever reads it. Serialising the whole
 # repository therefore bought no warming that parallel runs can lose. The one
 # real cost is the first run after a pin bump, where several cold builds can
 # race to save the same key and all but one gets a "cache already exists"
@@ -176,6 +196,7 @@ jobs:
         run: bash apply-patches.sh "$GITHUB_WORKSPACE/acore"
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3
 
       - name: Restore build cache
@@ -184,6 +205,36 @@ jobs:
         with:
           path: /tmp/buildx-cache
           key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
+
+      # This is the cache that actually matters: the ccache directory the
+      # pinned core's Dockerfile mounts as `RUN --mount=type=cache,target=/ccache`.
+      # `actions/cache` (the combined restore+save action, not the split
+      # restore/save used above) has to come before the dance step below so
+      # its save-on-post runs AFTER the dance's extract-on-post - GitHub Actions
+      # runs post-hooks in reverse step order, so registering restore first and
+      # inject/extract second is what makes extraction land before the save
+      # instead of racing it.
+      - name: Restore ccache (BuildKit cache-mount contents)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: ccache
+        with:
+          path: /tmp/buildkit-ccache-mount
+          key: buildx-ccache-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
+
+      # Copies /tmp/buildkit-ccache-mount into the buildx builder's /ccache
+      # cache mount now (main step) and copies it back out after the build
+      # finishes (automatic post step) - via a throwaway container, no
+      # Dockerfile change required. This is the only mechanism that actually
+      # persists a `--mount=type=cache` volume across runs; see the header
+      # comment above.
+      - name: Inject/extract ccache via buildkit-cache-dance
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "/tmp/buildkit-ccache-mount": "/ccache"
+            }
 
       - name: Build (compile only, no push)
         working-directory: acore
