@@ -11155,6 +11155,382 @@ std::vector<RecruitPick> RecruitShortlist(
     std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
     unsigned atMost);
 
+// -- the raid, and the eight groups it is made of (infra#3763) ---------------
+//
+// WHAT A RAID IS, IN THE CORE'S OWN TERMS, BECAUSE IT IS NOT A BIGGER PARTY. A
+// `Group` at 3.3.5a is one object with two shapes. As a party it holds at most
+// MAXGROUPSIZE (5) members and every one of them sits in subgroup 0. As a raid
+// it holds at most MAXRAIDSIZE (40) across MAX_RAID_SUBGROUPS (8) subgroups of
+// five, and `Group::IsFull()` answers against whichever of the two it is:
+//
+//     return isRaidGroup() ? (m_memberSlots.size() >= MAXRAIDSIZE)
+//                          : (m_memberSlots.size() >= MAXGROUPSIZE);
+//
+// (Group.cpp:2473 at the pinned core revision.) So "groups 1 through 8" is not
+// a thing this module can arrange by making more parties. It is one Group that
+// has been through `Group::ConvertToRaid()`, and the eight groups are the
+// `group_member`.`subgroup` column, which is a TINYINT UNSIGNED holding 0-7.
+//
+// THE NUMBERS BELOW ARE THE CORE'S, RESTATED, AND THEY ARE LOAD-BEARING. This
+// file compiles with no core in its include path - that is the whole point of
+// it - so MAXRAIDSIZE and MAX_RAID_SUBGROUPS cannot be included from Group.h
+// and are written out here instead. A number here that disagreed with the core
+// would not fail to compile. It would index past the end of a heap array:
+// `Group::_initRaidSubGroupsCounter` allocates exactly
+// `new uint8[MAX_RAID_SUBGROUPS]` and `Group::SubGroupCounterIncrease(subgroup)`
+// does an unchecked `++m_subGroupsCounts[subgroup]`, so a subgroup of 8 is a
+// write one byte past an 8-byte allocation, in the worldserver, silently. The
+// adapter re-checks the bound against the core's own constant before it calls
+// anything; this is the belt, that is the braces, and neither is decoration.
+constexpr unsigned RAID_SUBGROUPS = 8;       // the core's MAX_RAID_SUBGROUPS
+constexpr unsigned RAID_SUBGROUP_SIZE = 5;   // the core's MAXGROUPSIZE
+constexpr unsigned RAID_SIZE = RAID_SUBGROUPS * RAID_SUBGROUP_SIZE;  // MAXRAIDSIZE
+
+// WHICH ROSTER THIS IS ABOUT, AND WHY IT IS NOT `overseer_roster` (infra#3764).
+//
+// Every drive in this module censuses `overseer_roster`, a table that holds
+// five rows. DriveDungeonRun, DriveDungeonClear and the party former all run
+// the same `SELECT name, lead FROM overseer_roster WHERE enabled = 1`, and
+// DoJob is an UPDATE against it, so a character with no row there silently gets
+// no job at all. That is why a guild recruit is invisible to everything: the
+// guild grew to forty and the roster did not.
+//
+// THE OBVIOUS FIX IS THE WRONG ONE. Writing the thirty-five recruits into
+// `overseer_roster` would make them visible to every drive at once - including
+// KeepRosterAttended, which evicts any roster character with no game client
+// attached to it, because "the family only plays on camera". There are five
+// streamed clients. A thirty-fifth roster row with nobody watching it is not a
+// recruit; it is a login, an eviction, and a login again, for ever.
+//
+// SO THE RAID READS `guild_member` AND LEAVES `overseer_roster` ALONE. Not a
+// new table and not a new column: the guild's membership is ALREADY the census
+// this question wants, it is already read by this module (GuildRosterFacts,
+// which the profession view and the recruit shortlist both use), and it is
+// already kept in step with the world by the core itself every time
+// Guild::AddMember runs. A second table naming the same forty characters would
+// be a second answer that could disagree with the first, which is the failure
+// this module keeps writing comments about.
+//
+// AND THE NARROWNESS IS THE SAFETY. This widening is scoped to ONE question -
+// who stands in which raid group - and it changes the meaning of nothing else.
+// The five-name roster still means exactly what it meant: the characters this
+// module STEERS, on camera, with a client attached. The guild still means what
+// it meant: everybody who is in it. A raid is a thing a guild has, not a thing
+// a roster has, so the guild is the honest place to ask. Making recruits
+// drivable - jobs, dungeons, gathering - is a different and larger question,
+// and it is a question about KeepRosterAttended's second class of character
+// rather than about this file. It is infra#3764 and it stays there.
+
+// The one job a character is seated to do, as the layout sees it.
+//
+// READ THIS AGAINST GuildRole ABOVE, BECAUSE THEY ARE DELIBERATELY DIFFERENT
+// QUESTIONS AND KEEPING THEM APART IS MOST OF WHY THIS ENUM EXISTS AT ALL.
+// `ClassCanFill` answers COULD: a paladin could tank, could heal, could stand
+// in the melee. That is the right question for recruiting, where the answer
+// decides whether somebody is worth asking, and where being generous is safe -
+// it can recommend a character who then has to respec, never one who could not
+// do the job at all.
+//
+// A SEATING PLAN CANNOT BE GENEROUS, because a seat is exclusive. Four tanks
+// out of seven warriors, four paladins and four druids is not a question about
+// what a paladin could do; it is a question about which twelve characters are
+// doing which four jobs, and every "could" that stays unresolved is a character
+// in two groups at once. So this enum names exactly one seat per character and
+// the picker below resolves the overlap explicitly, where it can be argued
+// with, rather than letting a first-match-wins loop resolve it by accident.
+enum class RaidSeat : std::uint8_t
+{
+    Tank,
+    Healer,
+    Melee,
+    Ranged,
+};
+constexpr unsigned RAID_SEAT_COUNT = 4;
+char const* RaidSeatName(RaidSeat seat);
+
+// Which of the two damage seats a class takes when it is not tanking and not
+// healing. Melee or Ranged, never anything else, and every class has an answer.
+//
+// THIS IS A TABLE AND NOT A RULE, on purpose: six of the ten classes can
+// honestly stand in either band at 3.3.5a, so a "rule" here would be a
+// preference wearing a rule's clothes. The table is the preference, written
+// down once, where a reviewer can disagree with a line of it rather than with a
+// loop. The four that argue at all:
+//
+//   PALADIN -> Melee. A paladin who is not healing is retribution, and
+//     retribution stands in the melee. The alternative, holy, is a healer seat
+//     and the picker has already had its chance at that.
+//   SHAMAN -> Melee, and this is the one line with a MEASURED fact behind it.
+//     infra#3763 counted 66 unguilded Draenei shamans on this realm, race 11
+//     class 7, so Alliance melee groups here can have a Windfury totem, which
+//     is not true of stock 3.3.5a Alliance. A shaman's totems are the canonical
+//     party-scoped effect of the era, so a shaman seated among casters spends
+//     them on characters that do not swing a weapon. (That the SPELL behaves
+//     as expected at this build is a DBC fact nobody has verified; the
+//     characters existing is the half this table needs, and the layout below
+//     does not fall over if the spell is wrong - it just stops being a reason.)
+//   DEATH KNIGHT -> Melee. There is no ranged death knight.
+//   DRUID -> Ranged. This is the contestable one: feral cat is a real melee
+//     seat and balance is a real ranged one. Ranged wins for a reason that is
+//     about this module rather than about druids - the druid is the only class
+//     that brings GuildService::BattleRes, which is the module's own named
+//     answer to a death, and a druid standing at range is a druid that is
+//     still alive to cast it when the melee goes down. A reviewer who thinks
+//     that is too clever should change this line and one test, which is
+//     exactly the amount of ceremony a judgement like this deserves.
+RaidSeat RaidDamageBand(unsigned classId);
+
+// How many of the forty seats are tanks and how many are healers.
+//
+// EVERYTHING ELSE FALLS OUT OF THESE TWO. There is no melee quota and no ranged
+// quota, because there is no decision there to make: once the tanks and the
+// healers are chosen, every remaining character goes to whichever damage band
+// its class belongs to, and the split is whatever the roster happens to be. A
+// quota on the damage bands would be a quota this module could not honour
+// anyway - it cannot turn a mage into a rogue.
+struct RaidShape
+{
+    unsigned tanks{0};
+    unsigned healers{0};
+};
+
+// THE DEFAULTS, AND THE ARGUMENT FOR EACH. Both are judgements. Neither is
+// measured, and neither can be: what a raid should be composed of is not
+// written down anywhere this module can read, which is the same sentence the
+// recruit config file already has to say about its level ceiling.
+//
+// FOUR TANKS. A Molten Core or Blackwing Lair night is not one tank and a
+// spare. It is a main tank on the boss, an off-tank on whatever the boss
+// brought with it, and enough further tank-capable characters that the raid
+// does not stop when one of them dies. Four is the smallest number that covers
+// all three of those and still leaves thirty-six seats for the raid to be
+// anything else. It is not eight: a tank who is not tanking is a damage seat
+// spent on a character built to survive rather than to kill.
+//
+// TEN HEALERS, which is a quarter of the raid. The era's own arithmetic:
+// forty-man content at this tier was run on roughly ten to twelve healers, and
+// the number is bounded on both sides rather than free. Too few and a raid dies
+// to attrition it could have healed through; too many and it never kills
+// anything before an enrage. Ten is the low end of that range, chosen
+// deliberately: this guild is levels 13 to 55 (measured on the live realm,
+// 2026-09-13), nowhere near the gear that makes healing cheap, and the honest
+// direction to be wrong in is the one where the raid is slow rather than dead.
+//
+// AN OPERATOR WHO DISAGREES CHANGES A CONFIG KEY, NOT THIS FILE. See
+// `Overseer.Raid.Tanks` and `Overseer.Raid.Healers` in
+// conf/mod_overseer.conf.dist - the same shape the recruit policy already has,
+// and for the same reason infra#3744 gave: how a guild wants to be composed is
+// deployment-specific, and a source edit, a pin bump, an image build and a
+// promote is too much ceremony for changing your mind about a number.
+constexpr unsigned RAID_TANKS_DEFAULT = 4;
+constexpr unsigned RAID_HEALERS_DEFAULT = 10;
+
+// The shape a roster of `members` should be planned to, given the shape a full
+// forty would be planned to.
+//
+// WHY THIS EXISTS AT ALL, because it looks like arithmetic nobody asked for.
+// The quotas above are stated against forty seats. Run them unscaled against
+// the twelve-member guild this one was a fortnight ago and you get four tanks
+// and ten healers out of twelve characters, which is not a cautious answer or
+// a partial one - it is a confidently wrong one, a raid with two damage dealers
+// in it, and nothing anywhere would have said so. The guild grows into forty
+// over weeks and every day before it gets there is a day this verb can be
+// asked.
+//
+// SO THE QUOTAS SCALE WITH THE ROSTER, rounded UP, with a floor of one of each
+// the moment there are at least three members to spend. Rounded up rather than
+// down because a raid with no healer is a different kind of broken from a raid
+// with one too many, and a floor of one because "no tank at all" is never the
+// right answer to a group that has a tank-capable character in it.
+RaidShape RaidShapeFor(RaidShape const& full, unsigned members);
+
+// One member's seat: which of the vector handed in, what they are seated to do,
+// and which of the eight groups they stand in.
+struct RaidSeatPlan
+{
+    std::size_t index{0};    // into the members vector as it was given
+    RaidSeat seat{RaidSeat::Melee};
+    // ZERO-BASED, matching `group_member`.`subgroup` and the core's own
+    // `Group::ChangeMembersGroup`. The owner asked for "group 1 thru 8" and the
+    // verb PRINTS 1-based for exactly that reason, but the conversion happens
+    // once, at the edge, where it is visible. A struct that carried 1-based
+    // numbers into a core call would be one `- 1` away from the out-of-bounds
+    // write described at the top of this section, for ever.
+    unsigned subgroup{0};
+    // One line a person can read, always set - the same discipline
+    // RecruitVerdict keeps, and for the same reason: a character who appears in
+    // group 6 without a reason is the next argument nobody can settle.
+    std::string said;
+};
+
+// The whole layout, plus what did not fit.
+struct RaidPlan
+{
+    // One entry per seated member, in the order the members were given rather
+    // than in group order, so a caller can join it back to its own roster
+    // without a lookup. Sorting is a presentation decision and belongs to
+    // whoever is printing.
+    std::vector<RaidSeatPlan> seats;
+    // Indices of members who got no seat, which happens for exactly one reason:
+    // the guild holds more than forty characters. NOT AN ERROR AND NOT A
+    // REFUSAL - a guild over its target size is a thing that can happen, and
+    // the honest answer is a full raid and a named list of who is standing
+    // outside it, rather than a plan that silently loses people the way the
+    // party former's `party full, '{}' left out` did.
+    std::vector<std::size_t> benched;
+    // How many of each seat were actually filled. Never larger than the shape
+    // asked for; smaller when the roster has nobody who can take the seat.
+    unsigned filled[RAID_SEAT_COUNT]{};
+};
+
+// Seat a guild's members into a forty-man raid, and say why each one sits where
+// it does.
+//
+// THE ROSTER IT PLANS OVER IS THE WHOLE GUILD, NOT WHOEVER IS ONLINE, and that
+// is a deliberate choice with a cost. The alternative - plan over the
+// characters currently in the world - produces a layout that is different every
+// time it is asked, because a random-bot manager logs characters in and out all
+// day. A raid layout that reshuffles hourly is not a layout; it is a lottery,
+// and "perfect group orientations for group 1 thru 8" is a thing somebody wants
+// to be able to READ. So the plan is a standing seat per member, stable until
+// the guild's membership or levels change, and the act of forming the raid
+// seats whoever of it happens to be present. The cost is that a plan can name
+// forty characters when twelve are in the world, which the verb reports rather
+// than hides.
+//
+// WHO IS PICKED FOR THE EXCLUSIVE SEATS, AND IN WHAT ORDER.
+//
+//   1. TANKS FIRST, because the tank seat is the narrowest: four classes can
+//      take it and the raid stops without it. Taken in class preference order
+//      WARRIOR, DEATH KNIGHT, DRUID, PALADIN - and the order is an
+//      OPPORTUNITY-COST argument rather than a claim about who tanks best. A
+//      warrior who is not tanking is a melee damage seat, which this roster is
+//      already deep in (seven warriors and four rogues, measured 2026-09-13);
+//      a paladin or a druid who is not tanking is a HEALER, which is the other
+//      scarce seat on the same roster. Taking tanks off the warrior pile
+//      therefore costs the raid the least somewhere else. The death knight
+//      sits second for the same reason and because there is exactly one.
+//   2. HEALERS SECOND, out of whoever the tank pass did not take, in class
+//      preference order PRIEST, PALADIN, DRUID, SHAMAN. Priests first because
+//      a priest's alternative seat is ranged damage and this roster already
+//      has mages, warlocks and hunters in it. Shaman last, deliberately: with
+//      one shaman on the roster, leaving it unhealed and letting it fall
+//      through to a melee group is what puts its party-scoped totems where
+//      they do something - see RaidDamageBand.
+//   3. EVERYBODY ELSE takes the damage band of their class, which is a table
+//      lookup and not a choice.
+//
+// AND WITHIN A CLASS, THE HIGHEST LEVEL GOES FIRST. This is the one place this
+// section disagrees with RecruitShortlist, which breaks its ties by name and
+// says in its own comment that doing so is an admission rather than an
+// algorithm. The difference is real: every recruit candidate has already passed
+// through a level band, so the ones being compared are genuinely alike and
+// nothing can separate them. This guild is levels 13 to 55. A main tank chosen
+// out of seven warriors by the alphabet would be a level 20 standing in front
+// of a boss because his name begins with A, while a level 47 stood behind him.
+// Level is a fact, it is the fact that separates these characters, and refusing
+// to use it here would be squeamishness rather than discipline. Name ascending
+// is still the tie-break UNDER level, so the answer is stable between runs.
+//
+// THE LAYOUT, ONCE THE SEATS ARE DECIDED. Four passes, in this order:
+//
+//   1. TANKS fill from group 1 upward. With the default four tanks they all
+//      land in group 1, which is the convention every raid leader already has:
+//      "the tank group" is group 1 and nobody has to be told.
+//   2. HEALERS go round the groups one at a time, group 1 first, skipping any
+//      group that is already full. So group 1's tanks get a healer before any
+//      group gets a second, and the tenth healer lands in group 2 rather than
+//      doubling up somewhere arbitrary. ONE HEALER PER GROUP IS THE POINT: the
+//      era's party-scoped heals (Prayer of Healing is the obvious one) are
+//      spent on the caster's own subgroup, and a raid leader assigning healing
+//      by group index is assigning it to a list the game already keeps.
+//   3. MELEE fill from the LOWEST-numbered group with a free seat.
+//   4. RANGED fill from the HIGHEST-numbered group with a free seat.
+//
+// PASSES 3 AND 4 RUN FROM OPPOSITE ENDS ON PURPOSE. It is the cheapest way to
+// get the melee and the casters as far apart in the group list as the roster
+// allows, without a rule that has to know which is which twice. Party-scoped
+// effects are the reason it matters at all: whatever a melee group wants
+// (a shaman's totems, at this realm's one shaman) is wasted on a group of
+// mages, and the reverse. If a roster is short enough that the two ends meet,
+// they meet in the middle and one group is mixed, which is the correct answer
+// to a raid that is not forty characters.
+//
+// WHAT THIS DOES NOT DO, STATED SO NOBODY GOES LOOKING. It does not read
+// `character_talent` and it never will - `ClassCanFill`'s own comment argues
+// that at length and the argument is unchanged here. A shaman seated in a melee
+// group may be walking around as restoration. The plan says what the character
+// should be asked to do, which is a decision; it does not claim to know what
+// the character currently is, which would be a measurement it cannot take.
+RaidPlan PlanRaid(std::vector<GuildMemberFacts> const& members,
+                  RaidShape const& shape);
+
+// -- and getting forty characters from where they are to where they belong ---
+//
+// One member of a raid that already exists: where the core says they are
+// standing, and where the plan says they should be.
+struct RaidSeatNow
+{
+    // The subgroup the core currently has them in. Anything at or above
+    // RAID_SUBGROUPS means "the core does not have them in this raid at all" -
+    // `Group::GetMemberGroup` answers MAX_RAID_SUBGROUPS + 1 for a guid it
+    // cannot find, and that value reaching a move would be the out-of-bounds
+    // write this section opened with.
+    unsigned subgroup{0};
+    // Where the plan wants them. Only read when `planned` is true.
+    unsigned want{0};
+    // Is this character in the plan at all. A raid can hold characters the plan
+    // never named - somebody who was already in the group - and they are never
+    // MOVED for their own sake, only ever displaced to make room for somebody
+    // who was.
+    bool planned{false};
+};
+
+// One move: put member `who` into subgroup `to`.
+struct RaidMove
+{
+    std::size_t who{0};   // into the seats vector as it was given
+    unsigned to{0};
+};
+
+// The moves that turn the raid as it stands into the raid the plan wants, in
+// the order they must be applied.
+//
+// WHY THIS IS A LIST OF MOVES AND NOT A LOOP IN THE ADAPTER. Two reasons, and
+// the second is the one that made it worth a function.
+//
+//   1. IT IS TESTABLE. A loop against a live `Group` can only be proven by
+//      running a worldserver. A list of moves can be applied to an array in a
+//      test and compared against the wanted layout, which is what
+//      tests/test_raid.cpp does.
+//   2. THE NAIVE LOOP IS WRONG, AND WRONG IN THE WAY THAT CORRUPTS MEMORY.
+//      `Group::ChangeMembersGroup(guid, group)` checks that the group is a
+//      raid and that the guid is in it, and then checks NOTHING ELSE - not the
+//      bound on `group`, and not whether the destination already holds five.
+//      It goes straight to `SubGroupCounterIncrease(group)`. The core's own
+//      caller does both checks itself before calling it
+//      (GroupHandler.cpp:684 `if (groupNr >= MAX_RAID_SUBGROUPS)` and :691
+//      `if (!group->HasFreeSlotSubGroup(groupNr))`, at the pinned revision), so
+//      a module that calls it without them is not taking a shortcut the core
+//      takes; it is skipping a check the core does not happen to keep in the
+//      same function.
+//
+// SO A FULL DESTINATION IS A SWAP, NOT A PUSH. When the wanted group already
+// holds five, this displaces one of its occupants into the mover's old group
+// and then moves the mover in - two moves, emitted in that order. That is
+// exactly what the core does for a hand-dragged swap in the raid frame
+// (GroupHandler.cpp:1232-1233 calls `ChangeMembersGroup` twice, in the same
+// shape), so it is the core's own idiom rather than an invention.
+//
+// AND THE OCCUPANT DISPLACED IS ALWAYS ONE THAT DOES NOT BELONG THERE - a
+// member whose plan names a different group, or a member the plan never named.
+// That is what makes this terminate: every emitted pair puts one more character
+// into the group the plan wants and never takes one out of the group the plan
+// wants, so the number of correctly seated members strictly increases and the
+// loop cannot cycle. A version that displaced whoever was nearest would swap
+// two characters back and forth for ever.
+std::vector<RaidMove> RaidSeatingMoves(std::vector<RaidSeatNow> const& seats);
+
 // -- and the row that asks for any of it -------------------------------------
 //
 // THE GRAMMAR IS PARSED HERE RATHER THAN IN THE ADAPTER for the same reason the
@@ -11223,6 +11599,24 @@ enum class GuildVerb : std::uint8_t
     // and never a partial move. Which tab, whether to try other tabs, and
     // withdraw are all explicitly deferred - see the design doc.
     BankDepositItem,
+    // `raid` - the seating plan for the whole guild: who tanks, who heals, and
+    // which of groups 1 through 8 each member stands in. READ-ONLY: it forms
+    // nothing, moves nobody and changes no row, exactly the way `shortlist` is
+    // read-only beside `invite`. It is also the half of infra#3763 that works
+    // TODAY, because it plans over `guild_member` rather than over the world
+    // and therefore does not care that thirty-five of the forty are offline.
+    Raid,
+    // `raid form` - convert the acting character's group into a raid and seat
+    // into it whoever of the plan is actually in the world.
+    //
+    // WHY THIS IS A SEPARATE VERB FROM `raid` AND NOT A FLAG ON IT.
+    // `Group::ConvertToRaid()` IS IRREVERSIBLE. There is no ConvertToParty
+    // anywhere in the core at the pinned revision - grepped Group.h, which
+    // declares ConvertToLFG and ConvertToRaid and nothing that goes back - so
+    // the only way out of a raid is to disband the group and form it again. A
+    // verb that could do that as a side effect of being asked a question is a
+    // verb somebody will one day ask a question with.
+    RaidForm,
 };
 
 struct GuildRequest
@@ -11295,7 +11689,8 @@ constexpr unsigned GUILD_NAME_MAX = 24;
 // quote character - the rule every executor in this file keeps.
 namespace GuildRefusal
 {
-constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard or bank";
+constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard, bank or raid";
+constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
 constexpr char const* BankNeedsDeposit = "bank takes exactly `deposit <copper>` or `deposit-item <guid:N|entry:N>`";
 constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount and nothing else";
 constexpr char const* BankAmountIsZero = "a deposit of nothing is not a request";

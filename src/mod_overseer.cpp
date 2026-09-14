@@ -33772,6 +33772,85 @@ private:
         return policy;
     }
 
+    // THE MODULE'S NUMBERS AND THE CORE'S NUMBERS, COMPARED AT COMPILE TIME.
+    //
+    // src/overseer_decisions.h restates MAXRAIDSIZE, MAXGROUPSIZE and
+    // MAX_RAID_SUBGROUPS because it compiles with no core in its include path -
+    // that is the whole property check.decisions.yml exists to protect. A
+    // restated constant drifts, and this one drifts into a heap overrun rather
+    // than into a wrong answer: Group::_initRaidSubGroupsCounter allocates
+    // exactly `new uint8[MAX_RAID_SUBGROUPS]` and
+    // Group::SubGroupCounterIncrease does an unchecked
+    // `++m_subGroupsCounts[subgroup]`, so a module that believed in nine
+    // subgroups would write one byte past that allocation in the worldserver
+    // and nothing would say so.
+    //
+    // THIS FILE IS THE ONE PLACE BOTH NUMBERS ARE VISIBLE AT ONCE, so it is the
+    // only place the comparison can be made. It costs nothing at runtime and it
+    // fails the build rather than the raid.
+    static_assert(OverseerDecisions::RAID_SUBGROUPS == unsigned(MAX_RAID_SUBGROUPS),
+                  "overseer: RAID_SUBGROUPS disagrees with the core's MAX_RAID_SUBGROUPS");
+    static_assert(OverseerDecisions::RAID_SUBGROUP_SIZE == unsigned(MAXGROUPSIZE),
+                  "overseer: RAID_SUBGROUP_SIZE disagrees with the core's MAXGROUPSIZE");
+    static_assert(OverseerDecisions::RAID_SIZE == unsigned(MAXRAIDSIZE),
+                  "overseer: RAID_SIZE disagrees with the core's MAXRAIDSIZE");
+
+    // The raid shape as configured, read fresh each time for exactly the same
+    // reason RecruitPolicyFromConfig is: a guild verb runs a few times an hour,
+    // two sConfigMgr lookups cost nothing measurable, and a module that read
+    // these once at load time would go on using the old numbers after a
+    // `.reload config` that changed them.
+    //
+    // These are a DECISION and not a measurement, which is why they are
+    // configuration at all. How many of forty seats should tank and how many
+    // should heal is not written down anywhere this module can read, and the
+    // defaults in overseer_decisions.h argue for themselves at length rather
+    // than pretending otherwise.
+    static OverseerDecisions::RaidShape RaidShapeFromConfig()
+    {
+        OverseerDecisions::RaidShape shape;
+        shape.tanks = sConfigMgr->GetOption<uint32>(
+            "Overseer.Raid.Tanks", OverseerDecisions::RAID_TANKS_DEFAULT);
+        shape.healers = sConfigMgr->GetOption<uint32>(
+            "Overseer.Raid.Healers", OverseerDecisions::RAID_HEALERS_DEFAULT);
+        return shape;
+    }
+
+    // May `guild raid form` convert the party the roster characters are in.
+    //
+    // OFF BY DEFAULT, AND THE DEFAULT IS THE WHOLE POINT OF THE KEY. Two facts
+    // together make converting the family's own party a thing nobody should be
+    // able to do by accident:
+    //
+    //   1. IT CANNOT BE UNDONE. There is no ConvertToParty anywhere in the core
+    //      at the pinned revision - Group.h declares ConvertToLFG and
+    //      ConvertToRaid and nothing that goes back. The only exit from a raid
+    //      is to disband the group and form it again, which loses the leader,
+    //      the loot method and every instance binding the group held.
+    //   2. IT SPLITS THE FAMILY'S PARTY CHAT, which is the thing
+    //      KeepRosterGrouped exists for. Party chat inside a raid goes to the
+    //      SPEAKER'S SUBGROUP only - ChatHandler.cpp:474 at the pinned revision
+    //      passes `group->GetMemberGroup(GetPlayer()->GetGUID())` straight into
+    //      BroadcastPacket - and this module's own chat verb mirrors that
+    //      faithfully (see the `subgroupOnly` branch in DoChat). While the
+    //      group is an ordinary party every member is in subgroup 0 and
+    //      nothing changes; the moment a raid layout spreads five roster
+    //      characters across five subgroups, a `/party` line reaches whoever
+    //      happens to share a subgroup with the speaker and nobody else. The
+    //      measured plan for this realm's guild puts the five family characters
+    //      in groups 1, 1, 2, 7 and 8, so this is not hypothetical.
+    //
+    // The verb therefore refuses when the group holds more than one enabled
+    // roster character, unless an operator has said otherwise here. This is a
+    // deliberate act somebody performs in a config file and a restart, which is
+    // the right amount of ceremony for something irreversible - and it means
+    // the verb is gated rather than unreachable: a group with at most one
+    // roster character in it converts with no flag at all.
+    static bool RaidMayConvertTheRosterParty()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false);
+    }
+
     // Form a guild, look at what it covers, find who would fill the holes, and
     // ask one of them in (#413).
     //
@@ -34491,6 +34570,330 @@ private:
 
             describe("read", "");
             status = "delivered";
+            return "";
+        }
+
+        if (request.verb == GuildVerb::Raid || request.verb == GuildVerb::RaidForm)
+        {
+            using OverseerDecisions::PlanRaid;
+            using OverseerDecisions::RAID_SUBGROUPS;
+            using OverseerDecisions::RaidMove;
+            using OverseerDecisions::RaidPlan;
+            using OverseerDecisions::RaidSeat;
+            using OverseerDecisions::RaidSeatName;
+            using OverseerDecisions::RaidSeatNow;
+            using OverseerDecisions::RaidSeatingMoves;
+            using OverseerDecisions::RaidShape;
+
+            // THE PLAN IS OVER THE WHOLE GUILD AND NOT OVER WHOEVER IS ONLINE,
+            // which is the choice PlanRaid's own comment argues at length. It
+            // also happens to be the only reason this verb answers anything at
+            // all today: thirty-five of this guild's forty characters are
+            // offline at any given moment, `Group::AddMember` takes a `Player*`
+            // and has no offline path at all, and a plan built from the world
+            // would therefore be a plan for twelve characters that read like a
+            // plan for a raid.
+            RaidShape const shape = RaidShapeFromConfig();
+            RaidPlan const plan = PlanRaid(members, shape);
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"members\":" << members.size()
+              << ",\"shape\":{\"tanks\":" << shape.tanks
+              << ",\"healers\":" << shape.healers << '}'
+              << ",\"filled\":{\"tanks\":" << plan.filled[unsigned(RaidSeat::Tank)]
+              << ",\"healers\":" << plan.filled[unsigned(RaidSeat::Healer)]
+              << ",\"melee\":" << plan.filled[unsigned(RaidSeat::Melee)]
+              << ",\"ranged\":" << plan.filled[unsigned(RaidSeat::Ranged)] << '}'
+              << ",\"groups\":[";
+            // PRINTED ONE-BASED, STORED ZERO-BASED, AND THIS IS THE EDGE WHERE
+            // THE TWO MEET. The owner asked for "group 1 thru 8";
+            // `group_member`.`subgroup` and every core call below hold 0 to 7.
+            // The conversion happens once, here, in the part nobody calls a
+            // core with.
+            for (unsigned g = 0; g < RAID_SUBGROUPS; ++g)
+            {
+                o << (g ? "," : "") << "{\"group\":" << (g + 1) << ",\"seats\":[";
+                bool firstSeat = true;
+                for (size_t i = 0; i < plan.seats.size(); ++i)
+                {
+                    if (plan.seats[i].subgroup != g)
+                        continue;
+                    GuildMemberFacts const& m = members[plan.seats[i].index];
+                    o << (firstSeat ? "" : ",") << "{\"name\":" << J(m.name)
+                      << ",\"class\":" << m.classId << ",\"level\":" << m.level
+                      << ",\"seat\":" << J(RaidSeatName(plan.seats[i].seat)) << '}';
+                    firstSeat = false;
+                }
+                o << "]}";
+            }
+            o << "],\"benched\":[";
+            for (size_t i = 0; i < plan.benched.size(); ++i)
+                o << (i ? "," : "") << J(members[plan.benched[i]].name);
+            o << ']';
+
+            if (request.verb == GuildVerb::Raid)
+            {
+                // READ-ONLY. Nothing above this line touched a Group, invited
+                // anybody or wrote a row, exactly the way `shortlist` is
+                // read-only beside `invite`.
+                note = o.str();
+                describe("read", "");
+                status = "delivered";
+                return "";
+            }
+
+            // -- GuildVerb::RaidForm from here down ---------------------------
+
+            Group* group = who->GetGroup();
+
+            // A BATTLEGROUND, BATTLEFIELD OR DUNGEON-FINDER GROUP IS NOT OURS
+            // TO CONVERT, and the core agrees in its own way: ConvertToRaid
+            // skips the `groups` row entirely for a BG or BF group, so the
+            // conversion would exist in memory and nowhere else, and the
+            // dungeon finder owns the shape of an LFG group on the far side of
+            // a system this module does not participate in. Refusing loudly is
+            // the only honest answer to any of the three.
+            if (group && (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup()))
+                return refuse("that group belongs to a battleground or the dungeon finder");
+
+            // THE ROSTER'S OWN PARTY IS NOT CONVERTED BY DEFAULT. See
+            // RaidMayConvertTheRosterParty for the two reasons, both of which
+            // are facts about the pinned core rather than preferences.
+            //
+            // MORE THAN ONE is the test, not "any", because the acting
+            // character is itself a roster character on this realm - every
+            // command row runs on one, since they are the only characters with
+            // clients attached. A gate on "any" would be a gate on everything.
+            if (group && !RaidMayConvertTheRosterParty())
+            {
+                unsigned rosterInGroup = 0;
+                if (QueryResult roster = CharacterDatabase.Query(
+                        "SELECT name FROM overseer_roster WHERE enabled = 1"))
+                {
+                    do
+                    {
+                        std::string const rosterName =
+                            roster->Fetch()[0].Get<std::string>();
+                        ObjectGuid const rosterGuid =
+                            sCharacterCache->GetCharacterGuidByName(rosterName);
+                        if (rosterGuid && group->IsMember(rosterGuid))
+                            ++rosterInGroup;
+                    } while (roster->NextRow());
+                }
+                if (rosterInGroup > 1)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: refusing to convert the group holding {} roster "
+                             "characters into a raid - Group::ConvertToRaid cannot be "
+                             "undone and a raid layout would split the family party chat "
+                             "across subgroups; set Overseer.Raid.ConvertRosterParty if "
+                             "that is genuinely wanted",
+                             rosterInGroup);
+                    return refuse("this group is the roster party and a raid conversion "
+                                  "cannot be undone - see Overseer.Raid.ConvertRosterParty");
+                }
+            }
+
+            bool const madeTheGroup = !group;
+            if (!group)
+            {
+                // The same three lines KeepRosterGrouped uses to form the
+                // family party, for the same reason: there is no other way to
+                // create a Group from a session with no GM security, and
+                // `.group join` needs a group to already exist.
+                group = new Group();
+                if (!group->Create(who))
+                {
+                    delete group;
+                    return refuse("the core refused to form the group");
+                }
+                sGroupMgr->AddGroup(group);
+            }
+
+            bool const wasAlreadyARaid = group->isRaidGroup();
+            if (!wasAlreadyARaid)
+                group->ConvertToRaid();
+
+            // DELIVERED IS NOT DONE: ASK THE GROUP. ConvertToRaid returns void
+            // and reports nothing at all, which is exactly the shape AGENTS.md
+            // warns about - a call whose failure is told to a client that does
+            // not exist. isRaidGroup() reads the flag the rest of the server
+            // will read.
+            if (!group->isRaidGroup())
+                return refuse("the group was not a raid when it was read back");
+
+            // -- who can actually be put in it --------------------------------
+            //
+            // ONLINE ONLY, AND THAT IS A CORE CONSTRAINT RATHER THAN A CHOICE.
+            // Group::AddMember takes a `Player*`. There is no offline path
+            // anywhere on Group at the pinned revision - AddMemberWithGuid is
+            // protected and LoadMemberFromDB is for startup - unlike
+            // Guild::AddMember, which reads `characters` for an absent
+            // character and is why `guild invite` works on somebody who is not
+            // logged in. So a forty-man raid needs forty characters in the
+            // world, and this reports the shortfall rather than hiding it.
+            std::vector<std::string> invited;
+            std::ostringstream notSeated;
+            unsigned notSeatedCount = 0;
+            auto cannotSeat = [&](std::string const& name, char const* why)
+            {
+                notSeated << (notSeatedCount ? "," : "") << "{\"name\":" << J(name)
+                          << ",\"why\":" << J(why) << '}';
+                ++notSeatedCount;
+            };
+
+            for (size_t i = 0; i < plan.seats.size(); ++i)
+            {
+                std::string const& name = members[plan.seats[i].index].name;
+                Player* p = ObjectAccessor::FindPlayerByName(name);
+                if (!p || !p->IsInWorld())
+                {
+                    cannotSeat(name, "not in the world");
+                    continue;
+                }
+                if (p->GetGroup() == group)
+                    continue;   // already with us
+                if (p->GetGroup())
+                {
+                    // NOT PULLED OUT OF SOMEBODY ELSE'S PARTY. The same rule
+                    // KeepRosterGrouped keeps, and Group::AddMember on a player
+                    // who already has a group does not move them anyway - it
+                    // takes the SetOriginalGroup branch and leaves two groups
+                    // both believing they hold the character.
+                    cannotSeat(name, "already in another group");
+                    continue;
+                }
+                if (group->IsFull())
+                {
+                    cannotSeat(name, "the raid is full");
+                    continue;
+                }
+                if (group->AddMember(p))
+                    invited.push_back(name);
+                else
+                    cannotSeat(name, "the core refused to add them");
+            }
+
+            // -- and the seating ----------------------------------------------
+            //
+            // The raid as the core has it right now, joined back to the plan BY
+            // NAME. Name is what MemberSlot carries and what GuildRosterFacts
+            // read, character names are unique on a realm, and it is the same
+            // join Guild::GetMember(std::string_view) makes - a second lookup
+            // through the character cache would be one more thing that can
+            // disagree.
+            std::vector<RaidSeatNow> seats;
+            std::vector<ObjectGuid> guids;
+            for (Group::MemberSlotList::const_iterator slot =
+                     group->GetMemberSlots().begin();
+                 slot != group->GetMemberSlots().end(); ++slot)
+            {
+                RaidSeatNow now;
+                now.subgroup = slot->group;
+                now.planned = false;
+                for (size_t i = 0; i < plan.seats.size(); ++i)
+                {
+                    if (members[plan.seats[i].index].name != slot->name)
+                        continue;
+                    now.want = plan.seats[i].subgroup;
+                    now.planned = true;
+                    break;
+                }
+                seats.push_back(now);
+                guids.push_back(slot->guid);
+            }
+
+            std::vector<RaidMove> const moves = RaidSeatingMoves(seats);
+            unsigned applied = 0;
+            for (size_t m = 0; m < moves.size(); ++m)
+            {
+                // THE BOUND IS RE-CHECKED AGAINST THE CORE'S OWN CONSTANT, not
+                // against the module's copy of it. The static_assert beside
+                // RaidShapeFromConfig already compares the two, so this can
+                // only fire if the decisions layer is wrong about its own
+                // arithmetic - which is precisely the case worth surviving,
+                // because Group::ChangeMembersGroup takes this number straight
+                // to an unchecked `++m_subGroupsCounts[subgroup]`.
+                if (moves[m].to >= unsigned(MAX_RAID_SUBGROUPS)
+                    || moves[m].who >= guids.size())
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: refusing a raid move to subgroup {} for index {} "
+                              "of {} - this is a bug in RaidSeatingMoves and the move is "
+                              "dropped rather than handed to the core",
+                              moves[m].to, uint32(moves[m].who), uint32(guids.size()));
+                    continue;
+                }
+                // AND THE FULLNESS CHECK IS DELIBERATELY *NOT* REPEATED HERE,
+                // which reads like an omission and is the opposite. The core's
+                // own handler asks HasFreeSlotSubGroup before it moves anybody
+                // (GroupHandler.cpp:691) because it is moving ONE character on
+                // a person's instruction. This is applying a swap: the first of
+                // the pair deliberately puts six in the group being vacated for
+                // the instant before the second takes one out again, exactly as
+                // the core's own raid-frame swap does (GroupHandler.cpp:1232-
+                // 1233). A HasFreeSlotSubGroup guard here would reject the
+                // first half of every swap and leave the raid half-seated. The
+                // accounting that makes the FINAL layout legal lives in
+                // RaidSeatingMoves, where a test can reach it.
+                group->ChangeMembersGroup(guids[moves[m].who], uint8(moves[m].to));
+                ++applied;
+            }
+
+            // -- read the world back ------------------------------------------
+            //
+            // ChangeMembersGroup returns void and no branch of it reports
+            // anything, so the only honest question is where the group says
+            // everybody is standing now.
+            unsigned inPlace = 0;
+            unsigned outOfPlace = 0;
+            for (Group::MemberSlotList::const_iterator slot =
+                     group->GetMemberSlots().begin();
+                 slot != group->GetMemberSlots().end(); ++slot)
+            {
+                for (size_t i = 0; i < plan.seats.size(); ++i)
+                {
+                    if (members[plan.seats[i].index].name != slot->name)
+                        continue;
+                    if (unsigned(slot->group) == plan.seats[i].subgroup)
+                        ++inPlace;
+                    else
+                        ++outOfPlace;
+                    break;
+                }
+            }
+
+            group->SendUpdate();
+
+            o << ",\"formed\":{\"group_made\":" << (madeTheGroup ? "true" : "false")
+              << ",\"already_a_raid\":" << (wasAlreadyARaid ? "true" : "false")
+              << ",\"in_raid\":" << group->GetMembersCount()
+              << ",\"invited\":[";
+            for (size_t i = 0; i < invited.size(); ++i)
+                o << (i ? "," : "") << J(invited[i]);
+            o << "],\"moves\":" << applied
+              << ",\"seated_as_planned\":" << inPlace
+              << ",\"seated_elsewhere\":" << outOfPlace
+              << ",\"not_seated\":[" << notSeated.str() << "]}";
+            note = o.str();
+
+            LOG_INFO("module.overseer",
+                     "overseer: guild '{}' ({}) raid - {} members in the raid, {} of the "
+                     "plan seated as planned, {} elsewhere, {} of the plan not in it at "
+                     "all ({} invited, {} moves applied)",
+                     guild->GetName(), guild->GetId(), group->GetMembersCount(), inPlace,
+                     outOfPlace, notSeatedCount, uint32(invited.size()), applied);
+
+            describe("formed", "");
+            // UNCHANGED WHEN NOTHING CHANGED, which is the same idempotence the
+            // formation machine keeps: running this twice in a row against a
+            // raid that is already seated should say so rather than claim to
+            // have done it again.
+            status = (madeTheGroup || !wasAlreadyARaid || !invited.empty() || applied != 0)
+                         ? "applied"
+                         : "unchanged";
             return "";
         }
 

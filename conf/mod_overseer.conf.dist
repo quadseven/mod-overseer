@@ -113,3 +113,108 @@
 #        Default:     60
 #
 #Overseer.Recruit.LevelMax = 60
+
+########################################
+#
+#    THE RAID, AND GROUPS 1 THROUGH 8
+#
+#    `guild raid` prints a seating plan for the whole guild: who tanks, who
+#    heals, and which of the eight raid groups each member stands in.
+#    `guild raid form` turns the acting character's group into a raid and seats
+#    into it whoever of that plan is actually in the world.
+#
+#    TWO OF THESE THREE KEYS ARE A DECISION AND THE THIRD IS A SAFETY CATCH.
+#    How many of forty seats should tank and how many should heal is not written
+#    down anywhere the module can read - it is the same sentence the recruit
+#    ceiling above has to say about itself - so it is configuration, with a
+#    default that argues for itself in src/overseer_decisions.h rather than
+#    pretending to be measured. Everything ELSE about the layout is derived:
+#    which class takes which seat, who is picked first, and which group anybody
+#    ends up in are all rules, not settings, because they follow from the two
+#    numbers plus the roster.
+#
+
+#
+#    Overseer.Raid.Tanks
+#        Description: How many of the forty seats are tanks.
+#
+#                     A raid night at this tier is a main tank on the boss, an
+#                     off-tank on whatever the boss brought with it, and enough
+#                     further tank-capable characters that the raid does not
+#                     stop when one of them dies. Four is the smallest number
+#                     that covers all three and still leaves thirty-six seats
+#                     for the raid to be anything else.
+#
+#                     IT IS NOT A FLOOR ON WHO CAN TANK. The picker takes tanks
+#                     in class order - warrior, death knight, druid, paladin -
+#                     and that order is an opportunity-cost argument rather than
+#                     a claim about who tanks best: a warrior who is not tanking
+#                     is a melee damage seat, while a paladin or druid who is
+#                     not tanking is a HEALER, which is the other scarce seat.
+#
+#                     SCALED DOWN FOR A SHORT ROSTER, rounded up. A guild of
+#                     twelve gets two tanks rather than four, because four tanks
+#                     and ten healers out of twelve characters is a raid with
+#                     two damage dealers in it.
+#
+#        Default:     4
+#
+#Overseer.Raid.Tanks = 4
+
+#
+#    Overseer.Raid.Healers
+#        Description: How many of the forty seats heal.
+#
+#                     A quarter of the raid. Forty-man content at this tier was
+#                     run on roughly ten to twelve healers, and the number is
+#                     bounded on both sides: too few and a raid dies to
+#                     attrition it could have healed through, too many and it
+#                     never kills anything before an enrage. Ten is the low end
+#                     of that range, chosen deliberately - this realm's guild is
+#                     levels 13 to 55, nowhere near the gear that makes healing
+#                     cheap, and the honest direction to be wrong in is the one
+#                     where the raid is slow rather than dead.
+#
+#                     HEALERS ARE SPREAD ONE PER GROUP before anybody gets a
+#                     second, so this number is also how many groups are
+#                     covered. Below eight, the low-numbered groups are covered
+#                     first and the tanks are always covered.
+#
+#        Default:     10
+#
+#Overseer.Raid.Healers = 10
+
+#
+#    Overseer.Raid.ConvertRosterParty
+#        Description: May `guild raid form` convert the party the roster
+#                     characters are in into a raid.
+#
+#                     OFF BY DEFAULT, AND THE DEFAULT IS THE POINT OF THE KEY.
+#                     Two facts make converting that particular group something
+#                     nobody should be able to do by accident, and both are
+#                     facts about the pinned core rather than preferences:
+#
+#                     1. IT CANNOT BE UNDONE. There is no ConvertToParty in the
+#                        core - Group declares ConvertToLFG and ConvertToRaid
+#                        and nothing that goes back. The only exit from a raid
+#                        is to disband the group and form it again, losing the
+#                        leader, the loot method and every instance binding.
+#                     2. IT SPLITS THE ROSTER PARTY CHAT, which is the whole
+#                        reason that party exists. Party chat inside a raid
+#                        reaches the speaker's SUBGROUP only. While the group is
+#                        an ordinary party everybody is in subgroup 0 and
+#                        nothing changes; the moment a raid layout spreads five
+#                        roster characters across five subgroups, a party line
+#                        reaches whoever happens to share a subgroup with the
+#                        speaker and nobody else.
+#
+#                     The gate is MORE THAN ONE enabled roster character in the
+#                     group, not "any": the acting character is itself normally
+#                     a roster character, because those are the ones with
+#                     clients attached, so a gate on "any" would be a gate on
+#                     everything. A group holding at most one roster character
+#                     converts with this left alone.
+#
+#        Default:     0
+#
+#Overseer.Raid.ConvertRosterParty = 0

@@ -37,9 +37,19 @@ setting duplicating something the database already knows would be a second
 answer that could disagree with the first.
 
 What IS configuration is the handful of values that are a **decision somebody
-made about one deployment** rather than a measurement — today, the guild
-recruit policy: how big the guild is recruiting toward, and the two ends of the
-level range it will ask inside. Nothing in a character database knows those.
+made about one deployment** rather than a measurement — today, two groups of
+them:
+
+- the guild **recruit policy**: how big the guild is recruiting toward, and the
+  two ends of the level range it will ask inside;
+- the guild **raid shape**: how many of a forty-man raid's seats tank and how
+  many heal, plus one safety catch on the irreversible half of `guild raid
+  form`.
+
+Nothing in a character database knows any of those. Everything else about a
+raid layout (which class takes which seat, who is picked first, which of groups
+1 through 8 anybody ends up in) is derived from those two numbers and the
+guild's own roster, so it is a rule rather than a setting.
 
 Every key is optional and has a compiled default, so a worldserver that has
 never seen `conf/mod_overseer.conf.dist` behaves exactly as one that copied it

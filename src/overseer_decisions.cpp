@@ -8788,6 +8788,433 @@ std::vector<RecruitPick> RecruitShortlist(
     return picks;
 }
 
+char const* RaidSeatName(RaidSeat seat)
+{
+    switch (seat)
+    {
+        case RaidSeat::Tank:   return "Tank";
+        case RaidSeat::Healer: return "Healer";
+        case RaidSeat::Melee:  return "Melee";
+        case RaidSeat::Ranged: return "Ranged";
+    }
+    return "";
+}
+
+RaidSeat RaidDamageBand(unsigned classId)
+{
+    // The four that argue are argued in the header. The rest are not choices:
+    // there is no ranged rogue and no melee mage.
+    if (classId == CLASS_WARRIOR || classId == CLASS_ROGUE || classId == CLASS_PALADIN
+        || classId == CLASS_DEATH_KNIGHT || classId == CLASS_SHAMAN)
+        return RaidSeat::Melee;
+    return RaidSeat::Ranged;
+}
+
+RaidShape RaidShapeFor(RaidShape const& full, unsigned members)
+{
+    RaidShape shape;
+    if (members == 0)
+        return shape;
+
+    // Rounded UP, against the size of a full raid. Integer arithmetic rather
+    // than floating point, because a seat count is a whole number and a
+    // rounding rule written as `(a * b + c - 1) / c` is one a reader can check
+    // by hand.
+    unsigned const wantTanks = (full.tanks * members + RAID_SIZE - 1) / RAID_SIZE;
+    unsigned const wantHealers = (full.healers * members + RAID_SIZE - 1) / RAID_SIZE;
+
+    shape.tanks = wantTanks;
+    shape.healers = wantHealers;
+
+    // THE FLOOR, AND WHY IT IS THREE MEMBERS AND NOT ONE. Below three there is
+    // nothing left over: two characters made of one tank and one healer is a
+    // group with nothing in it that kills anything, and the scaled quotas are
+    // already 1 and 1 at that size anyway. At three and above, a group with no
+    // tank at all, or none with a healer, is the answer nobody wants and the
+    // rounding above cannot produce it - but a caller may hand in a `full`
+    // shape of its own with a zero in it, and this is where that stops being a
+    // raid with no healers in it by accident.
+    if (members >= 3)
+    {
+        if (shape.tanks == 0)
+            shape.tanks = 1;
+        if (shape.healers == 0)
+            shape.healers = 1;
+    }
+
+    // AND THE CEILING, WHICH IS THE ROSTER ITSELF. A `full` shape asking for
+    // more tanks and healers together than there are characters would otherwise
+    // have the healer pass eat every seat the tank pass left, and the raid
+    // would have no damage in it at all. Tanks keep their share first because
+    // they were picked first; healers take what is left of the exclusive half.
+    if (shape.tanks > members)
+        shape.tanks = members;
+    if (shape.tanks + shape.healers > members)
+        shape.healers = members - shape.tanks;
+
+    return shape;
+}
+
+namespace
+{
+
+// Is this class allowed in this exclusive seat at all. Deliberately the SAME
+// answer ClassCanFill gives for Tank and Healer, asked through a second
+// function rather than by calling it, because the two are answering different
+// questions that happen to agree today - see the header. If they ever stop
+// agreeing, the disagreement should be a change to one of these and not a
+// silent change to both.
+bool ClassTakesSeat(unsigned classId, RaidSeat seat)
+{
+    if (seat == RaidSeat::Tank)
+        return classId == CLASS_WARRIOR || classId == CLASS_DEATH_KNIGHT
+               || classId == CLASS_DRUID || classId == CLASS_PALADIN;
+    if (seat == RaidSeat::Healer)
+        return classId == CLASS_PRIEST || classId == CLASS_PALADIN
+               || classId == CLASS_DRUID || classId == CLASS_SHAMAN;
+    return RaidDamageBand(classId) == seat;
+}
+
+// Where a class sits in the preference order for an exclusive seat: 0 is taken
+// first. A class that cannot take the seat answers a number past the end of the
+// list, so a caller that forgot to ask ClassTakesSeat first still sorts it last
+// rather than first - the failure direction that loses a tank rather than the
+// one that makes a mage tank.
+unsigned SeatPreference(unsigned classId, RaidSeat seat)
+{
+    unsigned const notThisSeat = 99;
+    if (seat == RaidSeat::Tank)
+    {
+        // Opportunity cost, argued in the header: take the tanks off the class
+        // whose other seat is the most replaceable.
+        if (classId == CLASS_WARRIOR)       return 0;
+        if (classId == CLASS_DEATH_KNIGHT)  return 1;
+        if (classId == CLASS_DRUID)         return 2;
+        if (classId == CLASS_PALADIN)       return 3;
+        return notThisSeat;
+    }
+    if (seat == RaidSeat::Healer)
+    {
+        if (classId == CLASS_PRIEST)        return 0;
+        if (classId == CLASS_PALADIN)       return 1;
+        if (classId == CLASS_DRUID)         return 2;
+        if (classId == CLASS_SHAMAN)        return 3;
+        return notThisSeat;
+    }
+    return notThisSeat;
+}
+
+// Is `a` taken before `b` for this seat. Class preference, then level
+// DESCENDING, then name ascending. The level tie-break is the one place this
+// section departs from RecruitShortlist's name-only rule and the header argues
+// why at length.
+bool TakenFirst(GuildMemberFacts const& a, GuildMemberFacts const& b, RaidSeat seat)
+{
+    unsigned const pa = SeatPreference(a.classId, seat);
+    unsigned const pb = SeatPreference(b.classId, seat);
+    if (pa != pb)
+        return pa < pb;
+    if (a.level != b.level)
+        return a.level > b.level;
+    return a.name < b.name;
+}
+
+// The lowest-numbered subgroup with a free seat, or RAID_SUBGROUPS when the
+// raid is full. `RAID_SUBGROUPS` is the "nowhere" answer on purpose: it is the
+// first value that is not a legal subgroup, so a caller that used it as one
+// would be caught by the same bound check the adapter keeps rather than by a
+// wrap to zero.
+unsigned LowestFree(unsigned const* held)
+{
+    for (unsigned g = 0; g < RAID_SUBGROUPS; ++g)
+        if (held[g] < RAID_SUBGROUP_SIZE)
+            return g;
+    return RAID_SUBGROUPS;
+}
+
+// And the highest-numbered one, for the ranged pass that fills from the far end.
+unsigned HighestFree(unsigned const* held)
+{
+    for (unsigned g = RAID_SUBGROUPS; g > 0; --g)
+        if (held[g - 1] < RAID_SUBGROUP_SIZE)
+            return g - 1;
+    return RAID_SUBGROUPS;
+}
+
+// The members holding one seat, in the order they should be placed: the same
+// order the picker chose them in, so the first healer into the tank group is
+// the healer the roster would least like to lose.
+//
+// AN INSERTION SORT, WRITTEN OUT, RATHER THAN std::sort. This translation unit
+// includes its own header and nothing else - the file says so in its first
+// paragraph and check.decisions.yml enforces it by compiling these two files
+// with no include path into anything at all. <algorithm> would be the second
+// include, and the argument for refusing the third is weaker the moment the
+// second is normal. Over at most forty entries the difference is not
+// measurable.
+std::vector<std::size_t> SeatedInOrder(std::vector<GuildMemberFacts> const& members,
+                                       std::vector<RaidSeat> const& seatOf,
+                                       RaidSeat seat)
+{
+    std::vector<std::size_t> order;
+    for (std::size_t i = 0; i < members.size(); ++i)
+        if (seatOf[i] == seat)
+            order.push_back(i);
+
+    for (std::size_t a = 1; a < order.size(); ++a)
+        for (std::size_t b = a;
+             b > 0 && TakenFirst(members[order[b]], members[order[b - 1]], seat); --b)
+        {
+            std::size_t const held = order[b];
+            order[b] = order[b - 1];
+            order[b - 1] = held;
+        }
+    return order;
+}
+
+}  // namespace
+
+RaidPlan PlanRaid(std::vector<GuildMemberFacts> const& members,
+                  RaidShape const& fullShape)
+{
+    RaidPlan plan;
+
+    RaidShape const shape =
+        RaidShapeFor(fullShape, static_cast<unsigned>(members.size()));
+
+    // Which seat each member was given, and whether they have been given one at
+    // all. Parallel to `members` throughout, so an index means the same thing
+    // in every array here and in the plan that comes out.
+    std::vector<RaidSeat> seatOf(members.size(), RaidSeat::Melee);
+    std::vector<bool> seated(members.size(), false);
+
+    // -- the two exclusive passes --------------------------------------------
+    //
+    // Tanks then healers, each taking the best remaining candidate one at a
+    // time. A sort-then-slice would be shorter and would be wrong: the healer
+    // pass has to see what the tank pass took, and the two orders are
+    // different, so the pool has to be re-asked rather than re-sorted.
+    RaidSeat const exclusive[2] = {RaidSeat::Tank, RaidSeat::Healer};
+    unsigned const wanted[2] = {shape.tanks, shape.healers};
+    for (unsigned pass = 0; pass < 2; ++pass)
+    {
+        for (unsigned taken = 0; taken < wanted[pass]; ++taken)
+        {
+            bool found = false;
+            std::size_t best = 0;
+            for (std::size_t i = 0; i < members.size(); ++i)
+            {
+                if (seated[i] || !ClassTakesSeat(members[i].classId, exclusive[pass]))
+                    continue;
+                if (!found || TakenFirst(members[i], members[best], exclusive[pass]))
+                {
+                    found = true;
+                    best = i;
+                }
+            }
+            if (!found)
+                break;   // the roster has nobody left who can take this seat
+            seatOf[best] = exclusive[pass];
+            seated[best] = true;
+        }
+    }
+
+    // -- and everybody else, by the table ------------------------------------
+    for (std::size_t i = 0; i < members.size(); ++i)
+    {
+        if (seated[i])
+            continue;
+        seatOf[i] = RaidDamageBand(members[i].classId);
+        seated[i] = true;
+    }
+
+    // -- the layout ----------------------------------------------------------
+    //
+    // Four passes, argued in the header. Within a pass the members are placed
+    // in the order the picker would have chosen them, which does real work in
+    // the healer pass: group 1 holds the tanks and takes the first healer, so
+    // the first healer should be the one the roster would least like to lose.
+    unsigned held[RAID_SUBGROUPS] = {};
+    std::vector<unsigned> group(members.size(), RAID_SUBGROUPS);
+
+    // Pass 1: tanks, from group 1 upward, so the default four share group 1.
+    // Pass 3: melee, the same way, filling in behind them.
+    // Pass 4: ranged, from group 8 downward, so melee and casters end up as far
+    //         apart as the roster allows.
+    // Each stops the moment there is no free seat left anywhere; whoever is
+    // still unplaced is benched below and named.
+    auto fill = [&](RaidSeat seat, bool fromTheLowEnd)
+    {
+        std::vector<std::size_t> const order = SeatedInOrder(members, seatOf, seat);
+        for (std::size_t n = 0; n < order.size(); ++n)
+        {
+            unsigned const at = fromTheLowEnd ? LowestFree(held) : HighestFree(held);
+            if (at == RAID_SUBGROUPS)
+                break;
+            group[order[n]] = at;
+            ++held[at];
+        }
+    };
+
+    fill(RaidSeat::Tank, true);
+
+    // Pass 2: healers, one per group, group 1 first, skipping any group that is
+    // already full, and going round again for any healer past the eighth. The
+    // `placed` guard is what ends it when every group is full - without it a
+    // raid with more healers than seats would spin here for ever.
+    {
+        std::vector<std::size_t> const order =
+            SeatedInOrder(members, seatOf, RaidSeat::Healer);
+        std::size_t next = 0;
+        bool placed = true;
+        while (next < order.size() && placed)
+        {
+            placed = false;
+            for (unsigned g = 0; g < RAID_SUBGROUPS && next < order.size(); ++g)
+            {
+                if (held[g] >= RAID_SUBGROUP_SIZE)
+                    continue;
+                group[order[next++]] = g;
+                ++held[g];
+                placed = true;
+            }
+        }
+    }
+
+    fill(RaidSeat::Melee, true);
+    fill(RaidSeat::Ranged, false);
+
+    // -- and the answer ------------------------------------------------------
+    for (std::size_t i = 0; i < members.size(); ++i)
+    {
+        if (group[i] >= RAID_SUBGROUPS)
+        {
+            plan.benched.push_back(i);
+            continue;
+        }
+        RaidSeatPlan seat;
+        seat.index = i;
+        seat.seat = seatOf[i];
+        seat.subgroup = group[i];
+        seat.said = std::string(RaidSeatName(seatOf[i])) + " in group "
+                    + std::to_string(group[i] + 1);
+        plan.seats.push_back(seat);
+        ++plan.filled[static_cast<unsigned>(seatOf[i])];
+    }
+
+    return plan;
+}
+
+std::vector<RaidMove> RaidSeatingMoves(std::vector<RaidSeatNow> const& seats)
+{
+    std::vector<RaidMove> moves;
+
+    // Where everybody is as the moves are worked out, and how full each group
+    // is. `where` starts as the core's answer and is kept in step with the
+    // moves emitted, so the counts below are always the counts the core would
+    // have once the moves so far had been applied.
+    std::vector<unsigned> where(seats.size(), RAID_SUBGROUPS);
+    unsigned held[RAID_SUBGROUPS] = {};
+    for (std::size_t i = 0; i < seats.size(); ++i)
+    {
+        where[i] = seats[i].subgroup;
+        if (where[i] < RAID_SUBGROUPS)
+            ++held[where[i]];
+    }
+
+    // THE BOUND ON THE OUTER LOOP IS A BACKSTOP AND NOT THE TERMINATION
+    // ARGUMENT. Every round that emits anything strictly increases the number
+    // of correctly seated members (see the header), so at most RAID_SIZE rounds
+    // can do any work and the `!moved` break is what actually ends it. The
+    // bound exists so that a future edit which breaks that property produces a
+    // finished command rather than a worldserver that stops answering - the
+    // same reason every other loop in this file that could in principle spin
+    // carries one.
+    for (unsigned round = 0; round < RAID_SIZE; ++round)
+    {
+        bool moved = false;
+        for (std::size_t i = 0; i < seats.size(); ++i)
+        {
+            if (!seats[i].planned)
+                continue;
+            unsigned const want = seats[i].want;
+            // A plan that names no legal subgroup is not a move. The adapter
+            // never builds one, and the check costs nothing next to what it
+            // prevents: `Group::ChangeMembersGroup` would take it straight to
+            // an unchecked `++m_subGroupsCounts[want]`.
+            if (want >= RAID_SUBGROUPS)
+                continue;
+            // NOR IS A CHARACTER THE CORE DOES NOT HAVE IN THIS RAID. That is
+            // what a current subgroup at or above RAID_SUBGROUPS means -
+            // `Group::GetMemberGroup` answers MAX_RAID_SUBGROUPS + 1 for a guid
+            // it cannot find - and moving one would be a no-op inside
+            // `ChangeMembersGroup` (it returns early on the same lookup) while
+            // this function's own count of the destination went up regardless,
+            // which would then overfill the NEXT group that wanted a seat there.
+            // A move nothing applies is worse than no move: it is a move
+            // everything after it is wrong about.
+            if (where[i] >= RAID_SUBGROUPS)
+                continue;
+            if (where[i] == want)
+                continue;
+
+            if (held[want] < RAID_SUBGROUP_SIZE)
+            {
+                --held[where[i]];
+                ++held[want];
+                where[i] = want;
+                RaidMove move;
+                move.who = i;
+                move.to = want;
+                moves.push_back(move);
+                moved = true;
+                continue;
+            }
+
+            // The wanted group is full. Displace somebody in it who does not
+            // belong there, into the group this member is leaving - which is
+            // the core's own two-call swap idiom.
+            //
+            // THE PAIR IS BRIEFLY ILLEGAL AND THAT IS UNAVOIDABLE, so it is
+            // said out loud rather than discovered. Between the two calls the
+            // group being vacated holds six, because the occupant has arrived
+            // and the mover has not left yet. There is no ordering that avoids
+            // it - the only free seat in the vacated group is the one the mover
+            // is still sitting in - and the core's own raid-frame swap has
+            // exactly the same window (GroupHandler.cpp:1232-1233). Nothing
+            // reads the counter in between: both calls are synchronous, on the
+            // world thread, inside one command.
+            for (std::size_t other = 0; other < seats.size(); ++other)
+            {
+                if (other == i || where[other] != want)
+                    continue;
+                if (seats[other].planned && seats[other].want == want)
+                    continue;   // this one does belong here; leave it alone
+                unsigned const vacated = where[i];
+                RaidMove out;
+                out.who = other;
+                out.to = vacated;
+                moves.push_back(out);
+                where[other] = vacated;
+                RaidMove in;
+                in.who = i;
+                in.to = want;
+                moves.push_back(in);
+                where[i] = want;
+                // The counts do not change: one leaves each group and one
+                // arrives in each group. Said out loud because a `--held` here
+                // is exactly the edit somebody makes on the way past.
+                moved = true;
+                break;
+            }
+        }
+        if (!moved)
+            break;
+    }
+
+    return moves;
+}
+
 GuildRequest ParseGuildRequest(std::string const& command)
 {
     GuildRequest request;
@@ -8825,6 +9252,28 @@ GuildRequest ParseGuildRequest(std::string const& command)
         // ALSO put Cogwin in target_arg is not wrong, it is just saying it
         // twice, and refusing that would be a trap rather than a check.
         request.verb = GuildVerb::Invite;
+        return request;
+    }
+
+    if (verb == "raid")
+    {
+        // `raid` alone reads. `raid form` acts. Nothing else is accepted, and
+        // in particular a misspelling is REFUSED rather than falling back to
+        // the read - the two differ by an irreversible Group::ConvertToRaid,
+        // and a grammar where `raid frm` quietly did the safe thing would be a
+        // grammar where `raid form` quietly did the safe thing too on the day
+        // somebody fat-fingered it in the other direction.
+        if (rest.empty())
+        {
+            request.verb = GuildVerb::Raid;
+            return request;
+        }
+        if (rest == "form")
+        {
+            request.verb = GuildVerb::RaidForm;
+            return request;
+        }
+        request.error = GuildRefusal::RaidTakesFormOrNothing;
         return request;
     }
 
