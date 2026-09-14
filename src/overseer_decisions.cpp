@@ -8271,6 +8271,169 @@ TownRetry CastRefusalRetry(std::string const& detail)
     return TownRetry::Later;
 }
 
+// ------------------------------------------ learning a recipe from an item --
+
+namespace
+{
+// The words of the line, split on runs of blanks. ParseCastRequest's own
+// splitter, and this grammar rides on the same `kind` so it splits the same
+// way; duplicated rather than shared because ParseCastRequest's copy is inline
+// in its body and pulling it out would change a function this does not touch.
+std::vector<std::string> LearnWords(std::string const& command)
+{
+    std::vector<std::string> words;
+    std::string::size_type at = 0;
+    while (at < command.size())
+    {
+        std::string::size_type const start = command.find_first_not_of(" \t", at);
+        if (start == std::string::npos)
+            break;
+        std::string::size_type const end = command.find_first_of(" \t", start);
+        words.push_back(command.substr(
+            start, end == std::string::npos ? std::string::npos : end - start));
+        at = (end == std::string::npos) ? command.size() : end;
+    }
+    return words;
+}
+
+// `<key>:<digits>` -> true and the number. Same rules TownKeyed keeps: a value
+// that is not digits, is empty, or would not fit a uint32 is malformed and NOT
+// a zero, because a wrapped number names a different item.
+bool LearnKeyed(std::string const& word, char const* key, uint32_t& value)
+{
+    std::string const prefix = std::string(key) + ":";
+    if (word.size() <= prefix.size() || word.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    std::string const digits = word.substr(prefix.size());
+    if (digits.size() > 10)
+        return false;
+    uint64_t parsed = 0;
+    for (char const c : digits)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        parsed = parsed * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (parsed > 0xFFFFFFFFull)
+        return false;
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+}  // namespace
+
+bool IsLearnRow(std::string const& command)
+{
+    std::vector<std::string> const words = LearnWords(command);
+    return !words.empty() && words[0] == "use";
+}
+
+LearnRequest ParseLearnRequest(std::string const& command)
+{
+    LearnRequest request;
+    std::vector<std::string> const words = LearnWords(command);
+
+    if (words.empty() || words[0] != "use")
+    {
+        request.error = LearnRefusal::NoVerb;
+        return request;
+    }
+    if (words.size() < 2)
+    {
+        request.error = LearnRefusal::NoItem;
+        return request;
+    }
+    // REFUSED RATHER THAN IGNORED. A trailing word is somebody reaching for an
+    // option this grammar does not have, and silently dropping it would run a
+    // command that is not the one that was written.
+    if (words.size() > 2)
+    {
+        request.error = LearnRefusal::TooManyWords;
+        return request;
+    }
+
+    uint32_t key = 0;
+    if (LearnKeyed(words[1], "guid", key))
+        request.byGuid = true;
+    else if (!LearnKeyed(words[1], "entry", key))
+    {
+        request.error = LearnRefusal::NoItem;
+        return request;
+    }
+    if (key == 0)
+    {
+        request.error = LearnRefusal::BadItem;
+        return request;
+    }
+
+    request.ok = true;
+    request.key = key;
+    return request;
+}
+
+char const* LearnOutcomeWord(LearnOutcome outcome)
+{
+    switch (outcome)
+    {
+        case LearnOutcome::Learned:
+            return "learned";
+        case LearnOutcome::NotLearned:
+            return "not learned";
+        case LearnOutcome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
+LearnOutcome JudgeLearn(LearnReadBack const& read)
+{
+    // THE ONLY QUESTION, AND THE WORLDSERVER OWNS THE ANSWER. Player::HasSpell
+    // reads the in-memory spell map, which is the same thing every gate in the
+    // core consults. It is deliberately NOT character_spell: a recipe granted
+    // at runtime is written only when its state is not UNCHANGED, so that table
+    // can be permanently wrong about a bot while HasSpell is right.
+    if (!read.learnerReadable)
+        return LearnOutcome::Unreadable;
+    if (read.knowsItNow)
+        return LearnOutcome::Learned;
+    // ITEM-STILL-CARRIED IS NOT PART OF THE VERDICT, only of the sentence. A
+    // recipe that is not known is not known whether or not the Pattern
+    // survived, and calling a destroyed-item-taught-nothing row anything other
+    // than a failure is the `delivered is not done` mistake with extra steps.
+    return LearnOutcome::NotLearned;
+}
+
+TownRetry LearnRefusalRetry(std::string const& detail)
+{
+    // NEVER. The row, the item, or a permanent fact about it is the wall.
+    // NotCarried is here and not under `later`: this verb is handed an exact
+    // guid or entry by whatever decided to use it, and an item that is not in
+    // the bags will not walk into them on its own - the pass that wanted it has
+    // to look again and write a new row.
+    if (detail == LearnRefusal::NoVerb || detail == LearnRefusal::NoItem
+        || detail == LearnRefusal::BadItem || detail == LearnRefusal::TooManyWords
+        || detail == LearnRefusal::NotCarried || detail == LearnRefusal::NoTemplate
+        || detail == LearnRefusal::NotARecipeItem || detail == LearnRefusal::NoLearnSpell
+        || detail == LearnRefusal::UnknownLearnSpell || detail == LearnRefusal::NoGenericLearn
+        || detail == LearnRefusal::AlreadyKnown || detail == LearnRefusal::BoundToSomebodyElse
+        || detail == LearnRefusal::NoBotAI)
+        return TownRetry::Never;
+
+    // ELSEWHERE, AND THIS IS THE ONE THAT MATTERS TO A SHOPPING PASS. A skill
+    // too low for the item is not answered by waiting and not answered by
+    // walking to a different counter either - it is answered by the character
+    // levelling the trade, which happens somewhere else in every sense that
+    // matters here. Classed with the other "go and change something first"
+    // refusals rather than `later`, so nothing re-asks this row on a timer
+    // while the skill sits where it was.
+    if (detail == LearnRefusal::SkillTooLow || detail == LearnRefusal::CannotUse)
+        return TownRetry::Elsewhere;
+
+    // LATER, and everything this table has never heard of: the character is
+    // moving, fighting, dead, mid-cast or already running a row, and every one
+    // of those ends by itself.
+    return TownRetry::Later;
+}
+
 namespace
 {
 

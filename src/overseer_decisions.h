@@ -10564,6 +10564,200 @@ constexpr char const* BadTargetName = "a character name is letters only";
 // heard of is more likely a new transient than a new permanent.
 TownRetry CastRefusalRetry(std::string const& detail);
 
+// ------------------------------------------ learning a recipe from an item --
+//
+// WHAT THIS IS, AND WHY IT IS NOT THE TRAINER PROBLEM. A crafting recipe
+// reaches a character by one of two completely separate routes, and only one
+// of them is blocked:
+//
+//   A TRAINER TEACHES IT.  Blocked, and out of scope here. The module's
+//                          TrainerSpellForSkill only ever returns a skill's
+//                          RANK spells (Apprentice, Journeyman, ...) and never
+//                          the recipes a trainer also sells, so a recipe on
+//                          that route cannot be bought at all today.
+//
+//   AN ITEM TEACHES IT.    A Pattern, Formula, Manual, Recipe, Plans,
+//                          Schematic or Design - every one of them
+//                          item_template.class 9 - is USED, and using it
+//                          teaches the recipe and destroys the item. Those
+//                          items drop, and they are sold by vendors and on the
+//                          auction house. This is that route, and nothing in
+//                          this module could drive it.
+//
+// HOW THE CORE ACTUALLY DOES IT, read off the pinned core rather than guessed,
+// because three plausible mechanisms are wrong and one of them would have been
+// a silent no-op:
+//
+//   item_template carries TWO spell slots for such an item. Slot 1 is spell 483
+//   ("Learning") with spelltrigger 0 (ON_USE); slot 2 is the recipe itself with
+//   spelltrigger 6, which ItemTemplate.h names ITEM_SPELLTRIGGER_LEARN_SPELL_ID
+//   and documents as "used in item_template.spell_2 with spell_id with
+//   SPELL_GENERIC_LEARN in spell_1".
+//
+//   NOTHING SWITCHES ON TRIGGER 6 ANYWHERE. It is a marker for a human reading
+//   the table. The mechanism is a hardcoded special case at the top of
+//   Player::CastItemUseSpell (Player.cpp:7591-7611): when Spells[0].SpellId is
+//   483 or 55884 it builds spell 483 by hand, sets m_CastItem to the item, and
+//   calls SetSpellValue(SPELLVALUE_BASE_POINT0, Spells[1].SpellId). Spell 483's
+//   only effect is SPELL_EFFECT_LEARN_SPELL, and Spell::EffectLearnSpell
+//   (SpellEffects.cpp:2582) reads that base point back:
+//
+//       uint32 spellToLearn = (m_spellInfo->Id == 483 || m_spellInfo->Id == 55884)
+//                                 ? damage : m_spellInfo->Effects[effIndex].TriggerSpell;
+//       player->learnSpell(spellToLearn);
+//
+// THREE CONSEQUENCES, AND EACH ONE IS A DESIGN CONSTRAINT RATHER THAN TRIVIA:
+//
+//   1. THE `cast` VERB CANNOT DO THIS. Casting 483 by spell id runs the same
+//      effect with `damage` taken from the spell's own EffectBasePoints, which
+//      Spell.dbc records as 0 for 483. That is learnSpell(0) - a silent no-op.
+//      The item has to be the cast item, which means going through
+//      CastItemUseSpell and not through a spell id.
+//
+//   2. IT IS NOT INSTANT. Spell.dbc gives 483 CastingTimeIndex 14, which
+//      SpellCastTimes.dbc resolves to 3000ms. So the learn has NOT happened
+//      when CastItemUseSpell returns, the caster must be held still for the
+//      duration exactly as `cast` holds one, and the row is judged later from
+//      its own window. A verb that read HasSpell straight back would report
+//      every successful learn as a failure.
+//
+//   3. THE ITEM IS DESTROYED EITHER WAY. spellcharges_1 is -1 on these items,
+//      so Spell::TakeCastItem (Spell.cpp:5254-5313) decrements to zero and
+//      calls DestroyItemCount. Nothing in the core asks whether the character
+//      already knew the recipe - EffectLearnSpell has no such check and
+//      Spell::CheckCast has none for a player-targeted learn. USING A RECIPE
+//      THE CHARACTER ALREADY KNOWS THEREFORE BURNS IT FOR NOTHING, which is
+//      why AlreadyKnown below is a refusal this module makes for itself rather
+//      than one it waits for the core to make.
+//
+// WHY IT RIDES ON kind='cast' RATHER THAN A kind OF ITS OWN. A new `kind`
+// value is an ENUM migration in data/sql, which reaches a world only through a
+// db-import run, on a different clock from the module image. The grammars do
+// not collide: a cast row begins with a spell id, which is digits, and this one
+// begins with the word `use`. IsLearnRow is what tells them apart, and it is
+// the only reason the dispatch needs to know this verb exists.
+
+// `use guid:<item_instance.guid>` or `use entry:<item_template.entry>`.
+struct LearnRequest
+{
+    bool ok{false};
+    // GUID NAMES ONE ITEM; ENTRY NAMES A TYPE. Both are accepted for the same
+    // reason ParseGiveSpec accepts both: an operator reading a row out of
+    // character_inventory already has the guid, and a pass that has only just
+    // decided to buy something has only the entry. Unlike `give`, neither is
+    // preferred here - every copy of a Pattern teaches the same recipe, so an
+    // entry has no ambiguity to resolve.
+    bool byGuid{false};
+    uint32_t key{0};
+    // The refusal literal when ok is false, a pointer into the table below for
+    // the same reason CastRequest::error is one: it goes straight into `detail`
+    // where LearnRefusalRetry keys on it.
+    char const* error{""};
+};
+
+// Is this `cast` row an item-use row rather than a spell-id row? True only when
+// the first word is exactly `use`. Deliberately NOT "does it contain a colon" or
+// "is the first character not a digit": a malformed spell id must keep reaching
+// ParseCastRequest, whose sentences already say what a cast row looks like.
+bool IsLearnRow(std::string const& command);
+
+LearnRequest ParseLearnRequest(std::string const& command);
+
+// THE FOUR THINGS A LEARN ROW CAN HONESTLY CLAIM. Shorter than CastOutcome's
+// list because the post-condition here is exact: Player::HasSpell is the
+// worldserver's own answer to the only question that matters, and it is
+// readable before and after.
+enum class LearnOutcome
+{
+    // The character could not be read back at the verdict, so HasSpell was
+    // never asked a second time. Says nothing about whether the recipe was
+    // learned.
+    Unreadable,
+    // HasSpell was false before the use and is true after it. The whole point.
+    Learned,
+    // HasSpell is still false. The item may or may not still be in the bags,
+    // and which of those it is separates "the use never started" from "the use
+    // consumed the item and taught nothing" - both are failures and neither is
+    // `applied`.
+    NotLearned,
+};
+
+// "unreadable", "learned", "not learned". Here rather than in the executor so
+// the word a test pins is the word a row carries.
+char const* LearnOutcomeWord(LearnOutcome outcome);
+
+// What the executor measured, handed over as facts.
+struct LearnReadBack
+{
+    bool learnerReadable{false};
+    bool knowsItNow{false};
+    // Whether the item is still carried at the verdict. Not part of the
+    // verdict - the recipe being known is - but it is what makes a failed row
+    // diagnosable, so it is carried alongside.
+    bool itemStillCarried{false};
+};
+
+LearnOutcome JudgeLearn(LearnReadBack const& read);
+
+// THE REFUSAL LITERALS. No quote characters, the rule every executor keeps.
+namespace LearnRefusal
+{
+constexpr char const* NoSession = "character has no session";
+constexpr char const* NotInWorld = "character is not in the world";
+// Same reason CastRefusal::NoBotAI gives: the hold below is a strategy change
+// and needs an engine to change it.
+constexpr char const* NoBotAI = "character has no bot AI to hold it still";
+constexpr char const* NotOwnMover = "character is not its own mover";
+constexpr char const* Dead = "character is dead";
+constexpr char const* InFlight = "character is in flight";
+// HandleUseItemOpcode refuses an item use in combat outright when any of the
+// item's spells cannot be used in combat (SpellHandler.cpp:167-180), and a
+// 3000ms cast would not survive being hit anyway.
+constexpr char const* InCombat = "character is in combat";
+constexpr char const* Stunned = "character is stunned";
+constexpr char const* LoggingOut = "character is logging out";
+constexpr char const* Trading = "character is in a trade";
+constexpr char const* OnTransport = "character is on a transport";
+constexpr char const* AlreadyCasting = "character is already casting";
+// Spell::prepare refuses a moving caster when the spell has a cast time, and
+// 483 has 3000ms of one. Refused rather than driven, and the executor places a
+// hold on its way out so the next ask finds a character standing.
+constexpr char const* Moving = "character is moving";
+constexpr char const* NotCarried = "no carried item matches that guid or entry";
+constexpr char const* NoTemplate = "the item has no template";
+// The scope wall, and it is worth being explicit about. This verb drives the
+// learning special case at the top of CastItemUseSpell and nothing else. A
+// general use-any-item verb would have to reason about potions, bandages,
+// scrolls, bombs and quest items, each with its own post-condition; none of
+// that is needed to learn a recipe and none of it would be exercised.
+constexpr char const* NotARecipeItem = "that item does not teach a recipe when it is used";
+constexpr char const* NoLearnSpell = "that item names no spell to teach";
+constexpr char const* UnknownLearnSpell = "the core does not know the spell that item teaches";
+constexpr char const* NoGenericLearn = "the core does not know the generic learning spell";
+// THE ONE THAT SAVES THE ITEM. Nothing in the core asks this, and the item is
+// destroyed on use whether or not anything was learned.
+constexpr char const* AlreadyKnown = "the character already knows that recipe";
+// Player::CanUseItem's own answer, which is where the profession gate lives:
+// GetSkillValue(RequiredSkill) below RequiredSkillRank is EQUIP_ERR_CANT_EQUIP_SKILL
+// and a skill the character does not have at all is EQUIP_ERR_NO_REQUIRED_PROFICIENCY
+// (PlayerStorage.cpp:2402-2412). This is the refusal a pass that shops for
+// recipes has to plan around: a Pattern needing Tailoring 165 is unusable by a
+// tailor at 50, and buying it would be gold spent on a wall.
+constexpr char const* SkillTooLow = "the character skill is too low to use that item";
+constexpr char const* CannotUse = "the core refuses this character the use of that item";
+constexpr char const* BoundToSomebodyElse = "that item is soulbound to somebody else";
+// One learn row per character at a time, for the same hold reason
+// CastRefusal::AlreadyRunning gives.
+constexpr char const* AlreadyRunning = "a learn row is already running for that character";
+// The parser's own sentences.
+constexpr char const* NoVerb = "a learn row must begin with the word use";
+constexpr char const* NoItem = "a learn row takes use guid:<n> or use entry:<n>";
+constexpr char const* BadItem = "the item must be guid:<digits> or entry:<digits>, not 0";
+constexpr char const* TooManyWords = "a learn row takes exactly the word use and one item";
+}  // namespace LearnRefusal
+
+TownRetry LearnRefusalRetry(std::string const& detail);
+
 // --------------------------------------------------------- the guild (#413) --
 //
 // THE FAMILY HAS NO GUILD, AND THIS FILE HAS SAID SO FOR A WHILE. The repair
