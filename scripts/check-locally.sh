@@ -14,6 +14,18 @@
 #                                              ninja and the Linux toolchain
 #                                              apps/docker/Dockerfile installs
 #                                              -- run inside WSL2 on Windows)
+#
+# A STOCK UBUNTU IMAGE CAN STILL FAIL THE ADAPTER CHECK WITH A LINK ERROR ON
+# EVERY C++ FILE, NOT JUST THIS MODULE'S (seen on a WSL2 Ubuntu 26.04 image,
+# 2026-09-15): clang++ auto-detects whichever gcc version's directory is
+# newest on the system and prefers its libstdc++, but the apt list above only
+# guarantees THAT gcc's own package is present, not its libstdc++-dev -- if
+# something else on the box pulled in a newer gcc's runtime first, clang++
+# picks it and then has no matching libstdc++ headers/libs to link against.
+# `clang++ --version` and a trivial `echo 'int main(){}' | clang++ -x c++ - -o
+# /tmp/t` will fail the same way before this script ever gets involved; the
+# fix is installing that specific gcc version's libstdc++-<N>-dev package,
+# not anything in this script or this repository.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
