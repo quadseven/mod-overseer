@@ -2902,6 +2902,40 @@ ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
                                   std::vector<ProfessionHolding> const& held,
                                   unsigned maxPrimary);
 
+// ------------------------------------------------------------ job='fish' --
+//
+// Fishing does not fit ProfessionStep's shape at all: no primary-profession
+// slot, no cap, nothing to give up. DriveFish (mod_overseer.cpp) turns
+// mod-playerbots' own complete fishing AI ("master fishing", a strategy
+// upstream otherwise only ever turns on for a bot whose REAL, LOGGED-IN
+// master casts Fishing nearby - SeeSpellAction.cpp) into a standing errand
+// by toggling that strategy directly, by job. This is the ten-line decision
+// underneath that toggle, pulled out here for the identical reason
+// NextProfessionStep is: a `Player*`/`PlayerbotAI*` call site is not
+// something a unit test can construct, and a bare `if` embedded in that call
+// site is a decision nothing exercises directly.
+enum class FishDriveStep
+{
+    // The steady state once fishing has started, and the answer whenever
+    // `job` is not 'fish' and the strategy already agrees.
+    Nothing,
+
+    // Turn the strategy on: job='fish', not already running, and the
+    // character actually knows Fishing (see NextFishDriveStep for why that
+    // last part is a hard gate, not a hint).
+    TurnOn,
+
+    // Turn the strategy off: `job` moved away from 'fish' while it was
+    // still running. Never fires from a knowledge gap - only Nothing does,
+    // because a character that never started fishing has nothing to stop.
+    TurnOff,
+};
+
+// `wantsFishing` is `job == 'fish'` for this character right now.
+// `strategyIsOn` is `botAI->HasStrategy("master fishing", BOT_STATE_NON_COMBAT)`.
+// `knowsFishing` is `bot->GetSkillValue(SKILL_FISHING) != 0`.
+FishDriveStep NextFishDriveStep(bool wantsFishing, bool strategyIsOn, bool knowsFishing);
+
 // ------------------------------------------------------ the give backoff --
 //
 // "IT DID NOT WORK, AND IT WILL NOT WORK TWO SECONDS FROM NOW EITHER."
