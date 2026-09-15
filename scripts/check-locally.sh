@@ -136,7 +136,15 @@ run_adapter() {
       echo "failed to strip output flags out of the compile command, refusing to run it" >&2
       return 1 ;;
   esac
-  eval "$syntax -fsyntax-only \"$src\""
+
+  # $syntax comes from compile_commands.json, which cmake generates from this
+  # checkout's own build files -- not something to hand to eval or any other
+  # shell re-parse. xargs's word-splitting understands quoting and escaping
+  # but, unlike a shell, never expands $(...), backticks, ;, | or & -- so a
+  # malicious flag value lands as one inert argv element instead of running.
+  local -a args
+  mapfile -t args < <(xargs -n1 <<<"$syntax")
+  "${args[@]}" -fsyntax-only "$src"
 }
 
 mode="${1:-both}"
