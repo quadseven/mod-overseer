@@ -8978,13 +8978,28 @@ RecruitVerdict RecruitVerdictFor(RecruitCandidate const& candidate,
     return verdict;
 }
 
-std::vector<RecruitPick> RecruitShortlist(
+RecruitShortlistReport RecruitShortlistReportFor(
     std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
     unsigned atMost)
 {
-    std::vector<RecruitPick> picks;
+    RecruitShortlistReport report;
+    std::vector<RecruitPick>& picks = report.picks;
     if (atMost == 0)
-        return picks;
+        return report;
+
+    // Count refusals once against the same initial facts the caller supplied.
+    // The working copy below deliberately changes as picks consume holes, but
+    // that mutation is selection state, not a second explanation of the
+    // candidate pool.
+    std::map<RecruitRefusal, unsigned> refused;
+    for (RecruitCandidate const& candidate : candidates)
+    {
+        RecruitVerdict const verdict = RecruitVerdictFor(candidate, needs);
+        if (!verdict.invite)
+            ++refused[verdict.refusal];
+    }
+    for (auto const& entry : refused)
+        report.refused.emplace_back(entry.first, entry.second);
 
     // The working copy. Gaps come out of THIS as they are filled, which is what
     // stops three engineers being invited for one engineering hole.
@@ -9053,7 +9068,14 @@ std::vector<RecruitPick> RecruitShortlist(
         ++open.memberCount;
     }
 
-    return picks;
+    return report;
+}
+
+std::vector<RecruitPick> RecruitShortlist(
+    std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
+    unsigned atMost)
+{
+    return RecruitShortlistReportFor(candidates, needs, atMost).picks;
 }
 
 char const* RaidSeatName(RaidSeat seat)

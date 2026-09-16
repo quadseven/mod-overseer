@@ -57,6 +57,8 @@ using OverseerDecisions::RecruitBandFrom;
 using OverseerDecisions::RecruitCandidate;
 using OverseerDecisions::RecruitNeed;
 using OverseerDecisions::RecruitPick;
+using OverseerDecisions::RecruitShortlistReport;
+using OverseerDecisions::RecruitShortlistReportFor;
 using OverseerDecisions::RecruitPolicy;
 using OverseerDecisions::RecruitRefusal;
 using OverseerDecisions::RecruitShortlist;
@@ -654,6 +656,26 @@ void TheShortlistTakesTheHolesInTheOrderTheyMatter()
     CheckString("the shaman is named", candidates[picks[1].index].name, "Thrak");
 }
 
+void TheShortlistReportsWhyCandidatesWereRefused()
+{
+    GuildNeeds const needs = FamilyNeeds();
+    std::vector<RecruitCandidate> candidates;
+    candidates.push_back(Candidate("Guilded", HUNTER, 36, 0, 0));
+    candidates.back().guildId = 77;
+    candidates.push_back(Candidate("Low", HUNTER, 1, 0, 0));
+
+    RecruitShortlistReport const report =
+        RecruitShortlistReportFor(candidates, needs, 3);
+    CheckUnsigned("no refused candidate is silently discarded",
+                  static_cast<unsigned>(report.refused.size()), 2);
+    Check("already guilded has a refusal count",
+          report.refused[0].first == RecruitRefusal::AlreadyGuilded
+              && report.refused[0].second == 1);
+    Check("below-band has a refusal count",
+          report.refused[1].first == RecruitRefusal::BelowBand
+              && report.refused[1].second == 1);
+}
+
 // -- forming it --------------------------------------------------------------
 
 void FormationWaitsForTheFounderBeforeItTriesToCreate()
@@ -1014,6 +1036,7 @@ int main()
     APickClosesEveryHoleItFillsAndNotOnlyTheNamedOne();
     TheShortlistStopsAtTheCapAndAtTheRoster();
     TheShortlistTakesTheHolesInTheOrderTheyMatter();
+    TheShortlistReportsWhyCandidatesWereRefused();
     FormationWaitsForTheFounderBeforeItTriesToCreate();
     FormationAddsOneFounderAtATimeAndThenStops();
     FormationRefusesLoudlyRatherThanWorkingRound();
