@@ -34794,6 +34794,90 @@ private:
             return "";
         }
 
+        if (request.verb == GuildVerb::BankGrantDeposit)
+        {
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to change guild bank rights through");
+            if (guild->GetLeaderGUID() != who->GetGUID())
+                return refuse("only the guild master may change guild bank rights");
+
+            // HandleSetRankInfo replaces the whole rank record. Read every
+            // existing field first, then alter only the deposit bits for the
+            // purchased tabs. Missing tables are an old-realm condition, not
+            // a reason to turn the whole guild command endpoint into a 503.
+            QueryResult rank = CharacterDatabase.Query(
+                "SELECT rname, rights, BankMoneyPerDay FROM guild_rank "
+                "WHERE guildid = {} AND rid = {}", guild->GetId(), request.bankRankId);
+            if (!rank)
+                return refuse("the guild rank table is not installed or the rank does not exist (1146)");
+
+            QueryResult tabs = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name IN "
+                "('guild_bank_tab','guild_bank_right')");
+            if (!tabs || tabs->Fetch()[0].Get<uint32>() != 2)
+                return refuse("the guild bank rights tables are not installed on this realm (1146)");
+
+            QueryResult purchased = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM guild_bank_tab WHERE guildid = {}", guild->GetId());
+            if (!purchased)
+                return refuse("the guild bank tab table could not be read (1146)");
+            uint32 const purchasedTabs = purchased->Fetch()[0].Get<uint32>();
+            if (purchasedTabs == 0)
+                return refuse("the guild has no purchased bank tab to open");
+
+            std::array<GuildBankRightsAndSlots, GUILD_BANK_MAX_TABS> rightsAndSlots{};
+            for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
+                rightsAndSlots[tabId] = GuildBankRightsAndSlots(tabId);
+
+            QueryResult existing = CharacterDatabase.Query(
+                "SELECT TabId, gbright, SlotPerDay FROM guild_bank_right "
+                "WHERE guildid = {} AND rid = {}", guild->GetId(), request.bankRankId);
+            if (existing)
+            {
+                do
+                {
+                    Field* row = existing->Fetch();
+                    uint32 const tabId = row[0].Get<uint32>();
+                    if (tabId < GUILD_BANK_MAX_TABS)
+                        rightsAndSlots[tabId] = GuildBankRightsAndSlots(
+                            static_cast<uint8>(tabId), row[1].Get<uint32>(), row[2].Get<uint32>());
+                } while (existing->NextRow());
+            }
+
+            uint8 const depositRights = GUILD_BANK_RIGHT_VIEW_TAB | GUILD_BANK_RIGHT_PUT_ITEM;
+            for (uint32 tabId = 0; tabId < purchasedTabs && tabId < GUILD_BANK_MAX_TABS; ++tabId)
+                rightsAndSlots[tabId].SetRights(rightsAndSlots[tabId].GetRights() | depositRights);
+
+            Field* rankFields = rank->Fetch();
+            std::string const rankName = rankFields[0].Get<std::string>();
+            uint32 const generalRights = rankFields[1].Get<uint32>();
+            uint32 const moneyPerDay = rankFields[2].Get<uint32>();
+            guild->HandleSetRankInfo(session, request.bankRankId, rankName,
+                                     generalRights, moneyPerDay, rightsAndSlots);
+
+            QueryResult witnessed = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM guild_bank_right WHERE guildid = {} AND rid = {} "
+                "AND TabId < {} AND (gbright & {}) = {}", guild->GetId(),
+                request.bankRankId, purchasedTabs, depositRights, depositRights);
+            uint32 const openedTabs = witnessed ? witnessed->Fetch()[0].Get<uint32>() : 0;
+            if (openedTabs != purchasedTabs)
+                return refuse("the core did not open every purchased bank tab for that rank");
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"rank_id\":" << static_cast<unsigned>(request.bankRankId)
+              << ",\"tabs_opened\":" << openedTabs;
+            note = o.str();
+            LOG_INFO("module.overseer", "overseer: {} opened {} guild bank tabs for rank {} in '{}'",
+                     who->GetName(), openedTabs, request.bankRankId, guild->GetName());
+            describe("deposit rights opened", "");
+            status = "applied";
+            return "";
+        }
+
         if (request.verb == GuildVerb::Bank)
         {
             // Travel to the vault is the existing errand - the same NPC-flag

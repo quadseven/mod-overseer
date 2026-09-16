@@ -895,6 +895,19 @@ void BankDepositParses()
     CheckString("bank buy-tab takes no trailing argument",
                 ParseGuildRequest("bank buy-tab 1").error,
                 BankBuyTabTrailing);
+    GuildRequest const grant = ParseGuildRequest("bank grant-deposit rank:1");
+    Check("grant-deposit parses", grant.verb == GuildVerb::BankGrantDeposit);
+    CheckUnsigned("and carries the rank id", grant.bankRankId, 1);
+    CheckString("grant-deposit is accepted", grant.error, "");
+    CheckString("grant-deposit requires rank syntax",
+                ParseGuildRequest("bank grant-deposit 1").error,
+                BankGrantDepositInvalid);
+    CheckString("grant-deposit refuses trailing words",
+                ParseGuildRequest("bank grant-deposit rank:1 extra").error,
+                BankGrantDepositInvalid);
+    CheckString("grant-deposit refuses a non-numeric rank",
+                ParseGuildRequest("bank grant-deposit rank:officer").error,
+                BankGrantDepositInvalid);
     CheckString("an unknown sub-verb is refused",
                 ParseGuildRequest("bank withdraw 5000").error, BankNeedsDeposit);
     CheckString("deposit with nothing after it is refused",
