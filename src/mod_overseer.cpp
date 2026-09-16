@@ -30221,7 +30221,7 @@ private:
     {
         static std::vector<std::string> const modes = {
             "quest", "farm", "dungeon", "grind", "gear hunt", "craft",
-            "town run", "train", "rest", "bank", "reputation", "guild business",
+            "town run", "train", "raid prep", "rest", "bank", "reputation", "guild business",
         };
         return modes;
     }
