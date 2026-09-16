@@ -19,7 +19,9 @@ std::map<std::string, uint32_t> QuestAimsAfterRead(
     std::map<std::string, uint32_t> const& loaded, bool readSucceeded)
 {
     return readSucceeded ? loaded : previous;
- bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand)
+}
+
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand)
 {
     return !leaderHasOutstandingErrand;
 }
