@@ -34888,7 +34888,7 @@ private:
             return "";
         }
 
-        if (request.verb == GuildVerb::Bank)
+        if (request.verb == GuildVerb::Bank || request.verb == GuildVerb::BankWithdraw)
         {
             // Travel to the vault is the existing errand - the same NPC-flag
             // aim `travel_npc='guild bank'` already resolves - so this
@@ -34906,7 +34906,8 @@ private:
                                   ? "a guild bank is nearby but this character cannot use it"
                                   : "no guild bank in reach");
 
-            if (!who->HasEnoughMoney(request.depositCopper))
+            bool const withdrawing = request.verb == GuildVerb::BankWithdraw;
+            if (!withdrawing && !who->HasEnoughMoney(request.depositCopper))
                 return refuse("this character does not carry that much gold");
 
             // READ BEFORE, so a refusal still reports the state of the world
@@ -34918,35 +34919,49 @@ private:
             uint32 const purseBefore = who->GetMoney();
             uint64 const bankMoneyBefore = guild->GetTotalBankMoney();
 
-            guild->HandleMemberDepositMoney(session, request.depositCopper);
+            bool moved = false;
+            if (withdrawing)
+                moved = guild->HandleMemberWithdrawMoney(session, request.depositCopper, false);
+            else
+            {
+                guild->HandleMemberDepositMoney(session, request.depositCopper);
+                moved = true;
+            }
 
             uint32 const purseAfter = who->GetMoney();
             uint64 const bankMoneyAfter = guild->GetTotalBankMoney();
             uint32 const taken = purseBefore > purseAfter ? purseBefore - purseAfter : 0;
 
-            if (taken != request.depositCopper || bankMoneyAfter <= bankMoneyBefore)
+            uint32 const received = purseAfter > purseBefore ? purseAfter - purseBefore : 0;
+            bool const purseWitness = withdrawing ? received == request.depositCopper
+                                                  : taken == request.depositCopper;
+            bool const bankWitness = withdrawing
+                ? bankMoneyBefore >= bankMoneyAfter
+                  && bankMoneyBefore - bankMoneyAfter == request.depositCopper
+                : bankMoneyAfter >= bankMoneyBefore
+                  && bankMoneyAfter - bankMoneyBefore == request.depositCopper;
+            if (!moved || !purseWitness || !bankWitness)
             {
                 LOG_WARN("module.overseer",
                          "overseer: guild '{}' ({}) did not take a {} copper "
-                         "deposit from {} - {} copper moved, bank money {} -> {}",
+                         "money move for {} - purse {} -> {}, bank money {} -> {}",
                          guild->GetName(), guild->GetId(), request.depositCopper,
-                         who->GetName(), taken, bankMoneyBefore, bankMoneyAfter);
-                return refuse("the core did not move the money - most likely "
-                              "the guild bank is full");
+                         who->GetName(), purseBefore, purseAfter, bankMoneyBefore, bankMoneyAfter);
+                return refuse(withdrawing ? "the core refused the withdrawal - rank rights or daily allowance blocked it"
+                                          : "the core did not move the money - most likely the guild bank is full");
             }
 
             std::ostringstream o;
             o << "\"guild\":" << J(guild->GetName())
               << ",\"guild_id\":" << guild->GetId()
-              << ",\"deposited\":" << request.depositCopper
+              << (withdrawing ? ",\"withdrawn\":" : ",\"deposited\":") << request.depositCopper
               << ",\"bank_money_before\":" << bankMoneyBefore
               << ",\"bank_money_after\":" << bankMoneyAfter;
             note = o.str();
 
             LOG_INFO("module.overseer",
-                     "overseer: {} deposited {} copper into guild '{}' ({}) - "
-                     "bank now holds {}",
-                     who->GetName(), request.depositCopper, guild->GetName(),
+                     "overseer: {} {} {} copper in guild '{}' ({}) - bank now holds {}",
+                     who->GetName(), withdrawing ? "withdrew" : "deposited", request.depositCopper, guild->GetName(),
                      guild->GetId(), bankMoneyAfter);
 
             describe("deposited", "");

@@ -9811,7 +9811,8 @@ GuildRequest ParseGuildRequest(std::string const& command)
             request.itemKey = static_cast<std::uint32_t>(key);
             return request;
         }
-        if (sub != "deposit")
+        bool const withdrawing = sub == "withdraw";
+        if (!withdrawing && sub != "deposit")
         {
             request.error = GuildRefusal::BankNeedsDeposit;
             return request;
@@ -9858,7 +9859,7 @@ GuildRequest ParseGuildRequest(std::string const& command)
             request.error = GuildRefusal::BankAmountTooBig;
             return request;
         }
-        request.verb = GuildVerb::Bank;
+        request.verb = withdrawing ? GuildVerb::BankWithdraw : GuildVerb::Bank;
         request.depositCopper = static_cast<std::uint32_t>(amount);
         return request;
     }
