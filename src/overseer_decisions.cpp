@@ -21,6 +21,11 @@ std::map<std::string, uint32_t> QuestAimsAfterRead(
     return readSucceeded ? loaded : previous;
 }
 
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand)
+{
+    return !leaderHasOutstandingErrand;
+}
+
 namespace
 {
 
