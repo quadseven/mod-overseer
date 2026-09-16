@@ -19395,6 +19395,11 @@ private:
                     aimedZ = it->second.z;
                 }
             }
+            // Recovery is terminal for the unsafe travel aim. Capture the
+            // snapshot first so the recovery log preserves the cause, then
+            // clear it before any rescue teleport so the next travel poll
+            // cannot re-issue the same coordinate onto the bad plane.
+            _travelAims.Release(name);
 
             // A LIFT IS NOT A DISPLACEMENT, so it takes nothing away. Same map,
             // same x and y, on top of the surface the probe just read - and the
@@ -19402,9 +19407,9 @@ private:
             // removed the bind-point escalation that followed it. The map id
             // passed here is the character's own by construction, so a recovery
             // cannot change continents even if the surface reading is nonsense.
-            // travel aim, the quest aim and the party the character had a
-            // moment ago are all still exactly right for where it now stands.
-            // The old bind-point teleport cleared both aims every time; over
+            // quest aim and the party the character had a moment ago are still
+            // exactly right for where it now stands. The old bind-point
+            // teleport cleared both aims every time; over
             // the 204 recoveries measured on 2026-09-05 that was 204 silent
             // undos of errands the character was in the middle of, one of them
             // ten seconds after it had been sent to a vendor 39 yards away.
@@ -19444,7 +19449,7 @@ private:
                               "onto the surface at its own coordinates found by the deep "
                               "probe. Same map, same x, same y - nothing here can split "
                               "the family, and crossing the plane demonstrably does "
-                              "(#188). It keeps aim job='{}' quest={} travel='{}'. This "
+                              "(#188). It keeps quest aim job='{}' quest={} travel='{}'. This "
                               "is a rescue and not a fix: somebody still needs to look at "
                               "what drops a character through the world at these "
                               "coordinates",
@@ -19458,7 +19463,7 @@ private:
                          "overseer: '{}' read as below the world at map {} position "
                          "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
                          "{}; LIFTED straight up to z {:.1f} at the same "
-                         "x/y - it keeps aim job='{}' quest={} travel='{}' and its party. "
+                         "x/y - it keeps quest aim job='{}' quest={} travel='{}' and its party. "
                          "If this is a real recovery the next poll is clean; if the same "
                          "condition comes back it escalates rather than repeating",
                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
