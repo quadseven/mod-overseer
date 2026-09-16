@@ -11917,6 +11917,11 @@ enum class GuildVerb : std::uint8_t
     // member may deposit, the core's own `HandleMemberDepositMoney` performs
     // no rank check at all, only a bank-full ceiling.
     Bank,
+    // `bank buy-tab` - buy the next guild-bank tab through the core's own
+    // purchase handler. v1 intentionally has no tab argument: the core only
+    // accepts the next tab in order, and the executor reads that state from
+    // the guild-bank table before and after the call.
+    BankBuyTab,
     // `bank deposit-item guid:<item_instance.guid>` or `bank deposit-item
     // entry:<item id>` - move one carried item (the whole stack found, no
     // partial split in v1) into the guild's bank tab 0. DEPOSIT ONLY, and
@@ -12028,7 +12033,8 @@ namespace GuildRefusal
 {
 constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard, bank or raid";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
-constexpr char const* BankNeedsDeposit = "bank takes exactly `deposit <copper>` or `deposit-item <guid:N|entry:N>`";
+constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `deposit-item <guid:N|entry:N>` or `buy-tab`";
+constexpr char const* BankBuyTabTrailing = "bank buy-tab takes no argument";
 constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount and nothing else";
 constexpr char const* BankAmountIsZero = "a deposit of nothing is not a request";
 constexpr char const* BankAmountTooBig = "that deposit is larger than a character can ever carry";
