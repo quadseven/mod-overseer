@@ -3556,6 +3556,19 @@ float GearIncumbent(float mainHandScore, float offHandScore, bool takesBothHands
 // in the bag is the lower score.
 bool GearIsUpgrade(GearVerdict const& candidate, float incumbent);
 
+// Pure gate for transferring a candidate item to a sibling. Ownership flags
+// are explicit and the candidate must be a judged, wearable upgrade.
+struct SiblingUpgradeRequest
+{
+    GearVerdict candidate;
+    float incumbent{0.f};
+    bool questItem{false};
+    bool equipped{false};
+    bool soulbound{false};
+};
+
+bool SiblingUpgradeDecision(SiblingUpgradeRequest const& request);
+
 // ------------------------------------------- a swap that settles (#221) --
 //
 // WHAT WENT WRONG, MEASURED. On the dev realm, one character's hands slot
