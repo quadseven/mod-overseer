@@ -10377,9 +10377,9 @@ private:
         return "an unnamed skill";
     }
 
-    // Which primary profession, if any, this trainer spell would START somebody
-    // in. 0 for everything else - a recipe, a rank-up, a class spell, a
-    // secondary skill.
+    // Which profession, if any, this trainer spell would START somebody in.
+    // Primary-only is the default because the primary slot planner must never
+    // count cooking, fishing, or first aid as a slot-consuming trade.
     //
     // TWO SHAPES, AND trainer_spell CONTAINS BOTH. A row may name the
     // profession spell itself, or a wrapper whose SPELL_EFFECT_LEARN_SPELL
@@ -10391,7 +10391,13 @@ private:
     // category check (SpellMgr.cpp:38-48) - and it is what keeps cooking,
     // fishing and first aid out of this. Those cost no slot, all five already
     // hold them, and an errand for one would be an errand for nothing.
-    static uint32 SkillStartedBySpell(uint32 spellId)
+    static bool IsSecondaryProfessionSkill(uint32 skill)
+    {
+        SkillLineEntry const* line = sSkillLineStore.LookupEntry(skill);
+        return line && line->categoryId == SKILL_CATEGORY_SECONDARY;
+    }
+
+    static uint32 SkillStartedBySpell(uint32 spellId, bool includeSecondary = false)
     {
         SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
         if (!info)
@@ -10404,7 +10410,10 @@ private:
             SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(candidate);
             if (!node)
                 return 0;
-            return IsPrimaryProfessionSkill(node->skill) ? node->skill : 0;
+            if (IsPrimaryProfessionSkill(node->skill)
+                || (includeSecondary && IsSecondaryProfessionSkill(node->skill)))
+                return node->skill;
+            return 0;
         };
 
         if (uint32 const direct = primaryOf(spellId))
@@ -10443,7 +10452,7 @@ private:
         std::set<uint32>& skills = _trainerSkills[entry];
         if (Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry))
             for (Trainer::Spell const& spell : trainer->GetSpells())
-                if (uint32 const skill = SkillStartedBySpell(spell.SpellId))
+                if (uint32 const skill = SkillStartedBySpell(spell.SpellId, true))
                     skills.insert(skill);
         return skills;
     }
@@ -10459,7 +10468,7 @@ private:
     {
         for (Trainer::Spell const& spell : trainer->GetSpells())
         {
-            if (SkillStartedBySpell(spell.SpellId) != skill)
+            if (SkillStartedBySpell(spell.SpellId, true) != skill)
                 continue;
             if (!trainer->CanTeachSpell(bot, &spell))
                 continue;
@@ -10804,7 +10813,8 @@ private:
 
         char const* const skillName = SkillName(skill);
 
-        if (!plan.wanted.count(skill))
+        bool const secondary = IsSecondaryProfessionSkill(skill);
+        if (!secondary && !plan.wanted.count(skill))
         {
             LOG_WARN("module.overseer",
                      "overseer: '{}' was sent to learn {} ({}), which the roster does not "
@@ -10844,7 +10854,7 @@ private:
         // Staying put is the right answer: walking away from the trainer and
         // coming back is a five-minute round trip for a condition that clears
         // in thirty seconds.
-        if (!alreadyHasSkill && !bot->GetFreePrimaryProfessionPoints())
+        if (!secondary && !alreadyHasSkill && !bot->GetFreePrimaryProfessionPoints())
         {
             LOG_INFO("module.overseer",
                      "overseer: '{}' is at the trainer for {} ({}) but holds two primary "
