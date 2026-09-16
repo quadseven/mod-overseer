@@ -10403,7 +10403,7 @@ private:
         if (!info)
             return 0;
 
-        auto primaryOf = [](uint32 candidate) -> uint32
+        auto primaryOf = [includeSecondary](uint32 candidate) -> uint32
         {
             if (!candidate)
                 return 0;
