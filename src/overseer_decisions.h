@@ -11922,15 +11922,13 @@ enum class GuildVerb : std::uint8_t
     // partial tabard is not a thing the core can store.
     Tabard,
     // `bank deposit <copper>` - move gold from the acting character's own
-    // purse into the guild bank. DEPOSIT ONLY: no withdraw verb exists yet
-    // (infra#2831 / mod-overseer#437) because a withdraw needs the per-rank
-    // permission read done on the PLANNING side, before an aim is even
-    // written - the core's own rank check happens at the wrong end of that
-    // problem for this module's purposes, and getting it wrong hands guild
-    // funds to the wrong character. Deposit alone has no such rank gate: any
-    // member may deposit, the core's own `HandleMemberDepositMoney` performs
-    // no rank check at all, only a bank-full ceiling.
+    // purse into the guild bank. Any member may deposit; the core's own
+    // `HandleMemberDepositMoney` performs no rank check, only a bank ceiling.
     Bank,
+    // `bank withdraw <copper>` - move gold from the guild bank into the
+    // acting character's purse. The core remains the authority for rank
+    // rights and daily allowance, and the executor witnesses both balances.
+    BankWithdraw,
     // `bank buy-tab` - buy the next guild-bank tab through the core's own
     // purchase handler. v1 intentionally has no tab argument: the core only
     // accepts the next tab in order, and the executor reads that state from
@@ -11988,9 +11986,8 @@ struct GuildRequest
     // else, and zero is also a legal tabard value - which is why `verb` is
     // what says whether to read them, never the values themselves.
     unsigned emblem[TABARD_FIELDS]{};
-    // Bank only: copper to deposit. Never zero when verb is Bank - the
-    // parser refuses a zero amount the same way it refuses a missing one,
-    // because "deposit nothing" is not a request this verb can act on.
+    // Bank and BankWithdraw: copper to move. Never zero - the parser refuses
+    // a zero amount the same way it refuses a missing one.
     std::uint32_t depositCopper{0};
     // BankGrantDeposit only: the rank receiving deposit rights.
     std::uint8_t bankRankId{0};
@@ -12053,7 +12050,7 @@ namespace GuildRefusal
 {
 constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard, bank or raid";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
-constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `deposit-item <guid:N|entry:N>`, `buy-tab` or `grant-deposit rank:N`";
+constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N>`, `buy-tab` or `grant-deposit rank:N`";
 constexpr char const* BankBuyTabTrailing = "bank buy-tab takes no argument";
 constexpr char const* BankGrantDepositInvalid = "bank grant-deposit takes rank:N and nothing else";
 constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount and nothing else";
