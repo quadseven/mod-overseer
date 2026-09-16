@@ -1367,6 +1367,14 @@ bool DungeonRunEnteredTheInstance(std::string const& outcome)
            outcome != "split_failed" && outcome != "evacuated";
 }
 
+bool DungeonRunCountsAsDone(std::string const& outcome)
+{
+    // A run being entered is not the same fact as a dungeon being cleared.
+    // The campaign counter is deliberately tied to the latter, and the
+    // coordinator's completion proof is the only writer of this outcome.
+    return outcome == "complete";
+}
+
 unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst)
 {
     unsigned failures = 0;
@@ -1396,7 +1404,7 @@ DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
                                                 bool capKnown)
 {
     DungeonCampaignProgress progress;
-    progress.counted = DungeonRunEnteredTheInstance(outcome);
+    progress.counted = DungeonRunCountsAsDone(outcome);
 
     // THE SLOT IS ONLY FILLED BY AN ATTEMPT THAT ENTERED. `attemptedRunNumber`
     // is which slot was being aimed at, not which slot is now full, and those

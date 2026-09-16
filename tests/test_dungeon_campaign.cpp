@@ -17,6 +17,7 @@
 using OverseerDecisions::DungeonCampaignAfterRun;
 using OverseerDecisions::DungeonCampaignProgress;
 using OverseerDecisions::DungeonCampaignStopsOnFailures;
+using OverseerDecisions::DungeonRunCountsAsDone;
 using OverseerDecisions::DungeonRunEnteredTheInstance;
 using OverseerDecisions::DungeonRunTrailingFailures;
 
@@ -71,6 +72,19 @@ void EveryOutcomeWrittenAboutAPartyInsideIsARun()
     // 'complete' is already named as the next one.
     Check("complete", DungeonRunEnteredTheInstance("complete"), true);
     Check("unknown word", DungeonRunEnteredTheInstance("something_new"), true);
+}
+
+void OnlyAnExplicitClearCountsAsCampaignProgress()
+{
+    Check("complete counts", DungeonRunCountsAsDone("complete"), true);
+    Check("left does not count", DungeonRunCountsAsDone("left"), false);
+    Check("split_failed does not count", DungeonRunCountsAsDone("split_failed"), false);
+    Check("staging_failed does not count", DungeonRunCountsAsDone("staging_failed"), false);
+    Check("reset_failed does not count", DungeonRunCountsAsDone("reset_failed"), false);
+    Check("emptied does not count", DungeonRunCountsAsDone("emptied"), false);
+    Check("stalled does not count", DungeonRunCountsAsDone("stalled"), false);
+    Check("wipe does not count", DungeonRunCountsAsDone("wipe"), false);
+    Check("evacuated does not count", DungeonRunCountsAsDone("evacuated"), false);
 }
 
 void TheStreakStopsAtTheFirstRunThatHappened()
@@ -157,7 +171,7 @@ void TheStopReadsRealRowsTheWayTheCallerHandsThemOver()
 
 void ARunThatEnteredFillsItsSlot()
 {
-    DungeonCampaignProgress const p = DungeonCampaignAfterRun("left", 4, 100, true);
+    DungeonCampaignProgress const p = DungeonCampaignAfterRun("complete", 4, 100, true);
     Check("counted", p.counted, true);
     CheckCount("runsDone", p.runsDone, 4u);
     CheckCount("nextRunNumber", p.nextRunNumber, 5u);
@@ -185,7 +199,7 @@ void ARunThatNeverGotInsideLeavesItsSlotEmpty()
 void TheLastSlotIsWhereTheCountUsedToLie()
 {
     DungeonCampaignProgress const done =
-        DungeonCampaignAfterRun("left", 100, 100, true);
+        DungeonCampaignAfterRun("complete", 100, 100, true);
     CheckCount("last run done", done.runsDone, 100u);
     Check("last run ends the campaign", done.campaignOver, true);
     CheckCount("nothing next", done.nextRunNumber, 0u);
@@ -204,7 +218,7 @@ void AnUnknownCapNeverEndsACampaign()
     // A database that cannot answer is not a campaign that is finished. The
     // caller has its own branch for this and must not be told the count ran
     // out instead.
-    DungeonCampaignProgress const p = DungeonCampaignAfterRun("left", 7, 0, false);
+    DungeonCampaignProgress const p = DungeonCampaignAfterRun("complete", 7, 0, false);
     Check("counted", p.counted, true);
     CheckCount("runsDone", p.runsDone, 7u);
     Check("not over", p.campaignOver, false);
@@ -228,7 +242,7 @@ void AZeroCapStartsNothing()
     // dungeon_runs_wanted = 0 is the operator stopping the campaign outright,
     // and the roster migration says so. A run that somehow ended anyway must
     // not report room for another.
-    DungeonCampaignProgress const p = DungeonCampaignAfterRun("left", 1, 0, true);
+    DungeonCampaignProgress const p = DungeonCampaignAfterRun("complete", 1, 0, true);
     Check("over", p.campaignOver, true);
     CheckCount("nothing next", p.nextRunNumber, 0u);
 }
@@ -239,6 +253,7 @@ int main()
 {
     OnlyTheClosedSetOfOutcomesThatClearedNothingIsNotARun();
     EveryOutcomeWrittenAboutAPartyInsideIsARun();
+    OnlyAnExplicitClearCountsAsCampaignProgress();
     TheStreakStopsAtTheFirstRunThatHappened();
     ThreeInARowStopsTheCampaign();
     ALimitThatCouldNotBeReadStopsNothing();

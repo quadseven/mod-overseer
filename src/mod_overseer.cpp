@@ -8459,9 +8459,9 @@ private:
     // hundred without anybody ever standing on the instance map. Measured
     // 2026-09-05: two rows in overseer_dungeon_run, dungeon_runs_done reading
     // three, and a campaign that would have finished in nineteen hours having
-    // cleared nothing. The callers now ask
-    // OverseerDecisions::DungeonRunEnteredTheInstance first, and that predicate
-    // carries the argument for where the bar is.
+    // cleared nothing. The caller now asks
+    // OverseerDecisions::DungeonRunCountsAsDone, whose explicit completion
+    // outcome carries the argument for where the bar is.
     void CountRunDone(std::string const& leaderName)
     {
         if (!CampaignColumnsPresent())
@@ -8469,6 +8469,25 @@ private:
         CharacterDatabase.Execute(
             "UPDATE overseer_roster SET dungeon_runs_done = dungeon_runs_done + 1 "
             "WHERE name = '{}'", Esc(leaderName));
+    }
+
+    // THE CAMPAIGN IS PER ROSTER LEADER, SO THE RUN ROW MUST CARRY THAT SAME
+    // CANONICAL NAME. The arming drive sees whichever character crosses the
+    // instance trigger first and historically used that name for the row;
+    // the coordinator, however, reads `lead = 1` from the roster. That left
+    // rows naming Bork while the counter moved on Grog, making the accounting
+    // impossible to audit. The coordinator's roster leader is authoritative
+    // for the campaign, so normalize the active row before closing it. This
+    // is deliberately a write, not a second opinion about who is in the
+    // party: the campaign counter and its run ledger now share one identity.
+    void AlignRunLeader(uint32 runId, std::string const& leaderName)
+    {
+        if (!runId || !RunAccountingPresent())
+            return;
+        CharacterDatabase.Execute(
+            "UPDATE overseer_dungeon_run SET leader_name = '{}' "
+            "WHERE id = {} AND state = 'active'",
+            Esc(leaderName), runId);
     }
 
     // A NEW CAMPAIGN'S ID, ALLOCATED WITHOUT A READ-BACK. MAX + 1 rather than
@@ -24403,6 +24422,7 @@ private:
                          std::string const& reason,
                          bool stillWanted)
     {
+        AlignRunLeader(runId, leaderName);
         CloseRun(runId, outcome, reason);
 
         // WHERE THE CAMPAIGN STANDS NOW, AND WHETHER THIS RUN MOVED IT (#225).
