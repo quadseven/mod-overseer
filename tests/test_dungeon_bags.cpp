@@ -220,11 +220,11 @@ void AnEvacuatedRunSpendsNoSlotOfTheCampaign()
     CheckCount("the same slot is still to be made", p.nextRunNumber, 1u);
     CheckBool("the campaign is not over", p.campaignOver, false);
 
-    // And the older words are untouched: a run that walked out on its own two
-    // feet still fills its slot.
+    // A run that walked out on its own two feet was inside, but it was not
+    // cleared. It must leave the campaign slot available for a real clear.
     DungeonCampaignProgress const left = DungeonCampaignAfterRun("left", 1, 25, true);
-    CheckBool("'left' still counts", left.counted, true);
-    CheckCount("'left' fills slot 1", left.runsDone, 1u);
+    CheckBool("'left' does not count", left.counted, false);
+    CheckCount("'left' leaves slot 1", left.runsDone, 0u);
 }
 
 void EvacuationsStillCountTowardTheFailureStop()

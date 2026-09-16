@@ -8459,9 +8459,9 @@ private:
     // hundred without anybody ever standing on the instance map. Measured
     // 2026-09-05: two rows in overseer_dungeon_run, dungeon_runs_done reading
     // three, and a campaign that would have finished in nineteen hours having
-    // cleared nothing. The callers now ask
-    // OverseerDecisions::DungeonRunEnteredTheInstance first, and that predicate
-    // carries the argument for where the bar is.
+    // cleared nothing. The caller now asks
+    // OverseerDecisions::DungeonRunCountsAsDone, whose explicit completion
+    // outcome carries the argument for where the bar is.
     void CountRunDone(std::string const& leaderName)
     {
         if (!CampaignColumnsPresent())
@@ -8469,6 +8469,25 @@ private:
         CharacterDatabase.Execute(
             "UPDATE overseer_roster SET dungeon_runs_done = dungeon_runs_done + 1 "
             "WHERE name = '{}'", Esc(leaderName));
+    }
+
+    // THE CAMPAIGN IS PER ROSTER LEADER, SO THE RUN ROW MUST CARRY THAT SAME
+    // CANONICAL NAME. The arming drive sees whichever character crosses the
+    // instance trigger first and historically used that name for the row;
+    // the coordinator, however, reads `lead = 1` from the roster. That left
+    // rows naming Bork while the counter moved on Grog, making the accounting
+    // impossible to audit. The coordinator's roster leader is authoritative
+    // for the campaign, so normalize the active row before closing it. This
+    // is deliberately a write, not a second opinion about who is in the
+    // party: the campaign counter and its run ledger now share one identity.
+    void AlignRunLeader(uint32 runId, std::string const& leaderName)
+    {
+        if (!runId || !RunAccountingPresent())
+            return;
+        CharacterDatabase.Execute(
+            "UPDATE overseer_dungeon_run SET leader_name = '{}' "
+            "WHERE id = {} AND state = 'active'",
+            Esc(leaderName), runId);
     }
 
     // A NEW CAMPAIGN'S ID, ALLOCATED WITHOUT A READ-BACK. MAX + 1 rather than
@@ -10377,9 +10396,9 @@ private:
         return "an unnamed skill";
     }
 
-    // Which primary profession, if any, this trainer spell would START somebody
-    // in. 0 for everything else - a recipe, a rank-up, a class spell, a
-    // secondary skill.
+    // Which profession, if any, this trainer spell would START somebody in.
+    // Primary-only is the default because the primary slot planner must never
+    // count cooking, fishing, or first aid as a slot-consuming trade.
     //
     // TWO SHAPES, AND trainer_spell CONTAINS BOTH. A row may name the
     // profession spell itself, or a wrapper whose SPELL_EFFECT_LEARN_SPELL
@@ -10391,20 +10410,29 @@ private:
     // category check (SpellMgr.cpp:38-48) - and it is what keeps cooking,
     // fishing and first aid out of this. Those cost no slot, all five already
     // hold them, and an errand for one would be an errand for nothing.
-    static uint32 SkillStartedBySpell(uint32 spellId)
+    static bool IsSecondaryProfessionSkill(uint32 skill)
+    {
+        SkillLineEntry const* line = sSkillLineStore.LookupEntry(skill);
+        return line && line->categoryId == SKILL_CATEGORY_SECONDARY;
+    }
+
+    static uint32 SkillStartedBySpell(uint32 spellId, bool includeSecondary = false)
     {
         SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
         if (!info)
             return 0;
 
-        auto primaryOf = [](uint32 candidate) -> uint32
+        auto primaryOf = [includeSecondary](uint32 candidate) -> uint32
         {
             if (!candidate)
                 return 0;
             SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(candidate);
             if (!node)
                 return 0;
-            return IsPrimaryProfessionSkill(node->skill) ? node->skill : 0;
+            if (IsPrimaryProfessionSkill(node->skill)
+                || (includeSecondary && IsSecondaryProfessionSkill(node->skill)))
+                return node->skill;
+            return 0;
         };
 
         if (uint32 const direct = primaryOf(spellId))
@@ -10443,7 +10471,7 @@ private:
         std::set<uint32>& skills = _trainerSkills[entry];
         if (Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry))
             for (Trainer::Spell const& spell : trainer->GetSpells())
-                if (uint32 const skill = SkillStartedBySpell(spell.SpellId))
+                if (uint32 const skill = SkillStartedBySpell(spell.SpellId, true))
                     skills.insert(skill);
         return skills;
     }
@@ -10459,7 +10487,7 @@ private:
     {
         for (Trainer::Spell const& spell : trainer->GetSpells())
         {
-            if (SkillStartedBySpell(spell.SpellId) != skill)
+            if (SkillStartedBySpell(spell.SpellId, true) != skill)
                 continue;
             if (!trainer->CanTeachSpell(bot, &spell))
                 continue;
@@ -10804,7 +10832,8 @@ private:
 
         char const* const skillName = SkillName(skill);
 
-        if (!plan.wanted.count(skill))
+        bool const secondary = IsSecondaryProfessionSkill(skill);
+        if (!secondary && !plan.wanted.count(skill))
         {
             LOG_WARN("module.overseer",
                      "overseer: '{}' was sent to learn {} ({}), which the roster does not "
@@ -10844,7 +10873,7 @@ private:
         // Staying put is the right answer: walking away from the trainer and
         // coming back is a five-minute round trip for a condition that clears
         // in thirty seconds.
-        if (!alreadyHasSkill && !bot->GetFreePrimaryProfessionPoints())
+        if (!secondary && !alreadyHasSkill && !bot->GetFreePrimaryProfessionPoints())
         {
             LOG_INFO("module.overseer",
                      "overseer: '{}' is at the trainer for {} ({}) but holds two primary "
@@ -24393,6 +24422,7 @@ private:
                          std::string const& reason,
                          bool stillWanted)
     {
+        AlignRunLeader(runId, leaderName);
         CloseRun(runId, outcome, reason);
 
         // WHERE THE CAMPAIGN STANDS NOW, AND WHETHER THIS RUN MOVED IT (#225).
@@ -34878,7 +34908,7 @@ private:
             return "";
         }
 
-        if (request.verb == GuildVerb::Bank)
+        if (request.verb == GuildVerb::Bank || request.verb == GuildVerb::BankWithdraw)
         {
             // Travel to the vault is the existing errand - the same NPC-flag
             // aim `travel_npc='guild bank'` already resolves - so this
@@ -34896,7 +34926,8 @@ private:
                                   ? "a guild bank is nearby but this character cannot use it"
                                   : "no guild bank in reach");
 
-            if (!who->HasEnoughMoney(request.depositCopper))
+            bool const withdrawing = request.verb == GuildVerb::BankWithdraw;
+            if (!withdrawing && !who->HasEnoughMoney(request.depositCopper))
                 return refuse("this character does not carry that much gold");
 
             // READ BEFORE, so a refusal still reports the state of the world
@@ -34908,35 +34939,49 @@ private:
             uint32 const purseBefore = who->GetMoney();
             uint64 const bankMoneyBefore = guild->GetTotalBankMoney();
 
-            guild->HandleMemberDepositMoney(session, request.depositCopper);
+            bool moved = false;
+            if (withdrawing)
+                moved = guild->HandleMemberWithdrawMoney(session, request.depositCopper, false);
+            else
+            {
+                guild->HandleMemberDepositMoney(session, request.depositCopper);
+                moved = true;
+            }
 
             uint32 const purseAfter = who->GetMoney();
             uint64 const bankMoneyAfter = guild->GetTotalBankMoney();
             uint32 const taken = purseBefore > purseAfter ? purseBefore - purseAfter : 0;
 
-            if (taken != request.depositCopper || bankMoneyAfter <= bankMoneyBefore)
+            uint32 const received = purseAfter > purseBefore ? purseAfter - purseBefore : 0;
+            bool const purseWitness = withdrawing ? received == request.depositCopper
+                                                  : taken == request.depositCopper;
+            bool const bankWitness = withdrawing
+                ? bankMoneyBefore >= bankMoneyAfter
+                  && bankMoneyBefore - bankMoneyAfter == request.depositCopper
+                : bankMoneyAfter >= bankMoneyBefore
+                  && bankMoneyAfter - bankMoneyBefore == request.depositCopper;
+            if (!moved || !purseWitness || !bankWitness)
             {
                 LOG_WARN("module.overseer",
                          "overseer: guild '{}' ({}) did not take a {} copper "
-                         "deposit from {} - {} copper moved, bank money {} -> {}",
+                         "money move for {} - purse {} -> {}, bank money {} -> {}",
                          guild->GetName(), guild->GetId(), request.depositCopper,
-                         who->GetName(), taken, bankMoneyBefore, bankMoneyAfter);
-                return refuse("the core did not move the money - most likely "
-                              "the guild bank is full");
+                         who->GetName(), purseBefore, purseAfter, bankMoneyBefore, bankMoneyAfter);
+                return refuse(withdrawing ? "the core refused the withdrawal - rank rights or daily allowance blocked it"
+                                          : "the core did not move the money - most likely the guild bank is full");
             }
 
             std::ostringstream o;
             o << "\"guild\":" << J(guild->GetName())
               << ",\"guild_id\":" << guild->GetId()
-              << ",\"deposited\":" << request.depositCopper
+              << (withdrawing ? ",\"withdrawn\":" : ",\"deposited\":") << request.depositCopper
               << ",\"bank_money_before\":" << bankMoneyBefore
               << ",\"bank_money_after\":" << bankMoneyAfter;
             note = o.str();
 
             LOG_INFO("module.overseer",
-                     "overseer: {} deposited {} copper into guild '{}' ({}) - "
-                     "bank now holds {}",
-                     who->GetName(), request.depositCopper, guild->GetName(),
+                     "overseer: {} {} {} copper in guild '{}' ({}) - bank now holds {}",
+                     who->GetName(), withdrawing ? "withdrew" : "deposited", request.depositCopper, guild->GetName(),
                      guild->GetId(), bankMoneyAfter);
 
             describe("deposited", "");
@@ -41131,17 +41176,12 @@ private:
     //     same reason: it is the one thing a letter can carry away that gold
     //     cannot buy back, and 3.3.5a mail has no buyback slot at all.
     //
-    //   * THE RECIPIENT MUST BE ONLINE. Not the core's rule - the handler will
-    //     happily post to an offline character - but this module's, and it is
-    //     about proof rather than about mail. When the recipient is online,
-    //     MailDraft::SendMailTo puts the Mail* straight into that character's
-    //     own list before it returns (Mail.cpp), so the read-back can find the
-    //     letter in memory and say its id. When the recipient is offline the
-    //     letter exists only inside a CharacterDatabaseTransaction that has not
-    //     been executed yet, and a SELECT racing it would report "no mail"
-    //     for a letter that was sent perfectly. A row that cannot prove what it
-    //     claims does not get to claim it, so it is refused instead, retryably.
-    //     All five of the family are online whenever any of this runs.
+    //   * THE RECIPIENT MAY BE OFFLINE. The core resolves an offline character
+    //     through CharacterCache and commits the letter in the same synchronous
+    //     transaction as the online path. Online recipients are read back from
+    //     their Mail list; offline recipients are read back from the mail table
+    //     by receiver, sender, and subject. The cache supplies the same team,
+    //     account, and mailbox-count facts the core uses for its gates.
     //
     // WHAT THIS EXECUTOR ACCEPTS THAT AN OPERATOR MIGHT NOT EXPECT. An item
     // posted to a character on ANOTHER ACCOUNT waits an hour before it can be
@@ -41425,27 +41465,45 @@ private:
                 return refuse(R::NoRecipient);
 
             Player* receiver = ObjectAccessor::FindPlayerByName(recipientName);
-            if (!receiver)
+            ObjectGuid receiverGuid;
+            CharacterCacheEntry const* receiverData = nullptr;
+            if (receiver)
+                receiverGuid = receiver->GetGUID();
+            else
+            {
+                receiverGuid = sCharacterCache->GetCharacterGuidByName(recipientName);
+                receiverData = receiverGuid
+                    ? sCharacterCache->GetCharacterCacheByGuid(receiverGuid) : nullptr;
+            }
+            if (!receiverGuid)
                 return refuse(R::RecipientOffline);
             // :148-153. The handler refuses it too, silently.
-            if (receiver == who)
+            if (receiverGuid == who->GetGUID())
                 return refuse(R::RecipientIsSelf);
 
-            WorldSession* receiverSession = receiver->GetSession();
-            if (!receiverSession)
-                return refuse(R::RecipientOffline);
+            WorldSession* receiverSession = receiver ? receiver->GetSession() : nullptr;
 
             // :196-204. The cap is on the recipient's mailbox, not the
             // sender's, and it is 100.
-            if (receiver->GetMailSize() > 100)
+            uint16 const recipientMailCount = receiver
+                ? receiver->GetMailSize()
+                : (receiverData ? receiverData->MailCount : 0);
+            if (recipientMailCount > 100)
                 return refuse(R::RecipientFull);
 
-            bool const sameAccount = session->GetAccountId() == receiverSession->GetAccountId();
+            uint32 const receiverAccount = receiverSession
+                ? receiverSession->GetAccountId()
+                : sCharacterCache->GetCharacterAccountIdByGuid(receiverGuid);
+            bool const sameAccount = session->GetAccountId() == receiverAccount;
 
             // :222-228, including the permission that lifts it, so this refuses
             // exactly what the handler would refuse on a realm with two-side
             // mail turned on and nothing more.
-            if (!sameAccount && who->GetTeamId() != receiver->GetTeamId()
+            TeamId const receiverTeam = receiver
+                ? receiver->GetTeamId()
+                : (receiverData ? Player::TeamIdForRace(receiverData->Race)
+                                 : TEAM_NEUTRAL);
+            if (!sameAccount && who->GetTeamId() != receiverTeam
                 && !session->HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_MAIL))
                 return refuse(R::WrongTeam);
 
@@ -41518,8 +41576,9 @@ private:
             // row proves the mail it claims even when the same two characters
             // have written to each other all day.
             std::set<uint32> before;
-            for (Mail const* existing : receiver->GetMails())
-                before.insert(existing->messageID);
+            if (receiver)
+                for (Mail const* existing : receiver->GetMails())
+                    before.insert(existing->messageID);
 
             // CMSG_SEND_MAIL as HandleSendMail reads it (:65-110): mailbox
             // guid, receiver name, subject, body, two unused uint32s, the
@@ -41555,22 +41614,43 @@ private:
             // (:344-348 moves it out and hands its ownership over). The purse
             // is down by exactly the postage plus the money enclosed (:315).
             Mail const* posted = nullptr;
-            for (Mail const* candidate : receiver->GetMails())
-            {
-                if (before.count(candidate->messageID))
-                    continue;
-                if (candidate->messageType != MAIL_NORMAL)
-                    continue;
-                if (candidate->sender != who->GetGUID().GetCounter())
-                    continue;
-                posted = candidate;
-                break;
-            }
+            if (receiver)
+                for (Mail const* candidate : receiver->GetMails())
+                {
+                    if (before.count(candidate->messageID))
+                        continue;
+                    if (candidate->messageType != MAIL_NORMAL)
+                        continue;
+                    if (candidate->sender != who->GetGUID().GetCounter())
+                        continue;
+                    posted = candidate;
+                    break;
+                }
 
             bool const stillCarried = req.hasItem && who->GetItemByGuid(itemGuid) != nullptr;
             uint32 const moneyAfter = who->GetMoney();
 
-            if (!posted)
+            if (!posted && !receiver)
+            {
+                QueryResult offline = CharacterDatabase.Query(
+                    "SELECT id, sender, subject, money, cod, deliver_time "
+                    "FROM mail WHERE receiver = {} AND sender = {} AND subject = '{}' "
+                    "ORDER BY id DESC LIMIT 1", receiverGuid.GetCounter(),
+                    who->GetGUID().GetCounter(), Esc(req.subject));
+                if (offline)
+                {
+                    Field* row = offline->Fetch();
+                    facts.haveMail = true;
+                    facts.mailId = row[0].Get<uint32>();
+                    facts.mailSender = row[1].Get<uint32>();
+                    facts.mailSubject = row[2].Get<std::string>();
+                    facts.mailMoney = row[3].Get<uint32>();
+                    facts.mailCod = row[4].Get<uint32>();
+                    facts.deliverTime = row[5].Get<uint32>();
+                }
+            }
+
+            if (!posted && !facts.haveMail)
             {
                 // Nothing moved at all: a wall this function does not know
                 // about, which on this path means the OnPlayerCanSendMail
@@ -41585,13 +41665,16 @@ private:
             if (moneyAfter != moneyBefore - facts.cost)
                 return refuse(R::NotReadBack);
 
-            facts.haveMail = true;
-            facts.mailId = posted->messageID;
-            facts.mailSender = posted->sender;
-            facts.mailSubject = posted->subject;
-            facts.mailMoney = posted->money;
-            facts.mailCod = posted->COD;
-            facts.deliverTime = int64(posted->deliver_time);
+            if (posted)
+            {
+                facts.haveMail = true;
+                facts.mailId = posted->messageID;
+                facts.mailSender = posted->sender;
+                facts.mailSubject = posted->subject;
+                facts.mailMoney = posted->money;
+                facts.mailCod = posted->COD;
+                facts.deliverTime = int64(posted->deliver_time);
+            }
 
             LOG_INFO("module.overseer",
                      "overseer: '{}' posted mail {} to '{}' ('{}') with item {} (entry {}) x{}, "

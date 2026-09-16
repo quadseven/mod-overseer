@@ -908,8 +908,9 @@ void BankDepositParses()
     CheckString("grant-deposit refuses a non-numeric rank",
                 ParseGuildRequest("bank grant-deposit rank:officer").error,
                 BankGrantDepositInvalid);
-    CheckString("an unknown sub-verb is refused",
-                ParseGuildRequest("bank withdraw 5000").error, BankNeedsDeposit);
+    GuildRequest const withdraw = ParseGuildRequest("bank withdraw 5000");
+    Check("bank withdraw parses", withdraw.verb == GuildVerb::BankWithdraw);
+    Check("bank withdraw keeps amount", withdraw.depositCopper == 5000);
     CheckString("deposit with nothing after it is refused",
                 ParseGuildRequest("bank deposit").error, BankAmountNotANumber);
     CheckString("a word instead of a number is refused",

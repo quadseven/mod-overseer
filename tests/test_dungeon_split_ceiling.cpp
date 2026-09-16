@@ -118,7 +118,7 @@ void ASplitRunDoesNotFillTheSlotItWasAimingAt()
 
     // The same run, had it actually been driven to an ending, does fill it.
     DungeonCampaignProgress const real =
-        DungeonCampaignAfterRun("left", 2, 30, true);
+        DungeonCampaignAfterRun("complete", 2, 30, true);
     CheckBool("a real run counts", real.counted, true);
     CheckUnsigned("runs done after a real run", real.runsDone, 2);
     CheckUnsigned("the next run is the one after", real.nextRunNumber, 3);
