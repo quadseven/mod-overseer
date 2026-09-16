@@ -11086,11 +11086,45 @@ private:
             // is not (reagents) - so leaving the errand standing and trying
             // again next poll is correct, the same shape TrainOnArrival's
             // own `return false` holds for a full profession slot.
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' tried to craft '{}' ({}) and the cast was refused "
-                     "(SpellCastResult {}) - leaving the errand standing for the next "
-                     "poll", name, info->SpellName[LOCALE_enUS], spellId,
-                     static_cast<uint32>(result));
+            char const* resultName = "unknown";
+            switch (result)
+            {
+                case SPELL_FAILED_REQUIRES_SPELL_FOCUS:
+                    resultName = "requires spell focus";
+                    break;
+                case SPELL_FAILED_EQUIPPED_ITEM_CLASS:
+                    resultName = "equipped item class";
+                    break;
+                case SPELL_FAILED_NOT_READY:
+                    resultName = "not ready";
+                    break;
+                case SPELL_FAILED_REAGENTS:
+                    resultName = "missing reagents";
+                    break;
+                case SPELL_FAILED_ITEM_NOT_FOUND:
+                    resultName = "item not found";
+                    break;
+                default:
+                    break;
+            }
+
+            if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' tried to craft '{}' ({}) but is not near the "
+                         "required spell focus {} ({}; SpellCastResult {}) - leaving the "
+                         "errand standing for the next poll", name,
+                         info->SpellName[LOCALE_enUS], spellId, info->RequiresSpellFocus,
+                         resultName, static_cast<uint32>(result));
+            }
+            else
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' tried to craft '{}' ({}) and the cast was refused "
+                         "({}; SpellCastResult {}) - leaving the errand standing for the "
+                         "next poll", name, info->SpellName[LOCALE_enUS], spellId,
+                         resultName, static_cast<uint32>(result));
+            }
         }
     }
 
