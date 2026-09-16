@@ -2203,6 +2203,12 @@ bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
 // something has to bound a family whose bags never drain.
 bool DungeonRunEnteredTheInstance(std::string const& outcome);
 
+// DID THE DUNGEON ACTUALLY CLEAR? Only the explicit `complete` outcome is
+// proof that every required encounter was credited. Leaving, stalling,
+// wiping, evacuation, an empty close, and every pre-entry failure are not
+// campaign progress, even when the party spent time inside the map.
+bool DungeonRunCountsAsDone(std::string const& outcome);
+
 // HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
 // the newest and stopping at the first that did.
 //
@@ -2256,9 +2262,9 @@ bool DungeonCampaignStopsOnFailures(unsigned trailingFailures, unsigned failureL
 // only filled by an attempt that entered.
 struct DungeonCampaignProgress
 {
-    // Did this run fill the slot it was attempting? The one input that decides
-    // everything else here, and the only one the caller may act on when it
-    // writes dungeon_runs_done.
+    // Did this run actually clear the dungeon and fill the slot it was
+    // attempting? The one input that decides everything else here, and the
+    // only one the caller may act on when it writes dungeon_runs_done.
     bool counted{false};
     // How many runs of this campaign have now happened, which is what the
     // roster counter should read after this run.
