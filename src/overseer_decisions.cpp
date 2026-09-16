@@ -1569,6 +1569,43 @@ MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
     return walking ? MaintenanceHold::Walking : MaintenanceHold::Transacting;
 }
 
+DungeonTraversalAction DungeonTraversalStep(DungeonTraversalKind kind,
+                                             DungeonTraversalFacts const& facts,
+                                             DungeonTraversalState const& state)
+{
+    if (state.phase == DungeonTraversalPhase::Complete)
+        return DungeonTraversalAction::Complete;
+    if (state.phase == DungeonTraversalPhase::Aborted)
+        return DungeonTraversalAction::Abort;
+    if (!facts.approachMeasured || !facts.destinationMeasured)
+        return DungeonTraversalAction::WaitForMeasurement;
+    if (!facts.destinationNavmesh || !facts.destinationSafe)
+        return DungeonTraversalAction::Abort;
+    if ((kind == DungeonTraversalKind::Jump || kind == DungeonTraversalKind::Drop) &&
+        !facts.actionReady)
+        return DungeonTraversalAction::Abort;
+    switch (kind)
+    {
+        case DungeonTraversalKind::Walk: return DungeonTraversalAction::Walk;
+        case DungeonTraversalKind::Jump: return DungeonTraversalAction::Jump;
+        case DungeonTraversalKind::Drop: return DungeonTraversalAction::Drop;
+    }
+    return DungeonTraversalAction::Abort;
+}
+
+DungeonTraversalAction WailingTraversalStepDecision(WailingTraversalStep step,
+                                                     DungeonTraversalFacts const& facts,
+                                                     DungeonTraversalState const& state)
+{
+    switch (step)
+    {
+        case WailingTraversalStep::FirstJump:
+        case WailingTraversalStep::SecondJump:
+            return DungeonTraversalStep(DungeonTraversalKind::Jump, facts, state);
+    }
+    return DungeonTraversalAction::Abort;
+}
+
 StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
                              RatchetLimits const& limits,
