@@ -41131,17 +41131,12 @@ private:
     //     same reason: it is the one thing a letter can carry away that gold
     //     cannot buy back, and 3.3.5a mail has no buyback slot at all.
     //
-    //   * THE RECIPIENT MUST BE ONLINE. Not the core's rule - the handler will
-    //     happily post to an offline character - but this module's, and it is
-    //     about proof rather than about mail. When the recipient is online,
-    //     MailDraft::SendMailTo puts the Mail* straight into that character's
-    //     own list before it returns (Mail.cpp), so the read-back can find the
-    //     letter in memory and say its id. When the recipient is offline the
-    //     letter exists only inside a CharacterDatabaseTransaction that has not
-    //     been executed yet, and a SELECT racing it would report "no mail"
-    //     for a letter that was sent perfectly. A row that cannot prove what it
-    //     claims does not get to claim it, so it is refused instead, retryably.
-    //     All five of the family are online whenever any of this runs.
+    //   * THE RECIPIENT MAY BE OFFLINE. The core resolves an offline character
+    //     through CharacterCache and commits the letter in the same synchronous
+    //     transaction as the online path. Online recipients are read back from
+    //     their Mail list; offline recipients are read back from the mail table
+    //     by receiver, sender, and subject. The cache supplies the same team,
+    //     account, and mailbox-count facts the core uses for its gates.
     //
     // WHAT THIS EXECUTOR ACCEPTS THAT AN OPERATOR MIGHT NOT EXPECT. An item
     // posted to a character on ANOTHER ACCOUNT waits an hour before it can be
@@ -41425,27 +41420,45 @@ private:
                 return refuse(R::NoRecipient);
 
             Player* receiver = ObjectAccessor::FindPlayerByName(recipientName);
-            if (!receiver)
+            ObjectGuid receiverGuid;
+            CharacterCacheEntry const* receiverData = nullptr;
+            if (receiver)
+                receiverGuid = receiver->GetGUID();
+            else
+            {
+                receiverGuid = sCharacterCache->GetCharacterGuidByName(recipientName);
+                receiverData = receiverGuid
+                    ? sCharacterCache->GetCharacterCacheByGuid(receiverGuid) : nullptr;
+            }
+            if (!receiverGuid)
                 return refuse(R::RecipientOffline);
             // :148-153. The handler refuses it too, silently.
-            if (receiver == who)
+            if (receiverGuid == who->GetGUID())
                 return refuse(R::RecipientIsSelf);
 
-            WorldSession* receiverSession = receiver->GetSession();
-            if (!receiverSession)
-                return refuse(R::RecipientOffline);
+            WorldSession* receiverSession = receiver ? receiver->GetSession() : nullptr;
 
             // :196-204. The cap is on the recipient's mailbox, not the
             // sender's, and it is 100.
-            if (receiver->GetMailSize() > 100)
+            uint16 const recipientMailCount = receiver
+                ? receiver->GetMailSize()
+                : (receiverData ? receiverData->MailCount : 0);
+            if (recipientMailCount > 100)
                 return refuse(R::RecipientFull);
 
-            bool const sameAccount = session->GetAccountId() == receiverSession->GetAccountId();
+            uint32 const receiverAccount = receiverSession
+                ? receiverSession->GetAccountId()
+                : sCharacterCache->GetCharacterAccountIdByGuid(receiverGuid);
+            bool const sameAccount = session->GetAccountId() == receiverAccount;
 
             // :222-228, including the permission that lifts it, so this refuses
             // exactly what the handler would refuse on a realm with two-side
             // mail turned on and nothing more.
-            if (!sameAccount && who->GetTeamId() != receiver->GetTeamId()
+            TeamId const receiverTeam = receiver
+                ? receiver->GetTeamId()
+                : (receiverData ? Player::TeamIdForRace(receiverData->Race)
+                                 : TEAM_NEUTRAL);
+            if (!sameAccount && who->GetTeamId() != receiverTeam
                 && !session->HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_MAIL))
                 return refuse(R::WrongTeam);
 
@@ -41518,8 +41531,9 @@ private:
             // row proves the mail it claims even when the same two characters
             // have written to each other all day.
             std::set<uint32> before;
-            for (Mail const* existing : receiver->GetMails())
-                before.insert(existing->messageID);
+            if (receiver)
+                for (Mail const* existing : receiver->GetMails())
+                    before.insert(existing->messageID);
 
             // CMSG_SEND_MAIL as HandleSendMail reads it (:65-110): mailbox
             // guid, receiver name, subject, body, two unused uint32s, the
@@ -41555,22 +41569,43 @@ private:
             // (:344-348 moves it out and hands its ownership over). The purse
             // is down by exactly the postage plus the money enclosed (:315).
             Mail const* posted = nullptr;
-            for (Mail const* candidate : receiver->GetMails())
-            {
-                if (before.count(candidate->messageID))
-                    continue;
-                if (candidate->messageType != MAIL_NORMAL)
-                    continue;
-                if (candidate->sender != who->GetGUID().GetCounter())
-                    continue;
-                posted = candidate;
-                break;
-            }
+            if (receiver)
+                for (Mail const* candidate : receiver->GetMails())
+                {
+                    if (before.count(candidate->messageID))
+                        continue;
+                    if (candidate->messageType != MAIL_NORMAL)
+                        continue;
+                    if (candidate->sender != who->GetGUID().GetCounter())
+                        continue;
+                    posted = candidate;
+                    break;
+                }
 
             bool const stillCarried = req.hasItem && who->GetItemByGuid(itemGuid) != nullptr;
             uint32 const moneyAfter = who->GetMoney();
 
-            if (!posted)
+            if (!posted && !receiver)
+            {
+                QueryResult offline = CharacterDatabase.Query(
+                    "SELECT id, sender, subject, money, cod, deliver_time "
+                    "FROM mail WHERE receiver = {} AND sender = {} AND subject = '{}' "
+                    "ORDER BY id DESC LIMIT 1", receiverGuid.GetCounter(),
+                    who->GetGUID().GetCounter(), Esc(req.subject));
+                if (offline)
+                {
+                    Field* row = offline->Fetch();
+                    facts.haveMail = true;
+                    facts.mailId = row[0].Get<uint32>();
+                    facts.mailSender = row[1].Get<uint32>();
+                    facts.mailSubject = row[2].Get<std::string>();
+                    facts.mailMoney = row[3].Get<uint32>();
+                    facts.mailCod = row[4].Get<uint32>();
+                    facts.deliverTime = row[5].Get<uint32>();
+                }
+            }
+
+            if (!posted && !facts.haveMail)
             {
                 // Nothing moved at all: a wall this function does not know
                 // about, which on this path means the OnPlayerCanSendMail
@@ -41585,13 +41620,16 @@ private:
             if (moneyAfter != moneyBefore - facts.cost)
                 return refuse(R::NotReadBack);
 
-            facts.haveMail = true;
-            facts.mailId = posted->messageID;
-            facts.mailSender = posted->sender;
-            facts.mailSubject = posted->subject;
-            facts.mailMoney = posted->money;
-            facts.mailCod = posted->COD;
-            facts.deliverTime = int64(posted->deliver_time);
+            if (posted)
+            {
+                facts.haveMail = true;
+                facts.mailId = posted->messageID;
+                facts.mailSender = posted->sender;
+                facts.mailSubject = posted->subject;
+                facts.mailMoney = posted->money;
+                facts.mailCod = posted->COD;
+                facts.deliverTime = int64(posted->deliver_time);
+            }
 
             LOG_INFO("module.overseer",
                      "overseer: '{}' posted mail {} to '{}' ('{}') with item {} (entry {}) x{}, "
