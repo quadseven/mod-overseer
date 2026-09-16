@@ -9702,6 +9702,18 @@ GuildRequest ParseGuildRequest(std::string const& command)
         while (i < rest.size() && rest[i] != ' ')
             ++i;
         std::string const sub = rest.substr(wordBegin, i - wordBegin);
+        if (sub == "buy-tab")
+        {
+            while (i < rest.size() && rest[i] == ' ')
+                ++i;
+            if (i != rest.size())
+            {
+                request.error = GuildRefusal::BankBuyTabTrailing;
+                return request;
+            }
+            request.verb = GuildVerb::BankBuyTab;
+            return request;
+        }
         if (sub == "deposit-item")
         {
             // `guid:<n>` or `entry:<n>`, the exact same shape DoGive's own

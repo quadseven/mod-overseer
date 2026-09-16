@@ -34742,6 +34742,58 @@ private:
             return "";
         }
 
+        if (request.verb == GuildVerb::BankBuyTab)
+        {
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to buy a guild bank tab through");
+
+            // The Guild cache owns the tab vector, but its count is private at
+            // this core revision. The table is the persisted witness available
+            // to the module: read it before and after the real handler, and do
+            // not claim success from a void method that may have refused.
+            QueryResult table = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name = 'guild_bank_tab'");
+            if (!table || table->Fetch()[0].Get<uint32>() == 0)
+                return refuse("the guild bank table is not installed on this realm (1146)");
+
+            uint32 tabsBefore = 0;
+            if (QueryResult before = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM guild_bank_tab WHERE guildid = {}",
+                    guild->GetId()))
+                tabsBefore = before->Fetch()[0].Get<uint32>();
+            else
+                return refuse("the guild bank table could not be read (1146)");
+
+            if (tabsBefore >= 8)
+                return refuse("the guild already has every bank tab");
+
+            guild->HandleBuyBankTab(session, static_cast<uint8>(tabsBefore));
+
+            uint32 tabsAfter = 0;
+            if (QueryResult after = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM guild_bank_tab WHERE guildid = {}",
+                    guild->GetId()))
+                tabsAfter = after->Fetch()[0].Get<uint32>();
+            else
+                return refuse("the guild bank table disappeared while buying the tab (1146)");
+
+            if (tabsAfter != tabsBefore + 1)
+                return refuse("the core did not buy the next guild bank tab");
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"tab_id\":" << tabsBefore;
+            note = o.str();
+            LOG_INFO("module.overseer", "overseer: {} bought guild '{}' bank tab {}",
+                     who->GetName(), guild->GetName(), tabsBefore);
+            describe("bought", "");
+            status = "applied";
+            return "";
+        }
+
         if (request.verb == GuildVerb::Bank)
         {
             // Travel to the vault is the existing errand - the same NPC-flag

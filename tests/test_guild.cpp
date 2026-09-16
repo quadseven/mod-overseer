@@ -890,6 +890,11 @@ void BankDepositParses()
 
     CheckString("bank alone is refused", ParseGuildRequest("bank").error,
                 BankNeedsDeposit);
+    Check("bank buy-tab parses", ParseGuildRequest("bank buy-tab").verb
+              == GuildVerb::BankBuyTab);
+    CheckString("bank buy-tab takes no trailing argument",
+                ParseGuildRequest("bank buy-tab 1").error,
+                BankBuyTabTrailing);
     CheckString("an unknown sub-verb is refused",
                 ParseGuildRequest("bank withdraw 5000").error, BankNeedsDeposit);
     CheckString("deposit with nothing after it is refused",
