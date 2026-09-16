@@ -11469,6 +11469,16 @@ struct RecruitPick
     RecruitVerdict verdict{};
 };
 
+// The read-only report used by the guild shortlist verb. `picks` preserves
+// the existing ordering; `refused` counts candidates rejected against the
+// original guild state, so an empty shortlist explains whether nobody matched
+// or the rule rejected everyone for a known reason.
+struct RecruitShortlistReport
+{
+    std::vector<RecruitPick> picks;
+    std::vector<std::pair<RecruitRefusal, unsigned>> refused;
+};
+
 // The candidates worth inviting, best first, at most `atMost` of them.
 //
 // THE GAPS ARE CONSUMED AS THEY ARE FILLED, which is the property that makes
@@ -11489,6 +11499,10 @@ struct RecruitPick
 // the same every time it is asked. A shortlist that reordered itself between
 // two runs over the same data would be the thing nobody could review.
 std::vector<RecruitPick> RecruitShortlist(
+    std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
+    unsigned atMost);
+
+RecruitShortlistReport RecruitShortlistReportFor(
     std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
     unsigned atMost);
 

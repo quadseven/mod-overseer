@@ -34384,7 +34384,8 @@ private:
         using OverseerDecisions::RecruitPick;
         using OverseerDecisions::RecruitVerdict;
         using OverseerDecisions::RecruitVerdictFor;
-        using OverseerDecisions::RecruitShortlist;
+            using OverseerDecisions::RecruitShortlistReport;
+            using OverseerDecisions::RecruitShortlistReportFor;
 
         GuildRequest const request = ParseGuildRequest(command);
 
@@ -35336,8 +35337,9 @@ private:
             // answers who WOULD be worth asking and why, so that the judgement
             // can be read before it is acted on.
             std::vector<RecruitCandidate> const candidates = GuildCandidateFacts(needs.band);
-            std::vector<RecruitPick> const picks =
-                RecruitShortlist(candidates, needs, request.atMost);
+            RecruitShortlistReport const report =
+                RecruitShortlistReportFor(candidates, needs, request.atMost);
+            std::vector<RecruitPick> const& picks = report.picks;
 
             std::ostringstream o;
             o << "\"guild\":" << J(guild->GetName())
@@ -35346,7 +35348,15 @@ private:
               << ",\"band\":{\"lowest\":" << needs.band.lowest
               << ",\"highest\":" << needs.band.highest << '}'
               << ",\"considered\":" << candidates.size()
-              << ",\"shortlist\":[";
+              << ",\"refused\":{";
+            for (size_t i = 0; i < report.refused.size(); ++i)
+            {
+                if (i)
+                    o << ',';
+                o << J(OverseerDecisions::RecruitRefusalSaid(report.refused[i].first)) << ':'
+                  << report.refused[i].second;
+            }
+            o << "},\"shortlist\":[";
             for (size_t i = 0; i < picks.size(); ++i)
             {
                 RecruitCandidate const& candidate = candidates[picks[i].index];
