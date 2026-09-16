@@ -11936,6 +11936,10 @@ enum class GuildVerb : std::uint8_t
     // accepts the next tab in order, and the executor reads that state from
     // the guild-bank table before and after the call.
     BankBuyTab,
+    // `bank grant-deposit rank:<id>` - preserve a rank's existing general
+    // rights and money allowance while enabling item deposits on purchased
+    // tabs. The executor requires the acting character to be guild master.
+    BankGrantDeposit,
     // `bank deposit-item guid:<item_instance.guid>` or `bank deposit-item
     // entry:<item id>` - move one carried item (the whole stack found, no
     // partial split in v1) into the guild's bank tab 0. DEPOSIT ONLY, and
@@ -11988,6 +11992,8 @@ struct GuildRequest
     // parser refuses a zero amount the same way it refuses a missing one,
     // because "deposit nothing" is not a request this verb can act on.
     std::uint32_t depositCopper{0};
+    // BankGrantDeposit only: the rank receiving deposit rights.
+    std::uint8_t bankRankId{0};
     // BankDepositItem only: which carried item, in the same `guid:`/`entry:`
     // convention DoGive's own item spec already uses (guid names exactly one
     // item_instance row; entry names a type and picks whichever the
@@ -12047,8 +12053,9 @@ namespace GuildRefusal
 {
 constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard, bank or raid";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
-constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `deposit-item <guid:N|entry:N>` or `buy-tab`";
+constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `deposit-item <guid:N|entry:N>`, `buy-tab` or `grant-deposit rank:N`";
 constexpr char const* BankBuyTabTrailing = "bank buy-tab takes no argument";
+constexpr char const* BankGrantDepositInvalid = "bank grant-deposit takes rank:N and nothing else";
 constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount and nothing else";
 constexpr char const* BankAmountIsZero = "a deposit of nothing is not a request";
 constexpr char const* BankAmountTooBig = "that deposit is larger than a character can ever carry";

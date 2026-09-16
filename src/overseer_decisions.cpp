@@ -9693,8 +9693,8 @@ GuildRequest ParseGuildRequest(std::string const& command)
 
     if (verb == "bank")
     {
-        // `bank deposit <copper>` and nothing else - see GuildVerb::Bank for
-        // why deposit is the only verb this reads today.
+        // Each bank subcommand consumes the whole remainder so an operator
+        // cannot accidentally issue a partially understood write.
         std::size_t i = 0;
         while (i < rest.size() && rest[i] == ' ')
             ++i;
@@ -9712,6 +9712,42 @@ GuildRequest ParseGuildRequest(std::string const& command)
                 return request;
             }
             request.verb = GuildVerb::BankBuyTab;
+            return request;
+        }
+        if (sub == "grant-deposit")
+        {
+            while (i < rest.size() && rest[i] == ' ')
+                ++i;
+            std::size_t const specBegin = i;
+            while (i < rest.size() && rest[i] != ' ')
+                ++i;
+            std::string const spec = rest.substr(specBegin, i - specBegin);
+            while (i < rest.size() && rest[i] == ' ')
+                ++i;
+            if (i != rest.size() || spec.size() < 6
+                || spec.compare(0, 5, "rank:") != 0)
+            {
+                request.error = GuildRefusal::BankGrantDepositInvalid;
+                return request;
+            }
+            std::string const digits = spec.substr(5);
+            unsigned rank = 0;
+            for (char const ch : digits)
+            {
+                if (ch < '0' || ch > '9' || rank > 25)
+                {
+                    request.error = GuildRefusal::BankGrantDepositInvalid;
+                    return request;
+                }
+                rank = rank * 10 + static_cast<unsigned>(ch - '0');
+            }
+            if (digits.empty() || rank > 25)
+            {
+                request.error = GuildRefusal::BankGrantDepositInvalid;
+                return request;
+            }
+            request.verb = GuildVerb::BankGrantDeposit;
+            request.bankRankId = static_cast<std::uint8_t>(rank);
             return request;
         }
         if (sub == "deposit-item")
