@@ -17415,8 +17415,9 @@ private:
                 _travelAims.Release(name);
                 continue;
             }
-            botAI->rpgInfo.stuckTs = getMSTime();   // Timer.h:103
-            botAI->rpgInfo.stuckAttempts = 0;
+            // MoveFarTo owns these counters. It resets them when the bot makes
+            // measurable progress; resetting them here on every poll would
+            // prevent the five-attempt safety fuse above from ever firing.
 
             // THE RESOLVED SPAWN IS PINNED FOR THE LIFE OF THE ERRAND (PR
             // #2840 review). ResolveTravelTarget picks the nearest spawn of the
