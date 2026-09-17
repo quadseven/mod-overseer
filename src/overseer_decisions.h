@@ -12074,6 +12074,15 @@ constexpr char const* CountIsZero = "a shortlist of nothing is not a question";
 }  // namespace GuildRefusal
 
 GuildRequest ParseGuildRequest(std::string const& command);
+// A movement generator that has exhausted its own retry budget must be
+// released before the upstream fallback can teleport the character.
+enum class TravelStuckAction
+{
+    Continue,
+    Release,
+};
+
+TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit);
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

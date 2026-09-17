@@ -2700,7 +2700,6 @@ std::string GearNeedWinner(std::vector<GearContender> const& contenders)
     return winner;
 }
 
-
 // ------------------------------------------ what an equip displaced (#372) --
 
 void GearSlotCleared(GearSlotShadow& shadow, std::uint64_t stamp)
@@ -9874,5 +9873,10 @@ GuildRequest ParseGuildRequest(std::string const& command)
 
     request.error = GuildRefusal::NoVerb;
     return request;
+}
+TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit)
+{
+    return attempts >= limit ? TravelStuckAction::Release
+                             : TravelStuckAction::Continue;
 }
 }  // namespace OverseerDecisions
