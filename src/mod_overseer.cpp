@@ -1292,6 +1292,8 @@ static_assert(CROSSING_BERTH_ARRIVED_YARDS > TRAVEL_ARRIVED_POSITION_YARDS,
 // spawn that no longer exists. Longer than two RPG leases so an aim is never
 // released merely because the lease lapsed, which is what renewal is for.
 constexpr time_t TRAVEL_BACKSTOP_SECONDS = 20 * 60;
+// A zero-room economy errand must fail fast enough to protect the next loot.
+constexpr time_t ECONOMY_TRAVEL_BACKSTOP_SECONDS = 3 * 60;
 
 // How much nearer a character must get before the backstop above accepts that
 // the errand is working and starts its clock again. Compared against the
@@ -17960,8 +17962,12 @@ private:
             // distance to the thing this character was sent to - and, below,
             // what this drive does about a stall, which is the only part that
             // was ever this site's own.
+            time_t const backstop = OverseerDecisions::TravelBackstopSeconds(
+                target, TRAVEL_BACKSTOP_SECONDS, ECONOMY_TRAVEL_BACKSTOP_SECONDS);
+            OverseerDecisions::RatchetLimits limits = TRAVEL_RATCHET;
+            limits.patienceSeconds = backstop;
             OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
-                state.progress, distance, std::time(nullptr), TRAVEL_RATCHET);
+                state.progress, distance, std::time(nullptr), limits);
 
             // BACKSTOP. An errand that can never land must not pin a character
             // to it forever - that is a character standing still, which is the
@@ -17980,7 +17986,7 @@ private:
                          "overseer: '{}' was sent to '{}' and has not got any nearer than "
                          "{} yards for {} minutes - releasing the errand as unreachable",
                          name, target, static_cast<uint32>(state.progress.best),
-                         static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
+                         static_cast<uint32>(backstop / 60));
                 _travelAims.Release(name);
                 continue;
             }
