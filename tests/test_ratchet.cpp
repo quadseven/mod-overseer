@@ -14,6 +14,7 @@ using OverseerDecisions::RatchetLimits;
 using OverseerDecisions::RatchetProgressed;
 using OverseerDecisions::RatchetReading;
 using OverseerDecisions::RatchetState;
+using OverseerDecisions::TravelBackstopSeconds;
 
 namespace
 {
@@ -77,6 +78,16 @@ void ThePureComparisonKeepsItsExistingThreeArgumentMeaning()
           RatchetProgressed(0.f, 0.f, limits), false);
 }
 
+void EconomyAimsUseTheEmergencyFuse()
+{
+    Check("vendor uses economy fuse",
+          TravelBackstopSeconds("vendor", 1200, 180) == 180, true);
+    Check("auctioneer uses economy fuse",
+          TravelBackstopSeconds("auctioneer", 1200, 180) == 180, true);
+    Check("quest target keeps ordinary fuse",
+          TravelBackstopSeconds("at:0:1,2,3", 1200, 180) == 1200, true);
+}
+
 }  // namespace
 
 int main()
@@ -85,6 +96,7 @@ int main()
     ADistanceReadingStillUsesTheMargin();
     OtherReadingsKeepZeroAsARealReading();
     ThePureComparisonKeepsItsExistingThreeArgumentMeaning();
+    EconomyAimsUseTheEmergencyFuse();
 
     if (failures)
     {

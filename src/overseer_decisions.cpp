@@ -1290,6 +1290,18 @@ RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
     return verdict;
 }
 
+time_t TravelBackstopSeconds(std::string const& target,
+                             time_t ordinarySeconds,
+                             time_t economySeconds)
+{
+    // Keep this vocabulary in one pure function. These are the only travel
+    // aims whose failure immediately blocks inventory or maintenance work.
+    return target == "vendor" || target == "repair" || target == "banker" ||
+                   target == "guild banker" || target == "auctioneer"
+               ? economySeconds
+               : ordinarySeconds;
+}
+
 DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   bool partyBusy,
                                                   bool movementProgress,

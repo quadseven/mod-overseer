@@ -2144,6 +2144,14 @@ bool RatchetProgressed(float reading, float best, RatchetLimits const& limits,
 RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
                        RatchetLimits const& limits);
 
+// Emergency economy errands must not use the ordinary twenty-minute travel
+// fuse: a zero-room character cannot loot, so waiting that long is itself a
+// failure. The caller supplies both policy durations; this pure selector only
+// identifies the supported economy targets.
+time_t TravelBackstopSeconds(std::string const& target,
+                             time_t ordinarySeconds,
+                             time_t economySeconds);
+
 // The clearing watchdog has two remedies for a run that stopped: skip the
 // objective a bounded number of times, then leave the instance. Keep this
 // policy free of core types so the dangerous boundary is testable without a
