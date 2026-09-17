@@ -17397,6 +17397,24 @@ private:
                          UPSTREAM_MOVE_FAR_STUCK_SECONDS,
                          static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
             }
+            // NEVER LET THE UPSTREAM TELEPORT FUSE BECOME A WALL-HACK. Five
+            // failed MoveFarTo attempts are already the core's own proof that
+            // this route is not landing. Releasing here leaves the character
+            // on its current ground and lets the producer choose a different
+            // safe target; resetting the counters and continuing would keep
+            // issuing the same impossible walk until the twenty-minute
+            // backstop, while allowing upstream to snap the bot to a cliff.
+            if (OverseerDecisions::TravelStuckDecision(
+                    botAI->rpgInfo.stuckAttempts, 5) ==
+                OverseerDecisions::TravelStuckAction::Release)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' was sent to '{}' and made no progress in {} "
+                         "attempts - releasing the errand before upstream can teleport it",
+                         name, target, botAI->rpgInfo.stuckAttempts);
+                _travelAims.Release(name);
+                continue;
+            }
             botAI->rpgInfo.stuckTs = getMSTime();   // Timer.h:103
             botAI->rpgInfo.stuckAttempts = 0;
 
