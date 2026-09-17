@@ -16617,6 +16617,12 @@ private:
     bool TravelHoldsTheWheel(std::string const& name, std::string const& travelTarget,
                              PlayerbotAI* botAI)
     {
+        // Terrain recovery owns a character proven below the world. Keep the
+        // other drives from relabelling that state as an unreachable route
+        // while recovery retries or waits out its quiet period.
+        if (_belowTerrain.count(LowerName(name)))
+            return true;
+
         // 1. AN ERRAND IS OUTSTANDING. Not merely "the column is set": an aim
         //    on a character that cannot act on it moves nobody, and standing
         //    the quest drive down for one would quietly take an unaimable
@@ -16795,6 +16801,12 @@ private:
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
+                continue;
+
+            // GroundedStep cannot produce a safe horizontal step from below
+            // the world. The terrain drive is the sole owner until a later
+            // probe clears this publication.
+            if (_belowTerrain.count(LowerName(name)))
                 continue;
 
             auto const planIt = plans.find(name);
@@ -19332,6 +19344,14 @@ private:
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
+            bool const belowTerrain = gapCouldMatter &&
+                OverseerDecisions::BelowTerrainNeedsRecovery(
+                    reading.z, reading.surfaceAboveZ, reading.surfaceValid,
+                    reading.hasLocalNavmesh, TERRAIN_RECOVERY_GAP_YARDS);
+            if (belowTerrain)
+                _belowTerrain.insert(LowerName(name));
+            else
+                _belowTerrain.erase(LowerName(name));
             uint8 const rungBefore = static_cast<uint8>(memory.attempts);
             OverseerDecisions::TerrainRecoveryVerdict const verdict =
                 OverseerDecisions::TerrainRecoveryStep(
@@ -42476,6 +42496,11 @@ private:
     // OverseerDecisions::TerrainRecoveryStep, where it is tested without a
     // world.
     std::map<std::string, OverseerDecisions::TerrainRecoveryState> _terrainRecovery;
+
+    // Names currently proven below the world. This is a world-thread-only
+    // publication between terrain recovery and the travel/quest/dungeon
+    // drives; it is cleared as soon as a later probe sees ordinary footing.
+    std::set<std::string> _belowTerrain;
 
     // THE LAST FALL BASELINE THIS MODULE HANDED THE CORE FOR A CHARACTER, so
     // that nothing can leave the core believing a character's fall began

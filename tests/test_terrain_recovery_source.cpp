@@ -31,6 +31,21 @@ int main()
         std::cerr << "recovery must snapshot the aim, release it, then teleport\n";
         return EXIT_FAILURE;
     }
+
+    std::size_t const detector = text.find("bool const belowTerrain = gapCouldMatter");
+    std::size_t const publish = text.find("_belowTerrain.insert(LowerName(name));", detector);
+    std::size_t const clear = text.find("_belowTerrain.erase(LowerName(name));", detector);
+    std::size_t const travelGate = text.find(
+        "if (_belowTerrain.count(LowerName(name)))\n                continue;");
+    std::size_t const questGate = text.find(
+        "if (_belowTerrain.count(LowerName(name)))\n            return true;");
+    if (detector == std::string::npos || publish == std::string::npos ||
+        clear == std::string::npos || !(detector < publish && publish < clear) ||
+        travelGate == std::string::npos || questGate == std::string::npos)
+    {
+        std::cerr << "below-world state must be published, cleared, and consumed by both drives\n";
+        return EXIT_FAILURE;
+    }
     std::cout << "terrain recovery preserves the last aim before release\n";
     return EXIT_SUCCESS;
 }
