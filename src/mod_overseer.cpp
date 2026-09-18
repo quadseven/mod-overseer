@@ -30112,6 +30112,7 @@ private:
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
                 && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
+                && kind != "repair" && kind != "buy"
                 && kind != "bank" && kind != "auction" && kind != "bind"
                 && kind != "hearth" && kind != "conjure" && kind != "cast"
                 && kind != "summon"
