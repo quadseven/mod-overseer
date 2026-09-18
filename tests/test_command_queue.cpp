@@ -110,6 +110,11 @@ void Check(char const* what, bool got, bool want)
 void DirectEconomyRowsBypassWhisperDedupe()
 {
     std::ifstream source("src/mod_overseer.cpp");
+    if (!source)
+    {
+        Check("the adapter source is readable", false, true);
+        return;
+    }
     std::string const text((std::istreambuf_iterator<char>(source)),
                            std::istreambuf_iterator<char>());
     std::size_t const list = text.find("kind != \"repair\" && kind != \"buy\"");
