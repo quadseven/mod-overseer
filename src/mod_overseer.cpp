@@ -22515,6 +22515,9 @@ private:
     // the same argument the door's own coordinates are re-read under.
     static uint32 ExpectedEncounterMask(uint32 mapId)
     {
+        if (OverseerDecisions::DungeonMapHasIndependentWings(mapId))
+            return 0;
+
         DungeonEncounterList const* encounters =
             sObjectMgr->GetDungeonEncounterList(mapId, DUNGEON_DIFFICULTY_NORMAL);
         if (!encounters)

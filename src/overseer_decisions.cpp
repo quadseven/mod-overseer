@@ -1446,6 +1446,14 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
+bool DungeonMapHasIndependentWings(uint32_t mapId)
+{
+    // Scarlet Monastery's four wings share map 189 but have separate entrance
+    // triggers. The core exposes encounters by map, not by wing, so the union
+    // cannot prove any one wing complete.
+    return mapId == 189;
+}
+
 char const* DungeonRunExitOutcome(bool provedComplete, bool stalled, bool evacuated)
 {
     // PROOF OUTRANKS SUSPICION. A run can be both: the clearing watchdog can
