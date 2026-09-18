@@ -41,6 +41,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using OverseerDecisions::ClaimIsAbandoned;
@@ -103,6 +105,15 @@ void Check(char const* what, bool got, bool want)
     std::printf("FAIL %s: got %s, wanted %s\n", what, got ? "true" : "false",
                 want ? "true" : "false");
     ++failures;
+}
+
+void DirectEconomyRowsBypassWhisperDedupe()
+{
+    std::ifstream source("src/mod_overseer.cpp");
+    std::string const text((std::istreambuf_iterator<char>(source)),
+                           std::istreambuf_iterator<char>());
+    std::size_t const list = text.find("kind != \"repair\" && kind != \"buy\"");
+    Check("repair and buy are excluded from chat dedupe", list != std::string::npos, true);
 }
 
 // The poll #230 was measured on: 337 rows waiting, twenty of them in the
@@ -317,6 +328,7 @@ void AClaimWithNoHolderIsAbandonedOnceItIsOld()
 
 int main()
 {
+    DirectEconomyRowsBypassWhisperDedupe();
     APermanentlyFailingHeadIsCalledOut();
     ARowNothingIsReachingIsCalledOut();
     AHealthyQueueSaysNothing();
