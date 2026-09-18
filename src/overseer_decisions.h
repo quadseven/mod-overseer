@@ -10199,11 +10199,12 @@ struct TownTripLimits
     // never ends costs everything the family was doing instead.
     time_t boundSeconds{1200};
     // HOW LONG A MEMBER STANDS AT A COUNTER THIS MODULE DOES NOT TRANSACT AT.
-    // See TownVisitStep for the whole argument. Sixty seconds is thirty drains
-    // of the command queue at COMMANDS_PER_POLL every COMMAND_POLL_MS, which is
-    // six hundred rows, and it is a fifth of the counter hold's own ceiling - so
-    // a member is let go well before the hold it is standing under expires.
-    time_t dwellSeconds{60};
+    // See TownVisitStep for the whole argument. Six minutes leaves one full
+    // bridge vendor pass (the default is five minutes) a chance to observe the
+    // leader at the counter and queue the already-judged sale rows. A shorter
+    // dwell lets a family arrive, wait, and leave before the bridge can write
+    // the commands that make the visit useful.
+    time_t dwellSeconds{6 * 60};
 };
 
 // WHY THIS MEMBER WANTS A COUNTER. Ordered, and the order is the content.

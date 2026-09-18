@@ -25666,7 +25666,10 @@ private:
     // stands. That is what TownVisitStep's dwell is.
     static constexpr OverseerDecisions::TownTripLimits TOWN_TRIP_LIMITS{
         // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds
-        3, 1, 15 * 60, 20 * 60, 60};
+        // The bridge's vendor pass defaults to 300s. Keep the family at the
+        // counter for one complete pass so the leader-arrival queue can be
+        // observed before the world releases the trip.
+        3, 1, 15 * 60, 20 * 60, 6 * 60};
 
     // The role keyword ResolveTravelTarget takes for the counter this trip is
     // going to. Role aims remain preferable here because the trip already

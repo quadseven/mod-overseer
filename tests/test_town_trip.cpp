@@ -458,6 +458,16 @@ void ADwellOfZeroIsOverOnArrival()
                  OverseerDecisions::TownVisitStep(true, 0, 0)));
 }
 
+// The adapter and the bridge must leave enough time for one vendor pass to
+// observe the leader at the counter. The default is six minutes because the
+// bridge's normal vendor cadence is five minutes.
+void TheDefaultDwellCoversOneVendorPass()
+{
+    TownTripLimits limits;
+    if (limits.dwellSeconds != 6 * 60)
+        Fail("default counter dwell", "360", std::to_string(limits.dwellSeconds));
+}
+
 // ------------------------------------------------ what the trip proved --
 
 // THE ANSWER EVERY TRIP BEFORE THIS ONE WOULD HAVE GIVEN. It is a distinct word
@@ -599,6 +609,7 @@ int main()
     AVisitThatHasNotStartedIsNotAVisit();
     AVisitEndsWhenItHasBeenLongEnough();
     ADwellOfZeroIsOverOnArrival();
+    TheDefaultDwellCoversOneVendorPass();
 
     ATripThatChangedNothingSaysSo();
     ARepairIsProvedByTheGearAndNotByThePurse();
