@@ -104,6 +104,29 @@ void AFlickeringFlagCannotResetTheCeiling()
           DungeonClearBusyStillHolds(true, T0 + 60 * 60, T0 + 60 * 60 + 5, CEILING), true);
 }
 
+void APartyEatingOnEveryPollStillExpires()
+{
+    // IsSitState is one of the adapter's busy reasons. Repeating that reason
+    // on every five-second poll must not move the progress timestamp forward.
+    // This is the exact failure shape from #255: a finished or stalled party
+    // eats forever while the watchdog keeps resetting its patience clock.
+    time_t const lastProgress = T0;
+    time_t now = T0;
+    for (unsigned poll = 0; poll < 180; ++poll)
+    {
+        Check("eating party before busy ceiling",
+              DungeonClearBusyStillHolds(true, lastProgress, now, CEILING), true);
+        now += 5;
+    }
+
+    // The hold is inclusive at exactly the ceiling, so the next five-second
+    // poll is the first one that must expire.
+    Check("eating party at busy ceiling",
+          DungeonClearBusyStillHolds(true, lastProgress, now, CEILING), true);
+    Check("eating party after busy ceiling",
+          DungeonClearBusyStillHolds(true, lastProgress, now + 5, CEILING), false);
+}
+
 void TheEdgesThatWouldOtherwiseLiveInSomebodysHead()
 {
     // A ceiling of nothing is a bound, not a request for no bound - the same
@@ -126,6 +149,7 @@ int main()
     ABusyPartyInsideAMovingRunIsBelieved();
     TheMeasuredStallIsCaught();
     AFlickeringFlagCannotResetTheCeiling();
+    APartyEatingOnEveryPollStillExpires();
     TheEdgesThatWouldOtherwiseLiveInSomebodysHead();
     return failures ? 1 : 0;
 }
