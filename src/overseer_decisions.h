@@ -2404,6 +2404,11 @@ enum class DungeonCompletion : uint8_t
 // difficulty this run is not on says nothing about this run.
 DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completedMask);
 
+// Some maps contain several independent dungeon wings behind different
+// entrance triggers. Their encounter list is the union of all wings, so a
+// single-wing run cannot be proved complete from the map-level mask.
+bool DungeonMapHasIndependentWings(uint32_t mapId);
+
 // THE WORD THAT GOES ON THE ROW, in one place because the vocabulary is now
 // four wide at this one exit and picking it inline is how 'complete' would end
 // up written for a run that stalled.

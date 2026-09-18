@@ -15,6 +15,7 @@
 
 using OverseerDecisions::DungeonCompletion;
 using OverseerDecisions::DungeonRunCompletion;
+using OverseerDecisions::DungeonMapHasIndependentWings;
 using OverseerDecisions::DungeonRunExitOutcome;
 
 namespace
@@ -38,6 +39,15 @@ void Check(char const* what, DungeonCompletion got, DungeonCompletion want)
     if (got == want)
         return;
     std::printf("FAIL %s: got %s, want %s\n", what, Name(got), Name(want));
+    ++failures;
+}
+
+void CheckBool(char const* what, bool got, bool want)
+{
+    if (got == want)
+        return;
+    std::printf("FAIL %s: got %s, want %s\n", what, got ? "true" : "false",
+                want ? "true" : "false");
     ++failures;
 }
 
@@ -134,6 +144,10 @@ void TheNewWordStillCountsAsARun()
 
 int main()
 {
+    CheckBool("Scarlet Monastery is a split-wing map",
+          DungeonMapHasIndependentWings(189), true);
+    CheckBool("Deadmines is not a split-wing map",
+          DungeonMapHasIndependentWings(36), false);
     AMapThatCreditsNothingIsNeverFinished();
     EveryCreditedEncounterMeansComplete();
     OneEncounterShortIsNotFinished();
