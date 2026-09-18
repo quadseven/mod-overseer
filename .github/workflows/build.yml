@@ -74,6 +74,13 @@ name: Build against the pinned core
 on:
   push:
     branches: [main]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'patches/**'
+      - 'apply-patches.sh'
+      - '.github/workflows/build.yml'
+      - 'VERSION'
   workflow_dispatch: {}
 
 # CONCURRENCY IS KEYED ON THE COMMIT, NOT ON THE REPOSITORY (2026-09-05).
@@ -266,6 +273,7 @@ jobs:
           key: buildx-${{ env.CORE_SHA }}-${{ env.MODULE_SHA }}
 
       - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -280,6 +288,7 @@ jobs:
       # populated, so this is a re-tag-and-upload, not a second cold build -
       # the Dockerfile's layers already exist locally.
       - name: Push to GHCR
+        if: github.event_name != 'pull_request'
         working-directory: acore
         run: |
           set -euo pipefail
