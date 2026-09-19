@@ -12096,7 +12096,33 @@ enum class TravelStuckAction
     Release,
 };
 
-TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit);
+// AND A COUNTER NOBODY IS WRITING IS NOT A MEASUREMENT (#498). `attempts` is
+// upstream's `rpgInfo.stuckAttempts`, and the only thing that ever writes it is
+// MoveFarTo, which runs only while the character carries `new rpg`. Take the
+// strategy off and the number stops moving; it does not go back to zero, and a
+// release cannot reach into upstream's struct to clear it. So for a character
+// that is not carrying `new rpg` the number is a reading left behind by some
+// earlier walk, and reading it as this errand's progress is the same mistake as
+// reading an empty query as an empty result.
+//
+// THAT MADE THE REFUSAL SELF-FULFILLING. This drive released the errand on the
+// stale number; the release skipped the walk that is the number's only writer;
+// the roster column still held the aim, so it came straight back; and the next
+// poll read the same number again. Measured live over 73 minutes on a dev
+// realm: 114 releases, 53 of them on two characters whose engines had had
+// `new rpg` removed minutes earlier and not given back - one of those two
+// released 25 times running on the value 5, which never once moved. Over the
+// same window the errand's own backstop, which measures distance to the thing
+// the character was sent to, fired twice, because this fuse kept pre-empting
+// it.
+//
+// `carriesStrategy` is that question and nothing else: is the counter's writer
+// running for this character right now. False means "not measured", which is
+// the one answer this decision had no way to give. It also costs the guard
+// nothing, because the teleport this guard exists to prevent is MoveFarTo's
+// own, and MoveFarTo is not running either.
+TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
+                                      bool carriesStrategy);
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
