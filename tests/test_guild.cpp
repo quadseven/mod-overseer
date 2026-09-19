@@ -206,6 +206,73 @@ GuildNeeds FamilyNeeds()
     return GuildNeedsFrom(TheFamily(), HORDE, FamilyPolicy());
 }
 
+// A guild six short of its target with every hole already closed, which is the
+// shape #508 was measured in on 2026-09-19: 65 members against a target of 71,
+// no profession, service or role gap left open, and 376 eligible candidates
+// outside it.
+//
+// WRITTEN OUT RATHER THAN DERIVED FROM A ROSTER, because the interesting facts
+// are the two numbers and the three EMPTY gap lists, and sixty-five members
+// invented to produce them would say less than this does. A guild that covers
+// everything has one reason left to invite anybody, Depth, and Depth is the
+// only reason the roster count ever gated.
+GuildNeeds AGuildSixShortOfItsTarget()
+{
+    GuildNeeds needs;
+    needs.band.lowest = 29;
+    needs.band.highest = 43;
+    needs.teamId = HORDE;
+    needs.memberCount = 65;
+    needs.targetSize = 71;
+    return needs;
+}
+
+// A pool of candidates nobody can tell apart: guildless, in band, right
+// faction, and holding a class and a profession pair the guild above already
+// covers, so every one of them is Depth and every one of them ties with every
+// other.
+//
+// THE NAMES ARE ZERO PADDED so that "ascending by name" and "the order they
+// were built" are the same order. That is what makes a capped list visibly the
+// FIRST n rather than an arbitrary n, which is the half of #508 that made the
+// stall permanent rather than merely short.
+std::vector<RecruitCandidate> CandidatesNobodyCanTellApart(unsigned howMany)
+{
+    std::vector<RecruitCandidate> pool;
+    for (unsigned i = 0; i < howMany; ++i)
+    {
+        char name[24];
+        std::snprintf(name, sizeof(name), "Recruit%02u", i);
+        pool.push_back(Candidate(name, ROGUE, 36, MINING, SKINNING));
+    }
+    return pool;
+}
+
+// What the recruit loop does with a shortlist: walk it in the order the module
+// ranked it and take the first name it has not already asked inside its
+// thirty-day memory. Empty when every name on the list has been asked, which is
+// the pass that does nothing at all.
+//
+// THAT MEMORY LIVES ENTIRELY IN THE CALLER and no part of it ever reaches this
+// module, so this helper is not a rule being tested. It is the other half of
+// the system, modelled here only so the length of the list can be shown to
+// matter.
+std::string FirstNameTheLoopCouldStillAsk(std::vector<RecruitCandidate> const& pool,
+                                          std::vector<RecruitPick> const& picks,
+                                          std::vector<std::string> const& asked)
+{
+    for (std::size_t i = 0; i < picks.size(); ++i)
+    {
+        std::string const& name = pool[picks[i].index].name;
+        bool alreadyAsked = false;
+        for (std::size_t j = 0; j < asked.size(); ++j)
+            alreadyAsked = alreadyAsked || asked[j] == name;
+        if (!alreadyAsked)
+            return name;
+    }
+    return "";
+}
+
 // -- the view ---------------------------------------------------------------
 
 void TheViewHasARowPerProfessionWhetherOrNotAnybodyHoldsIt()
@@ -606,7 +673,7 @@ void APickClosesEveryHoleItFillsAndNotOnlyTheNamedOne()
           picks[1].verdict.need != RecruitNeed::Service);
 }
 
-void TheShortlistStopsAtTheCapAndAtTheRoster()
+void TheShortlistStopsAtTheCapAndAtAFullRoster()
 {
     GuildNeeds const needs = FamilyNeeds();
 
@@ -621,11 +688,26 @@ void TheShortlistStopsAtTheCapAndAtTheRoster()
     CheckUnsigned("a cap of nothing invites nobody",
                   static_cast<unsigned>(RecruitShortlist(candidates, needs, 0).size()), 0);
 
-    // The family is five, so a target of seven leaves room for two.
+    // THE OPEN SEAT COUNT NO LONGER SHORTENS THE LIST (#508). The family is
+    // five against a target of seven, so two seats are open, and a shortlist of
+    // ten still names all four candidates worth asking. A shortlist is a list
+    // of names worth asking and not a batch of invitations about to be sent:
+    // the invite verb re-reads the live roster and refuses RosterFull at the
+    // target on its own, and the caller sends one invitation a pass whatever
+    // the list's length.
     GuildNeeds small = FamilyNeeds();
     small.targetSize = 7;
-    CheckUnsigned("and so does the roster target",
-                  static_cast<unsigned>(RecruitShortlist(candidates, small, 10).size()), 2);
+    CheckUnsigned("but a roster short of its target does not shorten the list",
+                  static_cast<unsigned>(RecruitShortlist(candidates, small, 10).size()), 4);
+
+    // A roster AT its target is still an empty shortlist, because
+    // RecruitVerdictFor refuses every candidate RosterFull before any reason to
+    // invite them is reached. That gate is untouched and is the one that keeps
+    // a guild from over-recruiting.
+    GuildNeeds full = FamilyNeeds();
+    full.targetSize = 5;
+    CheckUnsigned("a roster at its target shortlists nobody",
+                  static_cast<unsigned>(RecruitShortlist(candidates, full, 10).size()), 0);
 
     // Everybody already guilded is nobody to invite, however many of them there
     // are. This is the realm's already-guilded population in miniature.
@@ -634,6 +716,73 @@ void TheShortlistStopsAtTheCapAndAtTheRoster()
         guilded[i].guildId = 41 + static_cast<unsigned>(i);
     CheckUnsigned("a pool of other guilds members yields an empty shortlist",
                   static_cast<unsigned>(RecruitShortlist(guilded, needs, 10).size()), 0);
+}
+
+void TheShortlistFillsToWhatWasAskedForAndNotToTheOpenSeatCount()
+{
+    GuildNeeds const needs = AGuildSixShortOfItsTarget();
+    CheckUnsigned("the fixture leaves six seats open",
+                  needs.targetSize - needs.memberCount, 6);
+
+    std::vector<RecruitCandidate> const pool = CandidatesNobodyCanTellApart(40);
+
+    // THE DEFECT, AS A NUMBER. Asked for twenty, this used to return exactly
+    // six, one per open seat, because the roster was simulated as filling while
+    // the list was built and Depth is only ever a reason to invite while the
+    // roster is under its target. What the caller asked for never got a look
+    // in.
+    std::vector<RecruitPick> const picks = RecruitShortlist(pool, needs, 20);
+    CheckUnsigned("twenty asked for is twenty returned, not one per open seat",
+                  static_cast<unsigned>(picks.size()), 20);
+
+    bool allDepth = true;
+    for (std::size_t i = 0; i < picks.size(); ++i)
+        allDepth = allDepth && picks[i].verdict.need == RecruitNeed::Depth;
+    Check("and every one of them is bench depth, the tier the count gated",
+          allDepth);
+
+    // Nobody is named twice, and the list still terminates when the pool runs
+    // out before the cap does. With the roster count no longer rising as the
+    // list is built, those two are the only things left stopping the sweep.
+    bool distinct = true;
+    for (std::size_t i = 0; i < picks.size(); ++i)
+        for (std::size_t j = i + 1; j < picks.size(); ++j)
+            distinct = distinct && picks[i].index != picks[j].index;
+    Check("no candidate is shortlisted twice", distinct);
+    CheckUnsigned("asked for more names than exist, it returns the ones that do",
+                  static_cast<unsigned>(RecruitShortlist(pool, needs, 100).size()), 40);
+}
+
+void AWiderShortlistIsWhatRoutesRoundNamesThisModuleCannotSee()
+{
+    GuildNeeds const needs = AGuildSixShortOfItsTarget();
+    std::vector<RecruitCandidate> const pool = CandidatesNobodyCanTellApart(40);
+
+    // The six alphabetically-first names, already asked inside the caller's
+    // thirty-day memory. That is the live fixture: eight invitations went out
+    // in strict name order over half an hour, every one of them accepted, and
+    // then the next list came back holding only names that had already been
+    // spent.
+    std::vector<std::string> asked;
+    for (unsigned i = 0; i < 6; ++i)
+        asked.push_back(pool[i].name);
+
+    // THE STALL, REPRODUCED. A list exactly as long as the open seat count is
+    // the same six names every run, ties being broken by name, so a caller that
+    // has already asked those six has nothing left to do - this pass, the next
+    // one, and every one after it until the memory expires. Nothing reports a
+    // fault: the guild simply stops growing.
+    CheckString("a list the width of the open seats leaves the caller nothing to do",
+                FirstNameTheLoopCouldStillAsk(pool, RecruitShortlist(pool, needs, 6), asked),
+                "");
+
+    // THE FIX, STATED AS THE THING IT BUYS. The module still cannot see that
+    // memory and still excludes nobody for it. What it can do is hand back more
+    // names than there are seats, so that a run of already-asked names at the
+    // top of the list does not exhaust it.
+    CheckString("the same pool asked for twenty gives it the seventh name instead",
+                FirstNameTheLoopCouldStillAsk(pool, RecruitShortlist(pool, needs, 20), asked),
+                "Recruit06");
 }
 
 void TheShortlistTakesTheHolesInTheOrderTheyMatter()
@@ -1053,7 +1202,9 @@ int main()
     TheNeedTiersAreInTheOrderTheHeaderClaims();
     OneHoleTakesOneCandidateAndNotThree();
     APickClosesEveryHoleItFillsAndNotOnlyTheNamedOne();
-    TheShortlistStopsAtTheCapAndAtTheRoster();
+    TheShortlistStopsAtTheCapAndAtAFullRoster();
+    TheShortlistFillsToWhatWasAskedForAndNotToTheOpenSeatCount();
+    AWiderShortlistIsWhatRoutesRoundNamesThisModuleCannotSee();
     TheShortlistTakesTheHolesInTheOrderTheyMatter();
     TheShortlistReportsWhyCandidatesWereRefused();
     FormationWaitsForTheFounderBeforeItTriesToCreate();
