@@ -4223,13 +4223,18 @@ public:
         // target this book already owns - the early return has already handled
         // every re-claim of an in-flight aim - so a legitimate dungeon-staging
         // walk or an escort already under way is untouched.
-        if (OverseerDecisions::IsMaintenanceErrand(CurrentTravelNpc(name)))
+        // AND A POSITIONAL AIM IS SOMEBODY'S ERRAND TOO. IsMaintenanceErrand
+        // answers only for the four counter keywords, so an `at:` aim the
+        // bridge wrote read as "nothing is outstanding" and this claim
+        // overwrote a walk already in progress. IsForeignTravelAim is that same
+        // question asked about the whole column rather than the keyword half of
+        // it; the vocabulary it shares with the arrival branch is unchanged.
+        if (OverseerDecisions::IsForeignTravelAim(CurrentTravelNpc(name)))
         {
             LOG_INFO("module.overseer",
-                     "overseer: travel aim '{}' for '{}' refused - a vendor/"
-                     "banker/repair errand is outstanding and this book did "
-                     "not issue it",
-                     target, name);
+                     "overseer: travel aim '{}' for '{}' refused - errand '{}' "
+                     "is outstanding and this book did not issue it",
+                     target, name, CurrentTravelNpc(name));
             return;
         }
 
@@ -4273,15 +4278,22 @@ public:
         // releases a straggler mid-catch-up must not blank a vendor/banker/
         // repair aim bridge.py wrote and has not resolved yet, any more than
         // Claim() may overwrite one.
+        // A POSITIONAL AIM IS PROTECTED HERE FOR THE SAME REASON A KEYWORD ONE
+        // IS. IsMaintenanceErrand covers only the four counter keywords, so an
+        // `at:` aim fell through to the else below and was erased mid-walk -
+        // measured at about 21 seconds for a gathering aim, and with four
+        // minutes of lease left for a vault aim 37 yards from its destination.
+        // Nothing else about this gate changes: it still only applies to an aim
+        // this book never claimed, so a claimed aim is still cleared exactly as
+        // before.
         if (!_claimed.count(name) &&
-            (LearnSkillPending(name) || OverseerDecisions::IsMaintenanceErrand(CurrentTravelNpc(name))))
+            (LearnSkillPending(name) || OverseerDecisions::IsForeignTravelAim(CurrentTravelNpc(name))))
         {
             LOG_INFO("module.overseer",
                      "overseer: travel release for '{}' skipped the column "
-                     "write - a profession or economy errand is outstanding "
-                     "and this book never claimed the aim it would have "
-                     "erased",
-                     name);
+                     "write - errand '{}' is outstanding and this book never "
+                     "claimed the aim it would have erased",
+                     name, CurrentTravelNpc(name));
         }
         else
         {

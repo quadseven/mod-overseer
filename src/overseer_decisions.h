@@ -2655,6 +2655,33 @@ bool ArrivalAnswersLearnAim(bool aimNamesTrainerRole, bool creatureTrains);
 // it". A trainer errand is somebody's profession and is not this.
 bool IsMaintenanceErrand(std::string const& aim);
 
+// Does an aim in `travel_npc` belong to somebody other than the travel book?
+//
+// ASKED ONLY BY THE TWO GUARDS IN TravelAimBook, and deliberately not by
+// widening IsMaintenanceErrand above. That function answers "did a pass that
+// transacts write this", which is a different question with six other callers -
+// one of them DungeonRunMaintenanceHold, where a wider answer would change when
+// a run is held rather than when a column is protected.
+//
+// THE BUG THIS EXISTS FOR. Both guards used IsMaintenanceErrand as a stand-in
+// for "somebody else owns this aim", and it is only ever true for the four
+// counter keywords. A positional `at:` aim - the shape the bridge writes to
+// send the family to a surveyed spawn - answered false, so the guard collapsed
+// and the column was cleared out from under a walk in progress. Measured on the
+// dev realm: a gathering aim erased about 21 seconds after it was written, and
+// a guild-vault aim erased with four minutes of its lease still to run while
+// the leader was 37 yards short of the vault. Keyword errands were protected
+// and completed; every positional one was wiped. It read as a travel failure
+// for weeks and was a vocabulary gap.
+//
+// `trigger:` IS DELIBERATELY NOT HERE. It is the other positional shape, and
+// ReadSplitErrand groups the two, but this module writes its own door and
+// portal aims and Claims them - so `_claimed` already answers for them, and the
+// only `trigger:` this would newly protect is one no longer claimed, where
+// clearing a stale door aim is the safer reading. Widening it to match
+// ReadSplitErrand is a change to dungeon behaviour and wants its own argument.
+bool IsForeignTravelAim(std::string const& aim);
+
 enum class MaintenanceHold : uint8_t
 {
     Open,         // nothing is outstanding; the run may start

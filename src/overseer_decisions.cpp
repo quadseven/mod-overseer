@@ -1572,6 +1572,25 @@ bool IsMaintenanceErrand(std::string const& aim)
     return CounterRoleForAim(aim) != CounterRole::None;
 }
 
+bool IsForeignTravelAim(std::string const& aim)
+{
+    // An empty column is nobody's errand, and saying so first means neither
+    // test below has to think about the empty string - the same order
+    // ReadSplitErrand uses for the same reason.
+    if (aim.empty())
+        return false;
+    // A counter keyword is an economy pass's errand, which is the half that was
+    // already protected. Asked of the shared vocabulary rather than re-listing
+    // the keywords, so a fifth counter follows both readers.
+    if (IsMaintenanceErrand(aim))
+        return true;
+    // AND A POSITIONAL AIM IS THE HALF THAT WAS NOT. `rfind(s, 0) == 0` is the
+    // starts-with every other aim-shape test in this module already uses, kept
+    // the same here so a reader comparing them does not have to check whether
+    // two spellings mean two things.
+    return aim.rfind("at:", 0) == 0;
+}
+
 MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
                                           unsigned outstandingErrands,
                                           time_t heldForSeconds,
