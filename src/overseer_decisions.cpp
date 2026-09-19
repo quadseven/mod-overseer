@@ -9111,7 +9111,24 @@ RecruitShortlistReport RecruitShortlistReportFor(
             if (ClassCanFill(chosen.classId, role))
                 Drop(open.roleGaps, role);
         }
-        ++open.memberCount;
+
+        // AND THE ROSTER DELIBERATELY DOES NOT FILL WITH IT (#508). A HOLE A
+        // PICK CLOSES IS CLOSED; A SEAT A PICK MIGHT TAKE IS NOT TAKEN. The
+        // three lists above come out as they are consumed because a second
+        // engineer really does not close the engineering hole twice. The member
+        // count is a different kind of thing: nobody has joined anything here,
+        // this verb invites nobody, and counting a pick as a member capped
+        // every list at `targetSize - memberCount` names however many were
+        // asked for - which is where the list stopped being a list of names
+        // worth asking and became a list of seats.
+        //
+        // `open.memberCount` therefore stays at the size the guild really is,
+        // and Depth keeps saying yes for as long as candidates and `atMost`
+        // both last. The seat count is still enforced, twice over, where a seat
+        // is actually taken: RecruitVerdictFor refuses RosterFull at the target
+        // on the invite path, against the roster read live at that moment, and
+        // the caller refuses to write the row at all once the roster reports
+        // itself full. See the header for why the shortlist wants the slack.
     }
 
     return report;

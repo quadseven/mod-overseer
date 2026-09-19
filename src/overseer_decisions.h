@@ -11719,8 +11719,34 @@ struct RecruitShortlistReport
 // sorting the results would invite all three for the same reason and leave the
 // guild with three engineers and still no second healer.
 //
-// AND THE ROSTER FILLS AS IT GOES, so `atMost` and the target size both bind:
-// the sweep stops when either is reached.
+// THE NUMBER OF OPEN SEATS DOES NOT BOUND THE LENGTH OF THIS LIST (#508). The
+// roster used to be simulated as filling while the list was built, so a guild
+// six short of its target handed back exactly six names however many were asked
+// for: Depth is the only reason left once every hole is closed, and Depth runs
+// out at precisely that count. Three arguments against that, and the first
+// would still hold on its own:
+//
+//   1. THIS VERB INVITES NOBODY. The seat count is enforced where a seat is
+//      actually taken - RecruitVerdictFor refuses RosterFull at the target on
+//      the invite path, against the roster read live at that moment - so
+//      enforcing it a second time while merely naming candidates buys no safety
+//      and costs the whole of the next argument.
+//   2. THE CALLER PACES ITSELF AND NEEDS THE SLACK. It sends one invitation per
+//      pass whatever the list's length, and it keeps a memory of who it has
+//      already asked that NOTHING IN THIS MODULE CAN SEE. Every name it has to
+//      skip is a spent list slot, and a list exactly as long as the seat count
+//      has no slot to spare.
+//   3. TIES BREAK BY NAME, SO A SHORT LIST IS ALWAYS THE SAME SHORT LIST. With
+//      every hole closed every candidate ties on Depth, so the first n by name
+//      win every run, for ever, as long as they stay unguilded. Measured
+//      2026-09-19: a guild at 65 of 71 with 376 eligible candidates outside it
+//      returned the same 6 names for five hours, all 6 already inside the
+//      caller's memory, and recruiting stopped dead with nothing anywhere
+//      reporting a fault.
+//
+// SO `atMost` AND THE POOL ARE WHAT BOUND THE LENGTH. A roster already AT its
+// target is still an empty list, because RecruitVerdictFor refuses every
+// candidate RosterFull before any reason to invite one is reached.
 //
 // TIES ARE BROKEN BY NAME, AND THAT IS AN ADMISSION RATHER THAN AN ALGORITHM.
 // Two level 36 engineers of the same class are indistinguishable to every fact
