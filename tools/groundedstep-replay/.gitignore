@@ -1,0 +1,21 @@
+# EXTRACTED GAME DATA DOES NOT GO IN THIS REPOSITORY.
+#
+# replay_step.py reads AzerothCore .map tiles, which are extracted from a game
+# client and are not ours to redistribute. They are also large: 11 tiles for
+# the self-test, and the working set extracted for #316 was 356 tiles and 26 MB.
+# README.md in this directory says where to get them and how to point the
+# script at them.
+#
+# The default location is maps/ beside the script, so that is what is refused
+# here, along with the tile and archive extensions wherever they land.
+maps/
+*.map
+*.tar
+*.tar.gz
+*.mmap
+*.mmtile
+*.vmtile
+*.vmtree
+
+# Importing replay_step rather than running it leaves one of these behind.
+__pycache__/
