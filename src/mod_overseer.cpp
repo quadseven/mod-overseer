@@ -1519,6 +1519,94 @@ constexpr unsigned TRAVEL_GROUND_REFUSAL_LIMIT = 8;
 // StepMayBridgeGap for why a far aim's height is not this step's business.
 constexpr float TRAVEL_STEP_VERTICAL_YARDS = 20.0f;
 
+// ------------------ WHERE THE SHORE IS LOOKED FOR, AND HOW HARD (#503) -----
+//
+// THE WHOLE RULE IS OverseerDecisions::ShoreSearchLimits and its declaration
+// carries the argument for having one at all. These are the numbers, and each
+// of them is a bound on terrain queries run on the world thread, so the
+// product of the last two is what a reader should look at first: eight
+// bearings across four rings is 32 candidates, and a candidate is one
+// Map::GetWaterOrGroundLevel. That is the cost of the ONE poll on which an aim
+// is found to be under water, not a per-poll cost, because a refused aim is
+// not written and a moved aim is measured once and then held by the errand.
+//
+// THE FIRST RING IS TWENTY YARDS BECAUSE A SHORE IS NOT A YARD AWAY. A point
+// under water is under water because the ground around it is under water too;
+// probing at arm's length would spend the whole budget inside the same lake.
+// Twenty yards is also comfortably inside TRAVEL_STEP_YARDS, so a moved aim is
+// still one ordinary step from where the leader actually stands and the party
+// does not end up meeting somewhere else.
+//
+// AND EIGHTY YARDS IS WHERE IT STOPS. Past that the aim is no longer "where
+// the leader is" in any sense a follower's walk means, and a point eighty
+// yards from a drowning leader is far enough that refusing outright is the
+// more honest answer than pretending the family has a meeting point. Eighty is
+// also under FOLLOW_CATCH_UP_DONE_YARDS (100), which is the gap at which a
+// catch-up hands back to `follow`, so a follower that walks the whole way to
+// the outermost shore this can choose has still arrived near enough for the
+// walk to end rather than being left one ring short of its own hand-back.
+constexpr OverseerDecisions::ShoreSearchLimits TRAVEL_SHORE_LIMITS{
+    20.0f, 20.0f, 4u, 8u};
+
+// HOW LONG A CHARACTER MAY STAND STILL IN WATER ON AN ERRAND (#503).
+//
+// SIXTY SECONDS, AND IT IS DERIVED FROM THE CORE RATHER THAN CHOSEN. The core
+// gives a player three minutes of breath and then deals GetMaxHealth() / 5 a
+// second (`WaterBreath.Timer` = 180000 at the pinned revision;
+// Player::HandleDrowning, Player.cpp:896-925). Sixty leaves two full minutes
+// between this release and the first tick of damage, which is the margin that
+// makes this a prevention rather than a race.
+//
+// AND IT CANNOT END A CROSSING, WHICH IS THE OTHER HALF. The clock only runs
+// while the character has not moved TRAVEL_WATER_STILL_YARDS, and the core's
+// own swim speed is 4.72 yards a second, so a character actually swimming
+// resets it roughly once a second and never reaches two of these, let alone
+// sixty. What reaches sixty is a character that has been in one spot in water
+// for a minute, which is not a crossing under any reading.
+constexpr time_t TRAVEL_WATER_STILL_SECONDS = 60;
+
+// HOW OFTEN THE "NO AIM WAS WRITTEN, THE LEADER IS SOMEWHERE NOBODY CAN STAND"
+// REFUSAL IS SAID. Sixty seconds, and it rations BOTH of them: the leader in
+// deep water with no shore in reach (#503) and the leader whose ground cannot
+// be measured at all (#188). One clock rather than two because the two cannot
+// be in force at once - they are different answers from one reading - and
+// because a reader watching a family that has gone quiet wants to know the
+// condition started, not which of its two shapes it is taking this second.
+//
+// The refusal is re-taken on every party poll for as long as the leader stays
+// there, and a line repeated every few seconds is a line nobody reads; a line
+// a minute is enough to see the condition start and see it end. Kept separate
+// from the stand-down clocks around it because it bounds a SENTENCE and not a
+// behaviour: nothing is held back by it.
+constexpr time_t CATCH_UP_BAD_GROUND_SAID_SECONDS = 60;
+
+// WHEN AN AIM'S HEIGHT AND THE SURFACE UNDER IT ARE THE SAME POINT (#188).
+// Half a yard. A character standing on ground reads a fraction of a yard off
+// the height the terrain reports for its own x and y, every time, so this is
+// the band inside which correcting the aim's z is not news. It gates only
+// whether the correction is REPORTED; the corrected z is written either way,
+// which is the half that matters and is why this is a reporting bound and not
+// a decision.
+constexpr float TRAVEL_AIM_GROUND_TOLERANCE_YARDS = 0.5f;
+
+// HOW FAR A CHARACTER IN WATER MAY MOVE BEFORE THE CLOCK ABOVE RESTARTS.
+// Five yards, and borrowed in spirit from TRAVEL_GROUND_REFUSAL_RADIUS: more
+// than the jitter a stationary character shows and less than one second of
+// swimming. The two are kept as separate constants for the reason that one
+// gives about its own neighbours - a future reason to move one is not a reason
+// to move the other, since that one is about a refusal episode and this one is
+// about whether anything is swimming.
+constexpr float TRAVEL_WATER_STILL_YARDS = 5.0f;
+
+// HOW FRESH A FALL-GUARD MASK HAS TO BE TO BE ABOUT THE DEATH BESIDE IT.
+// Two seconds. The terrain drive polls once a second, so a reading older than
+// this describes a character the drive was not reaching, which the column's
+// own comment already calls a different fault from standing down. Every one of
+// the eleven non-zero masks in the retained window since 2026-09-17 carries a
+// `fall_guard_seconds` of 0 or 1, so this bound excludes none of them and is
+// not a threshold tuned to admit the rows it was written for.
+constexpr OverseerDecisions::SelfDeathReadingLimits DEATH_READING_LIMITS{2};
+
 // HOW FAR A ROUTED PATH'S LAST POINT MAY SIT FROM THE HEIGHT THAT WAS ASKED
 // FOR, before the route is read as the nearest polygon to somewhere
 // unreachable rather than as a way to the place requested. Five, and the five
@@ -1845,6 +1933,17 @@ constexpr time_t REGROUP_STANDDOWN_SECONDS = CATCH_UP_STANDDOWN_SECONDS;
 // pin bump that changes it has one place to change. See the stuck-teleport
 // block in DriveTravel for what is done with it.
 constexpr uint32 UPSTREAM_MOVE_FAR_STUCK_SECONDS = 90;
+
+// The core's own breath timer: `WaterBreath.Timer`, 180000 ms at the pinned
+// revision (worldserver.conf.dist, read by Player::getMaxTimer at
+// Player.cpp:878-884). Named here for the same two reasons the fuse above is:
+// the line that releases a character standing still in water says what the
+// clock it is beating actually is, and a pin bump or a config change that
+// moves it has one place to be reconciled with. Nothing DECIDES on this - see
+// TRAVEL_WATER_STILL_SECONDS, which is the module's own bound and is a third
+// of it - so a realm that has changed the config gets a line with the wrong
+// number in it rather than a release at the wrong moment.
+constexpr uint32 UPSTREAM_BREATH_SECONDS = 180;
 
 // Upstream's own lease on an aimed wander: `statusWanderNpcDuration`, five
 // minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278). It is already
@@ -3951,6 +4050,28 @@ public:
         // rather than every poll it is held on the ground (#138). See the
         // stuck-teleport block in DriveTravel.
         bool stuckSaid{false};
+        // HOW LONG THIS CHARACTER HAS BEEN IN WATER WITHOUT MOVING (#503).
+        //
+        // `waterSince` is when the current spell of standing still in water
+        // began, and zero means it is not in one: not in water, or in water
+        // and swimming. `waterX`/`waterY`/`waterZ` are where it was standing
+        // when that spell began, so "has it moved" is a distance rather than a
+        // flag somebody has to remember to clear.
+        //
+        // THREE COORDINATES AND NOT TWO, unlike the escort's drift mark above.
+        // A character sinking is moving in z alone, and a reading that only
+        // watched x and y would call a descent through fifteen yards of lake
+        // "standing still" - which it is not, and which is also the one case
+        // where the water is about to get deeper.
+        //
+        // SCOPED TO THE ERRAND, like every other clock on this struct. A new
+        // errand is a fresh state and this starts again with it, which is
+        // right: the question is whether THIS errand is holding the character
+        // in water, and a new errand has not held it anywhere yet.
+        time_t waterSince{0};
+        float waterX{0.f};
+        float waterY{0.f};
+        float waterZ{0.f};
         // WHERE THIS CHARACTER HAS BEEN REFUSED EVERY BEARING, AND FOR HOW
         // MANY POLLS RUNNING (#312).
         //
@@ -13504,6 +13625,208 @@ private:
         return true;
     }
 
+    // HOW MUCH WATER STANDS OVER THE GROUND AT (x, y) (#503).
+    //
+    // ONE QUERY AND ONE SUBTRACTION, because GetWaterOrGroundLevel already
+    // computes both halves: it returns the water surface where there is water
+    // to swim in and writes the ground under it through the `ground`
+    // out-parameter on its way past (Map.cpp:1116-1130 at the pinned
+    // revision). SurfaceAt above passes nullptr for that parameter and throws
+    // the ground away, which is exactly why nothing in this module could tell
+    // a lake from a floor.
+    //
+    // `groundZ` COMES BACK AS WELL, and it is the one a caller aiming at this
+    // point wants: it is the surface a character would be STANDING on, which
+    // is what an aim means, rather than the water it would be floating under.
+    //
+    // False where the terrain has no answer at all, which is the edge of the
+    // world and an ungenerated grid. A caller must read that as "unknown", not
+    // as "dry": refusing to aim at ground nobody can measure is a decision for
+    // the caller and not for this reading.
+    static bool WaterDepthAt(Player* bot, float x, float y, float from,
+                             float& depthYards, float& groundZ)
+    {
+        Map* map = bot->GetMap();
+        if (!map)
+            return false;
+        float ground = 0.f;
+        float const surface = map->GetWaterOrGroundLevel(
+            bot->GetPhaseMask(), x, y, from, &ground, true,
+            bot->GetCollisionHeight());
+        if (surface <= INVALID_HEIGHT || ground <= INVALID_HEIGHT)
+            return false;
+        groundZ = ground;
+        // The core's own `delta` (Map.cpp:1360). Where there is no water this
+        // is zero or negative, because GetWaterOrGroundLevel returns the
+        // ground itself, or max(level, ground) for a water line below it.
+        depthYards = surface - ground;
+        return true;
+    }
+
+    // WHAT HAPPENED TO AN AIM THAT WAS MEASURED BEFORE IT WAS WRITTEN (#503).
+    enum class AimShore
+    {
+        // The point was standable ground and the caller's own z was already on
+        // it, so nothing was changed.
+        Unchanged,
+        // Standable ground was found and the caller's coordinates now name it:
+        // the z snapped onto the measured surface, or the whole point moved to
+        // the nearest shore, or both.
+        Moved,
+        // It was in deep water and no standable ground was found inside the
+        // search. There is no aim to write.
+        Drowned,
+        // The terrain has no answer at this x and y within reach of the aim's
+        // own height, so there is no ground to name and no way to find one.
+        // See the refusal in MoveAimToShore for why this is not folded into
+        // Unchanged.
+        NoGround,
+    };
+
+    // Move `x`, `y`, `z` onto the nearest ground a character could stand on.
+    //
+    // EVERY CANDIDATE IS A TERRAIN SAMPLE AND NOTHING HERE INVENTS A z. The
+    // bearing and the distance come from OverseerDecisions::ShoreProbeAt,
+    // which knows nothing about the world; the height of the answer is
+    // whatever WaterDepthAt measured at that x and y. A shore whose z was
+    // reasoned about rather than read is the mistake that put a staging point
+    // inside a mine shaft (#121), and a guessed z has no navmesh under it.
+    //
+    // AND THE NAVMESH IS ASKED LAST, AS A VETO. Shallow water over ground the
+    // mesh has no polygon for is not somewhere a walk can end, so a candidate
+    // that measures standable still has to be one the character could route
+    // to. NavmeshRoutes is the same question every other aim in this module is
+    // put through, asked here before the aim is written rather than after it
+    // has been walked at.
+    //
+    // `bot` IS THE CHARACTER STANDING AT THE AIM, NOT THE ONE BEING SENT TO IT,
+    // and that is the stronger of the two tests. NavmeshRoutes paths FROM its
+    // probe, so asking the character in the water gives "is there a route from
+    // this lake to that bank", which is the question; asking a follower four
+    // thousand yards away would give an answer dominated by everything in
+    // between, which is the surveyed route's job and not this one's.
+    //
+    // AND THE Z IS THE MEASURED SURFACE AND NOT THE LEADER'S OWN (#188). This
+    // half was found by a separate read-only investigation of a below-world
+    // fall burst on 2026-09-19, and it is the same defect as the drowning with
+    // a different hazard at the far end: the catch-up aim was a literal copy of
+    // the leader's raw position INCLUDING z, and the only gate on it was
+    // OnTheGround, which is three movement flags and asks nothing about ground.
+    // A leader parked under the terrain passes all three. At 15:10:24 the aim
+    // issued to three followers was `at:1:-7205.56,-2436.67,-218.161`, and by
+    // 15:22 four of the five characters' saved positions were on that exact
+    // point. Two of them had already fallen 121.7 and 213.1 yards to the crater
+    // floor.
+    //
+    // So a point whose ground cannot be measured is REFUSED rather than copied,
+    // and that refusal is deliberately loud: a follower left on `follow` rather
+    // than sent on a catch-up walk is the failure #70 and #404 exist about, so
+    // it must not be a silent no-op. Both callers say so on a rationed line.
+    //
+    // WHY NOT CHANGE OnTheGround INSTEAD, which is where that investigation
+    // suggested the question be asked. That predicate is read at two call sites
+    // in two different senses - as CatchUpAimFacts::leaderOnTheGround, which
+    // decides whether a destination MOVED, and as a gate on starting a walk at
+    // all - and it is asked of every follower on every party poll. Turning it
+    // into a terrain query would pay for the reading five times a poll and
+    // still not be the place the aim is written. Asked here, it is paid once,
+    // at the one statement that can act on the answer, and the answer carries
+    // the corrected z back with it rather than being a boolean somebody then
+    // has to re-derive.
+    static AimShore MoveAimToShore(Player* bot, float& x, float& y, float& z)
+    {
+        float depth = 0.f;
+        float ground = 0.f;
+        // Looked for from ABOVE the aim by the same snap reach GroundedStep
+        // uses, so a point recorded a few yards under the floor still finds
+        // the floor rather than falling through to whatever is below it.
+        //
+        // AND A FAILURE HERE IS THE #188 CASE. GetWaterOrGroundLevel searches
+        // DOWNWARD from what it is given, over DEFAULT_HEIGHT_SEARCH
+        // (Map.cpp:1119), so a character standing below the world - with the
+        // real terrain far ABOVE the probe rather than below it - is exactly
+        // the reading that comes back empty. So does the edge of the world and
+        // so does an ungenerated grid, and all three mean the same thing for an
+        // aim: there is no ground here to send anybody to.
+        if (!WaterDepthAt(bot, x, y, z + TRAVEL_GROUND_SNAP_YARDS, depth, ground))
+            return AimShore::NoGround;
+        if (OverseerDecisions::ShoreStandable(depth, bot->GetCollisionHeight()))
+        {
+            // THE AIM IS THE GROUND, NOT WHERE THE LEADER HAPPENS TO BE. For a
+            // character standing normally these are the same number to within
+            // rounding and this changes nothing; where they differ, the
+            // measured surface is the one a character can stand on and the
+            // leader's own z is the one that is wrong. GroundedStep already
+            // makes this correction for an aim it is about to step at, and
+            // only within TRAVEL_GROUND_SNAP_YARDS of it; making it HERE means
+            // the aim that goes into `travel_npc`, gets surveyed, gets routed
+            // over 3,897 yards and gets read back out of a death row is the
+            // corrected one.
+            //
+            // THE TOLERANCE IS THERE SO THE LINE MEANS SOMETHING. A character
+            // standing on ground sits a fraction of a yard off the surface the
+            // heightmap reports, every time, so an exact comparison would
+            // report a correction on every re-aim and the one that matters
+            // would read like the rest. The z is still written either way; only
+            // whether anybody is told about it depends on this.
+            bool const moved =
+                std::fabs(ground - z) > TRAVEL_AIM_GROUND_TOLERANCE_YARDS;
+            z = ground;
+            return moved ? AimShore::Moved : AimShore::Unchanged;
+        }
+
+        unsigned const probes =
+            OverseerDecisions::ShoreProbeCount(TRAVEL_SHORE_LIMITS);
+        for (unsigned i = 0; i < probes; ++i)
+        {
+            OverseerDecisions::ShoreProbe probe;
+            if (!OverseerDecisions::ShoreProbeAt(i, TRAVEL_SHORE_LIMITS, probe))
+                break;
+            // The fraction of a turn becomes an angle here and only here; see
+            // ShoreProbe::turns for why the decision side does not do this.
+            // Written as a literal for the same reason HasLocalNavmesh and
+            // GroundedStep's fan write theirs: M_PI is a POSIX extension
+            // rather than a guarantee of <cmath>, and this file already
+            // spells its angles in radians.
+            static constexpr float FULL_TURN_RADIANS = 6.2831853f;
+            float const angle = probe.turns * FULL_TURN_RADIANS;
+            float const cx = x + std::cos(angle) * probe.radiusYards;
+            float const cy = y + std::sin(angle) * probe.radiusYards;
+
+            float candidateDepth = 0.f;
+            float candidateGround = 0.f;
+            // Searched from the WATER LINE rather than from the drowned aim's
+            // own z: a shore is above the point being escaped from, and a
+            // search that started at the lake bed would pass under the bank.
+            //
+            // AND THAT PUTS A REAL BOUND ON WHAT THIS CAN FIND, which is worth
+            // stating rather than discovering. Map::GetHeight searches DOWNWARD
+            // over DEFAULT_HEIGHT_SEARCH from what it is handed, so starting
+            // TRAVEL_GROUND_SNAP_YARDS above the water line finds any ground
+            // from five yards proud of it down to forty-five below - which is
+            // every wadeable shallow and every ordinary bank, and NOT a cliff
+            // edge standing more than five yards above the water. A lake walled
+            // like that yields no candidate and the aim is refused, which is
+            // the safe answer rather than a silently worse one. It is not
+            // widened, because raising the start to catch tall banks would cost
+            // the shallows at the other end of the same fixed window, and the
+            // shallows are what an ordinary shore is made of.
+            if (!WaterDepthAt(bot, cx, cy, ground + depth + TRAVEL_GROUND_SNAP_YARDS,
+                              candidateDepth, candidateGround))
+                continue;
+            if (!OverseerDecisions::ShoreStandable(candidateDepth,
+                                                   bot->GetCollisionHeight()))
+                continue;
+            if (!NavmeshRoutes(bot, cx, cy, candidateGround))
+                continue;
+            x = cx;
+            y = cy;
+            z = candidateGround;
+            return AimShore::Moved;
+        }
+        return AimShore::Drowned;
+    }
+
     // The highest relevant surface above the character, looked for from one
     // bounded probe rather than from MAX_HEIGHT. Map::GetHeight considers both
     // map terrain and VMAP geometry, which is the distinction the incident
@@ -15080,8 +15403,22 @@ private:
         // Where the catch-up aim was last pointed, so "has the leader moved
         // far enough from it to re-aim" is answered from memory rather than by
         // parsing the aim string back. Meaningful only while `catchUp`.
+        //
+        // SINCE #503 THIS IS THE AIM AND NOT ALWAYS THE LEADER. Where the
+        // leader is standing in water the aim is the shore beside it, and
+        // CatchUpToward writes that point here for the reason given at the
+        // write: this is the mark CatchUpAimIsStale measures drift from, and
+        // its question is whether the DESTINATION moved.
         float x{0.f};
         float y{0.f};
+        // WHEN THE "NO AIM WAS WRITTEN" REFUSAL WAS LAST SAID (#503, #188). A
+        // refusal that is re-taken on every party poll for as long as the
+        // leader stands in a lake, or under the terrain, would bury its own
+        // line; this rations it to CATCH_UP_BAD_GROUND_SAID_SECONDS. Zero means
+        // never said, which is also what a fresh entry means, so the first
+        // refusal always speaks. One field for both refusals, for the reason
+        // that constant gives.
+        time_t badGroundSaid{0};
     };
     std::map<std::string, DungeonEscort> _dungeonEscorts;
 
@@ -15373,9 +15710,111 @@ private:
         if (!started && !escort.catchUp)
             return false;
 
+        // THE AIM IS MEASURED BEFORE IT IS WRITTEN (#503, #188). This is the
+        // one aim in this module built out of a live position rather than a
+        // spawn row, a survey node or a door table, so it is the one that can
+        // inherit whatever the leader was standing in. It was measured doing
+        // exactly that twice on 2026-09-19, three hundred yards and half an
+        // hour apart: at 14:42 the leader was in a lake in Un'Goro Crater,
+        // where it drowned, and the follower behind it was routed 3,897 yards
+        // toward that same water; at 15:10 the leader was under the terrain,
+        // the aim was the below-world point, and four of the five characters
+        // walked to it and stood on it. One reading answers both, because both
+        // are the same question - is this a point a character can stand on -
+        // and neither was being asked. See MoveAimToShore, and
+        // OverseerDecisions::ShoreSearchLimits for the water half's argument.
+        float ax = leader->GetPositionX();
+        float ay = leader->GetPositionY();
+        float az = leader->GetPositionZ();
+        AimShore const shore = MoveAimToShore(leader, ax, ay, az);
+        if (shore == AimShore::Drowned)
+        {
+            // SAID, AND SAID AS WATER. A refusal that read like any other
+            // unreachable aim is what #503 is about: the row already carried
+            // FALL_GUARD_IN_WATER and nobody was reading for it, and a line
+            // that said only "no aim was written" would leave the next reader
+            // exactly as far from the answer.
+            //
+            // RATIONED, because the leader stands in that water until
+            // something else moves it and this is asked on every party poll.
+            // One line a minute is enough to see it and few enough to read.
+            time_t const now = std::time(nullptr);
+            if (now - escort.badGroundSaid >= CATCH_UP_BAD_GROUND_SAID_SECONDS)
+            {
+                escort.badGroundSaid = now;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is not aimed at '{}' because the leader is "
+                         "standing in water deep enough to drown in and there is no "
+                         "standable ground within {} yards of it - walking a follower "
+                         "to where a character is drowning is how six of them died in "
+                         "95 seconds at one spot (#503). It keeps following, and the "
+                         "aim is written again as soon as the leader is back on ground",
+                         name, leader->GetName(),
+                         static_cast<uint32>(TRAVEL_SHORE_LIMITS.firstRingYards +
+                                             (TRAVEL_SHORE_LIMITS.rings - 1) *
+                                                 TRAVEL_SHORE_LIMITS.ringStepYards));
+            }
+            return false;
+        }
+        if (shore == AimShore::NoGround)
+        {
+            // AND THE OTHER WAY AN AIM CAN NAME NOWHERE (#188). Rationed on the
+            // same clock and for the same reason: a leader under the terrain
+            // stays under it until something else moves it, and this is asked
+            // every party poll.
+            //
+            // LOUD, AND NOT A SILENT NO-OP, because what it costs is real. A
+            // follower that is not given a catch-up aim keeps `follow`, and
+            // `follow` past FOLLOW_CATCH_UP_YARDS is the failure #70 and #404
+            // exist about. That is still the better of the two: the aim this
+            // replaces was a point four of five characters walked into, and two
+            // of them fell to the crater floor from it.
+            time_t const now = std::time(nullptr);
+            if (now - escort.badGroundSaid >= CATCH_UP_BAD_GROUND_SAID_SECONDS)
+            {
+                escort.badGroundSaid = now;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is not aimed at '{}' because the terrain has no "
+                         "ground within reach of where that leader is standing "
+                         "(map {}, {:.1f}, {:.1f}, {:.1f}) - which is what a character "
+                         "BELOW the world reads as, since the surface search only looks "
+                         "downward. The aim is not written rather than copied, because "
+                         "copying it is how four of five characters ended up standing on "
+                         "one below-world point and two of them fell to the crater floor "
+                         "(#188). It keeps following until the leader is somewhere "
+                         "measurable",
+                         name, leader->GetName(),
+                         static_cast<uint32>(leader->GetMapId()),
+                         leader->GetPositionX(), leader->GetPositionY(),
+                         leader->GetPositionZ());
+            }
+            return false;
+        }
         std::ostringstream aim;
-        aim << "at:" << leader->GetMapId() << ':' << leader->GetPositionX() << ','
-            << leader->GetPositionY() << ',' << leader->GetPositionZ();
+        aim << "at:" << leader->GetMapId() << ':' << ax << ',' << ay << ',' << az;
+
+        // SAID WHEN THE AIM CHANGES, NOT WHEN THE CORRECTION HAPPENS, which is
+        // the same log-once discipline EscortToward keeps a few lines above and
+        // it is load-bearing here rather than tidy. A correction moves the aim
+        // up to the outermost shore ring from the leader, and
+        // CatchUpAimIsStale measures the leader's drift FROM THE AIM - so while
+        // a leader stands in one lake, every poll of a follower already inside
+        // TRAVEL_ROUTE_MIN_YARDS reads that standing distance as drift, calls
+        // the aim stale, and arrives back here. The aim it recomputes is the
+        // same shore, so the string is identical and TravelAimBook::Claim
+        // leaves the errand alone; without this test the LINE would still be
+        // printed on every one of those polls.
+        if (shore == AimShore::Moved && escort.aim != aim.str())
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is aimed at ground measured beside '{}' rather than "
+                     "at the leader's own position - {} yards off it and at z {:.1f} "
+                     "rather than {:.1f}, on ground the terrain says holds. A move of "
+                     "any distance means the leader was in water deep enough to drown "
+                     "in (#503); a move of none with the height changed means its own z "
+                     "was not on the surface under it (#188)",
+                     name, leader->GetName(),
+                     static_cast<uint32>(leader->GetExactDist2d(ax, ay)), az,
+                     leader->GetPositionZ());
 
         escort.catchUp = true;
         escort.wanted = true;
@@ -15385,8 +15824,15 @@ private:
         // buying tickets. See ConsiderFlight.
         if (started)
             escort.mayFly = true;
-        escort.x = leader->GetPositionX();
-        escort.y = leader->GetPositionY();
+        // THE DRIFT MARK IS THE AIM AND NOT THE LEADER (#503). `escort.x` and
+        // `escort.y` are what CatchUpAimIsStale measures the leader's drift
+        // from, and its whole question is "has the destination moved" - so it
+        // has to be the point the follower was actually sent to. Writing the
+        // leader's own position here while aiming at a shore twenty yards away
+        // would report a drift of twenty yards on the very next poll and
+        // re-aim a walk that had not moved.
+        escort.x = ax;
+        escort.y = ay;
         escort.aim = aim.str();
         _travelAims.Claim(name, escort.aim);
         return started;
@@ -17355,6 +17801,121 @@ private:
                 state.progress.since = std::time(nullptr);
                 if (state.flightSince)
                     state.flightSince = std::time(nullptr);
+                continue;
+            }
+
+            // HOW LONG THIS CHARACTER HAS BEEN IN WATER WITHOUT MOVING (#503).
+            //
+            // KEPT HERE, ABOVE THE HOLD, AND ON THE ERRAND'S OWN STATE. The
+            // guard below is the one that says "held on the ground instead",
+            // and it has to be able to see that the ground is water before it
+            // says it. The reading is taken of the WORLD - Unit::IsInWater on
+            // this poll - for the reason the flight guard immediately above
+            // gives: the character's own bookkeeping is not the authority on
+            // where it is standing.
+            //
+            // THE CLOCK RESTARTS ON MOVEMENT AND ON LEAVING THE WATER, and
+            // that is the whole of what stops this ending an ordinary
+            // crossing. A character swimming covers 4.72 yards a second, so it
+            // clears TRAVEL_WATER_STILL_YARDS roughly once a second and never
+            // accumulates two of these. What accumulates is a character in one
+            // spot, which is what the leader that drowned on 2026-09-19 was
+            // doing for 191 seconds while this loop printed that it was being
+            // held on the ground.
+            //
+            // TAKEN ONCE AND READ TWICE. Unit::IsInWater is a GetLiquidData
+            // query rather than a flag read (Map.cpp:1591-1594), and the clock
+            // below and the decision under it are asking the same question
+            // about the same instant, so asking the world twice would cost two
+            // terrain queries per travelling character per poll and could in
+            // principle answer differently.
+            bool const inWater = bot->IsInWater();
+            long long stillInWater = -1;
+            if (!inWater)
+            {
+                state.waterSince = 0;
+            }
+            else
+            {
+                time_t const now = std::time(nullptr);
+                float const dx = bot->GetPositionX() - state.waterX;
+                float const dy = bot->GetPositionY() - state.waterY;
+                float const dz = bot->GetPositionZ() - state.waterZ;
+                bool const moved =
+                    std::sqrt(dx * dx + dy * dy + dz * dz) > TRAVEL_WATER_STILL_YARDS;
+                if (!state.waterSince || moved)
+                {
+                    state.waterSince = now;
+                    state.waterX = bot->GetPositionX();
+                    state.waterY = bot->GetPositionY();
+                    state.waterZ = bot->GetPositionZ();
+                }
+                stillInWater = static_cast<long long>(now - state.waterSince);
+            }
+
+            // AND THE GUARD BELOW IS NOT ALLOWED TO CALL WATER "THE GROUND"
+            // (#503). Asked BEFORE the stuck counter for two reasons. It is a
+            // live reading of the world rather than a number upstream owns and
+            // #498 proved cannot be trusted while nothing is moving - which is
+            // exactly the state a drowning character is in. And the sentence
+            // the counter's branch prints is the wrong sentence here whichever
+            // way that counter then goes, so it must not be printed first.
+            //
+            // MEASURED. 'Grug' carried a stuck `auctioneer` errand and stood at
+            // (-6617.46, -1473.14, -278.806) in Un'Goro Crater; from 14:33:34
+            // to 14:44:01 on 2026-09-19, eighteen times, this loop said it was
+            // held on the ground and then released the errand, and the errand
+            // came straight back. It drowned at 14:42:24 with a second
+            // character one yard away, and the loop was still printing the same
+            // line after the death and after the revival. Every non-zero
+            // fall-guard mask in the retained table since 2026-09-17 is a
+            // self-attributed death, and five of the eleven carry nothing but
+            // FALL_GUARD_IN_WATER.
+            //
+            // WHAT THIS DOES AND WHAT IT DELIBERATELY DOES NOT DO. It ends the
+            // hold and releases the errand, which stops THIS module pinning a
+            // character to a point it is drowning at. It does not move the
+            // character and it does not make it swim: surfacing when breath
+            // runs low is upstream's AI, and #503 puts that out of scope in as
+            // many words. This issue is about not sending a character under and
+            // not holding it there.
+            //
+            // AND IT IS REFUSED AS WELL AS RELEASED, FOR THE REASON THE DEATH
+            // BREAKER ALREADY GIVES. A release with no memory is undone by the
+            // next thing that re-aims the family, and measurably was: the
+            // errand that drowned the leader was released on the same loop and
+            // came straight back, eighteen times. The refusal is the only part
+            // that survives the other writer of this column, so this uses the
+            // one that already exists rather than inventing a second memory -
+            // and then the RefuseReissue branch above clears the column every
+            // poll for ERRAND_DEATH_LIMITS.cooloffSeconds and says so on its own
+            // rationed line, exactly as it does for an errand that was killing
+            // somebody.
+            if (OverseerDecisions::DrowningHoldDecision(
+                    {inWater, stillInWater},
+                    {TRAVEL_WATER_STILL_SECONDS}) ==
+                OverseerDecisions::DrowningHoldAction::ReleaseInWater)
+            {
+                // ITS OWN NAMED LINE, which is an acceptance criterion of #503
+                // rather than a stylistic choice: a release that read like the
+                // stuck-counter one below would put this back where it started,
+                // with the cause on disk and nothing saying it out loud.
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been standing still in water for {}s on "
+                         "the errand to '{}' and is NOT being held on the ground, "
+                         "because the ground is water - releasing the errand, and "
+                         "refusing it for {} minutes so the next pass does not write it "
+                         "straight back. The core gives {}s of breath and then deals a "
+                         "fifth of max health a second, so this is taken with time to "
+                         "spare rather than as a rescue. Nothing here makes it swim; "
+                         "that is upstream's AI and #503 leaves it there",
+                         name, static_cast<uint32>(stillInWater), target,
+                         static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60),
+                         static_cast<uint32>(UPSTREAM_BREATH_SECONDS));
+                _travelAims.Refuse(name, target,
+                                   "it was standing still in water on it, which is how "
+                                   "this roster drowns");
+                _travelAims.Release(name);
                 continue;
             }
 
@@ -29553,19 +30114,33 @@ private:
         // "fell 136.9 yards which is enough to kill it" was the sentence that
         // sent five separate fixes at the fall arithmetic for a death the fall
         // arithmetic has nothing to do with.
+        //
+        // AND THE MASK IS READ BACK, NOT JUST SPELLED OUT (#503). Naming the
+        // bits was #281's whole contribution and its own comment said so: every
+        // value written down and nothing reading it back. The line printed
+        // "fall guard falling|in-water" over two characters drowning in
+        // Un'Goro Crater and a reader still had to know what that implied,
+        // divide a health column by five and count ticks backwards to reach the
+        // word. The clause added here is that step done once, in the module,
+        // against the same fall arithmetic the clause beside it already uses -
+        // and it says nothing at all whenever the two instruments disagree or
+        // either was not sampled. See OverseerDecisions::ReadSelfDeath for why
+        // a reader that only ever confirmed a suspicion would be worth nothing.
+        OverseerDecisions::FallAccount const account =
+            OverseerDecisions::AccountForFall(
+                batch.back().yardsFallen, 0.f, 1.f, batch.back().z,
+                OverseerDecisions::VOID_PLANE_Z);
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
                  "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
-                 "fell {:.1f} yards which is {}, in combat {}; fall guard {})",
+                 "fell {:.1f} yards which is {}, in combat {}; fall guard {}, "
+                 "and {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
                  batch.back().killerType, batch.back().killerName,
                  batch.back().driver, batch.back().movement,
                  batch.back().yardsFallen,
-                 OverseerDecisions::FallAccountName(
-                     OverseerDecisions::AccountForFall(
-                         batch.back().yardsFallen, 0.f, 1.f, batch.back().z,
-                         OverseerDecisions::VOID_PLANE_Z)),
+                 OverseerDecisions::FallAccountName(account),
                  batch.back().inCombat < 0
                      ? "unsampled"
                      : (batch.back().inCombat ? "yes" : "no"),
@@ -29575,7 +30150,14 @@ private:
                  batch.back().fallGuardStandDown < 0
                      ? std::string("unsampled")
                      : OverseerDecisions::FallGuardStandDownNames(
-                           static_cast<uint16_t>(batch.back().fallGuardStandDown)));
+                           static_cast<uint16_t>(batch.back().fallGuardStandDown)),
+                 // #503, and the first thing that has ever read that mask back.
+                 OverseerDecisions::SelfDeathReadingName(
+                     OverseerDecisions::ReadSelfDeath(
+                         {batch.back().fallGuardStandDown,
+                          batch.back().fallGuardSeconds,
+                          batch.back().killerType == "self", account},
+                         DEATH_READING_LIMITS)));
     }
 
     // ------------------------------------------------------- outcome --

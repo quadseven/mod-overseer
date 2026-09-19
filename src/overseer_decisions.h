@@ -5081,6 +5081,102 @@ struct CatchUpAimFacts
 // Is the aim stale enough to be worth the route that rewriting it costs?
 bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits);
 
+// ------------- and an aim at the bottom of a lake is not an aim (#503) ------
+//
+// THE SAME DEFECT AS THE ONE ABOVE, ONE AXIS OVER. CatchUpAimFacts already
+// refuses to aim a follower at a leader who is in the air, on the argument
+// that a position in the air is not a place anybody can be sent. A position
+// under water is not one either, and until #503 nothing asked. The catch-up
+// aim is the ONE aim in this module built out of a live position rather than
+// out of a spawn row, a survey node or a door table, so it is the one aim that
+// can inherit whatever the leader happened to be standing in.
+//
+// MEASURED, 2026-09-19. The family leader stood at (-6617.46, -1473.14,
+// -278.806) in Un'Goro Crater carrying a stuck `auctioneer` errand from at
+// least 14:39:13, and died there at 14:42:24 with a second character one yard
+// away. Both rows are `killer_type = 'self'` with `yards_fallen` 0 and a
+// fall-guard mask carrying FALL_GUARD_IN_WATER. From 14:25:23 onward the
+// catch-up aim written for the member still behind was
+// `at:1:-6609.98,-1416,-271.753`, which is that same leader's own position a
+// few minutes earlier and 58 yards from where it drowned. The surveyed route
+// planned 3,897 yards of walking legs and 666 waypoints for it and handed the
+// last 7 yards to the ordinary step, toward a point the character that chose
+// it could not survive standing on. The route survey prices guarded ground
+// (#502) and prices water at nothing at all.
+//
+// THE THRESHOLD IS THE CORE'S OWN AND NOT A NUMBER SOMEBODY PICKED.
+// Map::GetLiquidData computes `delta = waterLevel - z` and calls the point
+// UNDER_WATER when `delta > collisionHeight` (Map.cpp:1360-1364 at the pinned
+// revision). Map::GetWaterOrGroundLevel hands a caller both halves of that
+// subtraction in one query - it returns the water surface and writes the
+// ground beneath it through its `ground` out-parameter (Map.cpp:1116-1130) -
+// so the depth at a point is two real terrain samples and one subtraction,
+// and the rule below is that comparison mirrored the same way AccountForFall
+// mirrors Player::HandleFall. The caller passes the CHARACTER's own collision
+// height rather than a literal, because that is the number the core will
+// compare against for that character.
+//
+// AND A SHORE IS FOUND RATHER THAN GUESSED. Nothing here returns a position.
+// What it yields is a bearing and a distance FROM the aim; the caller samples
+// the real terrain at each candidate in turn and takes the first that measures
+// standable, with that sample's own z. A "shore" computed as an offset with a
+// z somebody reasoned about would be the mistake that put a hand-written
+// staging point inside the wall of a mine shaft (#121), with a nicer name on
+// it.
+//
+// WHY RINGS AND NOT A SPIRAL, AND WHY NEAREST FIRST. The question is "where is
+// the nearest ground this character could stand on", and a search that
+// answered with a further point when a nearer one existed would move the
+// party's meeting point for no reason. Each ring is swept completely before
+// the next one opens, so the first standable answer is within one ring step of
+// the nearest one there is. The count is bounded and small because every
+// candidate is a terrain query on the world thread: see TRAVEL_SHORE_LIMITS
+// for the numbers and what they cost.
+struct ShoreSearchLimits
+{
+    // The nearest ring, in yards from the aim. Zero rings is a valid search
+    // that looks at nothing, which is how a caller disables this.
+    float firstRingYards{0.f};
+    // How much further out each next ring sits.
+    float ringStepYards{0.f};
+    // How many rings before the search gives up and the aim is refused.
+    unsigned rings{0};
+    // How many bearings are swept within one ring. They are spread evenly
+    // around the full turn.
+    unsigned bearings{0};
+};
+
+// One candidate point of a shore search, as an offset from the aim.
+struct ShoreProbe
+{
+    // Which ring this came from, zero-based and nearest first.
+    unsigned ring{0};
+    // How far from the aim, in yards.
+    float radiusYards{0.f};
+    // The bearing, as a fraction of a full turn in [0, 1). A FRACTION rather
+    // than an angle because this file may not include <cmath>: the caller,
+    // which already has it, multiplies by two pi. Keeping the trigonometry on
+    // the caller's side is also what lets this rule be tested without one.
+    float turns{0.f};
+};
+
+// Is ground with `waterDepthYards` of water over it ground this character can
+// stand on? `wadeDepthYards` is the character's own collision height; zero or
+// less means the caller is not asking and everything reads as standable, the
+// same "zero disables" convention every other bound in this file keeps.
+bool ShoreStandable(float waterDepthYards, float wadeDepthYards);
+
+// How many candidates a whole search looks at. Its own function rather than a
+// multiplication at the call site so the bound on terrain queries per search
+// is one number a reader can find.
+unsigned ShoreProbeCount(ShoreSearchLimits const& limits);
+
+// Candidate `index`, nearest ring first and sweeping the bearings within a
+// ring. False when the index is past the end of the search, which is the
+// caller's loop condition.
+bool ShoreProbeAt(unsigned index, ShoreSearchLimits const& limits,
+                  ShoreProbe& probe);
+
 // ------------------------- is the walk this drive would issue already running --
 //
 // THE GUARD THIS ANSWERS FOR, AND THE ONE THING IT USED TO GET WRONG (#293).
@@ -6945,6 +7041,93 @@ uint16_t FallGuardStandDownMask(bool alive, bool teleporting, bool inFlight,
 // line in the log beside it, so a reader does not need a lookup table at three
 // in the morning.
 std::string FallGuardStandDownNames(uint16_t mask);
+
+// ------------------ and somebody finally reads the mask back (#503) --------
+//
+// THE COMMENT ABOVE SAYS "every value here is written down and nothing reads
+// it back", and it was true for thirteen days. This is the first reader.
+//
+// WHAT IT COST TO HAVE NO READER. Of the eleven deaths in the retained window
+// from 2026-09-17 onward that carry a non-zero mask, every single one is
+// `killer_type = 'self'`: five carry mask 32, two carry 48, four carry 528.
+// Two of those are a leader and a second character who drowned one yard apart
+// in Un'Goro Crater, and the row that said so was on disk the whole time. The
+// log line beside it already printed "fall guard falling|in-water" and a
+// person still had to know what that implied, divide a health column by five,
+// and count ticks backwards to reach the word "drowning". #270 says these rows
+// cannot answer how a self-attributed death happened. For the ones carrying
+// this bit, they can, and the answer was already in the column.
+//
+// IT IS A READING AND NOT A CAUSE, AND THE DIFFERENCE IS THE WHOLE DESIGN.
+// RecordDeath still declines to name the environmental damage type
+// (mod_overseer.cpp:3818-3830) and #503 keeps that refusal on purpose: the
+// core does not tell this module what killed a character, and a heuristic that
+// guessed would be a new thing to be wrong about. This does not guess. It says
+// what the two instruments on the row agree about - where the character was
+// according to the guard, and what the drop accounts for according to the
+// core's own fall arithmetic - and says NoOpinion whenever they do not agree
+// or either of them was not sampled.
+//
+// THE FIXTURES, AND THEY INCLUDE THE ONES THAT MUST NOT READ AS DROWNING.
+// Rows 4456 and 4457 carry masks 32 and 48 with `yards_fallen` 0 and
+// `fall_guard_seconds` 0: drowning. Rows 4343, 4344, 4452 and 4453 carry mask
+// 528, which is DESCENDING plus FALLING, with recorded drops of 80.4, 45.9,
+// 257.6 and 129.4 yards: falls, and calling those drownings because they are
+// also self-attributed would be this reader inventing the same confusion it
+// exists to end. And two rows of the six-character cluster of 2026-09-18 carry
+// mask 0 - the guard looked and nothing declined it - so however strongly the
+// four rows beside them suggest water, these two say NoOpinion. A reader that
+// only ever confirmed a suspicion would be worth nothing.
+enum class SelfDeathReading
+{
+    // No mask on the row at all. The guard never sampled this character, which
+    // is a different finding from the guard finding nothing.
+    Unsampled,
+    // The instruments were read and they do not name anything. This is the
+    // common and correct answer, including for every death something else
+    // killed.
+    NoOpinion,
+    // The guard found this character in water, and the recorded drop does not
+    // account for the death.
+    Drowning,
+    // The recorded drop accounts for the death on the core's own arithmetic.
+    Fall,
+};
+
+struct SelfDeathReadingFacts
+{
+    // `overseer_death.fall_guard_standdown` exactly as the column holds it,
+    // where negative is the never-sampled sentinel.
+    int32_t fallGuardMask{-1};
+    // `overseer_death.fall_guard_seconds`, likewise: how old the mask is.
+    // Negative is never-sampled.
+    int32_t fallGuardSeconds{-1};
+    // Whether `killer_type` is 'self'. Something else killing the character is
+    // not a question this reader answers, whatever the mask says.
+    bool selfAttributed{false};
+    // What the recorded drop accounts for, already decided by AccountForFall
+    // so this rule cannot disagree with the one the summary line already
+    // prints.
+    FallAccount fall{FallAccount::Unsampled};
+};
+
+struct SelfDeathReadingLimits
+{
+    // How fresh the mask has to be to be about THIS death. The drive polls
+    // once a second, so a reading more than a second or two old is a reading
+    // about a character the drive was not reaching, which is a different fault
+    // and not evidence about the death. Zero or less means the caller is not
+    // asking and age is not tested.
+    int32_t freshSeconds{0};
+};
+
+SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts const& facts,
+                               SelfDeathReadingLimits const& limits);
+
+// The reading as the clause that goes on the end of the summary line. A
+// sentence fragment rather than a word, because it is read in the middle of a
+// line somebody is already skimming.
+char const* SelfDeathReadingName(SelfDeathReading reading);
 
 // -------------------------------------------------------------------- mail --
 //
@@ -12150,6 +12333,91 @@ enum class TravelStuckAction
 // own, and MoveFarTo is not running either.
 TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
                                       bool carriesStrategy);
+
+// ------------- holding a character on the ground, when the ground is water --
+//
+// WHAT THE GUARD ABOVE SAYS, AND WHY IT IS THE WRONG SENTENCE HERE (#503).
+// The line the stuck guard prints is "held on the ground instead, the errand's
+// own 20-minute backstop decides", and holding is the right call for a walk
+// that cannot find a path: the character stays where it is, which is somewhere
+// it was already standing safely, and something bounded decides later. Every
+// word of that argument assumes the ground is ground.
+//
+// MEASURED, 2026-09-19. The family leader carried a stuck `auctioneer` errand
+// and stood at one point in Un'Goro Crater. From 14:33:34 to 14:44:01,
+// eighteen times, five seconds apart, the errand drive printed that it was
+// being held on the ground. It was under water for all of it. The core gives a
+// player three minutes of breath (`WaterBreath.Timer`, 180000 ms at the pinned
+// revision) and then deals `GetMaxHealth() / 5` a second until it dies
+// (Player::HandleDrowning, Player.cpp:896-925); the leader stood still for 191
+// seconds and died, and the drive was still printing the same line after the
+// death and after the revival. Nothing in the loop - not this guard, not the
+// twenty-minute backstop, not the death breaker - asked whether the ground
+// being held was water.
+//
+// SO THIS IS ASKED FIRST AND IT IS ASKED OF THE WORLD. `inWater` is
+// Unit::IsInWater this poll, not a flag remembered from an earlier one, for
+// the same reason DriveTravel's flight guard is asked of the world: the
+// character's own bookkeeping is not the authority on where it is standing.
+//
+// AND IT IS NOT "IN WATER" ON ITS OWN, WHICH WOULD BREAK EVERY CROSSING. A
+// character swimming a river on its errand is in water and is getting there;
+// releasing that errand every poll would end every water crossing this roster
+// makes. The fact that separates the two is the one the row records and the
+// one the log shows: the leader that drowned did not move. `movement_generator`
+// reads `idle` on both death rows, and the position on the 14:39 snapshot is
+// the position on the 14:42 death row. A character swimming is moving. So the
+// reading is how long this character has been in water WITHOUT MOVING, and a
+// swim never accumulates any of it.
+//
+// WHY NOT READ THE STUCK COUNTER FOR THIS. `rpgInfo.stuckAttempts` is upstream's
+// and is only written while the character carries `new rpg` (see
+// TravelStuckDecision and #498), so for exactly the character this rule exists
+// to save - one standing still, going nowhere, possibly with the strategy off -
+// it is a number left behind by an older walk. Reading it here would make the
+// one decision that has to be right about a drowning depend on the one number
+// #498 proved cannot be trusted when nothing is moving. The clock below is
+// this module's own, measured from its own polls, and owes upstream nothing.
+//
+// WHAT A RELEASE BUYS AND WHAT IT DOES NOT. It does not move the character and
+// it does not make it swim: surfacing is upstream's AI and #503 says so
+// explicitly. What it does is stop this module pinning a character to a point
+// it is drowning at, hand the aim back to whatever wrote it, and say water out
+// loud on a line of its own so the next reader does not have to do the
+// arithmetic on a health column three days later.
+enum class DrowningHoldAction
+{
+    // Nothing here has an opinion. The guard does exactly what it did before,
+    // byte for byte, which is the answer for every character on dry land.
+    HoldAsBefore,
+    // In water and going nowhere. The errand is released, and the release
+    // names water.
+    ReleaseInWater,
+};
+
+struct DrowningHoldFacts
+{
+    // Unit::IsInWater, asked of the world on this poll.
+    bool inWater{false};
+    // How long this character has been in water without moving, on this
+    // errand, in seconds. NEGATIVE MEANS NOT MEASURED, which is what the first
+    // poll in water looks like and what a character that has just moved looks
+    // like, and it is deliberately a different answer from zero the same way
+    // `recovery_rung` and the fall-guard mask keep an absence apart from a
+    // reading.
+    long long stillInWaterSeconds{-1};
+};
+
+struct DrowningHoldLimits
+{
+    // How long a character may stand still in water before the errand holding
+    // it there is released. Zero or less means the caller is not asking, and
+    // every answer is HoldAsBefore.
+    long long stillSeconds{0};
+};
+
+DrowningHoldAction DrowningHoldDecision(DrowningHoldFacts const& facts,
+                                        DrowningHoldLimits const& limits);
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

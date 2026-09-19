@@ -9925,4 +9925,132 @@ TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
     return attempts >= limit ? TravelStuckAction::Release
                              : TravelStuckAction::Continue;
 }
+
+DrowningHoldAction DrowningHoldDecision(DrowningHoldFacts const& facts,
+                                        DrowningHoldLimits const& limits)
+{
+    // DRY LAND IS ANSWERED FIRST AND ANSWERED WITH NOTHING. Every character
+    // this module has ever held on a stuck errand reaches this line and leaves
+    // through it, so the guard downstream keeps behaving exactly as #498 and
+    // #500 left it. That is the property this rule has to have and it is the
+    // first statement in the function so it cannot be lost under a later edit.
+    if (!facts.inWater)
+        return DrowningHoldAction::HoldAsBefore;
+    if (limits.stillSeconds <= 0)
+        return DrowningHoldAction::HoldAsBefore;
+    // AND AN ABSENCE IS NOT A READING. A negative clock is a character whose
+    // still-in-water time has not been measured, which is what the first poll
+    // in water and the poll after any movement both look like. Reading it as
+    // zero would be the same fold #281 keeps apart on the death row, and
+    // reading it as "a long time" would release a swim on its first stroke.
+    if (facts.stillInWaterSeconds < 0)
+        return DrowningHoldAction::HoldAsBefore;
+    return facts.stillInWaterSeconds >= limits.stillSeconds
+               ? DrowningHoldAction::ReleaseInWater
+               : DrowningHoldAction::HoldAsBefore;
+}
+
+bool ShoreStandable(float waterDepthYards, float wadeDepthYards)
+{
+    // ZERO DISABLES, the same way every other optional bound in this file
+    // does, and it is reached by a caller that could not read a collision
+    // height rather than by one that wants everything drowned-proof.
+    if (wadeDepthYards <= 0.f)
+        return true;
+    // A NEGATIVE DEPTH IS DRY GROUND ABOVE A WATER LINE, not a reading to
+    // reject: GetWaterOrGroundLevel returns max(level, ground) where the
+    // ground stands above the water, so the subtraction can legitimately come
+    // back at or below zero.
+    return waterDepthYards <= wadeDepthYards;
+}
+
+unsigned ShoreProbeCount(ShoreSearchLimits const& limits)
+{
+    return limits.rings * limits.bearings;
+}
+
+bool ShoreProbeAt(unsigned index, ShoreSearchLimits const& limits,
+                  ShoreProbe& probe)
+{
+    if (limits.bearings == 0 || index >= ShoreProbeCount(limits))
+        return false;
+
+    // NEAREST RING FIRST, AND EACH RING SWEPT WHOLE BEFORE THE NEXT OPENS.
+    // The caller takes the first candidate that measures standable, so the
+    // order IS the "nearest shore" promise: an answer from ring N is within
+    // one ringStepYards of the nearest standable ground there is.
+    unsigned const ring = index / limits.bearings;
+    unsigned const bearing = index % limits.bearings;
+
+    probe.ring = ring;
+    probe.radiusYards =
+        limits.firstRingYards + static_cast<float>(ring) * limits.ringStepYards;
+    // A FRACTION OF A TURN, NOT AN ANGLE. See ShoreProbe::turns: the
+    // trigonometry belongs to the caller, which already has <cmath>, and
+    // keeping it there is what lets this be tested with neither a world nor a
+    // maths library.
+    probe.turns =
+        static_cast<float>(bearing) / static_cast<float>(limits.bearings);
+    return true;
+}
+
+SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts const& facts,
+                               SelfDeathReadingLimits const& limits)
+{
+    // NEVER SAMPLED IS ITS OWN ANSWER. The column's -1 means the guard did not
+    // look at this character at all, which is a fault worth seeing and is not
+    // the same as the guard looking and finding nothing.
+    if (facts.fallGuardMask < 0 || facts.fallGuardSeconds < 0)
+        return SelfDeathReading::Unsampled;
+
+    // A STALE READING IS NOT EVIDENCE ABOUT THIS DEATH. The drive polls once a
+    // second; a mask several seconds old describes a character the drive was
+    // not reaching, which the column's own comment already calls a different
+    // fault from standing down.
+    if (limits.freshSeconds > 0 && facts.fallGuardSeconds > limits.freshSeconds)
+        return SelfDeathReading::NoOpinion;
+
+    // SOMETHING ELSE KILLED IT. The mask says where the character was and says
+    // nothing about who hit it, and three creature kills in the retained table
+    // carry FALL_GUARD_IN_WATER for no better reason than that the fight was
+    // in a river.
+    if (!facts.selfAttributed)
+        return SelfDeathReading::NoOpinion;
+
+    // THE DROP IS ASKED ABOUT BEFORE THE WATER IS. A fall that the core's own
+    // arithmetic says could have done the killing is a fall, whatever else the
+    // character was standing in, and the four mask-528 rows in the retained
+    // window recorded drops of 45.9 to 257.6 yards. Calling one of those a
+    // drowning because it is also self-attributed would be this reader
+    // manufacturing the confusion it exists to end.
+    if (facts.fall == FallAccount::EnoughToKill ||
+        facts.fall == FallAccount::VoidPlane)
+        return SelfDeathReading::Fall;
+
+    uint16_t const mask = static_cast<uint16_t>(facts.fallGuardMask);
+    if (mask & FALL_GUARD_IN_WATER)
+        return SelfDeathReading::Drowning;
+
+    // EVERYTHING ELSE, INCLUDING A MASK OF ZERO. The guard looked and found
+    // nothing to decline it, so it has nothing to contribute about how this
+    // character died - which is the honest answer for two of the six rows in
+    // the 2026-09-18 cluster, however suggestive the four beside them are.
+    return SelfDeathReading::NoOpinion;
+}
+
+char const* SelfDeathReadingName(SelfDeathReading reading)
+{
+    switch (reading)
+    {
+        case SelfDeathReading::Unsampled:
+            return "the guard never looked, so this says nothing";
+        case SelfDeathReading::NoOpinion:
+            return "the guard names nothing";
+        case SelfDeathReading::Drowning:
+            return "it was in water and did not fall, which reads as drowning";
+        case SelfDeathReading::Fall:
+            return "the recorded drop accounts for it";
+    }
+    return "unknown";
+}
 }  // namespace OverseerDecisions
