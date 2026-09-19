@@ -9913,8 +9913,15 @@ GuildRequest ParseGuildRequest(std::string const& command)
     request.error = GuildRefusal::NoVerb;
     return request;
 }
-TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit)
+TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
+                                      bool carriesStrategy)
 {
+    // AN UNWRITTEN COUNTER IS NOT A MEASUREMENT (#498). Asked first, and
+    // asked as a refusal to read rather than as a value of its own, because
+    // the failure being answered is exactly a number being believed when
+    // nothing had produced it.
+    if (!carriesStrategy)
+        return TravelStuckAction::Continue;
     return attempts >= limit ? TravelStuckAction::Release
                              : TravelStuckAction::Continue;
 }

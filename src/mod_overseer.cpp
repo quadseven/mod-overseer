@@ -17381,14 +17381,11 @@ private:
             // through `new rpg`, which is to say only by the leader and by an
             // escorted follower - exactly the two this drive is walking.
             //
-            // THE LEVER IS THE CLOCK. `stuckTs` and `stuckAttempts` are plain
-            // public fields of the public `rpgInfo` struct (NewRpgInfo.h:20,
-            // :81-82), reset by upstream itself whenever the walk gets nearer
-            // (NewRpgBaseAction.cpp:91-95). Stamping them here on every poll
-            // is the same reset a five-yard improvement would have earned,
-            // and the poll is TRAVEL_POLL_MS (15 s) apart - DUNGEON_RUN_POLL_MS
-            // (5 s) while anyone is escorted - against a 90 s fuse, so the fuse
-            // can never burn down between two polls. A walk that genuinely
+            // THE LEVER IS THE COUNTER. `stuckTs` and `stuckAttempts` are
+            // plain public fields of the public `rpgInfo` struct
+            // (NewRpgInfo.h:20, :81-82), and MoveFarTo owns both: it resets
+            // them whenever the walk gets nearer (NewRpgBaseAction.cpp:91-95)
+            // and nothing else writes them at all. A walk that genuinely
             // cannot land is still bounded: the twenty-minute backstop below
             // releases the errand as unreachable, on the ground, which is what
             // "unreachable" should mean. Said once per errand when it was
@@ -17396,11 +17393,31 @@ private:
             // in the log: five attempts with no progress is a path problem
             // somebody may want to look at, and the teleport used to hide it.
             //
+            // AND IT IS ONLY A LEVER WHILE SOMETHING IS PULLING IT (#498).
+            // MoveFarTo runs only under `new rpg`, so for a character not
+            // carrying it the counter is frozen at whatever an earlier walk
+            // left behind - and a release cannot clear it, because it lives in
+            // upstream's struct rather than in this book's state. Read anyway,
+            // this drive refused the errand on a stale number, and the refusal
+            // skipped the walk that is that number's only writer, so the next
+            // poll read it again. See OverseerDecisions::TravelStuckDecision
+            // for the 114 releases in 73 minutes that measured it, 53 of them
+            // on two characters whose engines had had `new rpg` taken off
+            // minutes earlier.
+            //
+            // CanBeSentToNpc IS THE SAME QUESTION THE GRANT BELOW ASKS, asked
+            // here for the first time. It costs the guard nothing: the
+            // teleport being kept out of reach is MoveFarTo's own, and a
+            // character MoveFarTo is not running for cannot be teleported by
+            // it.
+            //
             // Held BEFORE the stand-still branches below so an escorted member
             // holding at its point - which MoveFarTo is not being asked to
             // move, and so never counts against - is covered on the same terms
             // as one still walking.
-            if (botAI->rpgInfo.stuckAttempts >= 5 && !state.stuckSaid)
+            bool const countsForThisCharacter = CanBeSentToNpc(botAI);
+            if (countsForThisCharacter && botAI->rpgInfo.stuckAttempts >= 5 &&
+                !state.stuckSaid)
             {
                 state.stuckSaid = true;
                 LOG_WARN("module.overseer",
@@ -17419,7 +17436,7 @@ private:
             // issuing the same impossible walk until the twenty-minute
             // backstop, while allowing upstream to snap the bot to a cliff.
             if (OverseerDecisions::TravelStuckDecision(
-                    botAI->rpgInfo.stuckAttempts, 5) ==
+                    botAI->rpgInfo.stuckAttempts, 5, countsForThisCharacter) ==
                 OverseerDecisions::TravelStuckAction::Release)
             {
                 LOG_WARN("module.overseer",
