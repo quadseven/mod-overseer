@@ -5484,6 +5484,30 @@ private:
         return session && !session->IsSocketClosed();
     }
 
+    // The headless roster as of the last sweep. Read by Steerable, which sits
+    // on every drive's hot path, so it is a cached vector refreshed once per
+    // KeepRosterAttended pass rather than a config parse per call. Empty until
+    // the first pass, which errs the safe way: nobody is steerable headless.
+    static std::vector<std::string>& HeadlessRosterCache()
+    {
+        static std::vector<std::string> cache;
+        return cache;
+    }
+
+    // May a drive steer this character? A real client, or a headless bot the
+    // configuration allows to play unwatched. See RosterCharacterIsSteerable
+    // for why spawning without this left every headless roster bot unsteered.
+    static bool Steerable(Player const* player)
+    {
+        if (!player)
+            return false;
+        bool const attached = ClientAttached(player);
+        WorldSession const* session = player->GetSession();
+        return OverseerDecisions::RosterCharacterIsSteerable(
+            attached, player->IsInWorld(), session && session->IsBot(),
+            player->GetName(), RosterRequiresAClient(), HeadlessRosterCache());
+    }
+
     // Log a headless bot out through whichever holder owns it. Mirrors
     // mod-playerbots' own eviction on a real login
     // (PlayerbotsSecureLogin.cpp:31-50): a bot added by a master lives in
@@ -5555,7 +5579,8 @@ private:
         std::vector<std::string> const names = ReloadRosterNames();
         // Read once per pass rather than per name: it is the same answer for
         // every row and it is a string parse, not a lookup.
-        std::vector<std::string> const headless = HeadlessRoster();
+        HeadlessRosterCache() = HeadlessRoster();
+        std::vector<std::string> const& headless = HeadlessRosterCache();
 
         for (std::string const& name : names)
         {
@@ -5672,13 +5697,14 @@ private:
             std::string const name = row[0].Get<std::string>();
             if (row[1].Get<uint8>() && wantsToLead.empty())
                 wantsToLead = name;
-            // Present means playing on camera (#131). A roster character in
-            // the world with no client is on its way out - KeepRosterAttended
-            // evicts it - and inviting it, pointing it at a leader or handing
-            // it leadership for the seconds in between would be steering a
-            // character nobody is watching.
+            // Present means playing: on camera (#131), or headless because
+            // Overseer.HeadlessRoster says this one is played unwatched. A
+            // roster character in the world with NEITHER is on its way out -
+            // KeepRosterAttended evicts it - and inviting it, pointing it at a
+            // leader or handing it leadership for the seconds in between
+            // would be steering a character that is being freed.
             Player* p = ObjectAccessor::FindPlayerByName(name);
-            if (ClientAttached(p))
+            if (Steerable(p))
                 present.push_back(p);
         } while (result->NextRow());
 
@@ -8207,7 +8233,9 @@ private:
     // watcher (:507) and a snapshot subject (:4338). The drives simply never
     // adopted it.
     //
-    // AND A REAL CLIENT MUST BE ATTACHED (#131). ClientAttached is the
+    // AND A REAL CLIENT MUST BE ATTACHED (#131) - or the character must be a
+    // headless bot the configuration allows (Overseer.HeadlessRoster; see
+    // Steerable). What follows describes the client case. ClientAttached is the
     // in-world-with-a-session check above plus the session socket, which is
     // what separates a filmed character from a headless bot - see
     // KeepRosterAttended. A roster character with no client is not steered by
@@ -8216,7 +8244,7 @@ private:
     // through this one function, so the rule is enforced in exactly one place.
     static PlayerbotAI* SteerableAI(Player* bot)
     {
-        if (!ClientAttached(bot))
+        if (!Steerable(bot))
             return nullptr;
         return GET_PLAYERBOT_AI(bot);
     }

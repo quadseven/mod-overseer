@@ -32,6 +32,7 @@
 using OverseerDecisions::HeadlessRosterNames;
 using OverseerDecisions::MayPlayHeadless;
 using OverseerDecisions::NamedInHeadlessRoster;
+using OverseerDecisions::RosterCharacterIsSteerable;
 
 namespace
 {
@@ -139,6 +140,43 @@ void AWatchedCharacterIsNeverOnTheList()
           MayPlayHeadless("Grug", false, list), true);
 }
 
+
+void AHeadlessBotOnTheListIsSteered()
+{
+    // THE DEFECT #547 SHIPPED WITH. Spawning a roster character headless put it
+    // in the world and left it under nobody's control, because every drive
+    // reaches a character through one funnel that refused anybody without a
+    // client. A listed bot must pass that funnel or it is logged in and idle.
+    std::vector<std::string> const list = HeadlessRosterNames("Bork,Grog");
+    Check("listed headless bot is steerable",
+          RosterCharacterIsSteerable(false, true, true, "Bork", true, list), true);
+    Check("a client-held character is steerable, list or no",
+          RosterCharacterIsSteerable(true, true, false, "Grug", true, list), true);
+}
+
+void AHeadlessBotOffTheListIsNotSteered()
+{
+    // A bot not on the list is one the sweep is about to evict. Steering a
+    // character while its Player and AI are being freed is the crash that
+    // removed the original KeepRosterOnline.
+    std::vector<std::string> const list = HeadlessRosterNames("Bork,Grog");
+    Check("unlisted headless bot is not steerable",
+          RosterCharacterIsSteerable(false, true, true, "Grug", true, list), false);
+    Check("nothing configured, nothing steerable headless",
+          RosterCharacterIsSteerable(false, true, true, "Bork", true, {}), false);
+}
+
+void AnythingNotInTheWorldIsNotSteered()
+{
+    std::vector<std::string> const list = HeadlessRosterNames("Bork");
+    Check("listed but not in the world",
+          RosterCharacterIsSteerable(false, false, true, "Bork", true, list), false);
+    // A real session with no socket that is NOT a bot is a client that has
+    // just dropped; the kick path owns it, not the drives.
+    Check("listed name but a real session that lost its client",
+          RosterCharacterIsSteerable(false, true, false, "Bork", true, list), false);
+}
+
 }  // namespace
 
 int main()
@@ -149,12 +187,15 @@ int main()
     TheListIsWhatPermitsPlayingUnwatched();
     TurningTheEvictionOffPermitsEverybody();
     AWatchedCharacterIsNeverOnTheList();
+    AHeadlessBotOnTheListIsSteered();
+    AHeadlessBotOffTheListIsNotSteered();
+    AnythingNotInTheWorldIsNotSteered();
 
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
         return EXIT_FAILURE;
     }
-    std::printf("ok: the list spawns, the boolean only stops the eviction\n");
+    std::printf("ok: the list spawns AND steers, the boolean only stops the eviction\n");
     return EXIT_SUCCESS;
 }
