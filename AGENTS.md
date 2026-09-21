@@ -112,6 +112,17 @@ beyond the README and an example config file to know what to change.
   exists — they're already written to take config as input rather than
   assume it.
 
+## Why this file, not just a smarter secret scanner
+
+A pattern-matching scanner catches shapes: an AWS key, a PEM block, a
+32-character hex string. It cannot catch a paragraph of ordinary prose
+that happens to name a real person or describe a real network in plain
+words — which is where nearly everything this file exists to prevent
+actually showed up. Scanners still belong in CI as a backstop for the
+shapes they *can* catch; this file is the layer above that, for the judgment
+a scanner doesn't have.
+
+<!-- Everything above the next line is synced from quadseven/infra-public and replaced on every sync. Put this repo's own content below it. -->
 <!-- repo-specific below -->
 
 ## Working on this module: things learned the expensive way
