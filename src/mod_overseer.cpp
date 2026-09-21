@@ -16413,6 +16413,82 @@ private:
     std::string _regroupLeader;
     std::string _regroupWaitingFor;
     OverseerDecisions::RatchetState _regroupProgress{};
+
+    // ONE WAIT PER FAMILY LEADER, NOT ONE FOR THE MODULE (#548).
+    //
+    // The registers above are the WORKING copy of one leader's wait. They were the
+    // only copy while the module drove one family. KeepTheFamilyTogether now runs
+    // once per family, so a second family's leader found the first family's wait
+    // in them, read `_regroupLeader != leaderName`, ended it as "the party changed
+    // leader", and its own turn then started a wait that the next family's turn
+    // ended in the same way - a hold and a release on every poll for as long as
+    // either family had a straggler. Measured: 38 of 38 such lines in 25 minutes
+    // were one family's, and its leader stood and walked on alternate polls.
+    //
+    // So each leader has a saved slot, loaded into the working registers when that
+    // leader's turn starts and stored back when it ends (RegroupTurn). The
+    // 35-odd uses of the registers stay exactly as they were; only whose wait they
+    // hold changes. A leader with no slot starts with a clean one, which is what a
+    // family that has never waited looks like.
+    struct RegroupSlot
+    {
+        bool waiting{false};
+        bool wanted{false};
+        std::string leader;
+        std::string waitingFor;
+        OverseerDecisions::RatchetState progress{};
+    };
+    std::map<std::string, RegroupSlot> _regroupSlots;
+
+    class RegroupTurn
+    {
+    public:
+        RegroupTurn(OverseerWorldScript& owner, std::string const& leader)
+            : _owner(owner), _key(leader)
+        {
+            RegroupSlot const& slot = _owner._regroupSlots[_key];
+            _owner._regroupWaiting = slot.waiting;
+            _owner._regroupWanted = slot.wanted;
+            _owner._regroupLeader = slot.leader;
+            _owner._regroupWaitingFor = slot.waitingFor;
+            _owner._regroupProgress = slot.progress;
+        }
+
+        ~RegroupTurn()
+        {
+            if (!_owner._regroupWaiting && !_owner._regroupWanted)
+            {
+                // Nothing to remember: drop the slot rather than keep an empty
+                // one per leader for ever.
+                _owner._regroupSlots.erase(_key);
+                _owner._regroupWaiting = false;
+                _owner._regroupWanted = false;
+                _owner._regroupLeader.clear();
+                _owner._regroupWaitingFor.clear();
+                _owner._regroupProgress = OverseerDecisions::RatchetState{};
+                return;
+            }
+            RegroupSlot& slot = _owner._regroupSlots[_key];
+            slot.waiting = _owner._regroupWaiting;
+            slot.wanted = _owner._regroupWanted;
+            slot.leader = _owner._regroupLeader;
+            slot.waitingFor = _owner._regroupWaitingFor;
+            slot.progress = _owner._regroupProgress;
+            // The working registers are only meaningful inside a turn.
+            _owner._regroupWaiting = false;
+            _owner._regroupWanted = false;
+            _owner._regroupLeader.clear();
+            _owner._regroupWaitingFor.clear();
+            _owner._regroupProgress = OverseerDecisions::RatchetState{};
+        }
+
+        RegroupTurn(RegroupTurn const&) = delete;
+        RegroupTurn& operator=(RegroupTurn const&) = delete;
+
+    private:
+        OverseerWorldScript& _owner;
+        std::string _key;
+    };
     // Members the family waited for and gave up on, and when. See
     // REGROUP_STANDDOWN_SECONDS.
     std::map<std::string, time_t> _regroupStandDown;
@@ -16466,15 +16542,27 @@ private:
     // is cleared here and re-set by the drive later in the same poll.
     void SweepRegroupWait()
     {
-        if (!_regroupWaiting)
-            return;
-        if (_regroupWanted)
+        // Every leader's wait is swept, not just whichever one the registers
+        // last held. A wait that nothing marked this poll belongs to a party that
+        // dissolved, so its leader is walked again; one that WAS marked has its
+        // mark cleared for the next poll, exactly as before.
+        std::vector<std::string> leaders;
+        for (auto const& entry : _regroupSlots)
+            leaders.push_back(entry.first);
+
+        for (std::string const& leader : leaders)
         {
-            _regroupWanted = false;
-            return;
+            RegroupTurn turn(*this, leader);
+            if (!_regroupWaiting)
+                continue;
+            if (_regroupWanted)
+            {
+                _regroupWanted = false;
+                continue;
+            }
+            EndTheRegroupWait("nothing marked it this poll, so the party this wait was "
+                              "about is gone");
         }
-        EndTheRegroupWait("nothing marked it this poll, so the party this wait was "
-                          "about is gone");
     }
 
     void KeepTheFamilyTogether(Group* group, Player* leader,
@@ -16483,6 +16571,9 @@ private:
         if (!group || !leader)
             return;
         std::string const leaderName = leader->GetName();
+
+        // THIS LEADER'S WAIT, AND ONLY THIS LEADER'S, for the length of this call.
+        RegroupTurn regroupTurn(*this, leaderName);
 
         // A LEADERSHIP CHANGE ENDS THE WAIT RATHER THAN INHERITING IT. The hold
         // is on one character and the ratchet is a memory of one gap; moving
