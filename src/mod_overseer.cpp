@@ -9270,25 +9270,52 @@ private:
             // read by their own guarded loaders above, so that a schema older
             // than either one costs that aim and not this whole drive
             // (infra#2846).
-            "SELECT name, `lead` FROM overseer_roster "
-            "WHERE enabled = 1");
+            "SELECT name, `lead`, `family` FROM overseer_roster "
+            "WHERE enabled = 1 ORDER BY `lead` DESC, name");
         // A roster query that comes back empty means there is no roster. That
         // IS nothing to do, and it is the one case where returning is right.
         if (!result)
             return;
 
-        // The roster is read out in full before anybody is steered, because
-        // the leader's pick below is ranked against the WHOLE family - who is
-        // youngest, who has already been rewarded for what - and that has to
-        // be known before the leader's row comes round, wherever in the
-        // result it happens to sit.
-        std::vector<std::pair<std::string, bool>> roster;
+        std::vector<OverseerDecisions::FamilyMember> rows;
         do
         {
             Field* fields = result->Fetch();
-            roster.emplace_back(fields[0].Get<std::string>(), fields[1].Get<uint8>() != 0);
+            rows.push_back(OverseerDecisions::FamilyMember{
+                fields[0].Get<std::string>(), fields[2].Get<std::string>(),
+                fields[1].Get<uint8>() != 0});
         } while (result->NextRow());
 
+        // EACH FAMILY IS DRIVEN AGAINST ITSELF (#548, step 3). The leader's pick
+        // in DriveFamilyQuests is ranked against "the WHOLE family" - who is
+        // youngest, who has already been rewarded for what - and with two
+        // families in one table the whole family was both of them: a level-60
+        // party would have been steered to serve a level-1 character of the
+        // other faction. The body is unchanged; it is called once per family.
+        for (OverseerDecisions::FamilyRoster const& family :
+             OverseerDecisions::PartitionRosterByFamily(rows))
+        {
+            std::vector<std::pair<std::string, bool>> roster;
+            for (OverseerDecisions::FamilyMember const& member : family.members)
+                roster.emplace_back(member.name, member.leader);
+            DriveFamilyQuests(roster, aims, travelAims, jobs);
+        }
+    }
+
+    // One family's quest drive: pick for the leader, aim the followers, hand in
+    // what is done. This is DriveQuests' body as it was when the roster was one
+    // family, moved and not rewritten, so the diff that introduced the split is
+    // the size of the split and not of the drive.
+    //
+    // The roster is read out in full before anybody is steered, because the
+    // leader's pick below is ranked against the WHOLE family - who is youngest,
+    // who has already been rewarded for what - and that has to be known before
+    // the leader's row comes round, wherever in the result it happens to sit.
+    void DriveFamilyQuests(std::vector<std::pair<std::string, bool>> const& roster,
+                           std::map<std::string, uint32> const& aims,
+                           std::map<std::string, std::string> const& travelAims,
+                           std::map<std::string, std::string> const& jobs)
+    {
         // Everybody present and steerable this tick. Resolved once here and
         // never held past this call: the pointers are valid for the length of
         // this world-thread tick and nothing below logs anybody out.
