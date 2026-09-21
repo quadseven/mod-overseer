@@ -12444,6 +12444,47 @@ struct DrowningHoldLimits
 
 DrowningHoldAction DrowningHoldDecision(DrowningHoldFacts const& facts,
                                         DrowningHoldLimits const& limits);
+
+// WHO PLAYS WITHOUT A CLIENT, PARSED AND DECIDED.
+//
+// Overseer.RequireClient answers "should an in-world headless bot be evicted".
+// It does not put anybody in the world, so on a roster that is simply logged
+// out - a host with two clients and ten characters - turning it off changes
+// nothing at all. Overseer.HeadlessRoster names the characters that are PLAYED
+// rather than WATCHED, and those are logged in as bots when they are missing.
+//
+// WHY A LIST AND NOT A SECOND BOOLEAN. The crash that removed the original
+// KeepRosterOnline was a real client logging in as a character already in the
+// world as a headless bot: mod-playerbots' secure login force-evicts the bot
+// holding that guid while this module's drives are still steering it by name.
+// A character must therefore be EITHER watched through a client OR played
+// headless, never both, and a list is the only shape that can say which is
+// which. Spawning is gated on the list alone and never on RequireClient, so
+// switching the eviction off cannot silently start spawning the characters
+// that have clients coming.
+
+// The names in a comma-separated config value, trimmed, in the order given.
+//
+// Blank entries are dropped rather than returned as empty names: a config list
+// is written by a person, and a trailing comma must not produce a name that
+// matches no character and fails silently. Returned as a vector because a
+// roster is a handful of names and membership is a scan - and because the
+// header's include list stays as it is.
+std::vector<std::string> HeadlessRosterNames(std::string const& configured);
+
+// Is this character named in that list? Exact, case-sensitive: a character
+// name IS its spelling, and a near-miss must read as "not listed" rather than
+// quietly matching somebody else.
+bool NamedInHeadlessRoster(std::string const& name,
+                           std::vector<std::string> const& headless);
+
+// May this character be in the world with no client attached?
+//
+// Either answer can be yes: `requireClient == false` says "evict nobody", and
+// the list says "this one in particular". Only the list also spawns, which is
+// the caller's business and deliberately not decided here.
+bool MayPlayHeadless(std::string const& name, bool requireClient,
+                     std::vector<std::string> const& headless);
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

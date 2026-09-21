@@ -5512,18 +5512,66 @@ private:
         sRandomPlayerbotMgr.LogoutPlayerBot(guid);
     }
 
+    // Put a roster character into the world with no client, the way
+    // KeepRosterOnline used to before the camera rule replaced it.
+    //
+    // THE GUID COMES FROM THE CHARACTER CACHE because the character is by
+    // definition not in the world, so there is no Player to ask. A name that
+    // resolves to nothing is a roster row for a character that does not exist
+    // - a typo in the table or in the config list - and it is logged once per
+    // pass rather than silently skipped, because "the bot never appeared" with
+    // nothing said is the failure that costs an afternoon.
+    //
+    // NO-OP IF IT IS ALREADY COMING. AddPlayerBot on a guid the random-bot
+    // holder is already bringing in is harmless, but the poll runs every few
+    // seconds and login is not instant, so this would otherwise log a line
+    // every pass until the character lands.
+    static void SpawnHeadlessRosterBot(std::string const& name)
+    {
+        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(name);
+        if (!guid)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' is named in Overseer.HeadlessRoster but no "
+                     "character by that name exists - nothing to log in", name);
+            return;
+        }
+
+        if (sRandomPlayerbotMgr.GetPlayerBot(guid))
+            return;   // already in the holder; it is on its way in
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is on the headless roster and is not in the world "
+                 "- logging it in as a bot with no client, because this character "
+                 "is played rather than watched", name);
+        sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+    }
+
     void KeepRosterAttended()
     {
         // The whole list is read every pass, because the event hooks need the
         // names of everybody on the roster and a row can be enabled between
         // polls.
         std::vector<std::string> const names = ReloadRosterNames();
+        // Read once per pass rather than per name: it is the same answer for
+        // every row and it is a string parse, not a lookup.
+        std::vector<std::string> const headless = HeadlessRoster();
 
         for (std::string const& name : names)
         {
             Player* player = ObjectAccessor::FindPlayerByName(name);
             if (!player)
-                continue;   // offline, which is the correct state with no client
+            {
+                // OFFLINE. With the camera rule on this is the correct state
+                // and there is nothing to do. With this character named in
+                // Overseer.HeadlessRoster it is the state this key exists to
+                // end: log it in as a headless bot so it plays.
+                if (OverseerDecisions::NamedInHeadlessRoster(name, headless))
+                {
+                    SpawnHeadlessRosterBot(name);
+                }
+                continue;
+            }
 
             if (ClientAttached(player))
                 continue;   // a real client is playing it; leave it alone
@@ -5534,7 +5582,8 @@ private:
 
             if (session->IsBot())
             {
-                if (!RosterRequiresAClient())
+                if (OverseerDecisions::MayPlayHeadless(
+                        name, RosterRequiresAClient(), headless))
                 {
                     continue;   // headless is allowed here; leave it playing
                 }
@@ -35043,6 +35092,21 @@ private:
     static bool RosterRequiresAClient()
     {
         return sConfigMgr->GetOption<bool>("Overseer.RequireClient", true);
+    }
+
+    // WHO MAY PLAY WITH NOBODY WATCHING. The parsing and the predicate are
+    // decisions and live in OverseerDecisions, where a test compiles them
+    // without the core; this is only the config read that feeds them.
+    //
+    // Overseer.RequireClient answers "should an in-world headless bot be
+    // evicted" and puts nobody in the world. Overseer.HeadlessRoster names the
+    // characters that are PLAYED rather than WATCHED - those get logged in.
+    // Never name a character a client logs in: see the header for the crash
+    // that rule exists to prevent.
+    static std::vector<std::string> HeadlessRoster()
+    {
+        return OverseerDecisions::HeadlessRosterNames(
+            sConfigMgr->GetOption<std::string>("Overseer.HeadlessRoster", ""));
     }
 
     // Form a guild, look at what it covers, find who would fill the holes, and

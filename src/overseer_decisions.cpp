@@ -10070,4 +10070,46 @@ char const* SelfDeathReadingName(SelfDeathReading reading)
     }
     return "unknown";
 }
+
+std::vector<std::string> HeadlessRosterNames(std::string const& configured)
+{
+    std::vector<std::string> names;
+    std::string::size_type start = 0;
+    while (start <= configured.size())
+    {
+        std::string::size_type const comma = configured.find(',', start);
+        std::string::size_type const end =
+            comma == std::string::npos ? configured.size() : comma;
+
+        std::string::size_type first = configured.find_first_not_of(" 	", start);
+        if (first != std::string::npos && first < end)
+        {
+            std::string::size_type last = configured.find_last_not_of(" 	", end - 1);
+            names.push_back(configured.substr(first, last - first + 1));
+        }
+
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return names;
+}
+
+bool NamedInHeadlessRoster(std::string const& name,
+                           std::vector<std::string> const& headless)
+{
+    for (std::string const& listed : headless)
+    {
+        if (listed == name)
+            return true;
+    }
+    return false;
+}
+
+bool MayPlayHeadless(std::string const& name, bool requireClient,
+                     std::vector<std::string> const& headless)
+{
+    return !requireClient || NamedInHeadlessRoster(name, headless);
+}
+
 }  // namespace OverseerDecisions
