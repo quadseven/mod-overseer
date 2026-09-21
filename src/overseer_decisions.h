@@ -12540,6 +12540,25 @@ struct FamilyRoster
 // neither is ever offered the other's.
 std::vector<FamilyRoster> PartitionRosterByFamily(std::vector<FamilyMember> const& rows);
 
+// WHICH FAMILY THE ONE-CAMPAIGN MACHINERY DRIVES (mod-overseer#548, step 2).
+//
+// Home binds, town trips, dungeon runs and guild founding were each written as
+// "the roster is one family, its leader is the last `lead` row", and the dungeon
+// run is a single state machine. Making them run two campaigns at once is a
+// structural change and is not attempted here. What IS done is to stop a second
+// family from contaminating the first: all four now read exactly ONE family's
+// roster, so an Alliance run is never handed a Horde character to walk to an
+// Alliance door.
+//
+// The family is the first roster that has a leader, in the order given. The
+// caller sorts `lead` DESC then name, so this is the family of the first named
+// leader - deterministic, and the same family the roster has always been. A
+// roster with no leader at all falls back to its first family, because the
+// callers already say "no leader, nothing to do".
+//
+// Returns null only when there are no rosters.
+FamilyRoster const* ChooseCampaignRoster(std::vector<FamilyRoster> const& rosters);
+
 bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
                                 bool isBotSession, std::string const& name,
                                 bool requireClient,

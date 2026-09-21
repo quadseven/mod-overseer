@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+using OverseerDecisions::ChooseCampaignRoster;
 using OverseerDecisions::FamilyMember;
 using OverseerDecisions::FamilyRoster;
 using OverseerDecisions::PartitionRosterByFamily;
@@ -218,6 +219,68 @@ void NoRowsIsNoRosters()
     CheckSize("empty in, empty out", PartitionRosterByFamily({}).size(), 0);
 }
 
+
+void TheCampaignIsExactlyOneFamily()
+{
+    // Home binds, town trips, dungeon runs and guild founding read ONE family's
+    // roster. The defect was that they read the whole table and took the last
+    // `lead` row as THE leader, so with two families an Alliance run was handed
+    // Horde characters to walk to an Alliance door.
+    auto const all = PartitionRosterByFamily(BothFamilies());
+    FamilyRoster const* campaign = ChooseCampaignRoster(all);
+    Check("a campaign roster is chosen", campaign != nullptr, true);
+    if (!campaign)
+        return;
+    CheckSize("with one family's five in it", campaign->members.size(), 5);
+    for (char const* horde : {"Zug", "Oz", "Uzza", "Zork", "Zrog"})
+        Check("no Horde character in the campaign", Has(*campaign, horde), false);
+    CheckStr("led by its own leader", campaign->leader, "Grug");
+}
+
+void TheCampaignFamilyIsTheFirstThatHasALeader()
+{
+    // Deterministic and never the other way round: the caller sorts `lead` DESC
+    // then name, so the family of the first named leader is chosen. A family
+    // with no leader is skipped in favour of one that has one.
+    std::vector<FamilyMember> rows = {
+        {"Zug", "Zug", true},
+        {"Oz", "Zug", false},
+        {"Bork", "Grug", false}};
+    auto const all = PartitionRosterByFamily(rows);
+    FamilyRoster const* campaign = ChooseCampaignRoster(all);
+    Check("chosen", campaign != nullptr, true);
+    if (campaign)
+        CheckStr("the family that has a leader wins", campaign->family, "Zug");
+
+    std::vector<FamilyMember> leaderless = {
+        {"Bork", "Grug", false}, {"Oz", "Zug", false}};
+    auto const none = PartitionRosterByFamily(leaderless);
+    FamilyRoster const* fallback = ChooseCampaignRoster(none);
+    Check("with no leader anywhere, the first family is still returned", fallback != nullptr, true);
+    if (fallback)
+        CheckStr("so the caller can say 'no leader, nothing to do'", fallback->leader, "");
+}
+
+void ASingleFamilyIsItsOwnCampaign()
+{
+    // The floor. One family is what every world had until now.
+    std::vector<FamilyMember> one = {
+        {"Grug", "Grug", true}, {"Bork", "Grug", false}};
+    auto const all = PartitionRosterByFamily(one);
+    FamilyRoster const* campaign = ChooseCampaignRoster(all);
+    Check("chosen", campaign != nullptr, true);
+    if (campaign)
+    {
+        CheckSize("everybody is in it", campaign->members.size(), 2);
+        CheckStr("under its leader", campaign->leader, "Grug");
+    }
+}
+
+void NoRostersIsNoCampaign()
+{
+    Check("empty in, null out", ChooseCampaignRoster({}) == nullptr, true);
+}
+
 }  // namespace
 
 int main()
@@ -231,6 +294,10 @@ int main()
     AFamilyWithNoLeaderHasNone();
     ABlankFamilyIsNotAdoptedByAnother();
     NoRowsIsNoRosters();
+    TheCampaignIsExactlyOneFamily();
+    TheCampaignFamilyIsTheFirstThatHasALeader();
+    ASingleFamilyIsItsOwnCampaign();
+    NoRostersIsNoCampaign();
 
     if (failures)
     {

@@ -10149,4 +10149,14 @@ std::vector<FamilyRoster> PartitionRosterByFamily(std::vector<FamilyMember> cons
     return out;
 }
 
+FamilyRoster const* ChooseCampaignRoster(std::vector<FamilyRoster> const& rosters)
+{
+    for (FamilyRoster const& roster : rosters)
+    {
+        if (!roster.leader.empty())
+            return &roster;
+    }
+    return rosters.empty() ? nullptr : &rosters.front();
+}
+
 }  // namespace OverseerDecisions
