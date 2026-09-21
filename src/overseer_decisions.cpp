@@ -10122,4 +10122,31 @@ bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
     return inWorld && isBotSession && MayPlayHeadless(name, requireClient, headless);
 }
 
+std::vector<FamilyRoster> PartitionRosterByFamily(std::vector<FamilyMember> const& rows)
+{
+    std::vector<FamilyRoster> out;
+    for (FamilyMember const& row : rows)
+    {
+        FamilyRoster* roster = nullptr;
+        for (FamilyRoster& existing : out)
+        {
+            if (existing.family == row.family)
+            {
+                roster = &existing;
+                break;
+            }
+        }
+        if (!roster)
+        {
+            out.push_back(FamilyRoster{});
+            roster = &out.back();
+            roster->family = row.family;
+        }
+        roster->members.push_back(row);
+        if (row.leader && roster->leader.empty())
+            roster->leader = row.name;
+    }
+    return out;
+}
+
 }  // namespace OverseerDecisions

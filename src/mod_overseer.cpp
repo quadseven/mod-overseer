@@ -5684,30 +5684,50 @@ private:
             // core treats a malformed query as unrecoverable, and the
             // worldserver aborts on the first roster poll. It shipped that way
             // and took the server down in a crash loop.
-            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
+            "SELECT name, `lead`, `family` FROM overseer_roster WHERE enabled = 1 "
             "ORDER BY `lead` DESC, name");
         if (!result)
             return;
 
-        std::string wantsToLead;
-        std::vector<Player*> present;
+        std::vector<OverseerDecisions::FamilyMember> rows;
         do
         {
             Field* row = result->Fetch();
-            std::string const name = row[0].Get<std::string>();
-            if (row[1].Get<uint8>() && wantsToLead.empty())
-                wantsToLead = name;
-            // Present means playing: on camera (#131), or headless because
-            // Overseer.HeadlessRoster says this one is played unwatched. A
-            // roster character in the world with NEITHER is on its way out -
-            // KeepRosterAttended evicts it - and inviting it, pointing it at a
-            // leader or handing it leadership for the seconds in between
-            // would be steering a character that is being freed.
-            Player* p = ObjectAccessor::FindPlayerByName(name);
-            if (Steerable(p))
-                present.push_back(p);
+            rows.push_back(OverseerDecisions::FamilyMember{
+                row[0].Get<std::string>(), row[2].Get<std::string>(),
+                row[1].Get<uint8>() != 0});
         } while (result->NextRow());
 
+        // ONE PARTY PER FAMILY (#548). This used to be one party for the whole
+        // roster under whichever `lead` row sorted first, which put an Alliance
+        // five and a Horde five in a single party of enemies.
+        for (OverseerDecisions::FamilyRoster const& roster :
+             OverseerDecisions::PartitionRosterByFamily(rows))
+        {
+            std::vector<Player*> present;
+            for (OverseerDecisions::FamilyMember const& member : roster.members)
+            {
+                // Present means playing: on camera (#131), or headless because
+                // Overseer.HeadlessRoster says this one is played unwatched. A
+                // roster character in the world with NEITHER is on its way out
+                // - KeepRosterAttended evicts it - and inviting it, pointing it
+                // at a leader or handing it leadership for the seconds in
+                // between would be steering a character that is being freed.
+                Player* p = ObjectAccessor::FindPlayerByName(member.name);
+                if (Steerable(p))
+                    present.push_back(p);
+            }
+            KeepFamilyGrouped(present, roster.leader);
+        }
+    }
+
+    // One family's party: form it, fill it, put its own leader at the head, and
+    // hand the followers their master. Everything here was the body of
+    // KeepRosterGrouped when the roster was one family; it is unchanged except
+    // that `present` and `wantsToLead` now belong to exactly one.
+    void KeepFamilyGrouped(std::vector<Player*> const& present,
+                           std::string const& wantsToLead)
+    {
         if (present.size() < 2)
             return;
 
