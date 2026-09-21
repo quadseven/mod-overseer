@@ -5684,17 +5684,20 @@ private:
             // core treats a malformed query as unrecoverable, and the
             // worldserver aborts on the first roster poll. It shipped that way
             // and took the server down in a crash loop.
-            "SELECT name, `lead`, `family` FROM overseer_roster WHERE enabled = 1 "
+            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
             "ORDER BY `lead` DESC, name");
         if (!result)
             return;
 
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
         std::vector<OverseerDecisions::FamilyMember> rows;
         do
         {
             Field* row = result->Fetch();
+            std::string const name = row[0].Get<std::string>();
+            auto const family = families.find(name);
             rows.push_back(OverseerDecisions::FamilyMember{
-                row[0].Get<std::string>(), row[2].Get<std::string>(),
+                name, family == families.end() ? std::string() : family->second,
                 row[1].Get<uint8>() != 0});
         } while (result->NextRow());
 
@@ -5721,6 +5724,34 @@ private:
         }
     }
 
+    // name -> family, for the enabled roster rows.
+    //
+    // `family` IS A LATE COLUMN (schema 2026_09_19_00), so it is read by a query
+    // of its own and never inside a drive's main roster query. That is the rule
+    // LoadJobs and LoadQuestAims already follow for their columns, and it is the
+    // rule test_schema_degrade pins for DriveQuests: a schema older than the
+    // column then costs the second-family feature and NOTHING ELSE. Every row
+    // comes back as one blank family, which is the single-family behaviour every
+    // world had, instead of the whole drive dying with the query that named a
+    // column it did not have.
+    //
+    // An empty result is not an error here. It is "no such column, or no roster",
+    // and both mean the same thing to every caller: one family.
+    static std::map<std::string, std::string> LoadRosterFamilies()
+    {
+        std::map<std::string, std::string> families;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, `family` FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return families;
+        do
+        {
+            Field* row = result->Fetch();
+            families[row[0].Get<std::string>()] = row[1].Get<std::string>();
+        } while (result->NextRow());
+        return families;
+    }
+
     // THE ROSTER THE ONE-CAMPAIGN MACHINERY DRIVES: one family's enabled members
     // and that family's own leader. Home binds, town trips, dungeon runs and guild
     // founding each used to read the whole table and take the last `lead` row as
@@ -5733,17 +5764,20 @@ private:
         QueryResult result = CharacterDatabase.Query(
             // `lead` is BACKTICKED: a reserved word in MySQL 8 (see
             // KeepRosterGrouped for the crash loop that taught this).
-            "SELECT name, `lead`, `family` FROM overseer_roster WHERE enabled = 1 "
+            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
             "ORDER BY `lead` DESC, name");
         if (!result)
             return false;
 
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
         std::vector<OverseerDecisions::FamilyMember> rows;
         do
         {
             Field* row = result->Fetch();
+            std::string const name = row[0].Get<std::string>();
+            auto const family = families.find(name);
             rows.push_back(OverseerDecisions::FamilyMember{
-                row[0].Get<std::string>(), row[2].Get<std::string>(),
+                name, family == families.end() ? std::string() : family->second,
                 row[1].Get<uint8>() != 0});
         } while (result->NextRow());
 
@@ -9270,19 +9304,22 @@ private:
             // read by their own guarded loaders above, so that a schema older
             // than either one costs that aim and not this whole drive
             // (infra#2846).
-            "SELECT name, `lead`, `family` FROM overseer_roster "
+            "SELECT name, `lead` FROM overseer_roster "
             "WHERE enabled = 1 ORDER BY `lead` DESC, name");
         // A roster query that comes back empty means there is no roster. That
         // IS nothing to do, and it is the one case where returning is right.
         if (!result)
             return;
 
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
         std::vector<OverseerDecisions::FamilyMember> rows;
         do
         {
             Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            auto const family = families.find(name);
             rows.push_back(OverseerDecisions::FamilyMember{
-                fields[0].Get<std::string>(), fields[2].Get<std::string>(),
+                name, family == families.end() ? std::string() : family->second,
                 fields[1].Get<uint8>() != 0});
         } while (result->NextRow());
 
