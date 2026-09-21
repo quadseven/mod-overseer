@@ -5413,6 +5413,11 @@ private:
 
             if (session->IsBot())
             {
+                if (!RosterRequiresAClient())
+                {
+                    continue;   // headless is allowed here; leave it playing
+                }
+
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is in the world as a headless bot with no client "
                          "attached - logging it out, because the family only plays on "
@@ -34432,6 +34437,30 @@ private:
     static bool RaidMayConvertTheRosterParty()
     {
         return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false);
+    }
+
+    // Must a roster character have a game client attached to stay in the world?
+    //
+    // THE DEFAULT IS THE RULE THIS MODULE WAS BUILT AROUND, and it stays the
+    // default: KeepRosterAttended evicts a roster character that is in the
+    // world as a headless bot, because "the family only plays on camera" - a
+    // POV nobody can see is a login, an eviction and a login again, for ever.
+    //
+    // WHY IT IS NOW A KEY AND NOT A LITERAL. How many of the five can be given
+    // a client is a fact about the MACHINE the clients run on, not about this
+    // module. On a host that can render five of them the rule costs nothing.
+    // On a host that can render one, the rule is the difference between a
+    // family that plays and a roster that is four-fifths empty, and the only
+    // way to disagree with it was to edit this file and build an image.
+    //
+    // TURNING IT OFF IS A TRADE, NOT A FIX. The characters still play and the
+    // drives still steer them; what is given up is that every one of them is
+    // watchable. Anything that reasons about a POV being observable - the
+    // stream feature above all - is reasoning about a promise this key can
+    // withdraw. Leave it on wherever there are clients to spare.
+    static bool RosterRequiresAClient()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.RequireClient", true);
     }
 
     // Form a guild, look at what it covers, find who would fill the holes, and
