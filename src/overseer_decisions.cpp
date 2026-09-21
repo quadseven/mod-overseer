@@ -10112,4 +10112,14 @@ bool MayPlayHeadless(std::string const& name, bool requireClient,
     return !requireClient || NamedInHeadlessRoster(name, headless);
 }
 
+bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
+                                bool isBotSession, std::string const& name,
+                                bool requireClient,
+                                std::vector<std::string> const& headless)
+{
+    if (clientAttached)
+        return true;
+    return inWorld && isBotSession && MayPlayHeadless(name, requireClient, headless);
+}
+
 }  // namespace OverseerDecisions

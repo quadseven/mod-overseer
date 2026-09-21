@@ -12485,6 +12485,26 @@ bool NamedInHeadlessRoster(std::string const& name,
 // the caller's business and deliberately not decided here.
 bool MayPlayHeadless(std::string const& name, bool requireClient,
                      std::vector<std::string> const& headless);
+
+// May a drive steer this roster character?
+//
+// SPAWNING IS NOT ENOUGH, AND #547 SHIPPED AS IF IT WERE. Every drive in the
+// module reaches a character through one funnel, SteerableAI, and that funnel
+// refused anybody without a client (#131). So a roster character logged in
+// headless by Overseer.HeadlessRoster was in the world and under nobody's
+// control: not grouped, not followed, not sent anywhere, wandering under stock
+// bot AI while the roster believed it was being played. The eviction was
+// already made to respect the list; the steering was not.
+//
+// A character is steerable when a real client holds it, OR when it is a
+// headless bot the configuration says may play unwatched. Deliberately not
+// simply "is a bot": a bot NOT on the list is one the sweep is about to evict,
+// and steering a character while it is being freed is the crash that removed
+// the original KeepRosterOnline.
+bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
+                                bool isBotSession, std::string const& name,
+                                bool requireClient,
+                                std::vector<std::string> const& headless);
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
