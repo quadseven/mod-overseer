@@ -218,3 +218,43 @@
 #        Default:     0
 #
 #Overseer.Raid.ConvertRosterParty = 0
+#
+########################################
+#
+#    THE ROSTER AND ITS CLIENTS
+#
+#    Overseer.RequireClient
+#        Description: Whether a roster character must have a game client
+#                     attached to stay in the world.
+#
+#                     ON, WHICH IS THE DEFAULT AND THE RULE THIS MODULE WAS
+#                     BUILT AROUND. KeepRosterAttended sweeps the roster every
+#                     pass and evicts any character that is in the world as a
+#                     headless bot, because "the family only plays on camera".
+#                     A POV nobody can see is not a character playing; it is a
+#                     login, an eviction and a login again, for ever.
+#
+#                     OFF, WHICH IS A TRADE AND NOT A FIX. A roster character
+#                     that is in the world as a bot is left alone. The drives
+#                     still steer it, it still takes jobs, it still travels -
+#                     what is given up is the promise that every one of the
+#                     five is watchable. Anything reasoning about a POV being
+#                     observable, the stream feature most of all, is reasoning
+#                     about a promise this key withdraws.
+#
+#                     WHY IT IS A KEY AT ALL. How many of the five can be given
+#                     a client is a fact about the MACHINE the clients run on,
+#                     not about this module. A host that renders five of them
+#                     pays nothing for the rule. A host that renders one - a
+#                     small box with no usable GPU, where every client is a
+#                     software rasteriser burning a core and a half - is a host
+#                     where the rule is the difference between a family that
+#                     plays and a roster four-fifths empty. Until now the only
+#                     way to disagree with it was to edit mod_overseer.cpp and
+#                     build an image.
+#
+#                     Leave it on wherever there are clients to spare.
+#
+#        Default:     1
+#
+#Overseer.RequireClient = 1
