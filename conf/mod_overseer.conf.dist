@@ -258,3 +258,41 @@
 #        Default:     1
 #
 #Overseer.RequireClient = 1
+#
+#    Overseer.HeadlessRoster
+#        Description: Roster characters that are PLAYED rather than WATCHED,
+#                     by name, comma separated.
+#
+#                     WHAT IT DOES THAT RequireClient DOES NOT. RequireClient
+#                     answers "should an in-world headless bot be evicted". It
+#                     does not put anybody in the world, so on a roster that is
+#                     simply logged out - a host with two clients and ten
+#                     characters - turning it off changes nothing at all. A
+#                     name listed here is LOGGED IN as a headless bot when it
+#                     is not in the world, which is the half that was deleted
+#                     with KeepRosterOnline when the camera rule arrived.
+#
+#                     THE ONE RULE: never name a character that a client logs
+#                     in. These names must be disjoint from whatever the client
+#                     host launches. A real client logging in as a character
+#                     that is already in the world as a bot is the crash that
+#                     removed the original KeepRosterOnline - mod-playerbots'
+#                     secure login force-evicts the bot holding that guid while
+#                     this module's drives are still steering it by name. A
+#                     character is either watched or played, never both, and
+#                     this list is where that is decided.
+#
+#                     This is why spawning is gated on this list alone and
+#                     never on RequireClient: switching the eviction off must
+#                     not silently start spawning characters that have clients
+#                     coming.
+#
+#                     WHAT IS GIVEN UP. A character here has no point of view
+#                     anybody can watch. It levels, travels, fights and dies
+#                     off camera. That is the trade: a family that plays in
+#                     full on a host that can only render some of it.
+#
+#        Example:     Overseer.HeadlessRoster = "Bork,Grog,Og,Ugga"
+#        Default:     "" (empty - nobody is spawned without a client)
+#
+#Overseer.HeadlessRoster = ""
