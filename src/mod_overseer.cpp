@@ -5721,6 +5721,46 @@ private:
         }
     }
 
+    // THE ROSTER THE ONE-CAMPAIGN MACHINERY DRIVES: one family's enabled members
+    // and that family's own leader. Home binds, town trips, dungeon runs and guild
+    // founding each used to read the whole table and take the last `lead` row as
+    // THE leader, which is right for one family and wrong for two (#548).
+    // Returns false when there is no roster at all, which is the case every
+    // caller already treats as "nothing to do".
+    static bool LoadCampaignRoster(std::vector<std::string>& members,
+                                   std::string& leaderName)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            // `lead` is BACKTICKED: a reserved word in MySQL 8 (see
+            // KeepRosterGrouped for the crash loop that taught this).
+            "SELECT name, `lead`, `family` FROM overseer_roster WHERE enabled = 1 "
+            "ORDER BY `lead` DESC, name");
+        if (!result)
+            return false;
+
+        std::vector<OverseerDecisions::FamilyMember> rows;
+        do
+        {
+            Field* row = result->Fetch();
+            rows.push_back(OverseerDecisions::FamilyMember{
+                row[0].Get<std::string>(), row[2].Get<std::string>(),
+                row[1].Get<uint8>() != 0});
+        } while (result->NextRow());
+
+        std::vector<OverseerDecisions::FamilyRoster> const rosters =
+            OverseerDecisions::PartitionRosterByFamily(rows);
+        OverseerDecisions::FamilyRoster const* campaign =
+            OverseerDecisions::ChooseCampaignRoster(rosters);
+        if (!campaign)
+            return false;
+
+        members.clear();
+        for (OverseerDecisions::FamilyMember const& member : campaign->members)
+            members.push_back(member.name);
+        leaderName = campaign->leader;
+        return true;
+    }
+
     // One family's party: form it, fill it, put its own leader at the head, and
     // hand the followers their master. Everything here was the body of
     // KeepRosterGrouped when the roster was one family; it is unchanged except
@@ -22134,21 +22174,10 @@ private:
         // that column and not the whole roster read (infra#2846).
         std::map<std::string, std::string> const jobs = LoadJobs();
 
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1");
-        if (!result)
-            return;
-
         std::vector<std::string> members;
         std::string leaderName;
-        do
-        {
-            Field* fields = result->Fetch();
-            std::string const name = fields[0].Get<std::string>();
-            members.push_back(name);
-            if (fields[1].Get<uint8>() != 0)
-                leaderName = name;
-        } while (result->NextRow());
+        if (!LoadCampaignRoster(members, leaderName))
+            return;
 
         if (leaderName.empty())
             return;
@@ -26631,20 +26660,8 @@ private:
         // DriveHomeBind states for the same reason.
         std::vector<std::string> members;
         std::string leaderName;
-        {
-            QueryResult result = CharacterDatabase.Query(
-                "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1");
-            if (!result)
-                return;
-            do
-            {
-                Field* fields = result->Fetch();
-                std::string const name = fields[0].Get<std::string>();
-                members.push_back(name);
-                if (fields[1].Get<uint8>() != 0)
-                    leaderName = name;
-            } while (result->NextRow());
-        }
+        if (!LoadCampaignRoster(members, leaderName))
+            return;
 
         if (_dungeonRunCoordinator.phase != DungeonRunPhase::Idle)
         {
@@ -27067,22 +27084,10 @@ private:
         // schema this coordinator most needs to degrade gracefully on.
         std::map<std::string, std::string> const jobs = LoadJobs();
 
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1");
-        if (!result)
-            return;
-
         std::vector<std::string> members;
         std::string leaderName;
-        do
-        {
-            Field* fields = result->Fetch();
-            std::string const name = fields[0].Get<std::string>();
-            bool const isLead = fields[1].Get<uint8>() != 0;
-            members.push_back(name);
-            if (isLead)
-                leaderName = name;
-        } while (result->NextRow());
+        if (!LoadCampaignRoster(members, leaderName))
+            return;
 
         // No leader on the roster at all is a roster-shape problem this drive
         // cannot fix, and every step below needs one to aim.
@@ -35319,18 +35324,17 @@ private:
             // worldserver down in a crash loop over exactly this.
             GuildFormationState state;
             state.wantedName = request.name;
-            if (QueryResult roster = CharacterDatabase.Query(
-                    "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
-                    "ORDER BY `lead` DESC, name"))
             {
-                do
+                // ONE FAMILY FOUNDS A GUILD, not the whole table: a second
+                // family's leader must never be offered as this guild's founder
+                // or have its members enrolled in it (#548).
+                std::vector<std::string> campaign;
+                std::string head;
+                if (LoadCampaignRoster(campaign, head))
                 {
-                    Field* row = roster->Fetch();
-                    std::string const name = row[0].Get<std::string>();
-                    if (row[1].Get<uint8>() && state.founderName.empty())
-                        state.founderName = name;
-                    state.founders.push_back(name);
-                } while (roster->NextRow());
+                    state.founderName = head;
+                    state.founders = campaign;
+                }
             }
             if (state.founderName.empty())
                 return refuse("no enabled roster character is marked as the lead");
