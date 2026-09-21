@@ -12501,6 +12501,45 @@ bool MayPlayHeadless(std::string const& name, bool requireClient,
 // simply "is a bot": a bot NOT on the list is one the sweep is about to evict,
 // and steering a character while it is being freed is the crash that removed
 // the original KeepRosterOnline.
+// ONE PARTY PER FAMILY, NOT ONE PARTY FOR THE ROSTER (mod-overseer#548, step 1).
+//
+// overseer_roster was written when it held exactly one family, and
+// KeepRosterGrouped read the whole table into a single party under whichever
+// `lead` row sorted first. A second family - an Alliance five and a Horde five -
+// therefore became ONE party of enemies, which the operator caught on
+// 2026-09-21: the two factions cannot be in a party together. The column that says
+// who belongs to whom (`family`) has existed since schema 2026_09_19_00 and
+// nothing in the module read it.
+struct FamilyMember
+{
+    std::string name;
+    std::string family;
+    bool leader{false};
+};
+
+struct FamilyRoster
+{
+    std::string family;
+    std::vector<FamilyMember> members;
+    // The member marked `lead` in THIS family, or empty. Never another family's.
+    std::string leader;
+};
+
+// Split roster rows into one roster per family.
+//
+// ORDER IS KEPT, BOTH WAYS. Families come out in the order each first appears,
+// and members within a family in the order given - the caller sorts `lead` DESC,
+// so the leader is first and the first member of a party is the one who forms it.
+// Re-sorting here would move that decision somewhere no test could see it.
+//
+// A blank family is a family of its own rather than being folded into another:
+// a row with no cohort must not be quietly adopted by whichever cohort happens to
+// come first.
+//
+// The leader is the first member flagged `lead`. Two families each have one, and
+// neither is ever offered the other's.
+std::vector<FamilyRoster> PartitionRosterByFamily(std::vector<FamilyMember> const& rows);
+
 bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
                                 bool isBotSession, std::string const& name,
                                 bool requireClient,
