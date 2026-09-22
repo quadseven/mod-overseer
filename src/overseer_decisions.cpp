@@ -1610,6 +1610,42 @@ LandedErrand LandedErrandStep(std::string const& landedAim,
                                              : LandedErrand::Resume;
 }
 
+TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
+{
+    // THE BOOK'S OWN AIM FIRST. Replacing it disturbs nobody's walk but the
+    // book's own, and asking the fences about it would refuse every re-aim of
+    // a catch-up walk and every next leg of a run.
+    if (facts.columnIsOurs && !facts.column.empty())
+        return TravelClaim::Write;
+    // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
+    // over an empty column overwrites no trainer walk; any other claim, or a
+    // column that holds anything at all, keeps the #435 answer.
+    if (facts.learnSkill != 0 && !(facts.catchUp && facts.column.empty()))
+        return TravelClaim::RefusedProfession;
+    if (IsForeignTravelAim(facts.column))
+        return TravelClaim::RefusedForeign;
+    return TravelClaim::Write;
+}
+
+std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing)
+{
+    bool const profession = learnSkill != 0;
+    bool const foreign = IsForeignTravelAim(standing);
+    if (!profession && !foreign)
+        return std::string();
+    std::string said;
+    if (profession)
+        said = "a profession errand (skill " + std::to_string(learnSkill) + ")";
+    if (foreign)
+    {
+        if (profession)
+            said += " and ";
+        said += "errand '" + standing + "'";
+    }
+    said += (profession && foreign) ? " are outstanding" : " is outstanding";
+    return said;
+}
+
 MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
                                           unsigned outstandingErrands,
                                           time_t heldForSeconds,
@@ -3756,6 +3792,7 @@ char const* RegroupClaimName(RegroupClaim claim)
         case RegroupClaim::Dead:          return "dead";
         case RegroupClaim::OnARun:        return "on a dungeon run";
         case RegroupClaim::StoodDown:     return "stood down";
+        case RegroupClaim::AimRefused:    return "catch-up aim refused";
     }
     return "unknown";
 }
@@ -3801,6 +3838,8 @@ RegroupClaim ReadRegroupClaim(RegroupMember const& member,
         return RegroupClaim::OnARun;
     if (member.stoodDown)
         return RegroupClaim::StoodDown;
+    if (!member.aimRefusedBecause.empty())
+        return RegroupClaim::AimRefused;
     return RegroupClaim::Rejoining;
 }
 
@@ -3846,9 +3885,26 @@ std::string RegroupCarriedOnWithout(std::vector<RegroupMember> const& members,
         said += member.name;
         said += " (";
         said += RegroupClaimName(claim);
+        if (claim == RegroupClaim::AimRefused)
+        {
+            said += ": ";
+            said += member.aimRefusedBecause;
+        }
         said += ")";
     }
     return said;
+}
+
+char const* RegroupLeaderRefusal(bool onARun, bool alive, bool onTheGround)
+{
+    if (onARun)
+        return "a dungeon run has the leader now";
+    if (!alive)
+        return "the leader is dead, and a corpse walks away from nobody";
+    if (!onTheGround)
+        return "the leader is in the air, on a taxi or falling, and no catch-up "
+               "walk is aimed at a leader who is not on the ground";
+    return nullptr;
 }
 
 bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits)
@@ -7701,7 +7757,7 @@ FlightDiscoveryArrival FlightDiscoveryArrivalStep(bool inReach, bool oneIsNearby
 
 bool RetakeTheHold(HeldStillFacts const& facts, float slackYards)
 {
-    // THE FOUR REFUSALS FIRST, AND EACH OF THEM IS AN ANSWER RATHER THAN A
+    // THE FIVE REFUSALS FIRST, AND EACH OF THEM IS AN ANSWER RATHER THAN A
     // GUARD. Every one is a case where the right thing to do is nothing
     // whatever the distance says, so reading the distance first and treating
     // these as tie-breaks would be the same code with three of its reasons
@@ -7714,12 +7770,19 @@ bool RetakeTheHold(HeldStillFacts const& facts, float slackYards)
         return false;
     if (facts.inCombat)
         return false;
+    if (facts.inFlight)
+        return false;
 
     // AND THEN THE ONLY MEASUREMENT. Strictly greater, so a slack of zero
     // means "any drift at all" - which is what a reader expects that word to
     // mean, and is a legitimate thing for a caller to ask for even though the
     // one caller that exists asks for more.
     return facts.driftYards > slackYards;
+}
+
+bool PinTookTheSlot(bool slotWasOccupied, bool generatorReplaced)
+{
+    return slotWasOccupied && generatorReplaced;
 }
 
 // ------------------ what stopped a cast this module drove at the core (#337) --

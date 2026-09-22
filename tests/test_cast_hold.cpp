@@ -49,6 +49,7 @@ using OverseerDecisions::CastHoldFacts;
 using OverseerDecisions::CastHoldPlan;
 using OverseerDecisions::HeldStillFacts;
 using OverseerDecisions::PlanCastHold;
+using OverseerDecisions::PinTookTheSlot;
 using OverseerDecisions::RetakeTheHold;
 
 namespace
@@ -286,6 +287,32 @@ void NoDistanceOverridesARefusal()
 
 }  // namespace
 
+// #559. A held character on a taxi is left alone however far the flight has
+// carried it from its anchor: the sweep's StopMoving would freeze the flight in
+// the air, and the flight is an errand this module was not asked to cancel.
+void AFlightIsLeftAlone()
+{
+    HeldStillFacts flying = Held(true, false, false, false, 925.f);
+    flying.inFlight = true;
+    Check("a character on a taxi is not re-taken", RetakeTheHold(flying, SLACK), false);
+    flying.inFlight = false;
+    Check("and the same drift on the ground is", RetakeTheHold(flying, SLACK), true);
+}
+
+// #559. The pin reports a takeover only when the slot really changed. Under a
+// taxi the core refuses the MovePoint, the old generator stays, and every
+// re-assertion used to count and log a takeover that never happened.
+void APinTheCoreRefusedIsNotATakeover()
+{
+    Check("an occupied slot the pin replaced is a takeover",
+          PinTookTheSlot(true, true), true);
+    Check("an occupied slot left as it was is not",
+          PinTookTheSlot(true, false), false);
+    Check("an empty slot is not", PinTookTheSlot(false, false), false);
+    Check("and nothing to displace is never a takeover", PinTookTheSlot(false, true),
+          false);
+}
+
 int main()
 {
     AFollowerLosesTheThingThatIsActuallyMovingIt();
@@ -300,6 +327,8 @@ int main()
     AFightIsLeftAlone();
     AHoldThatIsOverOrAbsentIsNotRetaken();
     NoDistanceOverridesARefusal();
+    AFlightIsLeftAlone();
+    APinTheCoreRefusedIsNotATakeover();
 
     if (failures)
     {

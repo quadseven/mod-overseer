@@ -2739,6 +2739,58 @@ LandedErrand LandedErrandStep(std::string const& landedAim,
                               int64_t landedForSeconds,
                               int64_t ceilingSeconds);
 
+// MAY TravelAimBook::Claim WRITE THIS AIM (#560)?
+//
+// TWO FENCES, AND EACH PROTECTS A WALK SOMEBODY ELSE STARTED. A profession
+// errand (`learn_skill` non-zero) is a trainer walk the bridge wrote (#435),
+// and a foreign aim in the column is a vendor, banker, repair or `at:` walk the
+// bridge wrote. Claim used to answer both with `void`, so a refused catch-up
+// walk was logged by its caller as started and the family waited for a walk
+// that never began.
+//
+// A CATCH-UP AIM OVER AN EMPTY COLUMN IS WRITTEN EVEN WITH A PROFESSION ERRAND
+// OUTSTANDING. The bridge aims a learn errand only at a family leader, so a
+// follower's `learn_skill` waits in the roster row for that follower to lead,
+// and its column stays empty. There is no trainer walk to overwrite, and the
+// fence only stranded the follower behind its leader. `learn_skill` itself is
+// not this decision's to touch: the catch-up aim is released as it is today,
+// by blanking `travel_npc` only.
+//
+// AN AIM THIS BOOK ALREADY WROTE IS NOBODY ELSE'S. A catch-up re-aim, or a
+// run's next leg, replaces the book's own previous aim; the foreign fence
+// exists for aims the book did not issue, which is what its own log line says.
+enum class TravelClaim : uint8_t
+{
+    Write,              // write the aim
+    RefusedProfession,  // a profession errand is outstanding and would be overwritten
+    RefusedForeign,     // the column holds an errand this book did not issue
+};
+
+struct TravelClaimFacts
+{
+    // `learn_skill` as read this call; zero means no profession errand.
+    uint32_t learnSkill{0};
+    // `travel_npc` as read this call.
+    std::string column;
+    // `column` is the aim this book itself last wrote for this character.
+    bool columnIsOurs{false};
+    // The aim is a follower's catch-up walk to its leader.
+    bool catchUp{false};
+};
+
+TravelClaim ReadTravelClaim(TravelClaimFacts const& facts);
+
+// THE RELEASE GATE'S SENTENCE (#561). TravelAimBook::Release skips its column
+// write for an aim it never claimed while either fence is up, and its log line
+// used to print the `travel_npc` column whichever fence fired - so a profession
+// errand read as "errand '' is outstanding", which describes a bug that does
+// not exist. This names the fence, or both, from the values the gate tested.
+//
+// Empty means neither fence is up and the column may be blanked. Otherwise it
+// is a whole clause, "a profession errand (skill 202) is outstanding", so the
+// caller cannot pair a plural subject with a singular verb.
+std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing);
+
 enum class MaintenanceHold : uint8_t
 {
     Open,         // nothing is outstanding; the run may start
@@ -4967,6 +5019,10 @@ struct RegroupMember
     // caller did not measure it, and is answered the same way as not being on
     // the leader's map at all.
     float yards{-1.f};
+    // WHY THIS POLL'S CATCH-UP AIM WAS REFUSED, or empty when it was not (#560).
+    // Carried as the sentence rather than a flag so the line that names the
+    // members the family carries on without can say why.
+    std::string aimRefusedBecause;
 };
 
 // What one member asks of the family, and each value is a separate answer
@@ -4996,6 +5052,10 @@ enum class RegroupClaim : std::uint8_t
     OnARun,
     // The family already waited for this one and that wait was given up on.
     StoodDown,
+    // ITS CATCH-UP AIM WAS REFUSED THIS POLL (#560), by a fence protecting an
+    // errand the travel book did not issue. No walk was written, so waiting for
+    // this member is waiting for a walk that is not happening.
+    AimRefused,
 };
 
 char const* RegroupClaimName(RegroupClaim claim);
@@ -5050,6 +5110,17 @@ FamilyRegroup ReadFamilyRegroup(std::vector<RegroupMember> const& members,
 std::string RegroupCarriedOnWithout(std::vector<RegroupMember> const& members,
                                     RegroupLimits const& limits,
                                     bool alreadyWaiting);
+
+// MAY THE FAMILY WAIT ON THIS LEADER AT ALL (#559)? Null when it may, and
+// otherwise the reason, which is also the reason a wait already running ends.
+//
+// `onTheGround` IS THE SAME READING DriveCatchUp APPLIES before it aims a
+// follower at the leader. A leader on a taxi or mid-fall is not a place a
+// follower can be sent, so no catch-up walk starts, and a wait placed over it
+// was the family holding a leader for twenty minutes for a walk that could
+// not begin. Worse, the hold's own StopMoving froze the taxi in the air.
+// Asking both drives the one question means they cannot disagree.
+char const* RegroupLeaderRefusal(bool onARun, bool alive, bool onTheGround);
 
 
 // ------------ when a catching-up follower's aim is worth rewriting (#404) ---
@@ -9773,6 +9844,12 @@ struct HeldStillFacts
     // kills it. That argument is older than this decision and applies with more
     // force to a pin that takes the slot the combat engine is steering with.
     bool inCombat{false};
+    // ON A TAXI (#559). A flight is a spline in the controlled slot, and the
+    // sweep's StopMoving replaces it with a stop spline the flight generator
+    // never finishes, so the rider hangs in the air until a relog. The flight
+    // is an errand this module was not asked to cancel; the hold waits for the
+    // landing and re-anchors there.
+    bool inFlight{false};
     // HOW FAR IT IS FROM WHERE THE HOLD LAST MEANT, and this is deliberately
     // not "is it moving". Unit::isMoving reads a movement flag that the core
     // writes and clears inside the very calls a hold makes, so a sweep keyed on
@@ -9793,6 +9870,21 @@ struct HeldStillFacts
 // written. A slack of zero would have the sweep answering "it has drifted"
 // about its own pin, every tick, for as long as the hold stood.
 bool RetakeTheHold(HeldStillFacts const& facts, float slackYards);
+
+// DID THE PIN ACTUALLY TAKE THE ACTIVE SLOT (#559)?
+//
+// The pin is a MovePoint at the character's own position, and the core returns
+// from MovePoint without doing anything when the unit carries
+// UNIT_FLAG_DISABLE_MOVE, which a taxi sets. The generator left in the slot was
+// then never displaced, and the pin still reported a takeover, so every
+// re-assertion logged "the motion slot is taken over again" about a slot that
+// nothing had touched. That line reads as something outside the module walking
+// the character, and nothing was.
+//
+// `slotWasOccupied` is whether anything was in the slot before the pin, and
+// `generatorReplaced` whether the generator in it afterwards is a different
+// one. Only both together are a takeover.
+bool PinTookTheSlot(bool slotWasOccupied, bool generatorReplaced);
 
 
 // ------------------ what stopped a cast this module drove at the core (#337) --
