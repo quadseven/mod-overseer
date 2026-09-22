@@ -10680,4 +10680,23 @@ bool MailWalkMadeProgress(float bestYards, float nowYards)
     return bestYards - nowYards >= MAIL_WALK_PROGRESS_YARDS;
 }
 
+void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
+                    std::uint32_t count, bool notable)
+{
+    note.looter = looter;
+    note.itemGuid = notable ? itemGuid : 0;
+    note.count = count;
+}
+
+std::uint32_t TakeLootedItemGuid(LootStoreNote& note, std::uint64_t looter, std::uint32_t count)
+{
+    LootStoreNote const taken = note;
+    note = LootStoreNote{};
+    if (taken.itemGuid == 0 || looter == 0)
+        return 0;
+    if (taken.looter != looter || taken.count != count)
+        return 0;
+    return taken.itemGuid;
+}
+
 }  // namespace OverseerDecisions

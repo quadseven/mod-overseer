@@ -12853,6 +12853,39 @@ void RememberStoryItem(ItemStoryBook& book, std::uint32_t itemGuid);
 
 bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid);
 
+// WHICH ITEM A LOOT HOOK MAY READ (#572). The Item* handed to
+// OnPlayerLootItem can already be freed when this module's hook runs. The
+// core calls every script's OnPlayerLootItem in turn with the same pointer,
+// and a script ahead of this one may destroy the item it was handed:
+// mod-junk-to-gold sells every grey it sees with Player::DestroyItem, and an
+// item still in ITEM_NEW, which every freshly looted item is, is deleted on
+// the spot by Item::SetState(ITEM_REMOVED). Reading the pointer after that,
+// even for its quality, is a use-after-free, and it is what segfaulted the
+// worldserver seconds after the bots began to loot.
+//
+// So the loot hooks never read the pointer. Player::StoreNewItem calls
+// OnPlayerStoreNewItem BEFORE any loot hook, on the same thread, while the
+// item is certainly alive (StoreNewItem itself returns it to its caller). That
+// hook notes the stored item here if it is notable; the loot hook takes the
+// note and looks the guid up in the looter's own bags, which can only answer
+// with an item that is really there.
+struct LootStoreNote
+{
+    std::uint64_t looter{0};
+    std::uint32_t itemGuid{0};   // 0: the last store was not a notable item
+    std::uint32_t count{0};
+};
+
+// Every store overwrites the note, a store of something not notable with guid
+// 0, so no note can outlive the store it describes into a later loot.
+void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
+                    std::uint32_t count, bool notable);
+
+// The guid a loot hook for `looter` may look up, or 0 when the store it
+// follows was not a notable item, was for somebody else, or stored a
+// different count. Consumes the note whatever it answers.
+std::uint32_t TakeLootedItemGuid(LootStoreNote& note, std::uint64_t looter, std::uint32_t count);
+
 // ------------------------------------------------- mailbox walk (#569) --
 //
 // WALK ONE ONLINE BOT TO THE NEAREST MAILBOX ON ITS MAP, SO A LETTER CAN BE
