@@ -12784,6 +12784,11 @@ constexpr char const* Need = "need";
 constexpr char const* Greed = "greed";
 }  // namespace ItemVia
 
+// `detail` and `source` are VARCHAR(255). Trims `text` to that many bytes
+// without splitting a UTF-8 character, which MySQL would refuse.
+constexpr std::size_t ITEM_STORY_COLUMN_BYTES = 255;
+void FitItemStoryColumn(std::string& text);
+
 // The human sentence for an item_given row's `detail`. The columns carry the
 // machine-readable copy; this is what a person reading the table sees.
 //   give  -> "given to Grog"

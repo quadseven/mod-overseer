@@ -10289,6 +10289,33 @@ bool ShouldRecordItemEquip(unsigned quality, ItemStoryWho wearer, bool itemInSto
     return false;
 }
 
+void FitItemStoryColumn(std::string& text)
+{
+    // The column is VARCHAR(255) utf8mb4. A cut on a plain byte can split a
+    // multi-byte name, and MySQL refuses the half character, which fails the
+    // whole batched INSERT and loses every other event in it. So the cut
+    // lands on a character boundary: back up to the lead byte of the last
+    // character kept, and drop that character if it no longer fits whole.
+    if (text.size() <= ITEM_STORY_COLUMN_BYTES)
+        return;
+    text.resize(ITEM_STORY_COLUMN_BYTES);
+    std::size_t lead = text.size();
+    while (lead > 0 && (static_cast<unsigned char>(text[lead - 1]) & 0xC0) == 0x80)
+        --lead;
+    if (lead == 0)
+        return;
+    unsigned char const first = static_cast<unsigned char>(text[lead - 1]);
+    std::size_t want = 1;
+    if ((first & 0xE0) == 0xC0)
+        want = 2;
+    else if ((first & 0xF0) == 0xE0)
+        want = 3;
+    else if ((first & 0xF8) == 0xF0)
+        want = 4;
+    if (text.size() - (lead - 1) < want)
+        text.resize(lead - 1);
+}
+
 std::string ItemGivenDetail(std::string const& via, std::string const& to,
                             std::string const& mailbox)
 {
@@ -10300,11 +10327,7 @@ std::string ItemGivenDetail(std::string const& via, std::string const& to,
     std::string out = verb + " to " + (to.empty() ? std::string("somebody") : to);
     if (via == ItemVia::Mail && !mailbox.empty())
         out += " from " + mailbox;
-    // The column is VARCHAR(255). Cut on a byte, which can split a multi-byte
-    // name at the very end; a truncated sentence is better than a refused
-    // INSERT that loses every event in the batch with it.
-    if (out.size() > 255)
-        out.resize(255);
+    FitItemStoryColumn(out);
     return out;
 }
 
@@ -10319,8 +10342,7 @@ std::string ItemLootDetail(std::string const& via, std::string const& source)
         out = "looted";
     if (!source.empty())
         out += " from " + source;
-    if (out.size() > 255)
-        out.resize(255);
+    FitItemStoryColumn(out);
     return out;
 }
 

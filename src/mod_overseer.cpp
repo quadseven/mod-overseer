@@ -3411,6 +3411,7 @@ void RecordItemLoot(Player* looter, Item* item, char const* via, std::string con
     extra.itemGuid = itemGuid;
     extra.via = via;
     extra.source = source;
+    OverseerDecisions::FitItemStoryColumn(extra.source);
     QueueEvent(looter, "item_loot", item->GetEntry(), proto->Name1,
                OverseerDecisions::ItemLootDetail(via, source), extra);
 }
@@ -3457,6 +3458,7 @@ void RecordItemGiven(Player* giver, Player const* receiver, std::string const& r
     extra.counterpart = toName;
     extra.via = via;
     extra.source = source;
+    OverseerDecisions::FitItemStoryColumn(extra.source);
     QueueEvent(giver, "item_given", itemEntry, proto->Name1,
                OverseerDecisions::ItemGivenDetail(via, toName, source), extra);
 }

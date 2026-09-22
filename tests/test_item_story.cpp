@@ -25,6 +25,7 @@
 #include <vector>
 
 using OverseerDecisions::ClassifyItemStoryCharacter;
+using OverseerDecisions::FitItemStoryColumn;
 using OverseerDecisions::IsNotableItemQuality;
 using OverseerDecisions::ItemGivenDetail;
 using OverseerDecisions::ItemLootDetail;
@@ -157,6 +158,34 @@ void TheSentencesNameWhatHappened()
               ItemLootDetail(ItemVia::Loot, std::string(400, 'x')).size() <= 255);
 }
 
+void ACutNeverSplitsACharacter()
+{
+    // 253 ASCII bytes then a three-byte character straddling the limit: the
+    // character must go whole, not leave a lead byte MySQL would refuse.
+    std::string text(253, 'a');
+    text += "\xE2\x80\x94tail";
+    FitItemStoryColumn(text);
+    CheckTrue("cut before the straddling character", text == std::string(253, 'a'));
+
+    // A two-byte character ending exactly at the limit is kept.
+    std::string exact(253, 'a');
+    exact += "\xC3\xA9";
+    exact += "more";
+    FitItemStoryColumn(exact);
+    CheckTrue("a whole character at the limit stays", exact.size() == 255);
+
+    std::string shortText = "short";
+    FitItemStoryColumn(shortText);
+    CheckText("short text untouched", shortText, "short");
+
+    // Through the sentence builders, which use it for a long source name.
+    std::string const longName = std::string(250, 'x') + "\xC3\xA9\xC3\xA9\xC3\xA9";
+    std::string const detail = ItemLootDetail(ItemVia::Loot, longName);
+    CheckTrue("loot detail fits", detail.size() <= 255);
+    CheckTrue("loot detail ends on a whole character",
+              (static_cast<unsigned char>(detail.back()) & 0xC0) != 0xC0);
+}
+
 void TheBookRemembersBoundedAndOnce()
 {
     ItemStoryBook book;
@@ -188,6 +217,7 @@ int main()
     AHandOverNeedsOneSideInTheRecord();
     EquipKeepsTheRosterAndGatesTheGuildOnTheStory();
     TheSentencesNameWhatHappened();
+    ACutNeverSplitsACharacter();
     TheBookRemembersBoundedAndOnce();
 
     if (failures)
