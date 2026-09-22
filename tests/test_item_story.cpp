@@ -75,6 +75,37 @@ void CheckWho(char const* what, ItemStoryWho got, ItemStoryWho want)
 
 std::vector<unsigned> const kGuilds{23, 24};
 
+// Every lead byte is followed by exactly the continuation bytes it announces,
+// so neither a dangling lead nor a stray continuation passes.
+bool WholeUtf8(std::string const& text)
+{
+    std::size_t i = 0;
+    while (i < text.size())
+    {
+        unsigned char const c = static_cast<unsigned char>(text[i]);
+        std::size_t want = 1;
+        if (c < 0x80)
+            want = 1;
+        else if ((c & 0xE0) == 0xC0)
+            want = 2;
+        else if ((c & 0xF0) == 0xE0)
+            want = 3;
+        else if ((c & 0xF8) == 0xF0)
+            want = 4;
+        else
+            return false;
+        if (i + want > text.size())
+            return false;
+        for (std::size_t k = 1; k < want; ++k)
+        {
+            if ((static_cast<unsigned char>(text[i + k]) & 0xC0) != 0x80)
+                return false;
+        }
+        i += want;
+    }
+    return true;
+}
+
 void RareAndUpAreNotableAndUncommonIsNot()
 {
     CheckFalse("poor", IsNotableItemQuality(0));
@@ -166,6 +197,7 @@ void ACutNeverSplitsACharacter()
     text += "\xE2\x80\x94tail";
     FitItemStoryColumn(text);
     CheckTrue("cut before the straddling character", text == std::string(253, 'a'));
+    CheckTrue("straddled cut is whole UTF-8", WholeUtf8(text));
 
     // A two-byte character ending exactly at the limit is kept.
     std::string exact(253, 'a');
@@ -182,8 +214,13 @@ void ACutNeverSplitsACharacter()
     std::string const longName = std::string(250, 'x') + "\xC3\xA9\xC3\xA9\xC3\xA9";
     std::string const detail = ItemLootDetail(ItemVia::Loot, longName);
     CheckTrue("loot detail fits", detail.size() <= 255);
-    CheckTrue("loot detail ends on a whole character",
-              (static_cast<unsigned char>(detail.back()) & 0xC0) != 0xC0);
+    CheckTrue("loot detail is whole UTF-8", WholeUtf8(detail));
+    CheckTrue("loot detail kept the prefix", detail.size() >= 250);
+
+    // Malformed input with no lead byte in the window: dropped, not kept.
+    std::string junk(300, '\x80');
+    FitItemStoryColumn(junk);
+    CheckTrue("continuation-only junk is cleared", junk.empty());
 }
 
 void TheBookRemembersBoundedAndOnce()

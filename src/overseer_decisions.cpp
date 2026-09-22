@@ -10302,8 +10302,13 @@ void FitItemStoryColumn(std::string& text)
     std::size_t lead = text.size();
     while (lead > 0 && (static_cast<unsigned char>(text[lead - 1]) & 0xC0) == 0x80)
         --lead;
+    // Nothing but continuation bytes: not UTF-8 at all, and nothing in it is
+    // a character worth keeping. Empty is a string MySQL accepts.
     if (lead == 0)
+    {
+        text.clear();
         return;
+    }
     unsigned char const first = static_cast<unsigned char>(text[lead - 1]);
     std::size_t want = 1;
     if ((first & 0xE0) == 0xC0)
