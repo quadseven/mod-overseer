@@ -44,6 +44,7 @@
 #ifndef MOD_OVERSEER_DECISIONS_H
 #define MOD_OVERSEER_DECISIONS_H
 
+#include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <map>
@@ -12817,6 +12818,218 @@ struct ItemStoryBook
 void RememberStoryItem(ItemStoryBook& book, std::uint32_t itemGuid);
 
 bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid);
+
+// ------------------------------------------------- mailbox walk (#569) --
+//
+// WALK ONE ONLINE BOT TO THE NEAREST MAILBOX ON ITS MAP, SO A LETTER CAN BE
+// POSTED FROM THERE. A `kind='mail'` row whose command is `walk-to-mailbox`.
+//
+// WHY A VERB AND NOT AN AIM. A guild hand-over is posted, never given, and
+// DoMail refuses a sender with no mailbox in reach, which is correct. The
+// holders the site wants to post from are random guild bots off the roster,
+// and nothing could walk one: TravelAimBook reads overseer_roster only, and
+// upstream's `go` returns at its first line for a bot with no master. So the
+// walk happens inside the row, under the same hold every other walking verb
+// here uses (the summon's approach is the precedent), and it ends at a box the
+// core's own CanOpenMailBox accepts. The letter is a separate `send` row.
+//
+// SHAPE. `walk-to-mailbox` alone, or `walk-to-mailbox max:<yards>` to cap the
+// walk below MAIL_WALK_MAX_YARDS. Nothing else is accepted.
+
+constexpr char const* MAIL_WALK_VERB = "walk-to-mailbox";
+
+// THE CAP, and the site's own: wow-overseer's plan_mail_runs walks a holder only
+// to a mailbox within 600 yards. A row cannot raise it.
+constexpr float MAIL_WALK_MAX_YARDS = 600.0f;
+
+// HOW FAR ONE LEG AIMS. PathGenerator smooths at most 74 points of 4 yards,
+// 296 yards (PathGenerator.h), and past that answers a two point shortcut that
+// NavmeshRoutes refuses. 250 is the module's own route lookahead
+// (TRAVEL_ROUTE_LOOKAHEAD_YARDS) and sits under that budget, so each leg is one
+// the mesh can still route.
+constexpr float MAIL_WALK_LEG_YARDS = 250.0f;
+
+// THE CLOCK. A bot runs at 7 yards a second; half that is allowed for bends,
+// doors and the stepped fallback, plus a floor for a box around the corner.
+constexpr float MAIL_WALK_PACE_YARDS_PER_SECOND = 3.5f;
+constexpr uint32_t MAIL_WALK_TIMEOUT_FLOOR_SECONDS = 60;
+constexpr uint32_t MAIL_WALK_TIMEOUT_CEILING_SECONDS = 300;
+
+// NO PROGRESS FOR THIS LONG ENDS THE WALK. "Progress" is getting at least
+// MAIL_WALK_PROGRESS_YARDS nearer the box than the best so far.
+constexpr uint32_t MAIL_WALK_STALL_SECONDS = 30;
+constexpr float MAIL_WALK_PROGRESS_YARDS = 10.0f;
+
+// THIS MANY POLLS IN A ROW WITH NO STEP THE GROUND WILL TAKE ENDS THE WALK.
+constexpr uint32_t MAIL_WALK_GROUND_REFUSALS_MAX = 5;
+
+// ON ARRIVAL THE HOLD STAYS THIS LONG, so the bot's own wander does not walk it
+// off the box before the site's `send` row lands. A successful `send` lifts it
+// sooner; the module's expiry sweep lifts it otherwise.
+constexpr uint32_t MAIL_WALK_LINGER_SECONDS = 120;
+
+// Is this `kind='mail'` row the walk rather than one of DoMail's five verbs?
+// Decided on the first word only, so a malformed walk still reaches the walk's
+// own parser and is refused with the walk's own sentence.
+bool IsMailWalkRow(std::string const& command);
+
+struct MailWalkRequest
+{
+    float maxYards{MAIL_WALK_MAX_YARDS};
+    // Empty when it parsed; otherwise a MailWalkRefusal literal.
+    char const* error{""};
+};
+
+MailWalkRequest ParseMailWalkRequest(std::string const& command);
+
+namespace MailWalkRefusal
+{
+// Refusals before anything moves.
+constexpr char const* Malformed        = "malformed walk-to-mailbox command";
+constexpr char const* NoBotAI          = "character has no bot AI";
+constexpr char const* NotInWorld       = "character is not in the world";
+constexpr char const* LoggingOut       = "character is logging out";
+constexpr char const* Dead             = "character is dead";
+constexpr char const* InFlight         = "character is on a flight path";
+constexpr char const* InCombat         = "character is in combat";
+constexpr char const* InInstance       = "character is inside an instance or battleground";
+constexpr char const* OnRoster         = "character is on the roster; aim it through travel_npc";
+constexpr char const* Follower         = "character is grouped as a follower";
+constexpr char const* AlreadyWalking   = "a mailbox walk is already under way for this character";
+constexpr char const* HeldByAnother    = "character is held by another verb";
+constexpr char const* NoMailboxOnMap   = "no mailbox on this map";
+constexpr char const* MailboxTooFar    = "nearest mailbox is beyond the cap";
+constexpr char const* OtherSidesGround = "the way to the nearest mailbox crosses the other side's ground";
+constexpr char const* GroundRefused    = "the ground toward the mailbox does not hold";
+
+// Endings of a walk that started.
+constexpr char const* EnteredCombat    = "entered combat on the way to the mailbox";
+constexpr char const* Died             = "died on the way to the mailbox";
+constexpr char const* LeftWorld        = "left the world on the way to the mailbox";
+constexpr char const* LeftMap          = "left the map on the way to the mailbox";
+constexpr char const* TookFlight       = "took a flight on the way to the mailbox";
+constexpr char const* TimedOut         = "did not reach the mailbox in time";
+constexpr char const* Stalled          = "stopped getting nearer the mailbox";
+}  // namespace MailWalkRefusal
+
+// Worth asking again later without changing the row: true for walls that move
+// (combat, death, flight, a hold, a walk under way, the ground, the clock),
+// false for the ones that will not (malformed, roster, no box, too far, the
+// other side's ground).
+bool MailWalkRefusalRetryable(std::string const& reason);
+
+// Everything the gate needs, read by the adapter before anything is held.
+struct MailWalkGateFacts
+{
+    bool hasBotAI{false};
+    bool inWorld{false};
+    bool loggingOut{false};
+    bool alive{false};
+    bool inFlight{false};
+    bool inCombat{false};
+    bool inInstance{false};
+    bool onRoster{false};
+    bool groupedFollower{false};
+    bool alreadyWalking{false};
+    bool heldByAnother{false};
+};
+
+// "" when the walk may start; otherwise the MailWalkRefusal literal for the
+// first wall, in the order the fields above are declared.
+char const* MailWalkGate(MailWalkGateFacts const& facts);
+
+// One spawned mailbox on the character's map, as the adapter read it from the
+// world's gameobject spawns. `otherSidesGround` is true when the other
+// faction's people stand within threat range of it.
+struct MailboxCandidate
+{
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+    bool otherSidesGround{false};
+};
+
+struct MailboxChoice
+{
+    int index{-1};             // into the candidates, -1 for none
+    float yards{-1.f};         // to the chosen one
+    float nearestYards{-1.f};  // to the nearest of any, chosen or not
+    char const* error{""};     // "" when one was chosen
+};
+
+// THE NEAREST MAILBOX THIS CHARACTER MAY WALK TO. Straight-line 3D distance;
+// a box on the other side's ground is skipped rather than chosen; the chosen
+// one must be within `capYards`. An empty list is NoMailboxOnMap; a list whose
+// every usable box is past the cap is MailboxTooFar; a list whose every box is
+// on the other side's ground is OtherSidesGround.
+MailboxChoice ChooseNearestMailbox(std::vector<MailboxCandidate> const& candidates,
+                                   float x, float y, float z, float capYards);
+
+struct MailWalkPoint
+{
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// THE AIM FOR THIS LEG: the box itself when it is within `legYards`, and
+// otherwise the point `legYards` along the straight line toward it (z
+// interpolated; the adapter re-grounds it). `final` says which.
+MailWalkPoint MailWalkLegAim(float fromX, float fromY, float fromZ, float toX, float toY,
+                             float toZ, float legYards, bool& final);
+
+// Points every `spacing` yards along the straight line, both ends included, for
+// the adapter's sweep for the other side's people along the walk.
+std::vector<MailWalkPoint> MailWalkLineSamples(float fromX, float fromY, float toX, float toY,
+                                               float spacing);
+
+// The walk's timeout for a box this far away, between the floor and ceiling.
+uint32_t MailWalkTimeoutSeconds(float yards);
+
+enum class MailWalkState
+{
+    Walking,
+    Arrived,
+    LeftWorld,
+    Died,
+    TookFlight,
+    LeftMap,
+    EnteredCombat,
+    TimedOut,
+    Stalled,
+    GroundRefused,
+};
+
+// What one poll of a walk read. `mailboxInReach` is the core's own gate: a
+// mailbox this character's session could open from where it stands.
+struct MailWalkFacts
+{
+    bool present{false};       // online and in the world
+    bool alive{false};
+    bool inFlight{false};
+    bool sameMap{false};
+    bool inCombat{false};
+    bool mailboxInReach{false};
+    uint32_t waitedMs{0};
+    uint32_t timeoutMs{0};
+    uint32_t sinceProgressMs{0};
+    uint32_t groundRefusals{0};
+};
+
+// THE VERDICT FOR ONE POLL. Leaving the world, dying, flying and changing map
+// end it first; then combat, because a character held through a fight is a
+// character killed by the hold; then arrival; then the clocks.
+MailWalkState JudgeMailWalk(MailWalkFacts const& facts);
+
+// "walking", "arrived", ... for the result JSON.
+char const* MailWalkStateWord(MailWalkState state);
+
+// The MailWalkRefusal literal for an ending, "" for Walking and Arrived.
+char const* MailWalkEndReason(MailWalkState state);
+
+// Did this poll get the walker nearer? True when `nowYards` is at least
+// MAIL_WALK_PROGRESS_YARDS under `bestYards`.
+bool MailWalkMadeProgress(float bestYards, float nowYards);
 
 }  // namespace OverseerDecisions
 

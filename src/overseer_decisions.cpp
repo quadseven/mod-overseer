@@ -10374,4 +10374,299 @@ bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid)
     return false;
 }
 
+
+// ------------------------------------------------- mailbox walk (#569) --
+
+namespace
+{
+std::vector<std::string> MailWalkWords(std::string const& command)
+{
+    std::vector<std::string> words;
+    std::string word;
+    for (char c : command)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            if (!word.empty())
+                words.push_back(word);
+            word.clear();
+            continue;
+        }
+        word.push_back(c);
+    }
+    if (!word.empty())
+        words.push_back(word);
+    return words;
+}
+
+// A plain decimal, digits with at most one point, and nothing else. No sign,
+// no exponent, no trailing text: a cap is written by a program, and one that
+// wrote anything else meant something this parser should not guess at.
+bool MailWalkYards(std::string const& text, float& out)
+{
+    if (text.empty() || text.size() > 12)
+        return false;
+    double whole = 0.0;
+    double scale = 0.0;
+    bool sawDigit = false;
+    for (char c : text)
+    {
+        if (c == '.')
+        {
+            if (scale != 0.0)
+                return false;
+            scale = 1.0;
+            continue;
+        }
+        if (c < '0' || c > '9')
+            return false;
+        sawDigit = true;
+        if (scale != 0.0)
+        {
+            scale /= 10.0;
+            whole += (c - '0') * scale;
+        }
+        else
+            whole = whole * 10.0 + (c - '0');
+    }
+    if (!sawDigit)
+        return false;
+    out = static_cast<float>(whole);
+    return true;
+}
+
+float MailWalkYardsBetween(float ax, float ay, float az, float bx, float by, float bz)
+{
+    float const dx = bx - ax;
+    float const dy = by - ay;
+    float const dz = bz - az;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+}  // namespace
+
+bool IsMailWalkRow(std::string const& command)
+{
+    std::vector<std::string> const words = MailWalkWords(command);
+    return !words.empty() && words[0] == MAIL_WALK_VERB;
+}
+
+MailWalkRequest ParseMailWalkRequest(std::string const& command)
+{
+    MailWalkRequest request;
+    std::vector<std::string> const words = MailWalkWords(command);
+    if (words.empty() || words[0] != MAIL_WALK_VERB || words.size() > 2)
+    {
+        request.error = MailWalkRefusal::Malformed;
+        return request;
+    }
+    if (words.size() == 2)
+    {
+        std::string const& word = words[1];
+        float yards = 0.f;
+        if (word.compare(0, 4, "max:") != 0 || !MailWalkYards(word.substr(4), yards)
+            || yards <= 0.f || yards > MAIL_WALK_MAX_YARDS)
+        {
+            request.error = MailWalkRefusal::Malformed;
+            return request;
+        }
+        request.maxYards = yards;
+    }
+    return request;
+}
+
+bool MailWalkRefusalRetryable(std::string const& reason)
+{
+    namespace R = MailWalkRefusal;
+    return reason == R::NotInWorld || reason == R::LoggingOut || reason == R::Dead
+        || reason == R::InFlight || reason == R::InCombat || reason == R::InInstance
+        || reason == R::Follower || reason == R::AlreadyWalking
+        || reason == R::HeldByAnother || reason == R::GroundRefused
+        || reason == R::EnteredCombat || reason == R::Died || reason == R::LeftWorld
+        || reason == R::LeftMap || reason == R::TookFlight || reason == R::TimedOut
+        || reason == R::Stalled;
+}
+
+char const* MailWalkGate(MailWalkGateFacts const& facts)
+{
+    namespace R = MailWalkRefusal;
+    if (!facts.hasBotAI)
+        return R::NoBotAI;
+    if (!facts.inWorld)
+        return R::NotInWorld;
+    if (facts.loggingOut)
+        return R::LoggingOut;
+    if (!facts.alive)
+        return R::Dead;
+    if (facts.inFlight)
+        return R::InFlight;
+    if (facts.inCombat)
+        return R::InCombat;
+    if (facts.inInstance)
+        return R::InInstance;
+    if (facts.onRoster)
+        return R::OnRoster;
+    if (facts.groupedFollower)
+        return R::Follower;
+    if (facts.alreadyWalking)
+        return R::AlreadyWalking;
+    if (facts.heldByAnother)
+        return R::HeldByAnother;
+    return "";
+}
+
+MailboxChoice ChooseNearestMailbox(std::vector<MailboxCandidate> const& candidates,
+                                   float x, float y, float z, float capYards)
+{
+    MailboxChoice choice;
+    if (candidates.empty())
+    {
+        choice.error = MailWalkRefusal::NoMailboxOnMap;
+        return choice;
+    }
+    float bestUsable = -1.f;
+    int bestIndex = -1;
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        MailboxCandidate const& box = candidates[i];
+        float const yards = MailWalkYardsBetween(x, y, z, box.x, box.y, box.z);
+        if (choice.nearestYards < 0.f || yards < choice.nearestYards)
+            choice.nearestYards = yards;
+        if (box.otherSidesGround)
+            continue;
+        if (bestIndex < 0 || yards < bestUsable)
+        {
+            bestUsable = yards;
+            bestIndex = static_cast<int>(i);
+        }
+    }
+    if (bestIndex < 0)
+    {
+        choice.error = MailWalkRefusal::OtherSidesGround;
+        return choice;
+    }
+    choice.yards = bestUsable;
+    if (bestUsable > capYards)
+    {
+        choice.error = MailWalkRefusal::MailboxTooFar;
+        return choice;
+    }
+    choice.index = bestIndex;
+    return choice;
+}
+
+MailWalkPoint MailWalkLegAim(float fromX, float fromY, float fromZ, float toX, float toY,
+                             float toZ, float legYards, bool& final)
+{
+    MailWalkPoint aim{toX, toY, toZ};
+    float const dx = toX - fromX;
+    float const dy = toY - fromY;
+    float const span = std::sqrt(dx * dx + dy * dy);
+    final = !(legYards > 0.f) || span <= legYards;
+    if (final)
+        return aim;
+    float const t = legYards / span;
+    aim.x = fromX + dx * t;
+    aim.y = fromY + dy * t;
+    aim.z = fromZ + (toZ - fromZ) * t;
+    return aim;
+}
+
+std::vector<MailWalkPoint> MailWalkLineSamples(float fromX, float fromY, float toX, float toY,
+                                               float spacing)
+{
+    std::vector<MailWalkPoint> points;
+    float const dx = toX - fromX;
+    float const dy = toY - fromY;
+    float const span = std::sqrt(dx * dx + dy * dy);
+    // Bounded whatever the arguments: a zero or negative spacing reads only
+    // the two ends, and no walk this verb allows needs more than a few dozen.
+    std::size_t steps = 1;
+    if (spacing > 0.f && span > spacing)
+        steps = static_cast<std::size_t>(span / spacing) + 1;
+    if (steps > 1000)
+        steps = 1000;
+    for (std::size_t i = 0; i <= steps; ++i)
+    {
+        float const t = static_cast<float>(i) / static_cast<float>(steps);
+        points.push_back(MailWalkPoint{fromX + dx * t, fromY + dy * t, 0.f});
+    }
+    return points;
+}
+
+uint32_t MailWalkTimeoutSeconds(float yards)
+{
+    if (!(yards > 0.f))
+        return MAIL_WALK_TIMEOUT_FLOOR_SECONDS;
+    float const seconds = static_cast<float>(MAIL_WALK_TIMEOUT_FLOOR_SECONDS)
+        + yards / MAIL_WALK_PACE_YARDS_PER_SECOND;
+    if (seconds >= static_cast<float>(MAIL_WALK_TIMEOUT_CEILING_SECONDS))
+        return MAIL_WALK_TIMEOUT_CEILING_SECONDS;
+    return static_cast<uint32_t>(seconds);
+}
+
+MailWalkState JudgeMailWalk(MailWalkFacts const& facts)
+{
+    if (!facts.present)
+        return MailWalkState::LeftWorld;
+    if (!facts.alive)
+        return MailWalkState::Died;
+    if (facts.inFlight)
+        return MailWalkState::TookFlight;
+    if (!facts.sameMap)
+        return MailWalkState::LeftMap;
+    if (facts.inCombat)
+        return MailWalkState::EnteredCombat;
+    if (facts.mailboxInReach)
+        return MailWalkState::Arrived;
+    if (facts.waitedMs >= facts.timeoutMs)
+        return MailWalkState::TimedOut;
+    if (facts.sinceProgressMs >= MAIL_WALK_STALL_SECONDS * 1000u)
+        return MailWalkState::Stalled;
+    if (facts.groundRefusals >= MAIL_WALK_GROUND_REFUSALS_MAX)
+        return MailWalkState::GroundRefused;
+    return MailWalkState::Walking;
+}
+
+char const* MailWalkStateWord(MailWalkState state)
+{
+    switch (state)
+    {
+        case MailWalkState::Walking:       return "walking";
+        case MailWalkState::Arrived:       return "arrived";
+        case MailWalkState::LeftWorld:     return "left_world";
+        case MailWalkState::Died:          return "died";
+        case MailWalkState::TookFlight:    return "took_flight";
+        case MailWalkState::LeftMap:       return "left_map";
+        case MailWalkState::EnteredCombat: return "entered_combat";
+        case MailWalkState::TimedOut:      return "timed_out";
+        case MailWalkState::Stalled:       return "stalled";
+        case MailWalkState::GroundRefused: return "ground_refused";
+    }
+    return "walking";
+}
+
+char const* MailWalkEndReason(MailWalkState state)
+{
+    namespace R = MailWalkRefusal;
+    switch (state)
+    {
+        case MailWalkState::Walking:       return "";
+        case MailWalkState::Arrived:       return "";
+        case MailWalkState::LeftWorld:     return R::LeftWorld;
+        case MailWalkState::Died:          return R::Died;
+        case MailWalkState::TookFlight:    return R::TookFlight;
+        case MailWalkState::LeftMap:       return R::LeftMap;
+        case MailWalkState::EnteredCombat: return R::EnteredCombat;
+        case MailWalkState::TimedOut:      return R::TimedOut;
+        case MailWalkState::Stalled:       return R::Stalled;
+        case MailWalkState::GroundRefused: return R::GroundRefused;
+    }
+    return "";
+}
+
+bool MailWalkMadeProgress(float bestYards, float nowYards)
+{
+    return bestYards - nowYards >= MAIL_WALK_PROGRESS_YARDS;
+}
+
 }  // namespace OverseerDecisions
