@@ -16110,6 +16110,12 @@ private:
         // per destination rather than once per five-second poll - the same
         // log-once discipline every other drive in this file keeps.
         std::string aim;
+        // THE TOLERANCE A WALK BACK IN ARRIVES ON, when its door needs one
+        // tighter than TRAVEL_ARRIVED_POSITION_YARDS (#577). Zero means the
+        // default. Set by RejoinToward alone and read by DriveTravel only while
+        // `rejoin` is set and `aim` is still the aim it was set for, so an
+        // escort some other walk took over cannot inherit it.
+        float arriveYards{0.f};
         // WHY THIS MEMBER IS BEING WALKED, for DriveDungeonClear (#351). That
         // drive arms the dungeon brain on GEOGRAPHY - alive, on an instance map
         // - and on nothing else, because it cannot gate itself on a run row it
@@ -17522,7 +17528,8 @@ private:
     // reason: the coordinator asks again on every poll of the hold, and
     // TravelAimBook::Claim refuses to disturb a walk it is holding the memory
     // for.
-    void RejoinToward(std::string const& name, std::string const& aim)
+    void RejoinToward(std::string const& name, std::string const& aim,
+                      float arriveYards)
     {
         DungeonEscort& escort = _dungeonEscorts[name];
         // A WALK ANOTHER OWNER HOLDS IS NOT TURNED ROUND, on the terms
@@ -17544,6 +17551,7 @@ private:
         // is carrying it, and DriveDungeonClear reads this field to tell a party
         // that is CLEARING from a straggler being walked out of an instance.
         escort.purpose = EscortPurpose::Assemble;
+        escort.arriveYards = arriveYards;
         if (!escort.rejoinSince)
             escort.rejoinSince = std::time(nullptr);
 
@@ -18057,6 +18065,44 @@ private:
     // and refuses a character not genuinely standing in the trigger, so nothing
     // here can move a character that has not walked to the door on its own legs.
     // The check is the server's, not ours, which is what makes it trustworthy.
+    // HOW CLOSE A POSITION AIM HAS TO GET BEFORE IT HAS ARRIVED (#577).
+    // TRAVEL_ARRIVED_POSITION_YARDS for every aim but two kinds of door walk,
+    // and for those the door's own row decides through
+    // OverseerDecisions::DoorArrivalYards, the same call the dungeon walks gate
+    // on - so a walk is never accepted on one number and arrived on another:
+    //
+    //   * a `trigger:` aim, whose trigger is read back out of the world here;
+    //   * a walk back in, whose `at:` aim names a point rather than a trigger,
+    //     so the tolerance its gate accepted rides on the rejoin escort and is
+    //     honoured only while that escort still holds that aim.
+    //
+    // A door no tolerance fits inside keeps the default, which is what it had
+    // before this existed; the dungeon walks refuse such a door before aiming.
+    float PositionArrivalYards(std::string const& name, std::string const& target) const
+    {
+        if (target.rfind("trigger:", 0) == 0)
+        {
+            std::istringstream in(target.substr(8));
+            uint32 id = 0;
+            // GetAreaTrigger  ObjectMgr.h:868  AreaTrigger const* GetAreaTrigger(uint32) const
+            AreaTrigger const* door = (in >> id) && id ? sObjectMgr->GetAreaTrigger(id) : nullptr;
+            if (door)
+            {
+                float const yards = OverseerDecisions::DoorArrivalYards(
+                    TRAVEL_ARRIVED_POSITION_YARDS, TriggerShapeOf(*door));
+                if (yards > 0.f)
+                    return yards;
+            }
+            return TRAVEL_ARRIVED_POSITION_YARDS;
+        }
+
+        auto const it = _dungeonEscorts.find(name);
+        if (it != _dungeonEscorts.end() && it->second.rejoin && it->second.aim == target &&
+            it->second.arriveYards > 0.f)
+            return it->second.arriveYards;
+        return TRAVEL_ARRIVED_POSITION_YARDS;
+    }
+
     bool StepThroughAreaTrigger(std::string const& name, Player* bot,
                                 std::string const& target)
     {
@@ -19012,7 +19058,7 @@ private:
             // for a creature, which is the whole distinction the two
             // tolerances are about - see TRAVEL_ARRIVED_POSITION_YARDS.
             float const arriveWithin =
-                entry ? TRAVEL_ARRIVED_YARDS : TRAVEL_ARRIVED_POSITION_YARDS;
+                entry ? TRAVEL_ARRIVED_YARDS : PositionArrivalYards(name, target);
             if (distance <= arriveWithin)
             {
                 // A DOORWAY IS ANSWERED FIRST, because for a `trigger:` aim
@@ -22428,7 +22474,7 @@ private:
             // places that ever compare against a trigger's radius -
             // DUNGEON_STAGING_STANDOFF_YARDS's margin (20 > 10 + 6) and
             // ArrivalReachesTrigger's check against TRAVEL_ARRIVED_POSITION_YARDS
-            // (5 < 6) - read `door->radius` out of the world at the time they run
+            // (5 < 6) - read the door's row out of the world at the time they run
             // rather than assuming 8, and the Deadmines exit (areatrigger 119) is
             // already radius 6 in this same table with the same margin to spare.
             // Recorded here so the next reader does not go looking for a bug
@@ -22654,13 +22700,11 @@ private:
             // says why; it is not walked at a guessed point.
             //
             // AND THE DOORS THAT ARE NOT HERE. Ragefire Chasm, both Maraudon
-            // wings, every Dire Maul door and Scholomance have a BOX trigger
-            // (radius 0) on the way out, and ArrivalReachesTrigger refuses to
-            // aim anybody at one, so a run through them would enter and never
-            // walk out. They wait for box-trigger support. Upper Blackrock
-            // Spire shares every trigger with the Lower Spire and is split
-            // from it by a door inside the instance, which a row of two
-            // areatriggers cannot name.
+            // wings, every Dire Maul door and Scholomance waited here for
+            // box-trigger support and are now at the end of the table (#577).
+            // Upper Blackrock Spire shares every trigger with the Lower Spire
+            // and is split from it by a door inside the instance, which a row
+            // of two areatriggers cannot name.
 
             // BLACKFATHOM DEEPS, on map 1 at the Zoram Strand. The door stands
             // at z -23 in a sunken temple, and the last stretch down to it is
@@ -22814,8 +22858,10 @@ private:
             // confirmed live. Inside, the Service Entrance Gate, gameobject
             // 175368, stands 40 yards from 2221, locked (flags 34, lock 879);
             // whether it blocks the walk out is not known. Door minimum level
-            // 45. The entry box also means a member left outside cannot be
-            // walked back in, the same as the Stockade.
+            // 45. The entry is a box, and since #577 a member left outside is
+            // walked back in on a tolerance that fits its 8.083 width (3.04
+            // yards), the same as the Stockade; and the box stands the party
+            // off by its half-diagonal plus the gather circle, 22.11 yards.
             //
             // areatrigger.sql: (2216,0,3392.46,-3396.77,143.073,0,22.83,8.083,34.69,0)
             // areatrigger_teleport.sql: (2216,'Stratholme - Eastern Plaguelands Instance',329,3395.09,-3380.25,142.702,0.1)
@@ -22835,6 +22881,128 @@ private:
             // areatrigger.sql: (2221,329,3584.78,-3632.05,142.118,10,9.778,17.94,27.92,0)
             // areatrigger_teleport.sql: (2221,'Stratholme - Eastern Plaguelands Instance (Inside)',0,3235.46,-4050.6,108.45,1.93522)
             {"stratholme-undead", 0, 2214, 329, 2221, 0.f, 0.f, 0.f},
+            // THE TEN BOX DOORS (#577). Each of these doors has a BOX trigger
+            // (radius 0, with a length, width, height and orientation) on the way
+            // out, and every one of their entries is a box too. They were held
+            // back until the pure layer could answer for a
+            // box the way the core does: see OverseerDecisions::AreaTriggerShape
+            // and the four calls beside it. Every number was read out of the
+            // world database of a realm on the pinned core with a SELECT on
+            // areatrigger joined to areatrigger_teleport, and is quoted here in
+            // the table's column order (entry, map, x, y, z, radius, length,
+            // width, height, orientation) so a future reader can check it without
+            // a running world. The staging point each derives is pinned in
+            // tests/test_staging_point.cpp; the standoff is the box's own
+            // half-diagonal plus the gather circle where that is more than 20.
+            //
+            // Door minimum levels are read from dungeon_access_template: 8 for
+            // Ragefire Chasm, 30 for both Maraudon wings, 45 for Scholomance and
+            // every Dire Maul door.
+
+            // RAGEFIRE CHASM, on map 1 in Orgrimmar's Cleft of Shadow. This is
+            // the Horde family's first dungeon, and an Alliance party must not
+            // be sent: the whole approach is inside a Horde capital. The
+            // standoff is 22.35 yards, the box's half-diagonal of 12.35 plus the
+            // gather circle.
+            //
+            // areatrigger: (2230,1,1818.4,-4427.26,-10.4478,0,21.69,11.83,21.22,0.576)
+            // areatrigger_teleport: (2230,'Ragefire Chasm - Ogrimmar Instance',389,3.81,-14.82,-17.84,4.39)
+            // areatrigger: (2226,389,2.58019,-0.013587,-13.3668,0,30.69,12.19,25.56,0)
+            // areatrigger_teleport: (2226,'Ragefire Chasm - Ogrimmar Instance (Inside)',1,1813.49,-4418.58,-18.57,1.78)
+            {"ragefire", 1, 2230, 389, 2226, 0.f, 0.f, 0.f},
+            // MARAUDON, THE ORANGE WING (Foulspore Cavern), on map 1 in
+            // Desolace. Both Maraudon rows share map 349, and this one is listed
+            // first so a run adopted inside that map after a restart, whose
+            // leader's job names neither, takes this door's way out. The orange
+            // and purple wings join the inner dungeon; which of the two the
+            // adapter walks out by follows the job, not the map.
+            //
+            // areatrigger: (3133,1,-1484.07,2617.57,75.7144,0,24.69,15.78,35.19,4.538)
+            // areatrigger_teleport: (3133,'Maraudon, Foulspore Cavern [Orange Wing] (Entrance)',349,1019.69,-458.31,-43.43,0.31)
+            // areatrigger: (3131,349,1005.02,-460.539,-43.2507,0,10.14,31.42,23.42,0.01745)
+            // areatrigger_teleport: (3131,'Maraudon, Foulspore Cavern [Orange Wing] (Exit)',1,-1471.07,2618.57,76.1944,0)
+            {"maraudon-orange", 1, 3133, 349, 3131, 0.f, 0.f, 0.f},
+            // MARAUDON, THE PURPLE WING (The Wicked Grotto). Standoff 28.06
+            // yards, the widest of the ten: its box is 31.69 long.
+            //
+            // areatrigger: (3134,1,-1181.98,2861.95,85.2581,0,31.69,17.33,34.19,3.211)
+            // areatrigger_teleport: (3134,'Maraudon, The Wicked Grotto [Purple Wing] (Entrance)',349,752.91,-616.53,-33.11,1.37)
+            // areatrigger: (3126,349,756.878,-633.96,-32.8191,0,15.94,26.44,44.14,1.641)
+            // areatrigger_teleport: (3126,'Maraudon, The Wicked Grotto [Purple Wing] (Exit)',1,-1186.98,2875.95,85.7258,1.78443)
+            {"maraudon-purple", 1, 3134, 349, 3126, 0.f, 0.f, 0.f},
+            // SCHOLOMANCE, on map 0 on Caer Darrow in the Western Plaguelands.
+            // THE SKELETON KEY. The Scholomance Door, gameobject 174626, stands
+            // on map 0 at (1267.59, -2567.38, 94.11), locked (flags 34, lock
+            // 1159), 23.6 yards from trigger 2567 and about 11 yards from the
+            // derived staging point; lock 1159 is the Skeleton Key (item 13704)
+            // in practice, since lock_dbc is empty in this world database. The
+            // key is what gets a party deep into Scholomance. Whether that door
+            // also stands between the staging point and the trigger is not
+            // known, and if it does, a party without the key cannot reach this
+            // door at all. This module does not check for the key (#578).
+            //
+            // areatrigger: (2567,0,1282.05,-2548.73,85.3994,0,10.56,13.03,21.67,0.4712)
+            // areatrigger_teleport: (2567,'Scholomance Entrance',289,196.37,127.05,134.91,6.09)
+            // areatrigger: (2568,289,182.265,126.45,143.707,0,12.33,8.889,16.39,0)
+            // areatrigger_teleport: (2568,'Scholomance Instance',0,1275.05,-2552.03,90.3994,3.6631)
+            {"scholomance", 0, 2567, 289, 2568, 0.f, 0.f, 0.f},
+            // DIRE MAUL, SIX DOORS INTO ONE MAP, on map 1 in Feralas. Each row
+            // is named by its wing and the side of that wing its door is on,
+            // after the world's own names for the triggers: East Wing [East],
+            // East Wing [West], East Wing [South], West Wing [North], West Wing
+            // [South] and North Wing. All six share map 429, and each way out
+            // stands in its own wing, so the adapter's restart adoption takes
+            // the row the leader's job names; the East wing's outer door is
+            // listed first as the fallback because it is the one with no key.
+            //
+            // THE CRESCENT KEY. Lock 1562 is the Crescent Key (item 18249) in
+            // practice, and it drops in the East wing. Three doors on map 1
+            // carry it (flags 34, locked) and each stands on the approach to a
+            // West or North wing trigger: gameobject 177189 at (-3763.5,
+            // 1249.41, 160.28), 1.5 yards from the `dire-maul-west-north`
+            // staging point; 177188 at (-3816.05, 1250.29, 160.28), 1.7 yards
+            // from the `dire-maul-west-south` one; and 177192 at (-3520.13,
+            // 1098.07, 161.03), 9.4 yards past the `dire-maul-north` one on the
+            // side away from the trigger. So those three rows are expected to
+            // need the key: a closed door on the approach is not in the navmesh,
+            // and whether the walk is stopped by it has not been measured. Three
+            // more lock 1562 doors stand inside map 429. The East
+            // wing needs no key. This module does not check for it (#578), so
+            // the ordering (an East wing run first) is on whoever starts the run.
+            //
+            // areatrigger: (3185,1,-4028.21,123.966,26.8109,0,9.833,4.583,15.69,0.4712)
+            // areatrigger_teleport: (3185,'Dire Maul, East Wing [East] (Entrance)',429,9.31119,-837.085,-32.5305,0)
+            // areatrigger: (3196,429,4.31119,-837.085,-33.0405,0,6.167,11.44,22.94,0)
+            // areatrigger_teleport: (3196,'Dire Maul, East Wing [East] (Exit)',1,-4030.21,127.966,26.8109,0)
+            {"dire-maul-east-east", 1, 3185, 429, 3196, 0.f, 0.f, 0.f},
+            // areatrigger: (3183,1,-3730.48,933.975,160.973,0,9.389,12.78,19.67,0)
+            // areatrigger_teleport: (3183,'Dire Maul, East Wing [West] (Entrance)',429,44.4499,-154.822,-2.71201,0)
+            // areatrigger: (3194,429,37.4499,-154.822,-2.71201,0,8.917,9.167,19.44,0)
+            // areatrigger_teleport: (3194,'Dire Maul, East Wing [West] (Exit)',1,-3737.48,934.975,160.973,3.13864)
+            {"dire-maul-east-west", 1, 3183, 429, 3194, 0.f, 0.f, 0.f},
+            // areatrigger: (3184,1,-3981.58,771.193,160.962,0,10.31,5.972,20.22,0)
+            // areatrigger_teleport: (3184,'Dire Maul, East Wing [South] (Entrance)',429,-201.11,-328.66,-2.72,5.22)
+            // areatrigger: (3195,429,-202.664,-314.876,-2.72353,0,9.806,10.17,17.44,0)
+            // areatrigger_teleport: (3195,'Dire Maul, East Wing [South] (Exit)',1,-3980.58,776.193,161.006,0)
+            {"dire-maul-east-south", 1, 3184, 429, 3195, 0.f, 0.f, 0.f},
+            // Crescent Key: gameobject 177189, see above.
+            // areatrigger: (3187,1,-3741.96,1249.18,160.217,0,7.861,10.33,18.69,0)
+            // areatrigger_teleport: (3187,'Dire Maul, West Wing [North] (Entrance)',429,31.5609,159.45,-3.4777,0.01)
+            // areatrigger: (3191,429,24.5609,159.45,-3.46677,0,7.694,9.694,21.61,0)
+            // areatrigger_teleport: (3191,'Dire Maul, West Wing [North](Exit)',1,-3747.96,1249.18,160.217,3.15827)
+            {"dire-maul-west-north", 1, 3187, 429, 3191, 0.f, 0.f, 0.f},
+            // Crescent Key: gameobject 177188, see above.
+            // areatrigger: (3186,1,-3837.79,1250.23,160.223,0,8.194,9.083,18.36,0)
+            // areatrigger_teleport: (3186,'Dire Maul, West Wing [South] (Entrance)',429,-62.9658,159.867,-3.46206,3.14788)
+            // areatrigger: (3190,429,-55.9658,159.867,-3.46206,0,7.222,10.08,19.56,0)
+            // areatrigger_teleport: (3190,'Dire Maul, West Wing [South] (Exit)',1,-3831.79,1250.23,160.223,0)
+            {"dire-maul-west-south", 1, 3186, 429, 3190, 0.f, 0.f, 0.f},
+            // Crescent Key: gameobject 177192, see above.
+            // areatrigger: (3189,1,-3520.65,1068.72,161.128,0,9.861,11.86,23.22,0)
+            // areatrigger_teleport: (3189,'Dire Maul, North Wing (Entrance)',429,255.249,-16.0561,-2.58737,4.7)
+            // areatrigger: (3193,429,255.249,-9.05606,-2.58737,0,8.333,8.583,20.72,0)
+            // areatrigger_teleport: (3193,'Dire Maul, North Wing (Exit)',1,-3520.65,1077.72,161.138,1.5009)
+            {"dire-maul-north", 1, 3189, 429, 3193, 0.f, 0.f, 0.f},
         };
         return portals;
     }
@@ -23435,6 +23603,27 @@ private:
     // about 30 yards (z 23.9 rising to 27.1) and roughly 9 yards wide across.
     // The old point's nearest walkable surface is 27 yards above the z the aim
     // carried; the new one's is a quarter of a yard below it.
+    // AN AREATRIGGER ROW, IN THE SHAPE THE PURE LAYER ASKS ABOUT (#577). Every
+    // field is copied, box extents included, so a decision that asks "sphere
+    // or box" asks it of the same row the handler's own IsInAreaTriggerRadius
+    // reads rather than of the radius alone - a radius of 0 is a box, and the
+    // radius alone could only ever call it "no door".
+    //
+    // AreaTrigger  ObjectMgr.h:422-434  x/y/z/radius/length/width/height/orientation
+    static OverseerDecisions::AreaTriggerShape TriggerShapeOf(AreaTrigger const& trigger)
+    {
+        OverseerDecisions::AreaTriggerShape shape;
+        shape.x = trigger.x;
+        shape.y = trigger.y;
+        shape.z = trigger.z;
+        shape.radius = trigger.radius;
+        shape.length = trigger.length;
+        shape.width = trigger.width;
+        shape.height = trigger.height;
+        shape.orientation = trigger.orientation;
+        return shape;
+    }
+
     static bool ResolveDungeonStagingPoint(DungeonPortal const& portal, Player* leader,
                                            float& outX, float& outY, float& outZ,
                                            std::string& why)
@@ -23491,10 +23680,18 @@ private:
         // door numbers as its test. What stayed here is the only part that
         // genuinely needs a world: reading the two triggers, and asking the map
         // how high the ground is where the answer landed.
+        //
+        // AND HOW FAR BACK IS ASKED OF THE DOOR'S SHAPE (#577). A sphere stands
+        // off by DUNGEON_STAGING_STANDOFF_YARDS exactly as before; a box stands
+        // off by its half-diagonal plus the gather circle when that is further,
+        // so the whole of DUNGEON_BARRIER_RADIUS_YARDS clears the box on every
+        // bearing. Derived from the row, never written down beside it.
+        float const standoff = OverseerDecisions::DungeonStagingStandoffYards(
+            TriggerShapeOf(*door), DUNGEON_STAGING_STANDOFF_YARDS, DUNGEON_BARRIER_RADIUS_YARDS);
         OverseerDecisions::StagingPoint const staged =
             OverseerDecisions::DungeonStagingPoint(door->x, door->y, back->target_X,
                                                    back->target_Y, back->target_Z,
-                                                   DUNGEON_STAGING_STANDOFF_YARDS);
+                                                   standoff);
         if (staged.verdict != OverseerDecisions::StagingPointVerdict::Usable)
         {
             why = OverseerDecisions::StagingPointRefusal(staged.verdict) +
@@ -23554,8 +23751,19 @@ private:
     // coordinator would return to IDLE, see InDungeonRun, decide the run belongs
     // to somebody else, and never watch the arming or walk anyone out - which is
     // exactly the "notices a restart" obligation the epic asks for, unfulfilled.
-    static DungeonPortal const* FindDungeonPortalByInsideMap(uint32 mapId)
+    //
+    // AND WHERE SEVERAL ROWS SHARE ONE INSIDE MAP, THE JOB PICKS (#577). Dire
+    // Maul is six doors into map 429 and Maraudon two into map 349, and each
+    // door's way out stands in its own wing. The row the leader's job names is
+    // the door this party went in by, so it is preferred when it names this
+    // map; otherwise the first row that does, which is the order the table is
+    // written in for exactly this case.
+    static DungeonPortal const* FindDungeonPortalByInsideMap(uint32 mapId,
+                                                             std::string const& jobKeyword)
     {
+        if (DungeonPortal const* named = FindDungeonPortal(jobKeyword))
+            if (named->insideMapId == mapId)
+                return named;
         for (DungeonPortal const& portal : DungeonPortals())
             if (mapId == portal.insideMapId)
                 return &portal;
@@ -24921,7 +25129,8 @@ private:
     // having to remember that it failed.
     static OverseerDecisions::DoorAimHeight DoorAimHeightFor(
         AreaTrigger const* door,
-        std::vector<OverseerDecisions::DungeonRunEntryState> const& states)
+        std::vector<OverseerDecisions::DungeonRunEntryState> const& states,
+        float arrivalYards = TRAVEL_ARRIVED_POSITION_YARDS)
     {
         Player* onDoorMap = nullptr;
         for (OverseerDecisions::DungeonRunEntryState const& state : states)
@@ -24943,10 +25152,10 @@ private:
                                    door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS,
                                    ground);
 
-        // AreaTrigger::radius  ObjectMgr.h:429  float radius
-        return OverseerDecisions::DoorAimOnTheFloor(
-            door->z, haveGround, ground, TRAVEL_ARRIVED_POSITION_YARDS,
-            door->radius);
+        // THE WHOLE ROW, NOT ITS RADIUS (#577): a box grounds on its own
+        // vertical half-extent, which the radius of 0 it carries cannot say.
+        return OverseerDecisions::DoorAimOnTheFloor(haveGround, ground, arrivalYards,
+                                                    TriggerShapeOf(*door));
     }
 
     // What one poll of a crossing decided. Named rather than returned as a pair
@@ -25291,21 +25500,28 @@ private:
             return 0;
         }
 
-        // AreaTrigger::radius  ObjectMgr.h:429  float radius
-        if (!OverseerDecisions::ArrivalReachesTrigger(TRAVEL_ARRIVED_POSITION_YARDS,
-                                                      door->radius))
+        // ASKED OF THE WHOLE ROW, SPHERE OR BOX (#577), on the tolerance a walk
+        // at this door is actually handed. DriveTravel arrives a `trigger:` aim
+        // on DoorArrivalYards for the same trigger, so the gate and the walk are
+        // the same number: the default where it fits, tighter where a box's
+        // shorter side is under ten yards, and refused only for a door no
+        // tolerance fits inside.
+        OverseerDecisions::AreaTriggerShape const shape = TriggerShapeOf(*door);
+        float const arriveWithin =
+            OverseerDecisions::DoorArrivalYards(TRAVEL_ARRIVED_POSITION_YARDS, shape);
+        if (!OverseerDecisions::ArrivalReachesTrigger(arriveWithin, shape))
         {
             if (!coord.loggedNoWayOut)
             {
                 coord.loggedNoWayOut = true;
                 LOG_ERROR("module.overseer",
                           "overseer: dungeon run {} will not aim anybody at areatrigger {} "
-                          "- a walk to it stops improving at {:.0f}y and the trigger's own "
-                          "radius is {:.0f}, so arriving would mean standing OUTSIDE the "
-                          "door with the errand reported as done. Nobody is aimed, rather "
-                          "than aimed somewhere that cannot work",
+                          "- no arrival tolerance fits inside it (it is {:.1f}y to its "
+                          "nearest edge from the middle), so arriving would mean standing "
+                          "OUTSIDE the door with the errand reported as done. Nobody is "
+                          "aimed, rather than aimed somewhere that cannot work",
                           coord.runNumber, portal.exitTriggerId,
-                          TRAVEL_ARRIVED_POSITION_YARDS, door->radius);
+                          OverseerDecisions::AreaTriggerInscribedYards(shape));
             }
             return 0;
         }
@@ -25515,21 +25731,26 @@ private:
         if (stranded.walk.empty() && stranded.wait.empty())
             return 0;   // nobody is outside on this door's map
 
-        // AreaTrigger::radius  ObjectMgr.h:429  float radius
-        if (!OverseerDecisions::ArrivalReachesTrigger(TRAVEL_ARRIVED_POSITION_YARDS,
-                                                      door->radius))
+        // THE SAME QUESTION WalkStragglersOut ASKS, of the entrance (#577).
+        // This walk is an `at:` aim under a rejoin escort, and the escort
+        // carries the tolerance below so DriveTravel arrives it on the same
+        // number this gate accepted.
+        OverseerDecisions::AreaTriggerShape const shape = TriggerShapeOf(*door);
+        float const arriveWithin =
+            OverseerDecisions::DoorArrivalYards(TRAVEL_ARRIVED_POSITION_YARDS, shape);
+        if (!OverseerDecisions::ArrivalReachesTrigger(arriveWithin, shape))
         {
             if (!coord.loggedNoWayBackIn)
             {
                 coord.loggedNoWayBackIn = true;
                 LOG_ERROR("module.overseer",
                           "overseer: dungeon run {} will not aim anybody back at "
-                          "areatrigger {} - a walk to it stops improving at {:.0f}y and "
-                          "the trigger's own radius is {:.0f}, so arriving would mean "
-                          "standing OUTSIDE the door with the errand reported as done. "
+                          "areatrigger {} - no arrival tolerance fits inside it (it is "
+                          "{:.1f}y to its nearest edge from the middle), so arriving would "
+                          "mean standing OUTSIDE the door with the errand reported as done. "
                           "Nobody is aimed, rather than aimed somewhere that cannot work",
-                          coord.runNumber, triggerId, TRAVEL_ARRIVED_POSITION_YARDS,
-                          door->radius);
+                          coord.runNumber, triggerId,
+                          OverseerDecisions::AreaTriggerInscribedYards(shape));
             }
             return 0;
         }
@@ -25539,7 +25760,7 @@ private:
         // The probe needs a member on the door's map, which is precisely who is
         // being walked, so this is the one caller that always has one.
         OverseerDecisions::DoorAimHeight const doorHeight =
-            DoorAimHeightFor(door, states);
+            DoorAimHeightFor(door, states, arriveWithin);
 
         std::ostringstream aim;
         // AreaTrigger::map/x/y  ObjectMgr.h:425,426,427
@@ -25562,7 +25783,7 @@ private:
         // instance on its own, which is the trickle this module refuses
         // everywhere else.
         for (std::string const& name : stranded.walk)
-            RejoinToward(name, doorAim);
+            RejoinToward(name, doorAim, arriveWithin);
 
         // KNOCKED FOR ONLY THE LIVING, matched back out of the census by name
         // because five names is a list rather than a set - the same matching
@@ -28257,7 +28478,8 @@ private:
             {
                 // GetMapId  Position.h:281  uint32 GetMapId() const
                 DungeonPortal const* inside =
-                    FindDungeonPortalByInsideMap(activeInside->GetMapId());
+                    FindDungeonPortalByInsideMap(activeInside->GetMapId(),
+                                                 DungeonKeywordForJob(leaderJob));
                 if (!inside)
                 {
                     LOG_INFO("module.overseer",
