@@ -1593,15 +1593,21 @@ bool IsForeignTravelAim(std::string const& aim)
 
 LandedErrand LandedErrandStep(std::string const& landedAim,
                               std::string const& columnAim,
-                              bool counterHoldActive)
+                              bool atCounter,
+                              bool counterHoldActive,
+                              int64_t landedForSeconds,
+                              int64_t ceilingSeconds)
 {
     if (landedAim.empty())
         return LandedErrand::NotLanded;
-    // Asked before the hold: a rewritten column is the writer's next errand,
-    // and a hold kept up for it would hold the character at the wrong place.
+    // Asked first: a rewritten column is the writer's next errand, and nothing
+    // about the last one may hold the character back from it.
     if (columnAim != landedAim)
         return LandedErrand::Resume;
-    return counterHoldActive ? LandedErrand::StandDown : LandedErrand::Resume;
+    if (atCounter)
+        return counterHoldActive ? LandedErrand::StandDown : LandedErrand::Resume;
+    return landedForSeconds < ceilingSeconds ? LandedErrand::StandDown
+                                             : LandedErrand::Resume;
 }
 
 MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,

@@ -2682,46 +2682,62 @@ bool IsMaintenanceErrand(std::string const& aim);
 // ReadSplitErrand is a change to dungeon behaviour and wants its own argument.
 bool IsForeignTravelAim(std::string const& aim);
 
-// WHAT THE TRAVEL DRIVE DOES WITH AN AIM IT HAS ALREADY ARRIVED AT AND COULD
-// NOT CLEAR (#558).
+// WHAT THE TRAVEL DRIVE DOES WITH AN AIM IT LET GO OF AND COULD NOT CLEAR
+// (#558).
 //
 // TWO OWNERS OF ONE AIM, AND ONLY ONE OF THEM WRITES IT. The pass outside the
-// worldserver writes a counter aim and is the only thing that clears it: it
-// holds `vendor` while its sell queue is outstanding and releases it when the
-// queue drains. TravelAimBook::Release deliberately skips the column write for
-// an aim it never claimed, so the arrival branch that says "errand done,
-// releasing" leaves the aim standing, and that is correct.
+// worldserver writes counter aims and `at:` aims and is the only thing that
+// clears them: it holds `vendor` while its sell queue is outstanding, and an
+// `at:` aim until its own lease or purpose ends. TravelAimBook::Release
+// deliberately skips the column write for an aim it never claimed, so a
+// release in the travel drive ("errand done, releasing", "releasing the errand
+// as unreachable", and every other one) leaves that aim standing, and that is
+// correct.
 //
-// WHAT WAS NOT CORRECT IS THE NEXT POLL. Release also erases the book's own
-// memory of the errand, so the next poll met the same standing aim with no
-// memory of it, read it as a NEW errand, and the new-errand branch took down
-// the counter hold the arrival had just put up ("sent somewhere else and cannot
-// be both at a counter and on its way to one"). Measured on the dev realm every
-// five seconds for the Alliance leader, and no sell row issued for over an
-// hour while the family's bags stayed full.
+// WHAT WAS NOT CORRECT IS THE NEXT POLL. Release also erases the book's memory
+// of the errand, so the next poll met the same standing aim with no memory of
+// it and started it again as a NEW errand. Measured on the dev realm:
 //
-// So an arrival whose release could not clear the column is remembered as
-// LANDED, and a landed aim is not walked again while the counter hold it took
-// is still in force. It resumes as an ordinary errand when the hold is gone,
-// which is the bound: a latched aim costs one hold window per cycle, not a
-// character stood still for ever.
+//   * at a vendor, every five seconds: the new-errand branch took down the
+//     counter hold the arrival had just put up ("sent somewhere else and
+//     cannot be both at a counter and on its way to one"), and no sell row was
+//     issued for over an hour while the family's bags stayed full;
+//   * on an `at:` aim, nine times in ten minutes: a walk given up on was walked
+//     again at once, into the same mountainside, with the quest drive told to
+//     stand down and pick up again each time.
+//
+// So a release that left the aim it was driving standing is remembered as a
+// LANDING, and a landed aim is not walked again while the landing stands:
+//
+//   * a landing at a counter stands while the counter hold it took is in
+//     force, and no longer, because the hold IS the visit. After it the aim
+//     is an ordinary errand, so a character that drifted off the counter
+//     with sales still outstanding is walked back to it;
+//   * any other landing stands for `ceilingSeconds`. That is the bound: an aim
+//     nobody ever clears costs one walk per ceiling, not one per poll, and
+//     cannot latch a character in place for ever.
 enum class LandedErrand : uint8_t
 {
     NotLanded,  // nothing remembered; the aim is an ordinary errand
-    StandDown,  // arrived, uncleared, hold in force: leave the character alone
+    StandDown,  // let go of and still standing: leave the character alone
     Resume,     // forget the landing and treat the aim as an ordinary errand
 };
 
-// `landedAim` is the aim this character last arrived at without clearing, or
-// empty. `columnAim` is `travel_npc` now. `counterHoldActive` is whether the
-// counter hold the arrival took is still in the register.
+// `landedAim` is the aim this character was let go of without clearing, or
+// empty. `columnAim` is `travel_npc` now. `atCounter` is whether the landing
+// was an arrival that took a counter hold, and `counterHoldActive` whether that
+// hold is still in the register. `landedForSeconds` is how long ago the
+// landing was made.
 //
 // A COLUMN THAT NOW NAMES SOMETHING ELSE RESUMES, and the new-errand branch
-// then releases the hold on purpose: the writer has sent the character
+// then releases any counter hold on purpose: the writer has sent the character
 // somewhere new, which is the case that branch was written for.
 LandedErrand LandedErrandStep(std::string const& landedAim,
                               std::string const& columnAim,
-                              bool counterHoldActive);
+                              bool atCounter,
+                              bool counterHoldActive,
+                              int64_t landedForSeconds,
+                              int64_t ceilingSeconds);
 
 enum class MaintenanceHold : uint8_t
 {
