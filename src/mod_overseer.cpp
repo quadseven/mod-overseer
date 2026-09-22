@@ -7136,13 +7136,20 @@ private:
     // halves are one call because every caller wants both, and a caller that
     // held and forgot to read would publish `hold_applied: false` about a
     // character it had just stopped.
+    //
+    // The ceiling and the stand-up are HoldCharacterStill's own two parameters,
+    // passed through with its defaults, so a verb that walks rather than casts
+    // (the mailbox walk, #569) reads the same four fields back.
     static void HoldStillAndReport(Player* who, std::string const& name, char const* verb,
-                                   CastHoldReport& report)
+                                   CastHoldReport& report,
+                                   uint32 ceilingSeconds = CAST_HOLD_CEILING_SECONDS,
+                                   bool readyToCast = true)
     {
         PlayerbotAI* botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
         if (!botAI)
             return;
-        bool const placed = HoldCharacterStill(who, botAI, name, verb);
+        bool const placed =
+            HoldCharacterStill(who, botAI, name, verb, ceilingSeconds, readyToCast);
         auto const& holds = HoldsInForce();
         auto const record = holds.find(name);
         if (record == holds.end())
@@ -7202,6 +7209,11 @@ private:
         for (SummonCheck const& check : _pendingSummons)
             if (check.summonerName == name || check.ev.helper == name
                 || check.helperName == name || check.ev.heldHelper == name)
+                return true;
+        // A mailbox walk owns its hold until it resolves (#569). Once it has
+        // arrived the row is gone and the linger is the ceiling's to end.
+        for (MailWalkCheck const& check : _pendingMailWalks)
+            if (check.targetName == name)
                 return true;
         return false;
     }
@@ -31545,6 +31557,10 @@ private:
         // reason the casts come after the conjures.
         ResolveLearnChecks(sincePollMs);
 
+        // ...and the mailbox walks, which are driven as well as judged: each
+        // poll reads where the walker is and hands it its next leg (#569).
+        ResolveMailWalks(sincePollMs);
+
         // Then end any cast hold that outlived the row that placed it (#335).
         // AFTER the five above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
@@ -31757,6 +31773,12 @@ private:
                 detail = DoBank(player, command, status, rowResult);
             else if (kind == "auction")
                 detail = DoAuction(player, command, status, rowResult);
+            else if (kind == "mail" && OverseerDecisions::IsMailWalkRow(command))
+                // THE SAME `kind` AGAIN, AND ROUTED THE WAY `cast` ROUTES A
+                // LEARN (#569): on the first word, so a malformed walk still
+                // reaches the walk's own parser. A new kind would be an ENUM
+                // migration, which reaches a world only when db-import runs.
+                detail = DoMailWalk(player, command, status, rowResult, _pendingMailWalks, id);
             else if (kind == "mail")
                 detail = DoMail(player, targetArg, command, status, rowResult);
             else if (kind == "repair")
@@ -43324,6 +43346,13 @@ private:
                          : "");
             status = "delivered";
 
+            // A bot a mailbox walk left standing at this box has done what it
+            // was walked there for, so its hold comes off now rather than at
+            // the end of the linger (#569). A no-op for a sender nothing held,
+            // and it lets go only of a hold the walk placed.
+            ReleaseHold(who->GetName(), who, "the letter it was walked here to post is posted",
+                        MAIL_WALK_HOLD_VERB);
+
             // The story of a notable item (#567): posted and read back, with
             // the mailbox it went from. A letter with no attachment is not a
             // hand-over of anything.
@@ -43578,6 +43607,547 @@ private:
         return "";
     }
 
+
+    // ------------------------------------------------ mailbox walk (#569) --
+    //
+    // WALK ONE ONLINE BOT TO THE NEAREST MAILBOX ON ITS MAP, so the `send` row
+    // after it finds a box DoMail's gate accepts. A `kind='mail'` row whose
+    // command is `walk-to-mailbox` (optionally `max:<yards>`), addressed to the
+    // bot by target_name.
+    //
+    // WHY INSIDE A ROW AND NOT THROUGH AN AIM. The holders a guild hand-over is
+    // posted from are random guild bots off the roster, and nothing else can
+    // walk one: TravelAimBook reads overseer_roster only, upstream's `go`
+    // returns at its first line for a bot with no master, and `sendmail` skips
+    // the mailbox for a random bot, which would be a hand-over at any distance.
+    // So this does what the summon's approach does (WalkTowardTheStone): the
+    // bot is HELD - `stay` on, `new rpg` and `follow` off, the active motion
+    // slot taken - and then walked, under the hold, with MotionMaster::MovePoint
+    // over the navmesh.
+    //
+    // WHAT KEEPS IT SAFE, all of it the module's own:
+    //   * The box is the world's: GAMEOBJECT_TYPE_MAILBOX spawns on the bot's
+    //     map and phase, from the core's own spawn table. No coordinate is
+    //     written here.
+    //   * A box with the other side's people within threat range is skipped,
+    //     and a walk whose straight line passes them is refused (the same
+    //     IsTheOtherSidesGround sweep the route planner prices legs with).
+    //   * Every leg is under MAIL_WALK_LEG_YARDS, which is under the 296 yards
+    //     PathGenerator will smooth, and every point handed to the mover has
+    //     been through GroundedStep: the navmesh when it routes, a short step
+    //     over proved ground when it does not, nothing at all otherwise.
+    //   * The walk ends, and the hold comes off, on combat, death, logout, a
+    //     taxi, a map change, its own timeout, thirty seconds without getting
+    //     nearer, or the ground refusing five polls running.
+    //
+    // ON ARRIVAL THE HOLD STAYS FOR MAIL_WALK_LINGER_SECONDS, so the bot's own
+    // wander does not walk it off the box before the site's `send` row lands.
+    // The `send` lifts it on success; the expiry sweep lifts it otherwise.
+    static constexpr char const* MAIL_WALK_HOLD_VERB = "mailwalk";
+    // Zero for the reason HOLD_PIN_POINT_ID gives: a Player's point generator
+    // informs nobody, so the id reaches no dispatch table.
+    static constexpr uint32 MAIL_WALK_POINT_ID = 0;
+    // How far past its own timeout the walk's hold may stand if nothing comes
+    // back for it: three polls.
+    static constexpr uint32 MAIL_WALK_HOLD_MARGIN_SECONDS = 6;
+    // How long one issued leg keeps KeepHeldCharactersStill off the walker.
+    // Several polls, so a late poll never lets the sweep re-pin a walk; it is
+    // renewed on every poll that still wants the walk.
+    static constexpr uint32 MAIL_WALK_SWEEP_QUIET_SECONDS = 10;
+
+    struct MailWalkEvidence
+    {
+        std::string character;
+        std::string request;
+        uint32 mapId{0};
+        float fromX{0.f};
+        float fromY{0.f};
+        float fromZ{0.f};
+        float capYards{OverseerDecisions::MAIL_WALK_MAX_YARDS};
+        uint32 mailboxesOnMap{0};
+        float nearestYards{-1.f};
+        bool haveMailbox{false};
+        uint32 mailboxSpawn{0};
+        uint32 mailboxEntry{0};
+        std::string mailboxName;
+        float boxX{0.f};
+        float boxY{0.f};
+        float boxZ{0.f};
+        float startYards{-1.f};
+        float bestYards{-1.f};
+        float nowYards{-1.f};
+        uint32 timeoutMs{0};
+        uint32 waitedMs{0};
+        uint32 sinceProgressMs{0};
+        uint32 legs{0};
+        uint32 groundRefusals{0};
+        bool alreadyThere{false};
+        std::string reachedName;
+        float reachedYards{-1.f};
+        CastHoldReport hold;
+    };
+
+    struct MailWalkCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        MailWalkEvidence ev;
+    };
+
+    // WALKS UNDER WAY. World thread only, beside _pendingHearths and bounded
+    // the same way: at most COMMANDS_PER_POLL are added per poll, one per bot,
+    // and each ends within MAIL_WALK_TIMEOUT_CEILING_SECONDS.
+    std::vector<MailWalkCheck> _pendingMailWalks;
+
+    static std::string MailWalkJson(MailWalkEvidence const& ev, char const* outcome,
+                                    char const* reason)
+    {
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason);
+        if (*reason)
+            o << ",\"retryable\":"
+              << (OverseerDecisions::MailWalkRefusalRetryable(reason) ? "true" : "false");
+        o << ",\"character\":" << J(ev.character)
+          << ",\"request\":" << J(ev.request)
+          << ",\"map\":" << ev.mapId
+          << ",\"from\":{\"x\":" << ev.fromX << ",\"y\":" << ev.fromY << ",\"z\":" << ev.fromZ
+          << "}"
+          << ",\"cap_yards\":" << ev.capYards
+          << ",\"mailboxes_on_map\":" << ev.mailboxesOnMap;
+        if (ev.nearestYards >= 0.f)
+            o << ",\"nearest_mailbox_yards\":" << ev.nearestYards;
+        if (ev.haveMailbox)
+            o << ",\"mailbox\":{\"spawn\":" << ev.mailboxSpawn
+              << ",\"entry\":" << ev.mailboxEntry
+              << ",\"name\":" << J(ev.mailboxName)
+              << ",\"x\":" << ev.boxX << ",\"y\":" << ev.boxY << ",\"z\":" << ev.boxZ << "}";
+        else
+            o << ",\"mailbox\":null";
+        if (ev.startYards >= 0.f)
+            o << ",\"start_yards\":" << ev.startYards;
+        if (ev.nowYards >= 0.f)
+            o << ",\"yards_now\":" << ev.nowYards;
+        if (ev.bestYards >= 0.f)
+            o << ",\"best_yards\":" << ev.bestYards;
+        o << ",\"already_there\":" << (ev.alreadyThere ? "true" : "false")
+          << ",\"timeout_ms\":" << ev.timeoutMs
+          << ",\"waited_ms\":" << ev.waitedMs
+          << ",\"legs\":" << ev.legs
+          << ",\"ground_refusals\":" << ev.groundRefusals;
+        if (!ev.reachedName.empty())
+            o << ",\"reached\":{\"name\":" << J(ev.reachedName)
+              << ",\"yards\":" << ev.reachedYards
+              << ",\"held_seconds\":" << OverseerDecisions::MAIL_WALK_LINGER_SECONDS << "}";
+        else
+            o << ",\"reached\":null";
+        o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
+          << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
+          << ",\"hold_took_follow\":" << (ev.hold.tookFollow ? "true" : "false")
+          << ",\"hold_took_new_rpg\":" << (ev.hold.tookNewRpg ? "true" : "false")
+          << "}";
+        return o.str();
+    }
+
+    // Every spawned mailbox gameobject on this character's map and phase, read
+    // from the core's own spawn table so a box in a grid nobody has loaded is
+    // still found. Creature mailboxes (an innkeeper's flag) are not walked to:
+    // a creature moves, and the verb promises a mailbox.
+    static void MailboxSpawnsOnMap(Player* who, std::vector<GameObjectData const*>& out)
+    {
+        out.clear();
+        uint32 const mapId = who->GetMapId();
+        uint32 const phase = who->GetPhaseMask();
+        for (auto const& itr : sObjectMgr->GetAllGOData())
+        {
+            GameObjectData const& data = itr.second;
+            if (data.mapid != mapId || !(data.phaseMask & phase))
+                continue;
+            GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(data.id);
+            if (!tmpl || tmpl->type != GAMEOBJECT_TYPE_MAILBOX)
+                continue;
+            out.push_back(&data);
+        }
+    }
+
+    // True when the core's own gate would open a mailbox from where this
+    // character stands, which is exactly what the next `send` asks.
+    static bool MailboxInReach(Player* who, std::string& name, float& yards)
+    {
+        float nearest = -1.f;
+        return !FindMailboxInReach(who, nearest, yards, name).IsEmpty();
+    }
+
+    // Hand the walker its next leg, if it needs one. Answers false when the
+    // ground gave no step, which the caller counts.
+    //
+    // A LEG IS ISSUED ONLY WHEN THE WALKER IS NOT ALREADY ON ONE: standing
+    // still, or with something other than a point walk in its active slot.
+    // Re-issuing a MovePoint every poll would restart the spline every two
+    // seconds for no gain.
+    static bool IssueMailWalkLeg(Player* who, MailWalkEvidence& ev, bool force)
+    {
+        MotionMaster* const motion = who->GetMotionMaster();
+        if (!motion)
+            return false;
+        if (!force && who->isMoving()
+            && motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+        {
+            LetHeldCharacterWalk(ev.character, MAIL_WALK_SWEEP_QUIET_SECONDS);
+            return true;
+        }
+
+        bool final = false;
+        OverseerDecisions::MailWalkPoint const aim = OverseerDecisions::MailWalkLegAim(
+            who->GetPositionX(), who->GetPositionY(), who->GetPositionZ(), ev.boxX, ev.boxY,
+            ev.boxZ, OverseerDecisions::MAIL_WALK_LEG_YARDS, final);
+        float aimZ = aim.z;
+        // A leg that stops short of the box ends on the ground under the line,
+        // not at a height interpolated through a hill.
+        if (!final)
+        {
+            float surface = 0.f;
+            if (SurfaceAt(who, aim.x, aim.y, aim.z + TRAVEL_GROUND_UPHILL_YARDS, surface))
+                aimZ = surface;
+        }
+
+        WorldPosition step;
+        if (!GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aimZ), step))
+            return false;
+
+        if (!who->IsStandState())
+            who->SetStandState(UNIT_STAND_STATE_STAND);
+        motion->MovePoint(MAIL_WALK_POINT_ID, step.GetPositionX(), step.GetPositionY(),
+                          step.GetPositionZ());
+        LetHeldCharacterWalk(ev.character, MAIL_WALK_SWEEP_QUIET_SECONDS);
+        ++ev.legs;
+        return true;
+    }
+
+    // Keep the hold standing at the box for the linger and stop the walk, on
+    // arrival. The register's own deadline is moved, because a re-assertion
+    // never extends one and the linger is a new, shorter promise.
+    static void HoldAtTheMailbox(Player* who, std::string const& name)
+    {
+        auto& holds = HoldsInForce();
+        auto const hold = holds.find(name);
+        if (hold == holds.end())
+            return;
+        who->StopMoving();
+        PinWhereItStands(who);
+        hold->second.walkingUntil = 0;
+        hold->second.until = time(nullptr) + OverseerDecisions::MAIL_WALK_LINGER_SECONDS;
+        AnchorHoldWhereItStands(hold->second, who);
+    }
+
+    static char const* DoMailWalk(Player* who, std::string const& command, char const*& status,
+                                  std::string& out, std::vector<MailWalkCheck>& walking,
+                                  uint32 id)
+    {
+        namespace D = OverseerDecisions;
+        namespace R = OverseerDecisions::MailWalkRefusal;
+
+        MailWalkEvidence ev;
+        ev.character = who->GetName();
+        ev.request = command;
+        ev.mapId = who->GetMapId();
+        ev.fromX = who->GetPositionX();
+        ev.fromY = who->GetPositionY();
+        ev.fromZ = who->GetPositionZ();
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = MailWalkJson(ev, "refused", reason);
+            LOG_INFO("module.overseer",
+                     "overseer: mailbox walk {} for '{}' refused: {}", id, ev.character, reason);
+            return reason;
+        };
+
+        D::MailWalkRequest const req = D::ParseMailWalkRequest(command);
+        if (*req.error)
+            return refuse(req.error);
+        ev.capYards = req.maxYards;
+
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(who);
+        WorldSession* session = who->GetSession();
+        Map* map = who->GetMap();
+
+        D::MailWalkGateFacts gate;
+        gate.hasBotAI = botAI != nullptr;
+        gate.inWorld = who->IsInWorld() && map;
+        gate.loggingOut = !session || session->isLogingOut();
+        gate.alive = who->IsAlive();
+        gate.inFlight = who->IsInFlight();
+        gate.inCombat = who->IsInCombat();
+        gate.inInstance = map && map->Instanceable();
+        gate.onRoster = OnRoster(ev.character);
+        Group* group = who->GetGroup();
+        gate.groupedFollower = group && group->GetLeaderGUID() != who->GetGUID();
+        for (MailWalkCheck const& check : walking)
+            if (check.targetName == ev.character)
+                gate.alreadyWalking = true;
+        {
+            auto const& holds = HoldsInForce();
+            auto const hold = holds.find(ev.character);
+            gate.heldByAnother = HeldStill(ev.character) && hold != holds.end()
+                && hold->second.verb != MAIL_WALK_HOLD_VERB;
+        }
+        if (char const* wall = D::MailWalkGate(gate); *wall)
+            return refuse(wall);
+
+        // A linger left by an earlier walk is this verb's own and is replaced
+        // rather than re-asserted, so the new walk gets its own ceiling.
+        ReleaseHold(ev.character, who, "a new mailbox walk replaces it", MAIL_WALK_HOLD_VERB);
+
+        // ALREADY AT A BOX. Nothing to walk; held there for the linger so the
+        // `send` finds it where it is now.
+        if (MailboxInReach(who, ev.reachedName, ev.reachedYards))
+        {
+            ev.alreadyThere = true;
+            HoldStillAndReport(who, ev.character, MAIL_WALK_HOLD_VERB, ev.hold,
+                               D::MAIL_WALK_LINGER_SECONDS, false);
+            LOG_INFO("module.overseer",
+                     "overseer: mailbox walk {} - '{}' already stands at '{}' ({:.1f} yards); "
+                     "held there for up to {}s for the letter",
+                     id, ev.character, ev.reachedName, ev.reachedYards,
+                     D::MAIL_WALK_LINGER_SECONDS);
+            status = "applied";
+            out = MailWalkJson(ev, "arrived", "");
+            return "";
+        }
+
+        // ---- which mailbox --------------------------------------------------
+        std::vector<GameObjectData const*> spawns;
+        MailboxSpawnsOnMap(who, spawns);
+        ev.mailboxesOnMap = static_cast<uint32>(spawns.size());
+
+        std::vector<D::MailboxCandidate> candidates;
+        candidates.reserve(spawns.size());
+        std::vector<std::pair<float, float>> spots;
+        std::vector<std::size_t> spotOf;
+        for (std::size_t i = 0; i < spawns.size(); ++i)
+        {
+            GameObjectData const* data = spawns[i];
+            D::MailboxCandidate box;
+            box.x = data->posX;
+            box.y = data->posY;
+            box.z = data->posZ;
+            candidates.push_back(box);
+            // Only a box that could be chosen is worth the threat sweep.
+            if (who->GetExactDist(data->posX, data->posY, data->posZ) <= ev.capYards)
+            {
+                spots.emplace_back(data->posX, data->posY);
+                spotOf.push_back(i);
+            }
+        }
+        if (!spots.empty())
+        {
+            std::vector<NearbyThreat> threats;
+            HostileSpawnsNearEach(who, ev.mapId, spots, TRAVEL_THREAT_RADIUS, 0, true, threats);
+            for (std::size_t s = 0; s < threats.size(); ++s)
+                if (threats[s].count)
+                    candidates[spotOf[s]].otherSidesGround = true;
+        }
+
+        D::MailboxChoice const choice = D::ChooseNearestMailbox(
+            candidates, ev.fromX, ev.fromY, ev.fromZ, ev.capYards);
+        ev.nearestYards = choice.nearestYards;
+        if (choice.index < 0)
+        {
+            ev.startYards = choice.yards;
+            return refuse(choice.error);
+        }
+
+        GameObjectData const* chosen = spawns[static_cast<std::size_t>(choice.index)];
+        ev.haveMailbox = true;
+        ev.mailboxSpawn = chosen->spawnId;
+        ev.mailboxEntry = chosen->id;
+        if (GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(chosen->id))
+            ev.mailboxName = tmpl->name;
+        ev.boxX = chosen->posX;
+        ev.boxY = chosen->posY;
+        ev.boxZ = chosen->posZ;
+        ev.startYards = choice.yards;
+        ev.bestYards = choice.yards;
+        ev.nowYards = choice.yards;
+
+        // ---- the way there ---------------------------------------------------
+        //
+        // The straight line is swept for the other side's people at the route
+        // planner's own spacing. The walk bends round buildings, but inside a
+        // 600 yard cap and a 60 yard threat radius the line is where it goes.
+        {
+            std::vector<D::MailWalkPoint> const line = D::MailWalkLineSamples(
+                ev.fromX, ev.fromY, ev.boxX, ev.boxY, TRAVEL_ROUTE_GUARDED_SPACING_YARDS);
+            std::vector<std::pair<float, float>> points;
+            points.reserve(line.size());
+            for (D::MailWalkPoint const& p : line)
+                points.emplace_back(p.x, p.y);
+            std::vector<NearbyThreat> threats;
+            HostileSpawnsNearEach(who, ev.mapId, points, TRAVEL_THREAT_RADIUS, 0, true, threats);
+            for (NearbyThreat const& threat : threats)
+                if (threat.count)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: mailbox walk {} - the line from '{}' to '{}' passes "
+                             "'{}' (level {}), the other side's",
+                             id, ev.character, ev.mailboxName, threat.name, threat.level);
+                    return refuse(R::OtherSidesGround);
+                }
+        }
+
+        ev.timeoutMs = D::MailWalkTimeoutSeconds(ev.startYards) * 1000u;
+
+        // ---- hold, then walk ------------------------------------------------
+        //
+        // HOLD FIRST, WALK SECOND, in that order for the reason #355 wrote
+        // down: a hold placed after a walk kills the walk. The ceiling is the
+        // walk's own timeout plus a margin, so the expiry sweep can only ever
+        // pick up a walk nothing came back for. `readyToCast` false: a walker
+        // may keep its mount.
+        HoldStillAndReport(who, ev.character, MAIL_WALK_HOLD_VERB, ev.hold,
+                           ev.timeoutMs / 1000u + MAIL_WALK_HOLD_MARGIN_SECONDS, false);
+        if (!ev.hold.applied)
+            return refuse(R::HeldByAnother);
+
+        if (!IssueMailWalkLeg(who, ev, true))
+        {
+            ReleaseHold(ev.character, who, "the ground toward the mailbox gave no step",
+                        MAIL_WALK_HOLD_VERB);
+            ev.groundRefusals = 1;
+            return refuse(R::GroundRefused);
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: mailbox walk {} - '{}' walks to '{}' (spawn {}) {:.0f} yards away on "
+                 "map {}, nearest of {} on the map; given {}s",
+                 id, ev.character, ev.mailboxName, ev.mailboxSpawn, ev.startYards, ev.mapId,
+                 ev.mailboxesOnMap, ev.timeoutMs / 1000u);
+
+        MailWalkCheck check;
+        check.id = id;
+        check.targetName = ev.character;
+        check.ev = ev;
+        walking.push_back(check);
+
+        status = "verifying";
+        out = MailWalkJson(ev, "walking", "");
+        return "";
+    }
+
+    // WHERE A WALK IS DRIVEN AND ANSWERED. Every poll: read where the walker
+    // is, judge it, and either hand it its next leg or end the row.
+    void ResolveMailWalks(uint32 elapsedMs)
+    {
+        namespace D = OverseerDecisions;
+        if (_pendingMailWalks.empty())
+            return;
+
+        std::vector<MailWalkCheck> still;
+        still.reserve(_pendingMailWalks.size());
+
+        for (MailWalkCheck& check : _pendingMailWalks)
+        {
+            MailWalkEvidence& ev = check.ev;
+            ev.waitedMs += elapsedMs;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+            D::MailWalkFacts facts;
+            facts.present = bot && bot->IsInWorld();
+            facts.alive = facts.present && bot->IsAlive();
+            facts.inFlight = facts.present && bot->IsInFlight();
+            facts.sameMap = facts.present && bot->GetMapId() == ev.mapId;
+            facts.inCombat = facts.present && bot->IsInCombat();
+            if (facts.present && facts.sameMap)
+            {
+                ev.nowYards = bot->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
+                if (D::MailWalkMadeProgress(ev.bestYards, ev.nowYards))
+                {
+                    ev.bestYards = ev.nowYards;
+                    ev.sinceProgressMs = 0;
+                }
+                else
+                    ev.sinceProgressMs += elapsedMs;
+                if (facts.alive)
+                    facts.mailboxInReach = MailboxInReach(bot, ev.reachedName, ev.reachedYards);
+            }
+            facts.waitedMs = ev.waitedMs;
+            facts.timeoutMs = ev.timeoutMs;
+            facts.sinceProgressMs = ev.sinceProgressMs;
+            facts.groundRefusals = ev.groundRefusals;
+
+            D::MailWalkState const state = D::JudgeMailWalk(facts);
+
+            if (state == D::MailWalkState::Walking)
+            {
+                // STILL OURS? Something else lifting the hold (a relog, an
+                // operator) ends the walk: walking a bot nothing is holding
+                // would be this module steering a free character.
+                auto const& holds = HoldsInForce();
+                auto const hold = holds.find(check.targetName);
+                if (hold == holds.end() || hold->second.verb != MAIL_WALK_HOLD_VERB)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: mailbox walk {} - '{}' is no longer held by the walk; "
+                             "ending it where it stands",
+                             check.id, check.targetName);
+                    ev.reachedName.clear();
+                    CharacterDatabase.Execute(
+                        "UPDATE overseer_command SET status = 'error', detail = '{}', "
+                        "result = '{}' WHERE id = {} AND status = 'verifying' "
+                        "AND claimed_by = '{}'",
+                        "the walk's hold was lifted by something else",
+                        EscLong(MailWalkJson(ev, "abandoned",
+                                             "the walk's hold was lifted by something else")),
+                        check.id, g_runToken);
+                    continue;
+                }
+                if (IssueMailWalkLeg(bot, ev, false))
+                    ev.groundRefusals = 0;
+                else
+                    ++ev.groundRefusals;
+                still.push_back(check);
+                continue;
+            }
+
+            char const* status = "error";
+            char const* reason = D::MailWalkEndReason(state);
+            char const* word = D::MailWalkStateWord(state);
+
+            if (state == D::MailWalkState::Arrived)
+            {
+                HoldAtTheMailbox(bot, check.targetName);
+                status = "applied";
+                LOG_INFO("module.overseer",
+                         "overseer: mailbox walk {} - '{}' reached '{}' ({:.1f} yards, the core "
+                         "would open it) after {}ms and {} leg(s); held there for up to {}s for "
+                         "the letter",
+                         check.id, check.targetName, ev.reachedName, ev.reachedYards,
+                         ev.waitedMs, ev.legs, D::MAIL_WALK_LINGER_SECONDS);
+            }
+            else
+            {
+                ev.reachedName.clear();
+                ReleaseHold(check.targetName, bot, reason, MAIL_WALK_HOLD_VERB);
+                if (state == D::MailWalkState::TimedOut || state == D::MailWalkState::Stalled
+                    || state == D::MailWalkState::GroundRefused)
+                    status = "unchanged";
+                LOG_WARN("module.overseer",
+                         "overseer: mailbox walk {} - '{}' {} after {}ms, {} leg(s), {:.0f} of "
+                         "{:.0f} yards still to go",
+                         check.id, check.targetName, reason, ev.waitedMs, ev.legs,
+                         ev.nowYards, ev.startYards);
+            }
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, reason, EscLong(MailWalkJson(ev, word, reason)), check.id, g_runToken);
+        }
+
+        _pendingMailWalks.swap(still);
+    }
 
     // --------------------------------------------------------------- share --
     //
