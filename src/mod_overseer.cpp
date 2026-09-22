@@ -6165,6 +6165,9 @@ private:
     // with an upstream one. Named anyway, because a bare literal in a MovePoint
     // call is the kind of thing somebody later reads as meaningful.
     static constexpr uint32 HOLD_PIN_POINT_ID = 0;
+    // How many names HoldCharacterStill remembers having refused in flight
+    // before it forgets them all (#559). Far above any roster this module runs.
+    static constexpr size_t FLIGHT_REFUSAL_SAID_MAX = 256;
 
     // HOW FAR A HELD CHARACTER MAY BE FROM ITS ANCHOR BEFORE THE PIN IS
     // RE-TAKEN (#358).
@@ -6504,10 +6507,16 @@ private:
         // a caller that reads the register back finds no new hold.
         //
         // SAID ONCE PER FLIGHT. The staging and regroup callers re-assert every
-        // poll, and a flight lasts minutes.
+        // poll, and a flight lasts minutes. BOUNDED: a name leaves when the
+        // same character is next asked on the ground, and one that never is
+        // would otherwise stay for the life of the world, so the memory is
+        // dropped whole past a roster's worth of names. The cost is one
+        // repeated line.
         static std::set<std::string> flightRefusalSaid;
         if (who->IsInFlight())
         {
+            if (flightRefusalSaid.size() >= FLIGHT_REFUSAL_SAID_MAX)
+                flightRefusalSaid.clear();
             if (flightRefusalSaid.insert(name).second)
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is on a taxi, so the {} hold is refused rather "
@@ -16380,9 +16389,13 @@ private:
     void DriveCatchUp(Player* p, Player* leader)
     {
         std::string const name = p->GetName();
-        // THIS POLL'S ANSWER ONLY (#560). Every member KeepTheFamilyTogether
-        // reads passes through here first on the same poll, so a refusal
-        // recorded below is always this poll's and never a stale one.
+        // THIS POLL'S ANSWER ONLY (#560). The ordering is KeepRosterFollowing's:
+        // its follow loop calls this for every member, and its last statement,
+        // after that loop, is KeepTheFamilyTogether, whose member filter (in
+        // this group, has a bot AI, no real player as master) is the loop's
+        // own. So every member the wait reads has passed through here earlier
+        // in the same poll, and a refusal recorded below is never a stale one.
+        // All of it runs on the world thread.
         _catchUpRefused.erase(name);
 
         // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Read

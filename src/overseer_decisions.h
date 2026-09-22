@@ -2786,7 +2786,9 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts);
 // errand read as "errand '' is outstanding", which describes a bug that does
 // not exist. This names the fence, or both, from the values the gate tested.
 //
-// Empty means neither fence is up and the column may be blanked. Otherwise it
+// Empty means neither fence applies to what stands in the column, so it may be
+// blanked: no profession errand, and nothing IsForeignTravelAim protects (a
+// keyword such as `trainer` is the book's to clear, as before). Otherwise it
 // is a whole clause, "a profession errand (skill 202) is outstanding", so the
 // caller cannot pair a plural subject with a singular verb.
 std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing);
