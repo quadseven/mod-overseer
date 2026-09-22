@@ -1377,6 +1377,14 @@ constexpr uint32 TRAVEL_FLIGHT_MAX_PER_ERRAND = 2;
 // drive can never be the same poll. See TravelHoldsTheWheel.
 constexpr time_t TRAVEL_HANDBACK_SECONDS = 45;
 
+// How long a travel errand let go of without clearing its column is left alone
+// before the same standing aim is walked again (#558). The same fifteen minutes
+// a called-off errand is refused for (ErrandDeathLimits::cooloffSeconds): long
+// enough that the pass that owns the aim has cleared or rewritten it many times
+// over, and short enough that an aim nobody ever clears is retried rather than
+// abandoned. A landing at a counter does not use this; its hold is its bound.
+constexpr time_t TRAVEL_LANDED_CEILING_SECONDS = 15 * 60;
+
 // WHAT AN ERRAND IS ALLOWED TO COST BEFORE IT IS CALLED OFF. The numbers are
 // AGENTS.md's own - "if deaths exceed roughly three in five minutes, clear the
 // aim" - and the cool-off is what stops the release being undone by the other
@@ -4367,6 +4375,7 @@ public:
             "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
             Esc(target), Esc(name));
         _state.erase(name);
+        _landed.erase(name);
         // AND THIS IS THE ONE PLACE THAT KNOWS WHOSE AIM IT IS. Claim is the
         // dungeon run coordinator's only door into this column, so membership
         // here IS "a run issued this errand" - the fact the death breaker needs
@@ -4407,14 +4416,29 @@ public:
         // Nothing else about this gate changes: it still only applies to an aim
         // this book never claimed, so a claimed aim is still cleared exactly as
         // before.
+        // WHATEVER THIS RELEASE LEAVES STANDING IS REMEMBERED, AND ONLY UNTIL
+        // THE NEXT ONE (#558). A release that skips its write leaves a live aim
+        // in the column with no memory of it on this side, which the next poll
+        // reads as a new errand. The landing recorded below is what stops
+        // that; see LandedStep and OverseerDecisions::LandedErrandStep.
+        _landed.erase(name);
+        std::string const standing = _claimed.count(name) ? std::string() : CurrentTravelNpc(name);
+        // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
+        // in the column the travel drive was not walking has not walked it at
+        // all, and must not stop the travel drive from starting it.
+        auto const driving = _state.find(name);
+        bool const wasDriving = driving != _state.end() && !standing.empty() &&
+                                driving->second.target == standing;
         if (!_claimed.count(name) &&
-            (LearnSkillPending(name) || OverseerDecisions::IsForeignTravelAim(CurrentTravelNpc(name))))
+            (LearnSkillPending(name) || OverseerDecisions::IsForeignTravelAim(standing)))
         {
             LOG_INFO("module.overseer",
                      "overseer: travel release for '{}' skipped the column "
                      "write - errand '{}' is outstanding and this book never "
                      "claimed the aim it would have erased",
-                     name, CurrentTravelNpc(name));
+                     name, standing);
+            if (wasDriving)
+                _landed[name] = Landing{standing, std::time(nullptr), false};
         }
         else
         {
@@ -4443,6 +4467,54 @@ public:
         _handback[name] = std::time(nullptr);
     }
 
+    // A LANDING THAT IS A VISIT TO A COUNTER (#558). Called by DriveTravel
+    // straight after the Release that ends an arrival at which it took the
+    // counter hold. The hold is then the landing's bound instead of the
+    // ceiling: the aim is walked again as soon as the hold is gone, so a
+    // character that drifted off the counter with sales still outstanding is
+    // walked back to it. A no-op when the release cleared the column, since
+    // there is then no landing to mark.
+    void MarkCounterLanding(std::string const& name, std::string const& target)
+    {
+        auto const it = _landed.find(name);
+        if (it == _landed.end() || it->second.aim != target)
+            return;
+        it->second.atCounter = true;
+    }
+
+    // WHAT DriveTravel DOES WITH THIS ROW, asked of the landing this book
+    // remembers. See OverseerDecisions::LandedErrandStep. Says once per landing
+    // that it is standing down, so the log shows why a standing aim is not
+    // being walked.
+    OverseerDecisions::LandedErrand LandedStep(std::string const& name,
+                                               std::string const& columnAim,
+                                               bool counterHoldActive)
+    {
+        auto const it = _landed.find(name);
+        if (it == _landed.end())
+            return OverseerDecisions::LandedErrand::NotLanded;
+        OverseerDecisions::LandedErrand const step = OverseerDecisions::LandedErrandStep(
+            it->second.aim, columnAim, it->second.atCounter, counterHoldActive,
+            static_cast<int64_t>(std::time(nullptr) - it->second.since),
+            static_cast<int64_t>(TRAVEL_LANDED_CEILING_SECONDS));
+        if (step == OverseerDecisions::LandedErrand::StandDown && !it->second.said)
+        {
+            it->second.said = true;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' was let go of '{}' and the pass that wrote it "
+                     "has not cleared it - not walked there again {}",
+                     name, columnAim,
+                     it->second.atCounter
+                         ? std::string("while its counter hold stands")
+                         : "for up to " +
+                               std::to_string(TRAVEL_LANDED_CEILING_SECONDS / 60) +
+                               " minutes");
+        }
+        else if (step == OverseerDecisions::LandedErrand::Resume)
+            _landed.erase(it);
+        return step;
+    }
+
     // An errand can also end without either drive touching it: the bridge owns
     // the column too and clears it when it re-aims the family. Such a row simply
     // stops coming back from Load(), so nothing INSIDE DriveTravel's loop can
@@ -4463,6 +4535,16 @@ public:
             _handback[it->first] = std::time(nullptr);
             _claimed.erase(it->first);
             it = _state.erase(it);
+        }
+        // A landing has no `_state` entry, because Release erased it, so the
+        // loop above never sees one. The writer clearing the column is the
+        // ordinary end of a landing, and this is where it is noticed.
+        for (auto it = _landed.begin(); it != _landed.end();)
+        {
+            if (stillAimed.count(it->first))
+                ++it;
+            else
+                it = _landed.erase(it);
         }
     }
 
@@ -4617,6 +4699,18 @@ private:
     // by Claim, which is its only door into the column, and erased by Release
     // and PruneVanished - every way an errand can end.
     std::map<std::string, std::string> _claimed;
+    // An aim this book was driving, let go of, and left standing in the column
+    // because it was not this book's to erase (#558). Written by Release and
+    // MarkCounterLanding, erased by Claim, Release, PruneVanished and
+    // LandedStep. World thread only.
+    struct Landing
+    {
+        std::string aim;
+        time_t since{0};
+        bool atCounter{false};
+        bool said{false};
+    };
+    std::map<std::string, Landing> _landed;
     // Which errand each character was last called off, so a re-aim at it is
     // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
@@ -17604,6 +17698,18 @@ private:
             // loop declined to move.
             stillAimed.insert(name);
 
+            // AN AIM THIS DRIVE HAS ALREADY LET GO OF IS NOT A NEW ERRAND
+            // (#558). The pass that wrote it clears it, and until it does the
+            // row keeps coming back here. Read as new, it resets the errand
+            // below: at a vendor that reset took down the counter hold the
+            // arrival had just put up, every five seconds, with no sale ever
+            // queued; on an `at:` aim it walked a given-up walk again at once,
+            // nine times in ten minutes. Asked before StateFor, because
+            // StateFor is what would start the new errand.
+            if (_travelAims.LandedStep(name, target, HasCounterHold(name)) ==
+                OverseerDecisions::LandedErrand::StandDown)
+                continue;
+
             // SteerableAI, not a bare lookup: a name can resolve to a
             // Player that is mid-login or mid-teardown, and its AI pointer is
             // non-null right up until it is freed. See SteerableAI above.
@@ -18833,6 +18939,8 @@ private:
                                  "overseer: '{}' reached '{}' (creature {}) - errand done, "
                                  "releasing", name, target, entry);
                         _travelAims.Release(name);
+                        if (arrival == OverseerDecisions::CounterArrival::StandAndTrade)
+                            _travelAims.MarkCounterLanding(name, target);
                         continue;
                     }
                 }

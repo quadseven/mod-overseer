@@ -1591,6 +1591,25 @@ bool IsForeignTravelAim(std::string const& aim)
     return aim.rfind("at:", 0) == 0;
 }
 
+LandedErrand LandedErrandStep(std::string const& landedAim,
+                              std::string const& columnAim,
+                              bool atCounter,
+                              bool counterHoldActive,
+                              int64_t landedForSeconds,
+                              int64_t ceilingSeconds)
+{
+    if (landedAim.empty())
+        return LandedErrand::NotLanded;
+    // Asked first: a rewritten column is the writer's next errand, and nothing
+    // about the last one may hold the character back from it.
+    if (columnAim != landedAim)
+        return LandedErrand::Resume;
+    if (atCounter)
+        return counterHoldActive ? LandedErrand::StandDown : LandedErrand::Resume;
+    return landedForSeconds < ceilingSeconds ? LandedErrand::StandDown
+                                             : LandedErrand::Resume;
+}
+
 MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
                                           unsigned outstandingErrands,
                                           time_t heldForSeconds,
