@@ -9661,6 +9661,53 @@ std::vector<RaidMove> RaidSeatingMoves(std::vector<RaidSeatNow> const& seats)
     return moves;
 }
 
+char const* GuildRemoveRefusalSaid(GuildRemoveRefusal refusal)
+{
+    switch (refusal)
+    {
+        case GuildRemoveRefusal::None:
+            return "";
+        case GuildRemoveRefusal::NoTarget:
+            return "no character to remove (put the name in target_arg)";
+        case GuildRemoveRefusal::NoSuchCharacter:
+            return "no character of that name exists";
+        case GuildRemoveRefusal::NotInThisGuild:
+            return "that character is not in this guild";
+        case GuildRemoveRefusal::OnRoster:
+            return "that character is on the roster, and the family is never removed by a row";
+        case GuildRemoveRefusal::NoRight:
+            return "the acting character has no right to remove members";
+        case GuildRemoveRefusal::TargetIsMaster:
+            return "the guild master cannot be removed";
+        case GuildRemoveRefusal::RankNotBelow:
+            return "that character is not of a lower rank than the acting character";
+    }
+    return "";
+}
+
+GuildRemoveRefusal GuildRemoveVerdictFor(GuildRemoveFacts const& facts)
+{
+    if (!facts.named)
+        return GuildRemoveRefusal::NoTarget;
+    if (!facts.exists)
+        return GuildRemoveRefusal::NoSuchCharacter;
+    if (!facts.inThisGuild)
+        return GuildRemoveRefusal::NotInThisGuild;
+    if (facts.onRoster)
+        return GuildRemoveRefusal::OnRoster;
+    // The core's three, in the core's order.
+    if (!facts.actorMayRemove)
+        return GuildRemoveRefusal::NoRight;
+    if (facts.targetRank == GUILD_RANK_MASTER)
+        return GuildRemoveRefusal::TargetIsMaster;
+    // Member::IsRankNotLower is `m_rankId <= rankId`: a target whose id is not
+    // strictly larger than the actor's is on the same rung or above it. This
+    // also refuses a character removing itself.
+    if (facts.targetRank <= facts.actorRank)
+        return GuildRemoveRefusal::RankNotBelow;
+    return GuildRemoveRefusal::None;
+}
+
 GuildRequest ParseGuildRequest(std::string const& command)
 {
     GuildRequest request;
@@ -9698,6 +9745,14 @@ GuildRequest ParseGuildRequest(std::string const& command)
         // ALSO put Cogwin in target_arg is not wrong, it is just saying it
         // twice, and refusing that would be a trap rather than a check.
         request.verb = GuildVerb::Invite;
+        return request;
+    }
+
+    if (verb == "remove")
+    {
+        // Same shape as `invite`: the character is in `target_arg`, and a name
+        // repeated here is saying it twice rather than saying it wrong.
+        request.verb = GuildVerb::Remove;
         return request;
     }
 

@@ -36401,6 +36401,92 @@ private:
         if (!guild)
             return refuse("that character is in no guild");
 
+        if (request.verb == GuildVerb::Remove)
+        {
+            // BEFORE THE ROSTER READ, like the tabard: one member and the guild
+            // object are the whole of what this needs.
+            //
+            // THE REMOVAL IS Guild::HandleRemoveMember AND NOT DeleteMember,
+            // because HandleRemoveMember is the path a player's /gremove takes:
+            // it asks the rank right and the rank order itself, calls
+            // DeleteMember with isKicked, writes the uninvite into the guild
+            // event log and tells every online member. Calling DeleteMember
+            // directly would skip the log and the broadcast, and would skip the
+            // core's own permission check, which is the one this verb must not
+            // be able to get round.
+            //
+            // THE GATES ARE ASKED HERE FIRST ANYWAY, for the reason the invite
+            // path gives: the core answers a refusal with a packet to a client,
+            // and a bot has no client to read it. Without them a refused
+            // removal would come back with nothing changed and no reason.
+            using OverseerDecisions::GuildRemoveFacts;
+            using OverseerDecisions::GuildRemoveRefusal;
+            using OverseerDecisions::GuildRemoveRefusalSaid;
+            using OverseerDecisions::GuildRemoveVerdictFor;
+
+            GuildRemoveFacts facts;
+            facts.named = !targetArg.empty();
+            ObjectGuid const targetGuid =
+                facts.named ? sCharacterCache->GetCharacterGuidByName(targetArg) : ObjectGuid::Empty;
+            facts.exists = !targetGuid.IsEmpty();
+            Guild::Member const* target = facts.exists ? guild->GetMember(targetGuid) : nullptr;
+            facts.inThisGuild = target != nullptr;
+            facts.onRoster = facts.named && OnRoster(targetArg);
+            facts.actorMayRemove = guild->HasRankRight(who, GR_RIGHT_REMOVE);
+            if (Guild::Member const* me = guild->GetMember(who->GetGUID()))
+                facts.actorRank = me->GetRankId();
+            if (target)
+                facts.targetRank = target->GetRankId();
+
+            // Copied now: after the removal `target` points at a member that
+            // no longer exists.
+            std::string const targetName = target ? target->GetName() : targetArg;
+            uint32 const membersBefore = guild->GetMemberCount();
+            {
+                std::ostringstream o;
+                o << "\"guild\":" << J(guild->GetName())
+                  << ",\"target\":" << J(targetName)
+                  << ",\"actor_rank\":" << facts.actorRank
+                  << ",\"target_rank\":" << facts.targetRank
+                  << ",\"members_before\":" << membersBefore;
+                note = o.str();
+            }
+
+            GuildRemoveRefusal const refusal = GuildRemoveVerdictFor(facts);
+            if (refusal != GuildRemoveRefusal::None)
+            {
+                // Static storage, so the column can take it after return.
+                describe("refused", GuildRemoveRefusalSaid(refusal));
+                status = "unchanged";
+                return GuildRemoveRefusalSaid(refusal);
+            }
+
+            uint32 const guildId = guild->GetId();
+            guild->HandleRemoveMember(who->GetSession(), targetName);
+
+            // Read the world back rather than believing a void call.
+            Guild* after = sGuildMgr->GetGuildById(guildId);
+            if (!after)
+                return refuse("the guild was not there when it was read back");
+            if (after->GetMember(targetGuid))
+                return refuse("the core kept that character in the guild");
+
+            {
+                std::ostringstream o;
+                o << note << ",\"members_after\":" << after->GetMemberCount();
+                note = o.str();
+            }
+
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' removed '{}' from guild '{}' ({}); {} members now",
+                     who->GetName(), targetName, after->GetName(), guildId,
+                     after->GetMemberCount());
+
+            describe("removed", "");
+            status = "applied";
+            return "";
+        }
+
         if (request.verb == GuildVerb::Tabard)
         {
             // BEFORE THE ROSTER READ, on purpose: a tabard is five numbers and
