@@ -2682,6 +2682,47 @@ bool IsMaintenanceErrand(std::string const& aim);
 // ReadSplitErrand is a change to dungeon behaviour and wants its own argument.
 bool IsForeignTravelAim(std::string const& aim);
 
+// WHAT THE TRAVEL DRIVE DOES WITH AN AIM IT HAS ALREADY ARRIVED AT AND COULD
+// NOT CLEAR (#558).
+//
+// TWO OWNERS OF ONE AIM, AND ONLY ONE OF THEM WRITES IT. The pass outside the
+// worldserver writes a counter aim and is the only thing that clears it: it
+// holds `vendor` while its sell queue is outstanding and releases it when the
+// queue drains. TravelAimBook::Release deliberately skips the column write for
+// an aim it never claimed, so the arrival branch that says "errand done,
+// releasing" leaves the aim standing, and that is correct.
+//
+// WHAT WAS NOT CORRECT IS THE NEXT POLL. Release also erases the book's own
+// memory of the errand, so the next poll met the same standing aim with no
+// memory of it, read it as a NEW errand, and the new-errand branch took down
+// the counter hold the arrival had just put up ("sent somewhere else and cannot
+// be both at a counter and on its way to one"). Measured on the dev realm every
+// five seconds for the Alliance leader, and no sell row issued for over an
+// hour while the family's bags stayed full.
+//
+// So an arrival whose release could not clear the column is remembered as
+// LANDED, and a landed aim is not walked again while the counter hold it took
+// is still in force. It resumes as an ordinary errand when the hold is gone,
+// which is the bound: a latched aim costs one hold window per cycle, not a
+// character stood still for ever.
+enum class LandedErrand : uint8_t
+{
+    NotLanded,  // nothing remembered; the aim is an ordinary errand
+    StandDown,  // arrived, uncleared, hold in force: leave the character alone
+    Resume,     // forget the landing and treat the aim as an ordinary errand
+};
+
+// `landedAim` is the aim this character last arrived at without clearing, or
+// empty. `columnAim` is `travel_npc` now. `counterHoldActive` is whether the
+// counter hold the arrival took is still in the register.
+//
+// A COLUMN THAT NOW NAMES SOMETHING ELSE RESUMES, and the new-errand branch
+// then releases the hold on purpose: the writer has sent the character
+// somewhere new, which is the case that branch was written for.
+LandedErrand LandedErrandStep(std::string const& landedAim,
+                              std::string const& columnAim,
+                              bool counterHoldActive);
+
 enum class MaintenanceHold : uint8_t
 {
     Open,         // nothing is outstanding; the run may start

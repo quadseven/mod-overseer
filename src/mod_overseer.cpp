@@ -4367,6 +4367,7 @@ public:
             "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
             Esc(target), Esc(name));
         _state.erase(name);
+        _landed.erase(name);
         // AND THIS IS THE ONE PLACE THAT KNOWS WHOSE AIM IT IS. Claim is the
         // dungeon run coordinator's only door into this column, so membership
         // here IS "a run issued this errand" - the fact the death breaker needs
@@ -4407,14 +4408,22 @@ public:
         // Nothing else about this gate changes: it still only applies to an aim
         // this book never claimed, so a claimed aim is still cleared exactly as
         // before.
+        // WHATEVER THIS RELEASE LEAVES STANDING IS REMEMBERED, AND ONLY UNTIL
+        // THE NEXT ONE (#558). A release that skips its write leaves a live aim
+        // in the column with no memory of it on this side, which the next poll
+        // reads as a new errand. MarkLanded below is what an arrival does with
+        // that; every other release simply overwrites or forgets it here.
+        _landed.erase(name);
+        std::string const standing = _claimed.count(name) ? std::string() : CurrentTravelNpc(name);
         if (!_claimed.count(name) &&
-            (LearnSkillPending(name) || OverseerDecisions::IsForeignTravelAim(CurrentTravelNpc(name))))
+            (LearnSkillPending(name) || OverseerDecisions::IsForeignTravelAim(standing)))
         {
             LOG_INFO("module.overseer",
                      "overseer: travel release for '{}' skipped the column "
                      "write - errand '{}' is outstanding and this book never "
                      "claimed the aim it would have erased",
-                     name, CurrentTravelNpc(name));
+                     name, standing);
+            _landed[name] = Landing{standing, false};
         }
         else
         {
@@ -4443,6 +4452,38 @@ public:
         _handback[name] = std::time(nullptr);
     }
 
+    // THE ARRIVAL HALF OF THE ABOVE (#558). Called by DriveTravel straight
+    // after the Release that ends an arrived errand. When that release left
+    // `target` standing in the column - the aim is the pass outside the
+    // worldserver's, and only that pass clears it - the character is marked as
+    // having LANDED on it, so the next poll does not read the same aim as a
+    // new errand and take down the counter hold the arrival just put up. See
+    // OverseerDecisions::LandedErrandStep for the whole argument.
+    void MarkLanded(std::string const& name, std::string const& target)
+    {
+        auto const it = _landed.find(name);
+        if (it == _landed.end() || it->second.aim != target)
+            return;
+        it->second.arrived = true;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' arrived at '{}', which the pass that wrote it "
+                 "clears - not walked there again while its counter hold stands",
+                 name, target);
+    }
+
+    // The aim this character landed on and could not clear, or empty.
+    std::string LandedAim(std::string const& name) const
+    {
+        auto const it = _landed.find(name);
+        return it == _landed.end() || !it->second.arrived ? std::string()
+                                                         : it->second.aim;
+    }
+
+    void ForgetLanded(std::string const& name)
+    {
+        _landed.erase(name);
+    }
+
     // An errand can also end without either drive touching it: the bridge owns
     // the column too and clears it when it re-aims the family. Such a row simply
     // stops coming back from Load(), so nothing INSIDE DriveTravel's loop can
@@ -4463,6 +4504,16 @@ public:
             _handback[it->first] = std::time(nullptr);
             _claimed.erase(it->first);
             it = _state.erase(it);
+        }
+        // A landing has no `_state` entry, because Release erased it, so the
+        // loop above never sees one. The writer clearing the column is the
+        // ordinary end of a landing, and this is where it is noticed.
+        for (auto it = _landed.begin(); it != _landed.end();)
+        {
+            if (stillAimed.count(it->first))
+                ++it;
+            else
+                it = _landed.erase(it);
         }
     }
 
@@ -4617,6 +4668,16 @@ private:
     // by Claim, which is its only door into the column, and erased by Release
     // and PruneVanished - every way an errand can end.
     std::map<std::string, std::string> _claimed;
+    // What a release left standing in the column because the aim was not this
+    // book's to erase, and whether it was an arrival that left it (#558).
+    // Written by Release and MarkLanded, erased by Claim, Release,
+    // PruneVanished and ForgetLanded. World thread only.
+    struct Landing
+    {
+        std::string aim;
+        bool arrived{false};
+    };
+    std::map<std::string, Landing> _landed;
     // Which errand each character was last called off, so a re-aim at it is
     // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
@@ -17604,6 +17665,25 @@ private:
             // loop declined to move.
             stillAimed.insert(name);
 
+            // AN AIM THIS DRIVE HAS ALREADY ARRIVED AT IS NOT A NEW ERRAND
+            // (#558). The pass that wrote it clears it, and until it does the
+            // row keeps coming back here. Read as new, it resets the errand
+            // below and that reset takes down the counter hold the arrival put
+            // up - measured every five seconds on the dev realm, with no sale
+            // ever queued. Asked before StateFor, because StateFor is what
+            // would start the new errand.
+            switch (OverseerDecisions::LandedErrandStep(_travelAims.LandedAim(name),
+                                                        target, HasCounterHold(name)))
+            {
+                case OverseerDecisions::LandedErrand::StandDown:
+                    continue;
+                case OverseerDecisions::LandedErrand::Resume:
+                    _travelAims.ForgetLanded(name);
+                    break;
+                case OverseerDecisions::LandedErrand::NotLanded:
+                    break;
+            }
+
             // SteerableAI, not a bare lookup: a name can resolve to a
             // Player that is mid-login or mid-teardown, and its AI pointer is
             // non-null right up until it is freed. See SteerableAI above.
@@ -18833,6 +18913,7 @@ private:
                                  "overseer: '{}' reached '{}' (creature {}) - errand done, "
                                  "releasing", name, target, entry);
                         _travelAims.Release(name);
+                        _travelAims.MarkLanded(name, target);
                         continue;
                     }
                 }
