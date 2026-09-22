@@ -5737,6 +5737,16 @@ private:
     //
     // An empty result is not an error here. It is "no such column, or no roster",
     // and both mean the same thing to every caller: one family.
+    // Which family one character is in, or empty when the roster does not say.
+    // Reads through LoadRosterFamilies so there is one answer to this question
+    // and not two that can disagree.
+    static std::string FamilyOfCharacter(std::string const& name)
+    {
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
+        auto const it = families.find(name);
+        return it == families.end() ? std::string() : it->second;
+    }
+
     static std::map<std::string, std::string> LoadRosterFamilies()
     {
         std::map<std::string, std::string> families;
@@ -5758,8 +5768,24 @@ private:
     // THE leader, which is right for one family and wrong for two (#548).
     // Returns false when there is no roster at all, which is the case every
     // caller already treats as "nothing to do".
+    // WITH `wantFamily` SET THIS ASKS FOR ONE NAMED FAMILY AND NEVER SUBSTITUTES
+    // ANOTHER. Left empty it keeps its old behaviour exactly: whichever family
+    // ChooseCampaignRoster prefers, which is right for a campaign because a
+    // campaign is a thing the world runs one of.
+    //
+    // IT IS WRONG FOR ANYTHING A PARTICULAR FAMILY ASKED FOR, and founding a
+    // guild is the case that proved it (#548 step 2). A `form` row carried by a
+    // Horde character was answered with the ALLIANCE lead as founder, who is
+    // already in a guild, so the refusal read "the founder is already in
+    // another guild" about a character nobody had named. Measured on the dev
+    // realm 2026-09-22.
+    //
+    // A NAMED FAMILY THAT IS NOT THERE IS A REFUSAL, NOT A FALLBACK. Falling
+    // back to the preferred roster is how the defect above reads to a caller:
+    // something was founded, for somebody else.
     static bool LoadCampaignRoster(std::vector<std::string>& members,
-                                   std::string& leaderName)
+                                   std::string& leaderName,
+                                   std::string const& wantFamily = "")
     {
         QueryResult result = CharacterDatabase.Query(
             // `lead` is BACKTICKED: a reserved word in MySQL 8 (see
@@ -5783,8 +5809,20 @@ private:
 
         std::vector<OverseerDecisions::FamilyRoster> const rosters =
             OverseerDecisions::PartitionRosterByFamily(rows);
-        OverseerDecisions::FamilyRoster const* campaign =
-            OverseerDecisions::ChooseCampaignRoster(rosters);
+        OverseerDecisions::FamilyRoster const* campaign = nullptr;
+        if (wantFamily.empty())
+        {
+            campaign = OverseerDecisions::ChooseCampaignRoster(rosters);
+        }
+        else
+        {
+            for (OverseerDecisions::FamilyRoster const& roster : rosters)
+                if (roster.family == wantFamily)
+                {
+                    campaign = &roster;
+                    break;
+                }
+        }
         if (!campaign)
             return false;
 
@@ -8438,6 +8476,20 @@ private:
         QueryResult result = CharacterDatabase.Query(
             "SELECT 1 FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} LIMIT 1",
             mapId);
+        return result != nullptr;
+    }
+
+    // IS ANY RUN OPEN AT ALL, on any map? The map-keyed question above cannot
+    // answer for a STAGING aim, which is the case this exists for: a run
+    // stages its party outdoors, so the claim sits on a character standing on
+    // a continent while the run it belongs to is keyed to an instance map.
+    // Asking `ActiveRunOnMap(bot->GetMapId())` there returns false for a run
+    // that is perfectly real, and asking nothing at all returns true for a run
+    // that ended ten days ago.
+    static bool AnyActiveRun()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT 1 FROM overseer_dungeon_run WHERE state = 'active' LIMIT 1");
         return result != nullptr;
     }
 
@@ -17677,7 +17729,23 @@ private:
             // the verdict wants to know whose aim this is.
             {
                 OverseerDecisions::ErrandDeathToll toll;
-                toll.runOwned = _travelAims.RunOwns(name, target);
+                // A CLAIM IS ONLY DEFERRED TO WHEN SOMETHING CAN ANSWER FOR
+                // IT. `RunOwns` reads one fact - that the aim was Claimed -
+                // and nine call sites reach that door, of which a dungeon run
+                // is only one. The deference below is written for a run
+                // because "a timer ends the run"; with no run open, that
+                // sentence is about nothing, the release is declined for ever,
+                // and the errand is pinned by a claimant that will never come
+                // back to answer for it.
+                //
+                // MEASURED ON THE DEV REALM, 2026-09-22: the Alliance leader
+                // held a vendor aim that was refused sixty times in ten
+                // minutes - once every ten seconds - deferring to "the run" on
+                // every one of them, while the newest row in
+                // `overseer_dungeon_run` had ended ten days earlier. This is
+                // the same shape `catchUp` was added for (#298) and the same
+                // fix: a claim nothing answers for is answered here.
+                toll.runOwned = _travelAims.RunOwns(name, target) && AnyActiveRun();
                 // ...AND WHETHER THE CLAIMANT IS THE ONE NOTHING ANSWERS FOR
                 // (#298). `_claimed` says a claim exists and cannot say whose;
                 // a dungeon run was the only claimant when RunOwns was written
@@ -35485,7 +35553,12 @@ private:
                 // or have its members enrolled in it (#548).
                 std::vector<std::string> campaign;
                 std::string head;
-                if (LoadCampaignRoster(campaign, head))
+                // THE FAMILY THAT ASKED, taken from the character carrying the
+                // row. Without it this founds for whichever family the
+                // campaign picker prefers, which is how a Horde `form` was
+                // answered with the Alliance leader (#548 step 2).
+                if (LoadCampaignRoster(campaign, head,
+                                       FamilyOfCharacter(who->GetName())))
                 {
                     state.founderName = head;
                     state.founders = campaign;
