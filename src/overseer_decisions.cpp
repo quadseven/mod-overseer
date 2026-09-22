@@ -1982,6 +1982,17 @@ bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
     return held;
 }
 
+char const* GiveRangeRefusalFor(bool sameMap, float yards, float tradeYards)
+{
+    if (!sameMap)
+        return GiveRangeRefusal::OtherMap;
+    // Strictly under, as the core's own _IsWithinDist compares; and a reading
+    // that is not a number is not a reading of two characters together.
+    if (!(yards < tradeYards))
+        return GiveRangeRefusal::TooFar;
+    return "";
+}
+
 bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
                      std::string const& reason, time_t now)
 {

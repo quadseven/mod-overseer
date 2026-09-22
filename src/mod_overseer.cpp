@@ -32763,6 +32763,44 @@ private:
         if (receiver == giver)
             return refuse("same character", "giver and receiver are the same character");
 
+        // ---- WITHIN TRADE RANGE, OR NOT AT ALL (#566) ---------------------
+        //
+        // A give is a trade that skips the window, and it used to skip the
+        // distance as well: measured on the dev realm, an epic two-hander went
+        // from a warlock in Silithus to a paladin in Winterspring in one poll.
+        // The rule is the trade handler's own - GetDistance2d against
+        // TRADE_DISTANCE (11.11 yards, ObjectDefines.h), on one map - decided in
+        // OverseerDecisions::GiveRangeRefusalFor, and asked BEFORE anything is
+        // looked up or moved, so a refused give costs the giver nothing. Two
+        // characters standing together are unaffected; two apart are told to
+        // meet or to mail it, and the distance is on the row.
+        {
+            // WorldObject::IsInMap: the same map instance, which is the
+            // precondition IsWithinDistInMap puts before any distance.
+            bool const sameMap = giver->IsInMap(receiver);
+            float const yards = sameMap ? giver->GetDistance2d(receiver) : -1.f;
+            char const* const wall =
+                OverseerDecisions::GiveRangeRefusalFor(sameMap, yards, TRADE_DISTANCE);
+            if (*wall)
+            {
+                std::ostringstream o;
+                o << "{\"outcome\":\"refused\",\"reason\":" << J(wall)
+                  << ",\"from\":" << J(giver->GetName())
+                  << ",\"to\":" << J(receiverName)
+                  << ",\"request\":" << J(command)
+                  << ",\"same_map\":" << (sameMap ? "true" : "false")
+                  << ",\"giver_map\":" << giver->GetMapId()
+                  << ",\"receiver_map\":" << receiver->GetMapId();
+                if (sameMap)
+                    o << ",\"yards\":" << yards;
+                else
+                    o << ",\"yards\":null";
+                o << ",\"trade_distance\":" << TRADE_DISTANCE << "}";
+                out = o.str();
+                return arm(wall);
+            }
+        }
+
         Item* item = FindCarriedItem(giver, spec.byGuid, spec.key);
         if (!item)
             return refuse("item not found",
