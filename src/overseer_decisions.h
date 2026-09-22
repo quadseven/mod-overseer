@@ -12357,6 +12357,12 @@ enum class GuildVerb : std::uint8_t
     // `invite` - invite the character named in the row's `target_arg`, the same
     // column the give, share, trade and mail rows put a second character in.
     Invite,
+    // `remove` - take the character named in the row's `target_arg` out of the
+    // acting character's guild, through the core's own
+    // Guild::HandleRemoveMember, so the rank-right and rank-order rules the
+    // game applies to a player's /gremove are the rules this verb obeys. See
+    // GuildRemoveVerdictFor for the gates it asks first.
+    Remove,
     // `tabard <style> <colour> <borderStyle> <borderColour> <background>` -
     // five integers in the order the `guild` table stores them, which is the
     // order `EmblemInfo::LoadFromDB` reads them in. Positional rather than
@@ -12490,7 +12496,7 @@ constexpr unsigned GUILD_NAME_MAX = 24;
 // quote character - the rule every executor in this file keeps.
 namespace GuildRefusal
 {
-constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, tabard, bank or raid";
+constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, remove, tabard, bank or raid";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
 constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N>`, `buy-tab` or `grant-deposit rank:N`";
 constexpr char const* BankBuyTabTrailing = "bank buy-tab takes no argument";
@@ -12510,6 +12516,64 @@ constexpr char const* CountIsZero = "a shortlist of nothing is not a question";
 }  // namespace GuildRefusal
 
 GuildRequest ParseGuildRequest(std::string const& command);
+
+// -- taking a member out -------------------------------------------------------
+//
+// THE ONLY WAY OUT OF A GUILD THIS MODULE OFFERS, and it goes through the
+// game's own handler rather than round it. The guild's size is a decision the
+// operator makes (40 raiders, 10 on maintenance, 21 summoners), and a roster
+// the random-bot rotation filled by accident can only be brought to that shape
+// if somebody can leave. A DELETE on guild_member would skip the core's own
+// bookkeeping: the in-memory roster, the character cache, the event log and
+// the broadcast every online member receives.
+//
+// THE FACTS ARE READ BY THE ADAPTER AND JUDGED HERE, so the order of the gates
+// and the words each refusal says can be pinned by a test with no world.
+struct GuildRemoveFacts
+{
+    // target_arg was not empty.
+    bool named{false};
+    // A character of that name exists on the realm.
+    bool exists{false};
+    // And is a member of the ACTING CHARACTER'S guild. Removing a member of
+    // somebody else's guild is not this verb's business, and the core would
+    // not find the name in this guild's roster anyway.
+    bool inThisGuild{false};
+    // The target is on overseer_roster. A family character is never taken out
+    // by a row: the lineup places the family first and never lists it as
+    // surplus, so a remove naming one is a mistake, whoever wrote it.
+    bool onRoster{false};
+    // The acting character's rank carries GR_RIGHT_REMOVE.
+    bool actorMayRemove{false};
+    // Rank ids, where 0 is the guild master and a larger id is a lower rung.
+    unsigned actorRank{0};
+    unsigned targetRank{0};
+};
+
+enum class GuildRemoveRefusal : std::uint8_t
+{
+    None,
+    NoTarget,
+    NoSuchCharacter,
+    NotInThisGuild,
+    OnRoster,
+    // The three below are the core's own three refusals, in the order
+    // Guild::HandleRemoveMember asks them. The core answers each with a packet
+    // to a client that a bot does not have, so the row would otherwise come
+    // back with nothing changed and no reason.
+    NoRight,
+    TargetIsMaster,
+    RankNotBelow,
+};
+
+// The refusal literals, for the same reason GuildRefusal's are literals: they
+// go into the row's `detail` column after the executor has returned, and none
+// may carry a quote character.
+char const* GuildRemoveRefusalSaid(GuildRemoveRefusal refusal);
+
+// None means the core should be asked. It is not a promise that the core will
+// agree: the adapter reads the roster back afterwards and reports what it sees.
+GuildRemoveRefusal GuildRemoveVerdictFor(GuildRemoveFacts const& facts);
 // A movement generator that has exhausted its own retry budget must be
 // released before the upstream fallback can teleport the character.
 enum class TravelStuckAction

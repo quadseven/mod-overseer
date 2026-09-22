@@ -41,6 +41,10 @@ using OverseerDecisions::GuildNeeds;
 using OverseerDecisions::GuildNeedsFrom;
 using OverseerDecisions::GuildProfessionGaps;
 using OverseerDecisions::GuildProfessionView;
+using OverseerDecisions::GuildRemoveFacts;
+using OverseerDecisions::GuildRemoveRefusal;
+using OverseerDecisions::GuildRemoveRefusalSaid;
+using OverseerDecisions::GuildRemoveVerdictFor;
 using OverseerDecisions::GuildRequest;
 using OverseerDecisions::GuildRole;
 using OverseerDecisions::GuildRoleGaps;
@@ -948,6 +952,11 @@ void TheFiveVerbsParse()
     // saying it twice rather than saying it wrong.
     Check("and a second mention of the name is not a refusal",
           ParseGuildRequest("invite Cogwin").verb == GuildVerb::Invite);
+    Check("remove parses", ParseGuildRequest("remove").verb == GuildVerb::Remove);
+    Check("and so does remove with the name said twice",
+          ParseGuildRequest("remove Cogwin").verb == GuildVerb::Remove);
+    Check("remove is case insensitive too",
+          ParseGuildRequest("  REMOVE ").verb == GuildVerb::Remove);
 
     GuildRequest const form = ParseGuildRequest("form Stonefist Kin");
     Check("form parses", form.verb == GuildVerb::Form);
@@ -980,6 +989,120 @@ void TheFiveVerbsParse()
     CheckUnsigned("then border style", tabard.emblem[2], 1);
     CheckUnsigned("then border colour", tabard.emblem[3], 11);
     CheckUnsigned("and background last", tabard.emblem[4], 39);
+}
+
+// -- remove ------------------------------------------------------------------
+
+// A removable member: named, real, in this guild, not family, and on a rung
+// below an officer who holds the remove right. Each case below breaks exactly
+// one of these, so a failure names the gate that moved.
+GuildRemoveFacts Removable()
+{
+    GuildRemoveFacts facts;
+    facts.named = true;
+    facts.exists = true;
+    facts.inThisGuild = true;
+    facts.onRoster = false;
+    facts.actorMayRemove = true;
+    facts.actorRank = OverseerDecisions::GUILD_RANK_OFFICER;
+    facts.targetRank = OverseerDecisions::GUILD_RANK_INITIATE;
+    return facts;
+}
+
+void ARemoveGoesToTheCoreOnlyWhenEveryGatePasses()
+{
+    Check("a removable member is sent to the core",
+          GuildRemoveVerdictFor(Removable()) == GuildRemoveRefusal::None);
+
+    GuildRemoveFacts master = Removable();
+    master.actorRank = GUILD_RANK_MASTER;
+    master.targetRank = OverseerDecisions::GUILD_RANK_OFFICER;
+    Check("the guild master may remove an officer",
+          GuildRemoveVerdictFor(master) == GuildRemoveRefusal::None);
+
+    GuildRemoveFacts unnamed = Removable();
+    unnamed.named = false;
+    Check("no name is refused", GuildRemoveVerdictFor(unnamed) == GuildRemoveRefusal::NoTarget);
+
+    GuildRemoveFacts ghost = Removable();
+    ghost.exists = false;
+    Check("an unknown name is refused",
+          GuildRemoveVerdictFor(ghost) == GuildRemoveRefusal::NoSuchCharacter);
+
+    GuildRemoveFacts elsewhere = Removable();
+    elsewhere.inThisGuild = false;
+    Check("a character outside this guild is refused",
+          GuildRemoveVerdictFor(elsewhere) == GuildRemoveRefusal::NotInThisGuild);
+
+    GuildRemoveFacts family = Removable();
+    family.onRoster = true;
+    Check("a roster character is never removed by a row",
+          GuildRemoveVerdictFor(family) == GuildRemoveRefusal::OnRoster);
+
+    GuildRemoveFacts noRight = Removable();
+    noRight.actorMayRemove = false;
+    Check("an actor without the remove right is refused",
+          GuildRemoveVerdictFor(noRight) == GuildRemoveRefusal::NoRight);
+
+    GuildRemoveFacts leader = Removable();
+    leader.targetRank = GUILD_RANK_MASTER;
+    Check("the guild master is never removed",
+          GuildRemoveVerdictFor(leader) == GuildRemoveRefusal::TargetIsMaster);
+
+    // Member::IsRankNotLower is `<=`, so the SAME rung is refused as well as a
+    // higher one. An off-by-one here would let one officer remove another.
+    GuildRemoveFacts peer = Removable();
+    peer.targetRank = peer.actorRank;
+    Check("a member on the same rung is refused",
+          GuildRemoveVerdictFor(peer) == GuildRemoveRefusal::RankNotBelow);
+    GuildRemoveFacts above = Removable();
+    above.actorRank = OverseerDecisions::GUILD_RANK_MEMBER;
+    above.targetRank = OverseerDecisions::GUILD_RANK_VETERAN;
+    Check("and a member above the actor is refused",
+          GuildRemoveVerdictFor(above) == GuildRemoveRefusal::RankNotBelow);
+}
+
+void TheRemoveGatesAreAskedInOrder()
+{
+    // Everything wrong at once: the FIRST gate is the one reported. The module's
+    // own gates come before the core's, so a row naming a family member is
+    // refused as family whatever the actor's rank.
+    GuildRemoveFacts all;
+    Check("no name is asked first",
+          GuildRemoveVerdictFor(all) == GuildRemoveRefusal::NoTarget);
+    GuildRemoveFacts family = Removable();
+    family.onRoster = true;
+    family.actorMayRemove = false;
+    family.targetRank = GUILD_RANK_MASTER;
+    Check("family is asked before any of the core's rules",
+          GuildRemoveVerdictFor(family) == GuildRemoveRefusal::OnRoster);
+    // And among the core's three, the core's own order: rights, then the
+    // guild master, then rank.
+    GuildRemoveFacts core = Removable();
+    core.actorMayRemove = false;
+    core.targetRank = GUILD_RANK_MASTER;
+    Check("the right is asked before the guild master",
+          GuildRemoveVerdictFor(core) == GuildRemoveRefusal::NoRight);
+
+    // Every refusal names itself, and none carries a quote.
+    GuildRemoveRefusal const refusals[] = {
+        GuildRemoveRefusal::NoTarget, GuildRemoveRefusal::NoSuchCharacter,
+        GuildRemoveRefusal::NotInThisGuild, GuildRemoveRefusal::OnRoster,
+        GuildRemoveRefusal::NoRight, GuildRemoveRefusal::TargetIsMaster,
+        GuildRemoveRefusal::RankNotBelow};
+    bool named = true;
+    bool clean = true;
+    for (GuildRemoveRefusal refusal : refusals)
+    {
+        char const* said = GuildRemoveRefusalSaid(refusal);
+        named = named && *said;
+        for (char const* c = said; *c; ++c)
+            clean = clean && *c != 0x27 && *c != 0x22 && *c != 0x5c;
+    }
+    Check("every remove refusal says something", named);
+    Check("and no remove refusal carries a quote", clean);
+    CheckString("and None says nothing",
+                GuildRemoveRefusalSaid(GuildRemoveRefusal::None), "");
 }
 
 void ATabardIsFiveBytesOrItIsRefused()
@@ -1215,6 +1338,8 @@ int main()
     BankDepositParses();
     BankDepositItemParses();
     ABadRowIsRefusedByNameAndNeverSilently();
+    ARemoveGoesToTheCoreOnlyWhenEveryGatePasses();
+    TheRemoveGatesAreAskedInOrder();
 
     if (failures)
     {
