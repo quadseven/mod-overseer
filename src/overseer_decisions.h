@@ -12714,6 +12714,110 @@ bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
                                 bool isBotSession, std::string const& name,
                                 bool requireClient,
                                 std::vector<std::string> const& headless);
+
+// ------------------------------------------- the story of a notable item (#567) --
+//
+// WHAT THIS RECORDS. Three moments in the life of one item instance, keyed by
+// its guid so a reader can join them: somebody in one of the families' guilds
+// looted it (`item_loot`), somebody handed it to somebody else through one of
+// this module's commands (`item_given`), and somebody put it on
+// (`item_equip`). Only items of NOTABLE quality, which is rare (blue) and up.
+//
+// WHICH GUILDS. The guilds that at least one enabled roster character belongs
+// to, read from the database on the roster poll. Nothing is configured: a
+// family that forms or joins a guild brings that guild into the record, and a
+// realm with no roster records nothing.
+//
+// WHY EQUIP IS GATED DIFFERENTLY FOR A GUILD MEMBER THAN FOR A ROSTER
+// CHARACTER. A roster character's every equip has been recorded since the
+// table was created, and that does not change. A guild member who is not on
+// the roster is usually a random bot, and the bot factory issues whole sets of
+// rare gear on a level-up or a re-roll, each piece passing through the same
+// equip hook. Recording those would bury the handful of real drops under
+// hundreds of rows of issued kit. So a guild member's equip is recorded only
+// for an item this record ALREADY knows about - one it saw looted or handed
+// over - which is exactly the equip that finishes an item's story.
+
+// Rare. ItemTemplate::Quality: 0 poor, 1 common, 2 uncommon, 3 rare, 4 epic,
+// 5 legendary, 6 artifact, 7 heirloom.
+constexpr unsigned NOTABLE_ITEM_QUALITY = 3;
+
+bool IsNotableItemQuality(unsigned quality);
+
+// Who a character is to this record. Roster outranks guild membership: a
+// roster character is also usually a guild member, and the roster answer is
+// the one that decides equips.
+enum class ItemStoryWho
+{
+    Stranger,
+    GuildMember,
+    Roster,
+};
+
+// `guildId` 0 means no guild, and is never a story guild even if a caller
+// passes a list containing it.
+ItemStoryWho ClassifyItemStoryCharacter(bool onRoster, unsigned guildId,
+                                        std::vector<unsigned> const& storyGuilds);
+
+// A loot or a roll won: notable quality, looted by anybody this record covers.
+bool ShouldRecordItemLoot(unsigned quality, ItemStoryWho looter);
+
+// A hand-over: notable quality, and either side is somebody this record
+// covers. The row is written under the giver's name either way.
+bool ShouldRecordItemGiven(unsigned quality, ItemStoryWho from, ItemStoryWho to);
+
+// An equip. A roster character: always, whatever the quality, which is what
+// `item_equip` has always meant. A guild member: only a notable item the record
+// already knows (see above). A stranger: never.
+bool ShouldRecordItemEquip(unsigned quality, ItemStoryWho wearer, bool itemInStory);
+
+// How an item moved from one character to another. Written to
+// `overseer_event.via` for item_given, and for item_loot says whether it was
+// picked up or won on a roll.
+namespace ItemVia
+{
+constexpr char const* Give = "give";
+constexpr char const* Trade = "trade";
+constexpr char const* Mail = "mail";
+constexpr char const* Loot = "loot";
+constexpr char const* Need = "need";
+constexpr char const* Greed = "greed";
+}  // namespace ItemVia
+
+// `detail` and `source` are VARCHAR(255). Trims `text` to that many bytes
+// without splitting a UTF-8 character, which MySQL would refuse.
+constexpr std::size_t ITEM_STORY_COLUMN_BYTES = 255;
+void FitItemStoryColumn(std::string& text);
+
+// The human sentence for an item_given row's `detail`. The columns carry the
+// machine-readable copy; this is what a person reading the table sees.
+//   give  -> "given to Grog"
+//   trade -> "traded to Grog"
+//   mail  -> "mailed to Grog" or "mailed to Grog from <mailbox>"
+std::string ItemGivenDetail(std::string const& via, std::string const& to,
+                            std::string const& mailbox);
+
+// The human sentence for an item_loot row's `detail`.
+//   "looted from Edwin VanCleef", "won on a need roll from Edwin VanCleef",
+//   and just "looted" when the source could not be named.
+std::string ItemLootDetail(std::string const& via, std::string const& source);
+
+// The instance guids this record has seen looted or handed over, so a guild
+// member's equip can be matched to them. Bounded: a full book forgets its
+// oldest entry first, which costs at worst one equip row for an item looted
+// long ago, and cannot grow without limit on a realm that runs for months.
+struct ItemStoryBook
+{
+    std::vector<std::uint32_t> order;   // oldest first
+    std::size_t capacity{4096};
+};
+
+// Remember one guid. A guid already known is not added twice. 0 is not a guid
+// and is ignored.
+void RememberStoryItem(ItemStoryBook& book, std::uint32_t itemGuid);
+
+bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

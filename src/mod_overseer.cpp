@@ -3167,11 +3167,16 @@ struct EventKey
     std::string kind;
     uint32 subjectId = 0;
     uint32 bucket = 0;
+    // The item instance (#567). 0 for every kind that is not about one item,
+    // which keeps their collapsing exactly what it was before the key grew -
+    // see 2026_09_22_00_overseer_event_item_story.sql.
+    uint32 itemGuid = 0;
 
     bool operator<(EventKey const& other) const
     {
-        return std::tie(characterName, kind, subjectId, bucket) <
-               std::tie(other.characterName, other.kind, other.subjectId, other.bucket);
+        return std::tie(characterName, kind, subjectId, bucket, itemGuid) <
+               std::tie(other.characterName, other.kind, other.subjectId, other.bucket,
+                        other.itemGuid);
     }
 };
 
@@ -3200,6 +3205,17 @@ struct EventExtra
     std::string priorName;
     uint32 priorQuality = 0;
     uint32 priorItemLevel = 0;
+
+    // THE STORY OF ONE ITEM (#567), the four columns
+    // 2026_09_22_00_overseer_event_item_story added. item_loot, item_given and
+    // item_equip set itemGuid, which RecordEvent copies into the key so the
+    // three rows about one sword share a guid a reader can join on. counterpart
+    // is who an item_given went TO; via is how it moved (ItemVia); source is
+    // what it was looted from, or the mailbox it was posted from.
+    uint32 itemGuid = 0;
+    std::string counterpart;
+    std::string via;
+    std::string source;
 };
 
 struct PendingEvent
@@ -3226,13 +3242,15 @@ uint64 g_droppedEvents = 0;
 // The one place an event is captured. Runs on whatever thread the event
 // happened on - for bots, a map-update thread - so it does NO database work
 // and does not resolve anything it was not handed.
-void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
-                 std::string const& subjectName, std::string const& detail,
-                 EventExtra const& extra)
+// QueueEvent is the capture with NO gate of its own. Every caller has already
+// decided this character belongs in the record: RecordEvent by the roster test
+// below, and the item-story hooks (#567) by their own wider test, which covers
+// the guilds roster characters belong to and filters on item quality instead.
+void QueueEvent(Player* actor, char const* kind, uint32 subjectId,
+                std::string const& subjectName, std::string const& detail,
+                EventExtra const& extra)
 {
     if (!actor || !kind)
-        return;
-    if (!OnRoster(actor->GetName()))
         return;
 
     EventKey key;
@@ -3240,6 +3258,7 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
     key.kind = kind;
     key.subjectId = subjectId;
     key.bucket = static_cast<uint32>(std::time(nullptr) / EVENT_BUCKET_SECONDS);
+    key.itemGuid = extra.itemGuid;
 
     std::lock_guard<std::mutex> guard(g_eventMutex);
     auto it = g_eventQueue.find(key);
@@ -3267,6 +3286,17 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
     ++pending.occurrences;
 }
 
+void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
+                 std::string const& subjectName, std::string const& detail,
+                 EventExtra const& extra)
+{
+    if (!actor || !kind)
+        return;
+    if (!OnRoster(actor->GetName()))
+        return;
+    QueueEvent(actor, kind, subjectId, subjectName, detail, extra);
+}
+
 // The form every kind but 'item_equip' uses, unchanged for its eight callers.
 // It exists so that adding gear columns to the table did not become a diff
 // across every recording site in the module, and so that a future kind that
@@ -3275,6 +3305,162 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
                  std::string const& subjectName, std::string const& detail)
 {
     RecordEvent(actor, kind, subjectId, subjectName, detail, EventExtra());
+}
+
+// ------------------------------------------ the story of a notable item (#567) --
+//
+// WHAT THIS RECORDS. Three moments in one item instance's life, joined by its
+// guid: looted (`item_loot`), handed on by one of this module's commands
+// (`item_given`), and put on (`item_equip`). Rare and up only. The gates and
+// the sentences are in OverseerDecisions, where test_item_story.cpp reaches
+// them; this section only feeds them what the world knows.
+//
+// WHOSE LOOT. Members of the guilds that enabled roster characters belong to,
+// plus the roster itself. The guild list is read on the roster poll, the same
+// read that feeds OnRoster, so nothing is configured and nothing polls: a
+// family that forms a guild brings it into the record on the next poll.
+//
+// THE COST ON THE HOT PATH. The loot and equip hooks fire for every player on
+// the world. Each one asks the item's quality first, which is a field on a
+// template already in hand, and returns there for everything below rare. Only
+// a notable item gets as far as a lock.
+
+std::mutex g_storyMutex;
+std::vector<unsigned> g_storyGuilds;
+OverseerDecisions::ItemStoryBook g_storyBook;
+
+void SetStoryGuilds(std::vector<unsigned> const& guilds)
+{
+    std::lock_guard<std::mutex> guard(g_storyMutex);
+    g_storyGuilds = guilds;
+}
+
+void RememberStoryItem(uint32 itemGuid)
+{
+    std::lock_guard<std::mutex> guard(g_storyMutex);
+    OverseerDecisions::RememberStoryItem(g_storyBook, itemGuid);
+}
+
+bool StoryKnowsItem(uint32 itemGuid)
+{
+    std::lock_guard<std::mutex> guard(g_storyMutex);
+    return OverseerDecisions::StoryKnowsItem(g_storyBook, itemGuid);
+}
+
+// GetGuildId is a field on the Player, so this reads no guild object and takes
+// no guild lock; the only lock is ours, held for a scan of two or three ids.
+OverseerDecisions::ItemStoryWho StoryWho(bool onRoster, uint32 guildId)
+{
+    std::lock_guard<std::mutex> guard(g_storyMutex);
+    return OverseerDecisions::ClassifyItemStoryCharacter(onRoster, guildId, g_storyGuilds);
+}
+
+OverseerDecisions::ItemStoryWho StoryWho(Player const* player)
+{
+    if (!player)
+        return OverseerDecisions::ItemStoryWho::Stranger;
+    return StoryWho(OnRoster(player->GetName()), player->GetGuildId());
+}
+
+// What an item was looted from, named at the moment of the loot. The guid's
+// type says which template to ask; an entry the template store does not know
+// reads as unnamed rather than as a guess.
+std::string LootSourceName(Player const* looter, ObjectGuid source)
+{
+    if (source.IsEmpty())
+        return "";
+    if (source.IsCreatureOrVehicle())
+    {
+        CreatureTemplate const* t = sObjectMgr->GetCreatureTemplate(source.GetEntry());
+        return t ? t->Name : "";
+    }
+    if (source.IsGameObject())
+    {
+        GameObjectTemplate const* t = sObjectMgr->GetGameObjectTemplate(source.GetEntry());
+        return t ? t->name : "";
+    }
+    if (source.IsItem() && looter)
+    {
+        // An item guid carries no entry, so a looted container (a lockbox, a
+        // clam) is named from the looter's own bags, where it still is while
+        // its loot window is open.
+        Item const* container = looter->GetItemByGuid(source);
+        ItemTemplate const* t = container ? container->GetTemplate() : nullptr;
+        return t ? t->Name1 : "";
+    }
+    return "";
+}
+
+// Record a loot or a roll won. `via` is ItemVia::Loot, Need or Greed.
+void RecordItemLoot(Player* looter, Item* item, char const* via, std::string const& source)
+{
+    if (!looter || !item)
+        return;
+    ItemTemplate const* proto = item->GetTemplate();
+    if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+        return;
+    if (!OverseerDecisions::ShouldRecordItemLoot(proto->Quality, StoryWho(looter)))
+        return;
+
+    uint32 const itemGuid = item->GetGUID().GetCounter();
+    RememberStoryItem(itemGuid);
+
+    EventExtra extra;
+    extra.subjectQuality = proto->Quality;
+    extra.subjectItemLevel = proto->ItemLevel;
+    extra.itemGuid = itemGuid;
+    extra.via = via;
+    extra.source = source;
+    OverseerDecisions::FitItemStoryColumn(extra.source);
+    QueueEvent(looter, "item_loot", item->GetEntry(), proto->Name1,
+               OverseerDecisions::ItemLootDetail(via, source), extra);
+}
+
+// Record a hand-over this module performed. Called AFTER the item has moved
+// and the move was read back, with values captured before it moved, because
+// the Item may not survive a store that merged it into a stack. `receiver` may
+// be null for a letter to a character who is offline; the guild is then read
+// from the character cache, which is how the core answers the same question
+// for an offline guild roster.
+void RecordItemGiven(Player* giver, Player const* receiver, std::string const& receiverName,
+                     uint32 itemGuid, uint32 itemEntry, char const* via,
+                     std::string const& mailbox)
+{
+    if (!giver)
+        return;
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
+    if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+        return;
+
+    OverseerDecisions::ItemStoryWho to = OverseerDecisions::ItemStoryWho::Stranger;
+    if (receiver)
+        to = StoryWho(receiver);
+    else if (!receiverName.empty())
+    {
+        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(receiverName);
+        uint32 const guildId = guid.IsEmpty()
+            ? 0 : static_cast<uint32>(sCharacterCache->GetCharacterGuildIdByGuid(guid));
+        to = StoryWho(OnRoster(receiverName), guildId);
+    }
+    if (!OverseerDecisions::ShouldRecordItemGiven(proto->Quality, StoryWho(giver), to))
+        return;
+
+    RememberStoryItem(itemGuid);
+
+    std::string const toName = receiver ? receiver->GetName() : receiverName;
+    std::string const source = (std::string(via) == OverseerDecisions::ItemVia::Mail)
+        ? mailbox : std::string();
+
+    EventExtra extra;
+    extra.subjectQuality = proto->Quality;
+    extra.subjectItemLevel = proto->ItemLevel;
+    extra.itemGuid = itemGuid;
+    extra.counterpart = toName;
+    extra.via = via;
+    extra.source = source;
+    OverseerDecisions::FitItemStoryColumn(extra.source);
+    QueueEvent(giver, "item_given", itemEntry, proto->Name1,
+               OverseerDecisions::ItemGivenDetail(via, toName, source), extra);
 }
 
 // ----------------------------------------- what an equip displaced (#372) --
@@ -5000,6 +5186,10 @@ public:
         PLAYERHOOK_ON_BEFORE_LOGOUT,
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_AFTER_SET_VISIBLE_ITEM_SLOT,
+        // #567. Both fire only when an item is actually stored on a looter,
+        // and both return on the item's quality before anything else.
+        PLAYERHOOK_ON_LOOT_ITEM,
+        PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM,
     }) {}
 
     // NINETEEN ARRAY READS, ONCE (#372). Player::GetItemByPos on
@@ -5101,15 +5291,35 @@ public:
         if (player->GetSession() && player->GetSession()->PlayerLoading())
             return;
 
+        ItemTemplate const* proto = item->GetTemplate();
+        uint32 const itemGuid = item->GetGUID().GetCounter();
+
         // ASKED HERE RATHER THAN LEFT TO RecordEvent, and asked first. Taking
         // the answer out of a slot is a WRITE to the shadow, and the shadow
         // must not be touched for the 500 bots, so this cannot be left to the
         // roster test the recording call makes for every other kind. It costs
         // the same one lookup that call was already making.
         if (!OnRoster(player->GetName()))
+        {
+            // A GUILD MEMBER WHO IS NOT ON THE ROSTER (#567). Recorded only
+            // for a notable item this record already saw looted or handed
+            // over, which is the equip that finishes that item's story; the
+            // bot factory's issued sets never are. Quality first, so the
+            // common case leaves without a lock. No shadow exists for these
+            // characters, so the prior slot is honestly 'unknown'.
+            if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+                return;
+            if (!OverseerDecisions::ShouldRecordItemEquip(proto->Quality, StoryWho(player),
+                                                          StoryKnowsItem(itemGuid)))
+                return;
+            OverseerDecisions::GearSlotBefore const unknown{};
+            EventExtra extra = EquipExtra(proto, unknown);
+            extra.itemGuid = itemGuid;
+            QueueEvent(player, "item_equip", item->GetEntry(), proto->Name1,
+                       OverseerDecisions::GearSwapDetail(static_cast<unsigned>(slot), unknown),
+                       extra);
             return;
-
-        ItemTemplate const* proto = item->GetTemplate();
+        }
 
         // WHAT CAME OFF, TAKEN BEFORE IT IS OVERWRITTEN (#372). By the time
         // this hook runs the new item IS the slot's occupant and the displaced
@@ -5122,9 +5332,48 @@ public:
         // The detail keeps its existing `slot <n>` opening - the website parses
         // it - and gains a sentence naming what came out. The machine-readable
         // copy of all of this is in the columns, so nothing has to parse this.
+        EventExtra extra = EquipExtra(proto, before);
+        extra.itemGuid = itemGuid;
         RecordEvent(player, "item_equip", item->GetEntry(), proto ? proto->Name1 : "",
                     OverseerDecisions::GearSwapDetail(static_cast<unsigned>(slot), before),
-                    EquipExtra(proto, before));
+                    extra);
+    }
+
+    // A LOOT (#567). Player::StoreLootItem calls this after the item is in the
+    // looter's bags (Player.cpp:13926), with the guid of what was looted - a
+    // creature, a game object, or a container item. A roll won never passes
+    // through here; the hook below has it.
+    void OnPlayerLootItem(Player* player, Item* item, uint32 /*count*/,
+                          ObjectGuid lootGuid) override
+    {
+        if (!player || !item)
+            return;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+            return;
+        RecordItemLoot(player, item, OverseerDecisions::ItemVia::Loot,
+                       LootSourceName(player, lootGuid));
+    }
+
+    // A ROLL WON (#567). Group::CountTheRoll stores the item on the winner and
+    // then calls this (Group.cpp:1657 for need, :1741 for greed). The roll's
+    // own guid is a fresh item guid made for the roll, not the corpse, so the
+    // source is the loot's own record of what it was generated from.
+    void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 /*count*/,
+                                     RollVote voteType, Roll* roll) override
+    {
+        if (!player || !item)
+            return;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+            return;
+        Loot* loot = roll ? roll->getLoot() : nullptr;
+        std::string const source = loot ? LootSourceName(player, loot->sourceWorldObjectGUID)
+                                        : std::string();
+        RecordItemLoot(player, item,
+                       voteType == NEED ? OverseerDecisions::ItemVia::Need
+                                        : OverseerDecisions::ItemVia::Greed,
+                       source);
     }
 
     // Who landed the killing blow, captured while `killer` is still a live
@@ -5259,6 +5508,11 @@ public:
             // restart - which is precisely when a character is most likely to
             // do something worth having a record of.
             ReloadRosterNames();
+            // And the item story book (#567), for the roster's reason: a guild
+            // member's equip is recorded only for an item the book knows, so
+            // an empty book after a restart would drop the equip that finishes
+            // a story begun before it.
+            ItemStoryColumnsPresent();
             // And what this realm is, for the same reason and one more: until
             // this row exists the site cannot say which world it is showing,
             // and "which world is this" is the question it must never answer
@@ -5586,6 +5840,24 @@ private:
             } while (result->NextRow());
         }
         SetRosterNames(names);
+
+        // THE GUILDS WHOSE NOTABLE ITEMS ARE RECORDED (#567): every guild an
+        // enabled roster character is in. Read from guild_member rather than
+        // from online Players, so a family whose characters are all logged
+        // out still has its guild's loot recorded. Same poll, same cadence.
+        std::vector<unsigned> guilds;
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT DISTINCT gm.guildid FROM overseer_roster r "
+                "JOIN characters c ON c.name = r.name "
+                "JOIN guild_member gm ON gm.guid = c.guid "
+                "WHERE r.enabled = 1"))
+        {
+            do
+            {
+                guilds.push_back(result->Fetch()[0].Get<uint32>());
+            } while (result->NextRow());
+        }
+        SetStoryGuilds(guilds);
         return names;
     }
 
@@ -30508,11 +30780,22 @@ private:
         if (batch.empty())
             return;
 
+        // THE ITEM-STORY COLUMNS MAY NOT EXIST YET (#567). The DDL and this
+        // writer ship in different images, and an INSERT naming one missing
+        // column fails WHOLE - every event in the batch, not only the new
+        // kinds. So the columns are probed once, and a database without them
+        // gets exactly the statement it got before, with the item rows'
+        // guid, counterpart, via and source left out and said so once.
+        bool const story = ItemStoryColumnsPresent();
+
         std::ostringstream ss;
         ss << "INSERT INTO overseer_event (character_name, character_guid, kind, subject_id, "
               "subject_name, detail, level, map, zone, bucket, occurrences, "
               "subject_quality, subject_item_level, prior_state, prior_id, prior_name, "
-              "prior_quality, prior_item_level) VALUES ";
+              "prior_quality, prior_item_level";
+        if (story)
+            ss << ", item_guid, counterpart, via, source";
+        ss << ") VALUES ";
         bool first = true;
         for (std::pair<EventKey const, PendingEvent> const& entry : batch)
         {
@@ -30542,8 +30825,13 @@ private:
                << "'," << ev.extra.priorId
                << ",'" << Esc(ev.extra.priorName)
                << "'," << ev.extra.priorQuality
-               << ',' << ev.extra.priorItemLevel
-               << ')';
+               << ',' << ev.extra.priorItemLevel;
+            if (story)
+                ss << ',' << key.itemGuid
+                   << ",'" << Esc(ev.extra.counterpart)
+                   << "','" << Esc(ev.extra.via)
+                   << "','" << Esc(ev.extra.source) << '\'';
+            ss << ')';
         }
 
         // The de-duplication contract. `occurrences` on the right of the `=` is
@@ -30578,7 +30866,56 @@ private:
               "prior_name = VALUES(prior_name), "
               "prior_quality = VALUES(prior_quality), "
               "prior_item_level = VALUES(prior_item_level)";
+        // item_guid is in the key, so it is never updated; the other three
+        // describe the last occurrence, like everything above.
+        if (story)
+            ss << ", counterpart = VALUES(counterpart), via = VALUES(via), "
+                  "source = VALUES(source)";
         CharacterDatabase.Execute(ss.str().c_str());
+    }
+
+    // Does overseer_event have the four #567 columns? Asked once per process,
+    // the way CampaignColumnsPresent asks, and for the same reason: the answer
+    // cannot change under a running worldserver without a db-import that would
+    // restart it. The first answer also seeds the story book from the rows
+    // already written, so an item looted before a restart still has its equip
+    // recorded after one.
+    SchemaColumns _itemStoryColumns{SchemaColumns::Unknown};
+
+    bool ItemStoryColumnsPresent()
+    {
+        if (_itemStoryColumns != SchemaColumns::Unknown)
+            return _itemStoryColumns == SchemaColumns::Present;
+
+        bool const present = SchemaHasColumns(
+            "overseer_event", "'item_guid','counterpart','via','source'", 4);
+        _itemStoryColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+        if (!present)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: overseer_event has no item_guid / counterpart / via / source "
+                     "(2026_09_22_00_overseer_event_item_story.sql has not been applied), so "
+                     "item_loot and item_given rows are written without the item guid, the "
+                     "receiver, how it moved or where it came from");
+            return false;
+        }
+
+        uint32 seeded = 0;
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT item_guid FROM overseer_event "
+                "WHERE kind IN ('item_loot', 'item_given') AND item_guid <> 0 "
+                "GROUP BY item_guid ORDER BY MAX(id)"))
+        {
+            do
+            {
+                RememberStoryItem(result->Fetch()[0].Get<uint32>());
+                ++seeded;
+            } while (result->NextRow());
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: item story book seeded with {} item(s) already looted or handed over",
+                 seeded);
+        return true;
     }
 
     // Write the queued deaths (infra#2912). Same shape as FlushEvents - one
@@ -32603,6 +32940,11 @@ private:
         describe("moved", equip ? "equipped in a free bag slot" : "", EQUIP_ERR_OK, destSlot);
         status = "delivered";
 
+        // The story of a notable item (#567). After the move, from values
+        // captured before it: the Item may not survive a merge into a stack.
+        RecordItemGiven(giver, receiver, receiver->GetName(), itemGuid.GetCounter(), itemEntry,
+                        OverseerDecisions::ItemVia::Give, "");
+
         // SOMETHING GOT THROUGH, so every refusal remembered against this
         // receiver is now an answer to a question whose facts have changed -
         // most obviously if what got through was a bag. Forgetting them costs
@@ -32826,6 +33168,11 @@ private:
 
         describe("moved", "");
         status = "delivered";
+
+        // The story of a notable item (#567). Read back above, so this is a
+        // trade that happened, not one that was asked for.
+        RecordItemGiven(giver, receiver, receiver->GetName(), itemGuid.GetCounter(), itemEntry,
+                        OverseerDecisions::ItemVia::Trade, "");
         return "";
     }
 
@@ -42976,6 +43323,13 @@ private:
                            "another account and MailHandler.cpp:362 applies the realm's delay"
                          : "");
             status = "delivered";
+
+            // The story of a notable item (#567): posted and read back, with
+            // the mailbox it went from. A letter with no attachment is not a
+            // hand-over of anything.
+            if (facts.haveItem)
+                RecordItemGiven(who, receiver, recipientName, facts.itemGuid, facts.itemEntry,
+                                OverseerDecisions::ItemVia::Mail, facts.mailboxName);
             return "";
         }
 

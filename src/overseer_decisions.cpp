@@ -10241,4 +10241,137 @@ FamilyRoster const* ChooseCampaignRoster(std::vector<FamilyRoster> const& roster
     return rosters.empty() ? nullptr : &rosters.front();
 }
 
+// ------------------------------------------- the story of a notable item (#567) --
+
+bool IsNotableItemQuality(unsigned quality)
+{
+    return quality >= NOTABLE_ITEM_QUALITY;
+}
+
+ItemStoryWho ClassifyItemStoryCharacter(bool onRoster, unsigned guildId,
+                                        std::vector<unsigned> const& storyGuilds)
+{
+    if (onRoster)
+        return ItemStoryWho::Roster;
+    if (guildId == 0)
+        return ItemStoryWho::Stranger;
+    for (unsigned id : storyGuilds)
+    {
+        if (id == guildId)
+            return ItemStoryWho::GuildMember;
+    }
+    return ItemStoryWho::Stranger;
+}
+
+bool ShouldRecordItemLoot(unsigned quality, ItemStoryWho looter)
+{
+    return IsNotableItemQuality(quality) && looter != ItemStoryWho::Stranger;
+}
+
+bool ShouldRecordItemGiven(unsigned quality, ItemStoryWho from, ItemStoryWho to)
+{
+    if (!IsNotableItemQuality(quality))
+        return false;
+    return from != ItemStoryWho::Stranger || to != ItemStoryWho::Stranger;
+}
+
+bool ShouldRecordItemEquip(unsigned quality, ItemStoryWho wearer, bool itemInStory)
+{
+    switch (wearer)
+    {
+        case ItemStoryWho::Roster:
+            return true;
+        case ItemStoryWho::GuildMember:
+            return IsNotableItemQuality(quality) && itemInStory;
+        case ItemStoryWho::Stranger:
+            return false;
+    }
+    return false;
+}
+
+void FitItemStoryColumn(std::string& text)
+{
+    // The column is VARCHAR(255) utf8mb4. A cut on a plain byte can split a
+    // multi-byte name, and MySQL refuses the half character, which fails the
+    // whole batched INSERT and loses every other event in it. So the cut
+    // lands on a character boundary: back up to the lead byte of the last
+    // character kept, and drop that character if it no longer fits whole.
+    if (text.size() <= ITEM_STORY_COLUMN_BYTES)
+        return;
+    text.resize(ITEM_STORY_COLUMN_BYTES);
+    std::size_t lead = text.size();
+    while (lead > 0 && (static_cast<unsigned char>(text[lead - 1]) & 0xC0) == 0x80)
+        --lead;
+    // Nothing but continuation bytes: not UTF-8 at all, and nothing in it is
+    // a character worth keeping. Empty is a string MySQL accepts.
+    if (lead == 0)
+    {
+        text.clear();
+        return;
+    }
+    unsigned char const first = static_cast<unsigned char>(text[lead - 1]);
+    std::size_t want = 1;
+    if ((first & 0xE0) == 0xC0)
+        want = 2;
+    else if ((first & 0xF0) == 0xE0)
+        want = 3;
+    else if ((first & 0xF8) == 0xF0)
+        want = 4;
+    if (text.size() - (lead - 1) < want)
+        text.resize(lead - 1);
+}
+
+std::string ItemGivenDetail(std::string const& via, std::string const& to,
+                            std::string const& mailbox)
+{
+    std::string verb = "given";
+    if (via == ItemVia::Trade)
+        verb = "traded";
+    else if (via == ItemVia::Mail)
+        verb = "mailed";
+    std::string out = verb + " to " + (to.empty() ? std::string("somebody") : to);
+    if (via == ItemVia::Mail && !mailbox.empty())
+        out += " from " + mailbox;
+    FitItemStoryColumn(out);
+    return out;
+}
+
+std::string ItemLootDetail(std::string const& via, std::string const& source)
+{
+    std::string out;
+    if (via == ItemVia::Need)
+        out = "won on a need roll";
+    else if (via == ItemVia::Greed)
+        out = "won on a greed roll";
+    else
+        out = "looted";
+    if (!source.empty())
+        out += " from " + source;
+    FitItemStoryColumn(out);
+    return out;
+}
+
+void RememberStoryItem(ItemStoryBook& book, std::uint32_t itemGuid)
+{
+    if (itemGuid == 0 || book.capacity == 0)
+        return;
+    if (StoryKnowsItem(book, itemGuid))
+        return;
+    if (book.order.size() >= book.capacity)
+        book.order.erase(book.order.begin());
+    book.order.push_back(itemGuid);
+}
+
+bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid)
+{
+    if (itemGuid == 0)
+        return false;
+    for (std::uint32_t known : book.order)
+    {
+        if (known == itemGuid)
+            return true;
+    }
+    return false;
+}
+
 }  // namespace OverseerDecisions
