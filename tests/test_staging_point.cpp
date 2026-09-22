@@ -160,6 +160,85 @@ void TheThreeScarletWingsDeriveTheirOwnStagingPoints()
                2906.3373f, -813.8402f, 160.33f);
 }
 
+// THE THIRTEEN DOORS ADDED FOR EVERY CLASSIC FIVE-PLAYER DUNGEON (#548). Each
+// door and each way-back-out landing point is copied from the areatrigger and
+// areatrigger_teleport rows DungeonPortals() quotes beside its keyword, so a
+// change to the derivation that moved any of them fails here, the same as the
+// rows above. None of these points has been walked yet; what is pinned is the
+// arithmetic, not that the ground there is standable.
+void TheClassicDoorsDeriveTheirOwnStagingPoints()
+{
+    // areatrigger 257 -> areatrigger_teleport 259's landing point, on map 1.
+    CheckPoint("blackfathom",
+               DungeonStagingPoint(4252.37f, 756.974f, 4247.74f, 745.879f, -24.5299f, 20.f),
+               4244.6680f, 738.5166f, -24.5299f);
+
+    // areatrigger 244 -> areatrigger_teleport 242's landing point, on map 1.
+    CheckPoint("razorfen-kraul",
+               DungeonStagingPoint(-4456.7f, -1655.99f, -4464.92f, -1666.24f, 81.8928f, 20.f),
+               -4469.2124f, -1671.5927f, 81.8928f);
+
+    // areatrigger 442 -> areatrigger_teleport 444's landing point, on map 1.
+    CheckPoint("razorfen-downs",
+               DungeonStagingPoint(-4666.52f, -2536.82f, -4658.12f, -2526.35f, 81.492f, 20.f),
+               -4654.0044f, -2521.2202f, 81.492f);
+
+    // areatrigger 324 -> areatrigger_teleport 322's landing point, on map 0.
+    CheckPoint("gnomeregan",
+               DungeonStagingPoint(-5161.33f, 939.623f, -5163.33f, 927.623f, 257.188f, 20.f),
+               -5164.6182f, 919.8951f, 257.188f);
+
+    // areatrigger 523 -> areatrigger_teleport 525's landing point, on map 0.
+    // The landing is due -Y of the door, so the point is too; it falls between
+    // the trigger and the locked Workshop Door the row's comment names.
+    CheckPoint("gnomeregan-depot",
+               DungeonStagingPoint(-4858.27f, 785.03f, -4858.27f, 756.435f, 244.923f, 20.f),
+               -4858.2700f, 765.0300f, 244.923f);
+
+    // areatrigger 286 -> areatrigger_teleport 288's landing point, on map 0.
+    CheckPoint("uldaman",
+               DungeonStagingPoint(-6053.73f, -2954.63f, -6066.73f, -2955.63f, 209.776f, 20.f),
+               -6073.6709f, -2956.1638f, 209.776f);
+
+    // areatrigger 902 -> areatrigger_teleport 882's landing point, on map 0.
+    CheckPoint("uldaman-back",
+               DungeonStagingPoint(-6606.48f, -3762.19f, -6620.48f, -3765.19f, 266.226f, 20.f),
+               -6626.0361f, -3766.3806f, 266.226f);
+
+    // areatrigger 924 -> areatrigger_teleport 922's landing point, on map 1.
+    // Radius 20, so this point is on the trigger's own rim; see the row.
+    CheckPoint("zulfarrak",
+               DungeonStagingPoint(-6773.49f, -2889.77f, -6796.49f, -2890.77f, 8.88063f, 20.f),
+               -6793.4712f, -2890.6387f, 8.88063f);
+
+    // areatrigger 446 -> areatrigger_teleport 448's landing point, on map 0.
+    CheckPoint("sunken-temple",
+               DungeonStagingPoint(-10162.7f, -3998.65f, -10175.1f, -3995.15f, -112.9f, 20.f),
+               -10181.9482f, -3993.2168f, -112.9f);
+
+    // areatrigger 1466 -> areatrigger_teleport 1472's landing point, on map 0.
+    CheckPoint("blackrock-depths",
+               DungeonStagingPoint(-7176.63f, -937.667f, -7179.63f, -923.667f, 166.416f, 20.f),
+               -7180.8203f, -918.1110f, 166.416f);
+
+    // areatrigger 1468 -> areatrigger_teleport 1470's landing point, on map 0.
+    CheckPoint("lower-blackrock-spire",
+               DungeonStagingPoint(-7518.19f, -1239.13f, -7524.7f, -1228.41f, 287.204f, 20.f),
+               -7528.5713f, -1222.0354f, 287.204f);
+
+    // areatrigger 2216 -> areatrigger_teleport 2221's landing point, on map 0.
+    // The landing is at the OTHER door, 672 yards away, so the bearing is the
+    // one the row's comment warns about; the arithmetic is still pinned.
+    CheckPoint("stratholme-live",
+               DungeonStagingPoint(3392.46f, -3396.77f, 3235.46f, -4050.6f, 108.45f, 20.f),
+               3387.7903f, -3416.2173f, 108.45f);
+
+    // areatrigger 2214 -> areatrigger_teleport 2221's landing point, on map 0.
+    CheckPoint("stratholme-undead",
+               DungeonStagingPoint(3237.46f, -4060.6f, 3235.46f, -4050.6f, 108.45f, 20.f),
+               3233.5376f, -4040.9885f, 108.45f);
+}
+
 // A landing point on top of the door names no direction to stand off along.
 void ADoorWithNoCorridorIsRefused()
 {
@@ -290,6 +369,7 @@ int main()
     TheWorkingPortalsDeriveWhatTheyAlreadyDerive();
     TheWailingCavernsPortalDerivesARealPlace();
     TheThreeScarletWingsDeriveTheirOwnStagingPoints();
+    TheClassicDoorsDeriveTheirOwnStagingPoints();
     ADoorWithNoCorridorIsRefused();
     TheOriginIsNeverAStagingPoint();
     APointOffTheWorldIsRefused();

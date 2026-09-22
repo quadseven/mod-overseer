@@ -22370,13 +22370,14 @@ private:
     // so keeps the check where the argument for it is.
     static constexpr float DUNGEON_STAGING_Z_SANITY_YARDS = 15.0f;
 
-    // Each supported dungeon is one row. Deadmines, Shadowfang and Stockades
-    // are all approached from map 0 and are reachable on foot from where the
-    // family lives. Wailing Caverns is approached from map 1 and is not: the
-    // row is measured and correct, and the crossing to Kalimdor that would make
-    // it reachable does not exist yet, so a run for it is refused rather than
-    // started. See DungeonPortals() below and the approach check in the
-    // coordinator's IDLE branch.
+    // Each supported dungeon is one row, approached from map 0 or map 1.
+    // Whether a party can reach a row's door from where it stands is not a
+    // property of the row: the approach check in the coordinator's IDLE branch
+    // asks OverseerDecisions::DungeonPortalApproach, and a door on the other
+    // continent is reached by a crossing (#241) or the run is refused rather
+    // than started. Nor does a row say which faction may walk to it. The
+    // Stockade stands inside Stormwind, so a Horde party must not be sent;
+    // that is decided by whoever writes the job, not by this table.
     static DungeonPortal const* FindDungeonPortal(std::string const& keyword)
     {
         for (DungeonPortal const& portal : DungeonPortals())
@@ -22637,6 +22638,203 @@ private:
              // corridor should begin at an innkeeper, so a rule that derived one
              // from the other would be true of this row and a trap on the next.
              -1050.0f, -3664.8f, 24.36f},
+            // THE REST OF THE CLASSIC FIVE-PLAYER DOORS (#548). Every number in
+            // the rows below was read out of the world database of a realm on
+            // the pinned core, with a SELECT on areatrigger joined to
+            // areatrigger_teleport, and is quoted in the same shape as the rows
+            // above so a future reader can check it without a running world.
+            //
+            // NONE OF THEM CARRIES A CORRIDOR OR A HOME, and that is the rule
+            // the `wailing` row is written on rather than an omission: a
+            // corridor or an inn that has not been measured against the
+            // navmesh must not be invented, and three zeros are this table's
+            // way of saying "walk straight at the door". Where the walk to a
+            // door is known to need more than that, the row says so. A run the
+            // default route cannot stage is refused by the staging check and
+            // says why; it is not walked at a guessed point.
+            //
+            // AND THE DOORS THAT ARE NOT HERE. Ragefire Chasm, both Maraudon
+            // wings, every Dire Maul door and Scholomance have a BOX trigger
+            // (radius 0) on the way out, and ArrivalReachesTrigger refuses to
+            // aim anybody at one, so a run through them would enter and never
+            // walk out. They wait for box-trigger support. Upper Blackrock
+            // Spire shares every trigger with the Lower Spire and is split
+            // from it by a door inside the instance, which a row of two
+            // areatriggers cannot name.
+
+            // BLACKFATHOM DEEPS, on map 1 at the Zoram Strand. The door stands
+            // at z -23 in a sunken temple, and the last stretch down to it is
+            // held by level 18 to 21 Blackfathom and Fallenroot mobs and may
+            // need swimming: a surveyed corridor is the likely answer if the
+            // default route cannot stage it. dungeon_access_template sets a
+            // door minimum of level 19, which the server checks at the knock.
+            //
+            // areatrigger.sql: (257,1,4252.37,756.974,-23.0632,12,0,0,0,0)
+            // areatrigger_teleport.sql: (257,'Blackphantom Deeps Entrance',48,-151.89,106.96,-39.87,4.53)
+            // areatrigger.sql: (259,48,-148.633,121.08,-33.4141,12,0,0,0,0)
+            // areatrigger_teleport.sql: (259,'Blackphantom Deeps Instance Start',1,4247.74,745.879,-24.5299,4.5828)
+            {"blackfathom", 1, 257, 48, 259, 0.f, 0.f, 0.f},
+            // RAZORFEN KRAUL, on map 1 on the southern rim of the Barrens.
+            // The nearest Alliance flight path, Thalanaar, is about 126 yards
+            // below the door, and the way up is the Great Lift, a transport the
+            // walker cannot path across; the long way round runs past Camp
+            // Taurajo. A Horde party walks south from Taurajo and must keep
+            // clear of the Bael'dun digsite. Door minimum level 17.
+            //
+            // areatrigger.sql: (244,1,-4456.7,-1655.99,86.1095,8,0,0,0,0)
+            // areatrigger_teleport.sql: (244,'Razorfen Kraul Entrance',47,1943,1544.63,82,1.38)
+            // areatrigger.sql: (242,47,1936.39,1534.47,86.8769,8,0,0,0,0)
+            // areatrigger_teleport.sql: (242,'Razorfen Kraul Instance Start',1,-4464.92,-1666.24,81.8928,4.28827)
+            {"razorfen-kraul", 1, 244, 47, 242, 0.f, 0.f, 0.f},
+            // RAZORFEN DOWNS, on the same rim about 900 yards east, with the
+            // same two ways up for an Alliance party and the Bael'dun digsite
+            // closer still for a Horde one. Door minimum level 25.
+            //
+            // areatrigger.sql: (442,1,-4666.52,-2536.82,86.9671,10,0,0,0,0)
+            // areatrigger_teleport.sql: (442,'Razorfen Downs Entrance',129,2592.55,1107.5,51.29,4.74)
+            // areatrigger.sql: (444,129,2593.94,1124.64,56.179,11,0,0,0,0)
+            // areatrigger_teleport.sql: (444,'Razorfen Downs Instance Start',1,-4658.12,-2526.35,81.492,1.25978)
+            {"razorfen-downs", 1, 442, 129, 444, 0.f, 0.f, 0.f},
+            // GNOMEREGAN, THE FRONT DOOR, on map 0 in a cavern about 105 yards
+            // under Dun Morogh. The way down is the lift (gameobject 80023,
+            // "Vator"), a transport the walker cannot path across, so this door
+            // needs a surveyed descent and lift handling before a run can
+            // stage. Door minimum level 15. Listed before the depot row below
+            // on purpose: a run adopted inside map 90 after a restart takes the
+            // first row that names the map, and this is the door with no lock.
+            //
+            // areatrigger.sql: (324,0,-5161.33,939.623,258.288,10,0,0,0,0)
+            // areatrigger_teleport.sql: (324,'Gnomeregan Entrance',90,-332.22,-2.28,-150.86,2.77)
+            // areatrigger.sql: (322,90,-312.205,-4.63256,-148.657,14,0,0,0,0)
+            // areatrigger_teleport.sql: (322,'Gnomeregan Instance Start',0,-5163.33,927.623,257.188,0)
+            {"gnomeregan", 0, 324, 90, 322, 0.f, 0.f, 0.f},
+            // GNOMEREGAN, THE TRAIN DEPOT DOOR, in the same cavern. Between the
+            // cavern and this trigger stands the Workshop Door, gameobject
+            // 90566 at (-4861.05, 740.452, 249.389), locked (flags 34, lock
+            // 92), and the Workshop Key is what opens it. Nobody in either
+            // family is known to hold one, and this module does not check for
+            // it, so a run aimed here without the key stands at a door that
+            // will not move. Same constraint as the Scarlet Key above: the
+            // ordering is on whoever starts the run. Prefer the front door.
+            //
+            // areatrigger.sql: (523,0,-4858.27,785.03,241.06,12,0,0,0,0)
+            // areatrigger_teleport.sql: (523,'Gnomeregan Train Depot Entrance',90,-736.51,2.71,-249.99,3.14)
+            // areatrigger.sql: (525,90,-717.868,1.37207,-241.293,12,0,0,0,0)
+            // areatrigger_teleport.sql: (525,'Gnomeregan Train Depot Instance',0,-4858.27,756.435,244.923,0)
+            {"gnomeregan-depot", 0, 523, 90, 525, 0.f, 0.f, 0.f},
+            // ULDAMAN, THE FRONT DOOR, on map 0 at the bottom of the dig site
+            // cave in Loch Modan. The trigger is at z 213.7 with the surface
+            // about 165 yards over it, which is the "door at the bottom of a
+            // drop" shape (#217): expect it to need a surveyed descent. Door
+            // minimum level 30. Listed before the back door for the same
+            // restart reason as Gnomeregan.
+            //
+            // areatrigger.sql: (286,0,-6053.73,-2954.63,213.686,10,0,0,0,0)
+            // areatrigger_teleport.sql: (286,'Uldaman Entrance',70,-226.8,49.09,-46.03,1.39)
+            // areatrigger.sql: (288,70,-228.193,34.1602,-39.2339,10,0,0,0,0)
+            // areatrigger_teleport.sql: (288,'Uldaman Instance Start',0,-6066.73,-2955.63,209.776,3.20443)
+            {"uldaman", 0, 286, 70, 288, 0.f, 0.f, 0.f},
+            // ULDAMAN, THE BADLANDS BACK DOOR. The two names in the world's own
+            // table read backwards: 902 "Uldaman Exit" is the outside door IN,
+            // and 882 "Uldaman Instance End" is the inside door OUT. It opens
+            // near Archaedas, the far end of the instance, so it is the wrong
+            // door for a full clear; it is here so a party already in the
+            // Badlands has a door, not as the default.
+            //
+            // areatrigger.sql: (902,0,-6606.48,-3762.19,266.91,12,0,0,0,0)
+            // areatrigger_teleport.sql: (902,'Uldaman Exit',70,-214.02,383.607,-38.7687,0.5)
+            // areatrigger.sql: (882,70,-213.72,370.607,-35.3887,10,0,0,0,0)
+            // areatrigger_teleport.sql: (882,'Uldaman Instance End',0,-6620.48,-3765.19,266.226,3.13531)
+            {"uldaman-back", 0, 902, 70, 882, 0.f, 0.f, 0.f},
+            // ZUL'FARRAK, on map 1 in open Tanaris desert. Door minimum level
+            // 35. AND THE ONE DOOR WHOSE RADIUS EATS THE WHOLE STANDOFF:
+            // areatrigger 924 is radius 20, the same as
+            // DUNGEON_STAGING_STANDOFF_YARDS, so the derived staging point sits
+            // on the trigger's rim and the gather circle overlaps it. The
+            // margin that constant's comment argues for (20 > 10 + radius)
+            // fails here by ten yards. `wailing` already fails it by three and
+            // stages; whether this one does has to be confirmed live.
+            //
+            // areatrigger.sql: (924,1,-6773.49,-2889.77,15.1063,20,0,0,0,0)
+            // areatrigger_teleport.sql: (924,'Zul'Farrak Entrance',209,1213.52,841.59,8.93,6.09)
+            // areatrigger.sql: (922,209,1190.35,840.587,13.4342,20,0,0,0,0)
+            // areatrigger_teleport.sql: (922,'Zul'Farrak Instance Start',1,-6796.49,-2890.77,8.88063,3.30496)
+            {"zulfarrak", 1, 924, 209, 922, 0.f, 0.f, 0.f},
+            // THE SUNKEN TEMPLE, on map 0 at the bottom of the flooded pit in
+            // the Swamp of Sorrows, z -108. The descent winds down the ringed
+            // ruin and partly through water, so a surveyed descent is the
+            // likely answer. Stonard, a Horde town, is in the same zone. Door
+            // minimum level 35.
+            //
+            // areatrigger.sql: (446,0,-10162.7,-3998.65,-107.978,11,0,0,0,0)
+            // areatrigger_teleport.sql: (446,'Altar of Atal'Hakkar Entrance',109,-319.24,99.9,-131.85,3.19)
+            // areatrigger.sql: (448,109,-300,99,-127,13,0,0,0,0)
+            // areatrigger_teleport.sql: (448,'Altar Of Atal'Hakkar Instance Start',0,-10175.1,-3995.15,-112.9,2.95938)
+            {"sunken-temple", 0, 446, 109, 448, 0.f, 0.f, 0.f},
+            // BLACKROCK DEPTHS (#510), on map 0 on the inner ledges of
+            // Blackrock Mountain, over lava, with the Spire door 117 yards
+            // higher on the same map. One door serves both halves of the
+            // instance; the Upper City past the Shadowforge Gate needs the
+            // Shadowforge Key, which this module does not check for. Door
+            // minimum level 40. The layered mountain is why a surveyed corridor
+            // from the outer entrance is the likely answer.
+            //
+            // areatrigger.sql: (1466,0,-7176.63,-937.667,170.206,13,0,0,0,0)
+            // areatrigger_teleport.sql: (1466,'Blackrock Depths Entrance',230,456.929,34.0923,-68.0896,4.71239)
+            // areatrigger.sql: (1472,230,456.969,48.368,-65.2753,12,0,0,0,0)
+            // areatrigger_teleport.sql: (1472,'Blackrock Dephts - Searing Gorge Instance',0,-7179.63,-923.667,166.416,1.84097)
+            {"blackrock-depths", 0, 1466, 230, 1472, 0.f, 0.f, 0.f},
+            // LOWER BLACKROCK SPIRE, on map 0 on the top ledge of the mountain,
+            // with level 53 to 59 Blackrock orcs 32 yards from the door. Door
+            // minimum level 45. The instance has a second way out, areatrigger
+            // 2068 "Blackrock Spire - Jump Exit" (a box), which lands on a
+            // different ledge, (-7558.39, -1309.43, 248.454); this row walks
+            // out by 1470 only.
+            //
+            // AND THIS ROW IS NOT UPPER BLACKROCK SPIRE. Both wings share
+            // trigger 1468, trigger 1470 and map 229. The Upper Spire starts at
+            // the Dragonspine Door, gameobject 164725, inside map 229, which
+            // opens for a party carrying the Seal of Ascension. A row of two
+            // areatriggers cannot name that door, so there is no Upper row.
+            //
+            // areatrigger.sql: (1468,0,-7518.19,-1239.13,287.243,10,0,0,0,0)
+            // areatrigger_teleport.sql: (1468,'Blackrock Spire - Searing Gorge Instance (Inside)',229,78.5083,-225.044,49.839,5.1)
+            // areatrigger.sql: (1470,229,73.5083,-215.044,52.3869,10,0,0,0,0)
+            // areatrigger_teleport.sql: (1470,'Blackrock Spire Entrance',0,-7524.7,-1228.41,287.204,1.74533)
+            {"lower-blackrock-spire", 0, 1468, 229, 1470, 0.f, 0.f, 0.f},
+            // STRATHOLME, THE MAIN GATE, on map 0 in the Eastern Plaguelands.
+            // The gate is two box triggers with one target, 2216 and 2217; the
+            // row knocks on 2216. The gate has NO way out of its own: the only
+            // teleport out of map 329 is 2221, at the service entrance on the
+            // far side of the city, which lands 670 yards from this gate. So a
+            // run through this door walks the whole city to leave, and
+            // ResolveDungeonStagingPoint takes its bearing from this gate
+            // toward that far landing, along the outer wall rather than up the
+            // road the gate faces. Whether that point is standable has to be
+            // confirmed live. Inside, the Service Entrance Gate, gameobject
+            // 175368, stands 40 yards from 2221, locked (flags 34, lock 879);
+            // whether it blocks the walk out is not known. Door minimum level
+            // 45. The entry box also means a member left outside cannot be
+            // walked back in, the same as the Stockade.
+            //
+            // areatrigger.sql: (2216,0,3392.46,-3396.77,143.073,0,22.83,8.083,34.69,0)
+            // areatrigger_teleport.sql: (2216,'Stratholme - Eastern Plaguelands Instance',329,3395.09,-3380.25,142.702,0.1)
+            // areatrigger.sql: (2221,329,3584.78,-3632.05,142.118,10,9.778,17.94,27.92,0)
+            // areatrigger_teleport.sql: (2221,'Stratholme - Eastern Plaguelands Instance (Inside)',0,3235.46,-4050.6,108.45,1.93522)
+            {"stratholme-live", 0, 2216, 329, 2221, 0.f, 0.f, 0.f},
+            // STRATHOLME, THE SERVICE ENTRANCE. 52 yards west of trigger 2214
+            // stands the Elders' Square Service Entrance, gameobject 175369 at
+            // (3185.48, -4039.1, 107.792), locked (flags 34, lock 879), and in
+            // practice the Key to the City is what opens it. The key drops on
+            // the Live side, so run `stratholme-live` first. This module does
+            // not check for the key, the same as the Scarlet Key above. Door
+            // minimum level 45; the entry is a 10 yard box.
+            //
+            // areatrigger.sql: (2214,0,3237.46,-4060.6,112.01,0,10,10,10,0)
+            // areatrigger_teleport.sql: (2214,'Stratholme - Eastern Plaguelands Instance',329,3593.15,-3646.56,138.5,5.33)
+            // areatrigger.sql: (2221,329,3584.78,-3632.05,142.118,10,9.778,17.94,27.92,0)
+            // areatrigger_teleport.sql: (2221,'Stratholme - Eastern Plaguelands Instance (Inside)',0,3235.46,-4050.6,108.45,1.93522)
+            {"stratholme-undead", 0, 2214, 329, 2221, 0.f, 0.f, 0.f},
         };
         return portals;
     }
