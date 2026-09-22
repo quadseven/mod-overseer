@@ -10241,4 +10241,110 @@ FamilyRoster const* ChooseCampaignRoster(std::vector<FamilyRoster> const& roster
     return rosters.empty() ? nullptr : &rosters.front();
 }
 
+// ------------------------------------------- the story of a notable item (#567) --
+
+bool IsNotableItemQuality(unsigned quality)
+{
+    return quality >= NOTABLE_ITEM_QUALITY;
+}
+
+ItemStoryWho ClassifyItemStoryCharacter(bool onRoster, unsigned guildId,
+                                        std::vector<unsigned> const& storyGuilds)
+{
+    if (onRoster)
+        return ItemStoryWho::Roster;
+    if (guildId == 0)
+        return ItemStoryWho::Stranger;
+    for (unsigned id : storyGuilds)
+    {
+        if (id == guildId)
+            return ItemStoryWho::GuildMember;
+    }
+    return ItemStoryWho::Stranger;
+}
+
+bool ShouldRecordItemLoot(unsigned quality, ItemStoryWho looter)
+{
+    return IsNotableItemQuality(quality) && looter != ItemStoryWho::Stranger;
+}
+
+bool ShouldRecordItemGiven(unsigned quality, ItemStoryWho from, ItemStoryWho to)
+{
+    if (!IsNotableItemQuality(quality))
+        return false;
+    return from != ItemStoryWho::Stranger || to != ItemStoryWho::Stranger;
+}
+
+bool ShouldRecordItemEquip(unsigned quality, ItemStoryWho wearer, bool itemInStory)
+{
+    switch (wearer)
+    {
+        case ItemStoryWho::Roster:
+            return true;
+        case ItemStoryWho::GuildMember:
+            return IsNotableItemQuality(quality) && itemInStory;
+        case ItemStoryWho::Stranger:
+            return false;
+    }
+    return false;
+}
+
+std::string ItemGivenDetail(std::string const& via, std::string const& to,
+                            std::string const& mailbox)
+{
+    std::string verb = "given";
+    if (via == ItemVia::Trade)
+        verb = "traded";
+    else if (via == ItemVia::Mail)
+        verb = "mailed";
+    std::string out = verb + " to " + (to.empty() ? std::string("somebody") : to);
+    if (via == ItemVia::Mail && !mailbox.empty())
+        out += " from " + mailbox;
+    // The column is VARCHAR(255). Cut on a byte, which can split a multi-byte
+    // name at the very end; a truncated sentence is better than a refused
+    // INSERT that loses every event in the batch with it.
+    if (out.size() > 255)
+        out.resize(255);
+    return out;
+}
+
+std::string ItemLootDetail(std::string const& via, std::string const& source)
+{
+    std::string out;
+    if (via == ItemVia::Need)
+        out = "won on a need roll";
+    else if (via == ItemVia::Greed)
+        out = "won on a greed roll";
+    else
+        out = "looted";
+    if (!source.empty())
+        out += " from " + source;
+    if (out.size() > 255)
+        out.resize(255);
+    return out;
+}
+
+void RememberStoryItem(ItemStoryBook& book, std::uint32_t itemGuid)
+{
+    if (itemGuid == 0 || book.capacity == 0)
+        return;
+    if (StoryKnowsItem(book, itemGuid))
+        return;
+    if (book.order.size() >= book.capacity)
+        book.order.erase(book.order.begin());
+    book.order.push_back(itemGuid);
+}
+
+bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid)
+{
+    if (itemGuid == 0)
+        return false;
+    for (std::uint32_t known : book.order)
+    {
+        if (known == itemGuid)
+            return true;
+    }
+    return false;
+}
+
 }  // namespace OverseerDecisions
