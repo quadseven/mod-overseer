@@ -3320,10 +3320,11 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
 // read that feeds OnRoster, so nothing is configured and nothing polls: a
 // family that forms a guild brings it into the record on the next poll.
 //
-// THE COST ON THE HOT PATH. The loot and equip hooks fire for every player on
-// the world. Each one asks the item's quality first, which is a field on a
-// template already in hand, and returns there for everything below rare. Only
-// a notable item gets as far as a lock.
+// THE COST ON THE HOT PATH. The store, loot and equip hooks fire for every
+// player on the world. Each one asks the item's quality first, which is a
+// field on a template already in hand, and returns there for everything below
+// rare (the loot hooks ask it of the note the store hook left, #572). Only a
+// notable item gets as far as a lock.
 
 std::mutex g_storyMutex;
 std::vector<unsigned> g_storyGuilds;
@@ -3345,6 +3346,39 @@ bool StoryKnowsItem(uint32 itemGuid)
 {
     std::lock_guard<std::mutex> guard(g_storyMutex);
     return OverseerDecisions::StoryKnowsItem(g_storyBook, itemGuid);
+}
+
+// THE ITEM A LOOT HOOK WAS HANDED MAY ALREADY BE FREED (#572). See
+// OverseerDecisions::LootStoreNote for the whole story: a script ahead of this
+// one in the OnPlayerLootItem chain (mod-junk-to-gold, for every grey) can
+// destroy the item, and a freshly looted item is deleted on the spot, so the
+// Item* is dangling by the time this module's hook reads it. The note is
+// written by OnPlayerStoreNewItem, which runs inside Player::StoreNewItem on
+// the thread that then calls the loot hook, so one note per thread is exactly
+// one note per loot in flight and needs no lock.
+thread_local OverseerDecisions::LootStoreNote t_lootStoreNote;
+
+void NoteStoredItem(Player const* player, Item const* item, uint32 count)
+{
+    if (!player)
+        return;
+    ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+    OverseerDecisions::NoteStoredItem(
+        t_lootStoreNote, player->GetGUID().GetRawValue(), item ? item->GetGUID().GetCounter() : 0,
+        count, proto && OverseerDecisions::IsNotableItemQuality(proto->Quality));
+}
+
+// The looted item as the looter's bags hold it now, or null. `handed` is the
+// hook's own pointer and is only ever compared with null, never read: the
+// guid comes from the note and the Item from Player::GetItemByGuid, so an item
+// another script destroyed is simply not found.
+Item* TakeLootedItem(Player* looter, Item const* handed, uint32 count)
+{
+    uint32 const itemGuid = OverseerDecisions::TakeLootedItemGuid(
+        t_lootStoreNote, looter ? looter->GetGUID().GetRawValue() : 0, count);
+    if (!looter || !handed || !itemGuid)
+        return nullptr;
+    return looter->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuid));
 }
 
 // GetGuildId is a field on the Player, so this reads no guild object and takes
@@ -5187,9 +5221,13 @@ public:
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_AFTER_SET_VISIBLE_ITEM_SLOT,
         // #567. Both fire only when an item is actually stored on a looter,
-        // and both return on the item's quality before anything else.
+        // and both return before anything else unless the store they follow
+        // noted a notable item (#572).
         PLAYERHOOK_ON_LOOT_ITEM,
         PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM,
+        // #572. Notes what a store put in the bags while the Item is alive,
+        // because the two hooks above may be handed one that is not.
+        PLAYERHOOK_ON_STORE_NEW_ITEM,
     }) {}
 
     // NINETEEN ARRAY READS, ONCE (#372). Player::GetItemByPos on
@@ -5339,19 +5377,35 @@ public:
                     extra);
     }
 
+    // A STORE (#572). Player::StoreNewItem calls this with the item it has
+    // just put in the bags, before it returns it to its caller, which is
+    // before either loot hook below. The item is alive here; this notes its
+    // guid when it is notable, so those hooks never have to read the pointer
+    // they are handed. One template read per store, the cost the loot hook
+    // used to pay.
+    void OnPlayerStoreNewItem(Player* player, Item* item, uint32 count) override
+    {
+        NoteStoredItem(player, item, count);
+    }
+
     // A LOOT (#567). Player::StoreLootItem calls this after the item is in the
     // looter's bags (Player.cpp:13926), with the guid of what was looted - a
     // creature, a game object, or a container item. A roll won never passes
     // through here; the hook below has it.
-    void OnPlayerLootItem(Player* player, Item* item, uint32 /*count*/,
+    //
+    // `item` IS NEVER READ HERE (#572). A script ahead of this one in the
+    // same hook may already have destroyed it - mod-junk-to-gold does, for
+    // every grey - and a freshly looted item is deleted on the spot, so
+    // item->GetTemplate() was a use-after-free that segfaulted the realm
+    // seconds after the bots began to loot. TakeLootedItem finds the item
+    // again by the guid OnPlayerStoreNewItem noted, in the looter's bags.
+    void OnPlayerLootItem(Player* player, Item* item, uint32 count,
                           ObjectGuid lootGuid) override
     {
-        if (!player || !item)
+        Item* live = TakeLootedItem(player, item, count);
+        if (!live)
             return;
-        ItemTemplate const* proto = item->GetTemplate();
-        if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
-            return;
-        RecordItemLoot(player, item, OverseerDecisions::ItemVia::Loot,
+        RecordItemLoot(player, live, OverseerDecisions::ItemVia::Loot,
                        LootSourceName(player, lootGuid));
     }
 
@@ -5359,18 +5413,21 @@ public:
     // then calls this (Group.cpp:1657 for need, :1741 for greed). The roll's
     // own guid is a fresh item guid made for the roll, not the corpse, so the
     // source is the loot's own record of what it was generated from.
-    void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 /*count*/,
+    //
+    // The item is found again the same way as a loot's (#572). No script on
+    // this realm destroys a roll's item in this hook today, but the pointer is
+    // handed down the same kind of chain, and reading it is safe only for as
+    // long as that stays true.
+    void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count,
                                      RollVote voteType, Roll* roll) override
     {
-        if (!player || !item)
-            return;
-        ItemTemplate const* proto = item->GetTemplate();
-        if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+        Item* live = TakeLootedItem(player, item, count);
+        if (!live)
             return;
         Loot* loot = roll ? roll->getLoot() : nullptr;
         std::string const source = loot ? LootSourceName(player, loot->sourceWorldObjectGUID)
                                         : std::string();
-        RecordItemLoot(player, item,
+        RecordItemLoot(player, live,
                        voteType == NEED ? OverseerDecisions::ItemVia::Need
                                         : OverseerDecisions::ItemVia::Greed,
                        source);
