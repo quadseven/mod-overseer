@@ -3206,6 +3206,40 @@ bool GiveHeldOff(GiveRefusalBook& book, std::string const& key, time_t now,
 bool NoteGiveRefusal(GiveRefusalBook& book, std::string const& key,
                      std::string const& reason, time_t now);
 
+// ---------------------------------------------------- the give range (#566) --
+//
+// A GIVE IS A TRADE THAT SKIPS THE WINDOW, AND NOTHING MORE. DoGive moves an
+// item straight from one character's bags into another's, and it used to do
+// that at any distance: an epic two-hander left Silithus and arrived in
+// Winterspring in the same second. No player can do that, so the give now
+// keeps the one rule a trade keeps and the window would have enforced: the
+// two stand within TRADE_DISTANCE of each other, on one map.
+//
+// THE SAME MEASUREMENT THE CORE'S TRADE HANDLER MAKES. The adapter asks
+// WorldObject::GetDistance2d, which is the flat distance less both
+// characters' combat reach, and IsWithinDistInMap(.., TRADE_DISTANCE, false)
+// in HandleInitiateTradeOpcode compares that same quantity strictly. So a
+// give this allows is a pair the core would let open a trade window, and a
+// give it refuses is one the core would answer TRADE_STATUS_TARGET_TO_FAR.
+//
+// The refusal names the two ways that do work at a distance: meet within trade
+// range, or mail it from a mailbox (kind='mail', and `walk-to-mailbox` for a
+// bot that is not standing at one). Both literals are free of quote
+// characters, because `detail` is written straight into an UPDATE.
+namespace GiveRangeRefusal
+{
+constexpr char const* OtherMap =
+    "giver and receiver are on different maps; meet within trade range or mail it";
+constexpr char const* TooFar =
+    "giver and receiver are too far apart to hand over; meet within trade range or mail it";
+}  // namespace GiveRangeRefusal
+
+// "" when the give may go ahead; otherwise the GiveRangeRefusal literal.
+// `yards` is GetDistance2d between the two and is only read when `sameMap`.
+// `tradeYards` is the core's TRADE_DISTANCE, passed in so this file carries no
+// copy of a number the core owns.
+char const* GiveRangeRefusalFor(bool sameMap, float yards, float tradeYards);
+
 // --------------------------------------------- the command queue drain (#230) --
 //
 // "THE QUEUE IS NOT STALLED. IT IS ATTEMPTING THE SAME TWENTY ROWS FOREVER."
