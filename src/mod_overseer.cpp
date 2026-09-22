@@ -4306,66 +4306,71 @@ public:
         return result->Fetch()[0].Get<std::string>();
     }
 
-    void Claim(std::string const& name, std::string const& target)
+    // ANSWERS WHETHER THE AIM IS NOW IN THE COLUMN (#560): true when this call
+    // wrote it or the walk in flight is already this aim, false when a fence
+    // refused it. A caller that reports a walk as started has to ask this
+    // rather than assume it: a refused catch-up was once logged as released to
+    // walk, and the family held its leader for a walk that never began.
+    //
+    // `catchUp` says the aim is a follower's catch-up walk to its leader, the
+    // one claim OverseerDecisions::ReadTravelClaim lets past a profession
+    // errand whose column is empty. See that function for the argument.
+    bool Claim(std::string const& name, std::string const& target, bool catchUp = false)
     {
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
-            return;
+            return true;
 
-        // A STANDING PROFESSION ERRAND OUTRANKS ANY AIM THIS BOOK WOULD TAKE
-        // (mod-overseer#435). `learn_skill` non-zero means bridge.py's
-        // _write_trade_errand has sent this character to a trainer - a plan
-        // documented there as one that "outlives" a single poll, the same
-        // way it is already fenced off from the ECONOMY_ERRANDS town-trip
-        // pass on the Python side. Nothing on this side had the matching
-        // fence, so a dungeon leader mid-crossing could silently steal the
-        // column from underneath it: the errand vanished with no log line
-        // anywhere, and `learn_skill` sat on the roster row looking active
-        // while nothing was walking toward a trainer any more. This does not
-        // apply to a target this book already owns - the early return above
-        // has already handled every case where `name` is being re-claimed at
-        // the aim it already holds - so a legitimate dungeon-staging walk in
-        // progress is untouched by this check.
-        if (uint32 const learnSkill = LearnSkillPending(name))
+        // TWO FENCES, EACH READ ONCE (#435, #497, #560). A STANDING
+        // PROFESSION ERRAND outranks any aim this book would take:
+        // `learn_skill` non-zero means the bridge has sent this
+        // character to a trainer, a plan that outlives a single poll, and a
+        // dungeon leader mid-crossing must not silently steal the column from
+        // underneath it. A STANDING ECONOMY OR POSITIONAL ERRAND outranks it
+        // the same way: the keyword or `at:` aim sitting in the column is the
+        // bridge's record that a vendor, banker, repair or surveyed walk has
+        // not resolved yet, and re-claiming a catch-up over it every poll is
+        // how a crafter's vial errand never got a sustained shot at completing.
+        //
+        // WHAT IS NEW IS WHERE THE ANSWER LIVES. The decision is
+        // OverseerDecisions::ReadTravelClaim, with the three cases #560 names
+        // under test, and two readings this function did not take before: a
+        // catch-up over an EMPTY column is not refused for a profession errand,
+        // because there is no trainer walk to overwrite, and an aim THIS BOOK
+        // wrote is not foreign, because replacing it disturbs nobody's walk
+        // but the book's own. The second is what lets a catch-up re-aim and a
+        // run's next leg replace the book's previous `at:` aim.
+        OverseerDecisions::TravelClaimFacts facts;
+        facts.learnSkill = LearnSkillPending(name);
+        facts.column = CurrentTravelNpc(name);
+        auto const ours = _claimed.find(name);
+        facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
+        facts.catchUp = catchUp;
+        OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
+        if (verdict != OverseerDecisions::TravelClaim::Write)
         {
-            LOG_INFO("module.overseer",
-                     "overseer: travel aim '{}' for '{}' refused - a profession "
-                     "errand (skill {}) is outstanding and this book did not "
-                     "issue it",
-                     target, name, learnSkill);
-            return;
+            // SAID ONCE PER STATE, NOT ONCE PER POLL (#560). A catch-up is
+            // re-asked on every party poll and a refusal can stand for as long
+            // as the errand does, which was the same four lines every thirty
+            // seconds. The fence and its value are the state; the target is
+            // not, because a catch-up target moves with the leader.
+            std::string const why =
+                verdict == OverseerDecisions::TravelClaim::RefusedProfession
+                    ? "a profession errand (skill " + std::to_string(facts.learnSkill) + ")"
+                    : "errand '" + facts.column + "'";
+            auto const said = _claimRefusalSaid.find(name);
+            if (said == _claimRefusalSaid.end() || said->second != why)
+            {
+                _claimRefusalSaid[name] = why;
+                LOG_INFO("module.overseer",
+                         "overseer: travel aim '{}' for '{}' refused - {} is outstanding "
+                         "and this book did not issue it. Said once until the fence "
+                         "changes or an aim is written",
+                         target, name, why);
+            }
+            return false;
         }
-
-        // A STANDING ECONOMY ERRAND OUTRANKS A CATCH-UP WALK THE SAME WAY
-        // (infra#3655). Ugga (job='craft') fell far enough behind her party
-        // that DungeonEscort's catch-up walk re-Claims her onto her leader's
-        // live position every poll (CatchUpToward, below) - and every poll it
-        // wins the race against craft_supply.py's own "vendor" aim before that
-        // aim can resolve into an actual buy, so the vial errand that IS her
-        // whole job right now (DriveCraft already treats job='craft' the same
-        // way) never gets a sustained shot at completing. `travel_npc` itself
-        // is the only outstanding-errand signal a vendor/banker/repair pass
-        // has - IsMaintenanceErrand is the same three keywords bridge.py's own
-        // ECONOMY_ERRANDS guard and mod-overseer#450's budget exemption already
-        // agree on, kept as one vocabulary rather than a third copy of it. As
-        // with the profession-errand fence above, this does not apply to a
-        // target this book already owns - the early return has already handled
-        // every re-claim of an in-flight aim - so a legitimate dungeon-staging
-        // walk or an escort already under way is untouched.
-        // AND A POSITIONAL AIM IS SOMEBODY'S ERRAND TOO. IsMaintenanceErrand
-        // answers only for the four counter keywords, so an `at:` aim the
-        // bridge wrote read as "nothing is outstanding" and this claim
-        // overwrote a walk already in progress. IsForeignTravelAim is that same
-        // question asked about the whole column rather than the keyword half of
-        // it; the vocabulary it shares with the arrival branch is unchanged.
-        if (OverseerDecisions::IsForeignTravelAim(CurrentTravelNpc(name)))
-        {
-            LOG_INFO("module.overseer",
-                     "overseer: travel aim '{}' for '{}' refused - errand '{}' "
-                     "is outstanding and this book did not issue it",
-                     target, name, CurrentTravelNpc(name));
-            return;
-        }
+        _claimRefusalSaid.erase(name);
 
         // Esc() rather than a bare interpolation, the same discipline every
         // other write in this file applies: the name came out of a table a
@@ -4384,6 +4389,15 @@ public:
         // than inside it precisely because the line above erases `_state`: a
         // new aim is a new errand, and this has to outlive that erase.
         _claimed[name] = target;
+        return true;
+    }
+
+    // Why this character's last claim was refused, or empty when the last
+    // claim wrote (#560). The same memory that rations the refusal line.
+    std::string ClaimRefusal(std::string const& name) const
+    {
+        auto const it = _claimRefusalSaid.find(name);
+        return it == _claimRefusalSaid.end() ? std::string() : it->second + " is outstanding";
     }
 
     // GIVE THE ERRAND BACK. THE ONE TERMINAL PATH - every release, in either
@@ -4422,21 +4436,26 @@ public:
         // reads as a new errand. The landing recorded below is what stops
         // that; see LandedStep and OverseerDecisions::LandedErrandStep.
         _landed.erase(name);
-        std::string const standing = _claimed.count(name) ? std::string() : CurrentTravelNpc(name);
+        // EACH FENCE IS READ ONCE, AND THE LINE PRINTS WHAT THE GATE TESTED
+        // (#561). The line used to read the column a second time and print it
+        // whichever fence fired, so a profession errand read as "errand ''".
+        bool const claimed = _claimed.count(name) != 0;
+        std::string const standing = claimed ? std::string() : CurrentTravelNpc(name);
+        uint32 const learnSkill = claimed ? 0 : LearnSkillPending(name);
+        std::string const fence = OverseerDecisions::TravelReleaseFence(learnSkill, standing);
         // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
         // in the column the travel drive was not walking has not walked it at
         // all, and must not stop the travel drive from starting it.
         auto const driving = _state.find(name);
         bool const wasDriving = driving != _state.end() && !standing.empty() &&
                                 driving->second.target == standing;
-        if (!_claimed.count(name) &&
-            (LearnSkillPending(name) || OverseerDecisions::IsForeignTravelAim(standing)))
+        if (!fence.empty())
         {
             LOG_INFO("module.overseer",
                      "overseer: travel release for '{}' skipped the column "
-                     "write - errand '{}' is outstanding and this book never "
-                     "claimed the aim it would have erased",
-                     name, standing);
+                     "write - {} and this book never claimed the aim it would "
+                     "have erased",
+                     name, fence);
             if (wasDriving)
                 _landed[name] = Landing{standing, std::time(nullptr), false};
         }
@@ -4715,6 +4734,10 @@ private:
     // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
     std::map<std::string, Refusal> _refused;
+    // The fence that refused each character's last claim, as said in the log,
+    // so a refusal is said once per state rather than every poll (#560).
+    // Erased when a claim writes. World thread only.
+    std::map<std::string, std::string> _claimRefusalSaid;
     // What economy errands have cost each character lately. Beside `_refused`
     // and for the same reason: it has to outlive the errands it is counting, or
     // it counts one errand at a time and never reaches a share of anything. Its
@@ -6142,6 +6165,9 @@ private:
     // with an upstream one. Named anyway, because a bare literal in a MovePoint
     // call is the kind of thing somebody later reads as meaningful.
     static constexpr uint32 HOLD_PIN_POINT_ID = 0;
+    // How many names HoldCharacterStill remembers having refused in flight
+    // before it forgets them all (#559). Far above any roster this module runs.
+    static constexpr size_t FLIGHT_REFUSAL_SAID_MAX = 256;
 
     // HOW FAR A HELD CHARACTER MAY BE FROM ITS ANCHOR BEFORE THE PIN IS
     // RE-TAKEN (#358).
@@ -6289,10 +6315,23 @@ private:
         MotionMaster* const motion = who->GetMotionMaster();
         if (!motion)
             return false;
-        if (motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == NULL_MOTION_TYPE)
+        bool const occupied = motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) != NULL_MOTION_TYPE;
+        if (!occupied)
             return false;
+        // AND IT ANSWERS WHETHER THE SLOT ACTUALLY CHANGED (#559). MovePoint
+        // returns without doing anything for a unit carrying
+        // UNIT_FLAG_DISABLE_MOVE (MotionMaster.cpp:489-490), which a taxi sets,
+        // and the generator left in the slot is then never displaced. This
+        // used to answer true anyway, so every re-assertion counted and logged
+        // a takeover nothing had made. The new generator is allocated before
+        // Mutate deletes the old one, so a changed pointer is a replaced
+        // generator and never an address the allocator happened to reuse.
+        MovementGenerator const* const before = motion->GetMotionSlot(MOTION_SLOT_ACTIVE);
         motion->MovePoint(HOLD_PIN_POINT_ID, who->GetPositionX(), who->GetPositionY(),
                           who->GetPositionZ());
+        bool const replaced = motion->GetMotionSlot(MOTION_SLOT_ACTIVE) != before;
+        if (!OverseerDecisions::PinTookTheSlot(occupied, replaced))
+            return false;
         who->StopMoving();
         return true;
     }
@@ -6454,6 +6493,43 @@ private:
     {
         if (!who || !botAI)
             return false;
+
+        // A CHARACTER ON A TAXI IS NOT HELD, AND THE HOLD IS REFUSED RATHER
+        // THAN PLACED (#559). Everything below starts with Unit::StopMoving,
+        // which replaces the flight spline with a stop spline the flight
+        // generator never finishes: measured, a leader hung twenty yards up
+        // for eighteen minutes, until a restart. The dismount below already
+        // leaves a flight alone for the reason this does - taking somebody off
+        // a taxi mid-route would be this module cancelling an errand it was not
+        // asked to cancel. A hold already standing is left in the register and
+        // untouched; the per-tick sweep leaves it alone in flight too, and
+        // re-anchors it where the character lands. No record is made here, so
+        // a caller that reads the register back finds no new hold.
+        //
+        // SAID ONCE PER FLIGHT. The staging and regroup callers re-assert every
+        // poll, and a flight lasts minutes. BOUNDED: a name leaves when the
+        // same character is next asked on the ground, and one that never is
+        // would otherwise stay for the life of the world, so the memory is
+        // dropped whole past a roster's worth of names. The cost is one
+        // repeated line.
+        static std::set<std::string> flightRefusalSaid;
+        if (who->IsInFlight())
+        {
+            if (flightRefusalSaid.size() >= FLIGHT_REFUSAL_SAID_MAX)
+                flightRefusalSaid.clear();
+            if (flightRefusalSaid.insert(name).second)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is on a taxi, so the {} hold is refused rather "
+                         "than placed - stopping a flight mid-route leaves the rider "
+                         "hanging in the air until a relog. {}",
+                         name, verb ? verb : "",
+                         HoldsInForce().count(name)
+                             ? "The hold already standing is kept and not re-asserted "
+                               "until it lands"
+                             : "Nothing is held");
+            return false;
+        }
+        flightRefusalSaid.erase(name);
 
         auto& holds = HoldsInForce();
         auto const existing = holds.find(name);
@@ -6927,6 +7003,17 @@ private:
             facts.pastDeadline = now >= record.until;
             facts.walkingOnPurpose = now < record.walkingUntil;
             facts.inCombat = facts.present && who->IsInCombat();
+            facts.inFlight = facts.present && who->IsInFlight();
+
+            // A CHARACTER ON A TAXI UNDER A HOLD IS LEFT ALONE, and its anchor
+            // follows it (#559). The sweep's StopMoving would freeze the flight
+            // in the air, and re-anchoring means the landing is where the hold
+            // means rather than a drift of hundreds of yards to take over.
+            if (facts.inFlight)
+            {
+                AnchorHoldWhereItStands(record, who);
+                continue;
+            }
 
             // A CHARACTER ON ANOTHER MAP UNDER ITS OWN HOLD IS A HEARTH THAT
             // WORKED, and this sweep has nothing to say about where it landed.
@@ -16144,6 +16231,25 @@ private:
         }
         std::ostringstream aim;
         aim << "at:" << leader->GetMapId() << ':' << ax << ',' << ay << ',' << az;
+        std::string const aimText = aim.str();
+
+        // THE AIM IS WRITTEN BEFORE ANYTHING IS RECORDED ABOUT IT (#560).
+        // TravelAimBook::Claim can refuse, when a fence protects an errand it
+        // did not issue, and this used to record the walk and answer `started`
+        // either way - so the caller logged a follower as released to walk
+        // under an aim that was never written, and the family held its leader
+        // for that walk. A refusal now leaves the escort as it found it, and a
+        // fresh entry this call made is dropped rather than left for
+        // SweepDungeonEscorts to end as if a run had held it. The refusal
+        // itself is said by Claim, once per state.
+        if (!_travelAims.Claim(name, aimText, true))
+        {
+            _catchUpRefused[name] = _travelAims.ClaimRefusal(name);
+            if (escort.aim.empty() && !escort.catchUp && !escort.rejoin &&
+                !escort.granted && !escort.homeBind)
+                _dungeonEscorts.erase(name);
+            return false;
+        }
 
         // SAID WHEN THE AIM CHANGES, NOT WHEN THE CORRECTION HAPPENS, which is
         // the same log-once discipline EscortToward keeps a few lines above and
@@ -16156,7 +16262,7 @@ private:
         // same shore, so the string is identical and TravelAimBook::Claim
         // leaves the errand alone; without this test the LINE would still be
         // printed on every one of those polls.
-        if (shore == AimShore::Moved && escort.aim != aim.str())
+        if (shore == AimShore::Moved && escort.aim != aimText)
             LOG_INFO("module.overseer",
                      "overseer: '{}' is aimed at ground measured beside '{}' rather than "
                      "at the leader's own position - {} yards off it and at z {:.1f} "
@@ -16185,8 +16291,7 @@ private:
         // re-aim a walk that had not moved.
         escort.x = ax;
         escort.y = ay;
-        escort.aim = aim.str();
-        _travelAims.Claim(name, escort.aim);
+        escort.aim = aimText;
         return started;
     }
 
@@ -16284,6 +16389,14 @@ private:
     void DriveCatchUp(Player* p, Player* leader)
     {
         std::string const name = p->GetName();
+        // THIS POLL'S ANSWER ONLY (#560). The ordering is KeepRosterFollowing's:
+        // its follow loop calls this for every member, and its last statement,
+        // after that loop, is KeepTheFamilyTogether, whose member filter (in
+        // this group, has a bot AI, no real player as master) is the loop's
+        // own. So every member the wait reads has passed through here earlier
+        // in the same poll, and a refusal recorded below is never a stale one.
+        // All of it runs on the world thread.
+        _catchUpRefused.erase(name);
 
         // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Read
         // BEFORE the escorted early-return below, so that a split is forgotten
@@ -16403,8 +16516,8 @@ private:
             aim.followerGapToLeader = gap;
             if (OverseerDecisions::CatchUpAimIsStale(aim, FOLLOW_CATCH_UP_AIM_LIMITS))
                 CatchUpToward(name, leader);
-            else
-                _travelAims.Claim(name, it->second.aim);
+            else if (!_travelAims.Claim(name, it->second.aim, true))
+                _catchUpRefused[name] = _travelAims.ClaimRefusal(name);
             return;
         }
 
@@ -16559,6 +16672,12 @@ private:
     std::string _regroupLeader;
     std::string _regroupWaitingFor;
     OverseerDecisions::RatchetState _regroupProgress{};
+    // Followers whose catch-up aim the travel book refused THIS poll, and the
+    // fence that refused it (#560). Written by DriveCatchUp and CatchUpToward,
+    // cleared by DriveCatchUp at the top of each member's turn, and read by
+    // KeepTheFamilyTogether later in the same poll, so the family never waits
+    // for a walk that was not written.
+    std::map<std::string, std::string> _catchUpRefused;
 
     // ONE WAIT PER FAMILY LEADER, NOT ONE FOR THE MODULE (#548).
     //
@@ -16733,12 +16852,17 @@ private:
         // would be two drives steering one character; a dead leader is walking
         // away from nobody and is the revival drive's business. Neither is a
         // family this wait has anything to say about.
-        if (InDungeonRun(leader) || !leader->IsAlive())
+        //
+        // ...OR THE LEADER IS NOT ON THE GROUND (#559). DriveCatchUp will not
+        // aim a follower at a leader on a taxi or mid-fall, so a wait placed
+        // then is the family holding a leader for a walk that cannot start -
+        // and the hold's own StopMoving froze a taxi in the air, where the
+        // leader hung until a relog. OnTheGround is the reading DriveCatchUp
+        // applies, so the two drives cannot disagree about it.
+        if (char const* const refusal = OverseerDecisions::RegroupLeaderRefusal(
+                InDungeonRun(leader), leader->IsAlive(), OnTheGround(leader)))
         {
-            EndTheRegroupWait(InDungeonRun(leader)
-                                  ? "a dungeon run has the leader now"
-                                  : "the leader is dead, and a corpse walks away "
-                                    "from nobody");
+            EndTheRegroupWait(refusal);
             return;
         }
 
@@ -16795,6 +16919,9 @@ private:
             // default is the honest value rather than a defensive one.
             if (member.sameMap)
                 member.yards = p->GetDistance2d(leader);
+            auto const refused = _catchUpRefused.find(member.name);
+            if (refused != _catchUpRefused.end())
+                member.aimRefusedBecause = refused->second;
             members.push_back(member);
         }
 
@@ -16824,10 +16951,17 @@ private:
 
         if (!verdict.wait)
         {
-            EndTheRegroupWait("everybody is back within " +
-                              std::to_string(static_cast<uint32>(
-                                  REGROUP_LIMITS.rejoinYards)) +
-                              " yards of the leader");
+            // TWO DIFFERENT ENDINGS, AND THE LINE HAS TO SAY WHICH (#560). A
+            // member whose catch-up aim was refused ends the wait without being
+            // back, and "everybody is back" about it would be false.
+            EndTheRegroupWait(verdict.notWaitedFor
+                                  ? "nobody still behind is walking back under a "
+                                    "catch-up aim - see the line naming who the "
+                                    "family carries on without"
+                                  : "everybody is back within " +
+                                        std::to_string(static_cast<uint32>(
+                                            REGROUP_LIMITS.rejoinYards)) +
+                                        " yards of the leader");
             return;
         }
 

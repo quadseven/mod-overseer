@@ -41,6 +41,7 @@ using OverseerDecisions::RegroupCarriedOnWithout;
 using OverseerDecisions::RegroupClaim;
 using OverseerDecisions::RegroupClaimIsWaitedFor;
 using OverseerDecisions::RegroupClaimName;
+using OverseerDecisions::RegroupLeaderRefusal;
 using OverseerDecisions::RegroupLimits;
 using OverseerDecisions::RegroupMember;
 
@@ -392,7 +393,8 @@ void EveryClaimHasItsOwnName()
     RegroupClaim const all[] = {
         RegroupClaim::InFormation, RegroupClaim::Rejoining,
         RegroupClaim::NotInTheWorld, RegroupClaim::AnotherMap,
-        RegroupClaim::Dead, RegroupClaim::OnARun, RegroupClaim::StoodDown};
+        RegroupClaim::Dead, RegroupClaim::OnARun, RegroupClaim::StoodDown,
+        RegroupClaim::AimRefused};
     for (RegroupClaim a : all)
     {
         Check("a name is never empty", RegroupClaimName(a)[0] != '\0', true);
@@ -488,6 +490,45 @@ void AStragglerThatNeverMovesKeepsSayingWaitAndThatIsTheCallersProblem()
           ReadFamilyRegroup(vanished, LIVE, true).wait, false);
 }
 
+// #560. A member whose catch-up aim the travel book refused has no walk under
+// it, so the family must not hold the leader for it, and the line that names
+// the members it carries on without must say why.
+void AMemberWhoseAimWasRefusedNeverHoldsTheFamily()
+{
+    std::vector<RegroupMember> family = TheNightItHappened();
+    family[3].aimRefusedBecause = "errand 'vendor' is outstanding";
+    CheckClaim("a refused aim is not a walk to wait for",
+               ReadRegroupClaim(family[3], LIVE, false), RegroupClaim::AimRefused);
+    Check("so the family does not wait", ReadFamilyRegroup(family, LIVE, false).wait,
+          false);
+    Check("and a wait already running for it ends",
+          ReadFamilyRegroup(family, LIVE, true).wait, false);
+    CheckName("and the reason is named with the member",
+              RegroupCarriedOnWithout(family, LIVE, false),
+              "behind (catch-up aim refused: errand 'vendor' is outstanding)");
+
+    // A refusal beside the leader asks nothing either way.
+    RegroupMember near = Near("near", 10.f);
+    near.aimRefusedBecause = "errand 'vendor' is outstanding";
+    CheckClaim("a refused aim inside the line is still in formation",
+               ReadRegroupClaim(near, LIVE, false), RegroupClaim::InFormation);
+}
+
+// #559. The family waits only on a leader standing on the ground, which is the
+// same reading DriveCatchUp applies before it aims anybody at that leader.
+void AWaitNeedsALeaderOnTheGround()
+{
+    Check("a leader on the ground may be waited on",
+          RegroupLeaderRefusal(false, true, true) == nullptr, true);
+    Check("a leader on a taxi may not",
+          RegroupLeaderRefusal(false, true, false) != nullptr, true);
+    Check("nor a dead one", RegroupLeaderRefusal(false, false, true) != nullptr, true);
+    Check("nor one a run has", RegroupLeaderRefusal(true, true, true) != nullptr, true);
+    char const* const air = RegroupLeaderRefusal(false, true, false);
+    Check("and the air is named as the reason",
+          air != nullptr && std::strstr(air, "not on the ground") != nullptr, true);
+}
+
 }  // namespace
 
 int main()
@@ -505,6 +546,8 @@ int main()
     AMemberTheFamilyAlreadyGaveUpOnNeverHoldsItAgain();
     NothingButAWalkableStragglerCanEverHoldTheFamily();
     AnEmptyFamilyWaitsForNobody();
+    AMemberWhoseAimWasRefusedNeverHoldsTheFamily();
+    AWaitNeedsALeaderOnTheGround();
 
     TheFamilyWaitsForTheOneFurthestBack();
     AWaitAndAnAbandonmentCanBothBeTrue();
