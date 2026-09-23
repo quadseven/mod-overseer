@@ -11559,9 +11559,11 @@ std::vector<RunTimelineEvent> RunTimelineEvents(RunTimelineSnapshot const& befor
 
     if (sameRunDecisions)
     {
-        if (after.clearEncounters != before.clearEncounters && after.clearEncounters != 0)
+        // Only bits newly set are credit. A mask that lost bits (an instance
+        // reset under the same run) is not a boss dying, and writes nothing.
+        uint32_t const gained = after.clearEncounters & ~before.clearEncounters;
+        if (gained != 0)
         {
-            uint32_t const gained = after.clearEncounters & ~before.clearEncounters;
             unsigned credited = 0;
             for (uint32_t bits = gained; bits; bits &= bits - 1)
                 ++credited;
@@ -11627,8 +11629,14 @@ std::vector<DcOnTimelineEvent> DcOnTimelineEvents(std::map<std::string, DcOnMark
             e.detail = RunTimelineDetail(detail);
             events.push_back(std::move(e));
         };
-        bool const issued = now.issuedAt != was.issuedAt || now.runId != was.runId;
-        if (issued && now.accepted)
+        // An ACCEPTANCE, not a timestamp: a row when the character becomes
+        // accepted, when it is accepted for a different run, or when it is
+        // armed again after a stand-down. A re-issue that changes only the
+        // time writes nothing.
+        bool const newlyAccepted = now.accepted &&
+                                   (!was.accepted || now.runId != was.runId ||
+                                    (was.stoodDown && !now.stoodDown));
+        if (newlyAccepted)
             add("dc_on", "'dc on' accepted for '" + name + "'");
         if (now.loggedRefused && (!was.loggedRefused || now.runId != was.runId))
             add("dc_on_refused", "'dc on' refused for '" + name + "'; retrying");

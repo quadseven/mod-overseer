@@ -79,6 +79,13 @@ int main()
               events[2].detail == "no boss credited in 10 minutes");
     check("the same stall is not written twice", RunTimelineEvents(later, later).empty());
 
+    // A mask that loses bits is not a boss credited.
+    RunTimelineSnapshot fewer = clearing;
+    fewer.clearEncounters = 0x1;
+    RunTimelineSnapshot more = clearing;
+    more.clearEncounters = 0x3;
+    check("a mask losing bits writes nothing", RunTimelineEvents(more, fewer).empty());
+
     // A flag the coordinator raises once per stretch is written once.
     RunTimelineSnapshot accepted = clearing;
     accepted.dcAcceptedAll = true;
@@ -158,11 +165,25 @@ int main()
     dc = DcOnTimelineEvents(r2, r3);
     check("a refusal that heals is one dc_on row", dc.size() == 1 && dc[0].kind == "dc_on");
 
+    DcOnMark reissued = onAccepted;
+    reissued.issuedAt = 2000;
+    std::map<std::string, DcOnMark> again{{"Zug", reissued}};
+    check("an accepted re-issue in the same run is not another row",
+          DcOnTimelineEvents(after, again).empty());
+    DcOnMark nextRun = onAccepted;
+    nextRun.runId = 8;
+    std::map<std::string, DcOnMark> next{{"Zug", nextRun}};
+    dc = DcOnTimelineEvents(after, next);
+    check("an acceptance for a new run is a row", dc.size() == 1 && dc[0].kind == "dc_on");
+
     DcOnMark down = onAccepted;
     down.stoodDown = true;
     std::map<std::string, DcOnMark> d{{"Zug", down}};
     dc = DcOnTimelineEvents(after, d);
     check("a dc off is one row", dc.size() == 1 && dc[0].kind == "dc_off");
+    std::map<std::string, DcOnMark> rearmed_dc{{"Zug", onAccepted}};
+    dc = DcOnTimelineEvents(d, rearmed_dc);
+    check("armed again after a dc off is a row", dc.size() == 1 && dc[0].kind == "dc_on");
 
     if (failures == 0)
         std::printf("ok test_run_timeline\n");
