@@ -33299,7 +33299,11 @@ private:
             OverseerDecisions::TankStrategyFacts facts;
             facts.rosterTreeTanks =
                 GearRoleFor(bot->getClass(), specTab) == OverseerDecisions::GearRole::Tank;
-            facts.talentsInTree = OverseerDecisions::DominantTree(points) == specTab;
+            // 255 is "no tree chosen", and DominantTree also answers 255 for a
+            // character with no point spent, so the tree is asked to be a real
+            // one before the two are compared.
+            facts.talentsInTree =
+                specTab <= 2 && OverseerDecisions::DominantTree(points) == specTab;
             facts.hasTank = StrategyPresent(botAI, StrategyItem{"tank", true});
             facts.hasTankAssist = StrategyPresent(botAI, StrategyItem{"tank assist", true});
 
