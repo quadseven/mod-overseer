@@ -72,6 +72,21 @@ void ARecordDoesNotOutliveTheCharacter()
     Check("logged out forgets", ForgetDcOnRecord(false, true));
     Check("off the dungeon map forgets", ForgetDcOnRecord(true, false));
     Check("inside keeps", !ForgetDcOnRecord(true, true));
+
+    // The round trip the fix is for. Armed for run 7, the head logs out, the
+    // record is forgotten, he comes back with an issuer (himself): the drive
+    // issues again rather than reading an old "accepted".
+    bool recordExists = true;
+    bool accepted = true;
+    Check("armed before the logout",
+          DecideDcArming(true, recordExists, accepted, false) == DcArmingStep::Armed);
+    if (ForgetDcOnRecord(false, true))
+    {
+        recordExists = false;
+        accepted = false;
+    }
+    Check("issued again on return",
+          DecideDcArming(true, recordExists, accepted, false) == DcArmingStep::Issue);
 }
 
 // (acceptedOnEveryoneInside, leaderVisible, issuerAvailable)

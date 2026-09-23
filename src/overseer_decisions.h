@@ -2437,7 +2437,12 @@ bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap);
 // Does the CLEARING stall clock run this poll (#618)? Only while the brain can
 // actually be driven: `dc on` accepted for everyone inside, the leader
 // visible on the dungeon map, and a groupmate able to issue `dc skip`.
-// Anything else HOLDS the clock, and the caller re-stamps it. Without the hold
+// Anything else HOLDS the clock, and the caller re-stamps it. The three are
+// asked in the order the CLEARING poll meets them, so the hold names the first
+// gate the run failed, which is not always the root cause: a run with nobody to
+// issue a command usually fails "accepted" first, because nothing could be
+// accepted. The arming drive's own "no groupmate may issue" line names that
+// root. Without the hold
 // the minutes the head spent offline were counted as a stall, and the ladder
 // of `dc skip`s and the extraction fired at a run that was only waiting for
 // him.
