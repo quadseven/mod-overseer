@@ -6208,16 +6208,50 @@ private:
         return families;
     }
 
+    // EVERY ENABLED FAMILY, EACH WITH ITS OWN MEMBERS AND ITS OWN LEADER, in the
+    // order the one-campaign picker has always read them: `lead` DESC then name,
+    // so the first family is the one ChooseCampaignRoster would pick. Empty when
+    // there is no roster or the read failed, which every caller treats as
+    // "nothing to do this poll" and never as "every family has gone".
+    static std::vector<OverseerDecisions::FamilyRoster> LoadFamilyRosters()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            // `lead` is BACKTICKED: a reserved word in MySQL 8 (see
+            // KeepRosterGrouped for the crash loop that taught this).
+            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
+            "ORDER BY `lead` DESC, name");
+        if (!result)
+            return {};
+
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
+        std::vector<OverseerDecisions::FamilyMember> rows;
+        do
+        {
+            Field* row = result->Fetch();
+            std::string const name = row[0].Get<std::string>();
+            auto const family = families.find(name);
+            rows.push_back(OverseerDecisions::FamilyMember{
+                name, family == families.end() ? std::string() : family->second,
+                row[1].Get<uint8>() != 0});
+        } while (result->NextRow());
+
+        return OverseerDecisions::PartitionRosterByFamily(rows);
+    }
+
     // THE ROSTER THE ONE-CAMPAIGN MACHINERY DRIVES: one family's enabled members
     // and that family's own leader. Home binds, town trips, dungeon runs and guild
     // founding each used to read the whole table and take the last `lead` row as
     // THE leader, which is right for one family and wrong for two (#548).
     // Returns false when there is no roster at all, which is the case every
     // caller already treats as "nothing to do".
+    // HOME BINDS, TOWN TRIPS AND DUNGEON RUNS NO LONGER COME HERE (#555): each
+    // now drives every family LoadFamilyRosters returns, from that family's own
+    // state, so two families run two campaigns at once. What is left is guild
+    // founding, which always names the family that asked.
+    //
     // WITH `wantFamily` SET THIS ASKS FOR ONE NAMED FAMILY AND NEVER SUBSTITUTES
     // ANOTHER. Left empty it keeps its old behaviour exactly: whichever family
-    // ChooseCampaignRoster prefers, which is right for a campaign because a
-    // campaign is a thing the world runs one of.
+    // ChooseCampaignRoster prefers.
     //
     // IT IS WRONG FOR ANYTHING A PARTICULAR FAMILY ASKED FOR, and founding a
     // guild is the case that proved it (#548 step 2). A `form` row carried by a
@@ -6233,28 +6267,9 @@ private:
                                    std::string& leaderName,
                                    std::string const& wantFamily = "")
     {
-        QueryResult result = CharacterDatabase.Query(
-            // `lead` is BACKTICKED: a reserved word in MySQL 8 (see
-            // KeepRosterGrouped for the crash loop that taught this).
-            "SELECT name, `lead` FROM overseer_roster WHERE enabled = 1 "
-            "ORDER BY `lead` DESC, name");
-        if (!result)
+        std::vector<OverseerDecisions::FamilyRoster> const rosters = LoadFamilyRosters();
+        if (rosters.empty())
             return false;
-
-        std::map<std::string, std::string> const families = LoadRosterFamilies();
-        std::vector<OverseerDecisions::FamilyMember> rows;
-        do
-        {
-            Field* row = result->Fetch();
-            std::string const name = row[0].Get<std::string>();
-            auto const family = families.find(name);
-            rows.push_back(OverseerDecisions::FamilyMember{
-                name, family == families.end() ? std::string() : family->second,
-                row[1].Get<uint8>() != 0});
-        } while (result->NextRow());
-
-        std::vector<OverseerDecisions::FamilyRoster> const rosters =
-            OverseerDecisions::PartitionRosterByFamily(rows);
         OverseerDecisions::FamilyRoster const* campaign = nullptr;
         if (wantFamily.empty())
         {
@@ -7482,11 +7497,14 @@ private:
     //
     // AND IT NAMES THE VERB, so a conjure hold on a character that happens to be
     // standing at a door is not lifted by a barrier opening. See ReleaseHold.
-    static void ReleaseEveryStagingHold(char const* why)
+    //
+    // EXCEPT the members named in `keep`, which are the members of a family
+    // whose own coordinator is still at BARRIER (#555).
+    static void ReleaseStagingHoldsExcept(std::set<std::string> const& keep, char const* why)
     {
         std::vector<std::string> held;
         for (auto const& hold : HoldsInForce())
-            if (hold.second.verb == STAGE_HOLD_VERB)
+            if (hold.second.verb == STAGE_HOLD_VERB && !keep.count(hold.first))
                 held.push_back(hold.first);
         for (std::string const& name : held)
             ReleaseStagingHold(name, why);
@@ -9289,12 +9307,26 @@ private:
     // whether delivered or refused, are not outstanding: the pass that wrote
     // them owns what happens next, and #230 is explicit that a retry is a fresh
     // row rather than a re-queue of this one.
-    uint32 OutstandingMaintenanceRows()
+    //
+    // AND THE ROSTER IS ONE FAMILY'S (#555). A trip another family is taking
+    // is that family's business, and counting its rows here would hold this
+    // family's run for the length of the other family's shopping.
+    uint32 OutstandingMaintenanceRows(std::vector<std::string> const& members)
     {
+        if (members.empty())
+            return 0;
+        std::string names;
+        for (std::string const& name : members)
+        {
+            if (!names.empty())
+                names += ", ";
+            names += "'" + Esc(name) + "'";
+        }
         QueryResult result = CharacterDatabase.Query(
             "SELECT COUNT(*) FROM overseer_command "
             "WHERE kind IN ('repair', 'buy', 'sell', 'bank') "
-            "AND status IN ('pending', 'claimed', 'verifying')");
+            "AND status IN ('pending', 'claimed', 'verifying') "
+            "AND target_name IN ({})", names);
         // A world image whose `kind` ENUM predates these values answers nothing
         // rather than failing: the query names no column that could be absent,
         // and an ENUM value that does not exist simply matches no rows. So
@@ -9381,7 +9413,19 @@ private:
     // comment for why this module treats a read-back after a write as a thing to
     // design around rather than a thing to do casually. The world thread is the
     // only writer, so there is no second allocator to race.
-    static uint32 AllocateCampaignId()
+    //
+    // AND NEVER ONE ANOTHER FAMILY'S COORDINATOR ALREADY HOLDS (#555). The stamp
+    // that writes an id back is queued, so two families opening a campaign in
+    // the same poll would read the same MAX. See OverseerDecisions::NextCampaignId.
+    uint32 AllocateCampaignId()
+    {
+        std::vector<unsigned> held;
+        for (auto const& entry : _dungeonRunCoordinators)
+            held.push_back(entry.second.campaignId);
+        return OverseerDecisions::NextCampaignId(CampaignIdAfterTable(), held);
+    }
+
+    static uint32 CampaignIdAfterTable()
     {
         QueryResult result = CharacterDatabase.Query(
             "SELECT COALESCE(MAX(campaign_id), 0) + 1 FROM overseer_dungeon_run");
@@ -23391,22 +23435,33 @@ private:
         // to an inn. The sweep above has already ended anything outstanding by
         // the time this returns, so a run opening mid-errand takes the member
         // back within one poll rather than leaving two owners for one walk.
-        if (_dungeonRunCoordinator.phase != DungeonRunPhase::Idle)
-            return;
+        //
+        // EACH FAMILY IS ASKED ABOUT ITS OWN CAMPAIGN (#555): a family whose
+        // coordinator is on a run is skipped, and the other family's campaign
+        // is still bound where its own door is approached from.
 
         // `job` through the same guarded loader DriveDungeonRun uses, for the
         // reason it gives: a schema older than one of these columns must cost
-        // that column and not the whole roster read (infra#2846).
+        // that column and not the whole roster read.
         std::map<std::string, std::string> const jobs = LoadJobs();
 
-        std::vector<std::string> members;
-        std::string leaderName;
-        if (!LoadCampaignRoster(members, leaderName))
-            return;
+        std::vector<OverseerDecisions::FamilyRoster> const rosters = LoadFamilyRosters();
+        for (OverseerDecisions::FamilyRoster const* roster :
+             OverseerDecisions::CampaignRosters(rosters))
+        {
+            if (FamilyOnADungeonRun(roster->family))
+                continue;
+            std::vector<std::string> members;
+            for (OverseerDecisions::FamilyMember const& member : roster->members)
+                members.push_back(member.name);
+            DriveHomeBindFor(members, roster->leader, jobs);
+        }
+    }
 
-        if (leaderName.empty())
-            return;
-
+    void DriveHomeBindFor(std::vector<std::string> const& members,
+                          std::string const& leaderName,
+                          std::map<std::string, std::string> const& jobs)
+    {
         auto const jobIt = jobs.find(leaderName);
         std::string const leaderJob =
             jobIt == jobs.end() ? std::string("quest") : jobIt->second;
@@ -24169,6 +24224,10 @@ private:
         // second timer here would be a bound on a bound, and the one that fired
         // first would be the one nobody had reasoned about.
         bool loggedHomeHold{false};
+        // AND WHETHER THE WAIT FOR ANOTHER FAMILY'S RUN ON THE SAME MAP HAS BEEN
+        // SAID (#555). Cleared when the map is free again, so a later episode
+        // is said too.
+        bool loggedMapHeld{false};
         // Said once, on the idle coordinator, for the same reason
         // `loggedCampaignOver` is: a portal the leader cannot walk to is a
         // standing fact about the job column rather than a transient, so it is
@@ -24261,7 +24320,24 @@ private:
         // deck, and without this the crossing would never be consulted again.
         bool crossingPassengers{false};
     };
-    DungeonRunCoordinatorState _dungeonRunCoordinator;
+    // ONE COORDINATOR PER FAMILY, KEYED BY THE `family` COLUMN (#555). It was
+    // one state machine for the world, fed by whichever family's `lead` row
+    // sorted first, so the second family could never run a dungeon while the
+    // first had a leader. Every family DriveDungeonRun drives gets its own run
+    // row, staging point, members, clocks and evacuation here, and nothing in
+    // one entry is read or written on behalf of another family.
+    std::map<std::string, DungeonRunCoordinatorState> _dungeonRunCoordinators;
+
+    // Is this family's coordinator anywhere but IDLE? A family with no
+    // coordinator has never started a run, which is IDLE. The home bind and the
+    // town trip ask this about their OWN family, so one family's run never
+    // stands the other family's errands down.
+    bool FamilyOnADungeonRun(std::string const& family) const
+    {
+        auto const it = _dungeonRunCoordinators.find(family);
+        return it != _dungeonRunCoordinators.end() &&
+               it->second.phase != DungeonRunPhase::Idle;
+    }
 
     // THE ONLY PLACE A STAGING AIM IS BUILT, AND THEREFORE THE ONLY PLACE THE
     // POINT IS CHECKED (#220).
@@ -27739,15 +27815,41 @@ private:
         return need;
     }
 
+    // THE TOWN TRIP'S OWN REGISTER, ONE PER FAMILY (#555). Not on the dungeon
+    // coordinator, deliberately: this trip outlives no run and belongs to no run,
+    // and putting it there is what scoped #397's leg to a phase in the first
+    // place. Per family because each family's bags fill on its own campaign, and
+    // a coordinator holds its run at IDLE until its OWN family's trip has emptied
+    // them; a trip only one family could take would hold the other family's
+    // campaign for ever.
+    struct TownTripState
+    {
+        bool active{false};
+        OverseerDecisions::CounterRole role{OverseerDecisions::CounterRole::None};
+        std::string leader;
+        time_t since{0};
+        // WHEN THE LAST TRIP ENDED, which is what the cooldown is measured from.
+        // Zero means "never", and PlanTownTrip is handed the cooldown itself in
+        // that case so a worldserver that has just started does not refuse the
+        // first trip.
+        time_t endedAt{0};
+        std::set<std::string> settled;
+        std::map<std::string, std::string> said;
+        std::map<std::string, time_t> stoodSince;
+        std::map<std::string, OverseerDecisions::TownNeed> before;
+        std::map<std::string, uint64> copperBefore;
+    };
+    std::map<std::string, TownTripState> _townTrips;   // keyed by family
+
     // Said once per member per reason, the same discipline SayRepairLegOnce and
     // SayHomeBindOnce keep: a walk to a town is minutes of five-second polls, and
     // a line carrying live counts would otherwise be printed sixty times.
-    bool SayTownTripOnce(std::string const& name, std::string const& why)
+    bool SayTownTripOnce(TownTripState& trip, std::string const& name, std::string const& why)
     {
-        auto const it = _townTripSaid.find(name);
-        if (it != _townTripSaid.end() && it->second == why)
+        auto const it = trip.said.find(name);
+        if (it != trip.said.end() && it->second == why)
             return false;
-        _townTripSaid[name] = why;
+        trip.said[name] = why;
         return true;
     }
 
@@ -27755,9 +27857,9 @@ private:
     // Ended HERE rather than at the sweep, the discipline EndHomeEscort keeps: a
     // lease held thirty seconds longer than it is wanted is thirty seconds of a
     // follower that could be following.
-    void SettleTownTripMember(std::string const& name)
+    void SettleTownTripMember(TownTripState& trip, std::string const& name)
     {
-        _townTripSettled.insert(name);
+        trip.settled.insert(name);
         if (HasCounterHold(name))
             ReleaseCounterHold(name, "the town trip is finished with it");
         _travelAims.Release(name);
@@ -27767,9 +27869,9 @@ private:
     // of it lets go of the same things - and the cooldown starts HERE, at the end
     // of a trip rather than at the start of one, so a trip that ran its whole
     // bound is not immediately followed by another.
-    void EndTownTrip(std::vector<std::string> const& members, char const* why)
+    void EndTownTrip(TownTripState& trip, std::vector<std::string> const& members, char const* why)
     {
-        if (!_townTripActive)
+        if (!trip.active)
             return;
         for (std::string const& name : members)
         {
@@ -27779,26 +27881,26 @@ private:
             // fired has none, and "the family went to town and this character
             // came back with nothing changed" is precisely the fact seventeen
             // thousand refusals never put in a table.
-            if (!_townTripSettled.count(name))
-                ProveAndRecordTownTrip(name, ObjectAccessor::FindPlayerByName(name));
+            if (!trip.settled.count(name))
+                ProveAndRecordTownTrip(trip, name, ObjectAccessor::FindPlayerByName(name));
             if (HasCounterHold(name))
                 ReleaseCounterHold(name, why);
             _travelAims.Release(name);
         }
         LOG_INFO("module.overseer",
                  "overseer: the town trip to a '{}' is over after {}s - {}",
-                 TownTripAimFor(_townTripRole),
-                 uint32(_townTripSince ? std::time(nullptr) - _townTripSince : 0), why);
-        _townTripActive = false;
-        _townTripRole = OverseerDecisions::CounterRole::None;
-        _townTripSince = 0;
-        _townTripEndedAt = std::time(nullptr);
-        _townTripLeader.clear();
-        _townTripSettled.clear();
-        _townTripSaid.clear();
-        _townTripStoodSince.clear();
-        _townTripBefore.clear();
-        _townTripCopperBefore.clear();
+                 TownTripAimFor(trip.role),
+                 uint32(trip.since ? std::time(nullptr) - trip.since : 0), why);
+        trip.active = false;
+        trip.role = OverseerDecisions::CounterRole::None;
+        trip.since = 0;
+        trip.endedAt = std::time(nullptr);
+        trip.leader.clear();
+        trip.settled.clear();
+        trip.said.clear();
+        trip.stoodSince.clear();
+        trip.before.clear();
+        trip.copperBefore.clear();
     }
 
     // WHAT THE TRIP PROVED ABOUT ONE MEMBER, READ OFF THE WORLD AND NOT OFF A
@@ -27812,15 +27914,15 @@ private:
     // WORKED. "The family stood at the counter and nothing happened" is the fact
     // seventeen thousand refusals never produced, and it is the one an operator
     // needs in a table.
-    void ProveAndRecordTownTrip(std::string const& name, Player* bot)
+    void ProveAndRecordTownTrip(TownTripState& trip, std::string const& name, Player* bot)
     {
-        auto const beforeIt = _townTripBefore.find(name);
-        if (beforeIt == _townTripBefore.end())
+        auto const beforeIt = trip.before.find(name);
+        if (beforeIt == trip.before.end())
             return;
 
         OverseerDecisions::TownNeed const after = ReadTownNeed(bot);
-        uint64 const copperBefore = _townTripCopperBefore.count(name)
-                                        ? _townTripCopperBefore[name]
+        uint64 const copperBefore = trip.copperBefore.count(name)
+                                        ? trip.copperBefore[name]
                                         : uint64(0);
         uint64 const copperAfter = bot ? uint64(bot->GetMoney()) : uint64(0);
 
@@ -27828,7 +27930,7 @@ private:
             beforeIt->second, after, copperBefore, copperAfter);
 
         std::ostringstream detail;
-        detail << TownTripAimFor(_townTripRole) << ": "
+        detail << TownTripAimFor(trip.role) << ": "
                << OverseerDecisions::TownTripProofWord(proof) << "; "
                << beforeIt->second.damagedItems << " damaged ("
                << beforeIt->second.brokenItems << " at zero) and "
@@ -27850,7 +27952,7 @@ private:
                      "copper, the same at both ends. The walk worked and the transaction "
                      "did not, which is the half this trip cannot do for itself: it holds "
                      "the character in range and the rows have to arrive",
-                     name, TownTripAimFor(_townTripRole), after.damagedItems,
+                     name, TownTripAimFor(trip.role), after.damagedItems,
                      after.freeBagSlots, copperAfter);
         else
             LOG_INFO("module.overseer",
@@ -27859,7 +27961,7 @@ private:
                      "against {}. Nothing it carries that can wear is below its maximum: "
                      "{}",
                      name, OverseerDecisions::TownTripProofWord(proof),
-                     TownTripAimFor(_townTripRole), after.damagedItems,
+                     TownTripAimFor(trip.role), after.damagedItems,
                      beforeIt->second.damagedItems, after.freeBagSlots,
                      beforeIt->second.freeBagSlots, copperAfter, copperBefore,
                      OverseerDecisions::TownTripMemberAccepted(after) ? "yes" : "NO");
@@ -27868,28 +27970,28 @@ private:
     // A COUNTER THIS MODULE DOES NOT TRANSACT AT: stand there, and be finished
     // when the visit has been long enough. Returns true when the trip is done
     // with this member.
-    bool VisitTheCounter(std::string const& name, Player* bot)
+    bool VisitTheCounter(TownTripState& trip, std::string const& name, Player* bot)
     {
-        if (!_townTripStoodSince.count(name))
+        if (!trip.stoodSince.count(name))
         {
-            _townTripStoodSince[name] = std::time(nullptr);
+            trip.stoodSince[name] = std::time(nullptr);
             LOG_INFO("module.overseer",
                      "overseer: '{}' is standing at the '{}' the town trip walked it to, "
                      "and is held there for {}s so the rows that have been refusing with "
                      "'not in range' find it in range. This module does not choose what to "
                      "sell - that decision is the bridge's, and always was; what was "
                      "missing was the character being here when it arrives",
-                     name, TownTripAimFor(_townTripRole),
+                     name, TownTripAimFor(trip.role),
                      uint32(TOWN_TRIP_LIMITS.dwellSeconds));
         }
 
-        time_t const stood = std::time(nullptr) - _townTripStoodSince[name];
+        time_t const stood = std::time(nullptr) - trip.stoodSince[name];
         switch (OverseerDecisions::TownVisitStep(true, stood,
                                                  TOWN_TRIP_LIMITS.dwellSeconds))
         {
             case OverseerDecisions::TownVisit::Served:
-                ProveAndRecordTownTrip(name, bot);
-                SettleTownTripMember(name);
+                ProveAndRecordTownTrip(trip, name, bot);
+                SettleTownTripMember(trip, name);
                 return true;
             case OverseerDecisions::TownVisit::Standing:
             case OverseerDecisions::TownVisit::Travelling:
@@ -27902,7 +28004,7 @@ private:
     // DoRepair's, called rather than copied, for the reason #348 gave when it
     // lifted the bind out of DoBind instead of writing a second one beside it.
     // Its answer is evidence; the verdict is the durability read back.
-    bool RepairAtTheCounter(std::string const& name, Player* bot)
+    bool RepairAtTheCounter(TownTripState& trip, std::string const& name, Player* bot)
     {
         char const* status = "error";
         std::string evidence;
@@ -27922,7 +28024,7 @@ private:
         // every poll would write the same one twenty times.
         if (!refusal.empty() && OverseerDecisions::RepairLegMayTryAgain(refusal))
         {
-            if (SayTownTripOnce(name, refusal))
+            if (SayTownTripOnce(trip, name, refusal))
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is at a repairer and the repair was refused - "
                          "{}. It is asked again next poll, until the {} minute bound",
@@ -27930,14 +28032,14 @@ private:
             return false;
         }
 
-        ProveAndRecordTownTrip(name, bot);
-        if (!refusal.empty() && SayTownTripOnce(name, refusal))
+        ProveAndRecordTownTrip(trip, name, bot);
+        if (!refusal.empty() && SayTownTripOnce(trip, name, refusal))
             LOG_ERROR("module.overseer",
                       "overseer: '{}' is standing at a repairer the core's own gate "
                       "accepts and the repair was refused - {}. The town trip has "
                       "nothing else to try for it",
                       name, refusal);
-        SettleTownTripMember(name);
+        SettleTownTripMember(trip, name);
         return true;
     }
 
@@ -27945,46 +28047,86 @@ private:
     // a completion test and a selling trip does not - see TownVisitStep for why -
     // so the two are asked differently and the difference lives here rather than
     // in the pure layer, which has no idea which executor this module owns.
-    bool OwedAtThisCounter(std::string const& name,
+    bool OwedAtThisCounter(TownTripState& trip, std::string const& name,
                            OverseerDecisions::TownNeed const& need)
     {
-        if (_townTripRole == OverseerDecisions::CounterRole::Repairer)
+        if (trip.role == OverseerDecisions::CounterRole::Repairer)
             return need.damagedItems > 0;
         // A visit is over when it has been long enough, and until then this
-        // member is owed one. `_townTripSettled` is what records that it has had
+        // member is owed one. `trip.settled` is what records that it has had
         // it; a member that has not started standing yet is owed by definition.
-        return !_townTripSettled.count(name);
+        return !trip.settled.count(name);
     }
 
+    // EVERY FAMILY WITH A LEADER TAKES ITS OWN TRIP (#555), from its own state,
+    // and one family's run or trip never ends or holds another's.
     void DriveTownTrip()
     {
-        // A ROSTER THAT IS ON A RUN IS NOT THIS DRIVE'S, and the check is first
+        std::vector<OverseerDecisions::FamilyRoster> const rosters = LoadFamilyRosters();
+        if (rosters.empty())
+            return;   // no roster, or the read failed: nothing is decided on no evidence
+        std::vector<OverseerDecisions::FamilyRoster const*> const driven =
+            OverseerDecisions::CampaignRosters(rosters);
+
+        // A FAMILY THAT LOST ITS LEADER, OR LEFT THE ROSTER, HAS ITS TRIP ENDED
+        // rather than abandoned: every member it was walking is handed back.
+        // The members are the ones the trip started with, which is the list
+        // its holds and aims were issued under.
+        for (auto it = _townTrips.begin(); it != _townTrips.end();)
+        {
+            bool stillDriven = false;
+            for (OverseerDecisions::FamilyRoster const* roster : driven)
+                if (roster->family == it->first)
+                    stillDriven = true;
+            if (stillDriven)
+            {
+                ++it;
+                continue;
+            }
+            std::vector<std::string> walked;
+            for (auto const& entry : it->second.before)
+                walked.push_back(entry.first);
+            EndTownTrip(it->second, walked, "the family has no leader on the roster");
+            it = _townTrips.erase(it);
+        }
+
+        for (OverseerDecisions::FamilyRoster const* roster : driven)
+        {
+            std::vector<std::string> members;
+            for (OverseerDecisions::FamilyMember const& member : roster->members)
+                members.push_back(member.name);
+            DriveTownTripFor(_townTrips[roster->family], roster->family, members,
+                             roster->leader);
+        }
+    }
+
+    void DriveTownTripFor(TownTripState& trip, std::string const& family,
+                          std::vector<std::string> const& members,
+                          std::string const& leaderName)
+    {
+        // A FAMILY THAT IS ON A RUN IS NOT THIS DRIVE'S, and the check is first
         // so that a run opening mid-trip takes the party back on the very next
         // poll rather than leaving two owners for five walks. Same rule
-        // DriveHomeBind states for the same reason.
-        std::vector<std::string> members;
-        std::string leaderName;
-        if (!LoadCampaignRoster(members, leaderName))
-            return;
-
-        if (_dungeonRunCoordinator.phase != DungeonRunPhase::Idle)
+        // DriveHomeBind states for the same reason. It asks THIS family's
+        // coordinator: another family's run owns none of these characters.
+        if (FamilyOnADungeonRun(family))
         {
-            EndTownTrip(members, "a dungeon run owns the party now");
+            EndTownTrip(trip, members, "a dungeon run owns the party now");
             return;
         }
 
         if (leaderName.empty())
         {
-            EndTownTrip(members, "the roster has no leader");
+            EndTownTrip(trip, members, "the roster has no leader");
             return;
         }
 
         // A LEADERSHIP CHANGE ENDS THE TRIP RATHER THAN INHERITING IT, the rule
         // DriveRegroup states about its own hold: the destination was resolved
         // from one character's position and the aims were issued under it.
-        if (_townTripActive && _townTripLeader != leaderName)
+        if (trip.active && trip.leader != leaderName)
         {
-            EndTownTrip(members, "the party changed leader mid-trip");
+            EndTownTrip(trip, members, "the party changed leader mid-trip");
             return;
         }
 
@@ -28000,7 +28142,7 @@ private:
 
         Player* leader = present[leaderName];
 
-        if (!_townTripActive)
+        if (!trip.active)
         {
             // `busy` IS ONE FLAG BY DESIGN. The pure rule refuses to keep a
             // second opinion about who owns the party, so everything that means
@@ -28012,7 +28154,7 @@ private:
 
             OverseerDecisions::TownTripPlan const plan = OverseerDecisions::PlanTownTrip(
                 needs, TOWN_TRIP_LIMITS,
-                _townTripEndedAt ? std::time(nullptr) - _townTripEndedAt
+                trip.endedAt ? std::time(nullptr) - trip.endedAt
                                  : TOWN_TRIP_LIMITS.cooldownSeconds,
                 busy);
             if (!plan.go)
@@ -28041,24 +28183,24 @@ private:
                          uint32(leader->GetMapId()),
                          said.empty() ? std::string("there is no such spawn") : said,
                          uint32(TOWN_TRIP_LIMITS.cooldownSeconds / 60));
-                _townTripEndedAt = std::time(nullptr);
+                trip.endedAt = std::time(nullptr);
                 return;
             }
 
-            _townTripActive = true;
-            _townTripRole = plan.role;
-            _townTripLeader = leaderName;
-            _townTripSince = std::time(nullptr);
-            _townTripSettled.clear();
-            _townTripSaid.clear();
-            _townTripStoodSince.clear();
-            _townTripBefore.clear();
-            _townTripCopperBefore.clear();
+            trip.active = true;
+            trip.role = plan.role;
+            trip.leader = leaderName;
+            trip.since = std::time(nullptr);
+            trip.settled.clear();
+            trip.said.clear();
+            trip.stoodSince.clear();
+            trip.before.clear();
+            trip.copperBefore.clear();
             for (size_t i = 0; i < members.size(); ++i)
             {
-                _townTripBefore[members[i]] = needs[i];
+                trip.before[members[i]] = needs[i];
                 Player* bot = present[members[i]];
-                _townTripCopperBefore[members[i]] = bot ? uint64(bot->GetMoney()) : uint64(0);
+                trip.copperBefore[members[i]] = bot ? uint64(bot->GetMoney()) : uint64(0);
             }
 
             LOG_INFO("module.overseer",
@@ -28076,7 +28218,7 @@ private:
                      uint32(leader->GetMapId()));
         }
 
-        char const* const aim = TownTripAimFor(_townTripRole);
+        char const* const aim = TownTripAimFor(trip.role);
 
         // HAS THE PARTY'S ANCHOR ARRIVED? Asked once and given to every member,
         // so the party cannot half-believe it has got there. It is the core's own
@@ -28087,7 +28229,7 @@ private:
             bool oneIsNearby = false;
             float nearestYards = -1.f;
             leaderAtTheCounter =
-                CounterInReach(leader, _townTripRole, oneIsNearby, nearestYards);
+                CounterInReach(leader, trip.role, oneIsNearby, nearestYards);
         }
 
         unsigned outstanding = 0;
@@ -28095,7 +28237,7 @@ private:
 
         for (std::string const& name : members)
         {
-            if (_townTripSettled.count(name))
+            if (trip.settled.count(name))
                 continue;
 
             Player* bot = present[name];
@@ -28103,7 +28245,7 @@ private:
 
             OverseerDecisions::TownStopFacts facts;
             facts.present = need.present;
-            facts.owed = need.present && OwedAtThisCounter(name, need);
+            facts.owed = need.present && OwedAtThisCounter(trip, name, need);
             facts.isLeader = name == leaderName;
             facts.leaderAtTheCounter = leaderAtTheCounter;
             if (facts.present && facts.owed)
@@ -28116,7 +28258,7 @@ private:
                                                                    : bot->GetMapId()) ==
                     OverseerDecisions::TownTripFormation::LeftBehind)
                 {
-                    if (SayTownTripOnce(name, "another map"))
+                    if (SayTownTripOnce(trip, name, "another map"))
                         LOG_WARN("module.overseer",
                                  "overseer: '{}' is on map {} and the town trip is on map "
                                  "{}. A trip to a counter is not a crossing - there is no "
@@ -28124,13 +28266,13 @@ private:
                                  "the trip carries on without it",
                                  name, uint32(bot->GetMapId()),
                                  uint32(leader ? leader->GetMapId() : 0));
-                    SettleTownTripMember(name);
+                    SettleTownTripMember(trip, name);
                     continue;
                 }
                 bool oneIsNearby = false;
                 float nearestYards = -1.f;
                 facts.atTheCounter =
-                    CounterInReach(bot, _townTripRole, oneIsNearby, nearestYards);
+                    CounterInReach(bot, trip.role, oneIsNearby, nearestYards);
             }
 
             switch (OverseerDecisions::TownTripMemberStop(facts))
@@ -28140,7 +28282,7 @@ private:
                     if (!owed.empty())
                         owed += ", ";
                     owed += name + " (not in the world)";
-                    if (SayTownTripOnce(name, "not in the world"))
+                    if (SayTownTripOnce(trip, name, "not in the world"))
                         LOG_INFO("module.overseer",
                                  "overseer: the town trip cannot read '{}' - it is not in "
                                  "the world, so what it needs is unknown rather than "
@@ -28149,12 +28291,12 @@ private:
                     break;
 
                 case OverseerDecisions::TownStop::Done:
-                    if (SayTownTripOnce(name, "wants nothing here"))
+                    if (SayTownTripOnce(trip, name, "wants nothing here"))
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' wants nothing from a '{}', so the town "
                                  "trip is finished with it without walking it anywhere",
                                  name, aim);
-                    SettleTownTripMember(name);
+                    SettleTownTripMember(trip, name);
                     break;
 
                 case OverseerDecisions::TownStop::Trade:
@@ -28170,9 +28312,9 @@ private:
                     // inside the module instead of from outside it.
                     HoldAtTheCounter(bot, name);
                     bool const finished =
-                        _townTripRole == OverseerDecisions::CounterRole::Repairer
-                            ? RepairAtTheCounter(name, bot)
-                            : VisitTheCounter(name, bot);
+                        trip.role == OverseerDecisions::CounterRole::Repairer
+                            ? RepairAtTheCounter(trip, name, bot)
+                            : VisitTheCounter(trip, name, bot);
                     if (!finished)
                     {
                         ++outstanding;
@@ -28188,7 +28330,7 @@ private:
                     if (!owed.empty())
                         owed += ", ";
                     owed += name + " (walking)";
-                    if (SayTownTripOnce(name, "walking"))
+                    if (SayTownTripOnce(trip, name, "walking"))
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' is walked to a '{}'. The aim is the ROLE "
                                  "rather than a creature name (#398): it resolves out of the "
@@ -28213,7 +28355,7 @@ private:
                     if (!owed.empty())
                         owed += ", ";
                     owed += name + " (following)";
-                    if (SayTownTripOnce(name, "following"))
+                    if (SayTownTripOnce(trip, name, "following"))
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' follows the leader to the '{}' rather "
                                  "than being aimed at one of its own - the family travels "
@@ -28225,7 +28367,7 @@ private:
         }
 
         time_t const heldFor =
-            _townTripSince ? std::time(nullptr) - _townTripSince : 0;
+            trip.since ? std::time(nullptr) - trip.since : 0;
 
         // THE SAME BOUND RULE THE REPAIR LEG USES, ASKED RATHER THAN COPIED. Its
         // three answers are exactly this leg's three, its argument about a
@@ -28239,7 +28381,7 @@ private:
                 return;
 
             case OverseerDecisions::RepairLegVerdict::Finished:
-                EndTownTrip(members, "every member has been served or wanted nothing");
+                EndTownTrip(trip, members, "every member has been served or wanted nothing");
                 return;
 
             case OverseerDecisions::RepairLegVerdict::Overdue:
@@ -28252,27 +28394,11 @@ private:
                           "and route gates, and no amount of waiting was going to help",
                           aim, uint32(heldFor / 60),
                           uint32(TOWN_TRIP_LIMITS.boundSeconds / 60), outstanding, owed);
-                EndTownTrip(members, "the bound fired");
+                EndTownTrip(trip, members, "the bound fired");
                 return;
         }
     }
 
-    // The town trip's own register. Not on the dungeon coordinator, deliberately:
-    // this trip outlives no run and belongs to no run, and putting it there is
-    // what scoped #397's leg to a phase in the first place.
-    bool _townTripActive{false};
-    OverseerDecisions::CounterRole _townTripRole{OverseerDecisions::CounterRole::None};
-    std::string _townTripLeader;
-    time_t _townTripSince{0};
-    // WHEN THE LAST TRIP ENDED, which is what the cooldown is measured from.
-    // Zero means "never", and PlanTownTrip is handed the cooldown itself in that
-    // case so a worldserver that has just started does not refuse the first trip.
-    time_t _townTripEndedAt{0};
-    std::set<std::string> _townTripSettled;
-    std::map<std::string, std::string> _townTripSaid;
-    std::map<std::string, time_t> _townTripStoodSince;
-    std::map<std::string, OverseerDecisions::TownNeed> _townTripBefore;
-    std::map<std::string, uint64> _townTripCopperBefore;
 
     // A full inventory is a run-ending safety condition, not merely a
     // bridge hint. The bridge can request quest mode, but a dungeon-clear
@@ -28367,8 +28493,22 @@ private:
         // A HOLD THIS MODULE PLACED FOR A CAST IS NOT TOUCHED. The release
         // names the staging verb, so a conjure that happens to be running on a
         // character standing at a door is left to the conjure's own release.
-        if (_dungeonRunCoordinator.phase != DungeonRunPhase::Barrier)
-            ReleaseEveryStagingHold("its run is no longer holding a barrier");
+        //
+        // PER FAMILY (#555): a hold stands only on a member whose OWN family's
+        // coordinator is at BARRIER. One family assembling at its door must not
+        // keep the other family's members pinned, and one family's barrier
+        // opening must not release the other's.
+        {
+            std::set<std::string> atBarrier;
+            for (auto const& [name, family] : LoadRosterFamilies())
+            {
+                auto const coord = _dungeonRunCoordinators.find(family);
+                if (coord != _dungeonRunCoordinators.end() &&
+                    coord->second.phase == DungeonRunPhase::Barrier)
+                    atBarrier.insert(name);
+            }
+            ReleaseStagingHoldsExcept(atBarrier, "its run is no longer holding a barrier");
+        }
 
         // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN (#122). Everything
         // this function escorts is marked as still wanted at the point it is
@@ -28388,16 +28528,58 @@ private:
         // schema this coordinator most needs to degrade gracefully on.
         std::map<std::string, std::string> const jobs = LoadJobs();
 
-        std::vector<std::string> members;
-        std::string leaderName;
-        if (!LoadCampaignRoster(members, leaderName))
-            return;
+        // EVERY FAMILY WITH A LEADER RUNS ITS OWN CAMPAIGN (#555), one after the
+        // other in the same poll, each from its own coordinator. A family with
+        // no leader is not driven: every step below needs one to aim, and that
+        // is a roster-shape problem this drive cannot fix.
+        std::vector<OverseerDecisions::FamilyRoster> const rosters = LoadFamilyRosters();
+        if (rosters.empty())
+            return;   // no roster, or the read failed: nothing is decided on no evidence
+        std::vector<OverseerDecisions::FamilyRoster const*> const driven =
+            OverseerDecisions::CampaignRosters(rosters);
 
-        // No leader on the roster at all is a roster-shape problem this drive
-        // cannot fix, and every step below needs one to aim.
-        if (leaderName.empty())
-            return;
+        // A COORDINATOR WHOSE FAMILY IS NO LONGER DRIVEN IS LET GO, and said so
+        // when it was mid-run. Kept, it would go on claiming its instance map
+        // and hold the other family off that dungeon for ever. A family that
+        // comes back is picked up by adoption, exactly as after a bounce.
+        for (auto it = _dungeonRunCoordinators.begin(); it != _dungeonRunCoordinators.end();)
+        {
+            bool stillDriven = false;
+            for (OverseerDecisions::FamilyRoster const* roster : driven)
+                if (roster->family == it->first)
+                    stillDriven = true;
+            if (stillDriven)
+            {
+                ++it;
+                continue;
+            }
+            if (it->second.phase != DungeonRunPhase::Idle)
+                LOG_WARN("module.overseer",
+                         "overseer: family '{}' is no longer on the roster with a leader, "
+                         "so its dungeon coordinator (run {}, portal '{}') is let go. The "
+                         "run row closes on its own cold heartbeat",
+                         it->first, it->second.runId, it->second.portalKeyword);
+            it = _dungeonRunCoordinators.erase(it);
+        }
 
+        for (OverseerDecisions::FamilyRoster const* roster : driven)
+        {
+            std::vector<std::string> members;
+            for (OverseerDecisions::FamilyMember const& member : roster->members)
+                members.push_back(member.name);
+            DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
+        }
+    }
+
+    // ONE FAMILY'S CAMPAIGN, from that family's own coordinator. Everything
+    // below was the body of DriveDungeonRun when the world had one coordinator;
+    // what changed is that `coord`, `members` and `leaderName` now belong to
+    // exactly one family.
+    void DriveDungeonRunFor(std::string const& family,
+                            std::vector<std::string> const& members,
+                            std::string const& leaderName,
+                            std::map<std::string, std::string> const& jobs)
+    {
         // LoadJobs() ONLY returns rows whose job is set and is NOT 'quest' -
         // see its own comment for why absence already means "quest, or the
         // column does not exist yet", which for THIS drive both mean
@@ -28405,7 +28587,7 @@ private:
         auto const jobIt = jobs.find(leaderName);
         std::string const leaderJob = jobIt == jobs.end() ? std::string("quest") : jobIt->second;
 
-        DungeonRunCoordinatorState& coord = _dungeonRunCoordinator;
+        DungeonRunCoordinatorState& coord = _dungeonRunCoordinators[family];
 
         // Bag pressure outranks dungeon progress. This check deliberately
         // happens after the roster census and before job/campaign decisions,
@@ -28767,7 +28949,7 @@ private:
                                        : 0;
             OverseerDecisions::MaintenanceHold const hold =
                 OverseerDecisions::DungeonRunMaintenanceHold(
-                    LeaderTravelAim(leaderName), OutstandingMaintenanceRows(),
+                    LeaderTravelAim(leaderName), OutstandingMaintenanceRows(members),
                     heldFor, DUNGEON_MAINTENANCE_HOLD_SECONDS);
 
             if (hold != OverseerDecisions::MaintenanceHold::Open)
@@ -28855,6 +29037,41 @@ private:
                 return;
             }
             coord.loggedWithheld = false;
+
+            // ANOTHER FAMILY'S RUN IS ON THIS MAP, SO THIS ONE WAITS (#555).
+            // overseer_dungeon_run allows one active row per instance map, and
+            // a second family crossing into the same dungeon would touch the
+            // first family's row and then have its own coordinator re-attribute
+            // that row to this leader. Nobody is aimed or reset; the run opens
+            // on the first poll after the other family's run is back at IDLE.
+            {
+                std::vector<OverseerDecisions::FamilyRunClaim> claims;
+                for (auto const& [otherFamily, other] : _dungeonRunCoordinators)
+                {
+                    DungeonPortal const* otherPortal =
+                        other.portalKeyword.empty() ? nullptr
+                                                    : FindDungeonPortal(other.portalKeyword);
+                    if (otherPortal)
+                        claims.push_back(OverseerDecisions::FamilyRunClaim{
+                            otherFamily, otherPortal->insideMapId,
+                            other.phase != DungeonRunPhase::Idle});
+                }
+                if (OverseerDecisions::DungeonMapHeldByAnotherFamily(
+                        family, portal->insideMapId, claims))
+                {
+                    if (!coord.loggedMapHeld)
+                    {
+                        coord.loggedMapHeld = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: the next dungeon run for '{}' waits - another "
+                                 "family's run is already on map {} ('{}'), and a map holds "
+                                 "one active run row. It opens when that run is over",
+                                 leaderName, portal->insideMapId, portal->keyword);
+                    }
+                    return;
+                }
+                coord.loggedMapHeld = false;
+            }
 
             // IS THIS FAMILY BOUND WHERE IT CAN RUN THIS DOOR (#348)?
             //

@@ -10472,6 +10472,33 @@ FamilyRoster const* ChooseCampaignRoster(std::vector<FamilyRoster> const& roster
     return rosters.empty() ? nullptr : &rosters.front();
 }
 
+std::vector<FamilyRoster const*> CampaignRosters(std::vector<FamilyRoster> const& rosters)
+{
+    std::vector<FamilyRoster const*> out;
+    for (FamilyRoster const& roster : rosters)
+        if (!roster.leader.empty())
+            out.push_back(&roster);
+    return out;
+}
+
+bool DungeonMapHeldByAnotherFamily(std::string const& family, unsigned insideMapId,
+                                   std::vector<FamilyRunClaim> const& claims)
+{
+    for (FamilyRunClaim const& claim : claims)
+        if (claim.running && claim.family != family && claim.insideMapId == insideMapId)
+            return true;
+    return false;
+}
+
+unsigned NextCampaignId(unsigned tableNext, std::vector<unsigned> const& heldInProcess)
+{
+    unsigned next = tableNext;
+    for (unsigned held : heldInProcess)
+        if (held != 0 && held + 1 > next)
+            next = held + 1;
+    return next;
+}
+
 // ------------------------------------------- the story of a notable item (#567) --
 
 bool IsNotableItemQuality(unsigned quality)
