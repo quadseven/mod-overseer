@@ -6429,27 +6429,97 @@ private:
     // hand the followers their master. Everything here was the body of
     // KeepRosterGrouped when the roster was one family; it is unchanged except
     // that `present` and `wantsToLead` now belong to exactly one.
+    // The last split each family's merge reported, keyed by the head's name
+    // (#607), so the split is said when it changes and not every poll.
+    std::map<std::string, std::string> _loggedFamilySplit;
+
     void KeepFamilyGrouped(std::vector<Player*> const& present,
                            std::string const& wantsToLead)
     {
         if (present.size() < 2)
             return;
 
-        // Prefer a group the roster is already in over making a new one, so a
-        // party someone formed by hand is joined rather than competed with.
-        Group* group = nullptr;
+        // ONE GROUP PER FAMILY, UNDER THE HEAD (#607). This used to take the
+        // first present member's group and skip anybody already in a group
+        // ("in a party of their own"). With LeaveGroupOnLogout on, every
+        // relog of the head's client takes him out of the family group and
+        // the core hands the lead to a member, so a head who came back in a
+        // group of his own stayed there, the members stayed in theirs, and
+        // HeadTakesTheLead refused because he was not in the family's group.
+        // PlanFamilyGroup picks the head's group whenever he has one, and a
+        // member in any other group leaves it the way a player types /leave
+        // and is added to the family's the way this module always adds one.
+        // A battleground, battlefield or dungeon-finder group is the core's
+        // and is never touched.
+        std::vector<OverseerDecisions::FamilyGroupSeat> seats;
+        seats.reserve(present.size());
         for (Player* p : present)
         {
-            if (Group* existing = p->GetGroup())
+            OverseerDecisions::FamilyGroupSeat seat;
+            seat.name = p->GetName();
+            seat.head = !wantsToLead.empty() && seat.name == wantsToLead;
+            seat.present = true;
+            if (Group* g = p->GetGroup())
             {
-                group = existing;
-                break;
+                // GetGUID  Group.h:230  ObjectGuid GetGUID() const
+                seat.groupId = g->GetGUID().GetRawValue();
+                // isBGGroup / isBFGroup / isLFGGroup  Group.h:222-225
+                seat.groupIsForeign = g->isBGGroup() || g->isBFGroup() || g->isLFGGroup();
+                seat.leadsItsGroup = g->GetLeaderGUID() == p->GetGUID();
             }
+            seats.push_back(seat);
+        }
+        OverseerDecisions::FamilyGroupPlan const plan = OverseerDecisions::PlanFamilyGroup(seats);
+
+        auto findPresent = [&present](std::string const& name) -> Player*
+        {
+            for (Player* p : present)
+                if (p->GetName() == name)
+                    return p;
+            return nullptr;
+        };
+
+        // Said when the split changes, not on every poll that finds it. A
+        // leave the core refuses would otherwise print this every few
+        // seconds for as long as it keeps refusing.
+        std::string const familyKey = wantsToLead.empty() ? present.front()->GetName() : wantsToLead;
+        std::string splitSignature;
+        for (std::string const& name : plan.leave)
+            splitSignature += name + ",";
+        splitSignature += "|";
+        for (std::string const& name : plan.untouched)
+            splitSignature += name + ",";
+        bool const sayIt = _loggedFamilySplit[familyKey] != splitSignature;
+        _loggedFamilySplit[familyKey] = splitSignature;
+
+        if (sayIt && !plan.untouched.empty())
+        {
+            std::string names;
+            for (std::string const& name : plan.untouched)
+                names += (names.empty() ? "'" : ", '") + name + "'";
+            LOG_WARN("module.overseer",
+                     "overseer: family of '{}' has {} in a battleground, battlefield or "
+                     "dungeon-finder group - the core owns that group, so the one-group "
+                     "rule leaves them in it until they are back",
+                     familyKey, names);
+        }
+
+        Group* group = nullptr;
+        if (plan.targetGroupId)
+        {
+            for (Player* p : present)
+                if (Group* g = p->GetGroup(); g && g->GetGUID().GetRawValue() == plan.targetGroupId)
+                {
+                    group = g;
+                    break;
+                }
         }
 
         if (!group)
         {
-            Player* leader = present.front();
+            Player* leader = findPresent(plan.founder);
+            if (!leader)
+                return;   // every present member is in a group the core owns
             group = new Group();
             if (!group->Create(leader))
             {
@@ -6462,10 +6532,56 @@ private:
                      leader->GetName());
         }
 
-        for (Player* p : present)
+        if (sayIt && !plan.leave.empty())
         {
+            std::string names;
+            for (std::string const& name : plan.leave)
+                names += (names.empty() ? "'" : ", '") + name + "'";
+            LOG_WARN("module.overseer",
+                     "overseer: family of '{}' is split across groups - {} in another group "
+                     "than the family's, led by '{}'. Merging it back: each leaves its stray "
+                     "group and joins the family's (#607)",
+                     familyKey, names, group->GetLeaderName());
+        }
+
+        for (std::string const& name : plan.leave)
+        {
+            Player* p = findPresent(name);
+            Group* stray = p ? p->GetGroup() : nullptr;
+            // Gone already: a stray group of two disbands when one of the
+            // two leaves, and takes the other with it.
+            if (!stray || stray == group)
+                continue;
+            std::string const strayLeader = stray->GetLeaderName();
+            // RemoveFromGroup  Player.h:1917, the path CMSG_GROUP_DISBAND takes
+            // for a player's own /leave (GroupHandler.cpp:507).
+            p->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
             if (p->GetGroup())
-                continue;   // already with us, or in a party of their own
+            {
+                if (sayIt)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' did not leave the stray group led by '{}' - it "
+                             "stays out of the family group, and the merge is tried again "
+                             "next poll",
+                             name, strayLeader);
+                continue;
+            }
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' left the stray group led by '{}' to rejoin its family",
+                     name, strayLeader);
+        }
+
+        for (std::string const& name : plan.join)
+        {
+            Player* p = findPresent(name);
+            if (!p || p->GetGroup() == group)
+                continue;
+            // Group::AddMember on a player who is still in a group does not
+            // move him: it takes the SetOriginalGroup branch and leaves two
+            // groups both believing they hold him. A failed leave above is
+            // left for the next poll.
+            if (p->GetGroup())
+                continue;
             if (group->IsFull())
             {
                 LOG_WARN("module.overseer", "overseer: party full, '{}' left out",
@@ -21473,6 +21589,9 @@ private:
         // went out 48 times per member. It is a hold, not news, after the
         // first line. Cleared the moment an issuer is found again.
         bool loggedNoIssuer{false};
+        // WHETHER "THE FAMILY IS IN TWO COPIES OF THIS MAP" HAS BEEN SAID FOR
+        // THIS STREAK (#620). Cleared when the copies agree again.
+        bool loggedSplitCopies{false};
     };
     std::map<std::string, DcOnRecord> _dcOnIssued;
 
@@ -21572,6 +21691,17 @@ private:
             "SELECT name FROM overseer_roster WHERE enabled = 1");
         if (!result)
             return;
+
+        // WHERE EACH FAMILY STANDS, BY MAP AND INSTANCE COPY (#620), read once
+        // for the pass. A family spread over two copies of one dungeon is not
+        // armed there at all: `dc on` in that state starts a run in a copy
+        // the rest of the family is not in.
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
+        std::map<std::string, std::vector<OverseerDecisions::InstanceSpot>> familySpots;
+        for (auto const& [member, family] : families)
+            if (Player* p = ObjectAccessor::FindPlayerByName(member); p && p->IsInWorld())
+                familySpots[family].push_back(
+                    OverseerDecisions::InstanceSpot{p->GetMapId(), p->GetInstanceId()});
 
         do
         {
@@ -21715,6 +21845,43 @@ private:
             // leader is kept a selfbot by KeepRosterFollowing (#135), so the
             // tank is normally the issuer; see AuthorizedDcIssuer for the
             // fallback and for why "has a client" is not by itself enough.
+            // NOT ARMED WHILE THE FAMILY IS IN TWO COPIES OF THIS MAP (#620).
+            // BELOW THE HEARTBEAT, so the run row stays warm for a member who
+            // is standing in there, and ABOVE THE ISSUER, so nothing is sent.
+            // The coordinator's census already counts a member outside the
+            // head's copy as not inside; this is the arming drive's half.
+            {
+                auto const family = families.find(name);
+                auto const spots = family == families.end()
+                                       ? familySpots.end()
+                                       : familySpots.find(family->second);
+                DcOnRecord& splitRecord = _dcOnIssued[name];
+                if (spots != familySpots.end() &&
+                    OverseerDecisions::SplitAcrossInstanceCopies(spots->second,
+                                                                 bot->GetMapId()))
+                {
+                    if (!splitRecord.loggedSplitCopies)
+                    {
+                        splitRecord.loggedSplitCopies = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is inside map {} copy {} but its family is "
+                                 "spread over more than one copy of that map - no dungeon-clear "
+                                 "command is issued to it until they are in one copy (#620)",
+                                 name, static_cast<uint32>(bot->GetMapId()),
+                                 bot->GetInstanceId());
+                    }
+                    continue;
+                }
+                if (splitRecord.loggedSplitCopies)
+                {
+                    splitRecord.loggedSplitCopies = false;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is inside map {} and its family is in one copy "
+                             "of it again - arming may go ahead",
+                             name, static_cast<uint32>(bot->GetMapId()));
+                }
+            }
+
             Player* issuer = AuthorizedDcIssuer(bot);
             DcOnRecord& record = _dcOnIssued[name];
             time_t const now = std::time(nullptr);
@@ -25194,6 +25361,10 @@ private:
         bool loggedCrossingAimGrounded{false};
         bool loggedCrossingWaiting{false};
         bool loggedStagedWaiting{false};
+        // THE LAST REASON THE FAMILY WAS NOT ONE GROUP UNDER ITS HEAD when the
+        // door wanted it to be (#620), or empty. Said when it changes, so a
+        // barrier held for a relog says so once and not every poll.
+        std::string loggedGroupBreach;
         bool loggedAccepted{false};
         bool loggedNotAccepted{false};
         bool loggedMoved{false};
@@ -26617,14 +26788,89 @@ private:
     // above; they are still written once rather than twice, for the reason the
     // predicates give.
 
+    // WHY THIS FAMILY IS NOT ONE GROUP UNDER ITS HEAD RIGHT NOW, or empty
+    // when it is (#620). The dungeon coordinator asks it before the barrier
+    // opens and before every knock: a member who zones in outside the head's
+    // group is given an instance copy of its own, and nothing afterwards
+    // merges two copies. KeepRosterGrouped runs earlier in the same poll and
+    // is what makes the answer empty again.
+    static std::string FamilyGroupBreachNow(std::vector<std::string> const& members,
+                                            std::string const& headName)
+    {
+        std::vector<OverseerDecisions::FamilyGroupSeat> seats;
+        seats.reserve(members.size());
+        for (std::string const& name : members)
+        {
+            OverseerDecisions::FamilyGroupSeat seat;
+            seat.name = name;
+            seat.head = name == headName;
+            Player* p = ObjectAccessor::FindPlayerByName(name);
+            seat.present = Steerable(p);
+            if (seat.present)
+                if (Group* g = p->GetGroup())
+                {
+                    seat.groupId = g->GetGUID().GetRawValue();
+                    seat.groupIsForeign = g->isBGGroup() || g->isBFGroup() || g->isLFGGroup();
+                    seat.leadsItsGroup = g->GetLeaderGUID() == p->GetGUID();
+                }
+            seats.push_back(seat);
+        }
+        return OverseerDecisions::FamilyGroupBreach(seats);
+    }
+
+    // Say the breach when it changes, and clear it when the family is whole.
+    // True when the door must wait.
+    static bool DungeonDoorWaitsForTheGroup(DungeonRunCoordinatorState& coord,
+                                            std::vector<std::string> const& members,
+                                            std::string const& leaderName, char const* phase)
+    {
+        std::string const breach = FamilyGroupBreachNow(members, leaderName);
+        if (breach.empty())
+        {
+            if (!coord.loggedGroupBreach.empty())
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} - the family of '{}' is one group under "
+                         "its head again, so the door is open to it",
+                         phase, leaderName);
+            coord.loggedGroupBreach.clear();
+            return false;
+        }
+        if (coord.loggedGroupBreach != breach)
+        {
+            coord.loggedGroupBreach = breach;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} waits for the family of '{}' to be one group "
+                     "under its head before anybody goes through the door - {}. A member "
+                     "who zones in outside the head's group gets an instance copy of its "
+                     "own (#620)",
+                     phase, leaderName, breach);
+        }
+        return true;
+    }
+
     // Where every roster member stands relative to one door. `throughMapId` is
     // the map a member is on once it is through - the instance map for ENTER,
     // the map outside it for EXIT.
+    //
+    // AND THROUGH MEANS INTO THE HEAD'S COPY (#620). With `headName` given and
+    // the head on `throughMapId`, a member on that map in a different instance
+    // copy is not through: it is in a run of its own. Measured on the dev
+    // realm after a restart: four members in one copy of Ragefire, the head
+    // logged into another, and this census, reading map ids only, counted all
+    // five as inside. Said once per member and copy.
     static std::vector<OverseerDecisions::DungeonRunEntryState> DungeonRunCensus(
         std::vector<std::string> const& members, AreaTrigger const* door,
-        uint32 throughMapId, uint32& through)
+        uint32 throughMapId, uint32& through, std::string const& headName = std::string())
     {
         through = 0;
+
+        static std::map<std::string, uint32> s_loggedOtherCopy;
+        uint32 headInstance = 0;
+        if (!headName.empty())
+            if (Player* head = ObjectAccessor::FindPlayerByName(headName);
+                head && head->IsInWorld() && head->GetMapId() == throughMapId)
+                // GetInstanceId  Object.h:514  uint32 GetInstanceId() const
+                headInstance = head->GetInstanceId();
 
         std::vector<OverseerDecisions::DungeonRunEntryState> states;
         states.reserve(members.size());
@@ -26639,6 +26885,10 @@ private:
             Player* member = ObjectAccessor::FindPlayerByName(name);
             if (!SteerableAI(member))
             {
+                // Out of the world is out of any copy: the latch goes with it,
+                // so the register never holds more than the members standing
+                // in a wrong copy right now.
+                s_loggedOtherCopy.erase(name);
                 states.push_back(state);
                 continue;
             }
@@ -26651,7 +26901,23 @@ private:
 
             // GetMapId  Position.h:281  uint32 GetMapId() const
             uint32 const memberMap = member->GetMapId();
-            if (memberMap == throughMapId)
+            bool const otherCopy = OverseerDecisions::InAnotherInstanceCopy(
+                memberMap, member->GetInstanceId(), throughMapId, headInstance);
+            if (!otherCopy)
+                s_loggedOtherCopy.erase(name);
+            if (otherCopy)
+            {
+                if (s_loggedOtherCopy[name] != member->GetInstanceId())
+                {
+                    s_loggedOtherCopy[name] = member->GetInstanceId();
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is on map {} but in instance copy {} while the "
+                             "head '{}' is in copy {} - not counted as inside, because it is "
+                             "in a run of its own (#620)",
+                             name, memberMap, member->GetInstanceId(), headName, headInstance);
+                }
+            }
+            else if (memberMap == throughMapId)
             {
                 state.through = true;
                 ++through;
@@ -26815,7 +27081,7 @@ private:
     {
         uint32 through = 0;
         std::vector<OverseerDecisions::DungeonRunEntryState> const states =
-            DungeonRunCensus(members, door, throughMapId, through);
+            DungeonRunCensus(members, door, throughMapId, through, leaderName);
 
         // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63's lesson, applied to a
         // different journey). One more member through is the only thing that
@@ -30343,7 +30609,8 @@ private:
 
                 uint32 adoptedInside = 0;
                 std::vector<OverseerDecisions::DungeonRunEntryState> const adoptedStates =
-                    DungeonRunCensus(members, entryDoor, inside->insideMapId, adoptedInside);
+                    DungeonRunCensus(members, entryDoor, inside->insideMapId, adoptedInside,
+                                     leaderName);
 
                 // AND THIS COORDINATOR DELIBERATELY HAS NO STAGING POINT (#220).
                 // An adopted run is already inside; there is no gather left to
@@ -31869,6 +32136,29 @@ private:
 
             if (coord.phase == DungeonRunPhase::Enter)
             {
+                // NOBODY IS KNOCKED WHILE THE FAMILY IS NOT ONE GROUP UNDER ITS
+                // HEAD (#620). A relog between the barrier opening and the
+                // knock is enough to take the head out of the group, and a
+                // member knocked then lands in a copy of its own. Bounded by
+                // the crossing's own backstop, whose clock started when the
+                // barrier opened: a family that never regroups is given up to
+                // IDLE the same way a crossing that never finishes is.
+                if (DungeonDoorWaitsForTheGroup(coord, members, leaderName, "ENTER"))
+                {
+                    if (std::time(nullptr) - coord.crossing.since >=
+                        DUNGEON_CROSSING_BACKSTOP_SECONDS)
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run ENTER gave up after {} minutes "
+                                 "waiting for the family of '{}' to be one group under its "
+                                 "head - {}. Back to IDLE",
+                                 static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60),
+                                 leaderName, coord.loggedGroupBreach);
+                        _travelAims.Release(leaderName);
+                        coord = DungeonRunCoordinatorState();
+                    }
+                    return;
+                }
                 switch (DriveDungeonCrossing(members, leaderName, door, triggerId,
                                              portal->insideMapId, "ENTER",
                                              EscortPurpose::Assemble, coord))
@@ -32034,7 +32324,7 @@ private:
             // of which are about who is inside rather than about a door.
             uint32 inside = 0;
             std::vector<OverseerDecisions::DungeonRunEntryState> const states =
-                DungeonRunCensus(members, door, portal->insideMapId, inside);
+                DungeonRunCensus(members, door, portal->insideMapId, inside, leaderName);
 
             // THE RUN JOINS ITS CAMPAIGN AS SOON AS THERE IS A ROW TO STAMP,
             // WHICH IS NOT WHERE THIS USED TO HAPPEN (#225). It was done at the
@@ -32771,7 +33061,12 @@ private:
             states.push_back(state);
         }
 
-        if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_APPROACH_LIMITS))
+        // AND THE BARRIER IS ALSO THE FAMILY BEING ONE GROUP UNDER ITS HEAD
+        // (#620). Asked only once the rest is met, so the line is about the
+        // group and nothing else. The staging backstop below still bounds a
+        // barrier that never opens.
+        if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_APPROACH_LIMITS) &&
+            !DungeonDoorWaitsForTheGroup(coord, members, leaderName, "BARRIER"))
         {
             // THE BARRIER IS A ONE-WAY DOOR INTO ENTER, not a condition ENTER
             // keeps re-asking. Once the party is gathered, the next thing that

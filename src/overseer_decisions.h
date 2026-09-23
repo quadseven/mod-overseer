@@ -2470,6 +2470,86 @@ char const* ClearingClockHoldReason(ClearingClock clock);
 bool HeadTakesTheLead(bool headNamed, bool headPresent, bool headInThisGroup,
                       bool headLeads);
 
+// ------------------------------------------- one group per family (#607) --
+//
+// EACH FAMILY IS ONE GROUP, AND THE HEAD LEADS IT WHENEVER HE IS ONLINE.
+//
+// The realm runs with LeaveGroupOnLogout on, and the core applies it only to
+// a session with a socket: the head, the one member with a client. Every
+// relog, client drop or worldserver bounce takes the head out of the family
+// group, and the core hands the lead to a member. The rejoin used to assume
+// the head came back in NO group. A head who came back in a group of his
+// own was skipped as "in a party of their own", HeadTakesTheLead refused
+// because he was not in the family's group, and the two groups stood side by
+// side for as long as nobody logged out again.
+//
+// So the plan is made over every present member, and a member in a stray
+// group leaves it and joins the family's. The family's group is the head's
+// when he is in one. Without him it is the group holding the most present
+// members, the earliest in roster order on a tie, and with no group at all a
+// new one is formed under the head, or under the first present member while
+// he is away.
+//
+// A BATTLEGROUND, BATTLEFIELD OR DUNGEON-FINDER GROUP IS NEVER TOUCHED. The
+// core owns those, and a member in one is left in it, never picked as the
+// family's group, and named in `untouched` so the adapter can say so.
+struct FamilyGroupSeat
+{
+    std::string name;
+    bool head = false;
+    // In the world and steered this poll. A seat that is not present is
+    // never moved; FamilyGroupBreach names it as missing.
+    bool present = false;
+    // 0 means in no group. Any other value identifies one group, and two
+    // seats with the same value are in the same group.
+    std::uint64_t groupId = 0;
+    bool groupIsForeign = false;
+    bool leadsItsGroup = false;
+};
+
+struct FamilyGroupPlan
+{
+    // The family's group, or 0 when a new one is to be formed under `founder`.
+    std::uint64_t targetGroupId = 0;
+    std::string founder;
+    // Present members to take out of a stray group before they join, in seat
+    // order. Every name here is also in `join`.
+    std::vector<std::string> leave;
+    // Present members to add to the family's group, in seat order. Never the
+    // founder.
+    std::vector<std::string> join;
+    // Present members in a group the core owns, left where they are.
+    std::vector<std::string> untouched;
+};
+
+FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats);
+
+// WHY THE FAMILY IS NOT ONE GROUP UNDER ITS HEAD, in words, or empty when it
+// is. Asked by the dungeon coordinator before anybody knocks on a door (#620):
+// a member who zones in outside the head's group is given an instance copy of
+// its own. Every seat counts here, present or not, because a member who is
+// offline is a member the run would leave behind. A family of one is whole.
+std::string FamilyGroupBreach(std::vector<FamilyGroupSeat> const& seats);
+
+// IS THIS CHARACTER IN A DIFFERENT COPY OF THE SAME MAP THAN THE HEAD (#620)?
+// True only when both are on `mapId`, the head's copy is known (non-zero),
+// and the two copies differ. The dungeon census counts such a member as NOT
+// inside: it is on the right map and in a run of its own.
+bool InAnotherInstanceCopy(std::uint32_t memberMap, std::uint32_t memberInstance,
+                           std::uint32_t headMap, std::uint32_t headInstance);
+
+// ARE THE FAMILY MEMBERS ON `mapId` SPREAD OVER MORE THAN ONE COPY OF IT?
+// Asked by the arming drive: `dc on` in that state arms a run in a copy the
+// rest of the family is not in, so nobody on the map is armed until the
+// copies agree. Members on other maps do not count.
+struct InstanceSpot
+{
+    std::uint32_t mapId = 0;
+    std::uint32_t instanceId = 0;
+};
+bool SplitAcrossInstanceCopies(std::vector<InstanceSpot> const& family,
+                               std::uint32_t mapId);
+
 // ------------------------------------------- what counts as a run (#225) --
 //
 // DID THE PARTY ACTUALLY GET INTO THE DUNGEON? Measured 2026-09-05: a campaign
