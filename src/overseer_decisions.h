@@ -14092,6 +14092,169 @@ char const* MailWalkEndReason(MailWalkState state);
 // MAIL_WALK_PROGRESS_YARDS under `bestYards`.
 bool MailWalkMadeProgress(float bestYards, float nowYards);
 
+// ------------------------------------------ trainer and vendor walks (#621) --
+//
+// THE MAILBOX WALK, AIMED AT A CREATURE. The guild's maintenance members are
+// random guild bots off the roster, and the site's crafting corps needs two
+// more places a crafter has to stand: a profession TRAINER, to buy the next
+// rank and the recipes its skill now allows, and a VENDOR, to buy the thread
+// every tailored bag takes. Nothing could walk such a bot to either:
+// TrainOnArrival teaches only a roster member aimed through travel_npc, and
+// kind='buy' needs the buyer already standing at the counter.
+//
+// So these are the mailbox walk with a different destination. The gate, the
+// hold, the legs, the per-poll verdict and the pending list are the mailbox
+// walk's own; only the choice of destination and what happens on arrival are
+// new, and they are what lives here.
+//
+// SHAPES, each on the kind whose verb it prepares, routed on the first word the
+// way `walk-to-mailbox` rides kind='mail' and `use` rides kind='cast':
+//
+//   kind='cast'  walk-to-trainer skill:<id> [learn:<spell>[,<spell>...]] [max:<yards>]
+//   kind='buy'   walk-to-vendor item:<entry> [max:<yards>]
+//
+// A trainer walk ends AT the trainer: on arrival the adapter buys the next rank
+// of `skill` (when this trainer sells one this character may take) and each
+// named spell whose trainer line belongs to `skill`, through the core's own
+// Trainer::TeachSpell, and reads each back. A vendor walk ends with the bot
+// held at the counter for MAIL_WALK_LINGER_SECONDS, so the `buy` row written
+// next finds a vendor in reach; a successful buy lifts the hold.
+
+constexpr char const* TRAINER_WALK_VERB = "walk-to-trainer";
+constexpr char const* VENDOR_WALK_VERB = "walk-to-vendor";
+
+// THE CAP. A trainer or a vendor stands in a town, and a bot on the road is
+// often past a mailbox's 600 yards from the nearest one. 1,000 yards is still
+// inside MAIL_WALK_TIMEOUT_CEILING_SECONDS at a bot's 7 yards a second with the
+// same allowance for bends, and a row cannot raise it.
+constexpr float ERRAND_WALK_MAX_YARDS = 1000.0f;
+
+// At most this many named spells in one trainer walk. A trainer visit buys a
+// rank and a handful of recipes; a longer list is a planner bug, not a visit.
+constexpr std::size_t TRAINER_WALK_MAX_LEARN = 8;
+
+// Where a walk goes. The mailbox walk is the first of these and keeps every
+// literal and field it had.
+enum class WalkGoal
+{
+    Mailbox,
+    Trainer,
+    Vendor,
+};
+
+// "mailbox", "trainer", "vendor": the result JSON's `goal` and the noun in
+// the log.
+char const* WalkGoalWord(WalkGoal goal);
+
+bool IsTrainerWalkRow(std::string const& command);
+bool IsVendorWalkRow(std::string const& command);
+
+struct TrainerWalkRequest
+{
+    uint32_t skill{0};
+    std::vector<uint32_t> learn;  // trainer spell ids, in the order written
+    float maxYards{ERRAND_WALK_MAX_YARDS};
+    char const* error{""};        // empty when it parsed
+};
+
+// `skill:` is required and must be a non-zero id. `learn:` is optional, a comma
+// list of non-zero ids with no repeats and at most TRAINER_WALK_MAX_LEARN of
+// them. `max:` is optional and no larger than ERRAND_WALK_MAX_YARDS. Each key at
+// most once, in any order; anything else is Malformed.
+TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command);
+
+struct VendorWalkRequest
+{
+    uint32_t item{0};
+    float maxYards{ERRAND_WALK_MAX_YARDS};
+    char const* error{""};
+};
+
+// `item:` is required and must be a non-zero entry; `max:` as above.
+VendorWalkRequest ParseVendorWalkRequest(std::string const& command);
+
+namespace ErrandWalkRefusal
+{
+constexpr char const* MalformedTrainer = "malformed walk-to-trainer command";
+constexpr char const* MalformedVendor  = "malformed walk-to-vendor command";
+
+// The gate's own wall, reworded: the walk under way may be any of the three.
+constexpr char const* AlreadyWalking   = "a walk is already under way for this character";
+
+constexpr char const* NoTrainerOnMap   = "no trainer on this map will teach this character that skill";
+constexpr char const* TrainerTooFar    = "the nearest trainer that will teach it is beyond the cap";
+constexpr char const* TrainerOtherSide = "the way to the nearest trainer crosses the other side's ground";
+constexpr char const* TrainerGround    = "the ground toward the trainer does not hold";
+
+constexpr char const* NoVendorOnMap    = "no vendor on this map sells that item to this character";
+constexpr char const* VendorTooFar     = "the nearest vendor that sells it is beyond the cap";
+constexpr char const* VendorOtherSide  = "the way to the nearest vendor crosses the other side's ground";
+constexpr char const* VendorGround     = "the ground toward the vendor does not hold";
+
+// Endings of a trainer walk that started.
+constexpr char const* TrainerCombat    = "entered combat on the way to the trainer";
+constexpr char const* TrainerDied      = "died on the way to the trainer";
+constexpr char const* TrainerLeftWorld = "left the world on the way to the trainer";
+constexpr char const* TrainerLeftMap   = "left the map on the way to the trainer";
+constexpr char const* TrainerFlight    = "took a flight on the way to the trainer";
+constexpr char const* TrainerTimedOut  = "did not reach the trainer in time";
+constexpr char const* TrainerStalled   = "stopped getting nearer the trainer";
+
+// Endings of a vendor walk that started.
+constexpr char const* VendorCombat     = "entered combat on the way to the vendor";
+constexpr char const* VendorDied       = "died on the way to the vendor";
+constexpr char const* VendorLeftWorld  = "left the world on the way to the vendor";
+constexpr char const* VendorLeftMap    = "left the map on the way to the vendor";
+constexpr char const* VendorFlight     = "took a flight on the way to the vendor";
+constexpr char const* VendorTimedOut   = "did not reach the vendor in time";
+constexpr char const* VendorStalled    = "stopped getting nearer the vendor";
+
+// What a trainer visit that arrived can end with.
+constexpr char const* NothingToLearn   = "the trainer had nothing left to teach that was asked for";
+constexpr char const* TaughtNothing    = "the trainer taught nothing, most likely for want of money";
+}  // namespace ErrandWalkRefusal
+
+// The refusal a walk to `goal` gives where the mailbox walk gives `mailboxWall`.
+// The mailbox goal answers the mailbox literal unchanged; the other two answer
+// their own sentence for every literal that names the destination, and pass the
+// ones about the character (dead, in combat, on the roster...) through as they
+// are.
+char const* WalkRefusalFor(WalkGoal goal, char const* mailboxWall);
+
+// The ending literal for `state` on a walk to `goal`; "" for Walking and
+// Arrived. The mailbox goal answers MailWalkEndReason exactly.
+char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state);
+
+// Worth asking again later without changing the row. The mailbox literals keep
+// MailWalkRefusalRetryable's answers. Too far is retryable here: a random bot
+// wanders, and the next pass may find it in town. No such destination on the
+// map, a malformed row and a trainer with nothing left to teach are not.
+bool ErrandWalkRefusalRetryable(std::string const& reason);
+
+// WHAT ONE TRAINER VISIT DID, from readings the adapter took on both sides of
+// each purchase: the skill's ceiling before and after for the rank, and
+// HasSpell before and after for each named spell.
+struct TrainerVisitFacts
+{
+    bool rankOffered{false};   // this trainer would sell this character the next rank
+    bool rankLearned{false};   // ...and the ceiling rose
+    uint32_t asked{0};         // named spells in the row
+    uint32_t alreadyKnown{0};  // ...known before the visit
+    uint32_t learned{0};       // ...not known before, known after
+};
+
+enum class TrainerVisitOutcome
+{
+    Learned,         // at least one new thing: status 'applied'
+    NothingToLearn,  // nothing offered and every named spell already known
+    TaughtNothing,   // something was offered and nothing came of it
+};
+
+TrainerVisitOutcome JudgeTrainerVisit(TrainerVisitFacts const& facts);
+
+// "learned", "nothing_to_learn", "taught_nothing".
+char const* TrainerVisitWord(TrainerVisitOutcome outcome);
+
 // ---------------------------------------------------------------------------
 // THE DUNGEON RUN TIMELINE (overseer_dungeon_run_event).
 //

@@ -300,6 +300,7 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -34116,11 +34117,18 @@ private:
                 // LEARN (#569): on the first word, so a malformed walk still
                 // reaches the walk's own parser. A new kind would be an ENUM
                 // migration, which reaches a world only when db-import runs.
-                detail = DoMailWalk(player, command, status, rowResult, _pendingMailWalks, id);
+                detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Mailbox, status,
+                                rowResult, _pendingMailWalks, id);
             else if (kind == "mail")
                 detail = DoMail(player, targetArg, command, status, rowResult);
             else if (kind == "repair")
                 detail = DoRepair(player, command, status, rowResult);
+            else if (kind == "buy" && OverseerDecisions::IsVendorWalkRow(command))
+                // The mailbox walk aimed at a vendor (#621), on the kind whose
+                // verb it prepares and routed on the first word, exactly as
+                // `walk-to-mailbox` rides kind='mail'.
+                detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Vendor, status,
+                                rowResult, _pendingMailWalks, id);
             else if (kind == "buy")
                 detail = DoBuy(player, command, status, rowResult);
             else if (kind == "bind")
@@ -34132,6 +34140,13 @@ private:
                                   _pendingSummons, id);
             else if (kind == "conjure")
                 detail = DoConjure(player, command, status, rowResult, _pendingConjures, id);
+            else if (kind == "cast" && OverseerDecisions::IsTrainerWalkRow(command))
+                // The mailbox walk aimed at a trainer (#621). On kind='cast'
+                // beside `use`, the other verb that teaches a character
+                // something; a cast row begins with a spell id, so the two
+                // grammars cannot collide.
+                detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Trainer, status,
+                                rowResult, _pendingMailWalks, id);
             else if (kind == "cast" && OverseerDecisions::IsLearnRow(command))
                 // THE SAME `kind`, TWO GRAMMARS, AND NOTHING ELSE HERE KNOWS IT.
                 // A cast row begins with a spell id, which is digits; a learn
@@ -46315,8 +46330,20 @@ private:
     // renewed on every poll that still wants the walk.
     static constexpr uint32 MAIL_WALK_SWEEP_QUIET_SECONDS = 10;
 
+    // THE SAME WALK TO A TRAINER OR A VENDOR (#621). A `kind='cast'` row
+    // `walk-to-trainer skill:<id> [learn:<spell>,...]` or a `kind='buy'` row
+    // `walk-to-vendor item:<entry>` walks the bot the same way to the nearest
+    // creature on its map that will serve it, through everything above: the
+    // gate, the hold, the legs, the per-poll verdict and this one pending list,
+    // so a bot is only ever on one walk. What differs is the destination - a
+    // creature spawn read from the core's own spawn table, kept only when its
+    // faction will deal with this character and it has something to offer it -
+    // and the arrival. At a trainer the walk buys what the row asked for and
+    // lets go; at a vendor it holds the bot at the counter for the `buy` row
+    // that follows, and a successful buy lifts the hold.
     struct MailWalkEvidence
     {
+        OverseerDecisions::WalkGoal goal{OverseerDecisions::WalkGoal::Mailbox};
         std::string character;
         std::string request;
         uint32 mapId{0};
@@ -46326,6 +46353,8 @@ private:
         float capYards{OverseerDecisions::MAIL_WALK_MAX_YARDS};
         uint32 mailboxesOnMap{0};
         float nearestYards{-1.f};
+        // THE DESTINATION, whichever kind it is. The names are the mailbox
+        // walk's, kept so its rows read exactly as they did.
         bool haveMailbox{false};
         uint32 mailboxSpawn{0};
         uint32 mailboxEntry{0};
@@ -46345,6 +46374,23 @@ private:
         std::string reachedName;
         float reachedYards{-1.f};
         CastHoldReport hold;
+
+        // A trainer walk's request and what the visit did.
+        uint32 skill{0};
+        std::vector<uint32> learnAsked;
+        uint32 rankSpell{0};
+        int32 maxBefore{-1};
+        int32 maxAfter{-1};
+        int32 valueNow{-1};
+        std::vector<uint32> taught;
+        std::vector<uint32> alreadyKnown;
+        std::vector<uint32> notTaught;
+        int64 moneyBefore{-1};
+        int64 moneyAfter{-1};
+        char const* visit{""};
+
+        // A vendor walk's request.
+        uint32 item{0};
     };
 
     struct MailWalkCheck
@@ -46359,31 +46405,48 @@ private:
     // and each ends within MAIL_WALK_TIMEOUT_CEILING_SECONDS.
     std::vector<MailWalkCheck> _pendingMailWalks;
 
+    static void WalkIdList(std::ostringstream& o, std::vector<uint32> const& ids)
+    {
+        o << "[";
+        for (std::size_t i = 0; i < ids.size(); ++i)
+            o << (i ? "," : "") << ids[i];
+        o << "]";
+    }
+
     static std::string MailWalkJson(MailWalkEvidence const& ev, char const* outcome,
                                     char const* reason)
     {
+        namespace D = OverseerDecisions;
+        bool const mailbox = ev.goal == D::WalkGoal::Mailbox;
         std::ostringstream o;
         o << "{\"outcome\":" << J(outcome)
           << ",\"reason\":" << J(reason);
         if (*reason)
             o << ",\"retryable\":"
-              << (OverseerDecisions::MailWalkRefusalRetryable(reason) ? "true" : "false");
-        o << ",\"character\":" << J(ev.character)
+              << ((mailbox ? D::MailWalkRefusalRetryable(reason)
+                           : D::ErrandWalkRefusalRetryable(reason))
+                      ? "true"
+                      : "false");
+        o << ",\"goal\":" << J(D::WalkGoalWord(ev.goal))
+          << ",\"character\":" << J(ev.character)
           << ",\"request\":" << J(ev.request)
           << ",\"map\":" << ev.mapId
           << ",\"from\":{\"x\":" << ev.fromX << ",\"y\":" << ev.fromY << ",\"z\":" << ev.fromZ
           << "}"
           << ",\"cap_yards\":" << ev.capYards
-          << ",\"mailboxes_on_map\":" << ev.mailboxesOnMap;
+          << (mailbox ? ",\"mailboxes_on_map\":" : ",\"destinations_on_map\":")
+          << ev.mailboxesOnMap;
         if (ev.nearestYards >= 0.f)
-            o << ",\"nearest_mailbox_yards\":" << ev.nearestYards;
+            o << (mailbox ? ",\"nearest_mailbox_yards\":" : ",\"nearest_yards\":")
+              << ev.nearestYards;
+        o << ",\"" << D::WalkGoalWord(ev.goal) << "\":";
         if (ev.haveMailbox)
-            o << ",\"mailbox\":{\"spawn\":" << ev.mailboxSpawn
+            o << "{\"spawn\":" << ev.mailboxSpawn
               << ",\"entry\":" << ev.mailboxEntry
               << ",\"name\":" << J(ev.mailboxName)
               << ",\"x\":" << ev.boxX << ",\"y\":" << ev.boxY << ",\"z\":" << ev.boxZ << "}";
         else
-            o << ",\"mailbox\":null";
+            o << "null";
         if (ev.startYards >= 0.f)
             o << ",\"start_yards\":" << ev.startYards;
         if (ev.nowYards >= 0.f)
@@ -46398,9 +46461,30 @@ private:
         if (!ev.reachedName.empty())
             o << ",\"reached\":{\"name\":" << J(ev.reachedName)
               << ",\"yards\":" << ev.reachedYards
-              << ",\"held_seconds\":" << OverseerDecisions::MAIL_WALK_LINGER_SECONDS << "}";
+              << ",\"held_seconds\":"
+              << (ev.goal == D::WalkGoal::Trainer ? 0u : D::MAIL_WALK_LINGER_SECONDS) << "}";
         else
             o << ",\"reached\":null";
+        if (ev.goal == D::WalkGoal::Trainer)
+        {
+            o << ",\"skill\":" << ev.skill << ",\"learn\":";
+            WalkIdList(o, ev.learnAsked);
+            o << ",\"visit\":" << J(ev.visit)
+              << ",\"rank_spell\":" << ev.rankSpell
+              << ",\"max_before\":" << ev.maxBefore
+              << ",\"max_after\":" << ev.maxAfter
+              << ",\"skill_value\":" << ev.valueNow
+              << ",\"taught\":";
+            WalkIdList(o, ev.taught);
+            o << ",\"already_known\":";
+            WalkIdList(o, ev.alreadyKnown);
+            o << ",\"not_taught\":";
+            WalkIdList(o, ev.notTaught);
+            o << ",\"money_before\":" << ev.moneyBefore
+              << ",\"money_after\":" << ev.moneyAfter;
+        }
+        if (ev.goal == D::WalkGoal::Vendor)
+            o << ",\"item\":" << ev.item;
         o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
           << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
           << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
@@ -46437,6 +46521,119 @@ private:
     {
         float nearest = -1.f;
         return !FindMailboxInReach(who, nearest, yards, name).IsEmpty();
+    }
+
+    // What this trainer would sell this character on this row: the next rank of
+    // the skill (TrainerSpellForSkill, the same answer TrainOnArrival buys on),
+    // and each named spell that sits on the skill's own trainer line. The core's
+    // CanTeachSpell decides both, so a spell already known, one the character's
+    // skill is still short of, and one of another trade are all left out here.
+    // Money is not asked: TeachSpell asks it, and a visit that cannot pay says so.
+    static void TrainerOffers(Trainer::Trainer* trainer, Player* who,
+                              MailWalkEvidence const& ev, uint32& rankSpell,
+                              std::vector<uint32>& spells)
+    {
+        rankSpell = TrainerSpellForSkill(trainer, who, ev.skill);
+        spells.clear();
+        for (uint32 spellId : ev.learnAsked)
+            if (Trainer::Spell const* spell = trainer->GetSpell(spellId))
+                if (spell->ReqSkillLine == ev.skill && trainer->CanTeachSpell(who, spell))
+                    spells.push_back(spellId);
+    }
+
+    // May a walk of this row end at a spawn of this creature entry? Its faction
+    // must be one the core would let this character deal with (the same
+    // reaction GetNPCIfCanInteractWith tests, read from the template because
+    // the spawn may be in a grid nobody has loaded), and it must have what the
+    // row came for: a trainer with something on offer, or a vendor whose list
+    // carries the item.
+    static bool CreatureServesWalk(Player* who, MailWalkEvidence const& ev, uint32 entry)
+    {
+        namespace D = OverseerDecisions;
+        CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
+        if (!tmpl || !D::MayInteractAt(ReactionTowardCharacter(who, tmpl->faction)))
+            return false;
+        if (ev.goal == D::WalkGoal::Vendor)
+        {
+            if (!(tmpl->npcflag & UNIT_NPC_FLAG_VENDOR))
+                return false;
+            VendorItemData const* items = sObjectMgr->GetNpcVendorItemList(entry);
+            if (!items)
+                return false;
+            for (VendorItem const* sold : items->m_items)
+                if (sold && sold->item == ev.item)
+                    return true;
+            return false;
+        }
+        if (!(tmpl->npcflag & UNIT_NPC_FLAG_TRAINER))
+            return false;
+        Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
+        if (!trainer || !trainer->IsTrainerValidForPlayer(who))
+            return false;
+        uint32 rankSpell = 0;
+        std::vector<uint32> spells;
+        TrainerOffers(trainer, who, ev, rankSpell, spells);
+        return rankSpell != 0 || !spells.empty();
+    }
+
+    // Every creature spawn on this character's map and phase that may end this
+    // walk. Each entry is judged once per row: a map carries hundreds of spawns
+    // of a few dozen trainers and vendors.
+    static void CreatureSpawnsForWalk(Player* who, MailWalkEvidence const& ev,
+                                      std::vector<CreatureData const*>& out)
+    {
+        out.clear();
+        std::unordered_map<uint32, bool> serves;
+        uint32 const mapId = who->GetMapId();
+        uint32 const phase = who->GetPhaseMask();
+        for (auto const& itr : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureData const& data = itr.second;
+            if (data.mapid != mapId || !(data.phaseMask & phase))
+                continue;
+            auto const found = serves.find(data.id);
+            bool ok = false;
+            if (found == serves.end())
+            {
+                ok = CreatureServesWalk(who, ev, data.id);
+                serves.emplace(data.id, ok);
+            }
+            else
+                ok = found->second;
+            if (ok)
+                out.push_back(&data);
+        }
+    }
+
+    // The creature a trainer or vendor walk is for, when this character could
+    // open its window from where it stands: GetNPCIfCanInteractWith, the gate
+    // TeachSpell's own caller and the `buy` row's purchase both go through.
+    static Creature* WalkCreatureInReach(Player* who, MailWalkEvidence const& ev)
+    {
+        if (!ev.mailboxEntry)
+            return nullptr;
+        Creature* npc = who->FindNearestCreature(ev.mailboxEntry, INTERACTION_DISTANCE * 2.f);
+        if (!npc)
+            return nullptr;
+        uint32 const flag = ev.goal == OverseerDecisions::WalkGoal::Trainer
+            ? UNIT_NPC_FLAG_TRAINER
+            : UNIT_NPC_FLAG_VENDOR;
+        return who->GetNPCIfCanInteractWith(npc->GetGUID(), flag);
+    }
+
+    // Has the walker arrived? The mailbox walk asks the core's mailbox gate;
+    // the other two ask the creature gate above.
+    static bool DestinationInReach(Player* who, MailWalkEvidence const& ev, std::string& name,
+                                   float& yards)
+    {
+        if (ev.goal == OverseerDecisions::WalkGoal::Mailbox)
+            return MailboxInReach(who, name, yards);
+        Creature* npc = WalkCreatureInReach(who, ev);
+        if (!npc)
+            return false;
+        name = npc->GetName();
+        yards = who->GetDistance(npc);
+        return true;
     }
 
     // Hand the walker its next leg, if it needs one. Answers false when the
@@ -46487,7 +46684,8 @@ private:
 
     // Keep the hold standing at the box for the linger and stop the walk, on
     // arrival. The register's own deadline is moved, because a re-assertion
-    // never extends one and the linger is a new, shorter promise.
+    // never extends one and the linger is a new, shorter promise. A vendor walk
+    // lingers the same way, for its `buy` row.
     static void HoldAtTheMailbox(Player* who, std::string const& name)
     {
         auto& holds = HoldsInForce();
@@ -46501,33 +46699,136 @@ private:
         AnchorHoldWhereItStands(hold->second, who);
     }
 
-    static char const* DoMailWalk(Player* who, std::string const& command, char const*& status,
-                                  std::string& out, std::vector<MailWalkCheck>& walking,
-                                  uint32 id)
+    // BUY WHAT THE ROW ASKED FOR, AT THE TRAINER THE WALK REACHED, the way a
+    // player does at the trainer window: Trainer::TeachSpell, which takes the
+    // money (with the reputation discount) and enforces every requirement, one
+    // spell at a time. TeachSpell reports only to a client, so each purchase is
+    // read back: the skill's ceiling for the rank, HasSpell for each recipe.
+    // Answers the status the row ends with and sets `reason`.
+    static char const* TeachAtTheTrainer(Player* bot, MailWalkEvidence& ev, char const*& reason)
+    {
+        namespace D = OverseerDecisions;
+        namespace E = OverseerDecisions::ErrandWalkRefusal;
+        D::TrainerVisitFacts facts;
+        facts.asked = static_cast<uint32_t>(ev.learnAsked.size());
+        ev.moneyBefore = int64(bot->GetMoney());
+        ev.maxBefore = int32(bot->GetPureMaxSkillValue(ev.skill));
+        bool const heldSkill = bot->HasSkill(ev.skill);
+        for (uint32 spellId : ev.learnAsked)
+            if (bot->HasSpell(spellId))
+            {
+                ev.alreadyKnown.push_back(spellId);
+                ++facts.alreadyKnown;
+            }
+
+        Creature* npc = WalkCreatureInReach(bot, ev);
+        Trainer::Trainer* trainer = npc ? sObjectMgr->GetTrainer(ev.mailboxEntry) : nullptr;
+        if (trainer)
+        {
+            uint32 rankSpell = 0;
+            std::vector<uint32> spells;
+            TrainerOffers(trainer, bot, ev, rankSpell, spells);
+            if (rankSpell)
+            {
+                facts.rankOffered = true;
+                ev.rankSpell = rankSpell;
+                trainer->TeachSpell(npc, bot, rankSpell);  // Trainer.h:73
+                facts.rankLearned = heldSkill
+                    ? int32(bot->GetPureMaxSkillValue(ev.skill)) > ev.maxBefore
+                    : bot->HasSkill(ev.skill);
+            }
+            for (uint32 spellId : spells)
+            {
+                trainer->TeachSpell(npc, bot, spellId);
+                if (bot->HasSpell(spellId))
+                {
+                    ev.taught.push_back(spellId);
+                    ++facts.learned;
+                }
+            }
+        }
+        for (uint32 spellId : ev.learnAsked)
+            if (!bot->HasSpell(spellId))
+                ev.notTaught.push_back(spellId);
+        ev.maxAfter = int32(bot->GetPureMaxSkillValue(ev.skill));
+        ev.valueNow = int32(bot->GetPureSkillValue(ev.skill));
+        ev.moneyAfter = int64(bot->GetMoney());
+
+        D::TrainerVisitOutcome const outcome = D::JudgeTrainerVisit(facts);
+        ev.visit = D::TrainerVisitWord(outcome);
+        switch (outcome)
+        {
+            case D::TrainerVisitOutcome::Learned:
+                reason = "";
+                return "applied";
+            case D::TrainerVisitOutcome::NothingToLearn:
+                reason = E::NothingToLearn;
+                return "unchanged";
+            case D::TrainerVisitOutcome::TaughtNothing:
+                reason = E::TaughtNothing;
+                return "unchanged";
+        }
+        reason = E::TaughtNothing;
+        return "unchanged";
+    }
+
+    // One walk row of any of the three kinds: parse, gate, choose, hold, walk.
+    static char const* DoWalk(Player* who, std::string const& command,
+                              OverseerDecisions::WalkGoal goal, char const*& status,
+                              std::string& out, std::vector<MailWalkCheck>& walking, uint32 id)
     {
         namespace D = OverseerDecisions;
         namespace R = OverseerDecisions::MailWalkRefusal;
 
         MailWalkEvidence ev;
+        ev.goal = goal;
         ev.character = who->GetName();
         ev.request = command;
         ev.mapId = who->GetMapId();
         ev.fromX = who->GetPositionX();
         ev.fromY = who->GetPositionY();
         ev.fromZ = who->GetPositionZ();
+        char const* const noun = D::WalkGoalWord(goal);
 
-        auto refuse = [&](char const* reason) -> char const*
+        auto refuse = [&](char const* wall) -> char const*
         {
+            char const* const reason = D::WalkRefusalFor(goal, wall);
             out = MailWalkJson(ev, "refused", reason);
-            LOG_INFO("module.overseer",
-                     "overseer: mailbox walk {} for '{}' refused: {}", id, ev.character, reason);
+            if (goal == D::WalkGoal::Mailbox)
+                LOG_INFO("module.overseer",
+                         "overseer: mailbox walk {} for '{}' refused: {}", id, ev.character,
+                         reason);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: {} walk {} for '{}' refused: {}", noun, id, ev.character,
+                         reason);
             return reason;
         };
 
-        D::MailWalkRequest const req = D::ParseMailWalkRequest(command);
-        if (*req.error)
-            return refuse(req.error);
-        ev.capYards = req.maxYards;
+        if (goal == D::WalkGoal::Mailbox)
+        {
+            D::MailWalkRequest const req = D::ParseMailWalkRequest(command);
+            if (*req.error)
+                return refuse(req.error);
+            ev.capYards = req.maxYards;
+        }
+        else if (goal == D::WalkGoal::Trainer)
+        {
+            D::TrainerWalkRequest const req = D::ParseTrainerWalkRequest(command);
+            if (*req.error)
+                return refuse(req.error);
+            ev.capYards = req.maxYards;
+            ev.skill = req.skill;
+            ev.learnAsked.assign(req.learn.begin(), req.learn.end());
+        }
+        else
+        {
+            D::VendorWalkRequest const req = D::ParseVendorWalkRequest(command);
+            if (*req.error)
+                return refuse(req.error);
+            ev.capYards = req.maxYards;
+            ev.item = req.item;
+        }
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(who);
         WorldSession* session = who->GetSession();
@@ -46558,11 +46859,13 @@ private:
 
         // A linger left by an earlier walk is this verb's own and is replaced
         // rather than re-asserted, so the new walk gets its own ceiling.
-        ReleaseHold(ev.character, who, "a new mailbox walk replaces it", MAIL_WALK_HOLD_VERB);
+        ReleaseHold(ev.character, who, "a new walk replaces it", MAIL_WALK_HOLD_VERB);
 
         // ALREADY AT A BOX. Nothing to walk; held there for the linger so the
-        // `send` finds it where it is now.
-        if (MailboxInReach(who, ev.reachedName, ev.reachedYards))
+        // `send` finds it where it is now. A trainer or vendor walk has no
+        // destination yet here; standing at one, it is chosen at 0 yards and
+        // arrives on the first poll.
+        if (goal == D::WalkGoal::Mailbox && MailboxInReach(who, ev.reachedName, ev.reachedYards))
         {
             ev.alreadyThere = true;
             HoldStillAndReport(who, ev.character, MAIL_WALK_HOLD_VERB, ev.hold,
@@ -46577,9 +46880,35 @@ private:
             return "";
         }
 
-        // ---- which mailbox --------------------------------------------------
-        std::vector<GameObjectData const*> spawns;
-        MailboxSpawnsOnMap(who, spawns);
+        // ---- which destination ---------------------------------------------
+        //
+        // The same list of candidates whatever they are: a position, and
+        // whether the other side's people stand at it. The mailbox walk's own
+        // chooser picks the nearest usable one; its refusals are reworded for
+        // a trainer or a vendor.
+        struct Spawn
+        {
+            uint32 spawnId;
+            uint32 entry;
+            float x, y, z;
+        };
+        std::vector<Spawn> spawns;
+        if (goal == D::WalkGoal::Mailbox)
+        {
+            std::vector<GameObjectData const*> boxes;
+            MailboxSpawnsOnMap(who, boxes);
+            for (GameObjectData const* data : boxes)
+                spawns.push_back(Spawn{uint32(data->spawnId), data->id, data->posX, data->posY,
+                                       data->posZ});
+        }
+        else
+        {
+            std::vector<CreatureData const*> creatures;
+            CreatureSpawnsForWalk(who, ev, creatures);
+            for (CreatureData const* data : creatures)
+                spawns.push_back(Spawn{uint32(data->spawnId), data->id, data->posX, data->posY,
+                                       data->posZ});
+        }
         ev.mailboxesOnMap = static_cast<uint32>(spawns.size());
 
         std::vector<D::MailboxCandidate> candidates;
@@ -46588,16 +46917,16 @@ private:
         std::vector<std::size_t> spotOf;
         for (std::size_t i = 0; i < spawns.size(); ++i)
         {
-            GameObjectData const* data = spawns[i];
+            Spawn const& spawn = spawns[i];
             D::MailboxCandidate box;
-            box.x = data->posX;
-            box.y = data->posY;
-            box.z = data->posZ;
+            box.x = spawn.x;
+            box.y = spawn.y;
+            box.z = spawn.z;
             candidates.push_back(box);
-            // Only a box that could be chosen is worth the threat sweep.
-            if (who->GetExactDist(data->posX, data->posY, data->posZ) <= ev.capYards)
+            // Only a destination that could be chosen is worth the threat sweep.
+            if (who->GetExactDist(spawn.x, spawn.y, spawn.z) <= ev.capYards)
             {
-                spots.emplace_back(data->posX, data->posY);
+                spots.emplace_back(spawn.x, spawn.y);
                 spotOf.push_back(i);
             }
         }
@@ -46619,15 +46948,20 @@ private:
             return refuse(choice.error);
         }
 
-        GameObjectData const* chosen = spawns[static_cast<std::size_t>(choice.index)];
+        Spawn const& chosen = spawns[static_cast<std::size_t>(choice.index)];
         ev.haveMailbox = true;
-        ev.mailboxSpawn = chosen->spawnId;
-        ev.mailboxEntry = chosen->id;
-        if (GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(chosen->id))
-            ev.mailboxName = tmpl->name;
-        ev.boxX = chosen->posX;
-        ev.boxY = chosen->posY;
-        ev.boxZ = chosen->posZ;
+        ev.mailboxSpawn = chosen.spawnId;
+        ev.mailboxEntry = chosen.entry;
+        if (goal == D::WalkGoal::Mailbox)
+        {
+            if (GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(chosen.entry))
+                ev.mailboxName = tmpl->name;
+        }
+        else if (CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(chosen.entry))
+            ev.mailboxName = tmpl->Name;
+        ev.boxX = chosen.x;
+        ev.boxY = chosen.y;
+        ev.boxZ = chosen.z;
         ev.startYards = choice.yards;
         ev.bestYards = choice.yards;
         ev.nowYards = choice.yards;
@@ -46636,7 +46970,7 @@ private:
         //
         // The straight line is swept for the other side's people at the route
         // planner's own spacing. The walk bends round buildings, but inside a
-        // 600 yard cap and a 60 yard threat radius the line is where it goes.
+        // 1,000 yard cap and a 60 yard threat radius the line is where it goes.
         {
             std::vector<D::MailWalkPoint> const line = D::MailWalkLineSamples(
                 ev.fromX, ev.fromY, ev.boxX, ev.boxY, TRAVEL_ROUTE_GUARDED_SPACING_YARDS);
@@ -46650,9 +46984,9 @@ private:
                 if (threat.count)
                 {
                     LOG_INFO("module.overseer",
-                             "overseer: mailbox walk {} - the line from '{}' to '{}' passes "
+                             "overseer: {} walk {} - the line from '{}' to '{}' passes "
                              "'{}' (level {}), the other side's",
-                             id, ev.character, ev.mailboxName, threat.name, threat.level);
+                             noun, id, ev.character, ev.mailboxName, threat.name, threat.level);
                     return refuse(R::OtherSidesGround);
                 }
         }
@@ -46673,17 +47007,25 @@ private:
 
         if (!IssueMailWalkLeg(who, ev, true))
         {
-            ReleaseHold(ev.character, who, "the ground toward the mailbox gave no step",
+            ReleaseHold(ev.character, who, "the ground toward the destination gave no step",
                         MAIL_WALK_HOLD_VERB);
             ev.groundRefusals = 1;
             return refuse(R::GroundRefused);
         }
 
-        LOG_INFO("module.overseer",
-                 "overseer: mailbox walk {} - '{}' walks to '{}' (spawn {}) {:.0f} yards away on "
-                 "map {}, nearest of {} on the map; given {}s",
-                 id, ev.character, ev.mailboxName, ev.mailboxSpawn, ev.startYards, ev.mapId,
-                 ev.mailboxesOnMap, ev.timeoutMs / 1000u);
+        if (goal == D::WalkGoal::Mailbox)
+            LOG_INFO("module.overseer",
+                     "overseer: mailbox walk {} - '{}' walks to '{}' (spawn {}) {:.0f} yards away "
+                     "on map {}, nearest of {} on the map; given {}s",
+                     id, ev.character, ev.mailboxName, ev.mailboxSpawn, ev.startYards, ev.mapId,
+                     ev.mailboxesOnMap, ev.timeoutMs / 1000u);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: {} walk {} - '{}' walks to '{}' (creature {}, spawn {}) {:.0f} "
+                     "yards away on map {} for '{}', nearest of {} that serve it; given {}s",
+                     noun, id, ev.character, ev.mailboxName, ev.mailboxEntry, ev.mailboxSpawn,
+                     ev.startYards, ev.mapId, ev.request, ev.mailboxesOnMap,
+                     ev.timeoutMs / 1000u);
 
         MailWalkCheck check;
         check.id = id;
@@ -46711,6 +47053,7 @@ private:
         {
             MailWalkEvidence& ev = check.ev;
             ev.waitedMs += elapsedMs;
+            char const* const noun = D::WalkGoalWord(ev.goal);
 
             Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
             D::MailWalkFacts facts;
@@ -46730,7 +47073,8 @@ private:
                 else
                     ev.sinceProgressMs += elapsedMs;
                 if (facts.alive)
-                    facts.mailboxInReach = MailboxInReach(bot, ev.reachedName, ev.reachedYards);
+                    facts.mailboxInReach =
+                        DestinationInReach(bot, ev, ev.reachedName, ev.reachedYards);
             }
             facts.waitedMs = ev.waitedMs;
             facts.timeoutMs = ev.timeoutMs;
@@ -46749,9 +47093,9 @@ private:
                 if (hold == holds.end() || hold->second.verb != MAIL_WALK_HOLD_VERB)
                 {
                     LOG_WARN("module.overseer",
-                             "overseer: mailbox walk {} - '{}' is no longer held by the walk; "
+                             "overseer: {} walk {} - '{}' is no longer held by the walk; "
                              "ending it where it stands",
-                             check.id, check.targetName);
+                             noun, check.id, check.targetName);
                     ev.reachedName.clear();
                     CharacterDatabase.Execute(
                         "UPDATE overseer_command SET status = 'error', detail = '{}', "
@@ -46772,19 +47116,45 @@ private:
             }
 
             char const* status = "error";
-            char const* reason = D::MailWalkEndReason(state);
+            char const* reason = D::WalkEndReasonFor(ev.goal, state);
             char const* word = D::MailWalkStateWord(state);
 
-            if (state == D::MailWalkState::Arrived)
+            if (state == D::MailWalkState::Arrived && ev.goal == D::WalkGoal::Trainer)
+            {
+                // AT THE TRAINER: buy, read back, and let go. Nothing follows a
+                // trainer walk, so there is no linger to hold it for.
+                bot->StopMoving();
+                status = TeachAtTheTrainer(bot, ev, reason);
+                word = ev.visit;
+                ReleaseHold(check.targetName, bot, "the trainer visit is over",
+                            MAIL_WALK_HOLD_VERB);
+                LOG_INFO("module.overseer",
+                         "overseer: trainer walk {} - '{}' reached '{}' after {}ms and {} "
+                         "leg(s): {} (rank spell {}, skill {} cap {} -> {}, {} recipe(s) "
+                         "taught, {} already known, {} not taught), money {} -> {}",
+                         check.id, check.targetName, ev.reachedName, ev.waitedMs, ev.legs,
+                         ev.visit, ev.rankSpell, ev.skill, ev.maxBefore, ev.maxAfter,
+                         ev.taught.size(), ev.alreadyKnown.size(), ev.notTaught.size(),
+                         ev.moneyBefore, ev.moneyAfter);
+            }
+            else if (state == D::MailWalkState::Arrived)
             {
                 HoldAtTheMailbox(bot, check.targetName);
                 status = "applied";
-                LOG_INFO("module.overseer",
-                         "overseer: mailbox walk {} - '{}' reached '{}' ({:.1f} yards, the core "
-                         "would open it) after {}ms and {} leg(s); held there for up to {}s for "
-                         "the letter",
-                         check.id, check.targetName, ev.reachedName, ev.reachedYards,
-                         ev.waitedMs, ev.legs, D::MAIL_WALK_LINGER_SECONDS);
+                if (ev.goal == D::WalkGoal::Mailbox)
+                    LOG_INFO("module.overseer",
+                             "overseer: mailbox walk {} - '{}' reached '{}' ({:.1f} yards, the "
+                             "core would open it) after {}ms and {} leg(s); held there for up to "
+                             "{}s for the letter",
+                             check.id, check.targetName, ev.reachedName, ev.reachedYards,
+                             ev.waitedMs, ev.legs, D::MAIL_WALK_LINGER_SECONDS);
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: vendor walk {} - '{}' reached '{}' ({:.1f} yards, the "
+                             "core would open its window) after {}ms and {} leg(s); held there "
+                             "for up to {}s for the purchase of item {}",
+                             check.id, check.targetName, ev.reachedName, ev.reachedYards,
+                             ev.waitedMs, ev.legs, D::MAIL_WALK_LINGER_SECONDS, ev.item);
             }
             else
             {
@@ -46794,9 +47164,9 @@ private:
                     || state == D::MailWalkState::GroundRefused)
                     status = "unchanged";
                 LOG_WARN("module.overseer",
-                         "overseer: mailbox walk {} - '{}' {} after {}ms, {} leg(s), {:.0f} of "
+                         "overseer: {} walk {} - '{}' {} after {}ms, {} leg(s), {:.0f} of "
                          "{:.0f} yards still to go",
-                         check.id, check.targetName, reason, ev.waitedMs, ev.legs,
+                         noun, check.id, check.targetName, reason, ev.waitedMs, ev.legs,
                          ev.nowYards, ev.startYards);
             }
 
