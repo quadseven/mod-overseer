@@ -18256,12 +18256,33 @@ private:
 
         std::set<std::string> stillAimed;
 
-        for (auto const& [name, target] : aims)
+        for (auto const& [name, columnAim] : aims)
         {
             // Recorded before any refusal below, because the ROW still exists:
             // the prune is about rows that vanished, not about characters this
             // loop declined to move.
             stillAimed.insert(name);
+
+            // THE CAMPAIGN BIND OUTRANKS A TOWN ERRAND WRITTEN OVER IT (#583).
+            // The bind trip and every other errand share this one column, so
+            // whichever was written last used to win: a vendor errand written
+            // over a leader held at its inn walked him off it, the bind drive
+            // let the hold go, and the walk home began again, five times in ten
+            // minutes with no homebind moved. While the trip is open this walks
+            // the inn instead, which is also what re-takes the inn hold on
+            // arrival and strips the `new rpg` the errand's writer handed back.
+            // The errand stays in the column and is walked on the first poll
+            // after the bind lands or the trip is given up.
+            std::string const bindAim = HomeBindAim(name);
+            std::string const target =
+                OverseerDecisions::TravelAimBesideBind(bindAim, columnAim);
+            if (target != columnAim && SayHomeBindOnce(name, "an errand waits for the bind"))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was handed errand '{}' while it is on its campaign "
+                         "bind trip to {} - the errand waits in the column and is walked "
+                         "once the bind lands or the trip is given up, rather than taking "
+                         "the character off the inn it is being bound at",
+                         name, columnAim, bindAim);
 
             // AN AIM THIS DRIVE HAS ALREADY LET GO OF IS NOT A NEW ERRAND
             // (#558). The pass that wrote it clears it, and until it does the
@@ -23389,6 +23410,18 @@ private:
     // left to the sweep - the same discipline DriveCatchUp keeps, and for the
     // same reason: a lease held thirty seconds longer than it is wanted is
     // thirty seconds of a follower that could be following.
+    // THE AIM THIS CHARACTER'S CAMPAIGN BIND TRIP CLAIMED, or empty when no
+    // bind trip is open for it (#583). The trip is open from the first walk
+    // towards the inn until the bind lands, the backstop gives it up or the
+    // sweep ends it, which are the three places its escort is erased.
+    std::string HomeBindAim(std::string const& name) const
+    {
+        auto const it = _dungeonEscorts.find(name);
+        if (it == _dungeonEscorts.end() || !it->second.homeBind)
+            return std::string();
+        return it->second.aim;
+    }
+
     void EndHomeEscort(std::string const& name)
     {
         auto const it = _dungeonEscorts.find(name);
@@ -28149,8 +28182,18 @@ private:
             // "not now" is collapsed here: no leader in the world, a leader that
             // cannot be steered, a dead leader walking to its corpse, or a leader
             // already held still by somebody else's verb.
+            //
+            // AND A MEMBER ON ITS CAMPAIGN BIND TRIP (#583). The trip would
+            // claim that member's column for a counter, the travel drive would
+            // go on walking it to the inn anyway, and the trip would spend its
+            // bound waiting for somebody who is not coming. So it waits for the
+            // bind to land instead, and opens on the first poll after.
+            bool anyMemberBinding = false;
+            for (std::string const& name : members)
+                if (!HomeBindAim(name).empty())
+                    anyMemberBinding = true;
             bool const busy = !SteerableAI(leader) || !leader->IsAlive() ||
-                              HeldStill(leaderName);
+                              HeldStill(leaderName) || anyMemberBinding;
 
             OverseerDecisions::TownTripPlan const plan = OverseerDecisions::PlanTownTrip(
                 needs, TOWN_TRIP_LIMITS,
