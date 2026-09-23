@@ -2250,6 +2250,12 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_STAGING_RATCHET{
 constexpr time_t DUNGEON_STAGING_BACKSTOP_SECONDS =
     2 * (OverseerDecisions::STAGING_NUDGE_STEPS + 1) * DUNGEON_STAGING_STALL_SECONDS;
 
+// HOW MUCH NEARER A GATHERING LEADER MUST GET TO RESTART THAT CLOCK (2026-09-23).
+// Ten times the stall jitter, so standing still and shuffling on the spot never
+// reads as progress, and small enough that a leader walking at any pace sets a
+// new best within seconds. See OverseerDecisions::StagingClockAfterReading.
+constexpr float DUNGEON_GATHER_PROGRESS_YARDS = 10.0f * DUNGEON_STAGING_STALL_YARDS;
+
 // ---------------- a home the campaign's own dungeon can be reached from (#348) --
 
 // HOW FAR A HOME MAY BE FROM THE CAMPAIGN'S OWN INN AND STILL BE THAT INN.
@@ -4280,6 +4286,12 @@ public:
         float y{0.f};
         float z{0.f};
         bool arrived{false};  // announced already
+        // THE AIM IN THIS COLUMN IS ONE NOTHING WALKS (2026-09-23). Set on the
+        // poll the drive refuses a follower's aim because a follower travels by
+        // following, cleared on the poll it walks one. The party flight reads
+        // it: a member carrying an aim nobody walks is still behind its leader,
+        // not off on an errand of its own. See MemberFollowsForFlight.
+        bool inertFollowerAim{false};
         // Said once per HOLD, not once per errand, which is why it is not
         // `arrived` (#311). The post-revival hold takes `new rpg` off on purpose
         // for a few seconds and gives it back itself, so the line about it is
@@ -4869,6 +4881,15 @@ public:
     {
         auto const it = _state.find(name);
         return it == _state.end() ? std::string() : it->second.target;
+    }
+
+    // WHETHER THE AIM IN THIS CHARACTER'S COLUMN IS ONE THE DRIVE REFUSED TO
+    // WALK, read without creating a record, for the reason TargetFor gives: the
+    // party flight asks it about every member it seats.
+    bool InertFollowerAim(std::string const& name) const
+    {
+        auto const it = _state.find(name);
+        return it != _state.end() && it->second.inertFollowerAim;
     }
 
     // DID A DUNGEON RUN ISSUE THIS ERRAND? Asked of the target as well as the
@@ -7626,6 +7647,16 @@ private:
     // Placed, or re-asserted, on every poll the follower is held. It never
     // takes over a hold another verb placed: that verb's release is the one
     // that owes the strategies back.
+    // Whether the too-far-to-walk hold has this character now. Read by the party
+    // flight, which must not fly the leader away from a follower that is
+    // standing still waiting for him to come back.
+    static bool HeldWaitingForLeader(std::string const& name)
+    {
+        auto const hold = HoldsInForce().find(name);
+        return hold != HoldsInForce().end() && hold->second.verb == FAR_HOLD_VERB &&
+               time(nullptr) < hold->second.until;
+    }
+
     static void HoldFarFromLeader(Player* member, std::string const& name)
     {
         auto const other = HoldsInForce().find(name);
@@ -12692,8 +12723,18 @@ private:
         // does not count as its own errand: its aim IS the leader's live
         // position, rewritten every time the leader moves on, which is exactly
         // the character #360 measured 4100 yards behind and diverging.
-        seat.read.followingTheLeader = _travelAims.TargetFor(seat.read.name).empty() ||
-                                       IsCatchingUp(seat.read.name);
+        //
+        // AND AN AIM NOTHING WALKS IS NOT AN ERRAND OF ITS OWN (2026-09-23). The
+        // Horde leader flew node 22 to node 23 alone and left four followers in
+        // Mulgore, each carrying an old bridge aim the drive had refused to walk
+        // and one of them held by the too-far-to-walk hold waiting for him. A
+        // non-empty column read as "walking somewhere of its own" exempted every
+        // one of them, so the planner saw a party of one. See
+        // OverseerDecisions::MemberFollowsForFlight.
+        seat.read.followingTheLeader = OverseerDecisions::MemberFollowsForFlight(
+            _travelAims.TargetFor(seat.read.name).empty(), IsCatchingUp(seat.read.name),
+            _travelAims.InertFollowerAim(seat.read.name),
+            HeldWaitingForLeader(seat.read.name));
 
         if (!seat.read.onSameMap || !seat.read.alive || seat.read.inFlight ||
             seat.read.atArrival || !seat.read.followingTheLeader)
@@ -19050,8 +19091,10 @@ private:
             }
             state.heldSaid = false;
 
-            if (mover == OverseerDecisions::AimedMover::RefuseInFormation ||
-                mover == OverseerDecisions::AimedMover::RefuseCutOff)
+            state.inertFollowerAim =
+                mover == OverseerDecisions::AimedMover::RefuseInFormation ||
+                mover == OverseerDecisions::AimedMover::RefuseCutOff;
+            if (state.inertFollowerAim)
             {
                 if (!state.arrived)
                 {
@@ -24457,6 +24500,12 @@ private:
         // independent of WHICH path entered the phase, and zeroed with the rest
         // of this struct when a run ends. See DUNGEON_STAGING_BACKSTOP_SECONDS.
         time_t stagingSince{0};
+        // THE LEADER'S BEST DISTANCE TO THE POINT HE IS WALKING AT, while
+        // GATHERING, or below zero for no reading yet (2026-09-23). A new best
+        // by DUNGEON_GATHER_PROGRESS_YARDS restarts `stagingSince`, so the
+        // backstop counts time without progress. Reset with each leg and with
+        // the clock. See OverseerDecisions::StagingClockAfterReading.
+        float gatherBest{-1.f};
         // THE CLEARING WATCHDOG'S MEMORY (#171). The same shape as
         // FollowStallState - a mark the subject is measured FROM, the shared
         // ratchet's reading of how far it has got from that mark, and a count
@@ -30512,6 +30561,7 @@ private:
                     // leader who has only just been set off. See
                     // OverseerDecisions::StagingAimRestartsMeasurement.
                     coord.staging.clear();
+                    coord.gatherBest = -1.f;
                 }
 
                 // SAID ONLY FOR A LEG CHANGE, because that is the only one of
@@ -30540,6 +30590,23 @@ private:
                          "that. Walking straight at the door ends on the rim above it",
                          portal->keyword, leaderName, portal->approachX,
                          portal->approachY, portal->approachZ);
+            }
+
+            // AND A LEADER STILL CLOSING THE GAP KEEPS HIS RUN (2026-09-23). A
+            // Ragefire run staged 5,000 yards out ran out of its twelve minutes
+            // with the leader still walking, and three of those stop a campaign.
+            // A new best by DUNGEON_GATHER_PROGRESS_YARDS restarts the whole-run
+            // clock; a leader who stops is written off twelve minutes after he
+            // stopped, as before. See OverseerDecisions::StagingClockAfterReading.
+            if (coord.stagingSince)
+            {
+                OverseerDecisions::StagingClock const clock =
+                    OverseerDecisions::StagingClockAfterReading(
+                        {coord.stagingSince, coord.gatherBest}, gap.measured,
+                        gap.horizontalYards, std::time(nullptr),
+                        DUNGEON_GATHER_PROGRESS_YARDS);
+                coord.stagingSince = clock.since;
+                coord.gatherBest = clock.bestYards;
             }
 
             // AND GATHERING IS BOUNDED (#165). It had no bound of its own at
@@ -31604,6 +31671,7 @@ private:
             // a bound of its own, DUNGEON_CROSSING_BACKSTOP_SECONDS, and two
             // clocks on one phase is two answers to the same question.
             coord.stagingSince = 0;
+            coord.gatherBest = -1.f;
             // BARRIER is over, so its watchdog is too - the staging point
             // stops being the thing anybody is measured against the moment
             // the party starts walking through the door (#164).

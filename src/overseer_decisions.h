@@ -10683,6 +10683,48 @@ struct PartyFlightPlan
 // `routeKnown` is each member's answer about that same landing.
 PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members);
 
+// IS THIS MEMBER BEHIND THE LEADER FOR A FLIGHT, OR WALKING SOMEWHERE OF ITS OWN?
+//
+// Measured 2026-09-23 on the dev realm: the Horde leader flew from node 22 to
+// node 23 alone and left all four followers standing in Mulgore, 5,000 yards
+// from the dungeon. Every one of them carried an old bridge aim in its travel
+// column, and the drive had said of each "does not carry `new rpg` - nothing
+// walks it anywhere". The seat reader took a non-empty column as a walk of its
+// own and exempted them, so the planner saw a party of one.
+//
+// A member is walking its own errand only when something walks it. So it is
+// behind the leader when its column is empty, when it is on a catch-up walk
+// (whose aim IS the leader), when the aim in its column is one the drive
+// refused to walk because a follower travels by following, or when it is held
+// still waiting for this leader (the too-far-to-walk hold). Only an aim the
+// drive is actually walking takes a member out of the leader's flight.
+bool MemberFollowsForFlight(bool columnEmpty, bool catchingUp, bool aimInert,
+                            bool heldForLeader);
+
+// THE GATHERING CLOCK COUNTS TIME WITHOUT PROGRESS, NOT TIME SINCE STAGING.
+//
+// Measured 2026-09-23 on the dev realm: a Ragefire run was staged with the
+// family 5,000 yards from the door, the twelve-minute whole-run backstop ran
+// out while the leader was still walking toward it, and three such attempts in
+// a row stop a campaign (TrailingUnenteredRuns). The backstop's own argument,
+// that a run written off early is re-staged from nearer the door and so costs
+// little, stopped holding when #225 made every one of them a strike.
+//
+// So in GATHERING the whole-run clock restarts each time the leader sets a new
+// best distance to the point he is walking at by at least `minProgressYards`.
+// A leader who keeps closing the gap is never written off; one who stops is
+// written off twelve minutes after he stopped, exactly as before, and the
+// per-character stall ladder still escalates him long before that. `bestYards`
+// below zero means no reading yet: the first reading is the baseline and does
+// not restart anything. A poll with no reading changes nothing.
+struct StagingClock
+{
+    time_t since{0};
+    float bestYards{-1.f};
+};
+StagingClock StagingClockAfterReading(StagingClock clock, bool measured, float yards,
+                                      time_t now, float minProgressYards);
+
 
 // -------------- the trip that follows a run, rather than one that never
 //                comes (#391) --
