@@ -19,10 +19,12 @@
 #include <cstdio>
 
 using OverseerDecisions::AreaTriggerShape;
+using OverseerDecisions::DungeonStagingHeight;
 using OverseerDecisions::DungeonStagingPoint;
 using OverseerDecisions::DungeonStagingStandoffYards;
 using OverseerDecisions::InsideAreaTrigger;
 using OverseerDecisions::StagingGroundBelievable;
+using OverseerDecisions::StagingHeight;
 using OverseerDecisions::StagingPoint;
 using OverseerDecisions::StagingPointCheck;
 using OverseerDecisions::StagingPointRefusal;
@@ -342,6 +344,39 @@ void TheBoxDoorsDeriveTheirOwnStagingPoints()
     }
 }
 
+// THE FALLBACK HEIGHT IS ASKED THE PROBE'S QUESTION (#582). Stratholme's main
+// gate stages off areatrigger 2216 at z 143.073, and the only way out of map 329
+// lands at the service entrance at z 108.45, 670 yards away. With the grid
+// unloaded, which is normal while the leader is far off, the staging point used
+// to carry that z: 34.6 yards below the gate. It is now refused.
+void TheFallbackHeightIsCheckedAgainstTheDoor()
+{
+    float const GATE_Z = 143.073f;      // areatrigger 2216
+    float const LANDING_Z = 108.45f;    // areatrigger_teleport 2221's landing
+    float const TOLERANCE = 15.f;       // DUNGEON_STAGING_Z_SANITY_YARDS
+
+    CheckBool("stratholme-live with no probe is refused, not staged below the gate",
+              DungeonStagingHeight(false, 0.f, LANDING_Z, GATE_Z, TOLERANCE).usable, false);
+    CheckBool("and with a probe that found another surface, the same",
+              DungeonStagingHeight(true, -100000.f, LANDING_Z, GATE_Z, TOLERANCE).usable, false);
+
+    StagingHeight const probed = DungeonStagingHeight(true, 142.9f, LANDING_Z, GATE_Z, TOLERANCE);
+    CheckBool("a probe on the gate's floor is used", probed.usable && probed.fromProbe, true);
+    CheckBool("at the probe's height", probed.z == 142.9f, true);
+
+    // stratholme-undead: trigger 2214 at z 112.01, the same landing 3.6 yards
+    // under it. The fallback is believable and is kept.
+    StagingHeight const undead = DungeonStagingHeight(false, 0.f, LANDING_Z, 112.01f, TOLERANCE);
+    CheckBool("a landing on the door's floor is still a fallback",
+              undead.usable && !undead.fromProbe, true);
+    CheckBool("at the landing's height", undead.z == LANDING_Z, true);
+
+    // Deadmines, the row every staging comment starts from: the landing at
+    // 24.66 against the door's 25.7612 is unchanged by this.
+    CheckBool("deadmines still stages on its landing",
+              DungeonStagingHeight(false, 0.f, 24.66f, 25.7612f, TOLERANCE).usable, true);
+}
+
 // A landing point on top of the door names no direction to stand off along.
 void ADoorWithNoCorridorIsRefused()
 {
@@ -478,6 +513,7 @@ int main()
     TheOriginIsNeverAStagingPoint();
     APointOffTheWorldIsRefused();
     AGroundHeightFarFromTheDoorIsDisbelieved();
+    TheFallbackHeightIsCheckedAgainstTheDoor();
     EveryRefusalSaysSomething();
     return failures ? 1 : 0;
 }
