@@ -4535,7 +4535,11 @@ public:
     // `catchUp` says the aim is a follower's catch-up walk to its leader, the
     // one claim OverseerDecisions::ReadTravelClaim lets past a profession
     // errand whose column is empty. See that function for the argument.
-    bool Claim(std::string const& name, std::string const& target, bool catchUp = false)
+    // `dungeonRun` says the aim is the dungeon coordinator's own (a staging
+    // point, a corridor leg, a berth), which is let past the same way
+    // (wow-overseer#227).
+    bool Claim(std::string const& name, std::string const& target, bool catchUp = false,
+               bool dungeonRun = false)
     {
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
@@ -4566,6 +4570,7 @@ public:
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
         facts.catchUp = catchUp;
+        facts.dungeonRun = dungeonRun;
         OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
         if (verdict != OverseerDecisions::TravelClaim::Write)
         {
@@ -27209,7 +27214,7 @@ private:
                 if (!coord.crossingSince)
                     coord.crossingSince = std::time(nullptr);
 
-                _travelAims.Claim(leaderName, aimText);
+                _travelAims.Claim(leaderName, aimText, false, true);
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is sent to the berth for '{}' at ({:.1f}, "
@@ -29806,7 +29811,7 @@ private:
                 // nowhere. See TravelAimBook. In a LOOP that argument stops
                 // being hypothetical: every run after the first aims at the
                 // identical string the previous run just finished with.
-                _travelAims.Claim(leaderName, aimTarget);
+                _travelAims.Claim(leaderName, aimTarget, false, true);
                 coord.legAim[leaderName] = aimTarget;
 
                 coord.phase = DungeonRunPhase::Gathering;
@@ -29964,7 +29969,7 @@ private:
                         _travelAims.RunOwns(leaderName, legAim.aim) &&
                             (inFlight.empty() || inFlight == legAim.aim));
 
-                _travelAims.Claim(leaderName, legAim.aim);
+                _travelAims.Claim(leaderName, legAim.aim, false, true);
                 coord.legAim[leaderName] = legAim.aim;
 
                 // SAID EVERY TIME, AND AT WARN, BECAUSE A SILENT SELF-HEAL

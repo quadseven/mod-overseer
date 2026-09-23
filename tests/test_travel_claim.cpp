@@ -8,7 +8,8 @@
  * held its leader for a walk that never began. The follower's column was
  * empty: the bridge aims a learn errand only at a family leader, so there was
  * no trainer walk to protect. A catch-up aim over an empty column is now
- * written; every other claim keeps the #435 fence.
+ * written, and so is a dungeon run's (wow-overseer#227); every other claim
+ * keeps the #435 fence.
  *
  * THE RELEASE LINE. When the profession fence fired, the release line printed
  * the empty `travel_npc` column as "errand ''". It now names the fence that
@@ -93,18 +94,45 @@ void ACatchUpClaimAcrossTheThreeCases()
                TravelClaim::RefusedForeign);
 }
 
-// THE #435 FENCE IS UNCHANGED FOR EVERY OTHER CLAIM. A run's aim over a leader
-// with a profession errand is still refused, empty column or not.
-void ARunClaimKeepsTheProfessionFence()
+TravelClaimFacts RunFacts(uint32_t learnSkill, char const* column)
 {
-    CheckClaim("a run's aim with learn_skill set is refused",
+    TravelClaimFacts facts = Facts(learnSkill, column, false, false);
+    facts.dungeonRun = true;
+    return facts;
+}
+
+// THE #435 FENCE IS UNCHANGED FOR EVERY CLAIM THAT IS NEITHER A CATCH-UP NOR A
+// DUNGEON RUN'S. An ordinary aim over a character with a profession errand is
+// still refused, empty column or not.
+void AnOrdinaryClaimKeepsTheProfessionFence()
+{
+    CheckClaim("an ordinary aim with learn_skill set is refused",
                ReadTravelClaim(Facts(186, "", false, false)),
                TravelClaim::RefusedProfession);
-    CheckClaim("a run's aim with nothing set is written",
+    CheckClaim("an ordinary aim with nothing set is written",
                ReadTravelClaim(Facts(0, "", false, false)), TravelClaim::Write);
-    CheckClaim("a run's aim over a vendor errand is refused",
+    CheckClaim("an ordinary aim over a vendor errand is refused",
                ReadTravelClaim(Facts(0, "vendor", false, false)),
                TravelClaim::RefusedForeign);
+}
+
+// wow-overseer#227. The measured case: skill 186 pending on the Horde leader,
+// the column emptied so the campaign can stage. The staging claim was refused
+// and the coordinator moved on to GATHERING with no aim written.
+void ARunClaimOverAnEmptyColumnIsWritten()
+{
+    CheckClaim("a run's aim with learn_skill set over an empty column is written",
+               ReadTravelClaim(RunFacts(186, "")), TravelClaim::Write);
+    CheckClaim("a run's aim over a trainer walk is still refused",
+               ReadTravelClaim(RunFacts(186, "trainer")),
+               TravelClaim::RefusedProfession);
+    CheckClaim("a run's aim over the bridge's mailbox walk is still refused",
+               ReadTravelClaim(RunFacts(186, "at:1:-443.7,-2649.1,95.8")),
+               TravelClaim::RefusedProfession);
+    CheckClaim("a run's aim over a vendor errand is refused as foreign",
+               ReadTravelClaim(RunFacts(0, "vendor")), TravelClaim::RefusedForeign);
+    CheckClaim("a run's aim with nothing set is written",
+               ReadTravelClaim(RunFacts(0, "")), TravelClaim::Write);
 }
 
 // AN AIM THE BOOK ALREADY WROTE IS REPLACED. A catch-up re-aim and a run's
@@ -150,7 +178,8 @@ void TheReleaseLineNamesTheFence()
 int main()
 {
     ACatchUpClaimAcrossTheThreeCases();
-    ARunClaimKeepsTheProfessionFence();
+    AnOrdinaryClaimKeepsTheProfessionFence();
+    ARunClaimOverAnEmptyColumnIsWritten();
     TheBooksOwnAimIsReplaced();
     TheReleaseLineNamesTheFence();
 

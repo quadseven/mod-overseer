@@ -2898,6 +2898,16 @@ LandedErrand LandedErrandStep(std::string const& landedAim,
 // not this decision's to touch: the catch-up aim is released as it is today,
 // by blanking `travel_npc` only.
 //
+// A DUNGEON RUN'S AIM OVER AN EMPTY COLUMN IS WRITTEN THE SAME WAY
+// (wow-overseer#227). The coordinator stages only once the leader's column is
+// empty, and the bridge now holds its learn trips while a campaign stages, so
+// an empty column with `learn_skill` pending is a trainer walk nobody will
+// start until the campaign lets go. Refusing the run there stranded the
+// campaign: measured on wow-dev 2026-09-23 with skill 186 pending on the Horde
+// leader, the staging claim would be refused and its caller moves on to
+// GATHERING regardless. `learn_skill` is left alone, and the run's own release
+// blanks only the column, so the learn is walked after the campaign.
+//
 // AN AIM THIS BOOK ALREADY WROTE IS NOBODY ELSE'S. A catch-up re-aim, or a
 // run's next leg, replaces the book's own previous aim; the foreign fence
 // exists for aims the book did not issue, which is what its own log line says.
@@ -2918,6 +2928,8 @@ struct TravelClaimFacts
     bool columnIsOurs{false};
     // The aim is a follower's catch-up walk to its leader.
     bool catchUp{false};
+    // The aim is the dungeon run coordinator's own (wow-overseer#227).
+    bool dungeonRun{false};
 };
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts);
