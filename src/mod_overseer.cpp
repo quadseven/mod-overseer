@@ -242,6 +242,7 @@
 #include "BankPackets.h"
 #include "DBCStores.h"
 #include "DBCStructure.h"
+#include "AiFactory.h"
 #include "PlayerbotFactory.h"
 #include "Playerbots.h"
 #include "ReputationMgr.h"
@@ -341,6 +342,10 @@ constexpr uint32 PARTY_POLL_MS = 30000;
 // is lost by a character carrying a new level for a minute before it knows what
 // that level taught it.
 constexpr uint32 TRAIN_POLL_MS = 60000;
+// How many travel polls a character sent for a talent reset may stand by its
+// trainer outside the interact gate before the walk is called a miss (#626).
+// The walk closes the last few yards in one or two polls when it can at all.
+constexpr uint32 RESPEC_REACH_TRIES = 8;
 
 // How often the traveller is pointed at a quest. Faster than training because
 // it is one indexed SELECT and a quest-log walk, and because a character that
@@ -5730,6 +5735,10 @@ public:
         {
             _trainTimer = 0;
             TrainRoster();
+            // After the trainer, so a reset bought since the last poll has had
+            // its points spent before the strategies are asked about (#626).
+            KeepTankStrategies();
+            DriveRespec();
         }
         if (_questTimer >= QUEST_POLL_MS)
         {
@@ -11082,6 +11091,19 @@ private:
     // which nearer spawns were passed over, or why nothing was chosen. It is
     // an out-parameter rather than a return value so the two existing call
     // sites that do not want it are unchanged.
+    // Is creature `entry` a class trainer for this character's own class? The
+    // trainer table's own answer, read through the same ObjectMgr lookup
+    // TrainOnArrival uses (#626).
+    static bool TrainerServesClassOf(uint32 entry, Player* bot)
+    {
+        Trainer::Trainer const* trainer = sObjectMgr->GetTrainer(entry);
+        if (!trainer || !bot)
+            return false;
+        return OverseerDecisions::ClassTrainerServes(
+            trainer->GetTrainerType() == Trainer::Type::Class,
+            trainer->GetTrainerRequirement(), bot->getClass());
+    }
+
     bool ResolveTravelTarget(Player* bot, std::string const& target,
                              uint32& outEntry, WorldPosition& outPos,
                              uint32 wantSkill = 0, std::string* outSaid = nullptr)
@@ -11290,6 +11312,15 @@ private:
             wantSkill && !wantedEntry &&
             (wantedFlag & (UNIT_NPC_FLAG_TRAINER | UNIT_NPC_FLAG_TRAINER_PROFESSION));
 
+        // A CLASS TRAINER IS NARROWED TO THE CHARACTER'S OWN CLASS (#626).
+        // UNIT_NPC_FLAG_TRAINER_CLASS is carried by every class's trainers
+        // alike, so the nearest one to a warrior in Orgrimmar can be a mage
+        // trainer, and nothing a class errand wants - spells, a talent reset -
+        // is sold there. Creature::CanResetTalents asks exactly this question
+        // of the trainer, so the walk ends where the reset can be bought.
+        bool const narrowToClass =
+            !wantedEntry && wantedFlag == UNIT_NPC_FLAG_TRAINER_CLASS;
+
         uint32 const mapId = bot->GetMapId();
 
         // ONE ANSWER PER FACTION, NOT PER SPAWN. A town's shops share a
@@ -11319,6 +11350,8 @@ private:
             else if (!(spawn.npcFlags & wantedFlag))
                 continue;
             if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
+                continue;
+            if (narrowToClass && !TrainerServesClassOf(spawn.entry, bot))
                 continue;
 
             auto known = mayDealWith.find(spawn.faction);
@@ -14119,6 +14152,145 @@ private:
     }
 
     // One character's bags, against one character's worn gear.
+    // A TANK HOLDING A TWO-HANDER TRADES IT FOR A ONE-HANDER AND A SHIELD
+    // (#626). The sweep below refuses a shield while both hands are full, on
+    // purpose, and scores a one-hander against the two-hander alone, so a tank
+    // who picked up a two-hander before the roster made him a tank keeps it for
+    // ever with the pair he should be holding in his bags. Measured on the dev
+    // realm: the Horde head held a two-hand mace with a one-hand sword and two
+    // bucklers carried. This is the comparison the sweep's own comment says it
+    // does not hold: the best one-hander and the best shield carried, scored as
+    // a pair against the two-hander, with the same margin every swap uses.
+    //
+    // BOTH HALVES GO ON IN ONE STEP. With the one-hander on and the shield
+    // still in the bags, the next sweep would price the two-hander against a
+    // one-hander and an empty off hand, and could put it straight back.
+    // Returns true when anything moved, so the rest of the sweep waits a poll
+    // and reads the hands as they now are.
+    bool TradeTwoHanderForShield(Player* bot, OverseerDecisions::GearWearer const& who)
+    {
+        Item* const held = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        ItemTemplate const* heldProto = held ? held->GetTemplate() : nullptr;
+        bool const twoHander = heldProto && heldProto->InventoryType == INVTYPE_2HWEAPON;
+        if (!OverseerDecisions::GearTankWeighsShieldPair(who.role, twoHander))
+            return false;
+
+        Item* oneHand = nullptr;
+        Item* shield = nullptr;
+        OverseerDecisions::GearVerdict oneHandVerdict;
+        OverseerDecisions::GearVerdict shieldVerdict;
+        for (Item* item : GearCarried(bot))
+        {
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!proto)
+                continue;
+            bool const isShield = proto->Class == ITEM_CLASS_ARMOR &&
+                                  proto->SubClass == ITEM_SUBCLASS_ARMOR_SHIELD;
+            bool const isOneHand = proto->Class == ITEM_CLASS_WEAPON &&
+                                   (proto->InventoryType == INVTYPE_WEAPON ||
+                                    proto->InventoryType == INVTYPE_WEAPONMAINHAND);
+            if (!isShield && !isOneHand)
+                continue;
+            OverseerDecisions::GearVerdict const verdict =
+                GearScoreFor(bot, who, proto, GearRandomPropertyOf(item));
+            if (!verdict.wearable)
+                continue;
+            if (isShield && (!shield || verdict.score > shieldVerdict.score))
+            {
+                shield = item;
+                shieldVerdict = verdict;
+            }
+            if (isOneHand && (!oneHand || verdict.score > oneHandVerdict.score))
+            {
+                oneHand = item;
+                oneHandVerdict = verdict;
+            }
+        }
+        if (!oneHand || !shield)
+            return false;
+
+        OverseerDecisions::GearVerdict const pair =
+            OverseerDecisions::GearShieldPair(oneHandVerdict, shieldVerdict);
+        OverseerDecisions::GearIncumbentScore const worn =
+            GearWornIncumbent(bot, who, EQUIPMENT_SLOT_MAINHAND);
+        OverseerDecisions::GearComparison const verdict = OverseerDecisions::GearCompare(pair, worn);
+        if (verdict == OverseerDecisions::GearComparison::NotBetter)
+            return false;
+        if (verdict == OverseerDecisions::GearComparison::Undecided)
+        {
+            if (SayGearOnce(who.name, oneHand->GetEntry()))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is a tank holding {} in both hands, and whether {} "
+                         "and {} beat it cannot be settled from the numbers - {} - so the "
+                         "two-hander stays",
+                         who.name, heldProto->Name1, oneHand->GetTemplate()->Name1,
+                         shield->GetTemplate()->Name1, pair.why);
+            return false;
+        }
+
+        // The same memory every other swap keeps, so a writer that puts the
+        // two-hander back is noticed and stood down from, not fought.
+        std::string const slotKey =
+            who.name + "/" + std::to_string(static_cast<uint32>(EQUIPMENT_SLOT_MAINHAND));
+        OverseerDecisions::GearSwapIntent const intent = OverseerDecisions::GearIntend(
+            _gearSlotMemory[slotKey], oneHand->GetEntry(),
+            GearWornEntry(bot, EQUIPMENT_SLOT_MAINHAND), true);
+        _gearSlotMemory[slotKey] = intent.memory;
+        if (intent.standDown)
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' has had {} put back in both hands {} times over a "
+                      "one-hander and a shield, so something else is equipping this "
+                      "character and the overseer is standing down on the main hand",
+                      who.name, heldProto->Name1, OverseerDecisions::GEAR_REVERSALS_ALLOWED);
+            return false;
+        }
+        if (!intent.swap)
+            return false;
+
+        std::string const twoHanderName = heldProto->Name1;
+        std::string const oneHandName = oneHand->GetTemplate()->Name1;
+        std::string const shieldName = shield->GetTemplate()->Name1;
+        uint32 const oneHandEntry = oneHand->GetEntry();
+        uint32 const shieldEntry = shield->GetEntry();
+
+        uint16 const oneHandSrc = static_cast<uint16>(
+            (static_cast<uint16>(oneHand->GetBagSlot()) << 8) | oneHand->GetSlot());
+        bot->SwapItem(oneHandSrc, static_cast<uint16>(
+            (static_cast<uint16>(INVENTORY_SLOT_BAG_0) << 8) | EQUIPMENT_SLOT_MAINHAND));
+        if (GearWornEntry(bot, EQUIPMENT_SLOT_MAINHAND) != oneHandEntry)
+        {
+            if (SayGearOnce(who.name, oneHandEntry))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is a tank and should trade {} for {} and {} - {} "
+                         "against {:.0f} - and the server refused the one-hander, so the "
+                         "two-hander stays",
+                         who.name, twoHanderName, oneHandName, shieldName, pair.why, worn.score);
+            return false;
+        }
+
+        // READ THE SHIELD'S PLACE AGAIN. The swap above moved the two-hander into
+        // the bag slot the one-hander left, and touched nothing else, so the
+        // shield is where it was; asking is cheaper than being wrong.
+        Item* const stillShield = bot->GetItemByGuid(shield->GetGUID());
+        if (stillShield)
+        {
+            uint16 const shieldSrc = static_cast<uint16>(
+                (static_cast<uint16>(stillShield->GetBagSlot()) << 8) | stillShield->GetSlot());
+            bot->SwapItem(shieldSrc, static_cast<uint16>(
+                (static_cast<uint16>(INVENTORY_SLOT_BAG_0) << 8) | EQUIPMENT_SLOT_OFFHAND));
+        }
+        bool const shieldOn = GearWornEntry(bot, EQUIPMENT_SLOT_OFFHAND) == shieldEntry;
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is a tank and trades {} for {} and {} - {} against {:.0f} "
+                 "for the two-hander{}",
+                 who.name, twoHanderName, oneHandName, shieldName, pair.why, worn.score,
+                 shieldOn ? "" : ", and the server refused the shield, so the off hand is "
+                                 "empty until the next sweep");
+        return true;
+    }
+
     void SweepGear(Player* bot, OverseerDecisions::GearWearer const& who)
     {
         // A character rummaging through its bags mid-fight is not a character
@@ -14126,6 +14298,9 @@ private:
         // weapon swap in combat anyway (CanUnequipItem). Dead is the same
         // answer for a plainer reason: SwapItem's first test is IsAlive.
         if (!bot->IsAlive() || bot->IsInCombat())
+            return;
+
+        if (TradeTwoHanderForShield(bot, who))
             return;
 
         for (Item* item : GearCarried(bot))
@@ -20084,6 +20259,25 @@ private:
                 // release. Folded in here, an arrival with nothing to do with
                 // training simply never calls TrainOnArrival and goes on to do
                 // whatever the errand WAS about.
+                // A TALENT RESET IS BOUGHT WHERE IT WAS WALKED FOR (#626), and it
+                // is asked BEFORE the learn branch below on purpose: a class
+                // trainer is a trainer, so a learn plan standing on the same
+                // character would otherwise run TrainOnArrival here, find no
+                // trade for sale, and drop the character's profession errand.
+                // Not released while the trainer is still outside the interact
+                // gate, so the walk below closes the last few yards.
+                else if (auto const respec = _respecErrands.find(name);
+                         respec != _respecErrands.end() &&
+                         target == OverseerDecisions::RESPEC_AIM)
+                {
+                    if (RespecOnArrival(name, bot, entry, respec->second))
+                    {
+                        _respecErrands.erase(name);
+                        _respecReachTries.erase(name);
+                        _travelAims.Release(name);
+                        continue;
+                    }
+                }
                 else if (plan &&
                          OverseerDecisions::ArrivalAnswersLearnAim(
                              AimNamesATrainer(target), creatureTrains) &&
@@ -32830,6 +33024,317 @@ private:
                 bot->LearnTalent(talent->TalentID, maxRank);
             }
         }
+    }
+
+    // ------------------------------------ the family's tank, made one (#626) --
+    //
+    // TrainRoster spends FREE points in the roster's tree and never takes one
+    // back, so a character whose points already sit in another tree stays there
+    // however `spec_tab` changes. The in-game way out is the one a player takes:
+    // walk to a trainer of your own class, pay, and confirm the reset. These
+    // three functions are that errand - deciding it, walking it, and buying it -
+    // and the strategy drive after them is what makes the result a tank to the
+    // playerbot as well as to the talent tree.
+
+    // Points in each of the three trees of the ACTIVE talent group, read the
+    // way the playerbot reads them (AiFactory::GetPlayerSpecTabs), so this
+    // module and the bot's own strategy choice cannot disagree about which tree
+    // a character is in.
+    static void TalentPointsByTree(Player* bot, uint32 (&points)[3])
+    {
+        std::map<uint8, uint32> const tabs = AiFactory::GetPlayerSpecTabs(bot);
+        for (uint8 tab = 0; tab < 3; ++tab)
+        {
+            auto const it = tabs.find(tab);
+            points[tab] = it == tabs.end() ? 0 : it->second;
+        }
+    }
+
+    // Decide, for every roster character, whether it should walk to a class
+    // trainer to buy a talent reset, and claim the walk when it should.
+    //
+    // THE PRICE IS THE CHARACTER'S OWN. Player::resetTalentsCost is what the
+    // core will take (one gold the first time, then five, ten, rising to fifty),
+    // and a character that cannot pay is not walked: the core's refusal goes to
+    // a client nobody reads. It is said once, with the numbers, so the purse is
+    // the thing somebody looks at.
+    void DriveRespec()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, spec_tab FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        time_t const now = std::time(nullptr);
+        bool const costWaived = sWorld->getBoolConfig(CONFIG_NO_RESET_TALENT_COST);
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            uint8 const specTab = fields[1].Get<uint8>();
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(bot))
+                continue;
+
+            std::string const column = TravelAimBook::CurrentTravelNpc(name);
+
+            // A WALK THIS DRIVE STARTED AND SOMETHING ELSE ENDED. The travel
+            // drive releases an errand on its own backstop, on a death, or on a
+            // spawn it cannot find, and none of those reach RespecOnArrival. A
+            // walk that is gone from the column without a reset is a miss, and
+            // the retry clock is what stops it being re-claimed every poll.
+            auto const walking = _respecErrands.find(name);
+            if (walking != _respecErrands.end() && column != OverseerDecisions::RESPEC_AIM)
+            {
+                _respecErrands.erase(walking);
+                _respecMissedAt[name] = now;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' was walking to a class trainer for a talent reset "
+                         "and the walk ended without one - trying again in {} minutes",
+                         name, OverseerDecisions::RESPEC_RETRY_SECONDS / 60);
+                continue;
+            }
+
+            OverseerDecisions::RespecFacts facts;
+            facts.specTab = specTab;
+            facts.level = bot->GetLevel();
+            TalentPointsByTree(bot, facts.pointsByTree);
+            facts.money = bot->GetMoney();
+            facts.cost = bot->resetTalentsCost();
+            facts.costWaived = costWaived;
+            facts.available = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
+                              bot->GetMap() && !bot->GetMap()->Instanceable();
+            facts.columnFree = column.empty() || column == OverseerDecisions::RESPEC_AIM;
+            auto const missed = _respecMissedAt.find(name);
+            if (missed != _respecMissedAt.end())
+                facts.sinceLastMiss = static_cast<uint32>(std::max<time_t>(0, now - missed->second));
+
+            OverseerDecisions::RespecStep const step = OverseerDecisions::JudgeRespec(facts);
+            uint32 const outside = OverseerDecisions::PointsOutsideTree(facts.pointsByTree, specTab);
+
+            if (step == OverseerDecisions::RespecStep::Walk)
+            {
+                if (walking != _respecErrands.end())
+                    continue;   // already on its way
+                if (!_travelAims.Claim(name, OverseerDecisions::RESPEC_AIM,
+                                       OverseerDecisions::TravelOwner::Respec))
+                    continue;   // Claim has said why, once
+                _respecErrands[name] = specTab;
+                _respecSaid.erase(name);
+                _respecReachTries.erase(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has {} talent point(s) outside tree {} and {} copper "
+                         "against a reset price of {} - sent to a class trainer of its own "
+                         "class to buy the reset",
+                         name, outside, static_cast<uint32>(specTab), facts.money,
+                         costWaived ? 0u : facts.cost);
+                continue;
+            }
+
+            // NOTHING TO WALK FOR ANY MORE, AND A WALK STILL STANDING. The talents
+            // were put right some other way, or the roster changed its mind.
+            if (walking != _respecErrands.end() &&
+                (step == OverseerDecisions::RespecStep::InTree ||
+                 step == OverseerDecisions::RespecStep::NoTree))
+            {
+                _respecErrands.erase(walking);
+                _travelAims.Release(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' no longer needs a talent reset ({}) - the walk to a "
+                         "class trainer is released", name,
+                         OverseerDecisions::RespecStepWord(step));
+                continue;
+            }
+
+            // SAID ONCE PER REASON. InTree and NoTree are the ordinary state of
+            // almost every character and are not worth a line at all.
+            if (step == OverseerDecisions::RespecStep::InTree ||
+                step == OverseerDecisions::RespecStep::NoTree ||
+                step == OverseerDecisions::RespecStep::TooLow)
+            {
+                _respecSaid.erase(name);
+                continue;
+            }
+            auto const said = _respecSaid.find(name);
+            if (said != _respecSaid.end() && said->second == step)
+                continue;
+            _respecSaid[name] = step;
+            if (step == OverseerDecisions::RespecStep::CannotAfford)
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has {} talent point(s) outside tree {} and cannot "
+                         "afford the reset - it holds {} copper and the trainer asks {}. Not "
+                         "sent until its own purse covers it",
+                         name, outside, static_cast<uint32>(specTab), facts.money, facts.cost);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has {} talent point(s) outside tree {} and is not sent "
+                         "for a reset yet - {}",
+                         name, outside, static_cast<uint32>(specTab),
+                         OverseerDecisions::RespecStepWord(step));
+        } while (result->NextRow());
+    }
+
+    // Buy the reset from the class trainer this character has just reached.
+    //
+    // THROUGH THE CLIENT'S OWN DOOR. A player clicks the trainer's "unlearn my
+    // talents" gossip, the client shows the price, and "yes" sends
+    // MSG_TALENT_WIPE_CONFIRM with the trainer's guid. The core's handler then
+    // asks whether this character can interact with that trainer, whether the
+    // trainer may reset it (CanResetTalents: level 10 and a trainer of its own
+    // class), takes the money inside Player::resetTalents, and casts the
+    // untalent visual. The packet is built here and handed to the same
+    // handler, the precedent being the areatrigger and the bank-slot purchase,
+    // so nothing about the price or the rules is this module's to get wrong.
+    //
+    // Returns true when the errand is over, reset or not, and false while the
+    // trainer is still outside the interact gate and the walk should close the
+    // last few yards.
+    bool RespecOnArrival(std::string const& name, Player* bot, uint32 entry, uint8 tree)
+    {
+        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+        if (!npc || !npc->IsAlive())
+        {
+            _respecMissedAt[name] = std::time(nullptr);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' reached the class trainer spawn it was sent to "
+                     "(creature {}) for a talent reset and nobody is standing there - "
+                     "trying again in {} minutes",
+                     name, entry, OverseerDecisions::RESPEC_RETRY_SECONDS / 60);
+            return true;
+        }
+
+        if (!bot->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
+        {
+            uint32& tries = _respecReachTries[name];
+            if (++tries < RESPEC_REACH_TRIES)
+                return false;
+            _respecMissedAt[name] = std::time(nullptr);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' stood by '{}' for {} polls and never came inside the "
+                     "interact gate the talent reset is judged by - giving up for {} minutes",
+                     name, npc->GetName(), RESPEC_REACH_TRIES,
+                     OverseerDecisions::RESPEC_RETRY_SECONDS / 60);
+            return true;
+        }
+
+        uint32 before[3] = {0, 0, 0};
+        TalentPointsByTree(bot, before);
+        uint32 const outsideBefore = OverseerDecisions::PointsOutsideTree(before, tree);
+        uint32 const freeBefore = bot->GetFreeTalentPoints();
+        uint32 const moneyBefore = bot->GetMoney();
+        uint32 const price = bot->resetTalentsCost();
+
+        WorldPacket packet(MSG_TALENT_WIPE_CONFIRM, 8);
+        packet << npc->GetGUID();
+        bot->GetSession()->HandleTalentWipeConfirmOpcode(packet);
+
+        // THE READ-BACK. The handler answers a client, and there is none: the
+        // character is the only witness to whether anything happened.
+        uint32 after[3] = {0, 0, 0};
+        TalentPointsByTree(bot, after);
+        uint32 const outsideAfter = OverseerDecisions::PointsOutsideTree(after, tree);
+        uint32 const freeAfter = bot->GetFreeTalentPoints();
+        uint32 const moneyAfter = bot->GetMoney();
+
+        if (!OverseerDecisions::RespecTook(outsideBefore, outsideAfter, freeBefore, freeAfter))
+        {
+            _respecMissedAt[name] = std::time(nullptr);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' asked '{}' (creature {}) for a talent reset and nothing "
+                     "changed - {} point(s) still outside tree {}, {} copper held against a "
+                     "price of {}. Trying again in {} minutes",
+                     name, npc->GetName(), entry, outsideAfter, static_cast<uint32>(tree),
+                     moneyAfter, price, OverseerDecisions::RESPEC_RETRY_SECONDS / 60);
+            return true;
+        }
+
+        _respecMissedAt.erase(name);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' BOUGHT A TALENT RESET from '{}' (creature {}) for {} copper "
+                 "- {} point(s) are free and the trainer drive spends them in tree {}",
+                 name, npc->GetName(), entry, moneyBefore - moneyAfter, freeAfter,
+                 static_cast<uint32>(tree));
+        RecordEvent(bot, "respec", entry, npc->GetName(),
+                    "bought a talent reset from a class trainer it walked to, to respend "
+                    "in tree " + std::to_string(static_cast<uint32>(tree)));
+        return true;
+    }
+
+    // Put the tank strategies on a character whose talents are in a tank tree.
+    //
+    // WHY THIS IS NEEDED AFTER A RESET. mod-playerbots chooses a bot's combat
+    // strategies from its talents when the bot is set up
+    // (AiFactory::AddDefaultCombatStrategies: a protection warrior gets `tank`,
+    // `tank assist`, `pull`, `pull back` and `aoe`), and nothing re-chooses
+    // them when the talents change under a running bot. So a warrior who was
+    // fury at login stays on `arms` or `fury` after he is protection, answers
+    // no to IsTank, and the dungeon module still elects nobody.
+    //
+    // ONLY `tank` AND `tank assist`. `tank` removes `arms` and `fury` as its
+    // siblings, and `tank assist` removes `dps assist` the same way, so the
+    // swap is whole. `pull` and `aoe` are left to the engagement drive, which
+    // takes them away from a character that is alone and unaimed; adding them
+    // here would be two drives arguing over one list.
+    void KeepTankStrategies()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, spec_tab FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            uint8 const specTab = fields[1].Get<uint8>();
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            uint32 points[3] = {0, 0, 0};
+            TalentPointsByTree(bot, points);
+
+            OverseerDecisions::TankStrategyFacts facts;
+            facts.rosterTreeTanks =
+                GearRoleFor(bot->getClass(), specTab) == OverseerDecisions::GearRole::Tank;
+            // 255 is "no tree chosen", and DominantTree also answers 255 for a
+            // character with no point spent, so the tree is asked to be a real
+            // one before the two are compared.
+            facts.talentsInTree =
+                specTab <= 2 && OverseerDecisions::DominantTree(points) == specTab;
+            facts.hasTank = StrategyPresent(botAI, StrategyItem{"tank", true});
+            facts.hasTankAssist = StrategyPresent(botAI, StrategyItem{"tank assist", true});
+
+            std::string const change = OverseerDecisions::TankStrategyChange(facts);
+            if (change.empty())
+                continue;
+
+            botAI->ChangeStrategy(change.c_str(), BOT_STATE_COMBAT);
+            bool const nowTank = StrategyPresent(botAI, StrategyItem{"tank", true}) &&
+                                 StrategyPresent(botAI, StrategyItem{"tank assist", true});
+            if (nowTank)
+            {
+                _tankStrategyRefused.erase(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' tanks by its talents (tree {}) and its combat engine "
+                         "lacked the tank strategies - '{}' added, so it answers IsTank and "
+                         "can lead a dungeon run",
+                         name, static_cast<uint32>(specTab), change);
+            }
+            else if (_tankStrategyRefused.insert(name).second)
+            {
+                // Said once: the drive asks again every poll, and a line a
+                // minute would bury the one that says why.
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' tanks by its talents (tree {}) and '{}' was handed "
+                         "to its combat engine and did not take - it still does not answer "
+                         "IsTank",
+                         name, static_cast<uint32>(specTab), change);
+            }
+        } while (result->NextRow());
     }
 
     // THIS REALM SAYS WHAT IT IS AND WHAT IT IS RUNNING (mod-overseer#184).
@@ -47618,6 +48123,16 @@ private:
     // style. Both drives reach the column through this and nothing else. World
     // thread only, like everything else on these loops.
     TravelAimBook _travelAims;
+    // The talent reset errand (#626). Who is walking to a class trainer for
+    // one, and the tree the reset is for; when the last walk ended without a
+    // reset; which reason not to walk was last said; and how many arrival polls
+    // a walker has stood outside the trainer's interact gate.
+    std::map<std::string, uint8> _respecErrands;
+    std::map<std::string, time_t> _respecMissedAt;
+    std::map<std::string, OverseerDecisions::RespecStep> _respecSaid;
+    std::map<std::string, uint32> _respecReachTries;
+    // Who has been told once that the tank strategies would not take.
+    std::set<std::string> _tankStrategyRefused;
 
     // The unlearn this module has already refused for each character, so a
     // standing disagreement about the price is said once rather than twice a
