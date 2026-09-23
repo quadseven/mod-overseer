@@ -1783,9 +1783,11 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     if (facts.columnIsOurs && !facts.column.empty())
         return TravelClaim::Write;
     // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
-    // over an empty column overwrites no trainer walk; any other claim, or a
-    // column that holds anything at all, keeps the #435 answer.
-    if (facts.learnSkill != 0 && !(facts.catchUp && facts.column.empty()))
+    // or a dungeon run's aim over an empty column overwrites no trainer walk
+    // (wow-overseer#227); any other claim, or a column that holds anything at
+    // all, keeps the #435 answer.
+    if (facts.learnSkill != 0 &&
+        !((facts.catchUp || facts.dungeonRun) && facts.column.empty()))
         return TravelClaim::RefusedProfession;
     if (IsForeignTravelAim(facts.column))
         return TravelClaim::RefusedForeign;
