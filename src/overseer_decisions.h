@@ -1707,6 +1707,34 @@ StagingPoint DungeonStagingPoint(float doorX, float doorY,
 // sentinel values to keep in step with a core.
 bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards);
 
+// WHICH HEIGHT THE STAGING POINT CARRIES, AND WHETHER IT MAY CARRY ANY (#582).
+//
+// The adapter probes the map for the ground at the staging point when it can,
+// and keeps the answer only if StagingGroundBelievable says it is on the
+// door's floor. When it cannot - the grid is not loaded, which is normal while
+// the leader is far away, or the probe found another surface - it used to fall
+// back to the way-back-out landing's own z WITHOUT ASKING THE SAME QUESTION OF
+// IT. That landing is usually a few yards from the door, and then the fallback
+// is fine. For Stratholme's main gate it is not: the only way out of map 329
+// lands at the service entrance 670 yards away, at z 108.45, and trigger 2216
+// stands at z 143.073. The staging point would have carried a z 34.6 yards
+// below the gate, which is the #121 defect this module's staging comments are
+// written around.
+//
+// So the fallback is put through the same test as the probe, against the same
+// door and the same tolerance, and a fallback that fails it is a REFUSAL
+// rather than a place: the caller says why and stages nobody. `probed` is
+// whether the map answered at all; `ground` is only read when it did.
+struct StagingHeight
+{
+    bool usable{false};
+    float z{0.f};
+    bool fromProbe{false};  // true: the map's own ground; false: the landing's z
+};
+
+StagingHeight DungeonStagingHeight(bool probed, float ground, float fallbackZ, float doorZ,
+                                   float toleranceYards);
+
 // THE CROSSING PREDICATES, KEPT FREE OF EVERY CORE TYPE FOR THE SAME REASON
 // THE BARRIER ONE IS. Nothing below touches Player, Map or PlayerbotAI, so
 // "when may the party be knocked through" can be exercised by a unit test

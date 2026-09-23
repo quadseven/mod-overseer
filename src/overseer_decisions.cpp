@@ -942,6 +942,28 @@ bool StagingGroundBelievable(float ground, float doorZ, float toleranceYards)
     return Magnitude(ground - doorZ) <= toleranceYards;
 }
 
+StagingHeight DungeonStagingHeight(bool probed, float ground, float fallbackZ, float doorZ,
+                                   float toleranceYards)
+{
+    StagingHeight out;
+    if (probed && StagingGroundBelievable(ground, doorZ, toleranceYards))
+    {
+        out.usable = true;
+        out.z = ground;
+        out.fromProbe = true;
+        return out;
+    }
+    // THE SAME TEST, ASKED OF THE FALLBACK. A NaN fails it the same way it
+    // fails the probe's, because Magnitude of a NaN compares false.
+    if (StagingGroundBelievable(fallbackZ, doorZ, toleranceYards))
+    {
+        out.usable = true;
+        out.z = fallbackZ;
+        return out;
+    }
+    return out;
+}
+
 ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits)
 {
     // NOT MEASURED, OR NOT A NUMBER, ARE THE SAME ANSWER. Both mean this poll

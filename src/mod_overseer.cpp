@@ -22388,6 +22388,14 @@ private:
         float homeX;
         float homeY;
         float homeZ;
+
+        // WHY THIS DOOR IS NOT OFFERED, OR NULL WHEN IT IS (#582). A row that
+        // is kept but withheld is still a door this module knows: a party found
+        // inside its map after a restart is still adopted and still walked out
+        // by it. What a withheld row does not do is open a new run. The reason
+        // is written beside the row, where the evidence for it is, and printed
+        // once when a job asks for it.
+        char const* withheld = nullptr;
     };
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
@@ -22863,11 +22871,24 @@ private:
             // yards), the same as the Stockade; and the box stands the party
             // off by its half-diagonal plus the gather circle, 22.11 yards.
             //
+            // THE STAGING HEIGHT (#582). The staging point's fallback z is the
+            // way-back-out landing's, 108.45, while this gate stands at
+            // 143.073. Since #582 that fallback is checked against the gate
+            // with the same 15 yard limit as the map's own answer, so while the
+            // grid at the staging point is not loaded this row is refused with
+            // a reason rather than staged 34.6 yards below the gate.
+            //
+            // AND THE WAY OUT LANDS IN A CLOSED YARD, which is why this row and
+            // the next are WITHHELD. See the next row for the measurement; it
+            // is the same yard for both, because both leave by 2221.
+            //
             // areatrigger.sql: (2216,0,3392.46,-3396.77,143.073,0,22.83,8.083,34.69,0)
             // areatrigger_teleport.sql: (2216,'Stratholme - Eastern Plaguelands Instance',329,3395.09,-3380.25,142.702,0.1)
             // areatrigger.sql: (2221,329,3584.78,-3632.05,142.118,10,9.778,17.94,27.92,0)
             // areatrigger_teleport.sql: (2221,'Stratholme - Eastern Plaguelands Instance (Inside)',0,3235.46,-4050.6,108.45,1.93522)
-            {"stratholme-live", 0, 2216, 329, 2221, 0.f, 0.f, 0.f},
+            {"stratholme-live", 0, 2216, 329, 2221, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             "its way out, areatrigger 2221, lands in a yard the navmesh closes "
+             "except through the locked Elders' Square Service Entrance (#582)"},
             // STRATHOLME, THE SERVICE ENTRANCE. 52 yards west of trigger 2214
             // stands the Elders' Square Service Entrance, gameobject 175369 at
             // (3185.48, -4039.1, 107.792), locked (flags 34, lock 879), and in
@@ -22876,11 +22897,43 @@ private:
             // not check for the key, the same as the Scarlet Key above. Door
             // minimum level 45; the entry is a 10 yard box.
             //
+            // THE EXIT YARD IS ENCLOSED, AND BOTH STRATHOLME ROWS ARE WITHHELD
+            // UNTIL A WAY OUT EXISTS (#582). Settled from the navmesh, not by
+            // eye: the extracted tiles the core's own pathfinder reads
+            // (mmaps/0002539.mmtile and 0002639.mmtile, map 0) were walked by
+            // polygon adjacency outward from the polygon under 2221's landing,
+            // (3235.46, -4050.6, 108.45). That polygon, this row's staging
+            // point and the part of trigger 2214 a character can stand in lie
+            // in one component of five polygons, x 3200 to 3241, y -4057 to
+            // -4032, and every edge of it is a wall but one. The one edge is
+            // at x 3200 and leads into the polygon that spans x 3180 to 3200
+            // across the gateway where gameobject 175369, the Elders' Square
+            // Service Entrance, stands at x 3185.48 - locked (flags 34, lock
+            // 879), closed (state 1), opened in practice by the Key to the City
+            // or by its button, gameobject 175432 at (3191.1, -4044.29), which
+            // no bot presses. With that gateway polygon treated as shut the
+            // walk out reaches nothing past the five; with it open, as the
+            // navmesh is built (it does not model doors), the same walk reaches
+            // 23472 polygons, the main gate among them. So the gateway is the
+            // only way out. The portcullis to the east, gameobject 175370 at
+            // (3271.52, -4064.31), is not on the yard's edge at all: no
+            // polygon of the yard links east of x 3241.
+            //
+            // WHAT THIS DOES NOT SAY. The navmesh cannot tell whether a closed
+            // door stops a bot's walk, and that has not been measured; a way
+            // out through a locked door is not one this module counts on. The
+            // rows are kept, not deleted: a party found inside map 329 after a
+            // restart is still adopted and walked to 2221, and a row comes off
+            // the withheld list once a way out exists (a button press, or a
+            // surveyed exit).
+            //
             // areatrigger.sql: (2214,0,3237.46,-4060.6,112.01,0,10,10,10,0)
             // areatrigger_teleport.sql: (2214,'Stratholme - Eastern Plaguelands Instance',329,3593.15,-3646.56,138.5,5.33)
             // areatrigger.sql: (2221,329,3584.78,-3632.05,142.118,10,9.778,17.94,27.92,0)
             // areatrigger_teleport.sql: (2221,'Stratholme - Eastern Plaguelands Instance (Inside)',0,3235.46,-4050.6,108.45,1.93522)
-            {"stratholme-undead", 0, 2214, 329, 2221, 0.f, 0.f, 0.f},
+            {"stratholme-undead", 0, 2214, 329, 2221, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             "its way out, areatrigger 2221, lands in a yard the navmesh closes "
+             "except through the locked Elders' Square Service Entrance (#582)"},
             // THE TEN BOX DOORS (#577). Each of these doors has a BOX trigger
             // (radius 0, with a length, width, height and orientation) on the way
             // out, and every one of their entries is a box too. They were held
@@ -23708,23 +23761,47 @@ private:
         // GetMap  Object.h:631  Map* GetMap() const
         Map* map = leader ? leader->GetMap() : nullptr;
         // IsGridLoaded  Map.h:213  bool IsGridLoaded(float x, float y) const
+        bool probed = false;
+        float ground = 0.f;
         if (map && map->GetId() == portal.outsideMapId && map->IsGridLoaded(outX, outY))
         {
             // GetHeight  Map.h  float GetHeight(float x, float y, float z, ...) const
-            float const ground =
-                map->GetHeight(outX, outY, door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS);
-            if (OverseerDecisions::StagingGroundBelievable(ground, door->z,
-                                                           DUNGEON_STAGING_Z_SANITY_YARDS))
-                outZ = ground;
-            else
-                LOG_WARN("module.overseer",
-                         "overseer: the map answers z={:.2f} at the '{}' staging point "
-                         "({:.2f}, {:.2f}) while areatrigger {} stands at z={:.2f} - that is "
-                         "another surface or no surface, so the way-back-out's own z={:.2f} "
-                         "is used instead",
-                         ground, portal.keyword, outX, outY, portal.entryTriggerId,
-                         door->z, back->target_Z);
+            ground = map->GetHeight(outX, outY, door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS);
+            probed = true;
         }
+
+        // THE FALLBACK IS ASKED THE PROBE'S QUESTION (#582). The way-back-out's
+        // own z used to be kept unchecked whenever the probe could not answer,
+        // and for Stratholme's main gate that z is the service entrance's, 34.6
+        // yards below the gate. Now a fallback further than
+        // DUNGEON_STAGING_Z_SANITY_YARDS from the door is a refusal, said and
+        // not staged. See OverseerDecisions::DungeonStagingHeight.
+        OverseerDecisions::StagingHeight const height = OverseerDecisions::DungeonStagingHeight(
+            probed, ground, back->target_Z, door->z, DUNGEON_STAGING_Z_SANITY_YARDS);
+        if (probed && !height.fromProbe)
+            LOG_WARN("module.overseer",
+                     "overseer: the map answers z={:.2f} at the '{}' staging point "
+                     "({:.2f}, {:.2f}) while areatrigger {} stands at z={:.2f} - that is "
+                     "another surface or no surface, so the way-back-out's own z={:.2f} "
+                     "is {}",
+                     ground, portal.keyword, outX, outY, portal.entryTriggerId, door->z,
+                     back->target_Z, height.usable ? "used instead" : "tried and refused too");
+        if (!height.usable)
+        {
+            why = "no believable ground at the staging point: the map " +
+                  std::string(probed ? "found another surface" : "grid there is not loaded") +
+                  ", and the way-back-out's own z of " + std::to_string(back->target_Z) +
+                  " is more than " +
+                  std::to_string(static_cast<int>(DUNGEON_STAGING_Z_SANITY_YARDS)) +
+                  " yards from areatrigger " + std::to_string(portal.entryTriggerId) +
+                  "'s z of " + std::to_string(door->z) +
+                  ", so the party would be staged on another floor";
+            outX = 0.f;
+            outY = 0.f;
+            outZ = 0.f;
+            return false;
+        }
+        outZ = height.z;
 
         // AND THE ANSWER IS PUT THROUGH THE TEST ITS CONSUMERS APPLY, so that
         // "this function returned true" and "this point may be walked to" are
@@ -24058,6 +24135,8 @@ private:
         bool loggedResetWaiting{false};
         bool loggedTravelConflict{false};
         bool loggedCampaignOver{false};
+        // Rations the line that says a job named a withheld door (#582).
+        bool loggedWithheld{false};
         // AND THE TWO LINES THE RESET'S EVACUATION SAYS ONCE (#351).
         // `loggedWalkingOut` rations the sentence that explains why anybody is
         // being walked out of an instance at all; `loggedNoWayOut` rations the
@@ -28759,6 +28838,23 @@ private:
             DungeonPortal const* portal = FindDungeonPortal(dungeonKeyword);
             if (!portal)
                 return;  // no known portal for this job yet - nothing to gather toward
+
+            // A DOOR THE TABLE KEEPS BUT DOES NOT OFFER (#582). Said once, not
+            // every five seconds, for the reason the campaign-over line below
+            // gives: `job` stays where it is until somebody changes it.
+            if (portal->withheld)
+            {
+                if (!coord.loggedWithheld)
+                {
+                    coord.loggedWithheld = true;
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has job '{}', and the '{}' door is withheld - "
+                             "{}. No run is started; choose another dungeon",
+                             leaderName, leaderJob, portal->keyword, portal->withheld);
+                }
+                return;
+            }
+            coord.loggedWithheld = false;
 
             // IS THIS FAMILY BOUND WHERE IT CAN RUN THIS DOOR (#348)?
             //
