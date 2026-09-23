@@ -478,7 +478,8 @@ bool ProvenStepIsWorthTaking(bool wholeBearingHeld, float provedYards,
 }
 
 FootingRefusalVerdict FootingRefused(FootingRefusalState& state, uint32_t mapId,
-                                     float x, float y, float episodeRadius,
+                                     float x, float y, float yardsToAim,
+                                     float episodeRadius, float progressYards,
                                      unsigned limit)
 {
     // SOMEWHERE ELSE IS A NEW EPISODE. A character that has moved is asking a
@@ -486,16 +487,23 @@ FootingRefusalVerdict FootingRefused(FootingRefusalState& state, uint32_t mapId,
     // one is not getting out of here" has to be about one place or it means
     // nothing. Same shape as TerrainRecoveryStep's own anchor, including the
     // zero radius that turns the distance test off.
+    //
+    // AND MOVING ONLY COUNTS WHEN IT GOT THE CHARACTER NEARER. Something else
+    // carrying it sideways or away at run speed leaves the radius every poll
+    // and would otherwise restart the count every poll, for ever.
+    bool const moved = episodeRadius > 0.f &&
+                       !WithinRadius(state.x, state.y, x, y, episodeRadius);
+    bool const nearer =
+        yardsToAim <= state.yardsToAim - (progressYards > 0.f ? progressYards : 0.f);
     bool const elsewhere =
-        !state.anchored || state.mapId != mapId ||
-        (episodeRadius > 0.f &&
-         !WithinRadius(state.x, state.y, x, y, episodeRadius));
+        !state.anchored || state.mapId != mapId || (moved && nearer);
     if (elsewhere)
     {
         state.anchored = true;
         state.mapId = mapId;
         state.x = x;
         state.y = y;
+        state.yardsToAim = yardsToAim;
         state.consecutive = 0;
     }
     ++state.consecutive;
@@ -8373,6 +8381,16 @@ TownStop TownTripMemberStop(TownStopFacts const& facts)
     // and the regroup wait (#404), not by an aim of this trip's own.
     if (!facts.isLeader && !facts.leaderAtTheCounter)
         return TownStop::Follow;
+    if (!facts.isLeader)
+    {
+        // The two refusals of the one walk this trip gives a follower. The
+        // stand-down first: a member its last walk killed is not walked again
+        // at any distance.
+        if (facts.stoodDown)
+            return TownStop::StoodDown;
+        if (!(facts.walkLimitYards > 0.f) || facts.yardsFromLeader > facts.walkLimitYards)
+            return TownStop::TooFar;
+    }
     return TownStop::Walk;
 }
 
@@ -8404,6 +8422,8 @@ char const* TownStopWord(TownStop stop)
         case TownStop::Trade:  return "trade";
         case TownStop::Walk:   return "walk";
         case TownStop::Follow: return "follow";
+        case TownStop::TooFar: return "too far";
+        case TownStop::StoodDown: return "stood down";
     }
     return "unknown";
 }
