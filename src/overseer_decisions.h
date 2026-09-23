@@ -4434,6 +4434,136 @@ SellRetry SellRefusalRetry(std::string const& detail);
 // string a row carries.
 char const* SellRetryWord(SellRetry retry);
 
+// ------------------------------- a quest item its holder is done with (#614) --
+//
+// WHY THE MODULE NOW ASKS. DoSell used to refuse every ITEM_CLASS_QUEST stack,
+// because the side that writes the row could not see which quest a sale was
+// about to break. That side now can (wow-overseer#241 releases a class-12
+// stack once no open quest wants it and no quest it starts is still ahead of
+// the holder), and measured on the dev realm 2026-09-23 a level-60 priest was
+// carrying 99 Un'Goro Soil, 65 Yellow Power Crystal and 88 Bloodpetal Sprout
+// with no free slot at all, for quests turned in long ago. The refusal was
+// the only thing left between those stacks and the vendor.
+//
+// THE WORLD IS ASKED, NOT THE ROW. The row carries no claim about quests, and
+// even if it did, the character database it was decided from is a save file
+// minutes behind the world. So the executor reads the holder's own quest
+// status out of the core and hands the facts here; this function is the whole
+// rule, and it is pure so the rule is tested rather than trusted.
+//
+// Two ways a stack is still needed, and either one keeps it:
+//
+//   ActiveQuest       a quest in the holder's quest status map that is not
+//                     NONE and not REWARDED (complete-not-turned-in and
+//                     failed-but-retryable both still need the item) names
+//                     this entry as a required item, a collected drop, or
+//                     the item it hands out at the start.
+//   AvailableStarter  the item starts a quest the core knows, and the holder
+//                     has not been rewarded for it, or could take it again
+//                     (a repeatable one). A starter for a quest that does not
+//                     exist starts nothing and holds nothing.
+struct QuestItemHolderFacts
+{
+    // Every item id the holder's open quests name (RequiredItemId, ItemDrop,
+    // StartItem). Zeros are ignored.
+    std::vector<uint32_t> activeQuestItems;
+    uint32_t startQuest{0};          // ItemTemplate::StartQuest; 0 starts nothing
+    bool startQuestExists{false};    // the core has a template for it
+    bool startQuestRewarded{false};  // Player::GetQuestRewardStatus
+    bool startQuestTakeable{false};  // Player::CanTakeQuest(quest, false)
+};
+
+enum class QuestItemHold
+{
+    Released,
+    ActiveQuest,
+    AvailableStarter,
+};
+
+QuestItemHold QuestItemStillNeeded(uint32_t entry, QuestItemHolderFacts const& facts);
+
+// The word the result JSON carries: "released", "active quest",
+// "available starter".
+char const* QuestItemHoldWord(QuestItemHold hold);
+
+// "item is a quest item" when a sale must be refused, "" when it may go on.
+// Only ITEM_CLASS_QUEST (12) is gated here; every other class sells as it
+// always has.
+char const* SellQuestRefusal(uint32_t itemClass, QuestItemHold hold);
+
+// --------------------------------------- destroy what nothing will buy (#614) --
+//
+// A released quest item with no sell price can never leave the bags by sale:
+// the core's sale refuses SellPrice 0, and nothing else in the queue removes
+// an item. This verb is the player's own answer, dragging the stack out of
+// the bag and confirming, through WorldSession::HandleDestroyItemOpcode.
+//
+// THE SAME `kind`, A SECOND GRAMMAR. The row is kind='sell' and its command
+// begins with the word `destroy`, routed the way `cast` routes a learn and
+// `mail` routes a walk: a new kind is an ENUM migration, which reaches a world
+// only when db-import runs.
+//
+//     destroy guid:<item_instance.guid> count:<n>[ allow:bound][ allow:quality]
+//
+// THE COUNT IS REQUIRED AND MUST BE THE WHOLE STACK. A destroy has no buyback
+// slot, so the row states what it saw and the world must agree: a stack that
+// has grown since the row was written ("stack is larger than asked") or
+// shrunk ("count exceeds stack") is refused rather than reconciled.
+//
+// WHAT IS REFUSED UNLESS THE ROW SAYS OTHERWISE. Soulbound gear (a weapon or
+// armour carrying the soulbound flag) without `allow:bound`, and anything
+// above Uncommon quality without `allow:quality`. Refused whatever the row
+// says: an equipped item, an item with a sell price (sell it), an item the
+// core flags as not user-destroyable, a non-empty bag, an item being looted,
+// and anything a quest still needs (QuestItemStillNeeded, for every class,
+// not only class 12).
+bool IsDestroyRow(std::string const& command);
+
+struct DestroySpec
+{
+    bool valid{false};
+    uint32_t guid{0};
+    uint32_t count{0};  // never 0 when valid
+    bool allowBound{false};
+    bool allowQuality{false};
+};
+
+DestroySpec ParseDestroySpec(std::string const& command);
+
+// The world's facts about the named item, as the executor read them.
+struct DestroyFacts
+{
+    uint32_t itemClass{0};
+    uint32_t quality{0};
+    uint32_t sellPrice{0};
+    uint32_t stack{0};
+    bool soulbound{false};
+    bool equipped{false};
+    bool nonEmptyBag{false};
+    bool noUserDestroy{false};
+    bool beingLooted{false};
+    QuestItemHold questHold{QuestItemHold::Released};
+};
+
+// The refusal literal, or "" when the destroy may go ahead.
+char const* DestroyRefusal(DestroySpec const& spec, DestroyFacts const& facts);
+
+namespace DestroyRefusalText
+{
+constexpr char const* Malformed =
+    "malformed destroy: want destroy guid:<item_instance.guid> count:<n>[ allow:bound][ allow:quality]";
+constexpr char const* Equipped      = "item is equipped";
+constexpr char const* Quest         = "item is a quest item";
+constexpr char const* HasPrice      = "item has a sell price";
+constexpr char const* NoDestroy     = "item cannot be destroyed";
+constexpr char const* BoundGear     = "item is soulbound gear";
+constexpr char const* AboveUncommon = "item is above uncommon quality";
+constexpr char const* CountExceeds  = "count exceeds stack";
+constexpr char const* StackLarger   = "stack is larger than asked";
+constexpr char const* NonEmptyBag   = "item is a non-empty bag";
+constexpr char const* BeingLooted   = "item is being looted";
+}  // namespace DestroyRefusalText
+
 // ---------------------------------------------------------- the bank row --
 //
 // WHAT A kind='bank' ROW MAY SAY, decided here so the executor in

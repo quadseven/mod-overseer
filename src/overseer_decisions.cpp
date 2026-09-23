@@ -3347,6 +3347,15 @@ SellRetry SellRefusalRetry(std::string const& detail)
         "item is a quest item",
         "item cannot be sold",
         "count exceeds stack",
+        // The destroy grammar's own walls (#614). Each is a fact about the
+        // item or the row, so the same row meets it everywhere.
+        DestroyRefusalText::Malformed,
+        DestroyRefusalText::Equipped,
+        DestroyRefusalText::HasPrice,
+        DestroyRefusalText::NoDestroy,
+        DestroyRefusalText::BoundGear,
+        DestroyRefusalText::AboveUncommon,
+        DestroyRefusalText::StackLarger,
     };
     static char const* const ELSEWHERE[] = {
         "vendor not in range",
@@ -3374,6 +3383,137 @@ char const* SellRetryWord(SellRetry retry)
             break;
     }
     return "later";
+}
+
+// ------------------------------- a quest item its holder is done with (#614) --
+
+QuestItemHold QuestItemStillNeeded(uint32_t entry, QuestItemHolderFacts const& facts)
+{
+    if (entry != 0)
+        for (uint32_t wanted : facts.activeQuestItems)
+            if (wanted == entry)
+                return QuestItemHold::ActiveQuest;
+    if (facts.startQuest != 0 && facts.startQuestExists &&
+        (!facts.startQuestRewarded || facts.startQuestTakeable))
+        return QuestItemHold::AvailableStarter;
+    return QuestItemHold::Released;
+}
+
+char const* QuestItemHoldWord(QuestItemHold hold)
+{
+    switch (hold)
+    {
+        case QuestItemHold::ActiveQuest:
+            return "active quest";
+        case QuestItemHold::AvailableStarter:
+            return "available starter";
+        case QuestItemHold::Released:
+            break;
+    }
+    return "released";
+}
+
+char const* SellQuestRefusal(uint32_t itemClass, QuestItemHold hold)
+{
+    // ITEM_CLASS_QUEST, ItemTemplate.h:303.
+    if (itemClass == 12 && hold != QuestItemHold::Released)
+        return "item is a quest item";
+    return "";
+}
+
+// --------------------------------------- destroy what nothing will buy (#614) --
+
+namespace
+{
+std::vector<std::string> DestroyWords(std::string const& command)
+{
+    std::vector<std::string> words;
+    std::string::size_type start = 0;
+    while (start <= command.size())
+    {
+        std::string::size_type const space = command.find(' ', start);
+        std::string const word =
+            command.substr(start, space == std::string::npos ? std::string::npos : space - start);
+        if (!word.empty())
+            words.push_back(word);
+        if (space == std::string::npos)
+            break;
+        start = space + 1;
+    }
+    return words;
+}
+}  // namespace
+
+bool IsDestroyRow(std::string const& command)
+{
+    std::vector<std::string> const words = DestroyWords(command);
+    return !words.empty() && words[0] == "destroy";
+}
+
+DestroySpec ParseDestroySpec(std::string const& command)
+{
+    DestroySpec spec;
+    std::vector<std::string> const words = DestroyWords(command);
+    if (words.size() < 3 || words.size() > 5 || words[0] != "destroy")
+        return spec;
+
+    uint32_t guid = 0;
+    uint32_t count = 0;
+    if (!KeyedNumber(words[1], "guid", guid) || guid == 0)
+        return spec;
+    if (!KeyedNumber(words[2], "count", count) || count == 0)
+        return spec;
+
+    bool allowBound = false;
+    bool allowQuality = false;
+    for (size_t i = 3; i < words.size(); ++i)
+    {
+        if (words[i] == "allow:bound" && !allowBound)
+            allowBound = true;
+        else if (words[i] == "allow:quality" && !allowQuality)
+            allowQuality = true;
+        else
+            return spec;
+    }
+
+    spec.valid = true;
+    spec.guid = guid;
+    spec.count = count;
+    spec.allowBound = allowBound;
+    spec.allowQuality = allowQuality;
+    return spec;
+}
+
+char const* DestroyRefusal(DestroySpec const& spec, DestroyFacts const& facts)
+{
+    namespace R = DestroyRefusalText;
+    // ITEM_CLASS_WEAPON 2, ITEM_CLASS_ARMOR 4, ITEM_QUALITY_UNCOMMON 2
+    // (ItemTemplate.h). Spelled as numbers so this file stays core-free.
+    bool const gear = facts.itemClass == 2 || facts.itemClass == 4;
+
+    if (!spec.valid)
+        return R::Malformed;
+    if (facts.equipped)
+        return R::Equipped;
+    if (facts.questHold != QuestItemHold::Released)
+        return R::Quest;
+    if (facts.sellPrice > 0)
+        return R::HasPrice;
+    if (facts.noUserDestroy)
+        return R::NoDestroy;
+    if (gear && facts.soulbound && !spec.allowBound)
+        return R::BoundGear;
+    if (facts.quality > 2 && !spec.allowQuality)
+        return R::AboveUncommon;
+    if (spec.count > facts.stack)
+        return R::CountExceeds;
+    if (facts.stack > spec.count)
+        return R::StackLarger;
+    if (facts.nonEmptyBag)
+        return R::NonEmptyBag;
+    if (facts.beingLooted)
+        return R::BeingLooted;
+    return "";
 }
 
 // ---------------------------------------------------------- the bank row --
