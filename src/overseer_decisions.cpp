@@ -3389,10 +3389,13 @@ char const* SellRetryWord(SellRetry retry)
 
 QuestItemHold QuestItemStillNeeded(uint32_t entry, QuestItemHolderFacts const& facts)
 {
-    if (entry != 0)
-        for (uint32_t wanted : facts.activeQuestItems)
-            if (wanted == entry)
-                return QuestItemHold::ActiveQuest;
+    // No zero guard here: the rule answers for whatever entry it is given,
+    // and QuestItemFactsFor is what keeps empty objective slots (0) out of
+    // the list. A zero that leaked in still holds a zero entry, which is the
+    // fail-closed direction.
+    for (uint32_t wanted : facts.activeQuestItems)
+        if (wanted == entry)
+            return QuestItemHold::ActiveQuest;
     if (facts.startQuest != 0 && facts.startQuestExists &&
         (!facts.startQuestRewarded || facts.startQuestTakeable))
         return QuestItemHold::AvailableStarter;

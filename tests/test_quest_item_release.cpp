@@ -87,12 +87,15 @@ void AnOpenQuestThatNamesItKeepsIt()
     CheckWord("word", QuestItemHoldWord(QuestItemHold::ActiveQuest), "active quest");
 }
 
-void AZeroInTheQuestListMatchesNothing()
+void AnEmptySlotInTheQuestListHoldsNoRealItem()
 {
     QuestItemHolderFacts facts;
     facts.activeQuestItems = {0};
-    Check("entry 0 is not held by an empty objective",
-          QuestItemStillNeeded(0, facts) == QuestItemHold::Released, true);
+    Check("a real entry is not held by an empty objective",
+          QuestItemStillNeeded(SOIL, facts) == QuestItemHold::Released, true);
+    // The rule has no zero guard of its own; a leaked zero fails closed.
+    Check("a zero entry against a leaked zero is held",
+          QuestItemStillNeeded(0, facts) == QuestItemHold::ActiveQuest, true);
 }
 
 void AStarterForAQuestNotYetDoneIsKept()
@@ -303,7 +306,7 @@ int main()
 {
     ALeftoverFromAFinishedQuestIsReleased();
     AnOpenQuestThatNamesItKeepsIt();
-    AZeroInTheQuestListMatchesNothing();
+    AnEmptySlotInTheQuestListHoldsNoRealItem();
     AStarterForAQuestNotYetDoneIsKept();
     AStarterForADoneQuestIsReleased();
     AStarterForARepeatableQuestStillOnOfferIsKept();
