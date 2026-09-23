@@ -1977,6 +1977,31 @@ constexpr OverseerDecisions::RatchetLimits REGROUP_RATCHET = TRAVEL_RATCHET;
 // wait for it again.
 constexpr time_t REGROUP_STANDDOWN_SECONDS = CATCH_UP_STANDDOWN_SECONDS;
 
+// THE LEADER GOES BACK FOR A MEMBER TOO FAR TO WALK (2026-09-23), AND THESE ARE
+// ITS BOUNDS. None of the numbers is new. See OverseerDecisions::PickFetchTarget
+// and ReadFetch for the rule.
+//
+// THE CEILING IS THE WALK'S OWN BACKSTOP. TRAVEL_BACKSTOP_SECONDS is how long
+// the travel drive lets one errand go before calling it unreachable, and a
+// fetch is one errand, so a fetch that outlived it would be the leader walking
+// under an aim the drive had already given up on. Twenty minutes at a running
+// pace is over 8,000 yards, more than any gap on one continent that a flight
+// does not shorten.
+constexpr time_t FETCH_CEILING_SECONDS = TRAVEL_BACKSTOP_SECONDS;
+
+// ...AND ONE FETCH PER MEMBER PER STAND-DOWN, however it ended. The regroup's
+// fifteen minutes, read from it: "this member has had the family's attention,
+// leave it for a while" is the question REGROUP_STANDDOWN_SECONDS already
+// answers. It is what stops the leader going back and forth between two
+// members, and it is shorter than nothing that could strand one for good: the
+// member's own hold asks the flight again on the same clock.
+constexpr time_t FETCH_STANDDOWN_SECONDS = REGROUP_STANDDOWN_SECONDS;
+
+// The foot limit the hold lifts on, the line past which a member that is NOT
+// held is still walking back, and the ceiling above.
+constexpr OverseerDecisions::FetchLimits FETCH_LIMITS{
+    CATCH_UP_FOOT_LIMIT_YARDS, FOLLOW_CATCH_UP_YARDS, FETCH_CEILING_SECONDS};
+
 // Upstream's own fuse on MoveFarTo's stuck teleport: `stuckTime`, 90 seconds
 // (NewRpgBaseAction.h:76). Named here so the log line that reports the
 // teleport being kept out of reach can say what it was kept from, and so a
@@ -6191,6 +6216,10 @@ private:
         // a leader stands still in a field waiting for a family that is gone.
         SweepRegroupWait();
 
+        // ...AND THE LEADER'S FETCH, after SweepCatchUps so the escort it rides
+        // is ended once, by whichever sweep reaches it first. See DriveFetch.
+        SweepFetches();
+
         // AND THE FOURTH OWNER'S, ON THE SAME STATEMENT AND FOR A DIFFERENT
         // REASON (#393). The three sweeps above and beside it end a lease the
         // poll after its own drive stops marking it. This one has no drive
@@ -8870,6 +8899,11 @@ private:
         // because it needs every member's gap and not one at a time, and it is
         // the last statement in this function because the hold it may place is
         // read by the grants above on the NEXT poll rather than on this one.
+        //
+        // AND BEFORE IT, THE LEADER GOING BACK FOR A MEMBER TOO FAR TO WALK
+        // (2026-09-23), so the regroup reads this poll's fetch rather than the
+        // last one's. See DriveFetch.
+        DriveFetch(group, leader, present);
         KeepTheFamilyTogether(group, leader, present);
     }
 
@@ -12753,10 +12787,14 @@ private:
         // non-empty column read as "walking somewhere of its own" exempted every
         // one of them, so the planner saw a party of one. See
         // OverseerDecisions::MemberFollowsForFlight.
+        //
+        // AND NOT THE MEMBER THIS LEADER IS GOING BACK FOR (2026-09-23): he is
+        // flying to it, and it is held because it cannot reach a flight master.
         seat.read.followingTheLeader = OverseerDecisions::MemberFollowsForFlight(
             _travelAims.TargetFor(seat.read.name).empty(), IsCatchingUp(seat.read.name),
             _travelAims.InertFollowerAim(seat.read.name),
-            HeldWaitingForLeader(seat.read.name));
+            HeldWaitingForLeader(seat.read.name),
+            FetchTargetOf(leader->GetName()) == seat.read.name);
 
         if (!seat.read.onSameMap || !seat.read.alive || seat.read.inFlight ||
             seat.read.atArrival || !seat.read.followingTheLeader)
@@ -17715,6 +17753,9 @@ private:
             auto const refused = _catchUpRefused.find(member.name);
             if (refused != _catchUpRefused.end())
                 member.aimRefusedBecause = refused->second;
+            // THE LEADER IS GOING BACK FOR IT (2026-09-23). DriveFetch ran
+            // earlier in this poll, so this is this poll's answer.
+            member.beingFetched = member.name == FetchTargetOf(leaderName);
             members.push_back(member);
         }
 
@@ -17751,6 +17792,9 @@ private:
                                   ? "nobody still behind is walking back under a "
                                     "catch-up aim - see the line naming who the "
                                     "family carries on without"
+                              : verdict.fetched
+                                  ? "the leader is going back for the member still "
+                                    "behind, so he walks rather than waits"
                                   : "everybody is back within " +
                                         std::to_string(static_cast<uint32>(
                                             REGROUP_LIMITS.rejoinYards)) +
@@ -17840,6 +17884,299 @@ private:
                  leaderName, leaderName,
                  static_cast<uint32>(REGROUP_LIMITS.rejoinYards),
                  static_cast<uint32>(REGROUP_HOLD_CEILING_SECONDS / 60));
+    }
+
+    // ---- THE LEADER GOES BACK FOR A MEMBER TOO FAR TO WALK (2026-09-23) ----
+    //
+    // THE OTHER HALF OF THE TOO-FAR-TO-WALK HOLD. That hold stands a follower
+    // still until its leader is back within CATCH_UP_FOOT_LIMIT_YARDS, and the
+    // regroup above then carried on without it, because a held member is a walk
+    // that is not happening. Each waited for the other and nothing closed the
+    // gap: measured on the dev realm, followers 1,000 to 2,000 yards back in the
+    // Barrens while the leader walked on to Orgrimmar, and Ragefire runs closed
+    // at BARRIER naming members 1,900 yards out.
+    //
+    // SO THE LEADER WALKS BACK. His aim is the held member's live position,
+    // written through CatchUpToward, which is the one function that builds an aim
+    // out of a live position and measures the ground under it first; the travel
+    // drive walks him, or flies him and the family with him (#611), exactly as it
+    // walks any other catch-up. The hold lifts on its own line when he comes
+    // within range, the member's own catch-up walk and the regroup wait take it
+    // from there, and this ends. See OverseerDecisions::PickFetchTarget,
+    // ReadFetch and RunLetsTheLeaderFetch for the rule and its bounds.
+    //
+    // WORLD THREAD ONLY, and lost on a restart, which costs one restarted clock:
+    // the escort it rides is lost with it.
+    struct Fetch
+    {
+        std::string target;
+        time_t since{0};
+        // The leader's catch-up escort is aimed at the member. False while
+        // another owner's walk still has him (BARRIER's escort until the run
+        // lets go of it, or a home errand).
+        bool aimed{false};
+        // The fence that refused the aim, when one did. See ReadFetch.
+        std::string refusal;
+        // Marked by DriveFetch and swept by SweepFetches, the shape every other
+        // lease on the party clock has.
+        bool wanted{false};
+    };
+    std::map<std::string, Fetch> _fetches;              // leader -> the fetch
+    std::map<std::string, time_t> _fetchStandDown;      // member -> when its last fetch ended
+
+    bool LeaderIsFetching(std::string const& leaderName) const
+    {
+        return _fetches.find(leaderName) != _fetches.end();
+    }
+
+    // Who this leader is going back for, or empty.
+    std::string FetchTargetOf(std::string const& leaderName) const
+    {
+        auto const it = _fetches.find(leaderName);
+        return it == _fetches.end() ? std::string() : it->second.target;
+    }
+
+    bool WithinFetchStandDown(std::string const& name)
+    {
+        auto const it = _fetchStandDown.find(name);
+        if (it == _fetchStandDown.end())
+            return false;
+        if (std::time(nullptr) - it->second < FETCH_STANDDOWN_SECONDS)
+            return true;
+        _fetchStandDown.erase(it);
+        return false;
+    }
+
+    // WHERE THE LEADER'S OWN RUN STANDS, in the words the fetch rule reads.
+    // The coordinator is keyed by family, so the family is asked for; a leader
+    // with no coordinator, or an idle one, has no run.
+    OverseerDecisions::FetchRunPhase FetchRunPhaseFor(std::string const& leaderName)
+    {
+        auto const coord = _dungeonRunCoordinators.find(FamilyOfCharacter(leaderName));
+        if (coord == _dungeonRunCoordinators.end())
+            return OverseerDecisions::FetchRunPhase::NoRun;
+        return FetchRunPhaseOf(coord->second.phase);
+    }
+
+    // THE ONE TERMINAL PATH, for the reason EndTheRegroupWait is one. The
+    // leader's catch-up escort is ended here and only here, so what it stood
+    // down is handed back whichever way the fetch ended; and the member stands
+    // down whichever way it ended, which is the bound that stops the leader
+    // going back and forth.
+    void EndFetch(std::string const& leaderName, std::string const& why)
+    {
+        auto const it = _fetches.find(leaderName);
+        if (it == _fetches.end())
+            return;
+        std::string const target = it->second.target;
+        _fetches.erase(it);
+        _fetchStandDown[target] = std::time(nullptr);
+        auto const walk = _dungeonEscorts.find(leaderName);
+        if (walk != _dungeonEscorts.end() && walk->second.catchUp)
+        {
+            EndOneEscort(leaderName, walk->second.granted);
+            _dungeonEscorts.erase(walk);
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' stops going back for '{}' - {}. '{}' is not gone back "
+                 "for again for {} minutes",
+                 leaderName, target, why, target,
+                 static_cast<uint32>(FETCH_STANDDOWN_SECONDS / 60));
+    }
+
+    // Ends a fetch the party poll stopped marking: the family dissolved, the
+    // leader logged out, or leadership moved. On the same first statement as
+    // SweepCatchUps, and after it, so an escort that sweep already ended is
+    // simply not there to end twice.
+    void SweepFetches()
+    {
+        std::vector<std::string> stale;
+        for (auto& entry : _fetches)
+        {
+            if (entry.second.wanted)
+                entry.second.wanted = false;
+            else
+                stale.push_back(entry.first);
+        }
+        for (std::string const& leaderName : stale)
+            EndFetch(leaderName, "nothing marked it this poll, so the family it was for is "
+                                 "gone or has a new leader");
+    }
+
+    // AIM THE LEADER AT THE MEMBER, or leave the fetch unaimed and say why.
+    void AimFetch(Fetch& fetch, std::string const& leaderName, Player* target)
+    {
+        auto const walk = _dungeonEscorts.find(leaderName);
+        if (walk != _dungeonEscorts.end() && !walk->second.catchUp)
+            return;  // another owner's walk still has him; asked again next poll
+        _catchUpRefused.erase(leaderName);
+        CatchUpToward(leaderName, target);
+        auto const aimed = _dungeonEscorts.find(leaderName);
+        if (aimed != _dungeonEscorts.end() && aimed->second.catchUp)
+        {
+            fetch.aimed = true;
+            aimed->second.wanted = true;
+            return;
+        }
+        auto const refused = _catchUpRefused.find(leaderName);
+        if (refused != _catchUpRefused.end())
+            fetch.refusal = refused->second;
+    }
+
+    // ONE POLL OF THE FETCH, for one family. Called by KeepRosterFollowing after
+    // every member's DriveCatchUp, so the holds it reads are this poll's, and
+    // before KeepTheFamilyTogether, so the regroup reads this poll's fetch.
+    void DriveFetch(Group* group, Player* leader, std::vector<Player*> const& present)
+    {
+        if (!group || !leader)
+            return;
+        std::string const leaderName = leader->GetName();
+
+        // The run is asked only where there is a fetch to ask about, because
+        // finding it costs a roster read and most polls have none.
+        bool const leaderUsable = leader->IsInWorld() && leader->IsAlive() &&
+                                  SteerableAI(leader) && !InDungeonRun(leader) &&
+                                  !WithinCatchUpStandDown(leaderName);
+
+        auto const running = _fetches.find(leaderName);
+        if (running != _fetches.end())
+        {
+            bool const leaderFree =
+                leaderUsable &&
+                OverseerDecisions::RunLetsTheLeaderFetch(FetchRunPhaseFor(leaderName)) !=
+                    OverseerDecisions::FetchRunAnswer::Refuse;
+            Fetch& fetch = running->second;
+            Player* const target = ObjectAccessor::FindPlayerByName(fetch.target, false);
+            OverseerDecisions::FetchFacts facts;
+            facts.leaderFree = leaderFree;
+            facts.targetFetchable = target && target->IsInWorld() && target->IsAlive() &&
+                                    target->GetGroup() == group &&
+                                    target->GetMapId() == leader->GetMapId();
+            if (facts.targetFetchable)
+                facts.targetYards = target->GetDistance2d(leader);
+            facts.aimRefused = !fetch.refusal.empty();
+            facts.fetchingForSeconds = std::time(nullptr) - fetch.since;
+            OverseerDecisions::FetchStep const step =
+                OverseerDecisions::ReadFetch(facts, FETCH_LIMITS);
+            switch (step)
+            {
+                case OverseerDecisions::FetchStep::Arrived:
+                    // The hold lifted on this same reading in DriveCatchUp, so
+                    // what follows is the member's own catch-up walk and the
+                    // regroup wait. Nothing new starts on this poll: the next
+                    // one finds the family regrouping and waits for it.
+                    EndFetch(leaderName,
+                             "it is " + std::to_string(static_cast<uint32>(facts.targetYards)) +
+                                 " yards away, back within the line a catch-up may walk, "
+                                 "so its hold lifts and it walks the rest");
+                    return;
+                case OverseerDecisions::FetchStep::GiveUp:
+                    EndFetch(leaderName,
+                             "the fetch ran " +
+                                 std::to_string(static_cast<uint32>(FETCH_CEILING_SECONDS / 60)) +
+                                 " minutes without getting within " +
+                                 std::to_string(static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS)) +
+                                 " yards of it");
+                    return;
+                case OverseerDecisions::FetchStep::Abandon:
+                    EndFetch(leaderName,
+                             !facts.leaderFree
+                                 ? std::string("the leader is dead, out of the world, stood "
+                                               "down from a walk that killed him, or kept by "
+                                               "a dungeon run")
+                             : !facts.targetFetchable
+                                 ? std::string("it is dead, out of the world, out of the "
+                                               "party or on another map")
+                                 : "the leader's aim at it was refused - " + fetch.refusal);
+                    return;
+                case OverseerDecisions::FetchStep::Continue:
+                    break;
+            }
+            fetch.wanted = true;
+            auto const walk = _dungeonEscorts.find(leaderName);
+            if (!fetch.aimed || walk == _dungeonEscorts.end() || !walk->second.catchUp)
+            {
+                // Not aimed yet, or the walk was ended under it (the travel
+                // backstop, a sweep): aimed again from where he stands now.
+                fetch.aimed = false;
+                AimFetch(fetch, leaderName, target);
+                return;
+            }
+            walk->second.wanted = true;
+            // THE MEMBER USUALLY STANDS STILL, BUT NOT ALWAYS. Its hold asks
+            // the flight again every CATCH_UP_FAR_HOLD_SECONDS, and a member
+            // walking toward a leader walking toward it moves the aim. Re-aimed
+            // on the catch-up walk's own rule, so a route is not thrown away for
+            // a few yards; re-claimed otherwise, as DriveCatchUp does.
+            OverseerDecisions::CatchUpAimFacts aim;
+            aim.leaderOnTheGround = OnTheGround(target);
+            aim.leaderDriftFromAim = target->GetDistance2d(walk->second.x, walk->second.y);
+            aim.followerGapToLeader = facts.targetYards;
+            if (OverseerDecisions::CatchUpAimIsStale(aim, FOLLOW_CATCH_UP_AIM_LIMITS))
+                AimFetch(fetch, leaderName, target);
+            else if (!_travelAims.Claim(leaderName, walk->second.aim,
+                                        OverseerDecisions::TravelOwner::CatchUp))
+                fetch.refusal = _travelAims.ClaimRefusal(leaderName);
+            return;
+        }
+
+        // NOT GOING BACK YET. Should he?
+        if (!leaderUsable || !OnTheGround(leader))
+            return;
+        std::vector<OverseerDecisions::FetchCandidate> candidates;
+        for (Player* p : present)
+        {
+            if (!p || p == leader || p->GetGroup() != group)
+                continue;
+            // The regroup's own filter, for its reason: a member a person is
+            // playing is not this module's to wait for or to fetch.
+            PlayerbotAI* const memberAI = GET_PLAYERBOT_AI(p);
+            if (!memberAI || IsRealPlayer(memberAI->GetMaster()))
+                continue;
+            OverseerDecisions::FetchCandidate member;
+            member.name = p->GetName();
+            member.seen = p->IsInWorld();
+            member.sameMap = member.seen && p->GetMapId() == leader->GetMapId();
+            member.alive = p->IsAlive();
+            member.heldTooFar = HeldWaitingForLeader(member.name);
+            member.stoodDown = WithinFetchStandDown(member.name);
+            if (member.sameMap)
+                member.yards = p->GetDistance2d(leader);
+            candidates.push_back(member);
+        }
+        auto const slot = _regroupSlots.find(leaderName);
+        bool const regrouping = slot != _regroupSlots.end() && slot->second.waiting;
+        std::string const pick =
+            OverseerDecisions::PickFetchTarget(candidates, FETCH_LIMITS, regrouping);
+        if (pick.empty())
+            return;
+        Player* const target = ObjectAccessor::FindPlayerByName(pick, false);
+        if (!target)
+            return;
+        OverseerDecisions::FetchRunAnswer const runAnswer =
+            OverseerDecisions::RunLetsTheLeaderFetch(FetchRunPhaseFor(leaderName));
+        if (runAnswer == OverseerDecisions::FetchRunAnswer::Refuse)
+            return;
+
+        Fetch& fetch = _fetches[leaderName];
+        fetch = Fetch{};
+        fetch.target = pick;
+        fetch.since = std::time(nullptr);
+        fetch.wanted = true;
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' goes back for '{}', which is held {} yards away because "
+                 "that is too far to walk and no flight carries it - the leader walks or "
+                 "flies to where it stands and the family comes with him, rather than "
+                 "carrying on without it. The hold lifts within {} yards; the fetch gives "
+                 "up after {} minutes{}",
+                 leaderName, pick, static_cast<uint32>(target->GetDistance2d(leader)),
+                 static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS),
+                 static_cast<uint32>(FETCH_CEILING_SECONDS / 60),
+                 runAnswer == OverseerDecisions::FetchRunAnswer::RegatherFirst
+                     ? ", and the dungeon run at BARRIER goes back to GATHERING to let "
+                       "him go"
+                     : "");
+        AimFetch(fetch, leaderName, target);
     }
 
     // Recorded by DriveTravel at the instant it grants the strategy, so the
@@ -20052,7 +20389,12 @@ private:
             // nothing, so what is left for a far catch-up is the foot walk
             // across a continent this rule exists to refuse. See
             // OverseerDecisions::FarCatchUpWalk for the four answers.
-            if (IsCatchingUp(name))
+            //
+            // EXCEPT THE LEADER GOING BACK FOR A MEMBER (2026-09-23). His walk
+            // rides the catch-up lease, but it is the answer to this hold rather
+            // than another case of it: holding him too would be the mutual wait
+            // again, one step further back. He walks, and the family with him.
+            if (IsCatchingUp(name) && !LeaderIsFetching(name))
             {
                 auto const walk = _dungeonEscorts.find(name);
                 OverseerDecisions::FarCatchUpStep const far =
@@ -20069,7 +20411,8 @@ private:
                              "no flight carries it - so it is not walked there. Its catch-up "
                              "walk ends and it is held where it stands until the leader is "
                              "back within {} yards, or for {} minutes, when the flight is "
-                             "asked again. The family carries on without it",
+                             "asked again. Its leader goes back for it once the rest of the "
+                             "family is gathered",
                              name, static_cast<uint32>(distance), target,
                              static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS),
                              static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS),
@@ -24560,6 +24903,10 @@ private:
         // catches up, and repeating "still waiting" every five seconds would
         // bury the one line that matters.
         bool loggedGathering{false};
+        // WHO THE LEADER WAS LAST SAID TO BE GOING BACK FOR while this run
+        // waited (2026-09-23), so the line is said once per fetch rather than
+        // once per five-second poll. Empty when no fetch has been said.
+        std::string fetchSaid;
         bool loggedBarrierWaiting{false};
         bool loggedCrossingAim{false};
         // AND WHAT THAT LINE SAID ABOUT THE DOOR'S OWN HEIGHT (#376). The aim
@@ -24885,6 +25232,22 @@ private:
     // row, staging point, members, clocks and evacuation here, and nothing in
     // one entry is read or written on behalf of another family.
     std::map<std::string, DungeonRunCoordinatorState> _dungeonRunCoordinators;
+
+    // WHERE A RUN STANDS, in the words the fetch rule reads (2026-09-23). Here
+    // rather than beside DriveFetch because a parameter type has to be declared
+    // before the declaration that names it. See RunLetsTheLeaderFetch.
+    static OverseerDecisions::FetchRunPhase FetchRunPhaseOf(DungeonRunPhase phase)
+    {
+        switch (phase)
+        {
+            case DungeonRunPhase::Idle:      return OverseerDecisions::FetchRunPhase::NoRun;
+            case DungeonRunPhase::Resetting: return OverseerDecisions::FetchRunPhase::Resetting;
+            case DungeonRunPhase::Gathering: return OverseerDecisions::FetchRunPhase::Gathering;
+            case DungeonRunPhase::Barrier:   return OverseerDecisions::FetchRunPhase::Barrier;
+            default:                         return OverseerDecisions::FetchRunPhase::Committed;
+        }
+    }
+
 
     // Is this family's coordinator anywhere but IDLE? A family with no
     // coordinator has never started a run, which is IDLE. The home bind and the
@@ -30274,6 +30637,72 @@ private:
         if (assembling && !coord.stagingSince)
             coord.stagingSince = std::time(nullptr);
 
+        // THE LEADER HAS GONE BACK FOR A MEMBER TOO FAR TO WALK (2026-09-23).
+        // A member held past CATCH_UP_FOOT_LIMIT_YARDS does not move until the
+        // leader is within that line, so a run that keeps walking him to the
+        // door and waits for the whole roster there can only time out: measured
+        // at Ragefire, BARRIER closed naming 'Oz (1902y out and 81y above it)'.
+        // So the run lends him while it is assembling. See
+        // OverseerDecisions::RunLetsTheLeaderFetch for which phases, and why
+        // BARRIER goes back to GATHERING first rather than sending him alone.
+        //
+        // AND ITS CLOCK RESTARTS WHILE IT WAITS, because the twelve minutes are
+        // for staging and this is not staging. That cannot hold a run open for
+        // ever, and the run does not take the fetch's word for it: it lends the
+        // leader only while the fetch is younger than FETCH_CEILING_SECONDS, read
+        // here on the run's own clock, so a fetch whose party poll stopped
+        // running still stops holding the run at its ceiling. The member it was
+        // for is then not gone back for again inside FETCH_STANDDOWN_SECONDS,
+        // which is longer than DUNGEON_STAGING_BACKSTOP_SECONDS.
+        auto const fetch = _fetches.find(leaderName);
+        if (fetch != _fetches.end() &&
+            std::time(nullptr) - fetch->second.since < FETCH_CEILING_SECONDS)
+        {
+            OverseerDecisions::FetchRunAnswer const answer =
+                OverseerDecisions::RunLetsTheLeaderFetch(FetchRunPhaseOf(coord.phase));
+            if (answer == OverseerDecisions::FetchRunAnswer::RegatherFirst &&
+                coord.phase == DungeonRunPhase::Barrier)
+            {
+                // The leader's escort and every staging hold end with the phase:
+                // SweepDungeonEscorts ends what BARRIER stops marking, and the
+                // staging holds are released for any family not at BARRIER.
+                coord.phase = DungeonRunPhase::Gathering;
+                coord.loggedGathering = false;
+                coord.loggedBarrierWaiting = false;
+                coord.staging.clear();
+                coord.legAim.clear();
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run {} leaves BARRIER for GATHERING - '{}' "
+                         "goes back for '{}', which is held too far from the staging "
+                         "point to walk to it, and the family follows him rather than "
+                         "standing at the door. The barrier is asked again when he "
+                         "brings it back",
+                         coord.runNumber, leaderName, fetch->second.target);
+            }
+            if (answer != OverseerDecisions::FetchRunAnswer::Refuse &&
+                coord.phase == DungeonRunPhase::Gathering)
+            {
+                coord.stagingSince = std::time(nullptr);
+                coord.gatherBest = -1.f;
+                coord.staging.clear();
+                // A new leg when he comes back, not a re-armed errand: the fetch
+                // wrote over the staging aim on purpose.
+                coord.legAim.erase(leaderName);
+                if (coord.fetchSaid != fetch->second.target)
+                {
+                    coord.fetchSaid = fetch->second.target;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} GATHERING waits while '{}' goes back "
+                             "for '{}' - the staging aim is not re-claimed and the staging "
+                             "clock starts again when he is walking to the door",
+                             coord.runNumber, leaderName, fetch->second.target);
+                }
+                return;
+            }
+        }
+        else
+            coord.fetchSaid.clear();
+
         // THE GEAR IS PUT BACK BEFORE THE NEXT RUN OPENS (#391). Above
         // RESETTING because it comes before it in time, and because
         // everything below this line is about a run that is starting: RESET
@@ -30493,9 +30922,16 @@ private:
                 // nowhere. See TravelAimBook. In a LOOP that argument stops
                 // being hypothetical: every run after the first aims at the
                 // identical string the previous run just finished with.
-                _travelAims.Claim(leaderName, aimTarget,
-                                  OverseerDecisions::TravelOwner::Run);
-                coord.legAim[leaderName] = aimTarget;
+                //
+                // NOT WHILE HE IS GOING BACK FOR A MEMBER (2026-09-23): the claim
+                // would write over the fetch's aim and throw its route away, and
+                // GATHERING claims this same leg as a new one when he is back.
+                if (!LeaderIsFetching(leaderName))
+                {
+                    _travelAims.Claim(leaderName, aimTarget,
+                                      OverseerDecisions::TravelOwner::Run);
+                    coord.legAim[leaderName] = aimTarget;
+                }
 
                 coord.phase = DungeonRunPhase::Gathering;
                 coord.loggedGathering = false;
