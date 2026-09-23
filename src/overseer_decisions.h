@@ -2997,6 +2997,12 @@ bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner);
 
 struct TravelClaimFacts
 {
+    // THE OWNER IS A CONSTRUCTOR ARGUMENT, NOT A DEFAULTED FIELD (#598). A
+    // default would be the unnamed owner the BARRIER escort fell into, moved
+    // from Claim's signature into this struct; with no default constructor a
+    // caller that does not say whose walk it is does not compile.
+    explicit TravelClaimFacts(TravelOwner whose) : owner(whose) {}
+
     // `learn_skill` as read this call; zero means no profession errand.
     uint32_t learnSkill{0};
     // `travel_npc` as read this call.
@@ -3004,7 +3010,7 @@ struct TravelClaimFacts
     // `column` is the aim this book itself last wrote for this character.
     bool columnIsOurs{false};
     // Whose walk the aim is. See TravelOwner.
-    TravelOwner owner{TravelOwner::HomeErrand};
+    TravelOwner owner;
 };
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts);

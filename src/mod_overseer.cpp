@@ -4596,12 +4596,11 @@ public:
         // wrote is not foreign, because replacing it disturbs nobody's walk
         // but the book's own. The second is what lets a catch-up re-aim and a
         // run's next leg replace the book's previous `at:` aim.
-        OverseerDecisions::TravelClaimFacts facts;
+        OverseerDecisions::TravelClaimFacts facts(owner);
         facts.learnSkill = LearnSkillPending(name);
         facts.column = CurrentTravelNpc(name);
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
-        facts.owner = owner;
         OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
         if (verdict != OverseerDecisions::TravelClaim::Write)
         {

@@ -47,10 +47,9 @@ void Check(char const* what, bool got, bool want)
 // The measured column: nothing in it, skill 186 pending.
 TravelClaim ClaimOverAPendingLearn(TravelOwner owner, char const* column)
 {
-    TravelClaimFacts facts;
+    TravelClaimFacts facts(owner);
     facts.learnSkill = 186;
     facts.column = column;
-    facts.owner = owner;
     return ReadTravelClaim(facts);
 }
 

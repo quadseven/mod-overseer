@@ -63,12 +63,11 @@ void CheckText(char const* what, std::string const& got, std::string const& want
 
 TravelClaimFacts Facts(uint32_t learnSkill, char const* column, bool ours, bool catchUp)
 {
-    TravelClaimFacts facts;
+    TravelClaimFacts facts(catchUp ? OverseerDecisions::TravelOwner::CatchUp
+                                   : OverseerDecisions::TravelOwner::HomeErrand);
     facts.learnSkill = learnSkill;
     facts.column = column;
     facts.columnIsOurs = ours;
-    facts.owner = catchUp ? OverseerDecisions::TravelOwner::CatchUp
-                          : OverseerDecisions::TravelOwner::HomeErrand;
     return facts;
 }
 
