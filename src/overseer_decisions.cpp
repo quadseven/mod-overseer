@@ -4093,6 +4093,40 @@ char const* RegroupLeaderRefusal(bool onARun, bool alive, bool onTheGround)
     return nullptr;
 }
 
+FarCatchUpStep FarCatchUpWalk(float yardsToAim, float footLimitYards, bool flewThisWalk,
+                              bool flightDecided, bool carriesMover)
+{
+    // A flight already carried it: what is left is the walk from the landing,
+    // which ConsiderFlight chose because it beat walking the whole way.
+    if (flewThisWalk)
+        return FarCatchUpStep::Walk;
+    if (footLimitYards > 0.f && yardsToAim <= footLimitYards)
+        return FarCatchUpStep::Walk;
+    if (flightDecided)
+        return FarCatchUpStep::Hold;
+    return carriesMover ? FarCatchUpStep::Wait : FarCatchUpStep::Grant;
+}
+
+char const* FarCatchUpStepWord(FarCatchUpStep step)
+{
+    switch (step)
+    {
+        case FarCatchUpStep::Walk:  return "walk";
+        case FarCatchUpStep::Grant: return "grant";
+        case FarCatchUpStep::Wait:  return "wait";
+        case FarCatchUpStep::Hold:  return "hold";
+    }
+    return "unknown";
+}
+
+bool FarCatchUpStaysHeld(float gapYards, float footLimitYards, time_t heldForSeconds,
+                         time_t retrySeconds)
+{
+    if (footLimitYards > 0.f && gapYards >= 0.f && gapYards <= footLimitYards)
+        return false;
+    return heldForSeconds < retrySeconds;
+}
+
 bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits)
 {
     // UNCHANGED, AND ASKED FIRST. A leader in the air is not somewhere a
