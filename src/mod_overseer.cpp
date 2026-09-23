@@ -25458,6 +25458,9 @@ private:
         // Kept so a hold is said once when it starts and once when it ends,
         // rather than every poll. See HoldClearingClock.
         OverseerDecisions::ClearingClock clearClock{OverseerDecisions::ClearingClock::Runs};
+        // Whether the split-across-copies ERROR has been said for the split in
+        // progress (#620). Cleared when nobody is in another copy.
+        bool loggedOtherCopy{false};
         // Said once per stretch rather than once per poll, the log-once
         // discipline the rest of this struct follows. It is the line that tells
         // an operator WHY the watchdog started counting against a party that
@@ -26907,6 +26910,10 @@ private:
                 s_loggedOtherCopy.erase(name);
             if (otherCopy)
             {
+                // Named in the entry blockers and walked out by the coordinator
+                // (DungeonRunOtherCopy), so it can come back in through the door
+                // into the head's copy.
+                state.otherCopy = true;
                 if (s_loggedOtherCopy[name] != member->GetInstanceId())
                 {
                     s_loggedOtherCopy[name] = member->GetInstanceId();
@@ -27369,9 +27376,12 @@ private:
     // module uses and lets the game's own areatrigger decide.
     //
     // Returns how many members were aimed at the door this poll.
+    // `splitCopy` (#620) is the same walk for a different reason: members in
+    // another copy of the dungeon than their group leader, walked out so they
+    // can come back in through the door into his. Only the labels differ.
     uint32 WalkStragglersOut(std::vector<std::string> const& members,
                              std::string const& leaderName, DungeonPortal const& portal,
-                             DungeonRunCoordinatorState& coord)
+                             DungeonRunCoordinatorState& coord, bool splitCopy = false)
     {
         // GetAreaTrigger  ObjectMgr.h:868  AreaTrigger const* GetAreaTrigger(uint32) const
         AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.exitTriggerId);
@@ -27439,7 +27449,8 @@ private:
         std::string const exitAim = aim.str();
 
         for (std::string const& name : evacuation.walk)
-            EscortToward(name, exitAim, "RESET", EscortPurpose::LeaveInstance);
+            EscortToward(name, exitAim, splitCopy ? "SPLIT" : "RESET",
+                         EscortPurpose::LeaveInstance);
 
         // AND THE DOOR IS KNOCKED ON AT POLL RATE, NOT ONLY ON ARRIVAL, which
         // for the measured pair is the difference between walking eight yards
@@ -27484,17 +27495,18 @@ private:
         if (crossed)
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} knocked on areatrigger {} for the {} left "
-                     "inside map {} - {} went through this poll, which is what the reset "
+                     "inside map {} - {} went through this poll, which is what the {} "
                      "was waiting for",
                      coord.runNumber, portal.exitTriggerId,
-                     static_cast<uint32>(walking.size()), portal.insideMapId, crossed);
+                     static_cast<uint32>(walking.size()), portal.insideMapId, crossed,
+                     splitCopy ? "walk back into the party's copy" : "reset");
 
         // SAID ONCE PER RUN. EscortToward already says which character is being
         // walked where; this is the sentence that says why anybody is being
         // walked out of an instance at all, which is the fact an operator
         // reading a `reset_failed` row needs and the one the hold line above
         // could never give.
-        if (!coord.loggedWalkingOut)
+        if (!splitCopy && !coord.loggedWalkingOut)
         {
             coord.loggedWalkingOut = true;
             LOG_WARN("module.overseer",
@@ -32325,6 +32337,49 @@ private:
             uint32 inside = 0;
             std::vector<OverseerDecisions::DungeonRunEntryState> const states =
                 DungeonRunCensus(members, door, portal->insideMapId, inside, leaderName);
+
+            // A MEMBER IN ANOTHER COPY OF THE DUNGEON IS NOT INSIDE WITH US (#620),
+            // and the census already does not count it (#628). Waiting was the
+            // whole answer until now, ending in STAGED_INSIDE's split_failed
+            // backstop: nothing moved it. What brings it here is walking it OUT
+            // of its copy, after which the stranded walk below takes it back in
+            // through the door. #628 keeps the family one group under the head,
+            // and a grouped character entering through the door lands in its
+            // group leader's copy (PlayerGetDestinationInstanceId, "2. leader
+            // temp/perm"). A CLEARING run that finds one steps back to
+            // STAGED_INSIDE, the only phase that walks anybody back in. Said
+            // once per split.
+            {
+                std::vector<std::string> const otherCopy =
+                    OverseerDecisions::DungeonRunOtherCopy(states);
+                if (otherCopy.empty())
+                {
+                    coord.loggedOtherCopy = false;
+                }
+                else
+                {
+                    if (!coord.loggedOtherCopy)
+                    {
+                        coord.loggedOtherCopy = true;
+                        LOG_ERROR("module.overseer",
+                                  "overseer: dungeon run {} of campaign {} is SPLIT ACROSS "
+                                  "COPIES of map {} - {} {} in a different instance from the "
+                                  "head, so the dungeon brain cannot lead them and "
+                                  "they cannot reach it. Walking them out through "
+                                  "areatrigger {} to come back in through the door, which "
+                                  "puts a grouped character in its group leader's copy",
+                                  coord.runNumber, coord.campaignId, portal->insideMapId,
+                                  JoinNames(otherCopy), otherCopy.size() == 1 ? "is" : "are",
+                                  portal->exitTriggerId);
+                    }
+                    WalkStragglersOut(otherCopy, leaderName, *portal, coord, true);
+                    if (coord.phase == DungeonRunPhase::Clearing)
+                    {
+                        coord.phase = DungeonRunPhase::StagedInside;
+                        coord.loggedStagedWaiting = false;
+                    }
+                }
+            }
 
             // THE RUN JOINS ITS CAMPAIGN AS SOON AS THERE IS A ROW TO STAMP,
             // WHICH IS NOT WHERE THIS USED TO HAPPEN (#225). It was done at the

@@ -1814,7 +1814,19 @@ struct DungeonRunEntryState
     bool inCombat{false};
     bool through{false};          // already on the far side of the door
     float distanceFromDoor{-1.f}; // negative = not measured (through, wrong map, or !seen)
+    // On the dungeon map but in a different COPY of it than the head (#620).
+    // Never `through`: see InAnotherInstanceCopy.
+    bool otherCopy{false};
 };
+
+
+// The living members to walk OUT of their copy so they can come back in
+// through the door into the head's (#620). A character that logs in at a saved
+// position inside an instance lands in the copy its OWN bind names, so waiting
+// never moves it; the door does, because a grouped character entering through
+// it lands in its group leader's copy. The dead are left to the revival drive,
+// as everywhere else.
+std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members);
 
 // Is every member either already through, or standing on the doorstep alive
 // and out of combat? Fails closed on an empty roster and on any member this
