@@ -1269,11 +1269,6 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
     return blockers;
 }
 
-bool InOtherCopy(bool onThroughMap, uint32_t memberInstanceId, uint32_t referenceInstanceId)
-{
-    return onThroughMap && referenceInstanceId != 0 && memberInstanceId != referenceInstanceId;
-}
-
 std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members)
 {
     std::vector<std::string> walk;
@@ -1704,6 +1699,150 @@ bool HeadTakesTheLead(bool headNamed, bool headPresent, bool headInThisGroup,
                       bool headLeads)
 {
     return headNamed && headPresent && headInThisGroup && !headLeads;
+}
+
+FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats)
+{
+    FamilyGroupPlan plan;
+
+    FamilyGroupSeat const* head = nullptr;
+    for (FamilyGroupSeat const& seat : seats)
+        if (seat.head && seat.present)
+        {
+            head = &seat;
+            break;
+        }
+
+    // THE HEAD'S GROUP FIRST, whatever else is true. That is the whole of
+    // the fix: before this, the family's group was whichever present member
+    // happened to have one, and a head in a group of his own was left there.
+    if (head && head->groupId && !head->groupIsForeign)
+    {
+        plan.targetGroupId = head->groupId;
+    }
+    else
+    {
+        // Without the head in a group, the group most of the family is in,
+        // so the fewest members move. Seat order breaks a tie, and seat
+        // order is roster order.
+        std::vector<std::uint64_t> order;
+        std::map<std::uint64_t, unsigned> counts;
+        for (FamilyGroupSeat const& seat : seats)
+        {
+            if (!seat.present || !seat.groupId || seat.groupIsForeign)
+                continue;
+            if (!counts[seat.groupId]++)
+                order.push_back(seat.groupId);
+        }
+        unsigned best = 0;
+        for (std::uint64_t id : order)
+            if (counts[id] > best)
+            {
+                best = counts[id];
+                plan.targetGroupId = id;
+            }
+    }
+
+    if (!plan.targetGroupId)
+    {
+        if (head && !head->groupIsForeign)
+            plan.founder = head->name;
+        else
+            for (FamilyGroupSeat const& seat : seats)
+                if (seat.present && !seat.groupIsForeign)
+                {
+                    plan.founder = seat.name;
+                    break;
+                }
+    }
+
+    for (FamilyGroupSeat const& seat : seats)
+    {
+        if (!seat.present)
+            continue;
+        if (seat.groupIsForeign)
+        {
+            plan.untouched.push_back(seat.name);
+            continue;
+        }
+        if (seat.name == plan.founder)
+            continue;
+        if (plan.targetGroupId && seat.groupId == plan.targetGroupId)
+            continue;
+        if (seat.groupId)
+            plan.leave.push_back(seat.name);
+        plan.join.push_back(seat.name);
+    }
+    return plan;
+}
+
+std::string FamilyGroupBreach(std::vector<FamilyGroupSeat> const& seats)
+{
+    if (seats.size() < 2)
+        return "";
+
+    FamilyGroupSeat const* head = nullptr;
+    for (FamilyGroupSeat const& seat : seats)
+        if (seat.head)
+        {
+            head = &seat;
+            break;
+        }
+
+    if (!head)
+        return "the roster names no head";
+    if (!head->present)
+        return "the head '" + head->name + "' is not in the world";
+    if (!head->groupId || head->groupIsForeign)
+        return "the head '" + head->name + "' is in no family group";
+
+    std::string why;
+    auto add = [&why](std::string const& part)
+    {
+        why += (why.empty() ? "" : "; ") + part;
+    };
+    for (FamilyGroupSeat const& seat : seats)
+    {
+        if (&seat == head)
+            continue;
+        if (!seat.present)
+            add("'" + seat.name + "' is not in the world");
+        else if (!seat.groupId)
+            add("'" + seat.name + "' is in no group");
+        else if (seat.groupId != head->groupId)
+            add("'" + seat.name + "' is in another group");
+    }
+    if (!head->leadsItsGroup)
+        add("the head '" + head->name + "' does not lead the group");
+    return why;
+}
+
+bool InAnotherInstanceCopy(std::uint32_t memberMap, std::uint32_t memberInstance,
+                           std::uint32_t headMap, std::uint32_t headInstance)
+{
+    return memberMap == headMap && headInstance != 0 && memberInstance != headInstance;
+}
+
+bool SplitAcrossInstanceCopies(std::vector<InstanceSpot> const& family,
+                               std::uint32_t mapId)
+{
+    bool seen = false;
+    std::uint32_t first = 0;
+    for (InstanceSpot const& spot : family)
+    {
+        if (spot.mapId != mapId)
+            continue;
+        if (!seen)
+        {
+            seen = true;
+            first = spot.instanceId;
+        }
+        else if (spot.instanceId != first)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool DungeonRunEnteredTheInstance(std::string const& outcome)

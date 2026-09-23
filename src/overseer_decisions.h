@@ -1814,31 +1814,18 @@ struct DungeonRunEntryState
     bool inCombat{false};
     bool through{false};          // already on the far side of the door
     float distanceFromDoor{-1.f}; // negative = not measured (through, wrong map, or !seen)
-    // On the dungeon map but in a different COPY of it than the group leader
-    // (#620). Never `through`: see InOtherCopy.
+    // On the dungeon map but in a different COPY of it than the head (#620).
+    // Never `through`: see InAnotherInstanceCopy.
     bool otherCopy{false};
 };
 
-// IS THIS MEMBER IN ANOTHER COPY OF THE DUNGEON (#620)?
-//
-// "On the inside map" is a map id, and one map id can be several instances. A
-// character that logs in at a saved position inside a dungeon lands in the copy
-// its OWN bind names, not its party's. Measured on the dev realm after a
-// restart: the four bots in one copy, the head in another, the census counting
-// all five "inside together", and the dungeon module - which elects per Map
-// object - leading the head alone in his while refusing the other four. Only
-// the door fixes it: a grouped character entering through it lands in its
-// GROUP LEADER's bind (InstanceSaveMgr::PlayerGetDestinationInstanceId, "2.
-// leader temp/perm"), so the group leader's copy is the one the party can all
-// reach, and it is the reference.
-//
-// A reference of 0 means nobody knows which copy is the party's (the group
-// leader is not on the map), and then nobody is judged to be in another one.
-bool InOtherCopy(bool onThroughMap, uint32_t memberInstanceId, uint32_t referenceInstanceId);
 
 // The living members to walk OUT of their copy so they can come back in
-// through the door into the group leader's. The dead are left to the revival
-// drive, as everywhere else.
+// through the door into the head's (#620). A character that logs in at a saved
+// position inside an instance lands in the copy its OWN bind names, so waiting
+// never moves it; the door does, because a grouped character entering through
+// it lands in its group leader's copy. The dead are left to the revival drive,
+// as everywhere else.
 std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members);
 
 // Is every member either already through, or standing on the doorstep alive
@@ -2494,6 +2481,86 @@ char const* ClearingClockHoldReason(ClearingClock clock);
 // roster names no head, and then the group keeps whatever leader it has.
 bool HeadTakesTheLead(bool headNamed, bool headPresent, bool headInThisGroup,
                       bool headLeads);
+
+// ------------------------------------------- one group per family (#607) --
+//
+// EACH FAMILY IS ONE GROUP, AND THE HEAD LEADS IT WHENEVER HE IS ONLINE.
+//
+// The realm runs with LeaveGroupOnLogout on, and the core applies it only to
+// a session with a socket: the head, the one member with a client. Every
+// relog, client drop or worldserver bounce takes the head out of the family
+// group, and the core hands the lead to a member. The rejoin used to assume
+// the head came back in NO group. A head who came back in a group of his
+// own was skipped as "in a party of their own", HeadTakesTheLead refused
+// because he was not in the family's group, and the two groups stood side by
+// side for as long as nobody logged out again.
+//
+// So the plan is made over every present member, and a member in a stray
+// group leaves it and joins the family's. The family's group is the head's
+// when he is in one. Without him it is the group holding the most present
+// members, the earliest in roster order on a tie, and with no group at all a
+// new one is formed under the head, or under the first present member while
+// he is away.
+//
+// A BATTLEGROUND, BATTLEFIELD OR DUNGEON-FINDER GROUP IS NEVER TOUCHED. The
+// core owns those, and a member in one is left in it, never picked as the
+// family's group, and named in `untouched` so the adapter can say so.
+struct FamilyGroupSeat
+{
+    std::string name;
+    bool head = false;
+    // In the world and steered this poll. A seat that is not present is
+    // never moved; FamilyGroupBreach names it as missing.
+    bool present = false;
+    // 0 means in no group. Any other value identifies one group, and two
+    // seats with the same value are in the same group.
+    std::uint64_t groupId = 0;
+    bool groupIsForeign = false;
+    bool leadsItsGroup = false;
+};
+
+struct FamilyGroupPlan
+{
+    // The family's group, or 0 when a new one is to be formed under `founder`.
+    std::uint64_t targetGroupId = 0;
+    std::string founder;
+    // Present members to take out of a stray group before they join, in seat
+    // order. Every name here is also in `join`.
+    std::vector<std::string> leave;
+    // Present members to add to the family's group, in seat order. Never the
+    // founder.
+    std::vector<std::string> join;
+    // Present members in a group the core owns, left where they are.
+    std::vector<std::string> untouched;
+};
+
+FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats);
+
+// WHY THE FAMILY IS NOT ONE GROUP UNDER ITS HEAD, in words, or empty when it
+// is. Asked by the dungeon coordinator before anybody knocks on a door (#620):
+// a member who zones in outside the head's group is given an instance copy of
+// its own. Every seat counts here, present or not, because a member who is
+// offline is a member the run would leave behind. A family of one is whole.
+std::string FamilyGroupBreach(std::vector<FamilyGroupSeat> const& seats);
+
+// IS THIS CHARACTER IN A DIFFERENT COPY OF THE SAME MAP THAN THE HEAD (#620)?
+// True only when both are on `mapId`, the head's copy is known (non-zero),
+// and the two copies differ. The dungeon census counts such a member as NOT
+// inside: it is on the right map and in a run of its own.
+bool InAnotherInstanceCopy(std::uint32_t memberMap, std::uint32_t memberInstance,
+                           std::uint32_t headMap, std::uint32_t headInstance);
+
+// ARE THE FAMILY MEMBERS ON `mapId` SPREAD OVER MORE THAN ONE COPY OF IT?
+// Asked by the arming drive: `dc on` in that state arms a run in a copy the
+// rest of the family is not in, so nobody on the map is armed until the
+// copies agree. Members on other maps do not count.
+struct InstanceSpot
+{
+    std::uint32_t mapId = 0;
+    std::uint32_t instanceId = 0;
+};
+bool SplitAcrossInstanceCopies(std::vector<InstanceSpot> const& family,
+                               std::uint32_t mapId);
 
 // ------------------------------------------- what counts as a run (#225) --
 //

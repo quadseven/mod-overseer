@@ -3,10 +3,11 @@
  *
  * Measured on the dev realm after a worldserver restart: the four bots logged
  * in inside Ragefire Chasm in one instance, the head's client reconnected into
- * another, and the census counted all five "inside together" because it read
- * only the map id. These pin that a member in a different copy from the group
- * leader is not inside, is named as such, and is walked out to come back in
- * through the door.
+ * another. #628 stopped counting such a member as inside; nothing moved it,
+ * and the run waited for its split_failed backstop. These pin that a member in
+ * another copy is named as such and is walked out to come back in through the
+ * door, and that the stranded walk (which aims at the outdoor door) leaves it
+ * alone.
  *
  * Compiles against the pure decision file and nothing from AzerothCore.
  */
@@ -22,7 +23,6 @@ using OverseerDecisions::DungeonRunEntryBlockers;
 using OverseerDecisions::DungeonRunEntryState;
 using OverseerDecisions::DungeonRunOtherCopy;
 using OverseerDecisions::DungeonRunWrongSide;
-using OverseerDecisions::InOtherCopy;
 
 namespace
 {
@@ -46,15 +46,6 @@ DungeonRunEntryState Member(char const* name, bool through, bool otherCopy, bool
     state.through = through;
     state.otherCopy = otherCopy;
     return state;
-}
-
-// (onThroughMap, memberInstanceId, referenceInstanceId)
-void TheCopyIsJudgedAgainstTheGroupLeaders()
-{
-    Check("the measured split: leader in 1, member in 3", InOtherCopy(true, 3, 1));
-    Check("same copy is inside", !InOtherCopy(true, 1, 1));
-    Check("off the map is not a copy question", !InOtherCopy(false, 3, 1));
-    Check("no reference judges nobody", !InOtherCopy(true, 3, 0));
 }
 
 void AMemberInAnotherCopyIsNotInsideAndIsWalkedOut()
@@ -87,7 +78,6 @@ void AMemberInAnotherCopyIsNotInsideAndIsWalkedOut()
 
 int main()
 {
-    TheCopyIsJudgedAgainstTheGroupLeaders();
     AMemberInAnotherCopyIsNotInsideAndIsWalkedOut();
     if (failures)
     {
