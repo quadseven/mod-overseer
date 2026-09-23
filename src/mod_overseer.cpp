@@ -6486,11 +6486,23 @@ private:
         // implemented where the leader's errands are chosen - DriveQuests'
         // own-log pick, see QuestServesTheYoungest - and not by moving the
         // leader. With no `lead` row the group keeps whatever leader it has.
+        //
+        // THE HEAD COMES BACK A MEMBER, AND THIS IS WHAT HANDS IT BACK (#607,
+        // #618). When the head logs out the server promotes whoever is left,
+        // and the dungeon module's tankless-party rule follows the group
+        // leader, so the lead returning to him is also what lets the dungeon
+        // run resume under him. Present means in `present`, the same Steerable
+        // test the invites above use. The rule is HeadTakesTheLead.
         if (!wantsToLead.empty())
         {
-            if (Player* head = ObjectAccessor::FindPlayerByName(wantsToLead))
+            Player* head = ObjectAccessor::FindPlayerByName(wantsToLead);
+            bool const headPresent =
+                head && std::find(present.begin(), present.end(), head) != present.end();
+            if (head)
             {
-                if (head->GetGroup() == group && group->GetLeaderGUID() != head->GetGUID())
+                if (OverseerDecisions::HeadTakesTheLead(
+                        true, headPresent, head->GetGroup() == group,
+                        group->GetLeaderGUID() == head->GetGUID()))
                 {
                     group->ChangeLeader(head->GetGUID());
                     group->SendUpdate();
@@ -21261,6 +21273,11 @@ private:
         // the dungeon module's transient run state, and a verb re-issued eight
         // times a minute is a run restarted eight times a minute.
         bool stoodDown{false};
+        // WHETHER "NO GROUPMATE MAY ISSUE" HAS BEEN SAID FOR THIS STREAK (#618).
+        // Measured: the head's client dropped for six minutes and the same WARN
+        // went out 48 times per member. It is a hold, not news, after the
+        // first line. Cleared the moment an issuer is found again.
+        bool loggedNoIssuer{false};
     };
     std::map<std::string, DcOnRecord> _dcOnIssued;
 
@@ -21270,6 +21287,13 @@ private:
     // (DungeonClearChatActions.cpp:239-246), so "accepted for everyone inside"
     // says the command took on whichever of them the module elected leader,
     // and nothing more. See the CLEARING state for what more is required.
+    //
+    // IT USED TO SAY LESS THAN THAT (#618). With nobody elected - a party with
+    // no tank bot - every member took the trivially-true branch and the whole
+    // party read "accepted" while nothing was enabled anywhere. The dungeon
+    // module now elects a tankless party's group leader, and refuses `dc on`
+    // with "No tank bot found in your group." when it still elects nobody, so
+    // that state reads as the refusal it is.
     bool DcOnAccepted(std::string const& name, uint32 runId) const
     {
         auto const it = _dcOnIssued.find(name);
@@ -21362,6 +21386,18 @@ private:
             // mid-login or mid-teardown with a PlayerbotAI that is non-null
             // right up until it is freed.
             Player* bot = ObjectAccessor::FindPlayerByName(name);
+
+            // OUT OF THE WORLD FORGETS THE ISSUE TOO (#618), not only off the
+            // map. What `dc on` set lives on this character's PlayerbotAI in
+            // memory, and a logout destroys it. The record used to survive the
+            // logout and keep saying "accepted", so a head whose client dropped
+            // inside a dungeon came back to a run nothing would ever arm again.
+            if (OverseerDecisions::ForgetDcOnRecord(bot && bot->IsInWorld(), true))
+            {
+                _dcOnIssued.erase(name);
+                continue;
+            }
+
             PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
                 continue;
@@ -21388,7 +21424,7 @@ private:
             // InDungeonRun, because for them the run genuinely is the
             // precondition.
             Map* map = bot->GetMap();
-            if (!map || !map->IsDungeon())
+            if (OverseerDecisions::ForgetDcOnRecord(true, map && map->IsDungeon()))
             {
                 // OFF THE MAP FORGETS THE ISSUE. This is where the dungeon
                 // module itself strips the strategy and disables the run
@@ -21485,18 +21521,43 @@ private:
             // tank is normally the issuer; see AuthorizedDcIssuer for the
             // fallback and for why "has a client" is not by itself enough.
             Player* issuer = AuthorizedDcIssuer(bot);
-            if (!issuer)
+            DcOnRecord& record = _dcOnIssued[name];
+            time_t const now = std::time(nullptr);
+            OverseerDecisions::DcArmingStep const step = OverseerDecisions::DecideDcArming(
+                issuer != nullptr, record.runId == runId, record.accepted,
+                now - record.issuedAt >= DUNGEON_DC_ON_RETRY_SECONDS);
+
+            if (step == OverseerDecisions::DcArmingStep::HoldNoIssuer)
             {
-                // SAID, NOT SKIPPED. A run whose brain could not be switched on
-                // is the single most consequential thing this module can fail
-                // at, and it has failed at it silently for its whole life.
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' is inside map {} but no groupmate may issue a "
-                         "dungeon-clear command - the module refuses a true bot as issuer "
-                         "and no client-attached member of the party is a selfbot or a "
-                         "person, so the dungeon brain stays OFF",
-                         name, static_cast<uint32>(bot->GetMapId()));
+                // SAID, NOT SKIPPED, AND SAID ONCE PER STREAK (#618). A run
+                // whose brain could not be switched on is the single most
+                // consequential thing this module can fail at, and it failed
+                // at it silently for its whole life - so it is said. But it is
+                // a HOLD: the head is usually the one member with a client and
+                // is simply away, the CLEARING stall clock holds with it, and
+                // the next poll that finds an issuer arms the run. Forty-eight
+                // copies of this line per member in six minutes told nobody
+                // anything the first one had not.
+                if (!record.loggedNoIssuer)
+                {
+                    record.loggedNoIssuer = true;
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is inside map {} but no groupmate may issue a "
+                             "dungeon-clear command - the module refuses a true bot as "
+                             "issuer and no client-attached member of the party is a "
+                             "selfbot or a person, so the dungeon brain stays OFF. Holding "
+                             "until one is back; said once for this stretch",
+                             name, static_cast<uint32>(bot->GetMapId()));
+                }
                 continue;
+            }
+            if (record.loggedNoIssuer)
+            {
+                record.loggedNoIssuer = false;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is inside map {} and '{}' may issue dungeon-clear "
+                         "commands again - the hold for an issuer is over",
+                         name, static_cast<uint32>(bot->GetMapId()), issuer->GetName());
             }
 
             // ALREADY ISSUED FOR THIS RUN, BY THIS PROCESS, AND ACCEPTED: done
@@ -21505,19 +21566,14 @@ private:
             // this module's own memory of what it did - not the strategy list,
             // which the dungeon module fills in on its own (see THREE above).
             // It must stay below the heartbeat, for the reason above.
-            DcOnRecord& record = _dcOnIssued[name];
-            time_t const now = std::time(nullptr);
-            if (record.runId == runId)
-            {
-                if (record.accepted)
-                    continue;
-                // Refused last time. Retried, but not every poll: a refusal
-                // that heals (a dead member revived) is caught within a
-                // minute, and one that does not is one WARN below and then
-                // silence rather than a line every eight seconds.
-                if (now - record.issuedAt < DUNGEON_DC_ON_RETRY_SECONDS)
-                    continue;
-            }
+            //
+            // Refused last time is retried, but not every poll: a refusal that
+            // heals (a dead member revived) is caught within a minute, and one
+            // that does not is one WARN below and then silence rather than a
+            // line every eight seconds.
+            if (step == OverseerDecisions::DcArmingStep::Armed ||
+                step == OverseerDecisions::DcArmingStep::WaitRetry)
+                continue;
 
             bool const wasRefused = record.runId == runId && !record.accepted;
             // Event(source, param, owner)  Event.h:21-24; the owner is what
@@ -25032,6 +25088,10 @@ private:
         // two places this run demonstrably advanced. See
         // DUNGEON_CLEAR_BUSY_CEILING_SECONDS.
         time_t clearAdvancedAt{0};
+        // WHY THE CLEARING STALL CLOCK IS HELD, OR Runs WHEN IT IS NOT (#618).
+        // Kept so a hold is said once when it starts and once when it ends,
+        // rather than every poll. See HoldClearingClock.
+        OverseerDecisions::ClearingClock clearClock{OverseerDecisions::ClearingClock::Runs};
         // Said once per stretch rather than once per poll, the log-once
         // discipline the rest of this struct follows. It is the line that tells
         // an operator WHY the watchdog started counting against a party that
@@ -25829,6 +25889,48 @@ private:
     // Returns true when it has taken the run out of CLEARING, so the caller
     // stops rather than falling through into the arming verdict for a phase that
     // is over.
+    // HOLD THE CLEARING STALL CLOCK WHILE THE BRAIN CANNOT BE DRIVEN (#618).
+    //
+    // The watchdog below measures "no boss and no yards for fifteen minutes"
+    // and answers with `dc skip`s and then an exit. Every poll that does not
+    // reach it (the brain not yet armed on everyone inside, the leader off the
+    // map, or nobody who may issue a command) used to leave its clock where it
+    // was. So the minutes a party spent waiting for its head to come back were
+    // counted as minutes the run was stuck, and the first poll after his return
+    // could spend a `dc skip` on a brain that had not even been re-armed.
+    //
+    // A hold re-stamps both clocks the watchdog reads, and the arming verdict's
+    // anchor, so each starts fresh from the poll the run can be driven again.
+    // The mark and the skip count are left alone: a hold is not progress, and
+    // an issuer that flickers must not be able to reset the ladder.
+    void HoldClearingClock(DungeonRunCoordinatorState& coord,
+                           OverseerDecisions::ClearingClock clock, uint32 insideMapId)
+    {
+        if (clock == OverseerDecisions::ClearingClock::Runs)
+        {
+            if (coord.clearClock != OverseerDecisions::ClearingClock::Runs)
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} of campaign {} CLEARING on map {} - the "
+                         "stall clock runs again, started fresh from now",
+                         coord.runNumber, coord.campaignId, insideMapId);
+            coord.clearClock = clock;
+            return;
+        }
+
+        time_t const now = std::time(nullptr);
+        coord.clearProgress.since = now;
+        coord.clearAdvancedAt = now;
+        coord.anchorSet = false;
+        if (coord.clearClock == clock)
+            return;
+        coord.clearClock = clock;
+        LOG_INFO("module.overseer",
+                 "overseer: dungeon run {} of campaign {} CLEARING on map {} holds its stall "
+                 "clock - {}. No 'dc skip' and no exit while it is held",
+                 coord.runNumber, coord.campaignId, insideMapId,
+                 OverseerDecisions::ClearingClockHoldReason(clock));
+    }
+
     using DungeonRunEntryStates = std::vector<OverseerDecisions::DungeonRunEntryState>;
     bool RunClearingWatchdog(DungeonRunCoordinatorState& coord, Player* leader,
                              DungeonRunEntryStates const& states, uint32 insideMapId)
@@ -32027,6 +32129,8 @@ private:
                               accepted, inside, portal->insideMapId,
                               static_cast<uint32>(DUNGEON_ARMING_GRACE_SECONDS), notAccepted);
                 }
+                HoldClearingClock(coord, OverseerDecisions::ClearingClockState(false, true, true),
+                                  portal->insideMapId);
                 return;
             }
 
@@ -32055,7 +32159,11 @@ private:
             // for a poll and the anchor waits.
             Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
             if (!leader || leader->GetMapId() != portal->insideMapId)
+            {
+                HoldClearingClock(coord, OverseerDecisions::ClearingClockState(true, false, true),
+                                  portal->insideMapId);
                 return;
+            }
 
             // HAS THE RUN ACTUALLY GONE ANYWHERE (#171)? Asked BEFORE the
             // arming verdict below, because that verdict answers itself once
@@ -32129,6 +32237,18 @@ private:
                              "never be recorded 'complete'",
                              portal->insideMapId);
                 }
+            }
+
+            // NOBODY WHO MAY ISSUE `dc skip` IS NOBODY WHO MAY UNSTICK IT (#618),
+            // so the watchdog's ladder would spend its rungs on refusals. Held,
+            // like the two holds above; see HoldClearingClock.
+            {
+                OverseerDecisions::ClearingClock const clock =
+                    OverseerDecisions::ClearingClockState(
+                        true, true, AuthorizedDcIssuer(leader) != nullptr);
+                HoldClearingClock(coord, clock, portal->insideMapId);
+                if (clock != OverseerDecisions::ClearingClock::Runs)
+                    return;
             }
 
             if (RunClearingWatchdog(coord, leader, states, portal->insideMapId))

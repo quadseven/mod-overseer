@@ -1635,6 +1635,61 @@ bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
     return now - advancedAt <= ceilingSeconds;
 }
 
+DcArmingStep DecideDcArming(bool issuerAvailable, bool recordIsForThisRun,
+                            bool recordAccepted, bool retryDue)
+{
+    // FIRST, because nothing below it can happen without one. A `dc on` with
+    // no authorized issuer is refused by the dungeon module before it looks
+    // at anything else, so retrying it is noise and recording it would mark a
+    // refusal the character never earned.
+    if (!issuerAvailable)
+        return DcArmingStep::HoldNoIssuer;
+    if (recordIsForThisRun && recordAccepted)
+        return DcArmingStep::Armed;
+    if (recordIsForThisRun && !retryDue)
+        return DcArmingStep::WaitRetry;
+    return DcArmingStep::Issue;
+}
+
+bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap)
+{
+    return !inWorld || !onDungeonMap;
+}
+
+ClearingClock ClearingClockState(bool acceptedOnEveryoneInside, bool leaderVisible,
+                                 bool issuerAvailable)
+{
+    if (!acceptedOnEveryoneInside)
+        return ClearingClock::HeldNotArmed;
+    if (!leaderVisible)
+        return ClearingClock::HeldLeaderAway;
+    if (!issuerAvailable)
+        return ClearingClock::HeldNoIssuer;
+    return ClearingClock::Runs;
+}
+
+char const* ClearingClockHoldReason(ClearingClock clock)
+{
+    switch (clock)
+    {
+        case ClearingClock::HeldNotArmed:
+            return "'dc on' is not accepted for everyone inside yet";
+        case ClearingClock::HeldLeaderAway:
+            return "the leader is not on the dungeon map";
+        case ClearingClock::HeldNoIssuer:
+            return "no groupmate may issue a dungeon-clear command";
+        case ClearingClock::Runs:
+            break;
+    }
+    return "";
+}
+
+bool HeadTakesTheLead(bool headNamed, bool headPresent, bool headInThisGroup,
+                      bool headLeads)
+{
+    return headNamed && headPresent && headInThisGroup && !headLeads;
+}
+
 bool DungeonRunEnteredTheInstance(std::string const& outcome)
 {
     // THE CLOSED SET, NAMED RATHER THAN DERIVED. These are the only outcomes
