@@ -7825,6 +7825,17 @@ InnHold InnHoldStep(bool atTheInn, bool bindRefusedHere, bool alreadyHeld)
     return alreadyHeld ? InnHold::Release : InnHold::Nothing;
 }
 
+std::string TravelAimBesideBind(std::string const& bindAim, std::string const& column)
+{
+    // No bind trip open: the column is the errand, exactly as before.
+    if (bindAim.empty())
+        return column;
+    // The bind trip outranks whatever else was written over it, and an empty
+    // column (a release that cleared it mid-trip) does not end the trip either:
+    // the trip ends when the bind lands or its own backstop gives it up.
+    return bindAim;
+}
+
 // ------------- standing at a counter long enough to trade there (#378) ------
 
 CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby)

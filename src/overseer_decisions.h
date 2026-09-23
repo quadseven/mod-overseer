@@ -9813,6 +9813,27 @@ enum class InnHold : std::uint8_t
 // poll about a character nothing is holding is how a real one gets buried.
 InnHold InnHoldStep(bool atTheInn, bool bindRefusedHere, bool alreadyHeld);
 
+// A TOWN ERRAND WAITS FOR THE CAMPAIGN BIND, IT DOES NOT CANCEL IT (#583).
+//
+// Measured on the dev realm: a family leader walked to the Ratchet inn and held
+// there to bind was handed a vendor errand for a vendor fourteen yards off. The
+// pass that writes the errand also hands the character `new rpg` back, so the
+// travel drive walked it off the inn, the bind drive saw it outside the arrival
+// radius and let the hold go, and the walk home began again. Five cycles in ten
+// minutes; no homebind moved.
+//
+// The travel drive walks whatever `travel_npc` names, and the bind trip and a
+// town errand share that one column, so whichever wrote last won. This is the
+// order between them: while a character's campaign bind trip is open, the
+// travel drive keeps walking it to (and holding it at) the inn, and the errand
+// left in the column is served on the first poll after the bind lands or the
+// trip is given up. The errand is not erased; it only waits.
+//
+// `bindAim` is the aim the bind trip claimed, or empty when no trip is open for
+// this character. `column` is what `travel_npc` holds now. Returns the aim the
+// travel drive should walk this poll.
+std::string TravelAimBesideBind(std::string const& bindAim, std::string const& column);
+
 // AND THE WAITING HALF IS NOT HERE, deliberately. A hold is not instant -
 // StopMoving stops the spline and the flags Unit::isMoving reads clear on a
 // later tick, and a live conjure row that started moving spent one settle poll
