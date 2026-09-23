@@ -5824,7 +5824,11 @@ public:
             // character resurrected on this tick is alive by the time this one
             // asks, so a party that just recovered from a wipe inside the
             // instance is re-armed on the same pass rather than the next.
-            DriveDungeonClear();
+            {
+                std::map<std::string, OverseerDecisions::DcOnMark> const before = DcOnMarks();
+                DriveDungeonClear();
+                WriteDcOnTimeline(before, DcOnMarks());
+            }
         }
         // AFTER DriveTravel, on purpose. Both can run in the same tick, and
         // when they do the order that helps is travel first: a character that
@@ -5883,6 +5887,13 @@ public:
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_death WHERE created_at < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
+            // The run timeline: swept on created_at like the deaths, because a
+            // row is never updated after it is written.
+            if (RunTimelinePresent())
+                CharacterDatabase.Execute(
+                    "DELETE FROM overseer_dungeon_run_event "
+                    "WHERE created_at < NOW() - INTERVAL {} DAY",
+                    OverseerDecisions::RUN_TIMELINE_RETENTION_DAYS);
         }
         // EVERY TICK, AND ON NO TIMER AT ALL (#358). A hold that is only
         // re-asserted when some poll happens to come round is a hold with a
@@ -25236,6 +25247,177 @@ private:
     // one entry is read or written on behalf of another family.
     std::map<std::string, DungeonRunCoordinatorState> _dungeonRunCoordinators;
 
+    // THE RUN TIMELINE (overseer_dungeon_run_event). The coordinator's state is
+    // snapshotted before and after each family's poll and the difference is
+    // written down, one row per phase change or decision - see
+    // OverseerDecisions::RunTimelineEvents for why a diff and not a call at
+    // every transition. The container log rotates within minutes; this is the
+    // record that is still there an hour later.
+    static char const* DungeonRunPhaseName(DungeonRunPhase phase)
+    {
+        switch (phase)
+        {
+            case DungeonRunPhase::Idle:         return "IDLE";
+            case DungeonRunPhase::Resetting:    return "RESET";
+            case DungeonRunPhase::Gathering:    return "GATHERING";
+            case DungeonRunPhase::Barrier:      return "BARRIER";
+            case DungeonRunPhase::Enter:        return "ENTER";
+            case DungeonRunPhase::StagedInside: return "STAGED_INSIDE";
+            case DungeonRunPhase::Clearing:     return "CLEARING";
+            case DungeonRunPhase::Exiting:      return "EXIT";
+            case DungeonRunPhase::Repairing:    return "REPAIRING";
+        }
+        return "UNKNOWN";
+    }
+
+    static OverseerDecisions::RunTimelineSnapshot SnapshotRun(DungeonRunCoordinatorState const& coord)
+    {
+        OverseerDecisions::RunTimelineSnapshot snap;
+        snap.phase = DungeonRunPhaseName(coord.phase);
+        snap.runId = coord.runId;
+        snap.campaignId = coord.campaignId;
+        snap.runNumber = coord.runNumber;
+        snap.portal = coord.portalKeyword;
+        snap.clearSkips = coord.clearSkips;
+        snap.clearEncounters = coord.clearEncounters;
+        snap.stalledReason = coord.stalledReason;
+        snap.provedComplete = coord.provedComplete;
+        snap.evacuated = coord.evacuated;
+        snap.dcAcceptedAll = coord.loggedAccepted;
+        snap.dcNotAccepted = coord.loggedNotAccepted;
+        snap.brainNotMoving = coord.loggedNotMoved;
+        snap.busyCeiling = coord.loggedBusyCeiling;
+        snap.stagingRearms = coord.stagingRearms;
+        snap.resetAttempts = coord.resetAttempts;
+        return snap;
+    }
+
+    // What the timeline last wrote for each family. Lost on restart, which
+    // writes a run that is adopted afterwards as IDLE -> the phase it is in.
+    std::map<std::string, OverseerDecisions::RunTimelineSnapshot> _runTimelineSeen;
+
+    // A database without the table loses the timeline and nothing else, and
+    // says so once.
+    SchemaColumns _runTimelineColumns{SchemaColumns::Unknown};
+    bool RunTimelinePresent()
+    {
+        if (_runTimelineColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_dungeon_run_event", "'run_id','phase','kind','detail'", 4);
+            _runTimelineColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (present)
+                LOG_INFO("module.overseer",
+                         "overseer: run timeline on - dungeon run phase changes and "
+                         "decisions are written to overseer_dungeon_run_event and kept {} "
+                         "days", OverseerDecisions::RUN_TIMELINE_RETENTION_DAYS);
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_dungeon_run_event is missing "
+                         "(2026_09_23_00_overseer_dungeon_run_event.sql has not been "
+                         "applied), so dungeon runs are not written to the run timeline");
+        }
+        return _runTimelineColumns == SchemaColumns::Present;
+    }
+
+    void WriteRunTimeline(std::string const& family, std::string const& leaderName,
+                          std::string const& characterName,
+                          OverseerDecisions::RunTimelineEvent const& event)
+    {
+        if (!RunTimelinePresent())
+            return;
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_dungeon_run_event "
+            "(family, leader_name, character_name, run_id, campaign_id, run_number, "
+            " portal, phase, kind, detail) "
+            "VALUES ('{}', '{}', '{}', {}, {}, {}, '{}', '{}', '{}', '{}')",
+            Esc(family), Esc(leaderName), Esc(characterName), event.runId,
+            event.campaignId, event.runNumber, Esc(event.portal), Esc(event.phase),
+            Esc(event.kind), Esc(event.detail));
+    }
+
+    // The family a coordinator belongs to, found by address, because the
+    // functions that end a run are handed the state and not its key.
+    std::string FamilyOfCoordinator(DungeonRunCoordinatorState const& coord) const
+    {
+        for (auto const& [family, state] : _dungeonRunCoordinators)
+            if (&state == &coord)
+                return family;
+        return "";
+    }
+
+    // `dc on` / `dc off` for the timeline. The arming drive keeps its memory in
+    // _dcOnIssued; comparing it across one poll of that drive is every issue,
+    // acceptance, refusal streak and stand-down, without a line in the drive.
+    std::map<std::string, OverseerDecisions::DcOnMark> DcOnMarks() const
+    {
+        std::map<std::string, OverseerDecisions::DcOnMark> marks;
+        for (auto const& [name, record] : _dcOnIssued)
+        {
+            OverseerDecisions::DcOnMark mark;
+            mark.runId = record.runId;
+            mark.accepted = record.accepted;
+            mark.issuedAt = record.issuedAt;
+            mark.loggedRefused = record.loggedRefused;
+            mark.stoodDown = record.stoodDown;
+            marks[name] = mark;
+        }
+        return marks;
+    }
+
+    void WriteDcOnTimeline(std::map<std::string, OverseerDecisions::DcOnMark> const& before,
+                           std::map<std::string, OverseerDecisions::DcOnMark> const& after)
+    {
+        std::vector<OverseerDecisions::DcOnTimelineEvent> const events =
+            OverseerDecisions::DcOnTimelineEvents(before, after);
+        if (events.empty())
+            return;   // the roster is only read when there is something to write
+        std::vector<OverseerDecisions::FamilyRoster> const rosters = LoadFamilyRosters();
+        for (OverseerDecisions::DcOnTimelineEvent const& dc : events)
+        {
+            std::string family;
+            std::string leader;
+            for (OverseerDecisions::FamilyRoster const& roster : rosters)
+                for (OverseerDecisions::FamilyMember const& member : roster.members)
+                    if (member.name == dc.name)
+                    {
+                        family = roster.family;
+                        leader = roster.leader;
+                    }
+            OverseerDecisions::RunTimelineEvent event;
+            event.runId = dc.runId;
+            event.kind = dc.kind;
+            event.detail = dc.detail;
+            event.phase = "IDLE";
+            auto const coord = _dungeonRunCoordinators.find(family);
+            if (coord != _dungeonRunCoordinators.end())
+            {
+                event.campaignId = coord->second.campaignId;
+                event.runNumber = coord->second.runNumber;
+                event.portal = coord->second.portalKeyword;
+                event.phase = DungeonRunPhaseName(coord->second.phase);
+            }
+            WriteRunTimeline(family, leader, dc.name, event);
+        }
+    }
+
+    // THE ROW THAT SAYS HOW A RUN ENDED, with the same outcome and reason the
+    // run row gets. Written before the coordinator is reset, so it still knows
+    // which run it was; the phase change that follows is the diff's.
+    void WriteRunEnded(DungeonRunCoordinatorState const& coord, std::string const& leaderName,
+                       uint32 runId, char const* outcome, std::string const& reason)
+    {
+        OverseerDecisions::RunTimelineEvent event;
+        event.runId = runId ? runId : coord.runId;
+        event.campaignId = coord.campaignId;
+        event.runNumber = coord.runNumber;
+        event.portal = coord.portalKeyword;
+        event.phase = DungeonRunPhaseName(coord.phase);
+        event.kind = "ended";
+        event.detail = OverseerDecisions::RunTimelineDetail(std::string(outcome) + ": " + reason);
+        WriteRunTimeline(FamilyOfCoordinator(coord), leaderName, "", event);
+    }
+
     // WHERE A RUN STANDS, in the words the fetch rule reads (2026-09-23). Here
     // rather than beside DriveFetch because a parameter type has to be declared
     // before the declaration that names it. See RunLetsTheLeaderFetch.
@@ -27305,6 +27487,7 @@ private:
 
         RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
                            coord.runNumber, "reset_failed", reason, JoinNames(members));
+        WriteRunEnded(coord, leaderName, 0, "reset_failed", reason);
         _travelAims.Release(leaderName);
         coord = DungeonRunCoordinatorState();
     }
@@ -27572,6 +27755,7 @@ private:
     {
         AlignRunLeader(runId, leaderName);
         CloseRun(runId, outcome, reason);
+        WriteRunEnded(coord, leaderName, runId, outcome, reason);
 
         // WHERE THE CAMPAIGN STANDS NOW, AND WHETHER THIS RUN MOVED IT (#225).
         // The arithmetic is in the pure decisions because it is the part that
@@ -29628,11 +29812,24 @@ private:
                 continue;
             }
             if (it->second.phase != DungeonRunPhase::Idle)
+            {
                 LOG_WARN("module.overseer",
                          "overseer: family '{}' is no longer on the roster with a leader, "
                          "so its dungeon coordinator (run {}, portal '{}') is let go. The "
                          "run row closes on its own cold heartbeat",
                          it->first, it->second.runId, it->second.portalKeyword);
+                OverseerDecisions::RunTimelineEvent released;
+                released.runId = it->second.runId;
+                released.campaignId = it->second.campaignId;
+                released.runNumber = it->second.runNumber;
+                released.portal = it->second.portalKeyword;
+                released.phase = "IDLE";
+                released.kind = "released";
+                released.detail = "the family is no longer on the roster with a leader, so "
+                                  "its coordinator is let go";
+                WriteRunTimeline(it->first, "", "", released);
+            }
+            _runTimelineSeen.erase(it->first);
             it = _dungeonRunCoordinators.erase(it);
         }
 
@@ -29642,6 +29839,15 @@ private:
             for (OverseerDecisions::FamilyMember const& member : roster->members)
                 members.push_back(member.name);
             DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
+            // Compared with what was last WRITTEN rather than with the state at
+            // the top of this poll, so a change made anywhere between two polls
+            // is still caught here.
+            OverseerDecisions::RunTimelineSnapshot const now =
+                SnapshotRun(_dungeonRunCoordinators[roster->family]);
+            for (OverseerDecisions::RunTimelineEvent const& event :
+                 OverseerDecisions::RunTimelineEvents(_runTimelineSeen[roster->family], now))
+                WriteRunTimeline(roster->family, roster->leader, "", event);
+            _runTimelineSeen[roster->family] = now;
         }
     }
 

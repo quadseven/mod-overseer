@@ -11519,4 +11519,131 @@ std::uint32_t TakeLootedItemGuid(LootStoreNote& note, std::uint64_t looter, std:
     return taken.itemGuid;
 }
 
+std::string RunTimelineDetail(std::string const& text, std::size_t max)
+{
+    if (text.size() <= max)
+        return text;
+    if (max < 3)
+        return text.substr(0, max);
+    return text.substr(0, max - 3) + "...";
+}
+
+std::vector<RunTimelineEvent> RunTimelineEvents(RunTimelineSnapshot const& before,
+                                                RunTimelineSnapshot const& after)
+{
+    std::vector<RunTimelineEvent> events;
+
+    // A coordinator back at IDLE has forgotten which run it was driving, so
+    // anything that happened on the way there belongs to the earlier one.
+    bool const wentIdle = after.phase == "IDLE";
+    RunTimelineSnapshot const& who = wentIdle ? before : after;
+    // A fresh coordinator (after a run ended, or an IDLE that went back to
+    // IDLE) starts every counter at zero again, so a counter only means
+    // something when both snapshots are about the same run.
+    bool const sameRun = before.runNumber == after.runNumber &&
+                         before.campaignId == after.campaignId &&
+                         (before.runId == 0 || after.runId == 0 || before.runId == after.runId);
+    bool const sameRunDecisions = sameRun && !wentIdle;
+
+    auto add = [&](std::string kind, std::string detail) {
+        RunTimelineEvent e;
+        e.runId = who.runId;
+        e.campaignId = who.campaignId;
+        e.runNumber = who.runNumber;
+        e.portal = who.portal;
+        e.phase = after.phase;
+        e.kind = std::move(kind);
+        e.detail = RunTimelineDetail(detail);
+        events.push_back(std::move(e));
+    };
+
+    if (sameRunDecisions)
+    {
+        // Only bits newly set are credit. A mask that lost bits (an instance
+        // reset under the same run) is not a boss dying, and writes nothing.
+        uint32_t const gained = after.clearEncounters & ~before.clearEncounters;
+        if (gained != 0)
+        {
+            unsigned credited = 0;
+            for (uint32_t bits = gained; bits; bits &= bits - 1)
+                ++credited;
+            unsigned total = 0;
+            for (uint32_t bits = after.clearEncounters; bits; bits &= bits - 1)
+                ++total;
+            add("boss", std::to_string(credited) + " encounter" + (credited == 1 ? "" : "s") +
+                            " credited, " + std::to_string(total) + " in all (mask " +
+                            std::to_string(before.clearEncounters) + " -> " +
+                            std::to_string(after.clearEncounters) + ")");
+        }
+        if (after.clearSkips > before.clearSkips)
+            add("dc_skip", "'dc skip' " + std::to_string(after.clearSkips) +
+                               " issued: the run has not advanced");
+        if (after.resetAttempts > before.resetAttempts && after.resetAttempts > 1)
+            add("reset_retry", "reset attempt " + std::to_string(after.resetAttempts));
+        if (after.stagingRearms > before.stagingRearms)
+            add("staging_rearm", "the leader's staging errand was taken back (" +
+                                     std::to_string(after.stagingRearms) + " so far)");
+        if (after.dcAcceptedAll && !before.dcAcceptedAll)
+            add("dc_on_all", "'dc on' accepted for everyone inside");
+        if (after.dcNotAccepted && !before.dcNotAccepted)
+            add("dc_not_accepted", "'dc on' has not been accepted on everyone inside");
+        if (after.brainNotMoving && !before.brainNotMoving)
+            add("brain_not_moving", "'dc on' was accepted but the leader has not moved");
+        if (after.busyCeiling && !before.busyCeiling)
+            add("busy_ceiling", "the party has looked busy too long without progress; "
+                                "the clearing watchdog counts anyway");
+        if (!after.stalledReason.empty() && after.stalledReason != before.stalledReason)
+            add("stalled", after.stalledReason);
+        if (after.provedComplete && !before.provedComplete)
+            add("complete", "every encounter the map credits has been credited");
+        if (after.evacuated && !before.evacuated)
+            add("evacuated", "the family has no bag room; the run is walked out");
+    }
+
+    if (after.phase != before.phase)
+    {
+        std::string detail = before.phase + " -> " + after.phase;
+        if (before.phase == "IDLE" && !after.portal.empty())
+            detail += " (" + after.portal + ", run " + std::to_string(after.runNumber) +
+                      " of campaign " + std::to_string(after.campaignId) + ")";
+        add("phase", detail);
+    }
+    return events;
+}
+
+std::vector<DcOnTimelineEvent> DcOnTimelineEvents(std::map<std::string, DcOnMark> const& before,
+                                                  std::map<std::string, DcOnMark> const& after)
+{
+    std::vector<DcOnTimelineEvent> events;
+    for (auto const& entry : after)
+    {
+        std::string const& name = entry.first;
+        DcOnMark const& now = entry.second;
+        auto const it = before.find(name);
+        DcOnMark const was = it == before.end() ? DcOnMark{} : it->second;
+        auto add = [&](char const* kind, std::string detail) {
+            DcOnTimelineEvent e;
+            e.name = name;
+            e.runId = now.runId;
+            e.kind = kind;
+            e.detail = RunTimelineDetail(detail);
+            events.push_back(std::move(e));
+        };
+        // An ACCEPTANCE, not a timestamp: a row when the character becomes
+        // accepted, when it is accepted for a different run, or when it is
+        // armed again after a stand-down. A re-issue that changes only the
+        // time writes nothing.
+        bool const newlyAccepted = now.accepted &&
+                                   (!was.accepted || now.runId != was.runId ||
+                                    (was.stoodDown && !now.stoodDown));
+        if (newlyAccepted)
+            add("dc_on", "'dc on' accepted for '" + name + "'");
+        if (now.loggedRefused && (!was.loggedRefused || now.runId != was.runId))
+            add("dc_on_refused", "'dc on' refused for '" + name + "'; retrying");
+        if (now.stoodDown && !was.stoodDown)
+            add("dc_off", "'dc off' for '" + name + "': the brain lets go on the way out");
+    }
+    return events;
+}
+
 }  // namespace OverseerDecisions
