@@ -4883,6 +4883,15 @@ public:
         return it == _state.end() ? std::string() : it->second.target;
     }
 
+    // WHETHER THE AIM IN THIS CHARACTER'S COLUMN IS ONE THE DRIVE REFUSED TO
+    // WALK, read without creating a record, for the reason TargetFor gives: the
+    // party flight asks it about every member it seats.
+    bool InertFollowerAim(std::string const& name) const
+    {
+        auto const it = _state.find(name);
+        return it != _state.end() && it->second.inertFollowerAim;
+    }
+
     // DID A DUNGEON RUN ISSUE THIS ERRAND? Asked of the target as well as the
     // name, so a run staging aim that has since been replaced by somebody
     // else's errand for the same character does not answer for it.
@@ -12724,7 +12733,7 @@ private:
         // OverseerDecisions::MemberFollowsForFlight.
         seat.read.followingTheLeader = OverseerDecisions::MemberFollowsForFlight(
             _travelAims.TargetFor(seat.read.name).empty(), IsCatchingUp(seat.read.name),
-            _travelAims.StateFor(seat.read.name).inertFollowerAim,
+            _travelAims.InertFollowerAim(seat.read.name),
             HeldWaitingForLeader(seat.read.name));
 
         if (!seat.read.onSameMap || !seat.read.alive || seat.read.inFlight ||
