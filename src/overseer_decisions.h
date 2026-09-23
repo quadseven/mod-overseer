@@ -44,6 +44,7 @@
 #ifndef MOD_OVERSEER_DECISIONS_H
 #define MOD_OVERSEER_DECISIONS_H
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
@@ -8238,6 +8239,15 @@ struct RoutePlanLimits
     // could not do for itself, and aiming BACKWARDS is the greedy stepper's own
     // failure mode wearing a route's clothes.
     float minGainYards{200.f};
+    // NODES THAT MAY NOT BE THE WAY IN (2026-09-23). The nearest node is chosen
+    // by plane distance, and a node beside the character can stand on a level
+    // it cannot reach: in Orgrimmar the Horde PVP Barracks exit node sits 19
+    // yards from where the leader stood and 9 yards above him, and he "made no
+    // progress in 468 tries" at it. The caller asks the navmesh about the entry
+    // this planner chose and, when it cannot be reached, plans again with that
+    // node here. A refused node is only refused as the ENTRY: a route may still
+    // pass through it, since a recorded path leaves it from where it stands.
+    std::vector<std::uint32_t> refusedEntries;
 };
 
 // THE NODE SEQUENCE, AND THE ONE CHOICE THAT MAKES IT WORK.
@@ -8321,6 +8331,18 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                         std::vector<RouteLink> const& links,
                         std::uint32_t mapId, float fromX, float fromY,
                         float toX, float toY, RoutePlanLimits const& limits);
+
+// DOES THE NAVMESH SAY THIS ENTRY NODE CANNOT BE WALKED TO? (2026-09-23)
+//
+// Asked of the node PlanFootRoute chose as the way in, and answered YES only
+// when the navmesh was consulted and refused: no path at all, or a path whose
+// real end stops more than `toleranceYards` short of the node, which is what a
+// node on a platform above the character reads as. Everything else is NO, and
+// deliberately: a path that could not be computed is no answer, and ground with
+// no navmesh loaded is exactly the ground the survey exists to route across, so
+// refusing its nodes there would take away the only road the character has.
+bool EntryUnreachable(bool computed, bool meshAbsent, bool noPath, float endGapYards,
+                      float toleranceYards);
 
 // How far along its route a character has got. Held by the caller beside the
 // route itself, and thrown away with it.

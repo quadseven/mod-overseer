@@ -1743,6 +1743,16 @@ constexpr uint32 TRAVEL_ROUTE_LINK_WALK = 1;
 // margin and bounds the work; a route that has not settled by then keeps the
 // last plan, which is today's behaviour.
 constexpr unsigned TRAVEL_ROUTE_GUARDED_PASSES = 6;
+// HOW MANY SURVEY NODES A ROUTE MAY REFUSE AS ITS WAY IN (2026-09-23), one per
+// navmesh check on a node the character cannot walk to. Three is the nearest
+// three nodes; past that the character is standing somewhere the survey does
+// not reach, and the greedy stepper is what is left, as before.
+constexpr unsigned TRAVEL_ROUTE_ENTRY_RETRIES = 3;
+// How near the navmesh's own path must end to a route's entry node for the node
+// to count as reachable. The same ten yards TRAVEL_ARRIVED_VERTICAL_YARDS allows
+// between a place aim and a character's feet, so a node on the level above the
+// character, nine yards up and more, is not one it can walk to.
+constexpr float TRAVEL_ROUTE_ENTRY_REACH_YARDS = 10.0f;
 
 // How far apart to read the ground along a leg. The same thirty yards
 // PlanRouteSamples already uses for the straight-line gate, so the two readings
@@ -14991,6 +15001,24 @@ private:
     // or will it draw a straight line? The test is the mover's OWN
     // (PointMovementGenerator.cpp:66) rather than a judgement of this module's,
     // so the two can never disagree about what is about to happen.
+    // Does the navmesh positively refuse a walk from `bot` to (x, y, z)? Asked
+    // of a survey route's way in; see OverseerDecisions::EntryUnreachable for
+    // why no answer and no navmesh are both "no".
+    static bool NavmeshRefusesEntry(Player* bot, float x, float y, float z)
+    {
+        PathGenerator path(bot);   // PathGenerator.h:61
+        bool const computed = path.CalculatePath(x, y, z);
+        PathType const type = computed ? path.GetPathType() : PATHFIND_BLANK;
+        G3D::Vector3 const& end = path.GetActualEndPosition();
+        float const dx = end.x - x;
+        float const dy = end.y - y;
+        float const dz = end.z - z;
+        return OverseerDecisions::EntryUnreachable(
+            computed, (type & PATHFIND_NOT_USING_PATH) != 0,
+            (type & PATHFIND_NOPATH) != 0, std::sqrt(dx * dx + dy * dy + dz * dz),
+            TRAVEL_ROUTE_ENTRY_REACH_YARDS);
+    }
+
     static bool NavmeshRoutes(Player* bot, float x, float y, float z)
     {
         PathGenerator path(bot);   // PathGenerator.h:61
@@ -15796,19 +15824,53 @@ private:
         limits.entryNodeYards = TRAVEL_ROUTE_ENTRY_YARDS;
         limits.minGainYards = TRAVEL_ROUTE_GAIN_YARDS;
         OverseerDecisions::RoutePlan plan;
-        for (unsigned pass = 0; pass <= TRAVEL_ROUTE_GUARDED_PASSES; ++pass)
+        unsigned refusedEntries = 0;
+        uint32 walkableEntry = 0;
+        for (unsigned pass = 0; pass <= TRAVEL_ROUTE_GUARDED_PASSES;)
         {
             plan = OverseerDecisions::PlanFootRoute(
                 survey.nodes, survey.links, bot->GetMapId(), bot->GetPositionX(),
                 bot->GetPositionY(), aimX, aimY, limits);
             if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
                 break;
+            // THE WAY IN MUST BE A PLACE THE CHARACTER CAN WALK TO (2026-09-23).
+            // The nearest node by plane distance can stand on a level the
+            // character cannot reach: the Orgrimmar barracks exit node sat 19
+            // yards from the Horde leader and 9 yards above him, and he made no
+            // progress at it in 468 tries. The navmesh is asked about the entry,
+            // once per entry, and a node it positively refuses is refused
+            // as the way in and the plan is made again, up to
+            // TRAVEL_ROUTE_ENTRY_RETRIES times. A re-plan for the entry does not
+            // spend one of the guarded-ground passes below.
+            uint32 const entryId = plan.nodes.front();
+            if (entryId != walkableEntry && refusedEntries < TRAVEL_ROUTE_ENTRY_RETRIES)
+            {
+                auto const entry = byId.find(entryId);
+                if (entry != byId.end() &&
+                    NavmeshRefusesEntry(bot, entry->second->x, entry->second->y,
+                                        entry->second->z))
+                {
+                    ++refusedEntries;
+                    limits.refusedEntries.push_back(entryId);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' cannot walk to survey node {} from where it "
+                             "stands ({:.0f} yards across, {:.0f} up or down) - it is "
+                             "refused as the way in and the route is planned again "
+                             "from the next node",
+                             bot->GetName(), entryId,
+                             bot->GetDistance2d(entry->second->x, entry->second->y),
+                             std::fabs(bot->GetPositionZ() - entry->second->z));
+                    continue;
+                }
+                walkableEntry = entryId;
+            }
             // The last time round is a plan and not a measurement, so whatever
             // is returned was planned with everything that has been learned.
             if (pass == TRAVEL_ROUTE_GUARDED_PASSES)
                 break;
             if (!MeasureGuardedLegs(bot, survey, bot->GetMapId(), plan.nodes, byId))
                 break;
+            ++pass;
         }
 
         if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)

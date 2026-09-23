@@ -6820,6 +6820,14 @@ GroundDanger ScoreGroundDanger(std::vector<DangerSpawn> const& spawns,
     return out;
 }
 
+bool EntryUnreachable(bool computed, bool meshAbsent, bool noPath, float endGapYards,
+                      float toleranceYards)
+{
+    if (!computed || meshAbsent)
+        return false;
+    return noPath || endGapYards > toleranceYards;
+}
+
 RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                         std::vector<RouteLink> const& links,
                         std::uint32_t mapId, float fromX, float fromY,
@@ -6862,6 +6870,9 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     float entryDistance = -1.f;
     for (std::uint32_t i = 0; i < here.size(); ++i)
     {
+        if (std::find(limits.refusedEntries.begin(), limits.refusedEntries.end(),
+                      here[i].id) != limits.refusedEntries.end())
+            continue;
         float const d = PlaneDistance(here[i].x, here[i].y, fromX, fromY);
         if (entryDistance < 0.f || d < entryDistance)
         {
@@ -6869,7 +6880,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
             entry = i;
         }
     }
-    if (entryDistance > limits.entryNodeYards)
+    if (entryDistance < 0.f || entryDistance > limits.entryNodeYards)
     {
         plan.verdict = RoutePlanVerdict::NoEntryNode;
         return plan;
