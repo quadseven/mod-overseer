@@ -2969,6 +2969,32 @@ enum class TravelClaim : uint8_t
     RefusedForeign,     // the column holds an errand this book did not issue
 };
 
+// WHOSE WALK AN AIM IS, NAMED AT EVERY CLAIM (#598). Claim took two bools,
+// `catchUp` and `dungeonRun`, that defaulted to false, so a caller that named
+// neither was fenced as if it were nobody in particular. That is how the
+// BARRIER escort kept the #435 fence after #589 lifted it for the other run
+// claims: it called Claim(name, aim) and said nothing about whose aim it was.
+// Measured on the dev realm 2026-09-23 with skill 186 pending on the leader:
+// the staging errand was released on arrival, BARRIER's re-claim of the same
+// point was refused, and the leader was 408 yards away 90 seconds later.
+//
+// Four owners share the travel column, and each claim now says which it is.
+// There is no "unspecified", so a fifth owner cannot arrive fenced by default.
+enum class TravelOwner : uint8_t
+{
+    HomeErrand,  // a walk to the campaign's inn (#348)
+    CatchUp,     // a follower's catch-up walk to its leader (#138)
+    Run,         // a dungeon run's own aim: staging, corridor, berth, BARRIER,
+                 // crossing, town, repair or reset exit (wow-overseer#227)
+    WalkBackIn,  // a member walked back into the instance its run is in (#393)
+};
+
+// DOES THIS OWNER'S AIM PASS A PROFESSION ERRAND WHOSE COLUMN IS EMPTY? The
+// catch-up walk (#560) and every walk a dungeon run makes (wow-overseer#227,
+// #598), including the walk back in, which is the run's too. The home errand
+// keeps the #435 fence.
+bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner);
+
 struct TravelClaimFacts
 {
     // `learn_skill` as read this call; zero means no profession errand.
@@ -2977,13 +3003,33 @@ struct TravelClaimFacts
     std::string column;
     // `column` is the aim this book itself last wrote for this character.
     bool columnIsOurs{false};
-    // The aim is a follower's catch-up walk to its leader.
-    bool catchUp{false};
-    // The aim is the dungeon run coordinator's own (wow-overseer#227).
-    bool dungeonRun{false};
+    // Whose walk the aim is. See TravelOwner.
+    TravelOwner owner{TravelOwner::HomeErrand};
 };
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts);
+
+// DOES A TRAVEL FOCUS OUTLIVE ITS ERRAND (#404, #598)? The focus is the record
+// of the diverters (`grind`, `rpg`, `travel`, `move random` and the rest of
+// ESCORT_DIVERT_STRATEGIES) stood down for a walk, and SweepTravelFocus hands
+// them back once the errand stops coming back from the roster.
+//
+// A HOLD THAT KEEPS A CHARACTER STILL KEEPS ITS DIVERTERS DOWN, with or without
+// an errand under it. The regroup hold (#404) was the first owner of that
+// record with no errand at all. The staging hold is the second: a leader that
+// has reached the staging point has his errand released on arrival, and a
+// refused re-claim then left the sweep to hand `grind` back to a character the
+// barrier was holding. `grind` outranks `stay`, it walks him to a target, the
+// fight takes him off the point, and the hold lets go of a character in combat.
+// Both holds have ceilings of their own, so neither can keep a focus forever.
+struct TravelFocusFacts
+{
+    bool stillAimed{false};          // the errand still comes back from the roster
+    bool heldForRegroup{false};      // a regroup hold is on this character
+    bool heldAtStagingPoint{false};  // a dungeon run's staging hold is on it
+};
+
+bool TravelFocusOutlivesItsErrand(TravelFocusFacts const& facts);
 
 // THE RELEASE GATE'S SENTENCE (#561). TravelAimBook::Release skips its column
 // write for an aim it never claimed while either fence is up, and its log line

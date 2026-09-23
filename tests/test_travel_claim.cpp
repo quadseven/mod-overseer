@@ -67,7 +67,8 @@ TravelClaimFacts Facts(uint32_t learnSkill, char const* column, bool ours, bool 
     facts.learnSkill = learnSkill;
     facts.column = column;
     facts.columnIsOurs = ours;
-    facts.catchUp = catchUp;
+    facts.owner = catchUp ? OverseerDecisions::TravelOwner::CatchUp
+                          : OverseerDecisions::TravelOwner::HomeErrand;
     return facts;
 }
 
@@ -97,7 +98,7 @@ void ACatchUpClaimAcrossTheThreeCases()
 TravelClaimFacts RunFacts(uint32_t learnSkill, char const* column)
 {
     TravelClaimFacts facts = Facts(learnSkill, column, false, false);
-    facts.dungeonRun = true;
+    facts.owner = OverseerDecisions::TravelOwner::Run;
     return facts;
 }
 

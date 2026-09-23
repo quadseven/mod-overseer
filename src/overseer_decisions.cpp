@@ -1899,15 +1899,34 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     if (facts.columnIsOurs && !facts.column.empty())
         return TravelClaim::Write;
     // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
-    // or a dungeon run's aim over an empty column overwrites no trainer walk
-    // (wow-overseer#227); any other claim, or a column that holds anything at
-    // all, keeps the #435 answer.
+    // or any dungeon run's aim over an empty column overwrites no trainer walk
+    // (wow-overseer#227, #598); the home errand, or a column that holds
+    // anything at all, keeps the #435 answer.
     if (facts.learnSkill != 0 &&
-        !((facts.catchUp || facts.dungeonRun) && facts.column.empty()))
+        !(TravelOwnerPassesAnEmptyLearnColumn(facts.owner) && facts.column.empty()))
         return TravelClaim::RefusedProfession;
     if (IsForeignTravelAim(facts.column))
         return TravelClaim::RefusedForeign;
     return TravelClaim::Write;
+}
+
+bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner)
+{
+    switch (owner)
+    {
+        case TravelOwner::CatchUp:
+        case TravelOwner::Run:
+        case TravelOwner::WalkBackIn:
+            return true;
+        case TravelOwner::HomeErrand:
+            return false;
+    }
+    return false;
+}
+
+bool TravelFocusOutlivesItsErrand(TravelFocusFacts const& facts)
+{
+    return facts.stillAimed || facts.heldForRegroup || facts.heldAtStagingPoint;
 }
 
 std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing)
