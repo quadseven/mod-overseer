@@ -26,6 +26,107 @@ bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand)
     return !leaderHasOutstandingErrand;
 }
 
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
+                              bool errandIsTheRunsOwnAim)
+{
+    return !leaderHasOutstandingErrand || errandIsTheRunsOwnAim;
+}
+
+namespace
+{
+
+// One decimal field of a place aim, read without a stream or a header this file
+// does not include. std::stof comes with <string>; it throws on no digits and
+// says through `used` where it stopped, which is what the separators need.
+bool ReadAimNumber(std::string const& text, std::size_t& at, float& out)
+{
+    if (at >= text.size())
+        return false;
+    try
+    {
+        std::size_t used = 0;
+        out = std::stof(text.substr(at), &used);
+        if (used == 0)
+            return false;
+        at += used;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+}  // namespace
+
+bool ParsePlaceAim(std::string const& aim, std::uint32_t& mapId, float& x,
+                   float& y, float& z)
+{
+    if (aim.rfind("at:", 0) != 0)
+        return false;
+    std::size_t at = 3;
+    std::size_t const colon = aim.find(':', at);
+    if (colon == std::string::npos || colon == at)
+        return false;
+    std::string const digits = aim.substr(at, colon - at);
+    if (digits.size() > 10 || digits.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    unsigned long long parsed = 0;
+    for (char c : digits)
+        parsed = parsed * 10 + static_cast<unsigned long long>(c - '0');
+    if (parsed > 4294967295ULL)
+        return false;
+    at = colon + 1;
+    float px = 0.f, py = 0.f, pz = 0.f;
+    if (!ReadAimNumber(aim, at, px) || at >= aim.size() || aim[at] != ',')
+        return false;
+    ++at;
+    if (!ReadAimNumber(aim, at, py) || at >= aim.size() || aim[at] != ',')
+        return false;
+    ++at;
+    if (!ReadAimNumber(aim, at, pz) || at != aim.size())
+        return false;
+    mapId = static_cast<std::uint32_t>(parsed);
+    x = px;
+    y = py;
+    z = pz;
+    return true;
+}
+
+bool TravelErrandIsTheRunsOwnAim(std::string const& column,
+                                 std::vector<std::string> const& runAims,
+                                 float planeYards, float verticalYards)
+{
+    std::uint32_t map = 0;
+    float x = 0.f, y = 0.f, z = 0.f;
+    if (!ParsePlaceAim(column, map, x, y, z))
+        return false;
+    for (std::string const& own : runAims)
+    {
+        std::uint32_t ownMap = 0;
+        float ox = 0.f, oy = 0.f, oz = 0.f;
+        if (!ParsePlaceAim(own, ownMap, ox, oy, oz) || ownMap != map)
+            continue;
+        float const dx = ox - x;
+        float const dy = oy - y;
+        if (PlaceAimArrived(std::sqrt(dx * dx + dy * dy), oz - z, planeYards,
+                            verticalYards))
+            return true;
+    }
+    return false;
+}
+
+bool PlaceAimArrived(float planeYards, float verticalYards, float arriveWithin,
+                     float verticalWithin)
+{
+    if (planeYards > arriveWithin)
+        return false;
+    if (verticalWithin <= 0.f)
+        return true;
+    float const magnitude = verticalYards < 0.f ? -verticalYards : verticalYards;
+    return magnitude <= verticalWithin;
+}
+
 namespace
 {
 
