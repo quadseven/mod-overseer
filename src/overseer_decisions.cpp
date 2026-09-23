@@ -1977,6 +1977,7 @@ bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner)
         case TravelOwner::CatchUp:
         case TravelOwner::Run:
         case TravelOwner::WalkBackIn:
+        case TravelOwner::Respec:
             return true;
         case TravelOwner::HomeErrand:
             return false;
@@ -11699,6 +11700,125 @@ std::vector<DcOnTimelineEvent> DcOnTimelineEvents(std::map<std::string, DcOnMark
             add("dc_off", "'dc off' for '" + name + "': the brain lets go on the way out");
     }
     return events;
+}
+
+// --------------------------------------- the family's tank, made one (#626) --
+
+bool ClassTrainerServes(bool isClassTrainer, uint32_t requirement, uint32_t playerClass)
+{
+    return isClassTrainer && requirement != 0 && requirement == playerClass;
+}
+
+uint32_t PointsOutsideTree(uint32_t const (&pointsByTree)[3], uint8_t tree)
+{
+    uint32_t outside = 0;
+    for (uint8_t tab = 0; tab < 3; ++tab)
+        if (tab != tree)
+            outside += pointsByTree[tab];
+    return outside;
+}
+
+uint8_t DominantTree(uint32_t const (&pointsByTree)[3])
+{
+    uint8_t best = 255;
+    uint32_t most = 0;
+    for (uint8_t tab = 0; tab < 3; ++tab)
+    {
+        if (pointsByTree[tab] > most)
+        {
+            most = pointsByTree[tab];
+            best = tab;
+        }
+    }
+    return best;
+}
+
+RespecStep JudgeRespec(RespecFacts const& facts)
+{
+    if (facts.specTab > 2)
+        return RespecStep::NoTree;
+    if (facts.level < RESPEC_MIN_LEVEL)
+        return RespecStep::TooLow;
+    if (!PointsOutsideTree(facts.pointsByTree, facts.specTab))
+        return RespecStep::InTree;
+    // THE PRICE IS ASKED BEFORE ANYTHING ELSE ABOUT THE WALK. A walk to a
+    // trainer the character cannot pay is a walk that ends in the core's own
+    // BUY_ERR_NOT_ENOUGHT_MONEY, sent to a client nobody is reading.
+    if (!facts.costWaived && facts.money < facts.cost)
+        return RespecStep::CannotAfford;
+    if (!facts.available)
+        return RespecStep::NotNow;
+    if (!facts.columnFree)
+        return RespecStep::ColumnBusy;
+    if (facts.sinceLastMiss < RESPEC_RETRY_SECONDS)
+        return RespecStep::Resting;
+    return RespecStep::Walk;
+}
+
+char const* RespecStepWord(RespecStep step)
+{
+    switch (step)
+    {
+        case RespecStep::NoTree: return "no tree chosen";
+        case RespecStep::TooLow: return "below the reset level";
+        case RespecStep::InTree: return "already in its tree";
+        case RespecStep::CannotAfford: return "cannot afford the reset";
+        case RespecStep::NotNow: return "not free to walk";
+        case RespecStep::ColumnBusy: return "another errand holds the travel column";
+        case RespecStep::Resting: return "waiting out the retry after a missed reset";
+        case RespecStep::Walk: return "walk to its class trainer";
+    }
+    return "unknown";
+}
+
+bool RespecTook(uint32_t outsideBefore, uint32_t outsideAfter, uint32_t freeBefore,
+                uint32_t freeAfter)
+{
+    return outsideBefore > 0 && outsideAfter == 0 && freeAfter > freeBefore;
+}
+
+std::string TankStrategyChange(TankStrategyFacts const& facts)
+{
+    if (!facts.rosterTreeTanks || !facts.talentsInTree)
+        return std::string();
+    std::string change;
+    if (!facts.hasTank)
+        change = "+tank";
+    if (!facts.hasTankAssist)
+    {
+        if (!change.empty())
+            change += ',';
+        change += "+tank assist";
+    }
+    return change;
+}
+
+GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield)
+{
+    GearVerdict pair;
+    pair.wearable = oneHand.wearable && shield.wearable;
+    if (!pair.wearable)
+    {
+        GearVerdict const& refused = oneHand.wearable ? shield : oneHand;
+        pair.refusal = refused.refusal;
+        pair.why = refused.why;
+        pair.confidence = GearConfidence::Exact;
+        return pair;
+    }
+
+    GearIncumbentScore const summed = GearIncumbentPair(
+        GearIncumbentScore{oneHand.score, oneHand.confidence},
+        GearIncumbentScore{shield.score, shield.confidence});
+    pair.score = summed.score;
+    pair.confidence = summed.confidence;
+    pair.judged = oneHand.judged && shield.judged;
+    pair.why = oneHand.why + " with a shield, " + shield.why;
+    return pair;
+}
+
+bool GearTankWeighsShieldPair(GearRole role, bool twoHanderInMainHand)
+{
+    return role == GearRole::Tank && twoHanderInMainHand;
 }
 
 }  // namespace OverseerDecisions

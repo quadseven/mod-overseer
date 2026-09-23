@@ -3056,12 +3056,16 @@ enum class TravelOwner : uint8_t
     Run,         // a dungeon run's own aim: staging, corridor, berth, BARRIER,
                  // crossing, town, repair or reset exit (wow-overseer#227)
     WalkBackIn,  // a member walked back into the instance its run is in (#393)
+    Respec,      // a walk to a class trainer of its own class for a talent reset (#626)
 };
 
 // DOES THIS OWNER'S AIM PASS A PROFESSION ERRAND WHOSE COLUMN IS EMPTY? The
 // catch-up walk (#560) and every walk a dungeon run makes (wow-overseer#227,
 // #598), including the walk back in, which is the run's too. The home errand
-// keeps the #435 fence.
+// keeps the #435 fence. The talent reset (#626) passes as well: over an empty
+// column there is no trainer walk to overwrite, the bridge holds its learn
+// trips while the column is taken, and a tank who cannot tank is what keeps the
+// family's runs from starting at all.
 bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner);
 
 struct TravelClaimFacts
@@ -14189,6 +14193,137 @@ std::vector<DcOnTimelineEvent> DcOnTimelineEvents(std::map<std::string, DcOnMark
 // `text` cut to fit the detail column, marked with "..." when it was cut.
 std::string RunTimelineDetail(std::string const& text,
                               std::size_t max = RUN_TIMELINE_DETAIL_MAX);
+
+// --------------------------------------- the family's tank, made one (#626) --
+//
+// THE OPERATOR'S DECISION: the head of each family is a protection warrior and
+// the main tank. The roster already says which tree a character spends points
+// in (`overseer_roster.spec_tab`), and TrainRoster spends FREE points in that
+// tree. It never takes a point back, so a character whose points already sit in
+// another tree stays there however the column changes. Measured on the dev
+// realm: the Horde head had 16 points in fury under a roster row that called
+// him the tank, and his playerbot strategy fell back to `arms`, which is not a
+// tank strategy, so the dungeon module elected nobody to lead his runs.
+//
+// What follows is the in-game way out of that, in three parts: a talent reset
+// bought from a class trainer of the character's own class, a combat engine
+// that carries the tank strategies once the talents say tank, and a gear pass
+// that trades a two-hander for a one-hander and a shield when the character is
+// a tank.
+
+// THE ERRAND'S AIM. The same keyword TravelRoles() already resolves, narrowed
+// to a trainer of the character's own class (ClassTrainerServes below), since
+// only such a trainer offers the reset: Creature::CanResetTalents asks
+// Trainer::IsTrainerValidForPlayer, which for a class trainer is a class match.
+constexpr char const* RESPEC_AIM = "class trainer";
+
+// Creature::CanResetTalents refuses anybody below level 10.
+constexpr uint32_t RESPEC_MIN_LEVEL = 10;
+
+// How long a walk that ended without a reset is left before another is tried.
+// Long enough that a trainer that cannot be reached is not walked at every
+// poll, short enough that a purse that fills or a path that clears is used the
+// same evening.
+constexpr uint32_t RESPEC_RETRY_SECONDS = 30 * 60;
+
+// Does a trainer of this type and requirement serve a character of this class,
+// for the purpose of a class errand? Only a CLASS trainer whose requirement is
+// exactly the character's class. A class trainer with no requirement at all is
+// refused: nothing says whose trainer it is, and walking a warrior to one is a
+// guess.
+bool ClassTrainerServes(bool isClassTrainer, uint32_t requirement, uint32_t playerClass);
+
+// Points spent outside `tree` (0, 1 or 2), in the active talent group. Every
+// point when `tree` names no tree.
+uint32_t PointsOutsideTree(uint32_t const (&pointsByTree)[3], uint8_t tree);
+
+// The tree holding the most points, lowest tab first on a tie, and 255 when no
+// point is spent at all. The same reading AiFactory::GetPlayerSpecTab takes of
+// the same map, so "the talents say tank" here means what it means to the
+// playerbot deciding its own strategies.
+uint8_t DominantTree(uint32_t const (&pointsByTree)[3]);
+
+enum class RespecStep : uint8_t
+{
+    NoTree,        // spec_tab names no tree, so there is nothing to judge against
+    TooLow,        // below RESPEC_MIN_LEVEL; no trainer will reset this character
+    InTree,        // every spent point is already in the roster's tree
+    CannotAfford,  // the purse is short of the trainer's price
+    NotNow,        // dead, fighting, flying or inside an instance
+    ColumnBusy,    // the travel column holds another errand; it goes first
+    Resting,       // a recent walk ended without a reset; waiting out the retry
+    Walk,          // claim the class-trainer aim, or keep the one already claimed
+};
+
+struct RespecFacts
+{
+    uint8_t specTab{255};
+    uint32_t level{0};
+    uint32_t pointsByTree[3]{0, 0, 0};
+    // Player::GetMoney and Player::resetTalentsCost. `costWaived` is the realm's
+    // NoResetTalentsCost setting, under which the core charges nothing.
+    uint64_t money{0};
+    uint32_t cost{0};
+    bool costWaived{false};
+    // Alive, out of combat, not on a flight path and on an open-world map.
+    bool available{false};
+    // `travel_npc` is empty, or already holds RESPEC_AIM.
+    bool columnFree{false};
+    // Seconds since the last walk that ended without a reset; UINT32_MAX when
+    // there has been none.
+    uint32_t sinceLastMiss{UINT32_MAX};
+};
+
+// In the order the enum is declared: the first reason not to walk wins, and a
+// character is sent only when none applies.
+RespecStep JudgeRespec(RespecFacts const& facts);
+
+// "walk", "cannot afford" ... for the log line.
+char const* RespecStepWord(RespecStep step);
+
+// Did the reset take? The core's handler answers the client, not us, so the
+// answer is read off the character: no point left outside the tree, and more
+// free points than before. Anything else is a refusal - out of reach, the
+// money, or a trainer that would not.
+bool RespecTook(uint32_t outsideBefore, uint32_t outsideAfter, uint32_t freeBefore,
+                uint32_t freeAfter);
+
+// THE TANK STRATEGIES. mod-playerbots answers PlayerbotAI::IsTank for a bot by
+// asking its combat engine for a STRATEGY_TYPE_TANK strategy, and the dungeon
+// module picks a run leader only from bots that answer yes. The engine's
+// strategies are chosen at login from the talents (AiFactory::
+// AddDefaultCombatStrategies), and a reset mid-session leaves them as they were.
+//
+// Returns the ChangeStrategy text that adds what is missing - "+tank",
+// "+tank assist" or both, comma-joined - or "" when nothing is to change. Only
+// for a character whose roster tree is a tank tree AND whose spent talents are
+// in that tree: a fury warrior given the tank strategy holds aggro with no
+// Defiance, no Shield Slam and no Last Stand, which is a tank in name only.
+struct TankStrategyFacts
+{
+    bool rosterTreeTanks{false};   // GearRoleFor(class, spec_tab) is Tank
+    bool talentsInTree{false};     // DominantTree(points) == spec_tab
+    bool hasTank{false};           // "tank" is in the combat engine
+    bool hasTankAssist{false};     // "tank assist" is in the combat engine
+};
+
+std::string TankStrategyChange(TankStrategyFacts const& facts);
+
+// A TANK HOLDING A TWO-HANDER IS MEASURED THE OTHER WAY ROUND. The sweep scores
+// a two-hander against the PAIR it would replace (#14), and it scores a shield
+// only when the main hand is free for one. So a tank already holding a
+// two-hander, with a one-hander and a shield in the bags, is never offered the
+// pair: the shield is refused because both hands are full, and the one-hander
+// alone loses to the two-hander. This is the pair's own verdict, to be
+// compared against the two-hander with GearCompare.
+//
+// Wearable only when both halves are. The score is the sum, the confidence the
+// weaker half's, and `judged` holds only when both halves are judged.
+GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield);
+
+// Is the pair even the question? Only for a tank, and only when what is worn
+// in the main hand is a two-hander.
+bool GearTankWeighsShieldPair(GearRole role, bool twoHanderInMainHand);
 
 }  // namespace OverseerDecisions
 
