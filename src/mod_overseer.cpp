@@ -25512,7 +25512,7 @@ private:
         // standing in a map this module has no portal row for is a hold that
         // is true on every poll, and it used to be an EXIT set with no door
         // and an IDLE one poll later, written to the timeline every time (#631).
-        bool loggedNoWayOut{false};
+        bool loggedBagNoDoor{false};
         // Said once per run rather than once per poll, the same log-once
         // discipline every other flag on this struct follows: a map with no
         // encounter rows answers Unknowable on every poll for the whole run.
@@ -30656,7 +30656,7 @@ private:
                     // later episode says so too rather than holding silently -
                     // the same discipline loggedCampaignOver follows.
                     coord.loggedBagHold = false;
-                    coord.loggedNoWayOut = false;
+                    coord.loggedBagNoDoor = false;
                     break;
 
                 case OverseerDecisions::DungeonBagPressure::Evacuate:
@@ -30678,9 +30678,9 @@ private:
                                                                        insidePortal != nullptr))
                     {
                         case OverseerDecisions::EvacuationStart::NoWayOut:
-                            if (!coord.loggedNoWayOut)
+                            if (!coord.loggedBagNoDoor)
                             {
-                                coord.loggedNoWayOut = true;
+                                coord.loggedBagNoDoor = true;
                                 LOG_WARN("module.overseer",
                                          "overseer: family '{}' has no bag room and is inside "
                                          "map {}, which has no portal row - there is no known "
