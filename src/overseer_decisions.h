@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <ctime>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -1294,6 +1295,41 @@ bool RoutedPathGoesWhereAsked(bool noRouteAtAll, bool endIsOffTheMesh,
 // The caller logs the target when this refuses, keeping the policy free of
 // database and formatting concerns.
 bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand);
+
+// ...UNLESS THE ERRAND IS THE RUN'S OWN AIM (#596). After a worldserver
+// restart the roster column still holds the staging aim the run wrote before
+// the restart, and the rule above read that as somebody else's errand: the run
+// deferred staging to itself and waited on itself until the operator cleared
+// the column by hand. An errand that names the run's own staging point, or the
+// approach aim the run is about to write, is the run's work and is adopted.
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
+                              bool errandIsTheRunsOwnAim);
+
+// `at:<map>:<x>,<y>,<z>`, read back. False for anything else, including an aim
+// with trailing text or a missing separator.
+bool ParsePlaceAim(std::string const& aim, std::uint32_t& mapId, float& x,
+                   float& y, float& z);
+
+// Does the roster column name one of the run's own aims? Compared as PLACES
+// and not as strings, because the staging point is derived again after a
+// restart from a ground probe, and a z read back as -18.4334 once and -18.43
+// the next time is the same point. Same map, within `planeYards` across and
+// `verticalYards` up or down.
+bool TravelErrandIsTheRunsOwnAim(std::string const& column,
+                                 std::vector<std::string> const& runAims,
+                                 float planeYards, float verticalYards);
+
+// HAS A CHARACTER ARRIVED AT AN AIMED PLACE (#596)? Across AND up. The travel
+// drive measured arrival in the plane alone, so a character standing on
+// Orgrimmar's upper level 71 yards over the Ragefire staging point in the
+// Cleft of Shadow read as having reached it: the errand was released, the run
+// re-armed it, and it was released again, every fifty seconds, while GATHERING
+// refused the party for being above the point. A `verticalWithin` of zero or
+// less asks the plane alone, which is what a door aim wants: the core checks
+// its own trigger's height when the character steps in. `verticalOffset` is
+// signed (character minus aim, or either way round); only its size is read.
+bool PlaceAimArrived(float planeYards, float verticalOffset, float arriveWithin,
+                     float verticalWithin);
 
 
 // WHAT A REALM SAYS ABOUT ITSELF (mod-overseer#184).

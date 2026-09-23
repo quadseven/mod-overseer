@@ -1282,6 +1282,22 @@ constexpr uint32 CROSSING_BACKSTOP_SECONDS = 1800;
 // enough to act on a thing", which is exactly the question here.
 constexpr float TRAVEL_ARRIVED_POSITION_YARDS = 5.0f;
 
+// AND HOW FAR UP OR DOWN AN AIMED PLACE MAY BE AND STILL BE ARRIVED AT (#596).
+// Arrival was measured in the plane alone, so a character on Orgrimmar's upper
+// level 71 yards over the Ragefire staging point in the Cleft of Shadow had
+// "reached" it: the errand was released, re-armed by the run and released
+// again every fifty seconds, and GATHERING then refused the party for being
+// above the point.
+//
+// Ten yards, the same bound TRAVEL_GROUND_DROP_YARDS puts on how far the
+// surface may move between two footing samples, and for the same reason: that
+// much height between a character and its aim is still the ground it is
+// walking on, and more is another level. The aims this applies to are written
+// on the ground (a staging point is derived from a ground probe, a catch-up aim
+// is where a leader stands), so a character standing on one is within a yard
+// or two of it. Door aims are exempt; see PositionArrivalVerticalYards.
+constexpr float TRAVEL_ARRIVED_VERTICAL_YARDS = 10.0f;
+
 static_assert(CROSSING_BERTH_ARRIVED_YARDS > TRAVEL_ARRIVED_POSITION_YARDS,
               "the crossing must stop asking for the walk before the travel "
               "drive finishes it, or the two loop against each other");
@@ -18340,6 +18356,24 @@ private:
         return TRAVEL_ARRIVED_POSITION_YARDS;
     }
 
+    // HOW FAR UP OR DOWN THE SAME AIM MAY BE AND STILL COUNT (#596). Zero for
+    // the two door walks PositionArrivalYards gives the door's own tolerance:
+    // their aim is the trigger's centre, which for a box can stand half its
+    // height off the floor, and the core asks its own height question when the
+    // character steps in (IsInAreaTriggerRadius). Every other place aim is on
+    // the ground and gets TRAVEL_ARRIVED_VERTICAL_YARDS.
+    float PositionArrivalVerticalYards(std::string const& name,
+                                       std::string const& target) const
+    {
+        if (target.rfind("trigger:", 0) == 0)
+            return 0.f;
+        auto const it = _dungeonEscorts.find(name);
+        if (it != _dungeonEscorts.end() && it->second.rejoin && it->second.aim == target &&
+            it->second.arriveYards > 0.f)
+            return 0.f;
+        return TRAVEL_ARRIVED_VERTICAL_YARDS;
+    }
+
     bool StepThroughAreaTrigger(std::string const& name, Player* bot,
                                 std::string const& target)
     {
@@ -19317,7 +19351,17 @@ private:
             // tolerances are about - see TRAVEL_ARRIVED_POSITION_YARDS.
             float const arriveWithin =
                 entry ? TRAVEL_ARRIVED_YARDS : PositionArrivalYards(name, target);
-            if (distance <= arriveWithin)
+            // AND FOR A PLACE, UP AS WELL AS ACROSS (#596). A creature aim keeps
+            // the plane alone: its spawn z is where the world put it, and the
+            // slack above is about where it has walked since. A place is where
+            // this character is meant to STAND, and standing over it on the
+            // level above is not standing on it.
+            bool const arrived = entry
+                ? distance <= arriveWithin
+                : OverseerDecisions::PlaceAimArrived(
+                      distance, bot->GetPositionZ() - pos.GetPositionZ(), arriveWithin,
+                      PositionArrivalVerticalYards(name, target));
+            if (arrived)
             {
                 // A DOORWAY IS ANSWERED FIRST, because for a `trigger:` aim
                 // going through IS the errand and everything below is about
@@ -24681,6 +24725,55 @@ private:
         return true;
     }
 
+    // EVERY AIM THIS RUN WRITES ON ITS LEADER, as `at:` strings, for telling
+    // the run's own leftover errand from somebody else's (#596). The staging
+    // point (derived now, into locals, when the run carries none), the
+    // approach corridor's waypoint when the door has one, and whatever leg the
+    // run last wrote. Nothing here writes anything: the corridor's own leg
+    // state is not stepped, because this is a question and not a poll.
+    static std::vector<std::string> DungeonRunOwnAims(
+        DungeonPortal const& portal, DungeonRunCoordinatorState const& coord,
+        Player* leader, std::string const& leaderName)
+    {
+        std::vector<std::string> aims;
+        DungeonRunCoordinatorState point = coord;
+        if (!OverseerDecisions::StagingPointUsable(point.stageX, point.stageY,
+                                                   point.stageZ) &&
+            leader)
+        {
+            std::string why;
+            if (!ResolveDungeonStagingPoint(portal, leader, point.stageX, point.stageY,
+                                            point.stageZ, why))
+            {
+                // Said, at DEBUG because the RESET poll that asks this says
+                // its own deferral at INFO, and the staging point is derived
+                // again, loudly, the moment the reset succeeds.
+                LOG_DEBUG("module.overseer",
+                          "overseer: '{}' - the '{}' staging point cannot be derived "
+                          "to recognize the run's own leftover aim ({}), so only the "
+                          "corridor waypoint and the last leg are compared (#596)",
+                          leaderName, portal.keyword, why);
+                point.stageX = point.stageY = point.stageZ = 0.f;
+            }
+        }
+        std::string aim;
+        std::string why;
+        if (DungeonStagingAim(portal, point, aim, why))
+            aims.push_back(aim);
+        if (OverseerDecisions::StagingPointUsable(portal.approachX, portal.approachY,
+                                                  portal.approachZ))
+        {
+            std::ostringstream out;
+            out << "at:" << portal.outsideMapId << ':' << portal.approachX << ','
+                << portal.approachY << ',' << portal.approachZ;
+            aims.push_back(out.str());
+        }
+        auto const leg = coord.legAim.find(leaderName);
+        if (leg != coord.legAim.end() && !leg->second.empty())
+            aims.push_back(leg->second);
+        return aims;
+    }
+
     // THE GAP FROM A CHARACTER TO A PLACE ON THE PORTAL'S OUTSIDE MAP (#242).
     // One function, because the approach now measures TWO of these every poll -
     // the corridor's start and the staging point - and two readings taken
@@ -30022,7 +30115,29 @@ private:
             // line so a supersession cannot become silent again.
             std::map<std::string, std::string> const travelAims = _travelAims.Load();
             auto const leaderAim = travelAims.find(leaderName);
-            if (!OverseerDecisions::DungeonRunMayClaimTravel(leaderAim != travelAims.end()))
+            // UNLESS WHAT IS OUTSTANDING IS THIS RUN'S OWN AIM (#596). After a
+            // restart the column still holds the staging aim the run wrote
+            // before it, and read as somebody else's errand the run deferred to
+            // itself and waited on itself until the operator cleared the column.
+            // Compared as a place, because the point is derived again from a
+            // ground probe and need not print to the same string twice.
+            bool const ownAim = leaderAim != travelAims.end() &&
+                                OverseerDecisions::TravelErrandIsTheRunsOwnAim(
+                                    leaderAim->second,
+                                    DungeonRunOwnAims(*portal, coord, leader, leaderName),
+                                    TRAVEL_ARRIVED_POSITION_YARDS,
+                                    TRAVEL_ARRIVED_VERTICAL_YARDS);
+            if (ownAim && !coord.loggedTravelConflict)
+            {
+                coord.loggedTravelConflict = true;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} finds leader '{}' already carrying '{}', "
+                         "which is this run's own staging aim left over from before a "
+                         "restart - adopted rather than waited on (#596)",
+                         coord.runNumber, leaderName, leaderAim->second);
+            }
+            if (!OverseerDecisions::DungeonRunMayClaimTravel(leaderAim != travelAims.end(),
+                                                             ownAim))
             {
                 // The errand has its own bounded backstop. Do not spend the
                 // dungeon's reset or whole-staging budgets while waiting on
