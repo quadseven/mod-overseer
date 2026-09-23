@@ -1898,6 +1898,11 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     // a catch-up walk and every next leg of a run.
     if (facts.columnIsOurs && !facts.column.empty())
         return TravelClaim::Write;
+    // AND THE SAME AIM AGAIN IS NOT A NEW CLAIM, whoever the book remembers
+    // writing it. It overwrites nothing the fences protect: a trainer walk or a
+    // vendor errand in the column would not be equal to it.
+    if (!facts.column.empty() && facts.column == facts.target)
+        return TravelClaim::Write;
     // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
     // or any dungeon run's aim over an empty column overwrites no trainer walk
     // (wow-overseer#227, #598); the home errand, or a column that holds
