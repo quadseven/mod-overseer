@@ -41,7 +41,10 @@
  *                     The executor never chooses WHAT to sell: that is a
  *                     disposition rule that needs the whole family's bags at
  *                     once, and it lives in the bridge outside the world. See
- *                     2026_09_04_01_overseer_sell.sql.
+ *                     2026_09_04_01_overseer_sell.sql. A row whose command
+ *                     starts with `destroy` instead destroys ONE named stack
+ *                     that has no sell price and that no quest still needs,
+ *                     through WorldSession::HandleDestroyItemOpcode (#614).
  *       kind='bank' - deposit one named item into the character's bank,
  *                     withdraw one from it, or buy the next bank bag slot,
  *                     through the core's own bank packet handlers with a
@@ -33772,6 +33775,10 @@ private:
                 detail = DoShare(player, targetArg, command, status, rowResult);
             else if (kind == "job")
                 detail = DoJob(player, command, status);
+            else if (kind == "sell" && OverseerDecisions::IsDestroyRow(command))
+                // THE SAME `kind`, A SECOND GRAMMAR (#614), routed on the first
+                // word as `cast` routes a learn, so no ENUM migration is needed.
+                detail = DoDestroy(player, command, status, rowResult);
             else if (kind == "sell")
                 detail = DoSell(player, command, status, rowResult);
             else if (kind == "bank")
@@ -35312,11 +35319,14 @@ private:
     //   GetMoney() >= MAX_MONEY_AMOUNT - price  -> "too much gold"
     //
     // One refusal the core does NOT make, made here anyway: ITEM_CLASS_QUEST
-    // (ItemTemplate.h:303). The core sells a quest item that carries a price.
-    // This module does not, because the disposition rule upstream cannot see
-    // which quest a sold item was about to complete, and a quest item is the
-    // one thing a sale can destroy that gold cannot buy back once the buyback
-    // slot has rolled over. Named "item is a quest item", never retried.
+    // (ItemTemplate.h:303) while the holder still needs it. The core sells a
+    // quest item that carries a price. This module sells one only when the
+    // CORE'S OWN quest status for the holder says nothing wants it any more
+    // (#614): no open quest names the entry, and no quest it starts is still
+    // ahead of the holder. The row is never believed about this; the world
+    // is asked, through QuestItemFactsFor below and the pure rule in
+    // OverseerDecisions::QuestItemStillNeeded. Named "item is a quest item",
+    // never retried, when the answer is still "needed".
     //
     // What the core also does NOT refuse, and so neither does this: combat
     // and an open trade window. A player at a vendor mid-fight can sell; the
@@ -35352,6 +35362,51 @@ private:
                 && from->IsWithinDistInMap(creature, range);
         }
     };
+
+    // WHAT THE CORE SAYS THIS HOLDER STILL WANTS AN ITEM FOR (#614). Read out
+    // of the player's live quest status map, never out of the character
+    // database, which is a save file minutes behind: a quest accepted a
+    // minute ago is in the map and not yet in character_queststatus.
+    //
+    // An open quest is any entry whose status is not NONE and not REWARDED,
+    // the same set the bridge's QUEST_NEEDED_SQL reads (complete-but-not-
+    // turned-in and failed-but-retryable still need the item). Each names its
+    // items in three places (QuestDef.h:301-304, :259): what it requires, what
+    // it collects as a drop, and what it hands out at the start.
+    static OverseerDecisions::QuestItemHolderFacts QuestItemFactsFor(Player* holder,
+                                                                     ItemTemplate const* proto)
+    {
+        OverseerDecisions::QuestItemHolderFacts facts;
+        for (auto const& [questId, data] : holder->getQuestStatusMap())
+        {
+            if (data.Status == QUEST_STATUS_NONE || data.Status == QUEST_STATUS_REWARDED)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+                if (quest->RequiredItemId[i])
+                    facts.activeQuestItems.push_back(quest->RequiredItemId[i]);
+            for (uint8 i = 0; i < QUEST_SOURCE_ITEM_IDS_COUNT; ++i)
+                if (quest->ItemDrop[i])
+                    facts.activeQuestItems.push_back(quest->ItemDrop[i]);
+            if (quest->GetSrcItemId())
+                facts.activeQuestItems.push_back(quest->GetSrcItemId());
+        }
+
+        facts.startQuest = proto->StartQuest;
+        if (proto->StartQuest)
+        {
+            if (Quest const* starts = sObjectMgr->GetQuestTemplate(proto->StartQuest))
+            {
+                facts.startQuestExists = true;
+                facts.startQuestRewarded = holder->GetQuestRewardStatus(proto->StartQuest);
+                // msg=false: asked, not attempted; nothing is sent anywhere.
+                facts.startQuestTakeable = holder->CanTakeQuest(starts, false);
+            }
+        }
+        return facts;
+    }
 
     static char const* DoSell(Player* seller, std::string const& command,
                               char const*& status, std::string& out)
@@ -35417,8 +35472,18 @@ private:
                  << ",\"count\":" << sellCount
                  << ",\"stack\":" << countBefore << "}";
 
+        // A quest item is sold only once the core says its holder is done
+        // with it (#614). Every other class is untouched by this gate.
+        OverseerDecisions::QuestItemHold questHold = OverseerDecisions::QuestItemHold::Released;
         if (proto->Class == ITEM_CLASS_QUEST)
-            return refuse("item is a quest item", itemJson.str());
+        {
+            questHold = OverseerDecisions::QuestItemStillNeeded(
+                itemEntry, QuestItemFactsFor(seller, proto));
+            if (*OverseerDecisions::SellQuestRefusal(proto->Class, questHold))
+                return refuse("item is a quest item",
+                              itemJson.str() + ",\"quest_hold\":" +
+                                  J(OverseerDecisions::QuestItemHoldWord(questHold)));
+        }
         if (proto->SellPrice == 0)
             return refuse("item cannot be sold", itemJson.str());
         if (sellCount > countBefore)
@@ -35578,8 +35643,148 @@ private:
                  "overseer: '{}' sold {} x item {} (entry {}) to vendor {} (entry {}) for {} copper{}",
                  seller->GetName(), sellCount, itemGuid.GetCounter(), itemEntry, vendorName,
                  vendorEntry, moneyAfter - moneyBefore, buyback ? ", parked in buyback" : "");
+        if (proto->Class == ITEM_CLASS_QUEST)
+            LOG_INFO("module.overseer",
+                     "overseer: sold a released quest item {} (entry {}) for '{}': "
+                     "the core's quest log holds it for nothing (#614)",
+                     itemGuid.GetCounter(), itemEntry, seller->GetName());
 
         describe("sold", "");
+        status = "delivered";
+        return "";
+    }
+
+    // ------------------------------------------------------------- destroy --
+    //
+    // Destroy ONE named stack that nothing will buy, the way a player drags it
+    // out of the bag and confirms (#614).
+    //
+    // WHY. A quest item its holder is done with and that carries no sell price
+    // has no way out of the bags: the core's sale refuses SellPrice 0, and no
+    // other verb in this queue removes an item. Measured on the dev realm
+    // 2026-09-23, a level-60 priest with no free slot carried hundreds of such
+    // leftovers for quests turned in long ago.
+    //
+    // THE SAME kind='sell' ROW, A SECOND GRAMMAR, routed on the first word
+    // (IsDestroyRow) exactly as `cast` routes a learn: a new kind would be an
+    // ENUM migration. `destroy guid:<n> count:<n>[ allow:bound][ allow:quality]`.
+    // Like the sale, the executor never chooses the item; the row names it.
+    //
+    // THE CORE'S OWN DESTROY. WorldSession::HandleDestroyItemOpcode
+    // (ItemHandler.cpp:280-322, public at WorldSession.h:933) is what the
+    // client's CMSG_DESTROYITEM reaches: it refuses an unequippable
+    // equipment-slot item and ITEM_FLAG_NO_USER_DESTROY, recovers a refundable
+    // item's cost, destroys through Player::DestroyItem, and refreshes the
+    // quest-giver marks. The typed packet is bag, slot, count and three unused
+    // bytes (ItemPackets.h:89-102). The count is sent as 0, the handler's
+    // "whole stack" (DestroyItem), because DestroyRefusal has already required
+    // the row's count to equal the stack, and the packet's count is one byte.
+    //
+    // EVERY WALL IS TESTED FIRST, and the decision is the pure
+    // OverseerDecisions::DestroyRefusal, so the rule is tested without a
+    // world. The quest check is QuestItemStillNeeded over the core's live
+    // quest status, for every item class, not only class 12.
+    //
+    // THE READ-BACK IS THE RESULT. The handler returns void; success is the
+    // named guid no longer carried.
+    static char const* DoDestroy(Player* holder, std::string const& command,
+                                 char const*& status, std::string& out)
+    {
+        using OverseerDecisions::DestroyFacts;
+        using OverseerDecisions::DestroySpec;
+        using OverseerDecisions::SellRefusalRetry;
+        using OverseerDecisions::SellRetryWord;
+
+        auto answer = [&](char const* outcome, char const* detail, std::string const& extra)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(detail)
+              << ",\"retry\":" << J(*detail ? SellRetryWord(SellRefusalRetry(detail)) : "")
+              << ",\"holder\":" << J(holder->GetName())
+              << ",\"request\":" << J(command) << extra << "}";
+            out = o.str();
+        };
+        auto refuse = [&](char const* detail, std::string const& extra = std::string()) -> char const*
+        {
+            answer("refused", detail, extra);
+            return detail;
+        };
+
+        DestroySpec const spec = OverseerDecisions::ParseDestroySpec(command);
+        if (!spec.valid)
+            return refuse(OverseerDecisions::DestroyRefusalText::Malformed);
+
+        WorldSession* session = holder->GetSession();
+        if (!session)
+            return refuse("holder has no session");
+        if (!holder->IsInWorld())
+            return refuse("holder is not in the world");
+
+        Item* item = FindCarriedItem(holder, true, spec.guid);
+        if (!item)
+            return refuse("item not carried");
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return refuse("item has no template");
+
+        ObjectGuid const itemGuid = item->GetGUID();
+        uint32 const itemEntry = item->GetEntry();
+        uint16 const pos = item->GetPos();
+        uint8 const bag = item->GetBagSlot();
+        uint8 const slot = item->GetSlot();
+
+        DestroyFacts facts;
+        facts.itemClass = proto->Class;
+        facts.quality = proto->Quality;
+        facts.sellPrice = proto->SellPrice;
+        facts.stack = item->GetCount();
+        facts.soulbound = item->IsSoulBound();
+        facts.equipped = item->IsEquipped() || Player::IsEquipmentPos(pos) || Player::IsBagPos(pos);
+        facts.nonEmptyBag = item->IsNotEmptyBag();
+        facts.noUserDestroy = proto->HasFlag(ITEM_FLAG_NO_USER_DESTROY);
+        facts.beingLooted = holder->GetLootGUID() == itemGuid;
+        facts.questHold = OverseerDecisions::QuestItemStillNeeded(
+            itemEntry, QuestItemFactsFor(holder, proto));
+
+        std::ostringstream itemJson;
+        itemJson << ",\"item\":{\"guid\":" << itemGuid.GetCounter()
+                 << ",\"entry\":" << itemEntry
+                 << ",\"name\":" << J(proto->Name1)
+                 << ",\"class\":" << proto->Class
+                 << ",\"quality\":" << proto->Quality
+                 << ",\"count\":" << spec.count
+                 << ",\"stack\":" << facts.stack << "}"
+                 << ",\"quest_hold\":" << J(OverseerDecisions::QuestItemHoldWord(facts.questHold));
+
+        if (char const* wall = OverseerDecisions::DestroyRefusal(spec, facts); *wall)
+            return refuse(wall, itemJson.str());
+
+        // ---- the core's own destroy -------------------------------------------
+        WorldPacket raw(CMSG_DESTROYITEM, 6);
+        raw << uint8(bag);
+        raw << uint8(slot);
+        raw << uint8(0);  // 0 = the whole stack, which the row's count already is
+        raw << uint8(0) << uint8(0) << uint8(0);
+        WorldPackets::Item::DestroyItem packet(std::move(raw));
+        packet.Read();
+        session->HandleDestroyItemOpcode(packet);
+
+        // ---- believe nothing; read the bags back -----------------------------
+        Item* remaining = FindCarriedItem(holder, true, spec.guid);
+        uint32 const countAfter = remaining ? remaining->GetCount() : 0;
+        std::string const extra = itemJson.str() + ",\"remaining\":" + std::to_string(countAfter);
+        if (remaining)
+        {
+            answer("refused", "the core refused the destroy", extra);
+            return "the core refused the destroy";
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' destroyed {} x item {} (entry {}), unsellable and "
+                 "held by no quest (#614)",
+                 holder->GetName(), spec.count, itemGuid.GetCounter(), itemEntry);
+
+        answer("destroyed", "", extra);
         status = "delivered";
         return "";
     }
