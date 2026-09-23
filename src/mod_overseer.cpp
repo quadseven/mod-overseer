@@ -4564,14 +4564,14 @@ public:
     // rather than assume it: a refused catch-up was once logged as released to
     // walk, and the family held its leader for a walk that never began.
     //
-    // `catchUp` says the aim is a follower's catch-up walk to its leader, the
-    // one claim OverseerDecisions::ReadTravelClaim lets past a profession
-    // errand whose column is empty. See that function for the argument.
-    // `dungeonRun` says the aim is the dungeon coordinator's own (a staging
-    // point, a corridor leg, a berth), which is let past the same way
-    // (wow-overseer#227).
-    bool Claim(std::string const& name, std::string const& target, bool catchUp = false,
-               bool dungeonRun = false)
+    // `owner` says whose walk the aim is, and every caller names it (#598).
+    // A catch-up walk and every walk a dungeon run makes are let past a
+    // profession errand whose column is empty; the home errand is not. See
+    // OverseerDecisions::TravelOwner and ReadTravelClaim for the argument. It
+    // has no default on purpose: the BARRIER escort once called this with
+    // nothing said and was fenced as a stranger's claim.
+    bool Claim(std::string const& name, std::string const& target,
+               OverseerDecisions::TravelOwner owner)
     {
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
@@ -4596,13 +4596,11 @@ public:
         // wrote is not foreign, because replacing it disturbs nobody's walk
         // but the book's own. The second is what lets a catch-up re-aim and a
         // run's next leg replace the book's previous `at:` aim.
-        OverseerDecisions::TravelClaimFacts facts;
+        OverseerDecisions::TravelClaimFacts facts(owner);
         facts.learnSkill = LearnSkillPending(name);
         facts.column = CurrentTravelNpc(name);
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
-        facts.catchUp = catchUp;
-        facts.dungeonRun = dungeonRun;
         OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
         if (verdict != OverseerDecisions::TravelClaim::Write)
         {
@@ -7505,7 +7503,17 @@ private:
     // member is wanted still, for the reason HoldCharacterStill's own comment
     // gives: the register stops this module's sweeps and nothing else, so a
     // strategy something outside it granted has to be taken off again.
-    static void HoldAtStagingPoint(Player* member, std::string const& name)
+    //
+    // AND IT TAKES THE DIVERTERS DOWN, THE WAY THE REGROUP HOLD DOES (#598).
+    // A hold adds `stay` and takes `new rpg`, and `grind` outranks `stay`: it
+    // picks a target and walks to it, and the per-tick pin lets go of a
+    // character in combat. The escort's claim used to be the only thing
+    // keeping those strategies down, and a leader whose staging errand was
+    // released on arrival and whose re-claim was refused had none. Measured on
+    // the dev realm 2026-09-23 at Ragefire: 408 yards off the point 90 seconds
+    // into BARRIER, with no travel focus at all. SweepTravelFocus spares a
+    // character under this hold, so the stand-down lasts until it is lifted.
+    void HoldAtStagingPoint(Player* member, std::string const& name)
     {
         PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
         if (!botAI)
@@ -7518,6 +7526,13 @@ private:
         // wants neither; see HoldCharacterStill's stand-state and mount blocks.
         HoldCharacterStill(member, botAI, name, STAGE_HOLD_VERB,
                            STAGE_HOLD_CEILING_SECONDS, false);
+        std::string const took = TakeDownDiverters(name, botAI);
+        if (!took.empty())
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' stops choosing where to go while the barrier holds "
+                     "it on the staging point - {} taken off its non-combat engine, and "
+                     "given back when the hold is lifted (staging hold keeps the focus)",
+                     name, took);
     }
 
     // Lift one, naming the reason a reader wants: why this character is walking
@@ -16684,7 +16699,11 @@ private:
                      "the run's staging point is where the leader is going anyway",
                      what, name, from);
         }
-        _travelAims.Claim(name, aim);
+        // EVERY CALLER OF THIS IS THE RUN (#598): the doorway, the reset exit,
+        // REPAIR, TOWN and BARRIER. Claimed as the run's own so a pending learn
+        // over an empty column does not refuse it, which is what stranded a
+        // leader the barrier was waiting on.
+        _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::Run);
         if (escort.aim == aim)
             return;
 
@@ -16810,7 +16829,7 @@ private:
         // fresh entry this call made is dropped rather than left for
         // SweepDungeonEscorts to end as if a run had held it. The refusal
         // itself is said by Claim, once per state.
-        if (!_travelAims.Claim(name, aimText, true))
+        if (!_travelAims.Claim(name, aimText, OverseerDecisions::TravelOwner::CatchUp))
         {
             _catchUpRefused[name] = _travelAims.ClaimRefusal(name);
             if (escort.aim.empty() && !escort.catchUp && !escort.rejoin &&
@@ -17092,7 +17111,8 @@ private:
             aim.followerGapToLeader = gap;
             if (OverseerDecisions::CatchUpAimIsStale(aim, FOLLOW_CATCH_UP_AIM_LIMITS))
                 CatchUpToward(name, leader);
-            else if (!_travelAims.Claim(name, it->second.aim, true))
+            else if (!_travelAims.Claim(name, it->second.aim,
+                                        OverseerDecisions::TravelOwner::CatchUp))
                 _catchUpRefused[name] = _travelAims.ClaimRefusal(name);
             return;
         }
@@ -17808,7 +17828,7 @@ private:
         if (!escort.rejoinSince)
             escort.rejoinSince = std::time(nullptr);
 
-        _travelAims.Claim(name, aim);
+        _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::WalkBackIn);
         if (escort.aim == aim)
             return;
 
@@ -17883,7 +17903,8 @@ private:
                 // member would keep `new rpg` with no aim under it, and a
                 // `new rpg` with no aim goes idle and then wherever
                 // NewRpgStatusUpdateAction rolls it.
-                _travelAims.Claim(name, it->second.aim);
+                _travelAims.Claim(name, it->second.aim,
+                                  OverseerDecisions::TravelOwner::WalkBackIn);
                 ++it;
                 continue;
             }
@@ -18208,11 +18229,11 @@ private:
     {
         for (auto it = _travelFocus.begin(); it != _travelFocus.end(); )
         {
-            if (stillAimed.count(it->first))
-            {
-                ++it;
-                continue;
-            }
+            // STILL AIMED, OR HELD BY A HOLD THAT OWNS THE STAND-DOWN (#404,
+            // #598). One decision rather than three `continue`s, so the next
+            // hold that needs the focus is a field and a test, not a fourth
+            // branch here. See TravelFocusOutlivesItsErrand.
+            //
             // ...OR THE FAMILY IS WAITING FOR SOMEBODY AND THIS IS THE LEADER
             // IT IS HOLDING STILL TO DO IT (#404). A regroup hold takes the same
             // diverters down for the same reason an errand does - a leader that
@@ -18223,7 +18244,17 @@ private:
             // would be a hold on a character that walks anyway. It cannot leak:
             // the hold has a ceiling of its own and ReleaseExpiredHolds collects
             // it, after which this sweep takes the focus on the very next poll.
-            if (HasRegroupHold(it->first))
+            //
+            // ...OR THE BARRIER IS HOLDING IT ON THE STAGING POINT (#598), for
+            // the same reason and with the same ceiling argument: the staging
+            // hold takes the diverters down itself (HoldAtStagingPoint), and a
+            // leader whose staging errand was released on arrival has no errand
+            // for `stillAimed` to carry either.
+            OverseerDecisions::TravelFocusFacts keep;
+            keep.stillAimed = stillAimed.count(it->first) != 0;
+            keep.heldForRegroup = HasRegroupHold(it->first);
+            keep.heldAtStagingPoint = HasStagingHold(it->first);
+            if (OverseerDecisions::TravelFocusOutlivesItsErrand(keep))
             {
                 ++it;
                 continue;
@@ -23703,7 +23734,7 @@ private:
         if (!escort.homeSince)
             escort.homeSince = std::time(nullptr);
 
-        _travelAims.Claim(name, aim);
+        _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::HomeErrand);
         if (escort.aim == aim)
             return;
 
@@ -27567,7 +27598,7 @@ private:
                 if (!coord.crossingSince)
                     coord.crossingSince = std::time(nullptr);
 
-                _travelAims.Claim(leaderName, aimText, false, true);
+                _travelAims.Claim(leaderName, aimText, OverseerDecisions::TravelOwner::Run);
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is sent to the berth for '{}' at ({:.1f}, "
@@ -30260,7 +30291,8 @@ private:
                 // nowhere. See TravelAimBook. In a LOOP that argument stops
                 // being hypothetical: every run after the first aims at the
                 // identical string the previous run just finished with.
-                _travelAims.Claim(leaderName, aimTarget, false, true);
+                _travelAims.Claim(leaderName, aimTarget,
+                                  OverseerDecisions::TravelOwner::Run);
                 coord.legAim[leaderName] = aimTarget;
 
                 coord.phase = DungeonRunPhase::Gathering;
@@ -30418,7 +30450,8 @@ private:
                         _travelAims.RunOwns(leaderName, legAim.aim) &&
                             (inFlight.empty() || inFlight == legAim.aim));
 
-                _travelAims.Claim(leaderName, legAim.aim, false, true);
+                _travelAims.Claim(leaderName, legAim.aim,
+                                  OverseerDecisions::TravelOwner::Run);
                 coord.legAim[leaderName] = legAim.aim;
 
                 // SAID EVERY TIME, AND AT WARN, BECAUSE A SILENT SELF-HEAL
@@ -30599,6 +30632,34 @@ private:
             // A fresh watchdog for a fresh barrier (#164): nothing measured
             // yet, nobody on the ladder.
             coord.staging.clear();
+
+            // AND THE LEADER IS ESCORTED AND HELD ON THIS POLL, NOT THE NEXT
+            // (#598). He is aimed rather than escorted in GATHERING, so the
+            // travel drive releases his errand the moment he is inside
+            // TRAVEL_ARRIVED_POSITION_YARDS, and BARRIER used to take him over
+            // only on its own first poll, up to DUNGEON_RUN_POLL_MS later. In
+            // between nothing held him: measured on the dev realm 2026-09-23 at
+            // Ragefire, arrived at 08:47:19, released at 08:47:20, already
+            // outside the staging radius when BARRIER first looked at 08:47:24,
+            // and 408 yards off 90 seconds after that.
+            //
+            // The escort is what BARRIER does to him on every poll anyway, on
+            // the identical aim, so this moves it earlier rather than adding a
+            // second opinion; an escorted character's arrival is held, not
+            // released. The hold is asked of the barrier's own predicate, on the
+            // same reading this phase just called an arrival.
+            EscortToward(leaderName, legAim.aim, "BARRIER", EscortPurpose::Assemble);
+            OverseerDecisions::DungeonRunMemberState arrived;
+            arrived.name = leaderName;
+            arrived.seen = true;
+            // IsAlive  Unit.h:1793  bool IsAlive() const
+            arrived.alive = leader->IsAlive();
+            // IsInCombat  Unit.h:936  bool IsInCombat() const
+            arrived.inCombat = leader->IsInCombat();
+            arrived.distanceFromStage = gap.horizontalYards;
+            arrived.verticalFromStage = gap.verticalYards;
+            if (OverseerDecisions::DungeonRunHoldsAtStage(arrived, DUNGEON_APPROACH_LIMITS))
+                HoldAtStagingPoint(leader, leaderName);
             LOG_INFO("module.overseer",
                      "overseer: '{}' reached the staging point ({}) - GATHERING "
                      "done, BARRIER holds until the whole roster is alive, out of combat "
