@@ -30648,10 +30648,15 @@ private:
         //
         // AND ITS CLOCK RESTARTS WHILE IT WAITS, because the twelve minutes are
         // for staging and this is not staging. That cannot hold a run open for
-        // ever: the fetch has its own ceiling, and the member it was for is not
-        // gone back for again inside FETCH_STANDDOWN_SECONDS, which is longer
-        // than DUNGEON_STAGING_BACKSTOP_SECONDS.
-        if (auto const fetch = _fetches.find(leaderName); fetch != _fetches.end())
+        // ever, and the run does not take the fetch's word for it: it lends the
+        // leader only while the fetch is younger than FETCH_CEILING_SECONDS, read
+        // here on the run's own clock, so a fetch whose party poll stopped
+        // running still stops holding the run at its ceiling. The member it was
+        // for is then not gone back for again inside FETCH_STANDDOWN_SECONDS,
+        // which is longer than DUNGEON_STAGING_BACKSTOP_SECONDS.
+        auto const fetch = _fetches.find(leaderName);
+        if (fetch != _fetches.end() &&
+            std::time(nullptr) - fetch->second.since < FETCH_CEILING_SECONDS)
         {
             OverseerDecisions::FetchRunAnswer const answer =
                 OverseerDecisions::RunLetsTheLeaderFetch(FetchRunPhaseOf(coord.phase));
