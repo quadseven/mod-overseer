@@ -8278,6 +8278,87 @@ struct RouteLegLimits
 RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
                       float x, float y, RouteLegLimits const& limits);
 
+// INSIDE THE NAVMESH'S REACH BY DISTANCE IS NOT INSIDE IT BY WALKING (#592).
+//
+// TRAVEL_ROUTE_MIN_YARDS is a straight-line distance standing in for "the
+// navmesh can answer from here", and the two part company wherever the walk is
+// much longer than the line. Measured at Ragefire Chasm on 2026-09-23: the
+// leader stood 283 yards from the staging point in the Cleft of Shadow and 68
+// yards above it, the walk down is longer than the 296 yards PathGenerator will
+// return, and with the surveyed route dropped at 400 yards every poll aimed the
+// cone straight through the city floor. The survey had a route that finished 14
+// yards from the aim the whole time.
+//
+// So the distance still decides on its own outside the reach, exactly as
+// before, and inside it the navmesh is ASKED rather than assumed. The mover's
+// own answer for the errand is `navmeshReachesAim`.
+//
+// Worth planning: outside the reach, or inside it with no navmesh route.
+bool SurveyedRouteWorthPlanning(float fromAimYards, bool navmeshReachesAim,
+                                float minYards);
+
+// Still worth walking: outside the reach, or inside it with no navmesh route
+// AND a route whose last point is nearer the aim than the character is. The
+// second half is the old rule's own reason for dropping a route, kept: a route
+// that ends farther from the errand than the character already stands leads
+// nowhere useful, and the ordinary step is the better tool.
+bool SurveyedRouteStillLeads(float fromAimYards, float routeEndFromAimYards,
+                             bool navmeshReachesAim, float minYards);
+
+// NEARER WAYPOINTS TO TRY WHEN THE LOOKAHEAD ONE IS REFUSED (#592).
+//
+// RouteLegStep aims at the furthest waypoint within the lookahead IN A STRAIGHT
+// LINE. On open road that is the corner-cutting the stepper wants. In a layered
+// city it can be a waypoint 250 yards off across three walls and a floor, which
+// GroundedStep refuses, and before this the drive then reported the whole
+// forward cone refused while the next waypoint on the same surveyed road stood
+// a few yards away. Measured: 'every bearing in the forward cone toward it was
+// refused' repeated for five minutes in Orgrimmar on a route of 117 waypoints.
+//
+// The answer is the same RouteLegStep asked again with shorter reach: the
+// lookahead halved while it stays over `arrivedYards`, and last of all the next
+// waypoint whatever its distance (maxPointsAhead 1). A route already walked one
+// point at a time, a measured corridor, gets nothing: its next point is the
+// only aim it has and there is nothing nearer to offer. Nonsense limits give
+// nothing too.
+//
+// Each entry is to be asked of a COPY of the cursor. The cursor already moved
+// on the first ask, and a retreat must not move it again.
+std::vector<RouteLegLimits> RouteLegRetreats(RouteLegLimits const& first);
+
+// WHERE AN ORDINARY LIFT LANDS: THE NEAREST SURFACE OVER THE FEET, NOT THE
+// HIGHEST ONE IN REACH (#592).
+//
+// The surface probe searches DOWN from sixty yards above the character and the
+// first surface it meets is the highest in that window. Under open terrain that
+// is the only surface there is. In a layered city it is a roof or the canyon
+// rim, and at 06:48:21 on 2026-09-23 that is where the leader in Orgrimmar was
+// lifted, 58 yards up and farther from the Cleft he was walking to. The floor he
+// slipped under, if there is one, is the LOWEST surface above him.
+//
+// So the adapter probes upward in steps of `reach`, each probe reaching down
+// only as far as it rose, and hands the answers here in rising order. The first
+// valid surface at least `minRise` over the feet is the landing. `minRise` is the
+// footing reach: a surface closer than that is the one the floor probe already
+// said is not there. With no such answer the highest surface stands, which is
+// the lift this module made before, so a lift can only ever land lower than it
+// used to and never somewhere new.
+//
+// A probe that starts inside a slab meets its underside, because the core's
+// ray test is two-sided, so the landing is the highest answer within `minRise`
+// of that first one: the same layer's top face.
+struct LayerProbe
+{
+    bool valid{false};
+    float surfaceZ{0.f};
+};
+float LiftLandingSurface(float currentZ, std::vector<LayerProbe> const& rising,
+                         float highestSurfaceZ, float minRise);
+
+// The reaches for those probes: `step`, 2 * `step`, ... up to and including
+// `maxReach`. Empty for a step or reach that is not a positive distance.
+std::vector<float> LiftProbeReaches(float step, float maxReach);
+
 
 // ---------------------- what the ground itself costs to walk across (#400) --
 //

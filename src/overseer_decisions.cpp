@@ -6945,6 +6945,101 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
 }
 
 
+bool SurveyedRouteWorthPlanning(float fromAimYards, bool navmeshReachesAim,
+                                float minYards)
+{
+    // Outside the reach the distance decides alone, exactly as it did before
+    // #592. Inside it the navmesh's own answer does.
+    if (fromAimYards > minYards)
+        return true;
+    return !navmeshReachesAim;
+}
+
+bool SurveyedRouteStillLeads(float fromAimYards, float routeEndFromAimYards,
+                             bool navmeshReachesAim, float minYards)
+{
+    if (fromAimYards > minYards)
+        return true;
+    if (navmeshReachesAim)
+        return false;
+    // Strictly nearer. A route that ends as far out as the character already
+    // stands has nothing left to give it.
+    return routeEndFromAimYards < fromAimYards;
+}
+
+std::vector<RouteLegLimits> RouteLegRetreats(RouteLegLimits const& first)
+{
+    std::vector<RouteLegLimits> retreats;
+    if (!(first.lookaheadYards > 0.f) || !(first.arrivedYards >= 0.f))
+        return retreats;
+    // A route walked one point at a time already aims at the nearest thing it
+    // could offer.
+    if (first.maxPointsAhead == 1)
+        return retreats;
+    // Halved while it stays over the arrival radius. Bounded by the arithmetic
+    // and by the loop count both, so a limit nobody expected cannot make this
+    // long: 250 over 12 is four halvings.
+    float reach = first.lookaheadYards * 0.5f;
+    for (unsigned i = 0; i < 16 && reach >= first.arrivedYards; ++i)
+    {
+        RouteLegLimits shorter = first;
+        shorter.lookaheadYards = reach;
+        retreats.push_back(shorter);
+        reach *= 0.5f;
+    }
+    // And last of all the next waypoint, whatever its distance inside the
+    // original lookahead.
+    RouteLegLimits next = first;
+    next.maxPointsAhead = 1;
+    retreats.push_back(next);
+    return retreats;
+}
+
+float LiftLandingSurface(float currentZ, std::vector<LayerProbe> const& rising,
+                         float highestSurfaceZ, float minRise)
+{
+    for (LayerProbe const& probe : rising)
+    {
+        if (!probe.valid)
+            continue;
+        if (probe.surfaceZ < currentZ + minRise)
+            continue;
+        // Never above the reading that authorized the lift. A rising probe
+        // cannot legitimately see past the window the highest one searched, so
+        // an answer over it is not a layer this rule knows anything about.
+        if (probe.surfaceZ > highestSurfaceZ)
+            continue;
+        // THE FIRST LAYER IS FOUND; NOW ITS TOP. A probe that started inside a
+        // slab meets the slab's underside on the way down, because the core's
+        // ray test is two-sided. The probes after it start higher and meet the
+        // top face, so the highest answer within `minRise` of the first one is
+        // the same layer's upper surface. Compared against the FIRST answer and
+        // never a moving one, so a stack of close surfaces cannot be climbed.
+        float landing = probe.surfaceZ;
+        for (LayerProbe const& later : rising)
+        {
+            if (!later.valid || later.surfaceZ <= landing)
+                continue;
+            if (later.surfaceZ > probe.surfaceZ + minRise ||
+                later.surfaceZ > highestSurfaceZ)
+                continue;
+            landing = later.surfaceZ;
+        }
+        return landing;
+    }
+    return highestSurfaceZ;
+}
+
+std::vector<float> LiftProbeReaches(float step, float maxReach)
+{
+    std::vector<float> reaches;
+    if (!(step > 0.f) || !(maxReach > 0.f))
+        return reaches;
+    for (unsigned i = 1; step * static_cast<float>(i) <= maxReach; ++i)
+        reaches.push_back(step * static_cast<float>(i));
+    return reaches;
+}
+
 char const* StagingCorridorVerdictName(StagingCorridorVerdict verdict)
 {
     switch (verdict)

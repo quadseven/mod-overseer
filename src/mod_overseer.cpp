@@ -15608,8 +15608,28 @@ private:
         // corridor for this test to fire would have joined it rather than got
         // here - but writing it against `want` would leave the one line in this
         // function that still confused the two aims.
-        if (bot->GetExactDist2d(aimX, aimY) <= TRAVEL_ROUTE_MIN_YARDS)
+        //
+        // AND INSIDE THAT DISTANCE THE NAVMESH IS ASKED RATHER THAN ASSUMED
+        // (#592). Four hundred yards of straight line is a stand-in for "the
+        // mesh can walk this", and in a layered city the two part company: the
+        // Cleft of Shadow is 280 yards from Orgrimmar's upper level and 68 yards
+        // below it, the walk down is longer than PathGenerator will return, and
+        // with no route planned every poll aimed the cone through the city
+        // floor. Asked only inside the distance, so nothing outside it changes
+        // and the query is paid once per errand where it can change the answer.
+        float const aimZ = corridor.joinFirst ? corridor.joinAt.z : want.GetPositionZ();
+        float const fromAim = bot->GetExactDist2d(aimX, aimY);
+        bool const insideReach = fromAim <= TRAVEL_ROUTE_MIN_YARDS;
+        bool const navmeshReaches = insideReach && NavmeshRoutes(bot, aimX, aimY, aimZ);
+        if (!OverseerDecisions::SurveyedRouteWorthPlanning(fromAim, navmeshReaches,
+                                                           TRAVEL_ROUTE_MIN_YARDS))
             return route;
+        if (insideReach)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}', {:.0f} yards off, which is inside "
+                     "the distance the navmesh usually walks, but the navmesh has no route "
+                     "to it from here, so the survey is asked anyway (#592)",
+                     name, target, fromAim);
 
         ReadTheSurvey();
         TravelSurvey& survey = Survey();
@@ -15786,6 +15806,65 @@ private:
         return route;
     }
 
+    // The stepping limits a route is walked under. ONE POINT AT A TIME FOR A
+    // MEASURED CORRIDOR: see RouteLegLimits::maxPointsAhead. The descent's whole
+    // switchback fits inside one lookahead, so the ordinary rule aims across the
+    // ravine at a point 465 navmesh yards away, which comes back as a refused
+    // shortcut. A surveyed route keeps the lookahead it has always had, and a
+    // join leg IS a surveyed route.
+    static OverseerDecisions::RouteLegLimits RouteLimitsFor(
+        TravelAimBook::TravelState const& state)
+    {
+        OverseerDecisions::RouteLegLimits limits;
+        limits.lookaheadYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
+        limits.arrivedYards = TRAVEL_ROUTE_ARRIVED_YARDS;
+        if (state.routeIsMeasured)
+            limits.maxPointsAhead = 1;
+        return limits;
+    }
+
+    // WHEN THE ROUTE POINT THIS POLL AIMED AT IS REFUSED, A NEARER ONE ON THE
+    // SAME ROUTE (#592). RouteLegStep aims at the furthest waypoint within the
+    // lookahead in a straight line, and in a layered city that can be a long
+    // walk round several walls; GroundedStep refuses it and, before this, the
+    // drive reported the whole cone refused while the next waypoint stood a few
+    // yards off. Measured in Orgrimmar on 2026-09-23, five minutes of it on a
+    // route of 117 waypoints. See OverseerDecisions::RouteLegRetreats.
+    //
+    // THE CURSOR IS NOT MOVED. Each retreat is asked of a copy, because the
+    // cursor already advanced on this poll's first ask and a retreat is a
+    // nearer aim on the same stretch, not progress. Nothing when the route is
+    // empty, which is every leg that was not a route point to begin with.
+    static bool RetreatAlongRoute(Player* bot, WorldPosition const& want,
+                                  TravelAimBook::TravelState const& state,
+                                  WorldPosition& step)
+    {
+        if (state.route.empty())
+            return false;
+        OverseerDecisions::RouteLegLimits const first = RouteLimitsFor(state);
+        OverseerDecisions::RouteCursor tried = state.routeCursor;
+        OverseerDecisions::RouteAim const refused = OverseerDecisions::RouteLegStep(
+            tried, state.route, bot->GetPositionX(), bot->GetPositionY(), first);
+        // An index no route has, when this poll's own aim came back empty.
+        uint32 lastIndex = refused.hasAim ? refused.index
+                                          : static_cast<uint32>(state.route.size());
+        for (OverseerDecisions::RouteLegLimits const& limits :
+             OverseerDecisions::RouteLegRetreats(first))
+        {
+            OverseerDecisions::RouteCursor copy = state.routeCursor;
+            OverseerDecisions::RouteAim const aim = OverseerDecisions::RouteLegStep(
+                copy, state.route, bot->GetPositionX(), bot->GetPositionY(), limits);
+            // The same waypoint as the one just refused would be refused again.
+            if (!aim.hasAim || aim.index == lastIndex)
+                continue;
+            lastIndex = aim.index;
+            if (GroundedStep(bot, WorldPosition(want.GetMapId(), aim.x, aim.y, aim.z),
+                             step))
+                return true;
+        }
+        return false;
+    }
+
     // WHERE TO SEND THIS CHARACTER THIS POLL, given the errand it is on. `want`
     // is the errand and never moves; the answer is a point on the route while
     // there is one and `want` itself otherwise.
@@ -15857,28 +15936,39 @@ private:
             // itself be inside this distance of the door. Dropped there, the
             // character would be handed a bearing at the door with the corridor
             // never walked, which is the outcome the whole fix exists to end.
-            if (!state.routeIsMeasured && !state.routeJoinsCorridor &&
-                bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY()) <=
-                    TRAVEL_ROUTE_MIN_YARDS)
+            //
+            // BUT ONLY WHERE THE NAVMESH CAN ACTUALLY WALK THE REST (#592). The
+            // distance is a stand-in for that and the navmesh is asked inside
+            // it, the same question PlanRoute asks; a route that still ends
+            // nearer the errand than the character stands is kept while the
+            // answer is no. Asked only when the route does lead nearer, since
+            // otherwise it is dropped whatever the navmesh says.
+            if (!state.routeIsMeasured && !state.routeJoinsCorridor)
             {
-                state.route.clear();
-                return want;
+                float const fromAim =
+                    bot->GetExactDist2d(want.GetPositionX(), want.GetPositionY());
+                if (fromAim <= TRAVEL_ROUTE_MIN_YARDS)
+                {
+                    OverseerDecisions::RoutePoint const& end = state.route.back();
+                    float const endDx = end.x - want.GetPositionX();
+                    float const endDy = end.y - want.GetPositionY();
+                    float const endFromAim = std::sqrt(endDx * endDx + endDy * endDy);
+                    bool const navmeshReaches =
+                        endFromAim < fromAim &&
+                        NavmeshRoutes(bot, want.GetPositionX(), want.GetPositionY(),
+                                      want.GetPositionZ());
+                    if (!OverseerDecisions::SurveyedRouteStillLeads(
+                            fromAim, endFromAim, navmeshReaches, TRAVEL_ROUTE_MIN_YARDS))
+                    {
+                        state.route.clear();
+                        return want;
+                    }
+                }
             }
 
-            OverseerDecisions::RouteLegLimits limits;
-            limits.lookaheadYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
-            limits.arrivedYards = TRAVEL_ROUTE_ARRIVED_YARDS;
-            // ONE POINT AT A TIME FOR A MEASURED CORRIDOR. See
-            // RouteLegLimits::maxPointsAhead: the descent's whole switchback fits
-            // inside one lookahead, so the ordinary rule aims across the ravine at
-            // a point 465 navmesh yards away, which comes back as a refused
-            // shortcut. A surveyed route keeps the lookahead it has always had,
-            // and a join leg IS a surveyed route.
-            if (state.routeIsMeasured)
-                limits.maxPointsAhead = 1;
             OverseerDecisions::RouteAim const aim = OverseerDecisions::RouteLegStep(
                 state.routeCursor, state.route, bot->GetPositionX(),
-                bot->GetPositionY(), limits);
+                bot->GetPositionY(), RouteLimitsFor(state));
             if (!aim.hasAim)
             {
                 // Walked, or nothing left to offer. THE ROUTE IS DROPPED RATHER
@@ -19712,7 +19802,13 @@ private:
             // where this character is going. See RouteLeg.
             WorldPosition const leg = entry ? pos : RouteLeg(bot, pos, state, name, target);
             WorldPosition aimAt = leg;
-            if (!entry && !GroundedStep(bot, leg, aimAt))
+            // AND A REFUSED ROUTE POINT GIVES WAY TO A NEARER ONE BEFORE THE
+            // CONE IS DECLARED REFUSED (#592). See RetreatAlongRoute: the cone
+            // belongs pointed at the next stretch of the surveyed road, not at a
+            // waypoint 250 yards off across a layered city.
+            bool const stepped = entry || GroundedStep(bot, leg, aimAt) ||
+                                 RetreatAlongRoute(bot, pos, state, aimAt);
+            if (!stepped)
             {
                 // WHAT WAS MEASURED, AND NOT WHAT IT FELT LIKE (#312). This
                 // line used to say "there is no direction out of where it
@@ -21118,7 +21214,35 @@ private:
             // ten seconds after it had been sent to a vendor 39 yards away.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::LiftToSurface)
             {
-                bot->TeleportTo(bot->GetMapId(), fromX, fromY, verdict.liftZ,
+                // THE NEAREST LAYER OVER THE FEET, NOT THE TOP OF THE STACK
+                // (#592). The verdict's height is the first surface the probe
+                // met searching DOWN from sixty yards up, which is the highest
+                // one in reach; in a layered city that is a roof or the canyon
+                // rim, and on 2026-09-23 it put the Horde leader 58 yards above
+                // Orgrimmar and farther from the Cleft he was walking to. So the
+                // same probe is asked again rising in footing strides, and the
+                // first layer it meets is the landing. Not for the void catch,
+                // whose deep probe is answering a different question and where
+                // any surface at all is better than the plane.
+                float liftZ = verdict.liftZ;
+                float nearestLayerZ = reading.surfaceAboveZ;
+                if (!nearThePlane)
+                {
+                    std::vector<OverseerDecisions::LayerProbe> rising;
+                    for (float reach : OverseerDecisions::LiftProbeReaches(
+                             TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
+                             TERRAIN_RECOVERY_PROBE_YARDS))
+                    {
+                        OverseerDecisions::LayerProbe probe;
+                        probe.valid = SurfaceAbove(bot, probe.surfaceZ, reach);
+                        rising.push_back(probe);
+                    }
+                    nearestLayerZ = OverseerDecisions::LiftLandingSurface(
+                        fromZ, rising, reading.surfaceAboveZ,
+                        TERRAIN_RECOVERY_FOOTING_REACH_YARDS);
+                    liftZ = nearestLayerZ + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS;
+                }
+                bot->TeleportTo(bot->GetMapId(), fromX, fromY, liftZ,
                                 bot->GetOrientation());
                 // AND THE CORE NOW BELIEVES THIS CHARACTER'S FALL BEGAN UP
                 // HERE. Written down rather than acted on: the poll above
@@ -21130,7 +21254,7 @@ private:
                 // difference, at full health, out of combat, having moved 0.6
                 // yards downward in the last second of its life (#265).
                 OverseerDecisions::FallBaselineHandedOver(
-                    _fallBaseline[LowerName(name)], verdict.liftZ,
+                    _fallBaseline[LowerName(name)], liftZ,
                     std::time(nullptr));
                 // A CATCH ABOVE THE KILL PLANE IS NOT THE SAME EVENT AS A
                 // LIFT AND MUST NOT READ AS ONE. An ordinary lift is a
@@ -21158,7 +21282,7 @@ private:
                               "coordinates",
                               name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
                               TERRAIN_RECOVERY_VOID_CATCH_YARDS,
-                              OverseerDecisions::VOID_PLANE_Z, verdict.liftZ, job,
+                              OverseerDecisions::VOID_PLANE_Z, liftZ, job,
                               questAim, travelTarget);
                     continue;
                 }
@@ -21166,11 +21290,13 @@ private:
                          "overseer: '{}' read as below the world at map {} position "
                          "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
                          "{}; LIFTED straight up to z {:.1f} at the same "
-                         "x/y - it keeps quest aim job='{}' quest={} travel='{}' and its party. "
+                         "x/y, onto the nearest layer over its feet at z {:.1f} rather "
+                         "than the highest one in reach (#592) - it keeps quest aim "
+                         "job='{}' quest={} travel='{}' and its party. "
                          "If this is a real recovery the next poll is clean; if the same "
                          "condition comes back it escalates rather than repeating",
                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                         surface, surface - fromZ, footing, verdict.liftZ, job,
+                         surface, surface - fromZ, footing, liftZ, nearestLayerZ, job,
                          questAim, travelTarget);
                 continue;
             }
