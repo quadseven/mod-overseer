@@ -8371,6 +8371,28 @@ struct RouteCursor
 // below zero for no route; a new, shorter route is not progress by itself.
 bool RouteCursorAdvanced(long seen, long now);
 
+// A FOLLOWER IS LENT `new rpg` FOR A PARTY FLIGHT, AND GIVEN IT BACK ON LANDING
+// (2026-09-23). Every party flight on the dev realm was refused with "'Zrog' is
+// not a character this module steers": a follower does not carry `new rpg`,
+// on purpose, and boarding is that engine's action. So the leader walked 5,000
+// yards, or flew alone and stranded the family. Boarding now lends a following
+// member the strategy for the flight. What becomes of the loan each poll:
+//
+//   Keep       nothing to do: not lent, or lent and still walking to the
+//              flight master inside `boardLimit`.
+//   Flying     it has taken off; remember that, so landing can be told apart
+//              from never having boarded.
+//   Return     it has landed after flying, or it never took off within
+//              `boardLimit`: take `new rpg` back so `follow` has it again.
+enum class FlightLoanStep : std::uint8_t
+{
+    Keep,
+    Flying,
+    Return,
+};
+FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
+                              time_t now, time_t boardLimit);
+
 struct RouteAim
 {
     // False means "this poll has no route point to offer", which the caller

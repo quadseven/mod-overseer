@@ -6825,6 +6825,18 @@ GroundDanger ScoreGroundDanger(std::vector<DangerSpawn> const& spawns,
     return out;
 }
 
+FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
+                              time_t now, time_t boardLimit)
+{
+    if (!lent)
+        return FlightLoanStep::Keep;
+    if (inFlight)
+        return sawFlying ? FlightLoanStep::Keep : FlightLoanStep::Flying;
+    if (sawFlying)
+        return FlightLoanStep::Return;
+    return now - since > boardLimit ? FlightLoanStep::Return : FlightLoanStep::Keep;
+}
+
 bool RouteCursorAdvanced(long seen, long now)
 {
     return now >= 0 && seen >= 0 && now > seen;

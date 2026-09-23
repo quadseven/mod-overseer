@@ -12765,7 +12765,10 @@ private:
         // The same two gates every other aimed errand in this file is held to,
         // asked of the member rather than inherited from the leader.
         seat.ai = SteerableAI(member);
-        seat.read.steerable = seat.ai != nullptr && CanBeSentToNpc(seat.ai);
+        // A FOLLOWING BOT IS STEERABLE FOR A FLIGHT (2026-09-23). It does not
+        // carry `new rpg`, on purpose; boarding lends it for the flight and
+        // DriveCatchUp takes it back on landing. See ReadFlightLoan.
+        seat.read.steerable = seat.ai != nullptr;
         if (!seat.read.steerable)
             return;
 
@@ -13349,6 +13352,7 @@ private:
                     {
                         if (seat.who == bot || !seat.ai || seat.read.name != passenger)
                             continue;
+                        LendFlight(seat.read.name, seat.ai);
                         seat.ai->rpgInfo.ChangeToTravelFlight(seat.fmEntry, seat.fmPos,
                                                               seat.path);
                         TravelAimBook::TravelState& theirs =
@@ -17091,9 +17095,63 @@ private:
     // and `follow` are known to be correct - this is about whether following
     // can WORK from where the follower stands, which is the question nothing
     // above it asks. See FOLLOW_CATCH_UP_YARDS for the measurement.
+    // ------------------------------- a follower's party flight (2026-09-23) --
+    //
+    // WHAT A FOLLOWER IS LENT TO BOARD, AND WHEN IT IS GIVEN BACK. A follower
+    // does not carry `new rpg`, so the flight action boarding hands it has no
+    // engine to run on. The strategy is lent at boarding and taken back once
+    // the follower has flown and landed, or once `FLIGHT_LOAN_BOARD_SECONDS`
+    // pass without it ever taking off. See OverseerDecisions::ReadFlightLoan.
+    struct FlightLoan
+    {
+        time_t since{0};
+        bool sawFlying{false};
+    };
+    std::map<std::string, FlightLoan> _flightLoans;
+    static constexpr time_t FLIGHT_LOAN_BOARD_SECONDS = 5 * 60;
+
+    void LendFlight(std::string const& name, PlayerbotAI* botAI)
+    {
+        if (!botAI || CanBeSentToNpc(botAI))
+            return;
+        botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        _flightLoans[name] = FlightLoan{std::time(nullptr), false};
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is lent `new rpg` to board its leader's flight - it is "
+                 "taken back when it lands",
+                 name);
+    }
+
+    void SettleFlightLoan(Player* p, std::string const& name)
+    {
+        auto const loan = _flightLoans.find(name);
+        if (loan == _flightLoans.end())
+            return;
+        OverseerDecisions::FlightLoanStep const step = OverseerDecisions::ReadFlightLoan(
+            true, loan->second.sawFlying, p->IsInFlight(), loan->second.since,
+            std::time(nullptr), FLIGHT_LOAN_BOARD_SECONDS);
+        if (step == OverseerDecisions::FlightLoanStep::Flying)
+        {
+            loan->second.sawFlying = true;
+            return;
+        }
+        if (step != OverseerDecisions::FlightLoanStep::Return)
+            return;
+        bool const flew = loan->second.sawFlying;
+        _flightLoans.erase(loan);
+        if (PlayerbotAI* botAI = SteerableAI(p))
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' gives back the `new rpg` it was lent for a flight - {}",
+                 name,
+                 flew ? "it has landed, and follows its leader again"
+                      : "it never took off, so it follows its leader again on foot");
+    }
+
     void DriveCatchUp(Player* p, Player* leader)
     {
         std::string const name = p->GetName();
+        SettleFlightLoan(p, name);
         // THIS POLL'S ANSWER ONLY (#560). The ordering is KeepRosterFollowing's:
         // its follow loop calls this for every member, and its last statement,
         // after that loop, is KeepTheFamilyTogether, whose member filter (in
