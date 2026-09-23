@@ -12948,7 +12948,60 @@ std::vector<FamilyRoster> PartitionRosterByFamily(std::vector<FamilyMember> cons
 // callers already say "no leader, nothing to do".
 //
 // Returns null only when there are no rosters.
+//
+// SUPERSEDED FOR THE CAMPAIGN DRIVES by CampaignRosters below (#555), which
+// drives every family with a leader rather than choosing one. This remains the
+// answer for a caller that genuinely wants one family and names none.
 FamilyRoster const* ChooseCampaignRoster(std::vector<FamilyRoster> const& rosters);
+
+// EVERY FAMILY THE CAMPAIGN MACHINERY DRIVES, NOT ONE (mod-overseer#555).
+//
+// ChooseCampaignRoster answered "which family" for a world that could run one
+// campaign, and the answer was always the family of the first `lead` row. The
+// other family could never run a dungeon unless the first was disabled: the
+// operator's "Horde family through Ragefire Chasm while the Alliance family
+// keeps questing" had no way to happen.
+//
+// The dungeon coordinator, the home bind and the town trip now keep one state
+// per family and drive every family this returns, each from its own leader.
+// A family with no leader is left out because every one of those drives needs a
+// leader to aim, and without one they already said "nothing to do". Order is
+// the order given, so the family ChooseCampaignRoster would have picked is
+// still driven first, and a single-family roster drives exactly the family it
+// always did.
+std::vector<FamilyRoster const*> CampaignRosters(std::vector<FamilyRoster> const& rosters);
+
+// ONE ACTIVE RUN PER INSTANCE MAP, AND THE TABLE ENFORCES IT (mod-overseer#555).
+//
+// overseer_dungeon_run carries a unique key on the map of an ACTIVE run, so
+// two families in the same dungeon at once would share one row: the second
+// family's crossing would touch the first family's heartbeat and its
+// coordinator would re-attribute the row to its own leader. Until the run row
+// is keyed by family as well, a family whose door leads to a map another
+// family's run is already using waits at IDLE for that run to end.
+struct FamilyRunClaim
+{
+    std::string family;
+    unsigned insideMapId{0};
+    bool running{false};   // the family's coordinator is anywhere but IDLE
+};
+
+// Is `insideMapId` in use by a run that belongs to a family other than
+// `family`? A family's own claim never blocks it, and a claim that is not
+// running blocks nobody.
+bool DungeonMapHeldByAnotherFamily(std::string const& family, unsigned insideMapId,
+                                   std::vector<FamilyRunClaim> const& claims);
+
+// A NEW CAMPAIGN ID THAT NO OTHER FAMILY'S COORDINATOR IS ALREADY USING.
+//
+// The id is MAX(campaign_id) + 1 read off the run table, and the stamp that
+// writes it back is queued on the async worker. With one coordinator nothing
+// else allocated in between; with one per family, two families opening their
+// first run in the same poll would both read the same MAX and share a campaign,
+// and the failure stop that counts a campaign's runs would count both. So the
+// answer is the larger of the table's next id and one past every id a
+// coordinator in this process already holds.
+unsigned NextCampaignId(unsigned tableNext, std::vector<unsigned> const& heldInProcess);
 
 bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
                                 bool isBotSession, std::string const& name,
