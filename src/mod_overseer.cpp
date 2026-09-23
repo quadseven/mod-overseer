@@ -1877,6 +1877,22 @@ constexpr float FOLLOW_CATCH_UP_REAIM_YARDS = FOLLOW_CATCH_UP_DONE_YARDS / 2.0f;
 constexpr time_t CATCH_UP_STANDDOWN_SECONDS =
     static_cast<time_t>(ERRAND_DEATH_LIMITS.cooloffSeconds);
 
+// WHERE A CATCH-UP STOPS BEING A WALK (2026-09-23). FOLLOW_CATCH_UP_YARDS is
+// where the walk starts and nothing said where it ends: a follower in
+// Winterspring was released to walk 11,505 yards to a leader in Silithus,
+// routed round 35,358 yards of surveyed legs through elite ground. Past this
+// line the catch-up flies, through ConsiderFlight, or the follower is held
+// where it stands. It is TRAVEL_FLIGHT_MIN_YARDS, read rather than written
+// again: the distance at which this module already calls a trip a journey
+// worth a flight. See OverseerDecisions::FarCatchUpWalk.
+constexpr float CATCH_UP_FOOT_LIMIT_YARDS = TRAVEL_FLIGHT_MIN_YARDS;
+
+// HOW LONG A FOLLOWER IS HELD FOR BEING TOO FAR before the flight is asked
+// again. The catch-up stand-down's fifteen minutes, read from it: both answer
+// "leave this follower where it is for a while", and a leader who has moved
+// on may now be somewhere a flight reaches.
+constexpr time_t CATCH_UP_FAR_HOLD_SECONDS = CATCH_UP_STANDDOWN_SECONDS;
+
 // WHEN A CATCHING-UP FOLLOWER'S AIM IS WORTH REWRITING (#404), which is not the
 // same question as whether the leader has moved.
 //
@@ -7565,6 +7581,32 @@ private:
                     INN_HOLD_VERB);
     }
 
+    // ------------------------------- the too-far-to-walk hold (2026-09-23) --
+    //
+    // A FOLLOWER PAST CATCH_UP_FOOT_LIMIT_YARDS THAT NO FLIGHT CARRIES STANDS STILL.
+    // Handing it back to `follow` is not standing still: past SightDistance
+    // upstream's Follow() takes one straight step at the master per attempt,
+    // for ever (see FOLLOW_CATCH_UP_YARDS), which is the same walk across the
+    // same elite ground one step at a time. So it is held with the register
+    // every other verb uses, and what it owes back is paid when the leader is
+    // back within range or the hold is due to ask the flight again.
+    static constexpr char const* FAR_HOLD_VERB = "wait for leader";
+
+    // Placed, or re-asserted, on every poll the follower is held. It never
+    // takes over a hold another verb placed: that verb's release is the one
+    // that owes the strategies back.
+    static void HoldFarFromLeader(Player* member, std::string const& name)
+    {
+        auto const other = HoldsInForce().find(name);
+        if (other != HoldsInForce().end() && other->second.verb != FAR_HOLD_VERB)
+            return;
+        PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        if (!botAI)
+            return;
+        HoldCharacterStill(member, botAI, name, FAR_HOLD_VERB,
+                           static_cast<uint32>(CATCH_UP_FAR_HOLD_SECONDS), false);
+    }
+
     // ------------------------------------------ the counter hold (#378) --
     //
     // THE SIXTH REASON IN THE REGISTER, AND IT IS THE INN HOLD ABOVE APPLIED AT
@@ -13237,6 +13279,8 @@ private:
             // flight action until it lands or the leg's own backstop takes it
             // back.
             botAI->rpgInfo.ChangeToTravelFlight(fmEntry, fmPos, path);
+            if (chasing != _dungeonEscorts.end() && chasing->second.catchUp)
+                chasing->second.flew = true;
             state.flights++;
             state.flightSince = std::time(nullptr);
             LOG_INFO("module.overseer",
@@ -16235,6 +16279,11 @@ private:
         // whichever way that decision then goes. Meaningful only while
         // `catchUp`; see ConsiderFlight for the four fares it is about.
         bool mayFly{false};
+        // A FLIGHT CARRIED THIS CATCH-UP. Set where ConsiderFlight boards it,
+        // and read by FarCatchUpWalk: the walk left after a landing is the one
+        // the flight chose, and is not held for being long. Meaningful only
+        // while `catchUp`.
+        bool flew{false};
         // Where the catch-up aim was last pointed, so "has the leader moved
         // far enough from it to re-aim" is answered from memory rather than by
         // parsing the aim string back. Meaningful only while `catchUp`.
@@ -16333,6 +16382,23 @@ private:
     // refusal that outlives its reason is its own bug. World thread only, like
     // everything else on this loop.
     std::map<std::string, time_t> _catchUpStandDown;
+
+    // FOLLOWERS HELD FOR BEING TOO FAR TO WALK TO THE LEADER, and when the hold
+    // began. Written by the travel drive on the poll FarCatchUpWalk says Hold,
+    // read by DriveCatchUp before it starts another walk, and ended by
+    // EndFarHold. See CATCH_UP_FOOT_LIMIT_YARDS.
+    std::map<std::string, time_t> _catchUpHeldFar;
+
+    void EndFarHold(std::string const& name, char const* why)
+    {
+        if (!_catchUpHeldFar.erase(name))
+            return;
+        ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
+                    FAR_HOLD_VERB);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is no longer held for being too far from its leader - {}",
+                 name, why);
+    }
 
     bool WithinCatchUpStandDown(std::string const& name)
     {
@@ -16677,7 +16743,10 @@ private:
         // with a fresh flight budget; without this the same journey would keep
         // buying tickets. See ConsiderFlight.
         if (started)
+        {
             escort.mayFly = true;
+            escort.flew = false;
+        }
         // THE DRIFT MARK IS THE AIM AND NOT THE LEADER (#503). `escort.x` and
         // `escort.y` are what CatchUpAimIsStale measures the leader's drift
         // from, and its whole question is "has the destination moved" - so it
@@ -16808,6 +16877,11 @@ private:
         bool const split = reading == OverseerDecisions::FollowGap::SplitAcrossMaps;
         if (!split)
             _partySplitSaid.erase(name);
+        // THE ORDINARY END OF A TOO-FAR HOLD: the leader came back within the
+        // line. Asked before every return below so a follower back in
+        // formation is let go on the first poll that sees it.
+        if (!split && gap <= CATCH_UP_FOOT_LIMIT_YARDS)
+            EndFarHold(name, "the leader is back within the line a catch-up may walk");
 
         auto const it = _dungeonEscorts.find(name);
         bool const escorted = it != _dungeonEscorts.end();
@@ -16964,6 +17038,30 @@ private:
         // be standing on something, for the reason OnTheGround gives.
         if (!p->IsAlive() || p->IsInFlight() || InDungeonRun(p))
             return;
+        // A FOLLOWER HELD FOR BEING TOO FAR STAYS HELD, and is not sent on
+        // another walk that the flight has already refused (2026-09-23).
+        // Asked before the HeldStill test below, because that is the hold this
+        // re-asserts, and every poll: the refusal it records is what the
+        // regroup wait reads to carry on without it rather than hold the
+        // leader for a walk that is not happening. Said once, by the travel
+        // drive, on the poll the hold was placed.
+        {
+            auto const heldFar = _catchUpHeldFar.find(name);
+            if (heldFar != _catchUpHeldFar.end())
+            {
+                if (OverseerDecisions::FarCatchUpStaysHeld(
+                        gap, CATCH_UP_FOOT_LIMIT_YARDS, std::time(nullptr) - heldFar->second,
+                        CATCH_UP_FAR_HOLD_SECONDS))
+                {
+                    HoldFarFromLeader(p, name);
+                    _catchUpRefused[name] =
+                        "it is held where it stands, too far from the leader to walk and "
+                        "with no flight that carries it";
+                    return;
+                }
+                EndFarHold(name, "the hold is due to ask the flight again");
+            }
+        }
         // And a follower held after a revival is standing still on purpose,
         // for a few seconds - see HoldAfterRevival. So is one a casting verb is
         // holding (#335): the grant site below would refuse it the mover
@@ -19608,6 +19706,43 @@ private:
             // REPLACES the walk rather than competing with it.
             if (ConsiderFlight(name, bot, botAI, pos, distance, state))
                 continue;
+
+            // A CATCH-UP PAST THE LINE FLIES OR HOLDS, AND NEVER WALKS
+            // (2026-09-23). ConsiderFlight has just had its turn and issued
+            // nothing, so what is left for a far catch-up is the foot walk
+            // across a continent this rule exists to refuse. See
+            // OverseerDecisions::FarCatchUpWalk for the four answers.
+            if (IsCatchingUp(name))
+            {
+                auto const walk = _dungeonEscorts.find(name);
+                OverseerDecisions::FarCatchUpStep const far =
+                    OverseerDecisions::FarCatchUpWalk(
+                        distance, CATCH_UP_FOOT_LIMIT_YARDS, walk->second.flew,
+                        !walk->second.mayFly, CanBeSentToNpc(botAI));
+                if (far == OverseerDecisions::FarCatchUpStep::Wait)
+                    continue;
+                if (far == OverseerDecisions::FarCatchUpStep::Hold)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is {} yards from its catch-up aim '{}', past the "
+                             "{} yard line a catch-up may walk (CATCH_UP_FOOT_LIMIT_YARDS), and "
+                             "no flight carries it - so it is not walked there. Its catch-up "
+                             "walk ends and it is held where it stands until the leader is "
+                             "back within {} yards, or for {} minutes, when the flight is "
+                             "asked again. The family carries on without it",
+                             name, static_cast<uint32>(distance), target,
+                             static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS),
+                             static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS),
+                             static_cast<uint32>(CATCH_UP_FAR_HOLD_SECONDS / 60));
+                    _catchUpHeldFar[name] = std::time(nullptr);
+                    // `state` IS DEAD AFTER THIS: EndOneEscort releases the
+                    // errand, which erases the record it points into.
+                    EndOneEscort(name, walk->second.granted);
+                    _dungeonEscorts.erase(walk);
+                    HoldFarFromLeader(bot, name);
+                    continue;
+                }
+            }
 
             // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63). This is the site the
             // lesson was measured on and the rule is now written down once, in

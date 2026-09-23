@@ -5414,6 +5414,46 @@ struct CatchUpAimFacts
 // Is the aim stale enough to be worth the route that rewriting it costs?
 bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits);
 
+// ------------------ a catch-up walk a continent long is not a walk --
+//
+// MEASURED 2026-09-23. A follower in Winterspring was released to walk to its
+// leader in Silithus, 11,505 yards away, and was routed round 35,358 yards of
+// surveyed legs through elite ground. The catch-up walk had no distance bound:
+// FOLLOW_CATCH_UP_YARDS is where it STARTS, and nothing said where it stops
+// being a walk. The flight threshold is that line. Past it the module already
+// says a trip is a journey worth a flight, so past it a follower either flies
+// or stays where it is until the leader is back within range.
+//
+// WHAT ONE POLL OF THE TRAVEL DRIVE DOES WITH A CATCH-UP PAST THE LINE, after
+// ConsiderFlight has had its turn and not issued a flight.
+enum class FarCatchUpStep : std::uint8_t
+{
+    Walk,   // inside the line, or a flight already carried it: walk as before
+    Grant,  // issue this poll so the follower takes the mover: ConsiderFlight
+            // refuses anyone not carrying it, so the flight is decided next poll
+    Wait,   // the flight is not decided yet for another reason (a fight, a
+            // death): issue nothing this poll
+    Hold,   // the flight was decided and nothing flew: end the walk and hold
+};
+
+// `flightDecided` is the catch-up's own `mayFly` having been spent, which is
+// ConsiderFlight's record that it reached a real answer. `carriesMover` is
+// CanBeSentToNpc. A zero or negative footLimitYards is the tight reading and
+// holds every far walk, for the reason ProvenStepIsWorthTaking refuses a
+// nonsense floor.
+FarCatchUpStep FarCatchUpWalk(float yardsToAim, float footLimitYards, bool flewThisWalk,
+                              bool flightDecided, bool carriesMover);
+
+// "walk", "grant", "wait", "hold".
+char const* FarCatchUpStepWord(FarCatchUpStep step);
+
+// DOES A FOLLOWER HELD FOR BEING TOO FAR STAY HELD THIS POLL? It stops being
+// held when the leader is back within the line, which is the ordinary end, or
+// when the hold has lasted `retrySeconds`, so a leader who has moved somewhere
+// a flight now reaches gets the question asked again rather than never.
+bool FarCatchUpStaysHeld(float gapYards, float footLimitYards, time_t heldForSeconds,
+                         time_t retrySeconds);
+
 // ------------- and an aim at the bottom of a lake is not an aim (#503) ------
 //
 // THE SAME DEFECT AS THE ONE ABOVE, ONE AXIS OVER. CatchUpAimFacts already
