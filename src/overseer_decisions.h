@@ -8351,6 +8351,19 @@ struct RouteCursor
     std::uint32_t at{0};
 };
 
+// HAS A CHARACTER GOT FURTHER ALONG ITS SURVEYED ROUTE SINCE IT WAS LAST READ?
+// (2026-09-23)
+//
+// The staging watchdog reads progress as the straight-line gap to the staging
+// point, and a route through a layered city first walks AROUND: measured on
+// the dev realm, three Horde followers on the level above Orgrimmar's Cleft of
+// Shadow were 176 to 205 yards out and 44 to 69 yards up, on a surveyed way
+// down of over six hundred yards, and BARRIER closed the run as "stopped
+// descending" ninety seconds in. A route position that moved on is progress,
+// whatever the straight line says. `seen` and `now` are route point indexes,
+// below zero for no route; a new, shorter route is not progress by itself.
+bool RouteCursorAdvanced(long seen, long now);
+
 struct RouteAim
 {
     // False means "this poll has no route point to offer", which the caller
