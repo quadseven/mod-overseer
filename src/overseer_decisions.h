@@ -14024,6 +14024,104 @@ char const* MailWalkEndReason(MailWalkState state);
 // MAIL_WALK_PROGRESS_YARDS under `bestYards`.
 bool MailWalkMadeProgress(float bestYards, float nowYards);
 
+// ---------------------------------------------------------------------------
+// THE DUNGEON RUN TIMELINE (overseer_dungeon_run_event).
+//
+// WHY A TABLE AND NOT THE LOG. The module logs enough that the worldserver's
+// container log rotates within minutes, so the story of a run that failed an
+// hour ago is gone by the time anybody asks about it. The run row keeps how a
+// run ended; this keeps how it got there: every phase change and every
+// decision the coordinator takes about a run, one row each, kept 14 days.
+//
+// WHY A DIFF OF TWO SNAPSHOTS. The coordinator changes phase in more than a
+// dozen places and every one of them is in the middle of code that is edited
+// often. Taking the coordinator's state before and after each poll and
+// comparing them records every transition from ONE place, including the ones
+// added later, and it cannot record the same phase twice because a phase that
+// did not change produces nothing. The volume is bounded the same way: a poll
+// that changes nothing writes nothing.
+// ---------------------------------------------------------------------------
+
+// Rows older than this are deleted by the module's sweep.
+constexpr uint32_t RUN_TIMELINE_RETENTION_DAYS = 14;
+// The width of overseer_dungeon_run_event.detail.
+constexpr std::size_t RUN_TIMELINE_DETAIL_MAX = 500;
+
+// The parts of one family's coordinator a reader of the timeline cares about.
+// `phase` is the adapter's name for the phase ("IDLE", "GATHERING", ...), so
+// this file never needs the adapter's enum.
+struct RunTimelineSnapshot
+{
+    std::string phase{"IDLE"};
+    uint32_t runId{0};
+    uint32_t campaignId{0};
+    uint32_t runNumber{0};
+    std::string portal;
+    unsigned clearSkips{0};
+    uint32_t clearEncounters{0};
+    std::string stalledReason;
+    bool provedComplete{false};
+    bool evacuated{false};
+    bool dcAcceptedAll{false};    // CLEARING saw `dc on` accepted on everyone inside
+    bool dcNotAccepted{false};    // CLEARING gave up waiting for that
+    bool brainNotMoving{false};   // accepted, and the leader has not moved since
+    bool busyCeiling{false};      // the clearing watchdog stopped trusting "busy"
+    unsigned stagingRearms{0};
+    uint32_t resetAttempts{0};
+};
+
+// One row of the timeline, before the adapter adds who and when.
+struct RunTimelineEvent
+{
+    uint32_t runId{0};
+    uint32_t campaignId{0};
+    uint32_t runNumber{0};
+    std::string portal;
+    std::string phase;   // the phase the run is in once this happened
+    std::string kind;    // "phase", "boss", "dc_skip", "stalled", ...
+    std::string detail;
+};
+
+// Everything that happened to one family's run between two polls, in the
+// order a reader wants it: the decisions taken in the old phase first, then
+// the phase change. Empty when nothing a reader would act on changed.
+//
+// A run that ENDED during the poll has its identity reset along with the rest
+// of the coordinator, so every event is stamped with the run it happened to:
+// the later snapshot's while the run is still going, the earlier one's when
+// the coordinator went back to IDLE.
+std::vector<RunTimelineEvent> RunTimelineEvents(RunTimelineSnapshot const& before,
+                                                RunTimelineSnapshot const& after);
+
+// What the module remembers about `dc on` for one character (DcOnRecord).
+struct DcOnMark
+{
+    uint32_t runId{0};
+    bool accepted{false};
+    std::time_t issuedAt{0};
+    bool loggedRefused{false};
+    bool stoodDown{false};
+};
+
+// One `dc on` / `dc off` row, for the character named.
+struct DcOnTimelineEvent
+{
+    std::string name;
+    uint32_t runId{0};
+    std::string kind;    // "dc_on", "dc_on_refused", "dc_off"
+    std::string detail;
+};
+
+// What changed in the module's `dc on` memory over one poll of the arming
+// drive. An acceptance is one row per issue; a refusal is one row per streak,
+// not one per retry, which is the same once-per-streak rule the WARN follows.
+std::vector<DcOnTimelineEvent> DcOnTimelineEvents(std::map<std::string, DcOnMark> const& before,
+                                                  std::map<std::string, DcOnMark> const& after);
+
+// `text` cut to fit the detail column, marked with "..." when it was cut.
+std::string RunTimelineDetail(std::string const& text,
+                              std::size_t max = RUN_TIMELINE_DETAIL_MAX);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
