@@ -6820,6 +6820,11 @@ GroundDanger ScoreGroundDanger(std::vector<DangerSpawn> const& spawns,
     return out;
 }
 
+bool RouteCursorAdvanced(long seen, long now)
+{
+    return now >= 0 && seen >= 0 && now > seen;
+}
+
 bool EntryUnreachable(bool computed, bool meshAbsent, bool noPath, float endGapYards,
                       float toleranceYards)
 {

@@ -4902,6 +4902,17 @@ public:
         return it != _state.end() && it->second.inertFollowerAim;
     }
 
+    // HOW FAR ALONG ITS SURVEYED ROUTE THIS CHARACTER IS, as a point index, or
+    // -1 when it walks no route. Read without creating a record, for the reason
+    // TargetFor gives. See OverseerDecisions::RouteCursorAdvanced.
+    long RouteCursorOf(std::string const& name) const
+    {
+        auto const it = _state.find(name);
+        if (it == _state.end() || it->second.route.empty())
+            return -1;
+        return static_cast<long>(it->second.routeCursor.at);
+    }
+
     // DID A DUNGEON RUN ISSUE THIS ERRAND? Asked of the target as well as the
     // name, so a run staging aim that has since been replaced by somebody
     // else's errand for the same character does not answer for it.
@@ -24568,6 +24579,10 @@ private:
         // backstop counts time without progress. Reset with each leg and with
         // the clock. See OverseerDecisions::StagingClockAfterReading.
         float gatherBest{-1.f};
+        // EACH MEMBER'S SURVEYED ROUTE POSITION AS THE WATCHDOG LAST READ IT
+        // (2026-09-23). A position that moved on is progress along a way round
+        // the straight-line gap cannot see. See RunStagingWatchdog.
+        std::map<std::string, long> routeSeen;
         // THE CLEARING WATCHDOG'S MEMORY (#171). The same shape as
         // FollowStallState - a mark the subject is measured FROM, the shared
         // ratchet's reading of how far it has got from that mark, and a count
@@ -25515,6 +25530,23 @@ private:
         // The gap in whole yards, for every line below. Read once so the
         // corrections and the diagnosis quote the same numbers.
         std::string const where = OverseerDecisions::ApproachWhere(gap);
+
+        // A MEMBER STILL GOING FORWARD ON ITS SURVEYED ROUTE IS NOT STALLED
+        // (2026-09-23), however the straight line to the staging point reads.
+        // Its stall measurement starts again from here, so the ladder and the
+        // "above the staging point" close both wait for a member that has
+        // actually stopped. See OverseerDecisions::RouteCursorAdvanced.
+        {
+            long const cursor = _travelAims.RouteCursorOf(name);
+            auto const seen = coord.routeSeen.find(name);
+            long const before = seen == coord.routeSeen.end() ? -1 : seen->second;
+            coord.routeSeen[name] = cursor;
+            if (OverseerDecisions::RouteCursorAdvanced(before, cursor))
+            {
+                coord.staging.erase(name);
+                return false;
+            }
+        }
 
         OverseerDecisions::StagingStallState& stall = coord.staging[name];
         OverseerDecisions::StagingNudge const nudge = OverseerDecisions::StagingWatchdog(
