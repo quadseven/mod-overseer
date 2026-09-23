@@ -1961,8 +1961,8 @@ bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards);
 // sqrt(5^2 + 7.01^2) = 8.61 against a radius of 12.
 //
 // WHAT IS REFUSED, AND WHY REFUSING MEANS KEEPING THE OLD AIM RATHER THAN
-// AIMING NOWHERE. A door with no radius is a BOX trigger and this question has
-// no answer for it; a probe that found no surface has nothing to offer; and a
+// AIMING NOWHERE. A door with no radius is a BOX trigger and this radius
+// overload has no answer for it (the shape overload below does, #577); a probe that found no surface has nothing to offer; and a
 // correction larger than the door would be relocating the aim rather than
 // grounding it, which is exactly what TRAVEL_GROUND_SNAP_YARDS refuses in the
 // general case. All three keep the trigger's own z, which is the behaviour
@@ -1983,6 +1983,119 @@ struct DoorAimHeight
 
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
                                 float arrivalYards, float triggerRadiusYards);
+
+// ------------------------------------------------- a door that is a box (#577) --
+//
+// THE AREATRIGGER TABLE CARRIES TWO SHAPES, AND UNTIL #577 THIS MODULE KNEW
+// ONE. A row with a radius is a sphere. A row with a radius of 0 is a BOX:
+// `length`, `width` and `height` are its full extents and `orientation` turns
+// it about its centre. Ten classic doors are boxes on the way out (Ragefire
+// Chasm, both Maraudon wings, every Dire Maul door, Scholomance), and the only
+// answer ArrivalReachesTrigger had for a box was "no", so a run through any of
+// them would have entered and never walked out.
+//
+// WHAT THE CORE DOES, READ AT THE PIN THE ADAPTER BUILD USES, and mirrored
+// here rather than paraphrased. Player::IsInAreaTriggerRadius (Player.cpp:2216)
+// asks `radius > 0` first and takes the sphere branch if so, which is why a row
+// that carries a radius AND box extents (2221, Stratholme's way out) is a
+// sphere. Otherwise it calls Position::IsWithinBox (Position.cpp:118) with
+// half of each extent: the character's offset from the centre is turned by
+// 2*pi - orientation, and each of the three axes is then compared on its own.
+// Two differences from the sphere are worth saying out loud:
+//
+//   * the sphere measures WorldObject::GetDistance, which takes the
+//     character's own combat reach (1.5 yards at scale 1) off first; the box
+//     does not, so a box is exactly as big as its row says;
+//   * the box's vertical extent is independent of its horizontal one, so the
+//     floor under a box is inside it or not whatever the character's bearing.
+//
+// The handler that decides a knock (MiscHandler.cpp:716) passes a delta of 0
+// for every trigger this module aims at, so no delta is taken here.
+struct AreaTriggerShape
+{
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+    float radius{0.f};
+    float length{0.f};
+    float width{0.f};
+    float height{0.f};
+    float orientation{0.f};
+};
+
+enum class AreaTriggerForm : std::uint8_t
+{
+    Sphere,   // radius > 0, which the core asks first
+    Box,      // radius 0 and three positive extents
+    Nothing,  // neither: a row no character can ever be inside
+};
+
+AreaTriggerForm AreaTriggerFormOf(AreaTriggerShape const& trigger);
+
+// Is a character standing at (px, py, pz) inside this trigger, by the core's
+// own test? `objectSize` is the character's combat reach, which only the sphere
+// branch subtracts. The adapter's authority is still the handler's own check;
+// this exists so the arithmetic every decision below leans on is pinned by a
+// test against the same rows the adapter reads.
+bool InsideAreaTrigger(AreaTriggerShape const& trigger, float px, float py, float pz,
+                       float objectSize);
+
+// The horizontal radius inside which EVERY bearing from the centre is inside
+// the trigger: the radius itself for a sphere, half the shorter side for a box.
+// A walk stops somewhere on a circle about its aim without saying on which
+// bearing, so this is the size an arrival tolerance has to fit inside.
+float AreaTriggerInscribedYards(AreaTriggerShape const& trigger);
+
+// The horizontal radius outside which NO bearing is inside the trigger: the
+// radius for a sphere, the half-diagonal for a box. This is the size a gather
+// circle has to stay clear of.
+float AreaTriggerReachYards(AreaTriggerShape const& trigger);
+
+// ArrivalReachesTrigger FOR EITHER SHAPE. A sphere is asked exactly what the
+// radius overload asks. A box is asked whether a character that stopped
+// `arrivalYards` from its centre, on any bearing, is still inside it: the
+// arrival circle has to fit strictly inside the shorter side.
+bool ArrivalReachesTrigger(float arrivalYards, AreaTriggerShape const& trigger);
+
+// WHAT A WALK AT THIS DOOR SHOULD ARRIVE ON. `defaultYards` when that already
+// reaches the trigger, which is every sphere door in the portal table but one,
+// so none of those changes. The one is Shadowfang Keep's way out, areatrigger
+// 194, radius 5: five yards is not strictly inside five, the exit walk has
+// refused it since that row was added, and it now walks on four. Otherwise the trigger's inscribed radius less
+// DOOR_ARRIVAL_INSET_YARDS, provided that leaves at least
+// DOOR_ARRIVAL_FLOOR_YARDS; and zero when it does not, which ArrivalReachesTrigger
+// then refuses. Six of the Dire Maul boxes are under ten yards across on their
+// shorter side, so the five yard default arrives OUTSIDE them.
+float DoorArrivalYards(float defaultYards, AreaTriggerShape const& trigger);
+
+// A yard of room between the arrival circle and the box's face, so the noise in
+// where a walk actually stops cannot put an arrived character on the face
+// itself; and the smallest tolerance a walk is ever handed, because a walk
+// asked to stop within less than a yard of a point is asking the path's own
+// last segment for more than it promises.
+constexpr float DOOR_ARRIVAL_INSET_YARDS = 1.0f;
+constexpr float DOOR_ARRIVAL_FLOOR_YARDS = 1.0f;
+
+// DoorAimOnTheFloor FOR EITHER SHAPE. A sphere is the radius overload
+// unchanged. A box grounds when the floor under it is strictly inside its
+// vertical half-extent, because that is the whole of the box's test on z: a
+// character standing on that floor passes it on every bearing, and moving the
+// aim's z changes nothing about the horizontal test. The same refusals keep the
+// trigger's own z: no surface found, no tolerance, or a floor outside the box.
+DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYards,
+                                AreaTriggerShape const& trigger);
+
+// HOW FAR BACK FROM THIS DOOR THE PARTY GATHERS. The staging standoff is
+// measured from the door's centre, and for a sphere it is `standoffYards`
+// exactly as it always was: every sphere row stages on that number today and
+// two of them (`wailing`, `zulfarrak`) are known to stage inside the margin the
+// standoff constant argues for, which is recorded where they are rather than
+// changed here. For a box the size is not a radius at all, so the margin is
+// ENFORCED rather than assumed: the gather circle of `barrierYards` has to
+// clear the box's half-diagonal on every bearing, so the standoff is the larger
+// of `standoffYards` and reach + barrier.
+float DungeonStagingStandoffYards(AreaTriggerShape const& door, float standoffYards,
+                                  float barrierYards);
 
 enum class DungeonTraversalKind : std::uint8_t { Walk, Jump, Drop };
 enum class DungeonTraversalPhase : std::uint8_t { Planned, Executing, Complete, Aborted };

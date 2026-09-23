@@ -1244,6 +1244,149 @@ DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
     return out;
 }
 
+AreaTriggerForm AreaTriggerFormOf(AreaTriggerShape const& trigger)
+{
+    // THE CORE'S ORDER: radius first. A row with a radius and box extents is a
+    // sphere to Player::IsInAreaTriggerRadius, so it is a sphere here.
+    if (trigger.radius > 0.f)
+        return AreaTriggerForm::Sphere;
+    if (trigger.length > 0.f && trigger.width > 0.f && trigger.height > 0.f)
+        return AreaTriggerForm::Box;
+    return AreaTriggerForm::Nothing;
+}
+
+bool InsideAreaTrigger(AreaTriggerShape const& trigger, float px, float py, float pz,
+                       float objectSize)
+{
+    switch (AreaTriggerFormOf(trigger))
+    {
+        case AreaTriggerForm::Sphere:
+        {
+            // WorldObject::GetDistance: the exact distance less the
+            // character's own size, never below zero.
+            double const dx = double(px) - double(trigger.x);
+            double const dy = double(py) - double(trigger.y);
+            double const dz = double(pz) - double(trigger.z);
+            double distance = SquareRoot(dx * dx + dy * dy + dz * dz) - double(objectSize);
+            if (distance < 0.0)
+                distance = 0.0;
+            return !(distance > double(trigger.radius));
+        }
+        case AreaTriggerForm::Box:
+        {
+            // Position::IsWithinBox, line for line: turn the offset by
+            // 2*pi - orientation and compare each axis against its half-extent.
+            double const rotation = 2.0 * 3.14159265358979323846 - double(trigger.orientation);
+            double const sinVal = std::sin(rotation);
+            double const cosVal = std::cos(rotation);
+            double const offX = double(px) - double(trigger.x);
+            double const offY = double(py) - double(trigger.y);
+            double const alongLength = offX * cosVal - offY * sinVal;
+            double const alongWidth = offY * cosVal + offX * sinVal;
+            double const up = double(pz) - double(trigger.z);
+            return !(Magnitude(float(alongLength)) > trigger.length / 2.f ||
+                     Magnitude(float(alongWidth)) > trigger.width / 2.f ||
+                     Magnitude(float(up)) > trigger.height / 2.f);
+        }
+        case AreaTriggerForm::Nothing:
+            break;
+    }
+    return false;
+}
+
+float AreaTriggerInscribedYards(AreaTriggerShape const& trigger)
+{
+    switch (AreaTriggerFormOf(trigger))
+    {
+        case AreaTriggerForm::Sphere:
+            return trigger.radius;
+        case AreaTriggerForm::Box:
+            return (trigger.length < trigger.width ? trigger.length : trigger.width) / 2.f;
+        case AreaTriggerForm::Nothing:
+            break;
+    }
+    return 0.f;
+}
+
+float AreaTriggerReachYards(AreaTriggerShape const& trigger)
+{
+    switch (AreaTriggerFormOf(trigger))
+    {
+        case AreaTriggerForm::Sphere:
+            return trigger.radius;
+        case AreaTriggerForm::Box:
+        {
+            double const halfLength = double(trigger.length) / 2.0;
+            double const halfWidth = double(trigger.width) / 2.0;
+            return float(SquareRoot(halfLength * halfLength + halfWidth * halfWidth));
+        }
+        case AreaTriggerForm::Nothing:
+            break;
+    }
+    return 0.f;
+}
+
+bool ArrivalReachesTrigger(float arrivalYards, AreaTriggerShape const& trigger)
+{
+    switch (AreaTriggerFormOf(trigger))
+    {
+        case AreaTriggerForm::Sphere:
+            return ArrivalReachesTrigger(arrivalYards, trigger.radius);
+        case AreaTriggerForm::Box:
+            // Strictly inside, for the radius overload's reason: a tolerance
+            // equal to the half-side arrives ON the face, and the handler's
+            // `>` then decides a coin toss of float noise.
+            return arrivalYards > 0.f && arrivalYards < AreaTriggerInscribedYards(trigger);
+        case AreaTriggerForm::Nothing:
+            break;
+    }
+    return false;
+}
+
+float DoorArrivalYards(float defaultYards, AreaTriggerShape const& trigger)
+{
+    if (ArrivalReachesTrigger(defaultYards, trigger))
+        return defaultYards;
+    float const tighter = AreaTriggerInscribedYards(trigger) - DOOR_ARRIVAL_INSET_YARDS;
+    if (!(tighter >= DOOR_ARRIVAL_FLOOR_YARDS))
+        return 0.f;
+    return tighter;
+}
+
+DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYards,
+                                AreaTriggerShape const& trigger)
+{
+    if (AreaTriggerFormOf(trigger) != AreaTriggerForm::Box)
+        return DoorAimOnTheFloor(trigger.z, haveGround, groundZ, arrivalYards,
+                                 trigger.radius);
+
+    DoorAimHeight out;
+    out.z = trigger.z;
+    if (!haveGround || arrivalYards <= 0.f)
+        return out;
+
+    // The box's own test on z, strictly: IsWithinBox refuses |dz| > height/2,
+    // and a floor exactly on the bottom face is left alone for the same reason
+    // ArrivalReachesTrigger is strict.
+    float const correction = Magnitude(groundZ - trigger.z);
+    if (!(correction < trigger.height / 2.f))
+        return out;
+
+    out.z = groundZ;
+    out.grounded = true;
+    out.correctionYards = correction;
+    return out;
+}
+
+float DungeonStagingStandoffYards(AreaTriggerShape const& door, float standoffYards,
+                                  float barrierYards)
+{
+    if (AreaTriggerFormOf(door) != AreaTriggerForm::Box)
+        return standoffYards;
+    float const clear = AreaTriggerReachYards(door) + barrierYards;
+    return clear > standoffYards ? clear : standoffYards;
+}
+
 bool RatchetProgressed(float reading, float best, RatchetLimits const& limits,
                        bool seen)
 {

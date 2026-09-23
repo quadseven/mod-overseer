@@ -18,7 +18,10 @@
 
 #include <cstdio>
 
+using OverseerDecisions::AreaTriggerShape;
 using OverseerDecisions::DungeonStagingPoint;
+using OverseerDecisions::DungeonStagingStandoffYards;
+using OverseerDecisions::InsideAreaTrigger;
 using OverseerDecisions::StagingGroundBelievable;
 using OverseerDecisions::StagingPoint;
 using OverseerDecisions::StagingPointCheck;
@@ -30,6 +33,25 @@ namespace
 {
 
 int failures = 0;
+
+// The adapter's DUNGEON_STAGING_STANDOFF_YARDS and DUNGEON_BARRIER_RADIUS_YARDS.
+constexpr float STANDOFF = 20.f;
+constexpr float BARRIER = 10.f;
+
+// A box row, in the column order of the areatrigger table after the map.
+AreaTriggerShape Box(float x, float y, float z, float length, float width, float height,
+                     float orientation)
+{
+    AreaTriggerShape shape;
+    shape.x = x;
+    shape.y = y;
+    shape.z = z;
+    shape.length = length;
+    shape.width = width;
+    shape.height = height;
+    shape.orientation = orientation;
+    return shape;
+}
 
 char const* Name(StagingPointVerdict verdict)
 {
@@ -229,14 +251,95 @@ void TheClassicDoorsDeriveTheirOwnStagingPoints()
     // areatrigger 2216 -> areatrigger_teleport 2221's landing point, on map 0.
     // The landing is at the OTHER door, 672 yards away, so the bearing is the
     // one the row's comment warns about; the arithmetic is still pinned.
+    //
+    // AND 2216 IS A BOX, so since #577 it stands off by its half-diagonal plus
+    // the gather circle rather than by a flat 20: sqrt(11.415^2 + 4.0415^2)
+    // + 10 = 22.109. See TheBoxDoorsDeriveTheirOwnStagingPoints below.
     CheckPoint("stratholme-live",
-               DungeonStagingPoint(3392.46f, -3396.77f, 3235.46f, -4050.6f, 108.45f, 20.f),
-               3387.7903f, -3416.2173f, 108.45f);
+               DungeonStagingPoint(3392.46f, -3396.77f, 3235.46f, -4050.6f, 108.45f,
+                                   DungeonStagingStandoffYards(
+                                       Box(3392.46f, -3396.77f, 143.073f, 22.83f, 8.083f,
+                                           34.69f, 0.f),
+                                       STANDOFF, BARRIER)),
+               3387.2978f, -3418.2682f, 108.45f);
 
     // areatrigger 2214 -> areatrigger_teleport 2221's landing point, on map 0.
     CheckPoint("stratholme-undead",
                DungeonStagingPoint(3237.46f, -4060.6f, 3235.46f, -4050.6f, 108.45f, 20.f),
                3233.5376f, -4040.9885f, 108.45f);
+}
+
+// THE TEN BOX DOORS (#577). Every number is a row read out of the world
+// database and quoted beside the door in DungeonPortals(): the entry trigger's
+// own position and box, and where its row's exit trigger lands on the outside
+// map. The standoff is not written down either: it is derived from the box by
+// DungeonStagingStandoffYards, the same call the adapter makes.
+void TheBoxDoorsDeriveTheirOwnStagingPoints()
+{
+    struct Door
+    {
+        char const* keyword;
+        AreaTriggerShape entry;
+        float backX, backY, backZ;
+        float standoff;
+        float wantX, wantY;
+    };
+    Door const doors[] = {
+        // 2230 -> 2226's landing
+        {"ragefire", Box(1818.4f, -4427.26f, -10.4478f, 21.69f, 11.83f, 21.22f, 0.576f),
+         1813.49f, -4418.58f, -18.57f, 22.3532f, 1807.3943f, -4407.8039f},
+        // 3133 -> 3131's landing
+        {"maraudon-orange", Box(-1484.07f, 2617.57f, 75.7144f, 24.69f, 15.78f, 35.19f, 4.538f),
+         -1471.07f, 2618.57f, 76.1944f, 24.6510f, -1459.4916f, 2619.4606f},
+        // 3134 -> 3126's landing
+        {"maraudon-purple", Box(-1181.98f, 2861.95f, 85.2581f, 31.69f, 17.33f, 34.19f, 3.211f),
+         -1186.98f, 2875.95f, 85.7258f, 28.0595f, -1191.4174f, 2888.3748f},
+        // 2567 -> 2568's landing
+        {"scholomance", Box(1282.05f, -2548.73f, 85.3994f, 10.56f, 13.03f, 21.67f, 0.4712f),
+         1275.05f, -2552.03f, 90.3994f, 20.f, 1263.9595f, -2557.2584f},
+        // 3185 -> 3196's landing
+        {"dire-maul-east-east", Box(-4028.21f, 123.966f, 26.8109f, 9.833f, 4.583f, 15.69f, 0.4712f),
+         -4030.21f, 127.966f, 26.8109f, 20.f, -4037.1543f, 141.8545f},
+        // 3183 -> 3194's landing
+        {"dire-maul-east-west", Box(-3730.48f, 933.975f, 160.973f, 9.389f, 12.78f, 19.67f, 0.f),
+         -3737.48f, 934.975f, 160.973f, 20.f, -3750.2790f, 936.8034f},
+        // 3184 -> 3195's landing
+        {"dire-maul-east-south", Box(-3981.58f, 771.193f, 160.962f, 10.31f, 5.972f, 20.22f, 0.f),
+         -3980.58f, 776.193f, 161.006f, 20.f, -3977.6577f, 790.8046f},
+        // 3187 -> 3191's landing
+        {"dire-maul-west-north", Box(-3741.96f, 1249.18f, 160.217f, 7.861f, 10.33f, 18.69f, 0.f),
+         -3747.96f, 1249.18f, 160.217f, 20.f, -3761.96f, 1249.18f},
+        // 3186 -> 3190's landing
+        {"dire-maul-west-south", Box(-3837.79f, 1250.23f, 160.223f, 8.194f, 9.083f, 18.36f, 0.f),
+         -3831.79f, 1250.23f, 160.223f, 20.f, -3817.79f, 1250.23f},
+        // 3189 -> 3193's landing
+        {"dire-maul-north", Box(-3520.65f, 1068.72f, 161.128f, 9.861f, 11.86f, 23.22f, 0.f),
+         -3520.65f, 1077.72f, 161.138f, 20.f, -3520.65f, 1088.72f},
+    };
+
+    for (Door const& door : doors)
+    {
+        float const standoff = DungeonStagingStandoffYards(door.entry, STANDOFF, BARRIER);
+        float const off = standoff - door.standoff;
+        if (off > 0.002f || off < -0.002f)
+        {
+            std::printf("FAIL %s standoff: got %.4f, wanted %.4f\n", door.keyword,
+                        static_cast<double>(standoff), static_cast<double>(door.standoff));
+            ++failures;
+        }
+        StagingPoint const point = DungeonStagingPoint(door.entry.x, door.entry.y, door.backX,
+                                                       door.backY, door.backZ, standoff);
+        CheckPoint(door.keyword, point, door.wantX, door.wantY, door.backZ);
+
+        // AND THE POINT IS OUTSIDE THE DOOR, which is what the standoff is for.
+        // Asked of the core's own box test at the landing's height and at the
+        // door's: a staging point inside the trigger it stages for is a party
+        // gathering on the doormat.
+        CheckBool(door.keyword,
+                  InsideAreaTrigger(door.entry, point.x, point.y, door.entry.z, 0.f), false);
+        CheckBool(door.keyword,
+                  InsideAreaTrigger(door.entry, point.x, point.y, door.backZ, 0.f), false);
+    }
 }
 
 // A landing point on top of the door names no direction to stand off along.
@@ -370,6 +473,7 @@ int main()
     TheWailingCavernsPortalDerivesARealPlace();
     TheThreeScarletWingsDeriveTheirOwnStagingPoints();
     TheClassicDoorsDeriveTheirOwnStagingPoints();
+    TheBoxDoorsDeriveTheirOwnStagingPoints();
     ADoorWithNoCorridorIsRefused();
     TheOriginIsNeverAStagingPoint();
     APointOffTheWorldIsRefused();
