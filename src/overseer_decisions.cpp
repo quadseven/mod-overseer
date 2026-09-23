@@ -8319,6 +8319,30 @@ char const* PartyFlightVerdictWord(PartyFlightVerdict verdict)
     return "walk";
 }
 
+StagingClock StagingClockAfterReading(StagingClock clock, bool measured, float yards,
+                                      time_t now, float minProgressYards)
+{
+    if (!measured)
+        return clock;
+    if (clock.bestYards < 0.f)
+    {
+        clock.bestYards = yards;
+        return clock;
+    }
+    if (yards <= clock.bestYards - minProgressYards)
+    {
+        clock.bestYards = yards;
+        clock.since = now;
+    }
+    return clock;
+}
+
+bool MemberFollowsForFlight(bool columnEmpty, bool catchingUp, bool aimInert,
+                            bool heldForLeader)
+{
+    return columnEmpty || catchingUp || aimInert || heldForLeader;
+}
+
 PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members)
 {
     PartyFlightPlan plan;
