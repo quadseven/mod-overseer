@@ -4111,6 +4111,7 @@ char const* RegroupClaimName(RegroupClaim claim)
         case RegroupClaim::OnARun:        return "on a dungeon run";
         case RegroupClaim::StoodDown:     return "stood down";
         case RegroupClaim::AimRefused:    return "catch-up aim refused";
+        case RegroupClaim::Fetched:       return "the leader is going back for it";
     }
     return "unknown";
 }
@@ -4156,6 +4157,10 @@ RegroupClaim ReadRegroupClaim(RegroupMember const& member,
         return RegroupClaim::OnARun;
     if (member.stoodDown)
         return RegroupClaim::StoodDown;
+    // BEFORE THE REFUSAL, because the member being fetched is the one the far
+    // hold refused, and "refused" is the sentence the fetch makes untrue.
+    if (member.beingFetched)
+        return RegroupClaim::Fetched;
     if (!member.aimRefusedBecause.empty())
         return RegroupClaim::AimRefused;
     return RegroupClaim::Rejoining;
@@ -4170,6 +4175,11 @@ FamilyRegroup ReadFamilyRegroup(std::vector<RegroupMember> const& members,
         RegroupClaim const claim = ReadRegroupClaim(member, limits, alreadyWaiting);
         if (claim == RegroupClaim::InFormation)
             continue;
+        if (claim == RegroupClaim::Fetched)
+        {
+            ++verdict.fetched;
+            continue;
+        }
         if (!RegroupClaimIsWaitedFor(claim))
         {
             ++verdict.notWaitedFor;
@@ -4196,7 +4206,8 @@ std::string RegroupCarriedOnWithout(std::vector<RegroupMember> const& members,
     for (RegroupMember const& member : members)
     {
         RegroupClaim const claim = ReadRegroupClaim(member, limits, alreadyWaiting);
-        if (claim == RegroupClaim::InFormation || RegroupClaimIsWaitedFor(claim))
+        if (claim == RegroupClaim::InFormation || claim == RegroupClaim::Fetched ||
+            RegroupClaimIsWaitedFor(claim))
             continue;
         if (!said.empty())
             said += ", ";
@@ -4257,6 +4268,77 @@ bool FarCatchUpStaysHeld(float gapYards, float footLimitYards, time_t heldForSec
     if (footLimitYards > 0.f && gapYards >= 0.f && gapYards <= footLimitYards)
         return false;
     return heldForSeconds < retrySeconds;
+}
+
+std::string PickFetchTarget(std::vector<FetchCandidate> const& members,
+                            FetchLimits const& limits, bool regrouping)
+{
+    if (regrouping)
+        return std::string();
+    std::string pick;
+    float pickYards = 0.f;
+    for (FetchCandidate const& member : members)
+    {
+        // Nothing unmeasured is anywhere: off the map, not in the world, or a
+        // ghost is neither a member to fetch nor one still walking back.
+        if (!member.seen || !member.sameMap || !member.alive || member.yards < 0.f)
+            continue;
+        if (!member.heldTooFar)
+        {
+            // STILL WALKING BACK, so the family is not gathered yet.
+            if (member.yards > limits.gatheredYards)
+                return std::string();
+            continue;
+        }
+        // A held member inside the line is one whose hold lifts this poll.
+        if (member.stoodDown || member.yards <= limits.footLimitYards)
+            continue;
+        if (!pick.empty() &&
+            (member.yards > pickYards || (member.yards == pickYards && member.name > pick)))
+            continue;
+        pick = member.name;
+        pickYards = member.yards;
+    }
+    return pick;
+}
+
+FetchStep ReadFetch(FetchFacts const& facts, FetchLimits const& limits)
+{
+    if (!facts.leaderFree || !facts.targetFetchable || facts.aimRefused)
+        return FetchStep::Abandon;
+    if (facts.targetYards >= 0.f && facts.targetYards <= limits.footLimitYards)
+        return FetchStep::Arrived;
+    if (facts.fetchingForSeconds >= limits.ceilingSeconds)
+        return FetchStep::GiveUp;
+    return FetchStep::Continue;
+}
+
+char const* FetchStepWord(FetchStep step)
+{
+    switch (step)
+    {
+        case FetchStep::Continue: return "continue";
+        case FetchStep::Arrived:  return "arrived";
+        case FetchStep::Abandon:  return "abandon";
+        case FetchStep::GiveUp:   return "give up";
+    }
+    return "unknown";
+}
+
+FetchRunAnswer RunLetsTheLeaderFetch(FetchRunPhase phase)
+{
+    switch (phase)
+    {
+        case FetchRunPhase::NoRun:
+        case FetchRunPhase::Resetting:
+        case FetchRunPhase::Gathering:
+            return FetchRunAnswer::Fetch;
+        case FetchRunPhase::Barrier:
+            return FetchRunAnswer::RegatherFirst;
+        case FetchRunPhase::Committed:
+            return FetchRunAnswer::Refuse;
+    }
+    return FetchRunAnswer::Refuse;
 }
 
 bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits)
@@ -8371,8 +8453,10 @@ StagingClock StagingClockAfterReading(StagingClock clock, bool measured, float y
 }
 
 bool MemberFollowsForFlight(bool columnEmpty, bool catchingUp, bool aimInert,
-                            bool heldForLeader)
+                            bool heldForLeader, bool beingFetched)
 {
+    if (beingFetched)
+        return false;
     return columnEmpty || catchingUp || aimInert || heldForLeader;
 }
 

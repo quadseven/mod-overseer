@@ -5324,6 +5324,10 @@ struct RegroupMember
     // Carried as the sentence rather than a flag so the line that names the
     // members the family carries on without can say why.
     std::string aimRefusedBecause;
+    // THE LEADER IS GOING BACK FOR THIS ONE (2026-09-23). Not waited for, since
+    // holding the leader still would stop the fetch, and not carried on
+    // without, since the family is on its way to it. See PickFetchTarget.
+    bool beingFetched{false};
 };
 
 // What one member asks of the family, and each value is a separate answer
@@ -5357,6 +5361,10 @@ enum class RegroupClaim : std::uint8_t
     // errand the travel book did not issue. No walk was written, so waiting for
     // this member is waiting for a walk that is not happening.
     AimRefused,
+    // THE LEADER IS GOING BACK FOR IT (2026-09-23). The family is not carrying
+    // on without it and is not holding the leader for it either: the leader is
+    // the one walking.
+    Fetched,
 };
 
 char const* RegroupClaimName(RegroupClaim claim);
@@ -5398,6 +5406,10 @@ struct FamilyRegroup
     // Zero is the ordinary answer, and a non-zero one is the sentence
     // RegroupCarriedOnWithout below writes out.
     unsigned notWaitedFor{0};
+    // How many members behind are the one the leader is going back for. Kept
+    // apart from `notWaitedFor` because the line that ends a wait says which:
+    // "the family carries on" about a member being fetched would be false.
+    unsigned fetched{0};
 };
 
 FamilyRegroup ReadFamilyRegroup(std::vector<RegroupMember> const& members,
@@ -5549,6 +5561,132 @@ char const* FarCatchUpStepWord(FarCatchUpStep step);
 // a flight now reaches gets the question asked again rather than never.
 bool FarCatchUpStaysHeld(float gapYards, float footLimitYards, time_t heldForSeconds,
                          time_t retrySeconds);
+
+// ---------------- the leader goes back for a member too far to walk (2026-09-23) --
+//
+// THE HOLD ABOVE ENDS ONE HALF OF A MUTUAL WAIT. A follower past the foot limit
+// that no flight carries is held where it stands to wait for its leader, and
+// the family regroup reads that as a walk that is not happening and carries on
+// without it. So the follower waits for a leader who walks away. Measured on the
+// dev realm 2026-09-23: Horde followers left 1,000 to 2,000 yards behind in the
+// Barrens while the leader walked on to Orgrimmar, Ragefire runs closed at
+// BARRIER naming members 1,900 yards out, and Alliance followers left in
+// Winterspring while the leader stood in Silithus.
+//
+// A HUMAN GROUP CLOSES THAT GAP FROM THE OTHER END. The leader walks, or flies,
+// back to where the held member is standing, and the hold lifts on the line it
+// already lifts on: the leader back within the foot limit. What follows is the
+// ordinary catch-up walk and the ordinary regroup wait. These are the decisions
+// that make the going back bounded.
+
+// One member of the family as the fetch reads it this poll. Everything is the
+// caller's reading; nothing here has a clock or a world.
+struct FetchCandidate
+{
+    std::string name;
+    // In the world this poll, on the leader's map, and alive. Unmeasured is not
+    // near: `yards` means nothing unless `seen` and `sameMap` are both true.
+    bool seen{false};
+    bool sameMap{false};
+    bool alive{false};
+    // The too-far-to-walk hold is in force on it, waiting for this leader.
+    bool heldTooFar{false};
+    // It was fetched, or given up on, within the fetch stand-down.
+    bool stoodDown{false};
+    // How far from the leader, when `seen` and `sameMap`.
+    float yards{-1.f};
+};
+
+struct FetchLimits
+{
+    // CATCH_UP_FOOT_LIMIT_YARDS. The line the hold lifts on, and so the line a
+    // fetch ends on: past it the member is held, inside it it walks.
+    float footLimitYards{0.f};
+    // FOLLOW_CATCH_UP_YARDS. A member further back than this that is NOT held
+    // is still walking back, and the family gathers before it leaves.
+    float gatheredYards{0.f};
+    // How long one fetch may take, start to finish, before it is given up on.
+    time_t ceilingSeconds{0};
+};
+
+// WHICH HELD MEMBER TO GO BACK FOR, OR NOBODY (empty).
+//
+// THE NEAREST ONE FIRST. It is the shortest trip, so it is the soonest the
+// family is one bigger, and every member collected travels with the family to
+// the next one rather than being left to wait again. Going for the furthest, or
+// the one held longest, walks the leader past a nearer member who then waits
+// the whole length of a longer trip. Ties go to the name, so two polls with the
+// same readings pick the same member.
+//
+// AND NOBODY WHILE THE FAMILY IS STILL GATHERING. `regrouping` is the regroup
+// wait holding the leader for a member walking back, and a member further back
+// than `gatheredYards` that is not held is one about to be waited for. Leaving
+// then is how a leader ping-pongs: he reaches one member, turns for the next,
+// and the first chases a leader walking away until it is past the line and held
+// again. Gathered first, the family goes together.
+std::string PickFetchTarget(std::vector<FetchCandidate> const& members,
+                            FetchLimits const& limits, bool regrouping);
+
+// WHAT ONE POLL DOES WITH A FETCH ALREADY UNDER WAY.
+enum class FetchStep : std::uint8_t
+{
+    Continue,  // keep going: the leader's aim stays on the member
+    Arrived,   // the leader is back within the foot limit and the hold lifts
+    Abandon,   // the member or the leader stopped being one a fetch can serve
+    GiveUp,    // the ceiling ran out before the leader got there
+};
+
+struct FetchFacts
+{
+    // The member is in the world, in this party, alive and on the leader's map.
+    bool targetFetchable{false};
+    // Leader to member, when `targetFetchable`.
+    float targetYards{-1.f};
+    // The leader is alive, steerable, not stood down from a walk that killed
+    // him, and not owned by a run that refuses to lend him.
+    bool leaderFree{false};
+    // The leader's own travel column holds an errand this module did not
+    // issue, so no aim at the member can be written.
+    bool aimRefused{false};
+    time_t fetchingForSeconds{0};
+};
+
+// THE ORDER IS THE BOUND. Anything that makes the fetch meaningless ends it
+// first; then arriving, which is asked before the ceiling so a leader who gets
+// there on the last poll counts as there; then the ceiling, which is what ends
+// a fetch nothing else does.
+FetchStep ReadFetch(FetchFacts const& facts, FetchLimits const& limits);
+
+// "continue", "arrived", "abandon", "give up".
+char const* FetchStepWord(FetchStep step);
+
+// (a) A DUNGEON RUN AND A FETCH. Where the run stands, as the fetch needs it.
+enum class FetchRunPhase : std::uint8_t
+{
+    NoRun,      // no run, or IDLE
+    Resetting,  // the reset is issued from wherever the leader stands
+    Gathering,  // the leader is aimed at the staging point
+    Barrier,    // the leader is escorted and held at the staging point
+    Committed,  // ENTER onward, or a repair or town leg the run is walking
+};
+
+enum class FetchRunAnswer : std::uint8_t
+{
+    Fetch,          // the run lends the leader; GATHERING waits and its clock restarts
+    RegatherFirst,  // BARRIER goes back to GATHERING, then lends the leader
+    Refuse,         // the run owns the leader; no fetch
+};
+
+// WHY THE RUN LENDS THE LEADER RATHER THAN TIMING OUT. A run in GATHERING or
+// BARRIER with a member held too far to walk cannot open: BARRIER needs every
+// member within ten yards of the door, and the held member does not move until
+// the leader comes within the foot limit. Timing out closes the run and opens
+// another the same way. BARRIER goes back to GATHERING rather than sending the
+// leader out alone, because the family follows a leader who is aimed and stands
+// still under one who is held at a door. From ENTER on the party is crossing or
+// inside, and a repair or town leg is the run walking the leader somewhere it
+// needs him; those keep him.
+FetchRunAnswer RunLetsTheLeaderFetch(FetchRunPhase phase);
 
 // ------------- and an aim at the bottom of a lake is not an aim (#503) ------
 //
@@ -10762,8 +10900,13 @@ PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members);
 // refused to walk because a follower travels by following, or when it is held
 // still waiting for this leader (the too-far-to-walk hold). Only an aim the
 // drive is actually walking takes a member out of the leader's flight.
+//
+// AND NOT THE MEMBER THE LEADER IS GOING BACK FOR (2026-09-23). The leader is
+// flying TO it, so it is not behind him, and it is held because it cannot reach
+// a flight master: counting it as a passenger would refuse every flight the
+// fetch could take. The rest of the family still boards with him.
 bool MemberFollowsForFlight(bool columnEmpty, bool catchingUp, bool aimInert,
-                            bool heldForLeader);
+                            bool heldForLeader, bool beingFetched);
 
 // THE GATHERING CLOCK COUNTS TIME WITHOUT PROGRESS, NOT TIME SINCE STAGING.
 //

@@ -62,16 +62,16 @@ PartyFlightMember Stranded(std::string const& name, bool follows)
 
 void TheRuleItself()
 {
-    Check("an empty column follows", MemberFollowsForFlight(true, false, false, false),
+    Check("an empty column follows", MemberFollowsForFlight(true, false, false, false, false),
           true);
-    Check("a catch-up walk follows", MemberFollowsForFlight(false, true, false, false),
+    Check("a catch-up walk follows", MemberFollowsForFlight(false, true, false, false, false),
           true);
     Check("an aim nothing walks still follows",
-          MemberFollowsForFlight(false, false, true, false), true);
+          MemberFollowsForFlight(false, false, true, false, false), true);
     Check("a member held waiting for this leader follows",
-          MemberFollowsForFlight(false, false, false, true), true);
+          MemberFollowsForFlight(false, false, false, true, false), true);
     Check("an aim the drive is walking is its own errand",
-          MemberFollowsForFlight(false, false, false, false), false);
+          MemberFollowsForFlight(false, false, false, false, false), false);
 }
 
 void TheMeasuredSplit()
@@ -80,14 +80,14 @@ void TheMeasuredSplit()
     // an aim nothing walked, so each is behind the leader.
     std::vector<PartyFlightMember> party{Leader()};
     for (char const* name : {"Oz", "Uzza", "Zork", "Zrog"})
-        party.push_back(Stranded(name, MemberFollowsForFlight(false, false, true, false)));
+        party.push_back(Stranded(name, MemberFollowsForFlight(false, false, true, false, false)));
     Check("the leader does not fly away from followers nothing walks",
           PlanPartyFlight(party).verdict == PartyFlightVerdict::Fly, false);
 
     // A follower genuinely off on an errand the drive is walking is still not
     // dragged along, which is what the exemption has always been for.
     std::vector<PartyFlightMember> errand{Leader()};
-    errand.push_back(Stranded("Busy", MemberFollowsForFlight(false, false, false, false)));
+    errand.push_back(Stranded("Busy", MemberFollowsForFlight(false, false, false, false, false)));
     Check("a member walking its own errand does not hold the flight",
           PlanPartyFlight(errand).verdict == PartyFlightVerdict::Fly, true);
 }
