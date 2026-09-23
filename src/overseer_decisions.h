@@ -1814,7 +1814,32 @@ struct DungeonRunEntryState
     bool inCombat{false};
     bool through{false};          // already on the far side of the door
     float distanceFromDoor{-1.f}; // negative = not measured (through, wrong map, or !seen)
+    // On the dungeon map but in a different COPY of it than the group leader
+    // (#620). Never `through`: see InOtherCopy.
+    bool otherCopy{false};
 };
+
+// IS THIS MEMBER IN ANOTHER COPY OF THE DUNGEON (#620)?
+//
+// "On the inside map" is a map id, and one map id can be several instances. A
+// character that logs in at a saved position inside a dungeon lands in the copy
+// its OWN bind names, not its party's. Measured on the dev realm after a
+// restart: the four bots in one copy, the head in another, the census counting
+// all five "inside together", and the dungeon module - which elects per Map
+// object - leading the head alone in his while refusing the other four. Only
+// the door fixes it: a grouped character entering through it lands in its
+// GROUP LEADER's bind (InstanceSaveMgr::PlayerGetDestinationInstanceId, "2.
+// leader temp/perm"), so the group leader's copy is the one the party can all
+// reach, and it is the reference.
+//
+// A reference of 0 means nobody knows which copy is the party's (the group
+// leader is not on the map), and then nobody is judged to be in another one.
+bool InOtherCopy(bool onThroughMap, uint32_t memberInstanceId, uint32_t referenceInstanceId);
+
+// The living members to walk OUT of their copy so they can come back in
+// through the door into the group leader's. The dead are left to the revival
+// drive, as everywhere else.
+std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members);
 
 // Is every member either already through, or standing on the doorstep alive
 // and out of combat? Fails closed on an empty roster and on any member this

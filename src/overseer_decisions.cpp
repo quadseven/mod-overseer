@@ -1251,6 +1251,8 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
             why = "not seen";
         else if (!member.alive)
             why = "dead";
+        else if (member.otherCopy)
+            why = "in another copy of the dungeon";
         else if (member.inCombat)
             why = "in combat";
         else if (member.distanceFromDoor < 0.f)
@@ -1265,6 +1267,20 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
         blockers += member.name + " (" + why + ")";
     }
     return blockers;
+}
+
+bool InOtherCopy(bool onThroughMap, uint32_t memberInstanceId, uint32_t referenceInstanceId)
+{
+    return onThroughMap && referenceInstanceId != 0 && memberInstanceId != referenceInstanceId;
+}
+
+std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members)
+{
+    std::vector<std::string> walk;
+    for (DungeonRunEntryState const& member : members)
+        if (member.seen && member.alive && member.otherCopy)
+            walk.push_back(member.name);
+    return walk;
 }
 
 DungeonWrongSide DungeonRunWrongSide(std::vector<DungeonRunEntryState> const& members)
