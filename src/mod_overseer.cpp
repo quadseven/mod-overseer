@@ -24744,7 +24744,17 @@ private:
             std::string why;
             if (!ResolveDungeonStagingPoint(portal, leader, point.stageX, point.stageY,
                                             point.stageZ, why))
+            {
+                // Said, at DEBUG because the RESET poll that asks this says
+                // its own deferral at INFO, and the staging point is derived
+                // again, loudly, the moment the reset succeeds.
+                LOG_DEBUG("module.overseer",
+                          "overseer: '{}' - the '{}' staging point cannot be derived "
+                          "to recognize the run's own leftover aim ({}), so only the "
+                          "corridor waypoint and the last leg are compared (#596)",
+                          leaderName, portal.keyword, why);
                 point.stageX = point.stageY = point.stageZ = 0.f;
+            }
         }
         std::string aim;
         std::string why;

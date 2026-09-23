@@ -51,7 +51,14 @@ bool ReadAimNumber(std::string const& text, std::size_t& at, float& out)
         at += used;
         return true;
     }
-    catch (...)
+    // The two faults std::stof documents, and only those: no digits, and a
+    // number a float cannot hold. Anything else is not a malformed aim and
+    // is left to propagate.
+    catch (std::invalid_argument const&)
+    {
+        return false;
+    }
+    catch (std::out_of_range const&)
     {
         return false;
     }
@@ -116,14 +123,14 @@ bool TravelErrandIsTheRunsOwnAim(std::string const& column,
     return false;
 }
 
-bool PlaceAimArrived(float planeYards, float verticalYards, float arriveWithin,
+bool PlaceAimArrived(float planeYards, float verticalOffset, float arriveWithin,
                      float verticalWithin)
 {
     if (planeYards > arriveWithin)
         return false;
     if (verticalWithin <= 0.f)
         return true;
-    float const magnitude = verticalYards < 0.f ? -verticalYards : verticalYards;
+    float const magnitude = verticalOffset < 0.f ? -verticalOffset : verticalOffset;
     return magnitude <= verticalWithin;
 }
 

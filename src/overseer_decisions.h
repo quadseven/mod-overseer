@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <ctime>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -1325,8 +1326,9 @@ bool TravelErrandIsTheRunsOwnAim(std::string const& column,
 // re-armed it, and it was released again, every fifty seconds, while GATHERING
 // refused the party for being above the point. A `verticalWithin` of zero or
 // less asks the plane alone, which is what a door aim wants: the core checks
-// its own trigger's height when the character steps in.
-bool PlaceAimArrived(float planeYards, float verticalYards, float arriveWithin,
+// its own trigger's height when the character steps in. `verticalOffset` is
+// signed (character minus aim, or either way round); only its size is read.
+bool PlaceAimArrived(float planeYards, float verticalOffset, float arriveWithin,
                      float verticalWithin);
 
 
