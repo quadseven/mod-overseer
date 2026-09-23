@@ -910,6 +910,9 @@ struct FootingRefusalState
     uint32_t mapId{0};
     float x{0.f};
     float y{0.f};
+    // How far the errand was when the episode began. Moving re-anchors only
+    // when the character has got nearer than this.
+    float yardsToAim{0.f};
 };
 
 struct FootingRefusalVerdict
@@ -930,8 +933,20 @@ struct FootingRefusalVerdict
 // another map. A zero `episodeRadius` never re-anchors on distance and a zero
 // `limit` never gives up, which is what a caller that wants only the counting
 // asks for.
+//
+// MOVING IS NOT THE SAME AS GETTING NEARER (2026-09-23). `yardsToAim` is the
+// distance to the errand on this poll, the same reading the travel ratchet
+// takes, and the episode re-anchors on movement only when that distance is at
+// least `progressYards` shorter than it was when the episode began. Measured:
+// a follower 11,505 yards from its aim was refused every bearing on every
+// five second poll and warned every time, because the walk already in flight
+// carried it more than ten yards between polls and each poll opened a fresh
+// episode. It moved and got no nearer, so the bound never fired. A character
+// that moves AWAY or sideways is still the character this bound is about.
+// A negative `progressYards` is read as zero: any reading nearer re-anchors.
 FootingRefusalVerdict FootingRefused(FootingRefusalState& state, uint32_t mapId,
-                                     float x, float y, float episodeRadius,
+                                     float x, float y, float yardsToAim,
+                                     float episodeRadius, float progressYards,
                                      unsigned limit);
 
 // A poll that was NOT refused ends the episode. Called wherever a step was
@@ -10943,15 +10958,33 @@ struct TownStopFacts
     // shop". The caller passes the same reading for everybody, so the party
     // cannot half-believe it has arrived.
     bool leaderAtTheCounter{false};
+    // HOW FAR THIS MEMBER STANDS FROM THE LEADER, in yards on the same map.
+    // Read only for a follower, and only once the leader is at the counter,
+    // because that is the one moment this trip would aim it: the aim is
+    // "the last few yards", and this is what says whether they are.
+    float yardsFromLeader{0.f};
+    // THE FURTHEST THE LAST FEW YARDS MAY BE. Past it the walk is a journey,
+    // and a town trip does not make journeys: measured 2026-09-23, four
+    // members in Winterspring were escorted toward a leader's counter in
+    // Silithus, 11,000 to 12,500 yards away, through elite ground, and one
+    // died twice on it. The adapter passes the distance at which it already
+    // calls a walk long enough to consider a flight.
+    float walkLimitYards{0.f};
+    // THIS MEMBER'S LAST WALK TOWARD THE FAMILY KILLED IT, and it is inside
+    // the stand-down that death opened (#298). The catch-up walk already
+    // honors it; the trip's own walk took the catch-up over and did not.
+    bool stoodDown{false};
 };
 
 enum class TownStop : std::uint8_t
 {
-    Wait,    // nothing can be read or done about this member on this poll
-    Done,    // it wants nothing from this counter: the trip is finished with it
-    Trade,   // it is at the counter on the core's terms: hold it and transact
-    Walk,    // aim it at the party's counter
-    Follow,  // do NOT aim it: the journey is the leader's and follow brings this one
+    Wait,       // nothing can be read or done about this member on this poll
+    Done,       // it wants nothing from this counter: the trip is finished with it
+    Trade,      // it is at the counter on the core's terms: hold it and transact
+    Walk,       // aim it at the party's counter
+    Follow,     // do NOT aim it: the journey is the leader's and follow brings this one
+    TooFar,     // do NOT aim it: the counter is a journey away, not the last few yards
+    StoodDown,  // do NOT aim it: its last walk toward the family killed it (#298)
 };
 
 // THE ORDER OF THE FIVE TESTS IS THE MEANING, and each one makes the ones below
@@ -10965,9 +10998,23 @@ enum class TownStop : std::uint8_t
 // is safe. A follower that has wandered within reach of the counter during the
 // journey transacts on that poll rather than being told to keep following - the
 // same "spend the poll you have" rule, applied to a member that got lucky.
+//
+// TooFar AND StoodDown ARE ASKED ONLY WHERE Walk WOULD BE THE ANSWER, which is
+// what keeps them from costing anything else. Both are about the one walk this
+// trip issues to a follower, and both answer it the way TownTripFormation
+// already answers a member on another map: left where it is, and the trip
+// carries on without it. Not "the nearest counter to wherever it stands",
+// because the trip is one destination on purpose (see TownTripFormation), and
+// not "wait for it", because the leader is standing at the counter and is not
+// coming back. The member is served on the first trip after the family is
+// together again.
+//
+// A ZERO OR NEGATIVE walkLimitYards REFUSES EVERY FOLLOWER'S WALK rather than
+// allowing every one. A limit nobody set is the tight reading, for the reason
+// ProvenStepIsWorthTaking refuses a nonsense floor.
 TownStop TownTripMemberStop(TownStopFacts const& facts);
 
-// "wait", "done", "trade", "walk", "follow". Here rather than in the adapter so
+// "wait", "done", "trade", "walk", "follow", "too far", "stood down". Here rather than in the adapter so
 // the word a log line carries is the word a test pins.
 char const* TownStopWord(TownStop stop);
 

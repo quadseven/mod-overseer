@@ -61,6 +61,10 @@ constexpr float MIN_STEP = 8.f;
 constexpr float RADIUS = 10.f;
 constexpr unsigned LIMIT = 8;
 constexpr uint32_t KALIMDOR = 1;
+// The errand's distance, held constant unless a test is about it, and the
+// adapter's TRAVEL_PROGRESS_YARDS.
+constexpr float AIM = 11505.f;
+constexpr float PROGRESS = 10.f;
 
 // ------------------------------------------------------------------------
 // The ground a refused bearing proved.
@@ -135,13 +139,13 @@ void TheFirstRefusalOfAnEpisodeIsTheOneThatSpeaks()
 {
     FootingRefusalState state;
     FootingRefusalVerdict const first =
-        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     Check("the first poll says it", first.sayIt, true);
     Check("the first poll does not give up", first.giveUp, false);
     CheckCount("the first poll is poll one", first.consecutive, 1);
 
     FootingRefusalVerdict const second =
-        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     Check("the second poll is quiet", second.sayIt, false);
     CheckCount("the second poll is poll two", second.consecutive, 2);
 }
@@ -158,7 +162,7 @@ void ARewrittenTargetCannotReArmTheBound()
     for (unsigned poll = 0; poll < 6; ++poll)
     {
         FootingRefusalVerdict const v =
-            FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+            FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
         if (v.sayIt)
             ++said;
     }
@@ -172,38 +176,72 @@ void EightPollsWithoutMovingGivesTheErrandUp()
     for (unsigned poll = 1; poll < LIMIT; ++poll)
     {
         FootingRefusalVerdict const v =
-            FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+            FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
         Check("under the limit does not give up", v.giveUp, false);
     }
     FootingRefusalVerdict const last =
-        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     Check("the eighth poll gives up", last.giveUp, true);
     CheckCount("and says how many", last.consecutive, LIMIT);
 }
 
-void MovingRestartsTheEpisode()
+void MovingNearerRestartsTheEpisode()
 {
-    // A character that covered 2,335 yards while being refused is not a
-    // character stuck at one spot, whatever moved it. Its next refusal is
-    // about different ground and starts a new episode.
+    // A character that covered 2,335 yards toward its aim while being refused
+    // is not a character stuck at one spot, whatever moved it. Its next
+    // refusal is about different ground and starts a new episode.
     FootingRefusalState state;
     for (unsigned poll = 0; poll < LIMIT - 1; ++poll)
-        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     CheckCount("seven polls at the first spot", state.consecutive, LIMIT - 1);
 
-    FootingRefusalVerdict const moved =
-        FootingRefused(state, KALIMDOR, 514.6f, 760.0f, RADIUS, LIMIT);
+    FootingRefusalVerdict const moved = FootingRefused(
+        state, KALIMDOR, 514.6f, 760.0f, AIM - 30.f, RADIUS, PROGRESS, LIMIT);
     Check("thirty yards on is a new episode", moved.sayIt, true);
     Check("and does not give up", moved.giveUp, false);
     CheckCount("counting from one again", moved.consecutive, 1);
 }
 
+// THE MEASUREMENT (2026-09-23). 'Ugga' was 11,505 yards from its aim and
+// refused every bearing in the forward cone on every five second poll, and the
+// warning printed every time: the walk already in flight carried it more than
+// the ten yard radius between polls, so every poll opened a new episode and
+// the eighth never came. It moved thirty-five yards a poll and got no nearer.
+void MovingWithoutGettingNearerStillCounts()
+{
+    FootingRefusalState state;
+    unsigned said = 0;
+    bool gaveUp = false;
+    for (unsigned poll = 0; poll < LIMIT; ++poll)
+    {
+        // Thirty-five yards a poll, at run speed, and the aim no nearer.
+        FootingRefusalVerdict const v = FootingRefused(
+            state, KALIMDOR, 4800.f + 35.f * poll, -4500.f, AIM, RADIUS, PROGRESS, LIMIT);
+        if (v.sayIt)
+            ++said;
+        gaveUp = v.giveUp;
+    }
+    CheckCount("eight polls of moving sideways warn once", said, 1);
+    Check("and the eighth gives the errand up", gaveUp, true);
+
+    // Moving AWAY is the same fact, and so is getting nearer by less than the
+    // progress the ratchet itself would count.
+    FootingRefusalState away;
+    FootingRefused(away, KALIMDOR, 4800.f, -4500.f, AIM, RADIUS, PROGRESS, LIMIT);
+    FootingRefusalVerdict const further = FootingRefused(
+        away, KALIMDOR, 4850.f, -4500.f, AIM + 50.f, RADIUS, PROGRESS, LIMIT);
+    CheckCount("moving away keeps counting", further.consecutive, 2);
+    FootingRefusalVerdict const barely = FootingRefused(
+        away, KALIMDOR, 4900.f, -4500.f, AIM - 5.f, RADIUS, PROGRESS, LIMIT);
+    CheckCount("five yards nearer is not progress", barely.consecutive, 3);
+}
+
 void JitterInsideTheRadiusIsNotMoving()
 {
     FootingRefusalState state;
-    FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+    FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     FootingRefusalVerdict const jittered =
-        FootingRefused(state, KALIMDOR, 517.6f, 731.1f, RADIUS, LIMIT);
+        FootingRefused(state, KALIMDOR, 517.6f, 731.1f, AIM, RADIUS, PROGRESS, LIMIT);
     Check("three yards of jitter says nothing new", jittered.sayIt, false);
     CheckCount("and keeps counting", jittered.consecutive, 2);
 }
@@ -211,9 +249,9 @@ void JitterInsideTheRadiusIsNotMoving()
 void AnotherMapIsAlwaysANewEpisode()
 {
     FootingRefusalState state;
-    FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+    FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     FootingRefusalVerdict const crossed =
-        FootingRefused(state, 0, 514.6f, 729.1f, RADIUS, LIMIT);
+        FootingRefused(state, 0, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     Check("the same coordinates on another map are another place",
           crossed.sayIt, true);
     CheckCount("counting from one", crossed.consecutive, 1);
@@ -223,13 +261,13 @@ void AStepEndsTheEpisode()
 {
     FootingRefusalState state;
     for (unsigned poll = 0; poll < LIMIT - 1; ++poll)
-        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     FootingHeld(state);
     CheckCount("a step clears the count", state.consecutive, 0);
     Check("and the anchor with it", state.anchored, false);
 
     FootingRefusalVerdict const after =
-        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, LIMIT);
+        FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, LIMIT);
     Check("the next refusal speaks again", after.sayIt, true);
     Check("and is nowhere near the limit", after.giveUp, false);
 }
@@ -242,7 +280,7 @@ void AZeroLimitNeverGivesUp()
     for (unsigned poll = 0; poll < 40; ++poll)
     {
         FootingRefusalVerdict const v =
-            FootingRefused(state, KALIMDOR, 514.6f, 729.1f, RADIUS, 0);
+            FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, RADIUS, PROGRESS, 0);
         Check("a zero limit never gives up", v.giveUp, false);
     }
     CheckCount("but still counts", state.consecutive, 40);
@@ -251,9 +289,9 @@ void AZeroLimitNeverGivesUp()
 void AZeroRadiusOnlyReAnchorsOnAMapChange()
 {
     FootingRefusalState state;
-    FootingRefused(state, KALIMDOR, 514.6f, 729.1f, 0.f, LIMIT);
+    FootingRefused(state, KALIMDOR, 514.6f, 729.1f, AIM, 0.f, PROGRESS, LIMIT);
     FootingRefusalVerdict const far =
-        FootingRefused(state, KALIMDOR, 9000.f, -9000.f, 0.f, LIMIT);
+        FootingRefused(state, KALIMDOR, 9000.f, -9000.f, AIM, 0.f, PROGRESS, LIMIT);
     Check("a zero radius ignores distance", far.sayIt, false);
     CheckCount("and keeps counting", far.consecutive, 2);
 }
@@ -270,7 +308,8 @@ int main()
     TheFirstRefusalOfAnEpisodeIsTheOneThatSpeaks();
     ARewrittenTargetCannotReArmTheBound();
     EightPollsWithoutMovingGivesTheErrandUp();
-    MovingRestartsTheEpisode();
+    MovingNearerRestartsTheEpisode();
+    MovingWithoutGettingNearerStillCounts();
     JitterInsideTheRadiusIsNotMoving();
     AnotherMapIsAlwaysANewEpisode();
     AStepEndsTheEpisode();

@@ -19736,8 +19736,8 @@ private:
                 OverseerDecisions::FootingRefusalVerdict const refusal =
                     OverseerDecisions::FootingRefused(
                         state.footing, bot->GetMapId(), bot->GetPositionX(),
-                        bot->GetPositionY(), TRAVEL_GROUND_REFUSAL_RADIUS,
-                        TRAVEL_GROUND_REFUSAL_LIMIT);
+                        bot->GetPositionY(), distance, TRAVEL_GROUND_REFUSAL_RADIUS,
+                        TRAVEL_PROGRESS_YARDS, TRAVEL_GROUND_REFUSAL_LIMIT);
                 if (refusal.sayIt)
                     LOG_WARN("module.overseer",
                              "overseer: '{}' is sent to '{}', {} yards off, and every "
@@ -19750,7 +19750,7 @@ private:
                              "either. Nothing is holding it, either - its walk and its "
                              "`new rpg` are untouched - so if it moves, something else "
                              "moved it. Giving the errand up if {} consecutive polls are "
-                             "refused without it moving (#312)",
+                             "refused without it getting nearer (#312)",
                              name, target, static_cast<uint32>(distance),
                              static_cast<uint32>(TRAVEL_STEP_MIN_YARDS),
                              TRAVEL_GROUND_REFUSAL_LIMIT);
@@ -19762,8 +19762,7 @@ private:
                              // test greps this function for the phrase to prove
                              // every release path says why it fired.
                              "overseer: '{}' was sent to '{}' and has been refused every "
-                             "bearing out of one spot for {} polls running without moving "
-                             "a yard - releasing the errand as unreachable",
+                             "bearing for {} polls running without getting any nearer - releasing the errand as unreachable",
                              name, target, refusal.consecutive);
                     _travelAims.Release(name);
                 }
@@ -27803,6 +27802,17 @@ private:
     // auctioneer this trip PUTS THE CHARACTER THERE AND KEEPS IT THERE, and the
     // rows that have been failing for want of five and a half yards land while it
     // stands. That is what TownVisitStep's dwell is.
+
+    // THE FURTHEST A TOWN TRIP WALKS A FOLLOWER TO THE LEADER'S COUNTER. The
+    // trip aims a follower only once the leader is standing at the counter,
+    // and that aim is meant to be the last few yards (see
+    // OverseerDecisions::TownStopFacts). TRAVEL_FLIGHT_MIN_YARDS is the
+    // distance at which this module already calls a walk long enough to be a
+    // journey worth a flight, so it is read here rather than a second number
+    // being written. Measured 2026-09-23: four members 11,000 to 12,500 yards
+    // away were escorted across Kalimdor on foot, and one died twice.
+    static constexpr float TOWN_TRIP_WALK_LIMIT_YARDS = TRAVEL_FLIGHT_MIN_YARDS;
+
     static constexpr OverseerDecisions::TownTripLimits TOWN_TRIP_LIMITS{
         // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds
         // The bridge's vendor pass defaults to 300s. Keep the family at the
@@ -27872,6 +27882,10 @@ private:
         // first trip.
         time_t endedAt{0};
         std::set<std::string> settled;
+        // WHO THIS TRIP HAS AIMED AT ITS COUNTER. A member in here that is
+        // dead died on this trip's walk, and that is the fact the #298
+        // stand-down is written from.
+        std::set<std::string> walked;
         std::map<std::string, std::string> said;
         std::map<std::string, time_t> stoodSince;
         std::map<std::string, OverseerDecisions::TownNeed> before;
@@ -27935,6 +27949,7 @@ private:
         trip.endedAt = std::time(nullptr);
         trip.leader.clear();
         trip.settled.clear();
+        trip.walked.clear();
         trip.said.clear();
         trip.stoodSince.clear();
         trip.before.clear();
@@ -28240,6 +28255,7 @@ private:
             trip.leader = leaderName;
             trip.since = std::time(nullptr);
             trip.settled.clear();
+            trip.walked.clear();
             trip.said.clear();
             trip.stoodSince.clear();
             trip.before.clear();
@@ -28289,6 +28305,27 @@ private:
                 continue;
 
             Player* bot = present[name];
+
+            // A MEMBER THIS TRIP WALKED, FOUND DEAD, DIED ON THE TRIP'S WALK
+            // (#298). The death breaker cannot see it: it answers for the
+            // catch-up walk and the home errand, and it defers to an aim an
+            // escort claimed. So the trip writes the same stand-down the
+            // breaker writes for a catch-up, which also keeps the catch-up
+            // from walking it straight back over the same ground, and settles
+            // the member below rather than re-sending it after its revival.
+            if (bot && !bot->IsAlive() && trip.walked.count(name) &&
+                !WithinCatchUpStandDown(name))
+            {
+                _catchUpStandDown[name] = std::time(nullptr);
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' died on the town trip's walk to a '{}' - it is "
+                         "stood down for {} minutes, the same stand-down a catch-up walk "
+                         "that killed it gets (#298), and nothing walks it toward the "
+                         "family again until that is over",
+                         name, TownTripAimFor(trip.role),
+                         static_cast<uint32>(CATCH_UP_STANDDOWN_SECONDS / 60));
+            }
+
             OverseerDecisions::TownNeed const need = ReadTownNeed(bot);
 
             OverseerDecisions::TownStopFacts facts;
@@ -28321,6 +28358,12 @@ private:
                 float nearestYards = -1.f;
                 facts.atTheCounter =
                     CounterInReach(bot, trip.role, oneIsNearby, nearestYards);
+                // The formation test above has already put this member on the
+                // leader's map, so the distance is a same-map reading.
+                facts.yardsFromLeader =
+                    leader ? bot->GetDistance2d(leader) : 0.f;
+                facts.walkLimitYards = TOWN_TRIP_WALK_LIMIT_YARDS;
+                facts.stoodDown = WithinCatchUpStandDown(name);
             }
 
             switch (OverseerDecisions::TownTripMemberStop(facts))
@@ -28391,6 +28434,36 @@ private:
                     // inside anything, and the purpose is what DriveDungeonClear
                     // reads to decide whether to stand the dungeon brain down.
                     EscortToward(name, aim, "TOWN", EscortPurpose::Assemble);
+                    trip.walked.insert(name);
+                    break;
+
+                case OverseerDecisions::TownStop::TooFar:
+                    // THE SAME ANSWER AS A MEMBER ON ANOTHER MAP, for the same
+                    // reason: a town trip is not a crossing, and eleven
+                    // thousand yards of elite ground is one in all but name.
+                    if (SayTownTripOnce(trip, name, "too far"))
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is {} yards from the leader standing at "
+                                 "the '{}', past the {} yard walk a town trip will ask for "
+                                 "(TOWN_TRIP_WALK_LIMIT_YARDS). That is a journey and not "
+                                 "the last few yards, so it is not escorted there on foot: "
+                                 "it is left where it is, the trip carries on without it, "
+                                 "and it is served on the first trip after the family is "
+                                 "together again",
+                                 name, static_cast<uint32>(facts.yardsFromLeader), aim,
+                                 static_cast<uint32>(TOWN_TRIP_WALK_LIMIT_YARDS));
+                    SettleTownTripMember(trip, name);
+                    break;
+
+                case OverseerDecisions::TownStop::StoodDown:
+                    if (SayTownTripOnce(trip, name, "stood down"))
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is inside the stand-down its last walk "
+                                 "toward the family opened by killing it (#298), so the "
+                                 "town trip does not walk it to the '{}' either. It is "
+                                 "left where it is and the trip carries on without it",
+                                 name, aim);
+                    SettleTownTripMember(trip, name);
                     break;
 
                 case OverseerDecisions::TownStop::Follow:

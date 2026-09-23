@@ -336,6 +336,8 @@ void AMemberOnAnotherMapIsLeftWhereItIs()
 
 // -------------------------------------- what happens to one member, one poll --
 
+constexpr float WALK_LIMIT = 1500.f;
+
 TownStopFacts Facts(bool present, bool owed, bool atTheCounter, bool isLeader,
                     bool leaderAtTheCounter)
 {
@@ -345,7 +347,71 @@ TownStopFacts Facts(bool present, bool owed, bool atTheCounter, bool isLeader,
     facts.atTheCounter = atTheCounter;
     facts.isLeader = isLeader;
     facts.leaderAtTheCounter = leaderAtTheCounter;
+    // A follower a few yards from an arrived leader, under the adapter's own
+    // limit (TRAVEL_FLIGHT_MIN_YARDS), which is the case every test below
+    // this one was written about.
+    facts.yardsFromLeader = 40.f;
+    facts.walkLimitYards = WALK_LIMIT;
     return facts;
+}
+
+// THE MEASUREMENT THE WALK LIMIT EXISTS FOR (2026-09-23). The leader stood at
+// a vendor near Cenarion Hold in Silithus; four members were in Winterspring,
+// 11,000 to 12,500 yards away. Each was escorted "to vendor under its own
+// power", and one died twice to Hederine elites on the way. A walk of eleven
+// thousand yards is a journey, not the last few yards.
+void AFollowerAContinentAwayIsNotWalkedToTheCounter()
+{
+    TownStopFacts far = Facts(true, true, false, false, true);
+    far.yardsFromLeader = 11505.f;
+    Stop("a follower 11505 yards from an arrived leader", far, TownStop::TooFar);
+
+    TownStopFacts edge = Facts(true, true, false, false, true);
+    edge.yardsFromLeader = WALK_LIMIT;
+    Stop("a follower exactly at the limit", edge, TownStop::Walk);
+    edge.yardsFromLeader = WALK_LIMIT + 1.f;
+    Stop("a follower one yard past it", edge, TownStop::TooFar);
+
+    // THE LEADER IS NEVER REFUSED BY IT. Its distance from itself is zero, and
+    // the leader's walk is the journey to the counter it resolved from where
+    // it stands.
+    TownStopFacts leader = Facts(true, true, false, true, false);
+    leader.yardsFromLeader = 11505.f;
+    Stop("the leader, whatever the reading", leader, TownStop::Walk);
+
+    // AND IT DOES NOT TOUCH THE JOURNEY. Mid-journey a follower is not aimed
+    // by this trip at all, so there is no walk to refuse.
+    TownStopFacts behind = Facts(true, true, false, false, false);
+    behind.yardsFromLeader = 11505.f;
+    Stop("a far follower mid-journey still follows", behind, TownStop::Follow);
+
+    // A far follower that is somehow at the counter still trades.
+    TownStopFacts lucky = Facts(true, true, true, false, true);
+    lucky.yardsFromLeader = 11505.f;
+    Stop("a far follower in reach of a counter trades", lucky, TownStop::Trade);
+
+    // A limit nobody set refuses rather than allows.
+    TownStopFacts unset = Facts(true, true, false, false, true);
+    unset.walkLimitYards = 0.f;
+    Stop("an unset limit refuses the walk", unset, TownStop::TooFar);
+}
+
+// THE #298 STAND-DOWN, WHICH THE TRIP'S WALK TOOK OVER AND DID NOT HONOR. Og
+// died at 06:35:49 on the walk to a vendor and again at 06:38:02, because the
+// trip took the catch-up walk over and re-sent it the moment the revival hold
+// let go. A member inside its stand-down is not walked, however near.
+void AMemberInsideItsStandDownIsNotWalked()
+{
+    TownStopFacts dead = Facts(true, true, false, false, true);
+    dead.stoodDown = true;
+    Stop("a stood-down follower, a few yards off", dead, TownStop::StoodDown);
+    dead.yardsFromLeader = 11505.f;
+    Stop("a stood-down follower, far away", dead, TownStop::StoodDown);
+
+    TownStopFacts trading = Facts(true, true, true, false, true);
+    trading.stoodDown = true;
+    Stop("a stood-down follower already at the counter trades", trading,
+         TownStop::Trade);
 }
 
 // THE MEASUREMENT THIS RULE EXISTS FOR. Aiming the leader at a vendor 154 yards
@@ -403,10 +469,12 @@ void TheCounterOutranksTheWalk()
 
 void EveryCombinationHasAnAnswer()
 {
-    for (int i = 0; i < 32; ++i)
+    for (int i = 0; i < 128; ++i)
     {
-        TownStopFacts const facts = Facts((i & 1) != 0, (i & 2) != 0, (i & 4) != 0,
-                                          (i & 8) != 0, (i & 16) != 0);
+        TownStopFacts facts = Facts((i & 1) != 0, (i & 2) != 0, (i & 4) != 0,
+                                    (i & 8) != 0, (i & 16) != 0);
+        facts.stoodDown = (i & 32) != 0;
+        facts.yardsFromLeader = (i & 64) != 0 ? 11505.f : 40.f;
         if (std::string(TownStopWord(TownTripMemberStop(facts))) == "unknown")
             Fail("a combination with no answer", "a word", "unknown");
     }
@@ -600,6 +668,8 @@ int main()
 
     OnlyTheLeaderIsAimedOnTheJourney();
     EverybodyWalksTheLastFewYards();
+    AFollowerAContinentAwayIsNotWalkedToTheCounter();
+    AMemberInsideItsStandDownIsNotWalked();
     AFollowerAlreadyAtTheCounterTradesAnyway();
     AnUnreadableMemberIsWaitedForRatherThanFinished();
     AMemberThatWantsNothingIsFinishedWhereverItStands();
