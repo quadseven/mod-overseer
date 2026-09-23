@@ -11500,6 +11500,257 @@ bool MailWalkMadeProgress(float bestYards, float nowYards)
     return bestYards - nowYards >= MAIL_WALK_PROGRESS_YARDS;
 }
 
+// ------------------------------------------ trainer and vendor walks (#621) --
+
+namespace
+{
+// A non-zero decimal id that fits in 32 bits, and nothing else.
+bool ErrandWalkId(std::string const& text, uint32_t& out)
+{
+    if (text.empty() || text.size() > 10)
+        return false;
+    uint64_t value = 0;
+    for (char c : text)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        value = value * 10u + static_cast<uint64_t>(c - '0');
+    }
+    if (value == 0 || value > 0xFFFFFFFFull)
+        return false;
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+bool ErrandWalkCap(std::string const& text, float& out)
+{
+    float yards = 0.f;
+    if (!MailWalkYards(text, yards) || yards <= 0.f || yards > ERRAND_WALK_MAX_YARDS)
+        return false;
+    out = yards;
+    return true;
+}
+
+// Splits `key:value`; false when the word has no colon or an empty half.
+bool ErrandWalkPair(std::string const& word, std::string& key, std::string& value)
+{
+    std::size_t const colon = word.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= word.size())
+        return false;
+    key = word.substr(0, colon);
+    value = word.substr(colon + 1);
+    return true;
+}
+
+bool ErrandWalkLearnList(std::string const& text, std::vector<uint32_t>& out)
+{
+    std::string part;
+    for (std::size_t i = 0; i <= text.size(); ++i)
+    {
+        if (i < text.size() && text[i] != ',')
+        {
+            part.push_back(text[i]);
+            continue;
+        }
+        uint32_t id = 0;
+        if (!ErrandWalkId(part, id))
+            return false;
+        for (uint32_t seen : out)
+            if (seen == id)
+                return false;
+        out.push_back(id);
+        if (out.size() > TRAINER_WALK_MAX_LEARN)
+            return false;
+        part.clear();
+    }
+    return !out.empty();
+}
+}  // namespace
+
+char const* WalkGoalWord(WalkGoal goal)
+{
+    switch (goal)
+    {
+        case WalkGoal::Mailbox: return "mailbox";
+        case WalkGoal::Trainer: return "trainer";
+        case WalkGoal::Vendor:  return "vendor";
+    }
+    return "mailbox";
+}
+
+bool IsTrainerWalkRow(std::string const& command)
+{
+    std::vector<std::string> const words = MailWalkWords(command);
+    return !words.empty() && words[0] == TRAINER_WALK_VERB;
+}
+
+bool IsVendorWalkRow(std::string const& command)
+{
+    std::vector<std::string> const words = MailWalkWords(command);
+    return !words.empty() && words[0] == VENDOR_WALK_VERB;
+}
+
+TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command)
+{
+    TrainerWalkRequest request;
+    std::vector<std::string> const words = MailWalkWords(command);
+    // A refusal carries no half-parsed fields, so a caller that forgot to read
+    // `error` still sees skill 0 and an empty list.
+    auto malformed = []() -> TrainerWalkRequest
+    {
+        TrainerWalkRequest bad;
+        bad.error = ErrandWalkRefusal::MalformedTrainer;
+        return bad;
+    };
+    if (words.empty() || words[0] != TRAINER_WALK_VERB || words.size() > 4)
+        return malformed();
+    bool sawSkill = false, sawLearn = false, sawMax = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        std::string key, value;
+        if (!ErrandWalkPair(words[i], key, value))
+            return malformed();
+        if (key == "skill" && !sawSkill)
+        {
+            sawSkill = true;
+            if (!ErrandWalkId(value, request.skill))
+                return malformed();
+        }
+        else if (key == "learn" && !sawLearn)
+        {
+            sawLearn = true;
+            if (!ErrandWalkLearnList(value, request.learn))
+                return malformed();
+        }
+        else if (key == "max" && !sawMax)
+        {
+            sawMax = true;
+            if (!ErrandWalkCap(value, request.maxYards))
+                return malformed();
+        }
+        else
+            return malformed();
+    }
+    if (!sawSkill)
+        return malformed();
+    return request;
+}
+
+VendorWalkRequest ParseVendorWalkRequest(std::string const& command)
+{
+    VendorWalkRequest request;
+    std::vector<std::string> const words = MailWalkWords(command);
+    VendorWalkRequest bad;
+    bad.error = ErrandWalkRefusal::MalformedVendor;
+    if (words.empty() || words[0] != VENDOR_WALK_VERB || words.size() > 3)
+        return bad;
+    bool sawItem = false, sawMax = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        std::string key, value;
+        if (!ErrandWalkPair(words[i], key, value))
+            return bad;
+        if (key == "item" && !sawItem)
+        {
+            sawItem = true;
+            if (!ErrandWalkId(value, request.item))
+                return bad;
+        }
+        else if (key == "max" && !sawMax)
+        {
+            sawMax = true;
+            if (!ErrandWalkCap(value, request.maxYards))
+                return bad;
+        }
+        else
+            return bad;
+    }
+    if (!sawItem)
+        return bad;
+    return request;
+}
+
+char const* WalkRefusalFor(WalkGoal goal, char const* mailboxWall)
+{
+    namespace M = MailWalkRefusal;
+    namespace E = ErrandWalkRefusal;
+    if (goal == WalkGoal::Mailbox || !mailboxWall)
+        return mailboxWall;
+    std::string const wall = mailboxWall;
+    bool const trainer = goal == WalkGoal::Trainer;
+    if (wall == M::Malformed)
+        return trainer ? E::MalformedTrainer : E::MalformedVendor;
+    if (wall == M::AlreadyWalking)
+        return E::AlreadyWalking;
+    if (wall == M::NoMailboxOnMap)
+        return trainer ? E::NoTrainerOnMap : E::NoVendorOnMap;
+    if (wall == M::MailboxTooFar)
+        return trainer ? E::TrainerTooFar : E::VendorTooFar;
+    if (wall == M::OtherSidesGround)
+        return trainer ? E::TrainerOtherSide : E::VendorOtherSide;
+    if (wall == M::GroundRefused)
+        return trainer ? E::TrainerGround : E::VendorGround;
+    return mailboxWall;
+}
+
+char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state)
+{
+    namespace E = ErrandWalkRefusal;
+    if (goal == WalkGoal::Mailbox)
+        return MailWalkEndReason(state);
+    bool const trainer = goal == WalkGoal::Trainer;
+    switch (state)
+    {
+        case MailWalkState::Walking:       return "";
+        case MailWalkState::Arrived:       return "";
+        case MailWalkState::LeftWorld:     return trainer ? E::TrainerLeftWorld : E::VendorLeftWorld;
+        case MailWalkState::Died:          return trainer ? E::TrainerDied : E::VendorDied;
+        case MailWalkState::TookFlight:    return trainer ? E::TrainerFlight : E::VendorFlight;
+        case MailWalkState::LeftMap:       return trainer ? E::TrainerLeftMap : E::VendorLeftMap;
+        case MailWalkState::EnteredCombat: return trainer ? E::TrainerCombat : E::VendorCombat;
+        case MailWalkState::TimedOut:      return trainer ? E::TrainerTimedOut : E::VendorTimedOut;
+        case MailWalkState::Stalled:       return trainer ? E::TrainerStalled : E::VendorStalled;
+        case MailWalkState::GroundRefused: return trainer ? E::TrainerGround : E::VendorGround;
+    }
+    return "";
+}
+
+bool ErrandWalkRefusalRetryable(std::string const& reason)
+{
+    namespace E = ErrandWalkRefusal;
+    if (MailWalkRefusalRetryable(reason))
+        return true;
+    return reason == E::AlreadyWalking || reason == E::TrainerTooFar
+        || reason == E::VendorTooFar || reason == E::TrainerGround || reason == E::VendorGround
+        || reason == E::TrainerCombat || reason == E::TrainerDied
+        || reason == E::TrainerLeftWorld || reason == E::TrainerLeftMap
+        || reason == E::TrainerFlight || reason == E::TrainerTimedOut
+        || reason == E::TrainerStalled || reason == E::VendorCombat || reason == E::VendorDied
+        || reason == E::VendorLeftWorld || reason == E::VendorLeftMap
+        || reason == E::VendorFlight || reason == E::VendorTimedOut
+        || reason == E::VendorStalled || reason == E::TaughtNothing;
+}
+
+TrainerVisitOutcome JudgeTrainerVisit(TrainerVisitFacts const& facts)
+{
+    if (facts.rankLearned || facts.learned > 0)
+        return TrainerVisitOutcome::Learned;
+    if (!facts.rankOffered && facts.alreadyKnown >= facts.asked)
+        return TrainerVisitOutcome::NothingToLearn;
+    return TrainerVisitOutcome::TaughtNothing;
+}
+
+char const* TrainerVisitWord(TrainerVisitOutcome outcome)
+{
+    switch (outcome)
+    {
+        case TrainerVisitOutcome::Learned:        return "learned";
+        case TrainerVisitOutcome::NothingToLearn: return "nothing_to_learn";
+        case TrainerVisitOutcome::TaughtNothing:  return "taught_nothing";
+    }
+    return "taught_nothing";
+}
+
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
                     std::uint32_t count, bool notable)
 {
