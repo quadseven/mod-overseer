@@ -165,6 +165,11 @@ void TheBreachSaysWhatIsWrong()
           FamilyGroupBreach(memberAway) ==
               "'Bork' is not in the world; 'Og' is in no group");
 
+    std::vector<FamilyGroupSeat> const headless = {
+        Seat("Bork", false, 3, true), Seat("Grog", false, 3)};
+    Check("no seat is the head",
+          FamilyGroupBreach(headless) == "the roster names no head");
+
     std::vector<FamilyGroupSeat> const alone = {Seat("Grug", true, 0)};
     Check("a family of one is whole", FamilyGroupBreach(alone).empty());
 }

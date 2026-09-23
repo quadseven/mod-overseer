@@ -26885,6 +26885,10 @@ private:
             Player* member = ObjectAccessor::FindPlayerByName(name);
             if (!SteerableAI(member))
             {
+                // Out of the world is out of any copy: the latch goes with it,
+                // so the register never holds more than the members standing
+                // in a wrong copy right now.
+                s_loggedOtherCopy.erase(name);
                 states.push_back(state);
                 continue;
             }
@@ -26897,8 +26901,11 @@ private:
 
             // GetMapId  Position.h:281  uint32 GetMapId() const
             uint32 const memberMap = member->GetMapId();
-            if (OverseerDecisions::InAnotherInstanceCopy(memberMap, member->GetInstanceId(),
-                                                         throughMapId, headInstance))
+            bool const otherCopy = OverseerDecisions::InAnotherInstanceCopy(
+                memberMap, member->GetInstanceId(), throughMapId, headInstance);
+            if (!otherCopy)
+                s_loggedOtherCopy.erase(name);
+            if (otherCopy)
             {
                 if (s_loggedOtherCopy[name] != member->GetInstanceId())
                 {
@@ -26912,7 +26919,6 @@ private:
             }
             else if (memberMap == throughMapId)
             {
-                s_loggedOtherCopy.erase(name);
                 state.through = true;
                 ++through;
             }
