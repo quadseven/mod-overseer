@@ -3010,6 +3010,13 @@ struct TravelClaimFacts
     std::string column;
     // `column` is the aim this book itself last wrote for this character.
     bool columnIsOurs{false};
+    // The aim being claimed. When the column already holds exactly this, the
+    // write changes nothing and interrupts no walk (2026-09-23): after a
+    // restart the book no longer remembers writing the run's own staging aim,
+    // and the profession fence refused the identical claim on every poll, 94
+    // times in twelve minutes, so the run re-armed and re-planned its leader
+    // without ever letting him walk the route.
+    std::string target;
     // Whose walk the aim is. See TravelOwner.
     TravelOwner owner;
 };

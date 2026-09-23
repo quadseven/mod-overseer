@@ -173,10 +173,41 @@ void TheReleaseLineNamesTheFence()
     }
 }
 
+
+// THE SAME AIM AGAIN IS WRITTEN, whoever the book remembers writing it
+// (2026-09-23). After a restart the Horde leader's column still held the run's
+// Ragefire staging aim with learn_skill 186 pending, the book did not remember
+// writing it, and the fence refused the identical claim on every poll.
+void TheSameAimAgainIsWritten()
+{
+    char const* const STAGING = "at:1:1807.39,-4407.8,-18.4334";
+    TravelClaimFacts run(OverseerDecisions::TravelOwner::Run);
+    run.learnSkill = 186;
+    run.column = STAGING;
+    run.columnIsOurs = false;
+    run.target = STAGING;
+    CheckClaim("a run re-claiming the aim its column already holds is written",
+               ReadTravelClaim(run), TravelClaim::Write);
+
+    TravelClaimFacts other(OverseerDecisions::TravelOwner::Run);
+    other.learnSkill = 186;
+    other.column = "trainer";
+    other.target = STAGING;
+    CheckClaim("a run over a trainer walk is still refused",
+               ReadTravelClaim(other), TravelClaim::RefusedProfession);
+
+    TravelClaimFacts vendor(OverseerDecisions::TravelOwner::Run);
+    vendor.column = "vendor";
+    vendor.target = STAGING;
+    CheckClaim("a run over a vendor errand is still refused as foreign",
+               ReadTravelClaim(vendor), TravelClaim::RefusedForeign);
+}
+
 }  // namespace
 
 int main()
 {
+    TheSameAimAgainIsWritten();
     ACatchUpClaimAcrossTheThreeCases();
     AnOrdinaryClaimKeepsTheProfessionFence();
     ARunClaimOverAnEmptyColumnIsWritten();

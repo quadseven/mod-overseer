@@ -4623,6 +4623,7 @@ public:
         facts.column = CurrentTravelNpc(name);
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
+        facts.target = target;
         OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
         if (verdict != OverseerDecisions::TravelClaim::Write)
         {
