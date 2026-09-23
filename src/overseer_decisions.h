@@ -2402,6 +2402,69 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
 bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
                                 time_t ceilingSeconds);
 
+// ------------------------------- arming the dungeon brain, and when (#618) --
+//
+// One step of the arming drive for one character inside a dungeon. Four
+// answers, in the order they are asked:
+//
+//   HoldNoIssuer  no groupmate may issue a dungeon-clear command right now.
+//                 The dungeon module refuses a true bot as issuer, so on a
+//                 roster whose only client-attached member is the head, the
+//                 head being offline means NOBODY may. That is a hold, said
+//                 once per streak, and never a retry.
+//   Armed         already accepted for this run by this process. Done.
+//   WaitRetry     refused for this run, and the retry interval has not passed.
+//   Issue         send `dc on`.
+enum class DcArmingStep
+{
+    HoldNoIssuer,
+    Armed,
+    WaitRetry,
+    Issue,
+};
+
+DcArmingStep DecideDcArming(bool issuerAvailable, bool recordIsForThisRun,
+                            bool recordAccepted, bool retryDue);
+
+// Must the arming drive forget what it said to this character? Yes when the
+// character is off a dungeon map, which was always the rule, and ALSO when it
+// is not in the world at all (#618). What `dc on` set lives on the character's
+// PlayerbotAI in memory; a logout destroys it. A record that outlives the
+// logout says "armed" about a brain that no longer exists, so the head
+// relogging into the dungeon was never armed again, and the run stood.
+bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap);
+
+// Does the CLEARING stall clock run this poll (#618)? Only while the brain can
+// actually be driven: `dc on` accepted for everyone inside, the leader
+// visible on the dungeon map, and a groupmate able to issue `dc skip`.
+// Anything else HOLDS the clock, and the caller re-stamps it. Without the hold
+// the minutes the head spent offline were counted as a stall, and the ladder
+// of `dc skip`s and the extraction fired at a run that was only waiting for
+// him.
+enum class ClearingClock
+{
+    Runs,
+    HeldNotArmed,
+    HeldLeaderAway,
+    HeldNoIssuer,
+};
+
+ClearingClock ClearingClockState(bool acceptedOnEveryoneInside, bool leaderVisible,
+                                 bool issuerAvailable);
+
+// Words for a held clock, for the one log line a hold earns. Empty for Runs.
+char const* ClearingClockHoldReason(ClearingClock clock);
+
+// ------------------------------------------- who leads the family (#607) --
+//
+// The roster's head takes the lead of the family party whenever he is
+// present in it and does not already have it. The server promotes whoever is
+// left when the leader logs out, so a head who comes back comes back as a
+// member; this is the rule that hands it back. `headNamed` is false when the
+// roster names no head, and then the group keeps whatever leader it has.
+bool HeadTakesTheLead(bool headNamed, bool headPresent, bool headInThisGroup,
+                      bool headLeads);
+
 // ------------------------------------------- what counts as a run (#225) --
 //
 // DID THE PARTY ACTUALLY GET INTO THE DUNGEON? Measured 2026-09-05: a campaign
