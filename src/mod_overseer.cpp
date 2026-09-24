@@ -28374,8 +28374,15 @@ private:
             }
             return false;
         }
+        // THE CLOCK IS `stagingSince`, the one GATHERING's backstop reads. It
+        // is shifted forward by the stop's own duration so the age it gives
+        // stands still: the snapshot was taken when this stop was first seen,
+        // so a second stop in one staging pass snapshots the already shifted
+        // clock and the pauses add up. Clamped to `now` all the same, so a
+        // pause can never make staging look younger than zero.
         if (coord.townStopStagingSince)
-            coord.stagingSince = coord.townStopStagingSince + (now - coord.townStopSince);
+            coord.stagingSince = std::min<time_t>(
+                now, coord.townStopStagingSince + (now - coord.townStopSince));
         if (!coord.loggedTownStop)
         {
             coord.loggedTownStop = true;
