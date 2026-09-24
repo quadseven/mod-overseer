@@ -28693,8 +28693,9 @@ private:
             Esc(leaderName), kind, campaignId, attempt);
         if (!result)
             return false;
-        answer = result->Fetch()[0].Get<std::string>();
-        by = result->Fetch()[1].Get<std::string>();
+        Field* row = result->Fetch();
+        answer = row[0].Get<std::string>();
+        by = row[1].Get<std::string>();
         return !answer.empty();
     }
 
@@ -33575,7 +33576,11 @@ private:
                     // bridge asks Jev what should yield, and the answer (or the
                     // heuristic's, when none arrives) is applied above on a
                     // later poll.
-                    if (OverseerDecisions::StagingStallAskAt(coord.stagingRearms))
+                    // ONE QUESTION AT A TIME: an ask still waiting for its
+                    // answer is not overwritten by the next, or its row would
+                    // never be marked applied.
+                    if (OverseerDecisions::StagingStallAskAt(coord.stagingRearms) &&
+                        !coord.stallAskedAt)
                     {
                         OverseerDecisions::StagingStallFacts stall;
                         stall.rearms = coord.stagingRearms;

@@ -121,7 +121,12 @@ void NoStreakStopsTheCampaign()
     std::vector<std::string> const seven(7, "staging_failed");
     Check("seven in a row still recovers",
           DungeonCampaignRecovers(DungeonRunTrailingFailures(seven)), true);
-    Check("no failures, nothing to recover", DungeonCampaignRecovers(0), false);
+    // The one boundary, in both directions and in the caller's own shape.
+    Check("no failures, nothing to recover",
+          DungeonCampaignRecovers(DungeonRunTrailingFailures({"complete"})), false);
+    Check("the first failure recovers",
+          DungeonCampaignRecovers(DungeonRunTrailingFailures({"staging_failed", "complete"})),
+          true);
 }
 
 void TheStreakReadsRealRowsTheWayTheCallerHandsThemOver()
