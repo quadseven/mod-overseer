@@ -5777,6 +5777,12 @@ public:
         {
             _dungeonRunTimer = 0;
             DriveDungeonRun();
+            // THE RAID RUN ON THE SAME CLOCK, and before the town trip for the
+            // same reason the coordinator is: a head aim it writes this poll is
+            // picked up by DriveTravel below on the same tick. A family is on a
+            // dungeon job or a raid job, never both, so the two never steer one
+            // head together.
+            DriveRaidRun();
             // ON THE COORDINATOR'S OWN CLOCK AND IMMEDIATELY AFTER IT, sharing
             // this timer rather than adding another - the same choice
             // DriveHomeBind and DriveStuckRevival each made, and here it is not
@@ -21774,6 +21780,7 @@ private:
                 // to this character no longer holds, and the next time it is
                 // seen inside it is asked again - same run row or not.
                 _dcOnIssued.erase(name);
+                _raidArmingHeldSaid.erase(name);
                 continue;
             }
 
@@ -21786,6 +21793,22 @@ private:
             // the map change either way.
             if (!bot->IsAlive())
                 continue;
+
+            // NOT ON A RAID MAP UNTIL CLEARING IS ORDERED (the raid run's first
+            // slice). See OverseerDecisions::DungeonClearMayArmHere. No order to
+            // clear a raid exists yet, so the answer on a raid map is always
+            // hold, and no run row is opened for it either.
+            if (!OverseerDecisions::DungeonClearMayArmHere(map->IsRaid(), false))
+            {
+                if (_raidArmingHeldSaid.insert(name).second)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is inside raid map {} - the dungeon brain is "
+                             "held off because clearing a raid is not ordered; the raid "
+                             "stands at the entrance",
+                             name, static_cast<uint32>(bot->GetMapId()));
+                continue;
+            }
+            _raidArmingHeldSaid.erase(name);
 
             // THE HEARTBEAT IS TOUCHED FOR EVERY CHARACTER SEEN INSIDE,
             // BEFORE ANY OTHER DECISION, AND THAT ORDER IS THE WHOLE POINT.
@@ -30478,6 +30501,455 @@ private:
                  coord.campaignId);
     }
 
+    // ------------------------------------------------------------ the raid run --
+    //
+    // FORM, ASSEMBLE, ENTER, INSIDE: the first slice of a forty-player raid.
+    // OverseerDecisions::StepRaidRun decides; this reads the world into
+    // RaidRunFacts and does what one step says. See RaidDoor and StepRaidRun
+    // for the door, the order and why the head goes last.
+    //
+    // WHO SITS WHERE IS THE BRIDGE'S LINEUP, NOT A SECOND PLAN. The Raid tab
+    // shows wow-overseer's raidlineup.py, so the bridge writes that lineup into
+    // `overseer_raid_seat` when the operator orders the raid, and this reads it.
+    // PlanRaid (the `guild raid` verb's planner) is not consulted: two planners
+    // would put two different forty in front of the operator.
+    //
+    // WHAT MOVES A CHARACTER. Only three things, all of them the module's usual
+    // ones: the head's travel column (Claim, owner Run), the core's own group
+    // calls (ConvertToRaid, AddMember, ChangeMembersGroup, RemoveFromGroup), and
+    // the areatrigger knock, which the core's handler refuses for anybody not
+    // standing in the trigger. A guild bot added to the head's raid takes the
+    // head as its master and follows him (PlayerbotAI::FindNewMaster); nothing
+    // here teleports anybody.
+    struct RaidRunState
+    {
+        OverseerDecisions::RaidRunPhase phase{OverseerDecisions::RaidRunPhase::Idle};
+        time_t phaseSince{0};
+        std::string keyword;
+        std::string head;
+        // The group this run converted, by raw guid, so the release disbands
+        // that group and never one the family formed afterwards.
+        uint64 groupId{0};
+        std::string lastWhy;
+    };
+    std::map<std::string, RaidRunState> _raidRuns;
+    // Characters already told that the dungeon brain is held on a raid map, so
+    // the line is said once per stay rather than every poll.
+    std::set<std::string> _raidArmingHeldSaid;
+
+    // Can this seated character be put in `group` now: in the world, not in it
+    // already, not in a group the core owns, and the raid has room. One answer
+    // for the facts and for the formation, so FORM cannot wait on a seat the
+    // formation would never take.
+    static bool RaidSeatCanJoin(Player* p, Group* group)
+    {
+        if (!p || !p->IsInWorld())
+            return false;
+        Group* mine = p->GetGroup();
+        if (group && (mine == group || group->IsFull()))
+            return false;
+        return !(mine && (mine->isBGGroup() || mine->isBFGroup() || mine->isLFGGroup()));
+    }
+
+    // A database without the seat table (2026_09_23_01_overseer_raid_seat.sql
+    // not applied) forms no raid and says so once. Asked of the schema first
+    // because a query naming a missing table is not an empty answer to the
+    // core; it is an error it does not recover from.
+    SchemaColumns _raidSeatColumns{SchemaColumns::Unknown};
+    bool RaidSeatsPresent()
+    {
+        if (_raidSeatColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_raid_seat", "'family','keyword','name','subgroup'", 4);
+            _raidSeatColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_raid_seat is missing "
+                         "(2026_09_23_01_overseer_raid_seat.sql has not been applied), so "
+                         "an ordered raid has no lineup and is not formed");
+        }
+        return _raidSeatColumns == SchemaColumns::Present;
+    }
+
+    // name -> subgroup (0 to 7) for one family's order, or empty. An empty read
+    // (no rows, or a realm without the table) forms nothing: a raid is not
+    // invented from a missing lineup.
+    std::map<std::string, unsigned> LoadRaidSeats(std::string const& family,
+                                                  std::string const& keyword)
+    {
+        std::map<std::string, unsigned> seats;
+        if (!RaidSeatsPresent())
+            return seats;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, subgroup FROM overseer_raid_seat "
+            "WHERE family = '{}' AND keyword = '{}'",
+            Esc(family), Esc(keyword));
+        if (!result)
+            return seats;
+        do
+        {
+            Field* row = result->Fetch();
+            unsigned const subgroup = row[1].Get<uint8>();
+            if (subgroup < OverseerDecisions::RAID_SUBGROUPS)
+                seats[row[0].Get<std::string>()] = subgroup;
+        } while (result->NextRow());
+        return seats;
+    }
+
+    // Convert the head's group, add every seated character who is in the world,
+    // and move each into the subgroup the lineup gives it. Returns how many
+    // seated characters could still be added after this pass (0 = done).
+    unsigned FormRaidFromSeats(std::string const& family, Player* head,
+                               std::map<std::string, unsigned> const& seats,
+                               RaidRunState& run)
+    {
+        Group* group = head->GetGroup();
+        if (group && (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup()))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: raid run for family '{}' cannot form - '{}' is in a "
+                     "battleground, battlefield or dungeon-finder group the core owns",
+                     family, head->GetName());
+            return 0;
+        }
+        if (!group)
+        {
+            group = new Group();
+            if (!group->Create(head))
+            {
+                delete group;
+                LOG_WARN("module.overseer",
+                         "overseer: raid run for family '{}' - the core refused to form "
+                         "a group under '{}'",
+                         family, head->GetName());
+                return 0;
+            }
+            sGroupMgr->AddGroup(group);
+        }
+        if (!group->isRaidGroup())
+        {
+            // IRREVERSIBLE, and allowed here because the operator ordered this
+            // raid by name. `guild raid form` keeps its own refusal for the
+            // roster party (RaidMayConvertTheRosterParty); this is not that
+            // verb being asked a question, it is the order being carried out.
+            group->ConvertToRaid();
+            if (!group->isRaidGroup())
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: raid run for family '{}' - ConvertToRaid left '{}''s "
+                         "group a party when it was read back",
+                         family, head->GetName());
+                return 0;
+            }
+            LOG_INFO("module.overseer",
+                     "overseer: raid run for family '{}' converted '{}''s group to a raid "
+                     "on the operator's order",
+                     family, head->GetName());
+        }
+        run.groupId = group->GetGUID().GetRawValue();
+
+        unsigned added = 0;
+        unsigned leftOther = 0;
+        unsigned stillAddable = 0;
+        for (auto const& [name, subgroup] : seats)
+        {
+            Player* p = ObjectAccessor::FindPlayerByName(name);
+            // Not in the world, already seated, or in a group the core owns
+            // (left alone, as KeepFamilyGrouped leaves it).
+            if (!RaidSeatCanJoin(p, group))
+                continue;
+            if (Group* other = p->GetGroup())
+            {
+                // THE PLAYER'S OWN /leave (RemoveFromGroup, the path
+                // CMSG_GROUP_DISBAND takes), and only for a seat the operator's
+                // lineup named. AddMember on somebody still grouped would leave
+                // two groups both believing they hold him.
+                p->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+                if (p->GetGroup())
+                {
+                    ++stillAddable;
+                    continue;
+                }
+                ++leftOther;
+            }
+            if (group->IsFull())
+                break;
+            if (group->AddMember(p))
+                ++added;
+            else
+                ++stillAddable;
+        }
+
+        // THE SEATING, BY THE SAME MOVES `guild raid form` APPLIES, joined back to
+        // the lineup by name. See RaidSeatingMoves for why a full destination is a
+        // swap and why this terminates.
+        std::vector<OverseerDecisions::RaidSeatNow> now;
+        std::vector<ObjectGuid> guids;
+        for (Group::MemberSlotList::const_iterator slot = group->GetMemberSlots().begin();
+             slot != group->GetMemberSlots().end(); ++slot)
+        {
+            OverseerDecisions::RaidSeatNow seat;
+            seat.subgroup = slot->group;
+            auto const wanted = seats.find(slot->name);
+            seat.planned = wanted != seats.end();
+            seat.want = seat.planned ? wanted->second : 0;
+            now.push_back(seat);
+            guids.push_back(slot->guid);
+        }
+        unsigned moved = 0;
+        for (OverseerDecisions::RaidMove const& move : OverseerDecisions::RaidSeatingMoves(now))
+        {
+            if (move.to >= unsigned(MAX_RAID_SUBGROUPS) || move.who >= guids.size())
+                continue;   // see the same guard in DoGuild's `raid form`
+            group->ChangeMembersGroup(guids[move.who], uint8(move.to));
+            ++moved;
+        }
+        if (added || moved || leftOther)
+        {
+            group->SendUpdate();
+            LOG_INFO("module.overseer",
+                     "overseer: raid run for family '{}' seated the lineup - {} added ({} "
+                     "left another group first), {} moved between subgroups, {} now in "
+                     "the raid of {} seats",
+                     family, added, leftOther, moved, group->GetMembersCount(),
+                     uint32(seats.size()));
+        }
+
+        return stillAddable;
+    }
+
+    // Let go of what an ended order held: the head's aim, and the raid group
+    // this run converted. The group is disbanded (the core's own call; a raid
+    // cannot be turned back into a party) only when nobody in it is inside the
+    // raid map, because a disband there is a forced eviction from the instance.
+    // KeepRosterGrouped re-forms the family's party on its next poll.
+    bool ReleaseRaidRun(std::string const& family, RaidRunState& run,
+                        OverseerDecisions::RaidDoor const* door)
+    {
+        if (!run.head.empty())
+            _travelAims.Release(run.head);
+        Player* head = run.head.empty() ? nullptr : ObjectAccessor::FindPlayerByName(run.head);
+        Group* group = head ? head->GetGroup() : nullptr;
+        if (group && run.groupId && group->GetGUID().GetRawValue() == run.groupId &&
+            group->isRaidGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (member && door && member->GetMapId() == door->insideMapId)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' ended but '{}' is still "
+                             "inside {} - the raid is kept until nobody is, and the "
+                             "release is tried again next poll",
+                             family, member->GetName(), door->name);
+                    return false;
+                }
+            }
+            LOG_INFO("module.overseer",
+                     "overseer: raid run for family '{}' ended - disbanding the raid of {} "
+                     "under '{}'; the family's own party re-forms on the next party poll",
+                     family, group->GetMembersCount(), run.head);
+            group->Disband();
+        }
+        return true;
+    }
+
+    void DriveRaidRun()
+    {
+        using OverseerDecisions::RaidRunPhase;
+
+        std::map<std::string, std::string> const jobs = LoadJobs();
+        for (OverseerDecisions::FamilyRoster const& roster : LoadFamilyRosters())
+        {
+            if (roster.leader.empty())
+                continue;
+            RaidRunState& run = _raidRuns[roster.family];
+            auto const job = jobs.find(roster.leader);
+            std::string const keyword = OverseerDecisions::RaidKeywordForJob(
+                job == jobs.end() ? std::string() : job->second);
+            OverseerDecisions::RaidDoor const* door =
+                OverseerDecisions::RaidDoorFor(keyword.empty() ? run.keyword : keyword);
+
+            OverseerDecisions::RaidRunFacts facts;
+            facts.ordered = !keyword.empty();
+            Player* head = ObjectAccessor::FindPlayerByName(roster.leader);
+            facts.headStreaming = head && head->IsInWorld() && ClientAttached(head);
+            Group* group = head ? head->GetGroup() : nullptr;
+            facts.raidFormed = group && group->isRaidGroup();
+            facts.heldSeconds = run.phaseSince ? long(std::time(nullptr) - run.phaseSince) : 0;
+
+            std::map<std::string, unsigned> seats;
+            if (facts.ordered)
+                seats = LoadRaidSeats(roster.family, keyword);
+
+            if (facts.raidFormed && door)
+            {
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* member = ref->GetSource();
+                    if (!member || !member->IsInWorld())
+                        continue;
+                    ++facts.inWorld;
+                    if (member->GetMapId() == door->insideMapId)
+                        ++facts.inside;
+                    else if (member->GetMapId() == door->outsideMapId &&
+                             member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
+                                 OverseerDecisions::RAID_ASSEMBLE_YARDS)
+                        ++facts.assembled;
+                }
+            }
+            if (head && door)
+            {
+                facts.headInside = head->GetMapId() == door->insideMapId;
+                facts.headAssembled = head->GetMapId() == door->outsideMapId &&
+                                      head->GetDistance(door->stageX, door->stageY,
+                                                        door->stageZ) <=
+                                          OverseerDecisions::RAID_ASSEMBLE_YARDS;
+            }
+            // Seats that could still join, read without changing anything, so
+            // FORM is left only when formation has nothing more to do.
+            for (auto const& [name, subgroup] : seats)
+                if (RaidSeatCanJoin(ObjectAccessor::FindPlayerByName(name), group))
+                    ++facts.addable;
+
+            if (facts.ordered && seats.empty() && run.phase == RaidRunPhase::Idle)
+            {
+                if (run.lastWhy != "no seats")
+                    LOG_WARN("module.overseer",
+                             "overseer: raid run for family '{}' is ordered ({}) but "
+                             "overseer_raid_seat holds no lineup for it - nothing is formed "
+                             "until the bridge writes one",
+                             roster.family, keyword);
+                run.lastWhy = "no seats";
+                continue;
+            }
+
+            OverseerDecisions::RaidRunStep const step =
+                OverseerDecisions::StepRaidRun(run.phase, facts);
+
+            if (step.release)
+            {
+                if (ReleaseRaidRun(roster.family, run, door))
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' released at {} - {}",
+                             roster.family, OverseerDecisions::RaidRunPhaseName(run.phase),
+                             step.why);
+                    run = RaidRunState();
+                }
+                continue;
+            }
+            if (step.phase == RaidRunPhase::Idle)
+            {
+                run.lastWhy = step.why;
+                continue;
+            }
+
+            if (!keyword.empty())
+                run.keyword = keyword;
+            run.head = roster.leader;
+
+            if (step.phase != run.phase)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' ({}) {} -> {} - {} ({} in the "
+                         "world, {} at the door, {} inside, {} seats)",
+                         roster.family, door ? door->name : "?",
+                         OverseerDecisions::RaidRunPhaseName(run.phase),
+                         OverseerDecisions::RaidRunPhaseName(step.phase), step.why,
+                         facts.inWorld, facts.assembled, facts.inside,
+                         uint32(seats.size()));
+                run.phase = step.phase;
+                run.phaseSince = std::time(nullptr);
+                run.lastWhy = step.why;
+            }
+            else if (run.lastWhy != step.why)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' holds {} - {}",
+                         roster.family, OverseerDecisions::RaidRunPhaseName(step.phase),
+                         step.why);
+                run.lastWhy = step.why;
+            }
+
+            if (!head || !door)
+                continue;
+
+            if (step.form)
+                FormRaidFromSeats(roster.family, head, seats, run);
+
+            if (step.aimStaging || step.aimDoor)
+            {
+                float x = door->stageX;
+                float y = door->stageY;
+                float z = door->stageZ;
+                if (step.aimDoor)
+                {
+                    AreaTrigger const* trigger = sObjectMgr->GetAreaTrigger(door->entryTriggerId);
+                    if (!trigger)
+                    {
+                        LOG_ERROR("module.overseer",
+                                  "overseer: raid run for family '{}' - areatrigger {} is not "
+                                  "in this world, so there is no door to walk onto",
+                                  roster.family, door->entryTriggerId);
+                        continue;
+                    }
+                    x = trigger->x;
+                    y = trigger->y;
+                    // THE FLOOR OVER THE TRIGGER, READ FROM THE MAP. The trigger's
+                    // own z is the sphere's centre, under the floor; an aim at it
+                    // would ask the walker for a point inside rock.
+                    z = door->stageZ;
+                    Map* map = head->GetMap();
+                    if (map && map->GetId() == door->outsideMapId && map->IsGridLoaded(x, y))
+                    {
+                        float const ground = map->GetHeight(x, y, door->stageZ + 5.f);
+                        if (ground > INVALID_HEIGHT && std::fabs(ground - door->stageZ) < 6.f)
+                            z = ground;
+                    }
+                }
+                std::ostringstream aim;
+                aim << std::fixed << std::setprecision(1) << "at:" << door->outsideMapId
+                    << ':' << x << ',' << y << ',' << z;
+                // A refusal is said by Claim itself, once per fence.
+                _travelAims.Claim(roster.leader, aim.str(), OverseerDecisions::TravelOwner::Run);
+            }
+
+            if (step.knockMembers || step.knockHead)
+            {
+                AreaTrigger const* trigger = sObjectMgr->GetAreaTrigger(door->entryTriggerId);
+                if (!trigger || !group || !group->isRaidGroup())
+                    continue;
+                std::vector<std::string> inDoor;
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* member = ref->GetSource();
+                    if (member && member->IsInWorld() && member->IsAlive() &&
+                        member->IsInAreaTriggerRadius(trigger))
+                        inDoor.push_back(member->GetName());
+                }
+                std::string const knock = "trigger:" + std::to_string(door->entryTriggerId);
+                unsigned crossed = 0;
+                for (std::string const& name :
+                     OverseerDecisions::RaidKnockOrder(inDoor, roster.leader, step.knockHead))
+                {
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (member && StepThroughAreaTrigger(name, member, knock))
+                        ++crossed;
+                }
+                if (crossed)
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' knocked {} of {} standing "
+                             "in areatrigger {} through into {}{}",
+                             roster.family, crossed, uint32(inDoor.size()),
+                             door->entryTriggerId, door->name,
+                             step.knockHead ? " (the head may cross)" : "");
+            }
+        }
+    }
+
     void DriveDungeonRun()
     {
         // WHAT RELEASES A STAGING HOLD, AND IT IS THE PHASE RATHER THAN A LIST
@@ -35762,7 +36234,11 @@ private:
         auto const& modes = JobModes();
         bool const knownMode = std::find(modes.begin(), modes.end(), mode) != modes.end();
         bool const knownDungeon = IsDungeonJob(mode) && !DungeonKeywordForJob(mode).empty();
-        if (!knownMode && !knownDungeon)
+        // `raid:<keyword>` for a door this module has (RaidDoorFor). Any other
+        // raid keyword is refused here, so an order for a raid nothing can run
+        // never parks the family on a job every other drive stands down for.
+        bool const knownRaid = !OverseerDecisions::RaidKeywordForJob(mode).empty();
+        if (!knownMode && !knownDungeon && !knownRaid)
             return "unknown job mode";
 
         CharacterDatabase.DirectExecute(

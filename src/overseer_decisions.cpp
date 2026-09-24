@@ -10610,6 +10610,186 @@ std::vector<RaidMove> RaidSeatingMoves(std::vector<RaidSeatNow> const& seats)
     return moves;
 }
 
+// -- the raid run -------------------------------------------------------------
+
+RaidDoor const* RaidDoorFor(std::string const& keyword)
+{
+    // See RaidDoor for where every number comes from.
+    static RaidDoor const doors[] = {
+        {"moltencore", "Molten Core", 0, 3529, 409, 2890,
+         -7508.32f, -1039.74f, 180.912f, 50},
+    };
+    for (RaidDoor const& door : doors)
+        if (keyword == door.keyword)
+            return &door;
+    return nullptr;
+}
+
+std::string RaidKeywordForJob(std::string const& job)
+{
+    std::string const prefix = RAID_JOB_PREFIX;
+    if (job.size() <= prefix.size() || job.compare(0, prefix.size(), prefix) != 0)
+        return std::string();
+    std::string const keyword = job.substr(prefix.size());
+    return RaidDoorFor(keyword) ? keyword : std::string();
+}
+
+char const* RaidRunPhaseName(RaidRunPhase phase)
+{
+    switch (phase)
+    {
+        case RaidRunPhase::Idle:     return "IDLE";
+        case RaidRunPhase::Form:     return "FORM";
+        case RaidRunPhase::Assemble: return "ASSEMBLE";
+        case RaidRunPhase::Enter:    return "ENTER";
+        case RaidRunPhase::Inside:   return "INSIDE";
+    }
+    return "IDLE";
+}
+
+RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
+{
+    RaidRunStep step;
+    if (!facts.ordered)
+    {
+        step.phase = RaidRunPhase::Idle;
+        step.release = current != RaidRunPhase::Idle;
+        step.why = "no raid is ordered";
+        return step;
+    }
+
+    // Stragglers still standing in the door are let through after the head:
+    // the raid they were walking with is inside.
+    if (facts.headInside)
+    {
+        step.phase = RaidRunPhase::Inside;
+        step.knockMembers = true;
+        step.why = "the head is inside; the raid holds at the entrance because "
+                   "clearing is not ordered";
+        return step;
+    }
+
+    if (!facts.headStreaming)
+    {
+        step.phase = current;
+        step.why = "the head is not in the world with a game client attached, so "
+                   "the raid holds where it is";
+        return step;
+    }
+
+    switch (current)
+    {
+        case RaidRunPhase::Idle:
+            step.phase = RaidRunPhase::Form;
+            step.form = true;
+            step.why = "a raid is ordered; forming it from the seats";
+            return step;
+
+        case RaidRunPhase::Form:
+            if (!facts.raidFormed ||
+                (facts.addable > 0 && facts.heldSeconds < RAID_FORM_WAIT_SECONDS))
+            {
+                step.phase = RaidRunPhase::Form;
+                step.form = true;
+                step.why = !facts.raidFormed ? "the head's group is not a raid yet"
+                                             : "seated characters in the world are "
+                                               "not in the raid yet";
+                return step;
+            }
+            step.phase = RaidRunPhase::Assemble;
+            step.aimStaging = true;
+            step.form = facts.addable > 0;
+            step.why = facts.addable > 0 ? "the raid is formed; seats that would not "
+                                           "join are still asked while the head "
+                                           "walks to the door"
+                                         : "the raid is formed with everyone who can "
+                                           "be added; the head walks to the door";
+            return step;
+
+        case RaidRunPhase::Assemble:
+            if (!facts.raidFormed)
+            {
+                step.phase = RaidRunPhase::Form;
+                step.form = true;
+                step.why = "the head's group is no longer a raid";
+                return step;
+            }
+            // A seat whose character logged in since is still invited.
+            step.form = facts.addable > 0;
+            if (facts.headAssembled &&
+                (facts.assembled >= facts.inWorld ||
+                 facts.heldSeconds >= RAID_ASSEMBLE_WAIT_SECONDS))
+            {
+                step.phase = RaidRunPhase::Enter;
+                step.aimDoor = true;
+                step.knockMembers = true;
+                step.why = facts.assembled >= facts.inWorld
+                               ? "every raid member in the world is at the door"
+                               : "the wait for stragglers is over; the raid goes "
+                                 "with whoever is at the door";
+                return step;
+            }
+            step.phase = RaidRunPhase::Assemble;
+            step.aimStaging = true;
+            step.why = !facts.headAssembled ? "the head is walking to the door"
+                                            : "waiting for the raid at the door";
+            return step;
+
+        case RaidRunPhase::Enter:
+        {
+            step.phase = RaidRunPhase::Enter;
+            step.aimDoor = true;
+            step.knockMembers = true;
+            unsigned const othersOutside =
+                facts.assembled > (facts.headAssembled ? 1u : 0u)
+                    ? facts.assembled - (facts.headAssembled ? 1u : 0u)
+                    : 0u;
+            step.knockHead =
+                othersOutside == 0 || facts.heldSeconds >= RAID_ENTER_WAIT_SECONDS;
+            step.why = step.knockHead
+                           ? (othersOutside == 0 ? "everyone else at the door has "
+                                                   "crossed; the head goes last"
+                                                 : "the wait at the door is over; the "
+                                                   "head crosses and the rest follow")
+                           : "knocking the raid through the door; the head waits";
+            return step;
+        }
+
+        case RaidRunPhase::Inside:
+            // The head was inside and is not now: he died and released, or
+            // walked out. Nothing here walks forty characters back in on its
+            // own; the order stands and the operator decides.
+            step.phase = RaidRunPhase::Inside;
+            step.why = "the head has left the instance; the raid holds";
+            return step;
+    }
+    return step;
+}
+
+std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
+                                        std::string const& head, bool headMayCross)
+{
+    std::vector<std::string> order;
+    bool headInDoor = false;
+    for (std::string const& name : inDoor)
+    {
+        if (name == head)
+        {
+            headInDoor = true;
+            continue;
+        }
+        order.push_back(name);
+    }
+    if (headInDoor && headMayCross)
+        order.push_back(head);
+    return order;
+}
+
+bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered)
+{
+    return !raidMap || raidClearOrdered;
+}
+
 char const* GuildRemoveRefusalSaid(GuildRemoveRefusal refusal)
 {
     switch (refusal)
