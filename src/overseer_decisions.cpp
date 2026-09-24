@@ -5016,6 +5016,33 @@ bool SplitFollowerDrivesItself(std::string const& target)
     return ReadSplitErrand(target) != SplitErrand::NeedsTheFamily;
 }
 
+char const* const TOWN_HOLD_JOB = "town run";
+
+bool HoldsInTown(std::string const& job)
+{
+    return job == TOWN_HOLD_JOB;
+}
+
+bool FamilyHoldsInTown(std::vector<std::string> const& jobs)
+{
+    for (std::string const& job : jobs)
+        if (HoldsInTown(job))
+            return true;
+    return false;
+}
+
+bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand)
+{
+    return onAnErrand || !HoldsInTown(job);
+}
+
+bool CutOffFollowerRoams(std::string const& job, std::string const& target)
+{
+    if (!SplitFollowerDrivesItself(target))
+        return false;
+    return !target.empty() || !HoldsInTown(job);
+}
+
 char const* RegroupClaimName(RegroupClaim claim)
 {
     switch (claim)

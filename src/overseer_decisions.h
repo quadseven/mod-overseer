@@ -5889,6 +5889,58 @@ bool ErrandRunsAlone(std::string const& target);
 // the driving side of that line instead of the frozen one.
 bool SplitFollowerDrivesItself(std::string const& target);
 
+// ------------- the family waits in town for its campaign (2026-09-24) -------
+//
+// A dungeon campaign held "town first" for bag room waits while the family
+// sells, banks, posts and trains. The bridge used to put the family on the
+// default `quest` job for that wait, and on the dev realm that is what split
+// both families across a continent while their campaigns waited:
+//
+//   * The Alliance leader, level 60, was given the council's quest by the quest
+//     drive (04:53, re-asserted 04:59) and took a flight from Tanaris to
+//     Winterspring and then another to Un'Goro to hand it in. The members were
+//     13,000 yards behind by 05:06 and the catch-up walks never closed it.
+//   * The Horde leader was left inside the instance after its exit gave up,
+//     and at 02:55 the four members outside were granted `new rpg` here because
+//     they were cut off from him. Within five minutes one had flown to
+//     Ashenvale and another to Mulgore, and they stayed 5,000 to 6,600 yards
+//     apart for the next hour.
+//
+// Both movers are the rule for a QUESTING family: the leader travels to its
+// quest, and a follower that cannot follow levels where it stands. Neither is
+// what a group of players does while its dungeon waits on a vendor. They meet
+// in town and stay there. So the bridge now writes the `town run` job for the
+// wait, the quest drive stands down for it as it does for every non-quest job,
+// and these two answers keep everyone in the family from travelling on their
+// own. A town errand (a vendor, a banker, a mailbox, a trainer), a catch-up
+// walk and every other aim still walk the character they name.
+
+// The job the bridge writes while a campaign waits in town (DoJob accepts it).
+extern char const* const TOWN_HOLD_JOB;
+
+// Whether `job` is that wait. Exact, like every other job comparison here:
+// DoJob stores the lowercased mode and nothing else writes the column.
+bool HoldsInTown(std::string const& job);
+
+// Whether a FAMILY waits in town: any one of its rows says so. The job is
+// written one row at a time, so for a moment some members carry it and some do
+// not, and a family half moved onto the wait must not send the other half off
+// on the questing rules. The party poll reads every row and asks this once, and
+// the two answers below are given the family's answer rather than each row's.
+bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
+
+// May the party leader carry `new rpg` on this poll? Always for a questing
+// family, whose leader is its one traveller. In town only while it has an aim or
+// an escort to walk: with neither, upstream turns the strategy into a random
+// status (a flight, a far grind spot, a camp) and the family is left behind.
+bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand);
+
+// SplitFollowerDrivesItself for a family in town. A cut-off follower on an
+// errand of its own still runs it; one with an empty column stands where it is
+// instead of levelling there, because the family is waiting for it and a town
+// is where they meet.
+bool CutOffFollowerRoams(std::string const& job, std::string const& target);
+
 // -------------- the family waits for the member it left behind (#404) -------
 //
 // THE MEASUREMENT, AND IT IS NOT A NAVIGATION FAULT. Four of five characters
