@@ -42066,6 +42066,14 @@ private:
                 detail = DoShare(player, targetArg, command, status, rowResult);
             else if (kind == "quest")
                 detail = DoQuest(player, command, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsSpawnWalkRow(command))
+                // THE GUILD JOBS' WALK TO A SPAWN, on kind='job' because the
+                // place it goes is where the bot's job is (a field to gather,
+                // the door it summons at), and routed on the first word the
+                // way `walk-to-trainer` rides kind='cast'. DoJob's own grammar
+                // is a roster job mode, which never begins with this word.
+                detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Spawn, status,
+                                rowResult, _pendingMailWalks, id);
             else if (kind == "job")
                 detail = DoJob(player, command, status);
             else if (kind == "sell" && OverseerDecisions::IsDestroyRow(command))
@@ -54481,8 +54489,13 @@ private:
         int64 moneyAfter{-1};
         char const* visit{""};
 
-        // A vendor walk's request.
+        // A vendor walk's request: an item, or any vendor that buys.
         uint32 item{0};
+        bool anyVendor{false};
+
+        // A spawn walk's request: which table and which spawn id.
+        bool spawnIsObject{false};
+        uint32 spawnId{0};
 
         // A FAR WALK (#633): the destination lies past the goal's near cap, so
         // the walk mounts, may fly and follows the travel survey. `travel` is
@@ -54593,7 +54606,10 @@ private:
             o << ",\"reached\":{\"name\":" << J(ev.reachedName)
               << ",\"yards\":" << ev.reachedYards
               << ",\"held_seconds\":"
-              << (ev.goal == D::WalkGoal::Trainer ? 0u : D::MAIL_WALK_LINGER_SECONDS) << "}";
+              << (ev.goal == D::WalkGoal::Trainer || ev.goal == D::WalkGoal::Spawn
+                      ? 0u
+                      : D::MAIL_WALK_LINGER_SECONDS)
+              << "}";
         else
             o << ",\"reached\":null";
         if (ev.goal == D::WalkGoal::Trainer)
@@ -54615,7 +54631,10 @@ private:
               << ",\"money_after\":" << ev.moneyAfter;
         }
         if (ev.goal == D::WalkGoal::Vendor)
-            o << ",\"item\":" << ev.item;
+            o << ",\"item\":" << ev.item << ",\"any\":" << (ev.anyVendor ? "true" : "false");
+        if (ev.goal == D::WalkGoal::Spawn)
+            o << ",\"spawn_kind\":" << J(ev.spawnIsObject ? "gameobject" : "creature")
+              << ",\"spawn_id\":" << ev.spawnId;
         o << ",\"far\":" << (ev.far ? "true" : "false");
         if (ev.far)
             o << ",\"flights\":" << ev.flightLegs
@@ -54698,6 +54717,11 @@ private:
         {
             if (!(tmpl->npcflag & UNIT_NPC_FLAG_VENDOR))
                 return false;
+            // ANY VENDOR THAT BUYS (the guild jobs' sale stop): the core's own
+            // flag for a vendor that refuses sales rules one out, the flag the
+            // `sell` executor names when it refuses.
+            if (ev.anyVendor)
+                return !(tmpl->flags_extra & CREATURE_FLAG_EXTRA_NO_SELL_VENDOR);
             VendorItemData const* items = sObjectMgr->GetNpcVendorItemList(entry);
             if (!items)
                 return false;
@@ -54772,6 +54796,20 @@ private:
     {
         if (ev.goal == OverseerDecisions::WalkGoal::Mailbox)
             return MailboxInReach(who, name, yards);
+        // A SPAWN IS A PLACE: there once within SPAWN_WALK_ARRIVE_YARDS of the
+        // spawn row's own position, whatever stands on it now (a node already
+        // picked, a mob already killed).
+        if (ev.goal == OverseerDecisions::WalkGoal::Spawn)
+        {
+            if (who->GetMapId() != ev.mapId)
+                return false;
+            float const there = who->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
+            if (!OverseerDecisions::SpawnWalkArrived(there))
+                return false;
+            name = ev.mailboxName;
+            yards = there;
+            return true;
+        }
         Creature* npc = WalkCreatureInReach(who, ev);
         if (!npc)
             return false;
@@ -54992,6 +55030,15 @@ private:
             ev.skill = req.skill;
             ev.learnAsked.assign(req.learn.begin(), req.learn.end());
         }
+        else if (goal == D::WalkGoal::Spawn)
+        {
+            D::SpawnWalkRequest const req = D::ParseSpawnWalkRequest(command);
+            if (*req.error)
+                return refuse(req.error);
+            ev.capYards = req.maxYards;
+            ev.spawnIsObject = req.gameObject;
+            ev.spawnId = req.spawn;
+        }
         else
         {
             D::VendorWalkRequest const req = D::ParseVendorWalkRequest(command);
@@ -54999,6 +55046,7 @@ private:
                 return refuse(req.error);
             ev.capYards = req.maxYards;
             ev.item = req.item;
+            ev.anyVendor = req.any;
         }
 
         // THE CLASSIC RULESET. A walk is always on the walker's own map, so a
@@ -55079,6 +55127,44 @@ private:
                 spawns.push_back(Spawn{uint32(data->spawnId), data->id, data->posX, data->posY,
                                        data->posZ});
         }
+        else if (goal == D::WalkGoal::Spawn)
+        {
+            // THE ONE SPAWN THE ROW NAMES, read from the core's own spawn
+            // table. It must exist, stand on the walker's map, and, for a
+            // creature that belongs to a world event, be in the world now.
+            namespace S = D::SpawnWalkRefusal;
+            float x = 0.f, y = 0.f, z = 0.f;
+            uint32 entry = 0, mapId = 0;
+            bool found = false;
+            if (ev.spawnIsObject)
+            {
+                if (GameObjectData const* data = sObjectMgr->GetGameObjectData(ev.spawnId))
+                {
+                    found = true;
+                    entry = data->id;
+                    mapId = data->mapid;
+                    x = data->posX;
+                    y = data->posY;
+                    z = data->posZ;
+                }
+            }
+            else if (CreatureData const* data = sObjectMgr->GetCreatureData(ev.spawnId))
+            {
+                found = true;
+                entry = data->id;
+                mapId = data->mapid;
+                x = data->posX;
+                y = data->posY;
+                z = data->posZ;
+                if (!SpawnInWorldNow(GameEventOfSpawn(ev.spawnId)))
+                    return refuse(S::SpawnOutOfSeason);
+            }
+            if (!found)
+                return refuse(S::NoSuchSpawn);
+            if (mapId != ev.mapId)
+                return refuse(S::SpawnOtherMap);
+            spawns.push_back(Spawn{ev.spawnId, entry, x, y, z});
+        }
         else
         {
             std::vector<CreatureData const*> creatures;
@@ -55130,7 +55216,7 @@ private:
         ev.haveMailbox = true;
         ev.mailboxSpawn = chosen.spawnId;
         ev.mailboxEntry = chosen.entry;
-        if (goal == D::WalkGoal::Mailbox)
+        if (goal == D::WalkGoal::Mailbox || (goal == D::WalkGoal::Spawn && ev.spawnIsObject))
         {
             if (GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(chosen.entry))
                 ev.mailboxName = tmpl->name;
@@ -55636,6 +55722,22 @@ private:
                          ev.taught.size(), ev.alreadyKnown.size(), ev.notTaught.size(),
                          ev.moneyBefore, ev.moneyAfter);
             }
+            else if (state == D::MailWalkState::Arrived && ev.goal == D::WalkGoal::Spawn)
+            {
+                // AT THE PLACE ITS WORK IS: let go at once. Nothing follows a
+                // spawn walk; the bot's own grind and gather strategies are
+                // the work, and a hold would keep it from them.
+                bot->StopMoving();
+                status = "applied";
+                ReleaseHold(check.targetName, bot, "the walk to its work is over",
+                            MAIL_WALK_HOLD_VERB);
+                LOG_INFO("module.overseer",
+                         "overseer: spawn walk {} - '{}' reached '{}' ({} spawn {}, {:.1f} "
+                         "yards) after {}ms and {} leg(s); let go to play there",
+                         check.id, check.targetName, ev.mailboxName,
+                         ev.spawnIsObject ? "gameobject" : "creature", ev.spawnId,
+                         ev.reachedYards, ev.waitedMs, ev.legs);
+            }
             else if (state == D::MailWalkState::Arrived)
             {
                 HoldAtTheMailbox(bot, check.targetName);
@@ -55651,9 +55753,11 @@ private:
                     LOG_INFO("module.overseer",
                              "overseer: vendor walk {} - '{}' reached '{}' ({:.1f} yards, the "
                              "core would open its window) after {}ms and {} leg(s); held there "
-                             "for up to {}s for the purchase of item {}",
+                             "for up to {}s for {}",
                              check.id, check.targetName, ev.reachedName, ev.reachedYards,
-                             ev.waitedMs, ev.legs, D::MAIL_WALK_LINGER_SECONDS, ev.item);
+                             ev.waitedMs, ev.legs, D::MAIL_WALK_LINGER_SECONDS,
+                             ev.anyVendor ? std::string("the sale")
+                                          : "the purchase of item " + std::to_string(ev.item));
             }
             else
             {
