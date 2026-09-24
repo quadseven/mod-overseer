@@ -15053,7 +15053,7 @@ private:
             if (!present)
                 LOG_WARN("module.overseer",
                          "overseer: loot council is off - overseer_loot_council is missing "
-                         "(2026_09_24_00_overseer_loot_council.sql has not been applied), so "
+                         "(2026_09_24_01_overseer_loot_council.sql has not been applied), so "
                          "rolls keep the upstream vote and a raid's loot rules are left as "
                          "they are");
             else

@@ -247,7 +247,7 @@ void TheAdapterSeams()
            "the steer can hold a vote");
 
     std::string const sql =
-        Read("data/sql/characters/base/2026_09_24_00_overseer_loot_council.sql");
+        Read("data/sql/characters/base/2026_09_24_01_overseer_loot_council.sql");
     Expect(sql.find("CREATE TABLE IF NOT EXISTS `overseer_loot_council`") != std::string::npos,
            "the council table is created");
     Expect(sql.find("`council_key`") != std::string::npos, "rows are keyed by drop");
