@@ -13297,6 +13297,173 @@ struct RaidMove
 // two characters back and forth for ever.
 std::vector<RaidMove> RaidSeatingMoves(std::vector<RaidSeatNow> const& seats);
 
+// -- the raid run: a forty-player raid formed, assembled and walked in ---------
+//
+// WHAT THIS IS, AND WHAT IT IS NOT YET. The five-player dungeon coordinator
+// owns a family's party from RESET to EXIT. Nothing owned a raid: `guild raid
+// form` could convert a group, but nobody decided when, nobody brought forty
+// characters to a door, and nobody walked them through it. This is that owner,
+// FIRST SLICE: FORM the raid from the seats the bridge wrote, ASSEMBLE it at
+// the door, ENTER together, and HOLD inside. Clearing is a later slice and this
+// machine never starts it: DungeonClearMayArmHere below keeps the dungeon brain
+// off on a raid map, so a raid that walks in stands at the entrance.
+//
+// IT RUNS ONLY ON AN OPERATOR'S ORDER. The trigger is the head's roster `job`
+// reading `raid:<keyword>`, and the only writer of that value is the bridge's
+// campaign queue acting on an explicit `queue <family>: moltencore 1` order.
+// No planner or council proposes it, and DoJob refuses any other raid keyword.
+constexpr char RAID_JOB_PREFIX[] = "raid:";
+
+// ONE RAID DOOR, AND ITS NUMBERS ARE THE WORLD DATABASE'S. Read from the pinned
+// core's own tables on the dev realm, 2026-09-23:
+//
+//   areatrigger          (3529, 0, -7512.16, -1034.78, 177.208, radius 4)
+//   areatrigger_teleport (3529, 'The Molten Core Window(Lava) Entrance', 409, ...)
+//   areatrigger          (2890, 409, 1115.22, -462.959, -95.0148, radius 20)
+//   areatrigger_teleport (2890, 'The Molten Core, Exit (from inside of the
+//                         Instance)', 0, -7508.32, -1039.74, 180.912)
+//   dungeon_access_template (map 409): min_level 50, no requirement rows
+//
+// SO THE DOOR IS IN BLACKROCK MOUNTAIN, NOT INSIDE BLACKROCK DEPTHS. Trigger
+// 2886 ("The Molten Bridge") on map 230 is the other door, deep inside the
+// dungeon; this one stands beside Lothos Riftwaker on the mountain's own map.
+// The core's areatrigger handler asks only MapManager::PlayerCannotEnter of it:
+// a raid group and level 50. It does NOT ask for Attunement to the Core; the
+// attunement only opens Lothos's teleport gossip.
+//
+// THE STAGING POINT IS THE WAY OUT'S LANDING, (-7508.32, -1039.74, 180.912):
+// the core teleports every character leaving the instance onto exactly that
+// spot, so it is standable ground asserted by the world rather than by this
+// module. It is 7.3 yards from trigger 3529's centre, outside its radius of 4,
+// so a raid holding there cannot drift in.
+//
+// WHY 3529 AND NOT 3528. 3528 ("The Molten Core Window Entrance") is a box 0.36
+// yards thick whose floor is at z 181.92, a yard above the floor Lothos stands
+// on (z 180.995); a character standing on that floor is outside its height. 3529
+// is a sphere of radius 4 centred 3.8 yards below that floor, so a character
+// standing over its centre is inside it. Whether the floor there is where
+// Lothos's is has NOT been measured; the adapter reads the ground height at the
+// centre and logs it, and the core's own handler re-checks the radius before
+// anybody moves.
+struct RaidDoor
+{
+    char const* keyword;
+    char const* name;
+    unsigned outsideMapId;
+    unsigned entryTriggerId;
+    unsigned insideMapId;
+    unsigned exitTriggerId;
+    float stageX;
+    float stageY;
+    float stageZ;
+    unsigned minLevel;
+};
+
+// The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
+// keyword and nothing else does.
+RaidDoor const* RaidDoorFor(std::string const& keyword);
+
+// The known raid keyword in `job` (`raid:moltencore` -> "moltencore"), or ""
+// for anything else, including a raid keyword this module has no door for.
+std::string RaidKeywordForJob(std::string const& job);
+
+// How near the staging point counts as assembled, and how near a member has to
+// be to the head to have walked with him. Forty characters following one make
+// a crowd, not a point: the follow strategy spreads a raid over tens of yards.
+constexpr float RAID_ASSEMBLE_YARDS = 40.f;
+
+// HOW LONG FORM KEEPS INVITING A SEAT THAT WILL NOT JOIN, HOW LONG ASSEMBLE
+// WAITS FOR STRAGGLERS, AND HOW LONG ENTER WAITS FOR THE RAID BEFORE THE HEAD
+// CROSSES. A member who cannot reach the door (on another
+// continent, dead, stuck) must not hold forty others at it for ever; after the
+// wait the raid goes with whoever is there, and the log names who was not.
+constexpr long RAID_FORM_WAIT_SECONDS = 2 * 60;
+constexpr long RAID_ASSEMBLE_WAIT_SECONDS = 15 * 60;
+constexpr long RAID_ENTER_WAIT_SECONDS = 3 * 60;
+
+enum class RaidRunPhase : std::uint8_t
+{
+    Idle,      // no order, or the order ended
+    Form,      // the head's group is converted and the seats invited
+    Assemble,  // the head walks to the staging point and the raid gathers
+    Enter,     // the head stands on the door; members are knocked through, he goes last
+    Inside,    // the head is in the instance; the raid holds (clearing is a later slice)
+};
+
+char const* RaidRunPhaseName(RaidRunPhase phase);
+
+// What one poll saw. Counts are of characters, never of seats: a seat whose
+// character is offline is not a member anybody can walk.
+struct RaidRunFacts
+{
+    // The head's job names a raid door (RaidKeywordForJob is not empty).
+    bool ordered{false};
+    // The head is in the world with a game client attached. The operator's rule
+    // for any instance run: a family member is logged in and streaming.
+    bool headStreaming{false};
+    // The head's group is a raid.
+    bool raidFormed{false};
+    // Seats whose character is in the world, not yet in the raid, and could be
+    // added now (the raid has room). Zero means formation has done what it can.
+    unsigned addable{0};
+    // Raid members in the world, the head included.
+    unsigned inWorld{0};
+    // Raid members on the outside map within RAID_ASSEMBLE_YARDS of the staging
+    // point, the head included.
+    unsigned assembled{0};
+    // The same count without the head, taken in the same pass, so ENTER's
+    // "everyone else has crossed" never subtracts a head that was not counted.
+    unsigned othersAssembled{0};
+    // Raid members on the inside map.
+    unsigned inside{0};
+    bool headAssembled{false};
+    bool headInside{false};
+    // How long the current phase has held, in seconds.
+    long heldSeconds{0};
+};
+
+struct RaidRunStep
+{
+    RaidRunPhase phase{RaidRunPhase::Idle};
+    bool form{false};         // convert, invite and seat this poll
+    bool aimStaging{false};   // the head walks to the staging point
+    bool aimDoor{false};      // the head walks onto the door
+    bool knockMembers{false}; // knock every member standing in the door
+    bool knockHead{false};    // and the head, who goes last
+    bool release{false};      // the order ended: let go of the aim and the raid
+    char const* why{""};
+};
+
+// One poll of the raid run.
+//
+// THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.
+// No order ends the run whatever phase it is in. The head inside means the run
+// is inside whatever the previous phase thought. A head without a client holds
+// the run where it is: nothing walks forty characters to a door the operator
+// cannot watch. Then the phases in their own order.
+//
+// ENTER HAS NO WAY BACK TO ASSEMBLE. Once members are being knocked through, a
+// straggler who wanders off is left, not waited for: going back would strand
+// whoever already crossed inside with no head.
+RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts);
+
+// Who is knocked, in order: every member standing in the door first, the head
+// last, and the head only when `headMayCross`. The head crossing first takes
+// the anchor the others follow away from them; that is the dungeon
+// coordinator's measured lesson, kept here.
+std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
+                                        std::string const& head, bool headMayCross);
+
+// May the dungeon brain be armed for a character on this map?
+//
+// NOT ON A RAID MAP UNTIL CLEARING IS ORDERED. DriveDungeonClear arms `dc on`
+// for any roster character alive on any instance map, and a raid map is an
+// instance map (MapEntry::IsDungeon counts MAP_RAID). Without this, the raid
+// run's first slice would walk forty characters into Molten Core and the brain
+// would start pulling the first pack the moment the family crossed: a clear
+// nobody ordered, by a raid the readiness report calls unready.
+bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered);
+
 // -- and the row that asks for any of it -------------------------------------
 //
 // THE GRAMMAR IS PARSED HERE RATHER THAN IN THE ADAPTER for the same reason the
