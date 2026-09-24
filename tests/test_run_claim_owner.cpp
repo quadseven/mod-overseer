@@ -80,13 +80,13 @@ void TheFenceStillStandsWhereItProtectsAWalk()
           ClaimOverAPendingLearn(TravelOwner::HomeErrand, "") ==
               TravelClaim::RefusedProfession,
           true);
-    Check("a run's aim over a trainer walk is still refused",
-          ClaimOverAPendingLearn(TravelOwner::Run, "trainer") ==
-              TravelClaim::RefusedProfession,
+    // A live run outranks a trainer walk (#656): the trip waits for the run.
+    Check("a run's aim over a trainer walk outranks it",
+          ClaimOverAPendingLearn(TravelOwner::Run, "trainer") == TravelClaim::Outrank,
           true);
-    Check("the walk back in over a trainer walk is still refused",
+    Check("the walk back in over a trainer walk outranks it",
           ClaimOverAPendingLearn(TravelOwner::WalkBackIn, "trainer") ==
-              TravelClaim::RefusedProfession,
+              TravelClaim::Outrank,
           true);
 }
 

@@ -2356,6 +2356,15 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     // vendor errand in the column would not be equal to it.
     if (!facts.column.empty() && facts.column == facts.target)
         return TravelClaim::Write;
+    // A LIVE RUN OUTRANKS EVERYTHING IN THE COLUMN BUT A COUNTER ERRAND
+    // (#656): a trainer walk, a positional walk, or the book's own catch-up
+    // aim that it no longer remembers after a restart. `learn_skill` stays
+    // pending and the trainer trip is walked after the run. A counter errand
+    // still falls through to the fences below; the run's maintenance hold
+    // already waits for the leader's.
+    if (TravelOwnerIsALiveRun(facts.owner) && !facts.column.empty() &&
+        !IsMaintenanceErrand(facts.column))
+        return TravelClaim::Outrank;
     // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
     // or any dungeon run's aim over an empty column overwrites no trainer walk
     // (wow-overseer#227, #598); the home errand, or a column that holds
@@ -2378,6 +2387,21 @@ bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner)
         case TravelOwner::Respec:
             return true;
         case TravelOwner::HomeErrand:
+            return false;
+    }
+    return false;
+}
+
+bool TravelOwnerIsALiveRun(TravelOwner owner)
+{
+    switch (owner)
+    {
+        case TravelOwner::Run:
+        case TravelOwner::WalkBackIn:
+            return true;
+        case TravelOwner::HomeErrand:
+        case TravelOwner::CatchUp:
+        case TravelOwner::Respec:
             return false;
     }
     return false;
