@@ -269,6 +269,53 @@ void TheTimelineSaysWhatEndedTheErrandAndWhichRecovery()
     Check("a stall row", st.size() == 1 && st[0].kind == "staging_stall", true);
 }
 
+void ARunInsideMakesRoomAndLeavesOnlyForALostUpgrade()
+{
+    // MEASURED 2026-09-24: a Horde Ragefire run credited two bosses and was
+    // walked out mid-clear for bag room. Inside, bag pressure makes room.
+    DungeonBagPressure const inside =
+        DungeonRunBagPressure({15, 0, 6, 10, 6}, 3, true, false);
+    Check("the raw pressure inside is still an evacuation",
+          inside == DungeonBagPressure::Evacuate, true);
+    Check("with no upgrade on the floor the run makes room",
+          DungeonRunBagAnswer(inside, false) == DungeonBagPressure::MakeRoom, true);
+    Check("an upgrade on the floor for a full member walks it out",
+          DungeonRunBagAnswer(inside, true) == DungeonBagPressure::Evacuate, true);
+    // The pre-run town-first gate is untouched.
+    DungeonBagPressure const outside =
+        DungeonRunBagPressure({15, 2, 6, 10, 6}, 3, false, false);
+    Check("outside still holds out for the town trip",
+          DungeonRunBagAnswer(outside, true) == DungeonBagPressure::HoldOut, true);
+    Check("room everywhere is still nothing",
+          DungeonRunBagAnswer(DungeonRunBagPressure({15, 12}, 3, true, false), true) ==
+              DungeonBagPressure::None,
+          true);
+}
+
+void AGreyIsDestroyedForRoomDespiteItsPrice()
+{
+    DestroySpec grey = ParseDestroySpec("destroy guid:42 count:3 allow:grey");
+    Check("allow:grey parses", grey.valid && grey.allowGrey, true);
+    DestroyFacts facts;
+    facts.quality = 0;
+    facts.sellPrice = 7;
+    facts.stack = 3;
+    facts.questHold = QuestItemHold::ActiveQuest;
+    CheckText("a grey with a price and a cautious quest reading is destroyed",
+              DestroyRefusal(grey, facts), "");
+    DestroySpec plain = ParseDestroySpec("destroy guid:42 count:3");
+    CheckText("without allow:grey the price still refuses", DestroyRefusal(plain, facts),
+              DestroyRefusalText::Quest);
+    facts.quality = 1;
+    facts.questHold = QuestItemHold::Released;
+    CheckText("allow:grey does not reach a white", DestroyRefusal(grey, facts),
+              DestroyRefusalText::HasPrice);
+    facts.quality = 0;
+    facts.equipped = true;
+    CheckText("an equipped grey is still refused", DestroyRefusal(grey, facts),
+              DestroyRefusalText::Equipped);
+}
+
 }  // namespace
 
 int main()
@@ -281,6 +328,8 @@ int main()
     AStagingStallIsAskedEveryThirdRearm();
     AGiveUpOnTheGroundLeavesTheErrandAlone();
     TheTimelineSaysWhatEndedTheErrandAndWhichRecovery();
+    ARunInsideMakesRoomAndLeavesOnlyForALostUpgrade();
+    AGreyIsDestroyedForRoomDespiteItsPrice();
     if (failures)
         std::printf("%d failure(s)\n", failures);
     return failures ? 1 : 0;

@@ -2238,6 +2238,13 @@ DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlo
     return anyMemberInside ? DungeonBagPressure::Evacuate : DungeonBagPressure::HoldOut;
 }
 
+DungeonBagPressure DungeonRunBagAnswer(DungeonBagPressure pressure, bool upgradeStranded)
+{
+    if (pressure != DungeonBagPressure::Evacuate)
+        return pressure;
+    return upgradeStranded ? DungeonBagPressure::Evacuate : DungeonBagPressure::MakeRoom;
+}
+
 CounterRole CounterRoleForAim(std::string const& aim)
 {
     // The bridge's ECONOMY_ERRANDS, and the same three keywords the travel
@@ -3916,12 +3923,15 @@ DestroySpec ParseDestroySpec(std::string const& command)
 
     bool allowBound = false;
     bool allowQuality = false;
+    bool allowGrey = false;
     for (size_t i = 3; i < words.size(); ++i)
     {
         if (words[i] == "allow:bound" && !allowBound)
             allowBound = true;
         else if (words[i] == "allow:quality" && !allowQuality)
             allowQuality = true;
+        else if (words[i] == "allow:grey" && !allowGrey)
+            allowGrey = true;
         else
             return spec;
     }
@@ -3931,6 +3941,7 @@ DestroySpec ParseDestroySpec(std::string const& command)
     spec.count = count;
     spec.allowBound = allowBound;
     spec.allowQuality = allowQuality;
+    spec.allowGrey = allowGrey;
     return spec;
 }
 
@@ -3945,9 +3956,14 @@ char const* DestroyRefusal(DestroySpec const& spec, DestroyFacts const& facts)
         return R::Malformed;
     if (facts.equipped)
         return R::Equipped;
-    if (facts.questHold != QuestItemHold::Released)
+    // A GREY MADE ROOM FOR INSIDE A RUN (allow:grey) is destroyed despite its
+    // sell price, because no vendor is reachable from inside and a party that
+    // walks out for bag room loses the run. The quest check does not block it
+    // either: a Poor item is never a quest objective. Every other wall stands.
+    bool const greyRoom = spec.allowGrey && facts.quality == 0;
+    if (!greyRoom && facts.questHold != QuestItemHold::Released)
         return R::Quest;
-    if (facts.sellPrice > 0)
+    if (!greyRoom && facts.sellPrice > 0)
         return R::HasPrice;
     if (facts.noUserDestroy)
         return R::NoDestroy;

@@ -2670,6 +2670,9 @@ constexpr float DUNGEON_RECOVERY_REGROUP_YARDS = 60.f;
 // heuristic's is used, and how long the run yields when that is the answer.
 constexpr unsigned STAGING_STALL_ANSWER_SECONDS = 30;
 constexpr unsigned STAGING_STALL_YIELD_SECONDS = 120;
+// How far from a member with no bag room a corpse is searched for an upgrade
+// that would be lost (the one bag state that still walks a run out).
+constexpr float DUNGEON_ROOM_LOOT_YARDS = 40.f;
 
 // HOW LONG THE NEXT RUN WAITS FOR A MAINTENANCE ERRAND SOMEBODY ELSE IS
 // RUNNING (#168), before it opens anyway and says so.
@@ -25512,6 +25515,10 @@ private:
         std::time_t recoveryBestAt{0};
         bool recoveryTownReached{false};
         std::string recoveryNote;
+        // MAKING ROOM INSIDE (see MakeRoomInside): who has had the loot rule
+        // set this run, and who was told once that no grey was left.
+        std::set<std::string> roomLootRuleSet;
+        std::set<std::string> roomNoGreySaid;
         bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
@@ -31162,6 +31169,120 @@ private:
     }
 
     // The first roster member standing inside an open run, or null.
+    // IS AN UPGRADE BEING LEFT ON THE FLOOR FOR WANT OF ROOM? The one bag state
+    // that still walks a run out (OverseerDecisions::DungeonRunBagAnswer): a
+    // member inside with ZERO free slots, and a corpse near them still holding
+    // an Uncommon or better item they are allowed to loot.
+    static bool UpgradeStrandedOnTheFloor(std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !InDungeonRun(bot) || bot->GetFreeInventorySpace() > 0)
+                continue;
+            std::list<Creature*> corpses;
+            bot->GetDeadCreatureListInGrid(corpses, DUNGEON_ROOM_LOOT_YARDS);
+            for (Creature* corpse : corpses)
+            {
+                if (!corpse || corpse->loot.isLooted())
+                    continue;
+                for (LootItem const& item : corpse->loot.items)
+                {
+                    if (item.is_looted || !item.AllowedForPlayer(bot, corpse->GetGUID()))
+                        continue;
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item.itemid);
+                    if (proto && proto->Quality >= ITEM_QUALITY_UNCOMMON)
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' has no bag room and '{}' (entry {}, "
+                                 "quality {}) is on a corpse {:.0f}y away - an upgrade "
+                                 "would be lost, so this run walks out for bags",
+                                 name, proto->Name1, item.itemid, proto->Quality,
+                                 bot->GetExactDist2d(corpse));
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // MAKE ROOM WHERE THE PARTY STANDS (2026-09-24). What a group of people
+    // does when bags fill mid-clear: destroy the greys (through the #614
+    // destroy verb, with allow:grey lifting its sell-price and quest walls for
+    // a Poor item only) and stop picking up vendor trash (playerbots' `ll
+    // normal` loot rule: only items with a use). The run keeps clearing.
+    void MakeRoomInside(DungeonRunCoordinatorState& coord,
+                        std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const botAI = SteerableAI(bot);
+            if (!botAI || !InDungeonRun(bot) ||
+                bot->GetFreeInventorySpace() > TOWN_TRIP_LIMITS.freeBagSlotsToGo)
+                continue;
+
+            if (!coord.roomLootRuleSet.count(name))
+            {
+                coord.roomLootRuleSet.insert(name);
+                bool const set = botAI->DoSpecificAction("ll", Event("ll", "normal", bot), true);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is low on bag room inside the run - loot rule "
+                         "'normal' {} (vendor trash is left on the corpse)",
+                         name, set ? "set" : "NOT accepted");
+            }
+
+            std::vector<std::pair<uint32, uint32>> greys;   // guid counter, count
+            auto consider = [&](Item* item) {
+                if (!item)
+                    return;
+                ItemTemplate const* proto = item->GetTemplate();
+                if (proto && proto->Quality == ITEM_QUALITY_POOR)
+                    greys.emplace_back(item->GetGUID().GetCounter(), item->GetCount());
+            };
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                consider(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END;
+                 ++bagSlot)
+                if (Bag* bag = bot->GetBagByPos(bagSlot))
+                    for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                        consider(bag->GetItemByPos(static_cast<uint8>(slot)));
+
+            uint32 destroyed = 0;
+            for (auto const& [guid, count] : greys)
+            {
+                if (bot->GetFreeInventorySpace() > TOWN_TRIP_LIMITS.freeBagSlotsToGo)
+                    break;
+                char const* status = "error";
+                std::string out;
+                std::string const command = "destroy guid:" + std::to_string(guid) +
+                                            " count:" + std::to_string(count) +
+                                            " allow:grey";
+                if (!*DoDestroy(bot, command, status, out))
+                    ++destroyed;
+            }
+
+            uint32 const freeNow = bot->GetFreeInventorySpace();
+            if (destroyed)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' makes bag room inside the run - destroyed {} grey "
+                         "stack(s), {} free slot(s) now; the run keeps clearing and is not "
+                         "evacuated for bags",
+                         name, destroyed, freeNow);
+            else if (!coord.roomNoGreySaid.count(name))
+            {
+                coord.roomNoGreySaid.insert(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has {} free slot(s) inside the run and no grey "
+                         "left to destroy - the run keeps clearing, and walks out only if "
+                         "an Uncommon or better item is left on the floor for a member "
+                         "with no room",
+                         name, freeNow);
+            }
+        }
+    }
+
     static Player* FirstMemberInsideARun(std::vector<std::string> const& members)
     {
         for (std::string const& name : members)
@@ -31857,10 +31978,21 @@ private:
                                   bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo, false,
                                   false) != OverseerDecisions::DungeonBagPressure::None);
 
-            switch (OverseerDecisions::DungeonRunBagPressure(
-                bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
-                bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting))
+            // A RUN INSIDE MAKES ROOM RATHER THAN LEAVING (2026-09-24), unless a
+            // member with no room at all has an Uncommon or better item on the
+            // floor. See OverseerDecisions::DungeonRunBagAnswer.
+            OverseerDecisions::DungeonBagPressure const pressure =
+                OverseerDecisions::DungeonRunBagPressure(
+                    bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
+                    bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting);
+            switch (OverseerDecisions::DungeonRunBagAnswer(
+                pressure, pressure == OverseerDecisions::DungeonBagPressure::Evacuate &&
+                              UpgradeStrandedOnTheFloor(members)))
             {
+                case OverseerDecisions::DungeonBagPressure::MakeRoom:
+                    MakeRoomInside(coord, members);
+                    break;
+
                 case OverseerDecisions::DungeonBagPressure::None:
                     // The latch is cleared the moment there is room again, so a
                     // later episode says so too rather than holding silently -
@@ -31916,10 +32048,11 @@ private:
                     _travelAims.Release(leaderName, "the dungeon run coordinator");
                     LOG_WARN("module.overseer",
                              "overseer: an active dungeon run is being evacuated because a "
-                             "family member inside has {} or fewer free inventory slots. The "
-                             "row will read 'evacuated' rather than 'left', and the run does "
-                             "NOT spend a slot of the campaign, because it cleared nothing",
-                             TOWN_TRIP_LIMITS.freeBagSlotsToGo);
+                             "family member inside has no free inventory slot and an "
+                             "Uncommon or better item is on the floor for them - the one "
+                             "bag state making room inside cannot answer. The row will read "
+                             "'evacuated' rather than 'left', and the run does NOT spend a "
+                             "slot of the campaign");
                     return;
                 }
 

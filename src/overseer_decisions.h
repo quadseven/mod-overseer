@@ -2998,8 +2998,15 @@ enum class DungeonBagPressure : std::uint8_t
     // The family cannot loot and somebody is already on the instance map. The
     // party is walked out, which is what this check has always done and is
     // still right: bags can fill DURING a run, and that is the case this answer
-    // was actually built for.
+    // was actually built for. SINCE 2026-09-24 ONLY WHEN AN UPGRADE WOULD BE
+    // LOST: see DungeonRunBagAnswer, which turns an Evacuate the run can make
+    // room for into MakeRoom.
     Evacuate,
+    // The family cannot loot and is inside, and nothing better than common is
+    // lying on the floor for a member with no room. The run keeps clearing and
+    // makes room where it stands: greys are destroyed and the loot rule skips
+    // vendor trash. What a human group does.
+    MakeRoom,
 };
 
 // `freeBagSlots` is one reading per member the caller could actually read this
@@ -3031,6 +3038,16 @@ DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlo
                                          unsigned freeSlotsFloor,
                                          bool anyMemberInside,
                                          bool alreadyLeaving);
+
+// WHAT A RUN INSIDE DOES ABOUT IT (2026-09-24). Measured on the dev realm: a
+// Horde Ragefire run credited two bosses and was then walked out mid-clear
+// because a member's bags were low. A group of people keeps clearing and makes
+// room: it destroys greys and stops picking up vendor trash, and it leaves only
+// when an actual upgrade cannot be picked up. So an Evacuate becomes MakeRoom
+// unless `upgradeStranded`: a member with ZERO free slots has an Uncommon or
+// better item on the floor that they may loot. Every other answer passes
+// through unchanged, so the pre-run town-first gate (HoldOut) is untouched.
+DungeonBagPressure DungeonRunBagAnswer(DungeonBagPressure pressure, bool upgradeStranded);
 
 // --------------------------- the run yields to an errand it would trample --
 //
@@ -4855,6 +4872,9 @@ struct DestroySpec
     uint32_t count{0};  // never 0 when valid
     bool allowBound{false};
     bool allowQuality{false};
+    // `allow:grey`: a Poor (grey) item destroyed to make bag room inside a
+    // run. It lifts the sell-price and quest walls for a grey only.
+    bool allowGrey{false};
 };
 
 DestroySpec ParseDestroySpec(std::string const& command);
