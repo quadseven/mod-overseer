@@ -13544,8 +13544,55 @@ char const* WalkGoalWord(WalkGoal goal)
         case WalkGoal::Mailbox: return "mailbox";
         case WalkGoal::Trainer: return "trainer";
         case WalkGoal::Vendor:  return "vendor";
+        case WalkGoal::Spawn:   return "spawn";
     }
     return "mailbox";
+}
+
+bool IsSpawnWalkRow(std::string const& command)
+{
+    std::vector<std::string> const words = MailWalkWords(command);
+    return !words.empty() && words[0] == SPAWN_WALK_VERB;
+}
+
+SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command)
+{
+    SpawnWalkRequest request;
+    std::vector<std::string> const words = MailWalkWords(command);
+    SpawnWalkRequest bad;
+    bad.error = SpawnWalkRefusal::MalformedSpawn;
+    if (words.empty() || words[0] != SPAWN_WALK_VERB || words.size() > 3)
+        return bad;
+    bool sawSpawn = false, sawMax = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        std::string key, value;
+        if (!ErrandWalkPair(words[i], key, value))
+            return bad;
+        if ((key == "gameobject" || key == "creature") && !sawSpawn)
+        {
+            sawSpawn = true;
+            request.gameObject = key == "gameobject";
+            if (!ErrandWalkId(value, request.spawn))
+                return bad;
+        }
+        else if (key == "max" && !sawMax)
+        {
+            sawMax = true;
+            if (!ErrandWalkCap(value, request.maxYards))
+                return bad;
+        }
+        else
+            return bad;
+    }
+    if (!sawSpawn)
+        return bad;
+    return request;
+}
+
+bool SpawnWalkArrived(float yards)
+{
+    return yards >= 0.f && yards <= SPAWN_WALK_ARRIVE_YARDS;
 }
 
 bool IsTrainerWalkRow(std::string const& command)
@@ -13617,6 +13664,12 @@ VendorWalkRequest ParseVendorWalkRequest(std::string const& command)
     bool sawItem = false, sawMax = false;
     for (std::size_t i = 1; i < words.size(); ++i)
     {
+        if (words[i] == "any" && !sawItem)
+        {
+            sawItem = true;
+            request.any = true;
+            continue;
+        }
         std::string key, value;
         if (!ErrandWalkPair(words[i], key, value))
             return bad;
@@ -13644,43 +13697,52 @@ char const* WalkRefusalFor(WalkGoal goal, char const* mailboxWall)
 {
     namespace M = MailWalkRefusal;
     namespace E = ErrandWalkRefusal;
+    namespace S = SpawnWalkRefusal;
     if (goal == WalkGoal::Mailbox || !mailboxWall)
         return mailboxWall;
+    // One sentence per goal for each literal that names the destination.
+    auto pick = [goal](char const* trainer, char const* vendor, char const* spawn)
+    {
+        return goal == WalkGoal::Trainer ? trainer : goal == WalkGoal::Vendor ? vendor : spawn;
+    };
     std::string const wall = mailboxWall;
-    bool const trainer = goal == WalkGoal::Trainer;
     if (wall == M::Malformed)
-        return trainer ? E::MalformedTrainer : E::MalformedVendor;
+        return pick(E::MalformedTrainer, E::MalformedVendor, S::MalformedSpawn);
     if (wall == M::AlreadyWalking)
         return E::AlreadyWalking;
     if (wall == M::NoMailboxOnMap)
-        return trainer ? E::NoTrainerOnMap : E::NoVendorOnMap;
+        return pick(E::NoTrainerOnMap, E::NoVendorOnMap, S::NoSuchSpawn);
     if (wall == M::MailboxTooFar)
-        return trainer ? E::TrainerTooFar : E::VendorTooFar;
+        return pick(E::TrainerTooFar, E::VendorTooFar, S::SpawnTooFar);
     if (wall == M::OtherSidesGround)
-        return trainer ? E::TrainerOtherSide : E::VendorOtherSide;
+        return pick(E::TrainerOtherSide, E::VendorOtherSide, S::SpawnOtherSide);
     if (wall == M::GroundRefused)
-        return trainer ? E::TrainerGround : E::VendorGround;
+        return pick(E::TrainerGround, E::VendorGround, S::SpawnGround);
     return mailboxWall;
 }
 
 char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state)
 {
     namespace E = ErrandWalkRefusal;
+    namespace S = SpawnWalkRefusal;
     if (goal == WalkGoal::Mailbox)
         return MailWalkEndReason(state);
-    bool const trainer = goal == WalkGoal::Trainer;
+    auto pick = [goal](char const* trainer, char const* vendor, char const* spawn)
+    {
+        return goal == WalkGoal::Trainer ? trainer : goal == WalkGoal::Vendor ? vendor : spawn;
+    };
     switch (state)
     {
         case MailWalkState::Walking:       return "";
         case MailWalkState::Arrived:       return "";
-        case MailWalkState::LeftWorld:     return trainer ? E::TrainerLeftWorld : E::VendorLeftWorld;
-        case MailWalkState::Died:          return trainer ? E::TrainerDied : E::VendorDied;
-        case MailWalkState::TookFlight:    return trainer ? E::TrainerFlight : E::VendorFlight;
-        case MailWalkState::LeftMap:       return trainer ? E::TrainerLeftMap : E::VendorLeftMap;
-        case MailWalkState::EnteredCombat: return trainer ? E::TrainerCombat : E::VendorCombat;
-        case MailWalkState::TimedOut:      return trainer ? E::TrainerTimedOut : E::VendorTimedOut;
-        case MailWalkState::Stalled:       return trainer ? E::TrainerStalled : E::VendorStalled;
-        case MailWalkState::GroundRefused: return trainer ? E::TrainerGround : E::VendorGround;
+        case MailWalkState::LeftWorld:     return pick(E::TrainerLeftWorld, E::VendorLeftWorld, S::SpawnLeftWorld);
+        case MailWalkState::Died:          return pick(E::TrainerDied, E::VendorDied, S::SpawnDied);
+        case MailWalkState::TookFlight:    return pick(E::TrainerFlight, E::VendorFlight, S::SpawnFlight);
+        case MailWalkState::LeftMap:       return pick(E::TrainerLeftMap, E::VendorLeftMap, S::SpawnLeftMap);
+        case MailWalkState::EnteredCombat: return pick(E::TrainerCombat, E::VendorCombat, S::SpawnCombat);
+        case MailWalkState::TimedOut:      return pick(E::TrainerTimedOut, E::VendorTimedOut, S::SpawnTimedOut);
+        case MailWalkState::Stalled:       return pick(E::TrainerStalled, E::VendorStalled, S::SpawnStalled);
+        case MailWalkState::GroundRefused: return pick(E::TrainerGround, E::VendorGround, S::SpawnGround);
         case MailWalkState::Paused:        return "";
         case MailWalkState::Flying:        return "";
     }
@@ -13690,6 +13752,7 @@ char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state)
 bool ErrandWalkRefusalRetryable(std::string const& reason)
 {
     namespace E = ErrandWalkRefusal;
+    namespace S = SpawnWalkRefusal;
     if (MailWalkRefusalRetryable(reason))
         return true;
     return reason == E::AlreadyWalking || reason == E::TrainerTooFar
@@ -13700,7 +13763,10 @@ bool ErrandWalkRefusalRetryable(std::string const& reason)
         || reason == E::TrainerStalled || reason == E::VendorCombat || reason == E::VendorDied
         || reason == E::VendorLeftWorld || reason == E::VendorLeftMap
         || reason == E::VendorFlight || reason == E::VendorTimedOut
-        || reason == E::VendorStalled || reason == E::TaughtNothing;
+        || reason == E::VendorStalled || reason == E::TaughtNothing
+        || reason == S::SpawnTooFar || reason == S::SpawnGround || reason == S::SpawnCombat
+        || reason == S::SpawnDied || reason == S::SpawnLeftWorld || reason == S::SpawnLeftMap
+        || reason == S::SpawnFlight || reason == S::SpawnTimedOut || reason == S::SpawnStalled;
 }
 
 TrainerVisitOutcome JudgeTrainerVisit(TrainerVisitFacts const& facts)

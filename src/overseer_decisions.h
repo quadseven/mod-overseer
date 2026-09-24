@@ -15692,6 +15692,13 @@ bool MailWalkMadeProgress(float bestYards, float nowYards);
 //
 //   kind='cast'  walk-to-trainer skill:<id> [learn:<spell>[,<spell>...]] [max:<yards>]
 //   kind='buy'   walk-to-vendor item:<entry> [max:<yards>]
+//   kind='buy'   walk-to-vendor any [max:<yards>]
+//
+// `any` walks to the nearest vendor that buys at all (one not flagged to refuse
+// sales), for the `sell` rows a guild member writes next to sell what nobody in
+// its guild needs. As with `item:` and its `buy`, the site writes those rows
+// only after this walk's row reads `applied`: a `sell` row claimed while the
+// walk is still under way answers `vendor not in range`, which is the truth.
 //
 // A trainer walk ends AT the trainer: on arrival the adapter buys the next rank
 // of `skill` (when this trainer sells one this character may take) and each
@@ -15721,10 +15728,13 @@ enum class WalkGoal
     Mailbox,
     Trainer,
     Vendor,
+    // A named spawn row (the guild jobs, quadseven/wow-overseer#194): see
+    // "walks to a spawn" below.
+    Spawn,
 };
 
-// "mailbox", "trainer", "vendor": the result JSON's `goal` and the noun in
-// the log.
+// "mailbox", "trainer", "vendor", "spawn": the result JSON's `goal` and the
+// noun in the log.
 char const* WalkGoalWord(WalkGoal goal);
 
 bool IsTrainerWalkRow(std::string const& command);
@@ -15747,11 +15757,15 @@ TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command);
 struct VendorWalkRequest
 {
     uint32_t item{0};
+    // `any` in place of `item:` (the guild jobs): the nearest vendor that buys,
+    // for a `sell` row that follows. Such a walk carries item 0.
+    bool any{false};
     float maxYards{ERRAND_WALK_MAX_YARDS};
     char const* error{""};
 };
 
-// `item:` is required and must be a non-zero entry; `max:` as above.
+// `item:` (a non-zero entry) or the bare word `any`, exactly one of them;
+// `max:` as above.
 VendorWalkRequest ParseVendorWalkRequest(std::string const& command);
 
 namespace ErrandWalkRefusal
@@ -15796,7 +15810,7 @@ constexpr char const* TaughtNothing    = "the trainer taught nothing, most likel
 }  // namespace ErrandWalkRefusal
 
 // The refusal a walk to `goal` gives where the mailbox walk gives `mailboxWall`.
-// The mailbox goal answers the mailbox literal unchanged; the other two answer
+// The mailbox goal answers the mailbox literal unchanged; the other three answer
 // their own sentence for every literal that names the destination, and pass the
 // ones about the character (dead, in combat, on the roster...) through as they
 // are.
@@ -15809,7 +15823,10 @@ char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state);
 // Worth asking again later without changing the row. The mailbox literals keep
 // MailWalkRefusalRetryable's answers. Too far is retryable here: a random bot
 // wanders, and the next pass may find it in town. No such destination on the
-// map, a malformed row and a trainer with nothing left to teach are not.
+// map, a malformed row and a trainer with nothing left to teach are not. A
+// spawn walk's walls follow the same rule: too far, the ground and every
+// ending are retryable; a malformed row, a spawn the world does not hold, one
+// on another map and one out of season are not.
 bool ErrandWalkRefusalRetryable(std::string const& reason);
 
 // WHAT ONE TRAINER VISIT DID, from readings the adapter took on both sides of
@@ -15835,6 +15852,80 @@ TrainerVisitOutcome JudgeTrainerVisit(TrainerVisitFacts const& facts);
 
 // "learned", "nothing_to_learn", "taught_nothing".
 char const* TrainerVisitWord(TrainerVisitOutcome outcome);
+
+// ------------------------------------------------ walks to a spawn (guild jobs) --
+//
+// A GUILD BOT SENT TO WHERE ITS WORK IS. The walks above end at a mailbox, a
+// trainer or a vendor, each chosen by the module as the nearest one that serves
+// the row. A guild member whose job is to farm needs one more destination: the
+// place the work is. A maintenance member gathers at a field of herbs or ore its
+// skill can open; a guild warlock waits near the door it summons at, and grinds
+// and gathers there between summons. The site chooses the place from the
+// world's own spawn table (a node or a meeting stone), and the row names that
+// spawn by its id, so the coordinate the walk aims at is always a real spawn
+// row and never one the site computed.
+//
+// SHAPE, on kind='job' and routed on the first word the way `walk-to-trainer`
+// rides kind='cast':
+//
+//   kind='job'  walk-to-spawn gameobject:<spawn id> [max:<yards>]
+//   kind='job'  walk-to-spawn creature:<spawn id> [max:<yards>]
+//
+// Exactly one of `gameobject:` and `creature:`. `max:` as for the other walks,
+// up to FAR_WALK_MAX_YARDS; past ERRAND_WALK_MAX_YARDS the walk is a far walk.
+//
+// ARRIVING ENDS THE WALK AND LETS THE BOT GO. A walk to a spawn ends within
+// SPAWN_WALK_ARRIVE_YARDS of it with the hold lifted at once, like a trainer
+// walk, so the bot's own grind and gather strategies play where it now stands.
+// Nothing is gathered, looted or killed by this verb.
+
+constexpr char const* SPAWN_WALK_VERB = "walk-to-spawn";
+
+// How near the spawn counts as there. A node field or a door's surroundings is
+// a place, not a counter: twenty yards puts the node or the stone in sight, and
+// the bot's own gather strategy reaches a node from further than that.
+constexpr float SPAWN_WALK_ARRIVE_YARDS = 20.0f;
+
+bool IsSpawnWalkRow(std::string const& command);
+
+struct SpawnWalkRequest
+{
+    bool gameObject{false};   // true: a gameobject spawn; false: a creature spawn
+    uint32_t spawn{0};        // the spawn id (`gameobject.guid` or `creature.guid`)
+    float maxYards{ERRAND_WALK_MAX_YARDS};
+    char const* error{""};
+};
+
+// `gameobject:` or `creature:` (exactly one, a non-zero id) and an optional
+// `max:`, each at most once, in any order. Anything else is MalformedSpawn.
+SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command);
+
+// Is the walker there? True within SPAWN_WALK_ARRIVE_YARDS of the spawn. A
+// negative distance is an unread one and never counts.
+bool SpawnWalkArrived(float yards);
+
+namespace SpawnWalkRefusal
+{
+constexpr char const* MalformedSpawn = "malformed walk-to-spawn command";
+// The row names a spawn the world does not hold, on another map than the
+// walker's, or a seasonal one out of the world now.
+constexpr char const* NoSuchSpawn    = "no such spawn in the world";
+constexpr char const* SpawnOtherMap  = "the spawn is on another map than the character";
+constexpr char const* SpawnOutOfSeason = "the spawn belongs to a world event that is not running";
+
+constexpr char const* SpawnTooFar    = "the spawn is beyond the cap";
+constexpr char const* SpawnOtherSide = "the way to the spawn crosses the other side's ground";
+constexpr char const* SpawnGround    = "the ground toward the spawn does not hold";
+
+// Endings of a spawn walk that started.
+constexpr char const* SpawnCombat    = "entered combat on the way to the spawn";
+constexpr char const* SpawnDied      = "died on the way to the spawn";
+constexpr char const* SpawnLeftWorld = "left the world on the way to the spawn";
+constexpr char const* SpawnLeftMap   = "left the map on the way to the spawn";
+constexpr char const* SpawnFlight    = "took a flight on the way to the spawn";
+constexpr char const* SpawnTimedOut  = "did not reach the spawn in time";
+constexpr char const* SpawnStalled   = "stopped getting nearer the spawn";
+}  // namespace SpawnWalkRefusal
 
 // ------------------------------------------ far walks for guild bots (#633) --
 //
@@ -15898,7 +15989,7 @@ constexpr uint32_t FAR_WALK_FLIGHTS_MAX = 2;
 constexpr float FAR_WALK_FLIGHT_MIN_YARDS = 1500.0f;
 
 // The near cap of a walk to `goal`: MAIL_WALK_MAX_YARDS for a mailbox,
-// ERRAND_WALK_MAX_YARDS for a trainer or a vendor.
+// ERRAND_WALK_MAX_YARDS for a trainer, a vendor or a spawn.
 float NearWalkCapYards(WalkGoal goal);
 
 // Is a walk to `goal` whose chosen destination is `yards` away a far walk?
