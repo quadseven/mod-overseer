@@ -339,6 +339,35 @@ void AboardAtTheOriginRidesEvenWhileDocked()
                 CrossingAction::Ride);
 }
 
+// THE FAMILY DID NOT FOLLOW HIM ON. With the stop running out, he steps back
+// onto the berth rather than sail and split the family across an ocean.
+void ALeaderAboardWithoutHisFamilyStepsBack()
+{
+    CrossingWorld w = Docks();
+    w.dockedAtOrigin = true;
+    w.dwellLeftMs = 10000;
+    std::vector<CrossingMember> members = {Leader(1, 0.f, true), Follower(1, 0.f, true),
+                                           Follower(1, 8.f)};
+    CrossingStep const step = ReadCrossing(w, members, Limits());
+    CheckAction("one follower still on the pier, 10s left: step back", step.action,
+                CrossingAction::StepBack);
+    CheckLeg("back to waiting for the transport", step.leg, CrossingLeg::WaitForTransport);
+    CheckSays("and says why", CrossingExplanation(step, w), "rather than sail without them");
+
+    w.dwellLeftMs = 40000;
+    CheckAction("with 40s left the follower still has time: ride",
+                ReadCrossing(w, members, Limits()).action, CrossingAction::Ride);
+
+    w.dwellLeftMs = 10000;
+    CheckAction("everybody aboard: ride",
+                ReadCrossing(w, {Leader(1, 0.f, true), Follower(1, 0.f, true)}, Limits()).action,
+                CrossingAction::Ride);
+
+    CrossingWorld sailing = Docks();  // not docked: the boat has left
+    CheckAction("already sailing: ride, whoever is behind",
+                ReadCrossing(sailing, members, Limits()).action, CrossingAction::Ride);
+}
+
 // ----------------------------------------------------------- the dock read --
 
 // The Lady Mehley's two stops, as ArriveTime/DepartureTime pairs in the shape
@@ -582,6 +611,7 @@ int main()
     NoLandingIsNoWalkOff();
     TheLeaderAshoreWaitsForHisFollowers();
     AboardAtTheOriginRidesEvenWhileDocked();
+    ALeaderAboardWithoutHisFamilyStepsBack();
 
     DockedIsTheCoresOwnInterval();
     NoClockIsNeverDocked();

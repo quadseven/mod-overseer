@@ -7105,6 +7105,12 @@ enum class CrossingAction : std::uint8_t
     // followers follow their leader off. Appended rather than inserted so the
     // values that already existed keep their numbers.
     WalkOff,
+    // THE FAMILY DID NOT FOLLOW HIM ABOARD. The leader is on the deck at the
+    // ORIGIN, the transport is docked there, somebody on this side is still
+    // not aboard, and the stop is running out. Rather than sail and split the
+    // family across an ocean, he steps back onto the berth and the next stop
+    // is tried again. Same step as WalkOff, onto this end's berth.
+    StepBack,
 };
 
 char const* CrossingActionName(CrossingAction action);

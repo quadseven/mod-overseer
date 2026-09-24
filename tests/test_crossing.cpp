@@ -471,7 +471,8 @@ void EveryValueHasItsOwnName()
     std::vector<CrossingAction> const actions = {
         CrossingAction::Wait, CrossingAction::Refuse, CrossingAction::Walk,
         CrossingAction::Hold, CrossingAction::Ride, CrossingAction::Disembark,
-        CrossingAction::Done, CrossingAction::Board, CrossingAction::WalkOff};
+        CrossingAction::Done, CrossingAction::Board, CrossingAction::WalkOff,
+        CrossingAction::StepBack};
     for (std::size_t i = 0; i < actions.size(); ++i)
         for (std::size_t j = i + 1; j < actions.size(); ++j)
             if (std::string(CrossingActionName(actions[i])) ==

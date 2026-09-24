@@ -5722,6 +5722,7 @@ char const* CrossingActionName(CrossingAction action)
         case CrossingAction::Done:      return "done";
         case CrossingAction::Board:     return "board";
         case CrossingAction::WalkOff:   return "walk off";
+        case CrossingAction::StepBack:  return "step back";
     }
     return "wait";
 }
@@ -5857,10 +5858,19 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
     //    follower on the deck while the leader is still walking is an ordinary
     //    and expected state, and the previous version answered Ride to it, which
     //    released the leader's aim and left the boat to sail without him.
+    //
+    //    EXCEPT WHEN THE FAMILY HAS NOT FOLLOWED HIM ON. A leader aboard at the
+    //    origin, the boat still docked, somebody on the pier and the stop
+    //    running out: he steps back onto the berth rather than sail without
+    //    them, because a family split across an ocean is the one outcome this
+    //    crossing cannot undo. The next stop is tried again from the berth.
     if (step.leaderAboard)
     {
-        step.leg = CrossingLeg::Aboard;
-        step.action = CrossingAction::Ride;
+        bool const leftBehind = step.waiting > 0 && world.dockedAtOrigin &&
+                                !step.leaderOnDestination && world.berthKnown &&
+                                world.dwellLeftMs < limits.minBoardDwellMs;
+        step.leg = leftBehind ? CrossingLeg::WaitForTransport : CrossingLeg::Aboard;
+        step.action = leftBehind ? CrossingAction::StepBack : CrossingAction::Ride;
         return step;
     }
 
@@ -5977,6 +5987,14 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
             return "the leader is aboard on map " + destination +
                    " and the transport is docked, so he is walked off onto the "
                    "surveyed landing and the followers follow him off";
+
+        case CrossingAction::StepBack:
+            return std::to_string(step.waiting) +
+                   " member(s) on map " + origin +
+                   " did not follow the leader aboard and only " +
+                   std::to_string(world.dwellLeftMs / 1000) +
+                   "s of the stop is left, so he steps back onto the berth "
+                   "rather than sail without them; the next stop is tried again";
 
         case CrossingAction::Ride:
             return "the leader is aboard between maps " + origin + " and " +

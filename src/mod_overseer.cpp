@@ -1302,6 +1302,10 @@ constexpr float CROSSING_WALK_OFF_REACH_YARDS = 80.0f;
 // How long the hold lets a step on or off the deck run before the sweep may
 // re-take the slot. Eighty yards at run speed is under twelve seconds.
 constexpr uint32 CROSSING_STEP_WALK_SECONDS = 15;
+// Within this of the ground he was stepped to, he has stepped. Two yards, the
+// slack a spline stop leaves (HOLD_PIN_SLACK_YARDS is one) and well inside a
+// pier's width.
+constexpr float CROSSING_LANDED_YARDS = 2.0f;
 // Time on the water, priced in yards at a character's run speed, so a boat
 // that saves a long walk is taken and one that saves nothing is not.
 constexpr float CROSSING_PRICE_YARDS_PER_SECOND = 7.0f;
@@ -31937,6 +31941,12 @@ private:
         float berthX{0.f};
         float berthY{0.f};
         float berthZ{0.f};
+        // EVERY surveyed point level with the deck, nearest the mooring first;
+        // `berth*` above is the first. The step OFF a deck needs the rest: the
+        // nearest may be under the deck's own footprint (a zeppelin's origin
+        // sits at its gondola's edge), and a landing the map still puts on the
+        // transport is one a character never gets off at.
+        std::vector<OverseerDecisions::BerthCandidate> levelBerths;
     };
 
     struct CrossingCrewMember
@@ -32099,14 +32109,23 @@ private:
                 std::vector<float> decks;
                 for (CrossingCrewMember const& c : info.crew)
                     decks.push_back(stop.mooringZ + c.z);
-                int const pick = OverseerDecisions::PickBerth(mine, stop.mooringX, stop.mooringY,
-                                                              decks, limits);
-                if (pick < 0)
+                // PickBerth again and again, taking each pick out, gives every
+                // level candidate in its own order of preference.
+                for (;;)
+                {
+                    int const pick = OverseerDecisions::PickBerth(mine, stop.mooringX,
+                                                                  stop.mooringY, decks, limits);
+                    if (pick < 0)
+                        break;
+                    stop.levelBerths.push_back(mine[pick]);
+                    mine.erase(mine.begin() + pick);
+                }
+                if (stop.levelBerths.empty())
                     continue;
                 stop.berthKnown = true;
-                stop.berthX = mine[pick].x;
-                stop.berthY = mine[pick].y;
-                stop.berthZ = mine[pick].z;
+                stop.berthX = stop.levelBerths.front().x;
+                stop.berthY = stop.levelBerths.front().y;
+                stop.berthZ = stop.levelBerths.front().z;
             }
 
             LOG_INFO("module.overseer",
@@ -32278,7 +32297,77 @@ private:
         float landingMooringZ{0.f};
         // Every candidate the price looked at, in one sentence, for the log.
         std::string priced;
+        // Every level surveyed point at each end, nearest first (see
+        // CrossingStopInfo::levelBerths), for stepping OFF a deck.
+        std::vector<OverseerDecisions::BerthCandidate> originBerths;
+        std::vector<OverseerDecisions::BerthCandidate> landings;
     };
+
+    // THE FIRST LEVEL SURVEYED POINT THE MAP DOES NOT PUT ON THE TRANSPORT,
+    // nearest the mooring first. Stepping off a deck onto ground the map still
+    // calls deck is not stepping off: the bot AI's transport check would keep
+    // him a passenger and the boat would carry him back. With no live
+    // transport to ask, nothing says any point is on it, and the first wins.
+    static bool GroundOffTheDeck(Player* who, Transport* transport,
+                                 std::vector<OverseerDecisions::BerthCandidate> const& points,
+                                 float& outX, float& outY, float& outZ)
+    {
+        for (OverseerDecisions::BerthCandidate const& p : points)
+        {
+            if (transport && MapSaysOnTransport(who, transport, p.x, p.y, p.z))
+                continue;
+            outX = p.x;
+            outY = p.y;
+            outZ = p.z;
+            return true;
+        }
+        return false;
+    }
+
+    // THE STEP OFF A DECK, OR BACK OFF IT AT THE ORIGIN. Upstream's straight
+    // line, because a passenger has no navmesh under him, to a surveyed point
+    // level with the deck and within reach. Re-issued while he is off the deck
+    // but short of the point: the bot AI's transport check stops him dead the
+    // moment the map no longer puts him on the boat (PlayerbotAI.cpp:386-398,
+    // StopMovingOnCurrentPos), which is at the hull's edge and not on the
+    // ground he was walked to. Answers the distance walked, or a negative
+    // number when there was nowhere to step.
+    float StepOntoGround(Player* who, Transport* transport,
+                         std::vector<OverseerDecisions::BerthCandidate> const& points)
+    {
+        float x = 0.f, y = 0.f, z = 0.f;
+        if (!GroundOffTheDeck(who, transport, points, x, y, z))
+            return -1.f;
+        float const yards = who->GetExactDist2d(x, y);
+        if (yards > CROSSING_WALK_OFF_REACH_YARDS)
+            return -1.f;
+        if (yards <= CROSSING_LANDED_YARDS)
+            return yards;
+        who->GetMotionMaster()->MovePoint(CROSSING_STEP_POINT_ID, x, y, z, FORCED_MOVEMENT_NONE,
+                                          0.f, 0.f, /*generatePath*/ false,
+                                          /*forceDestination*/ false);
+        LetHeldCharacterWalk(who->GetName(), CROSSING_STEP_WALK_SECONDS);
+        return yards;
+    }
+
+    // A LEADER BY THE BERTH BUT A LEVEL OFF IT, on a tower's ramp or a lower
+    // quay: the travel drive calls him arrived (within its ten vertical yards)
+    // and a deck step is three. He is walked the rest under the hold the way
+    // the summon walks a clicker onto a stone - GroundedStep's proved step and
+    // no straight line over ground nothing checked.
+    static bool StepTowardBerth(Player* who, uint32 mapId, float x, float y, float z)
+    {
+        if (!who)
+            return false;
+        WorldPosition const want(mapId, x, y, z);
+        WorldPosition step;
+        if (!GroundedStep(who, want, step))
+            return false;
+        who->GetMotionMaster()->MovePoint(CROSSING_STEP_POINT_ID, step.GetPositionX(),
+                                          step.GetPositionY(), step.GetPositionZ());
+        LetHeldCharacterWalk(who->GetName(), CROSSING_STEP_WALK_SECONDS);
+        return true;
+    }
 
     // Level with the berth: within a step onto a deck of its height. PickBerth
     // admitted the berth only within the same step of the deck.
@@ -32465,6 +32554,8 @@ private:
             route.landingX = to.berthX;
             route.landingY = to.berthY;
             route.landingZ = to.berthZ;
+            route.originBerths = from.levelBerths;
+            route.landings = to.levelBerths;
 
             // DOCKED WHERE THE LEADER IS? Read off the live boat he can see,
             // on the core's own stop test. Not established - false - while the
@@ -32608,6 +32699,12 @@ private:
         {
             case OverseerDecisions::CrossingAction::Walk:
             {
+                // A HOLD FROM AN EARLIER STEP IS LET GO FIRST. A leader stepped
+                // toward a deck he never boarded - the stop ended, or the step
+                // came up short - reads more than a berth away on the next poll,
+                // and a held character is refused every aim (HeldStill), so the
+                // walk back would never start.
+                releaseTheLeader("he is walking to the berth again");
                 // The aim is on the leader's OWN map, so ResolveTravelTarget
                 // accepts it under the rule it has always applied. Nothing here
                 // relaxes the same-map check and nothing here crosses anything.
@@ -32660,8 +32757,18 @@ private:
                 // boat is away, and claims no errand. Only when he is level
                 // with the berth: a hold is a root, and a leader rooted a few
                 // yards short on a ramp below it could never step aboard.
-                if (LevelWithBerth(leader, route))
-                    holdTheLeader();
+                holdTheLeader();
+                // A LEVEL OFF IT, he is walked the rest under the hold rather
+                // than rooted short of it.
+                if (!LevelWithBerth(leader, route) &&
+                    !StepTowardBerth(leader, route.world.originMap, route.berthX, route.berthY,
+                                     route.berthZ) &&
+                    fresh)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is by the berth for '{}' but {:.1f} yards above "
+                             "or below it and no proved step toward it holds ground - {}",
+                             leaderName, boat,
+                             std::fabs(leader->GetPositionZ() - route.berthZ), why);
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is at the berth for '{}' on map {} - {}",
@@ -32696,6 +32803,14 @@ private:
                 // on the landing and HELD there while his followers follow him
                 // off.
                 holdTheLeader();
+                // A LEADER OFF THE DECK BUT SHORT OF THE LANDING is stepped the
+                // rest: the bot AI's transport check stopped him at the hull's
+                // edge (see StepOntoGround), and the followers follow him to
+                // where he ends up.
+                if (!step.leaderAboard && leader->GetMapId() == route.world.destinationMap)
+                    StepOntoGround(leader,
+                                   LiveCrossingTransport(leader, route.transportEntry),
+                                   route.landings);
                 if (fresh)
                     LOG_WARN("module.overseer",
                              "overseer: {} member(s) are ashore on map {} but still "
@@ -32734,18 +32849,26 @@ private:
                 // would walk him back off the deck he is stepping onto.
                 if (fresh)
                     _travelAims.Release(leaderName, "the dungeon run coordinator");
+                holdTheLeader();
                 if (!LevelWithBerth(leader, route))
                 {
+                    // Not level with the deck yet: the proved step up first,
+                    // and the step aboard on a later poll.
+                    bool const stepped = StepTowardBerth(leader, route.world.originMap,
+                                                         route.berthX, route.berthY,
+                                                         route.berthZ);
                     if (fresh)
                         LOG_WARN("module.overseer",
                                  "overseer: '{}' is by the berth for '{}' but {:.1f} yards "
                                  "above or below it, more than a step onto a deck, so he "
-                                 "does not step - {}",
+                                 "does not step aboard yet - {} - {}",
                                  leaderName, boat,
-                                 std::fabs(leader->GetPositionZ() - route.berthZ), why);
+                                 std::fabs(leader->GetPositionZ() - route.berthZ),
+                                 stepped ? "he is walked up to it first"
+                                         : "and no proved step toward it holds ground",
+                                 why);
                     break;
                 }
-                holdTheLeader();
 
                 CrossingTransportInfo const* info = CatalogueEntry(route.transportEntry);
                 MotionTransport* live = LiveCrossingTransport(leader, route.transportEntry);
@@ -32784,36 +32907,37 @@ private:
             }
 
             case OverseerDecisions::CrossingAction::WalkOff:
+            case OverseerDecisions::CrossingAction::StepBack:
             {
+                // THE SAME STEP, OFF THE DECK: onto the far landing, or back
+                // onto this end's berth when the family did not follow him on.
+                // Onto ground the survey stood on, level with this deck, and
+                // the first such point the map does not still put on the boat.
+                // The bot AI's transport check takes him off the deck the
+                // moment the map no longer puts him on it; the followers follow
+                // their leader.
                 holdTheLeader();
-                float const yards = leader->GetExactDist2d(route.landingX, route.landingY);
-                if (yards > CROSSING_WALK_OFF_REACH_YARDS)
+                bool const back = step.action == OverseerDecisions::CrossingAction::StepBack;
+                uint32 const onMap =
+                    back ? route.world.originMap : route.world.destinationMap;
+                float const yards = StepOntoGround(
+                    leader, leader->GetTransport(), back ? route.originBerths : route.landings);
+                if (yards < 0.f)
                 {
                     if (fresh)
                         LOG_WARN("module.overseer",
-                                 "overseer: '{}' is aboard '{}' at its dock on map {} but "
-                                 "{:.0f} yards from the landing, beyond the {:.0f} a step off "
-                                 "a deck may be, so he stays aboard - {}",
-                                 leaderName, boat, route.world.destinationMap, yards,
-                                 CROSSING_WALK_OFF_REACH_YARDS, why);
+                                 "overseer: '{}' is aboard '{}' at its dock on map {} and "
+                                 "there is no surveyed ground off its deck within {:.0f} "
+                                 "yards of him, so he stays aboard - {}",
+                                 leaderName, boat, onMap, CROSSING_WALK_OFF_REACH_YARDS, why);
                     break;
                 }
-                // The same move in the other direction, onto ground the survey
-                // stood on and PickBerth found level with this deck. The bot
-                // AI's transport check takes him off the deck the moment the
-                // map no longer puts him on it; the followers follow him off.
-                leader->GetMotionMaster()->MovePoint(CROSSING_STEP_POINT_ID, route.landingX,
-                                                     route.landingY, route.landingZ,
-                                                     FORCED_MOVEMENT_NONE, 0.f, 0.f,
-                                                     /*generatePath*/ false,
-                                                     /*forceDestination*/ false);
-                LetHeldCharacterWalk(leaderName, CROSSING_STEP_WALK_SECONDS);
                 if (fresh)
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' walks off '{}' onto the landing at ({:.1f}, "
-                             "{:.1f}, {:.1f}) on map {}, {:.1f} yards - {}",
-                             leaderName, boat, route.landingX, route.landingY,
-                             route.landingZ, route.world.destinationMap, yards, why);
+                             "overseer: '{}' {} '{}' on map {}, {:.1f} yards onto surveyed "
+                             "ground - {}",
+                             leaderName, back ? "steps back off" : "walks off", boat, onMap,
+                             yards, why);
                 break;
             }
 
