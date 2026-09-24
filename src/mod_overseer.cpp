@@ -25792,7 +25792,75 @@ private:
             // areatrigger_teleport: (2230,'Ragefire Chasm - Ogrimmar Instance',389,3.81,-14.82,-17.84,4.39)
             // areatrigger: (2226,389,2.58019,-0.013587,-13.3668,0,30.69,12.19,25.56,0)
             // areatrigger_teleport: (2226,'Ragefire Chasm - Ogrimmar Instance (Inside)',1,1813.49,-4418.58,-18.57,1.78)
-            {"ragefire", 1, 2230, 389, 2226, 0.f, 0.f, 0.f},
+            //
+            // AND IT CARRIES A MEASURED CORRIDOR AND A HOME, BECAUSE THE DEFAULT
+            // ROUTE FAILED LIVE (#557, #579). The door is on the floor of the
+            // Cleft of Shadow at z -18, under Orgrimmar's own streets, and 21 of
+            // the first 30 attempts on the dev realm ended `staging_failed`
+            // with a member "above the 'ragefire' staging point": 143 out and
+            // 49 up, 115 out and 44 up, 365 out and 143 up. On 2026-09-24 at
+            // 07:35 the leader stood on the cleft floor at (1794.1, -4370.2,
+            // -16.5), 40 yards from the door, and 48 seconds later at (1932.0,
+            // -4437.3, 24.7), back up the survey road from the Valley of
+            // Spirits, where the run was closed.
+            //
+            // HOW IT WAS MEASURED. The shortest walk over the shipped navmesh
+            // tiles for map 1, grids 27/39 through 29/41 (0012739.mmtile to
+            // 0012941.mmtile), by polygon adjacency from Innkeeper Gryshka's
+            // spawn (creature 6929, guid 4661, at (1633.99, -4439.37, 15.76))
+            // to the derived staging point: 678 yards of walking to cover 176
+            // of straight line. The points are that walk resampled to about 65
+            // yards each, well under the 296 yards PathGenerator will smooth,
+            // and the corridor is walked one point at a time. It leaves the
+            // Valley of Strength east over the pass, goes south and east round
+            // the rim, and comes back north and west down the cleft floor.
+            //
+            // The world's own spawns stand on the same line: Scout Tharr (guid
+            // 6494) at (1735.9, -4452.7, 37.1) on the pass, the grunts at
+            // (1882.2, -4484.0, 20.9), (1886.5, -4415.9, 12.0), (1845.5,
+            // -4396.0, 5.4) and (1817.1, -4357.1, -9.6) down the descent, and
+            // Neeru Fireblade (guid 3415) at (1800.7, -4374.5, -17.1) at the
+            // bottom. The last five points also lie on the survey's own road
+            // from Vol'jin to the door (playerbots_travelnode_path 488 -> 1711).
+            //
+            // THE APPROACH STARTS AT THE TOP OF THE PASS, NOT AT THE INN. The
+            // run is held while the leader reads Overhead of the point he is
+            // walked at first, and the flight master's tower, where a party
+            // flying in lands, stands at (1676.2, -4313.4, 61.4): the inn reads
+            // Overhead from there (133 out and 46 up) and the pass does not
+            // (158 out and 24 up). The inn is still the corridor's first point,
+            // so the walks that go to it (a bind to correct, the way back out)
+            // have measured ground under them.
+            //
+            // AND NOT ONE POINT AFTER THE PASS IS PROMISED CLOSING, which is the
+            // honest difference from `wailing`. Points 3 to 8 stand 32 to 56
+            // yards over the door at 83 to 115 yards out, where the rule allows
+            // 28 to 38. A leader walking them is progress along a measured
+            // route, which keeps the staging watchdog quiet (#605); one who
+            // stops on them is closed as above the door, which is right.
+            {"ragefire", 1, 2230, 389, 2226, 1737.1f, -4458.7f, 37.83f,
+             {
+                 {1634.0f, -4439.4f,  15.76f},
+                 {1664.0f, -4405.3f,  19.96f},
+                 {1724.8f, -4401.3f,  35.43f},
+                 {1737.1f, -4458.7f,  37.83f},
+                 {1769.5f, -4516.4f,  26.63f},
+                 {1834.7f, -4512.3f,  22.36f},
+                 {1881.3f, -4481.7f,  20.50f},
+                 {1889.2f, -4421.7f,  13.70f},
+                 {1837.1f, -4392.8f,   2.10f},
+                 {1795.7f, -4357.3f, -12.84f},
+                 // The derived staging point: 22.35 yards off the box of
+                 // areatrigger 2230 along the bearing to where 2226 lands,
+                 // (1807.3943, -4407.8039), at the height the ground probe
+                 // reads there.
+                 {1807.4f, -4407.8f, -18.43f},
+             },
+             // THE TOWN THIS CAMPAIGN BINDS IN: Innkeeper Gryshka's spawn,
+             // which is the corridor's first point. The Horde family was bound
+             // in the Valley of Trials, about 2,400 yards from this door, so a
+             // hearth regroup (#662) landed it outside the city.
+             1634.0f, -4439.4f, 15.76f},
             // MARAUDON, THE ORANGE WING (Foulspore Cavern), on map 1 in
             // Desolace. Both Maraudon rows share map 349, and this one is listed
             // first so a run adopted inside that map after a restart, whose
