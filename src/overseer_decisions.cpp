@@ -2082,6 +2082,11 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
     // tried twice that morning and neither got the family together.
     if (facts.hearthRegroupReady && facts.farthestMemberYards > RUN_RECOVERY_HEARTH_SPREAD_YARDS)
         return pick(RunRecovery::HearthRegroup);
+    // ...AND SO DOES A FAMILY WITH A MEMBER HELD OFF A LETHAL LEG (#697),
+    // however near it is. It will not walk to the family, so a regroup wait
+    // for it never ends, and meeting at the inn needs no walk from it.
+    if (facts.hearthRegroupReady && facts.memberHeldOffLethalLeg)
+        return pick(RunRecovery::HearthRegroup);
 
     // A staging that timed out with the leader far from the door never had a
     // chance: the walk does not fit in the clock.
@@ -2131,8 +2136,14 @@ std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery ch
                   "being taken back)";
             break;
         case RunRecovery::HearthRegroup:
-            why = "the family was spread across zones and most of it is bound at one inn, "
-                  "so it hearths there, meets, and walks to the door together";
+            why = facts.memberHeldOffLethalLeg &&
+                          facts.farthestMemberYards <= RUN_RECOVERY_HEARTH_SPREAD_YARDS
+                      ? "a member is held off a walk to the family that kept killing it or "
+                        "crosses ground well above its level, and most of the family is "
+                        "bound at one inn, so it hearths there, meets, and walks to the "
+                        "door together"
+                      : "the family was spread across zones and most of it is bound at "
+                        "one inn, so it hearths there, meets, and walks to the door together";
             break;
         case RunRecovery::Summon:
             why = std::to_string(facts.streak) +
@@ -5401,6 +5412,16 @@ bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand)
     return onAnErrand || !HoldsInTown(job);
 }
 
+UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTravelFlight,
+                                            bool moduleIssuedFlight, bool inFlight)
+{
+    if (mayCarryNewRpg || moduleIssuedFlight)
+        return UnissuedFlightStep::Leave;
+    if (inFlight)
+        return UnissuedFlightStep::Airborne;
+    return statusIsTravelFlight ? UnissuedFlightStep::Cancel : UnissuedFlightStep::Leave;
+}
+
 bool CutOffFollowerRoams(std::string const& job, std::string const& target)
 {
     if (!SplitFollowerDrivesItself(target))
@@ -5599,8 +5620,12 @@ std::string PickFetchTarget(std::vector<FetchCandidate> const& members,
                 return std::string();
             continue;
         }
-        // A held member inside the line is one whose hold lifts this poll.
-        if (member.stoodDown || member.yards <= limits.footLimitYards)
+        // A held member inside the line is one whose hold lifts this poll. For
+        // one held off a lethal leg (#697) the line is beside the leader.
+        float const lifts = member.heldOffLethalLeg && limits.lethalArrivalYards > 0.f
+                                ? limits.lethalArrivalYards
+                                : limits.footLimitYards;
+        if (member.stoodDown || member.yards <= lifts)
             continue;
         if (!pick.empty() &&
             (member.yards > pickYards || (member.yards == pickYards && member.name > pick)))
@@ -5615,7 +5640,10 @@ FetchStep ReadFetch(FetchFacts const& facts, FetchLimits const& limits)
 {
     if (!facts.leaderFree || !facts.targetFetchable || facts.aimRefused)
         return FetchStep::Abandon;
-    if (facts.targetYards >= 0.f && facts.targetYards <= limits.footLimitYards)
+    float const arrives = facts.targetHeldOffLethalLeg && limits.lethalArrivalYards > 0.f
+                              ? limits.lethalArrivalYards
+                              : limits.footLimitYards;
+    if (facts.targetYards >= 0.f && facts.targetYards <= arrives)
         return FetchStep::Arrived;
     if (facts.fetchingForSeconds >= limits.ceilingSeconds)
         return FetchStep::GiveUp;
@@ -6448,6 +6476,71 @@ RouteVerdict JudgeRoute(RouteReading const& reading, RouteLimits const& limits)
     // operator wants beside the refusal.
     verdict.survivable = verdict.longestLethalRunYards <= limits.lethalRunYards;
     return verdict;
+}
+
+uint32_t LoneLegDeathsInWindow(std::vector<int64_t> const& deathTimes, int64_t now,
+                               LoneLegLimits const& limits)
+{
+    uint32_t count = 0;
+    for (int64_t at : deathTimes)
+        if (now - at < limits.windowSeconds)
+            ++count;
+    return count;
+}
+
+RouteLimits LoneLegRouteLimits(LoneLegLimits const& limits)
+{
+    RouteLimits route;
+    route.unknownLevelDiff = limits.levelGap;
+    route.lethalRunYards = limits.lethalRunYards;
+    return route;
+}
+
+LoneLegVerdict DecideLoneLeg(LoneLegFacts const& facts, LoneLegLimits const& limits)
+{
+    LoneLegVerdict verdict;
+    // The doorstep is not judged: the family is close enough that this walk
+    // is the one `follow` would take.
+    if (facts.legYards <= limits.minLegYards)
+        return verdict;
+    if (limits.deaths > 0 && facts.legDeaths >= limits.deaths)
+        verdict.why = LoneLegReason::Deaths;
+    else if (!facts.ground.survivable)
+        verdict.why = LoneLegReason::Ground;
+    else
+        return verdict;
+
+    if (facts.hearthRegroupInPlay)
+        verdict.step = LoneLegStep::HearthRegroup;
+    else if (facts.hearthReady && facts.bindYardsFromLeader >= 0.f &&
+             facts.bindYardsFromLeader <= limits.hearthNearYards)
+        verdict.step = LoneLegStep::Hearth;
+    else
+        verdict.step = LoneLegStep::Wait;
+    return verdict;
+}
+
+char const* LoneLegStepWord(LoneLegStep step)
+{
+    switch (step)
+    {
+        case LoneLegStep::Walk:          return "walk";
+        case LoneLegStep::HearthRegroup: return "hearth regroup";
+        case LoneLegStep::Hearth:        return "hearth";
+        case LoneLegStep::Wait:          return "wait";
+    }
+    return "unknown";
+}
+
+char const* LoneLegReasonWord(LoneLegReason why)
+{
+    switch (why)
+    {
+        case LoneLegReason::None:   return "nothing against the walk";
+        case LoneLegReason::Deaths: return "it keeps dying on the walk to its family";
+        case LoneLegReason::Ground: return "the way to its family crosses ground well above its level";
+    }
+    return "unknown";
 }
 
 TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates)

@@ -2132,9 +2132,25 @@ constexpr time_t FETCH_CEILING_SECONDS = TRAVEL_BACKSTOP_SECONDS;
 constexpr time_t FETCH_STANDDOWN_SECONDS = REGROUP_STANDDOWN_SECONDS;
 
 // The foot limit the hold lifts on, the line past which a member that is NOT
-// held is still walking back, and the ceiling above.
+// held is still walking back, and the ceiling above. And where a fetch for a
+// member held off a lethal leg arrives (#697): beside it, at the line the
+// catch-up walk itself hands a member back to `follow`.
 constexpr OverseerDecisions::FetchLimits FETCH_LIMITS{
-    CATCH_UP_FOOT_LIMIT_YARDS, FOLLOW_CATCH_UP_YARDS, FETCH_CEILING_SECONDS};
+    CATCH_UP_FOOT_LIMIT_YARDS, FOLLOW_CATCH_UP_YARDS, FETCH_CEILING_SECONDS,
+    FOLLOW_CATCH_UP_DONE_YARDS};
+
+// A LONE MEMBER IS NOT WALKED DOWN A LEG THAT KEEPS KILLING IT (#697). The
+// numbers and the argument are on OverseerDecisions::LoneLegLimits; the two
+// distances are the catch-up walk's own starting line, read rather than
+// written again: a walk shorter than that is the family's doorstep.
+constexpr OverseerDecisions::LoneLegLimits LONE_LEG_LIMITS{
+    3, 30 * 60, FOLLOW_CATCH_UP_YARDS, 3, 120.f, FOLLOW_CATCH_UP_YARDS};
+
+// HOW FAR A MEMBER MOVES BEFORE ITS LEG IS READ AGAIN (#697). The ground
+// reading is one pass over every creature spawn in the world, so it is taken
+// when the aim changes or the member has moved this far since the last one,
+// which is what a flight landing or a hearth does, and not on every poll.
+constexpr float LONE_LEG_REREAD_YARDS = 500.0f;
 
 // Upstream's own fuse on MoveFarTo's stuck teleport: `stuckTime`, 90 seconds
 // (NewRpgBaseAction.h:76). Named here so the log line that reports the
@@ -6245,6 +6261,10 @@ public:
             // where a kept item should sit changes with a level or a banker.
             ReloadKeepReservations();
             KeepReservedItems();
+            // On the five second clock rather than the party's thirty, because
+            // what it catches is a walk to a flight master that takes seconds
+            // (#697). See KeepTownLeadersGrounded.
+            KeepTownLeadersGrounded();
         }
         if (_partyTimer >= PARTY_POLL_MS)
         {
@@ -18525,6 +18545,15 @@ private:
         // refusal always speaks. One field for both refusals, for the reason
         // that constant gives.
         time_t badGroundSaid{0};
+        // THE LAST READING OF THE GROUND ON THIS CATCH-UP'S LEG (#697): the aim
+        // it was read toward, where the member stood, and what JudgeRoute said
+        // at LONE_LEG_LIMITS. Read again when the aim changes or the member has
+        // moved LONE_LEG_REREAD_YARDS, because the reading is one pass over
+        // every creature spawn. Meaningful only while `catchUp`.
+        std::string legReadAim;
+        float legReadX{0.f};
+        float legReadY{0.f};
+        OverseerDecisions::RouteVerdict legGround;
     };
     std::map<std::string, DungeonEscort> _dungeonEscorts;
 
@@ -18611,8 +18640,59 @@ private:
     // EndFarHold. See CATCH_UP_FOOT_LIMIT_YARDS.
     std::map<std::string, time_t> _catchUpHeldFar;
 
+    // ...AND WHICH OF THEM ARE HELD OFF A LETHAL LEG RATHER THAN FOR THE
+    // DISTANCE (#697). Written beside `_catchUpHeldFar` by the travel drive
+    // when DecideLoneLeg says the walk is not to be taken, and erased with it
+    // by EndFarHold. Such a hold lifts when the leader is beside the member
+    // (FOLLOW_CATCH_UP_DONE_YARDS) rather than at the foot limit, because the
+    // ground in between is what killed it; the fetch arrives on the same line.
+    struct LethalLegHold
+    {
+        OverseerDecisions::LoneLegReason why{OverseerDecisions::LoneLegReason::None};
+        // Its bind is beside the family and the stone was ready: hearth it.
+        bool hearth{false};
+        // The hearth was cast (or refused), so it is not cast again.
+        bool hearthTried{false};
+        bool hearthCast{false};
+    };
+    std::map<std::string, LethalLegHold> _lethalLegHeld;
+
+    // EACH MEMBER'S DEATHS ON A WALK TO ITS FAMILY (#697), as epoch seconds.
+    // Written by FlushDeaths for a member whose catch-up walk was running when
+    // it died, whatever that walk's aim string was: the errand death breaker
+    // counts one aim at a time, and a catch-up is aimed again every time the
+    // leader moves, so this is the only count that sees the same leg kill the
+    // same member three times. Pruned to LONE_LEG_LIMITS.windowSeconds on
+    // every read. Lost on a restart, which costs the count and no correctness:
+    // the ground reading does not depend on it.
+    std::map<std::string, std::vector<int64_t>> _familyLegDeaths;
+
+    uint32 FamilyLegDeaths(std::string const& name)
+    {
+        auto const it = _familyLegDeaths.find(name);
+        if (it == _familyLegDeaths.end())
+            return 0;
+        int64_t const now = static_cast<int64_t>(std::time(nullptr));
+        std::vector<int64_t>& times = it->second;
+        times.erase(std::remove_if(times.begin(), times.end(),
+                                   [now](int64_t at)
+                                   { return now - at >= LONE_LEG_LIMITS.windowSeconds; }),
+                    times.end());
+        uint32 const count =
+            OverseerDecisions::LoneLegDeathsInWindow(times, now, LONE_LEG_LIMITS);
+        if (times.empty())
+            _familyLegDeaths.erase(it);
+        return count;
+    }
+
+    bool HeldOffLethalLeg(std::string const& name) const
+    {
+        return _lethalLegHeld.count(name) != 0;
+    }
+
     void EndFarHold(std::string const& name, char const* why)
     {
+        _lethalLegHeld.erase(name);
         if (!_catchUpHeldFar.erase(name))
             return;
         ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false), why,
@@ -18700,6 +18780,66 @@ private:
     // and this is the half that takes back a strategy granted before the wait.
     // The job the town-hold decisions read for `name`: TOWN_HOLD_JOB while its
     // family waits in town, and "" (questing) otherwise.
+    // A FAMILY WAITING IN TOWN IS NOT FLOWN AWAY BY ITS LEADER (#697).
+    //
+    // The party poll takes `new rpg` off a town leader with no errand
+    // (LeaderCarriesNewRpg), but that poll is thirty seconds apart, and the
+    // strategy comes back between polls whenever a hold or an errand that took
+    // it ends. Measured 2026-09-24: the Horde leader's regroup hold ended at
+    // 11:49:06 and gave it back, his vendor errand ended a second later, and by
+    // the next party poll he was in the air to Zoram'gar Outpost, with the
+    // family walking after him into Ashenvale. Upstream rolls that flight from
+    // idle, and it begins with a walk to a flight master, which this five
+    // second poll can still catch on the ground. A leader already in the air
+    // is said once and left: stopping a taxi mid-route is a teleport.
+    void KeepTownLeadersGrounded()
+    {
+        std::set<std::string> airborne;
+        for (std::string const& name : _heldInTown)
+        {
+            Player* const leader = ObjectAccessor::FindPlayerByName(name);
+            if (!leader || !leader->IsInWorld() || !leader->GetGroup() ||
+                !LeadsItsParty(leader) || leader->GetGroup()->GetMembersCount() < 2)
+                continue;
+            PlayerbotAI* const ai = SteerableAI(leader);
+            if (!ai)
+                continue;
+            bool const onErrand = !_travelAims.TargetFor(name).empty() || IsEscorted(name);
+            bool const mayCarry =
+                OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(name), onErrand);
+            OverseerDecisions::UnissuedFlightStep const step =
+                OverseerDecisions::TownLeaderUnissuedFlight(
+                    mayCarry, ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT,  // NewRpgInfo.h:99
+                    onErrand, leader->IsInFlight());
+            if (step == OverseerDecisions::UnissuedFlightStep::Cancel)
+            {
+                ai->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
+                if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' leads a family waiting in town with no errand and "
+                         "was walking to a flight master on a flight this module did not "
+                         "issue - the flight is called off and `new rpg` taken off, so the "
+                         "family is not led to another zone by a random status (#697)",
+                         name);
+            }
+            else if (step == OverseerDecisions::UnissuedFlightStep::Airborne)
+            {
+                airborne.insert(name);
+                if (!_townLeaderAirborneSaid.count(name))
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' leads a family waiting in town and is already "
+                             "in the air on a flight this module did not issue - it cannot "
+                             "be stopped without a teleport, so the family will follow it "
+                             "to wherever it lands (#697)",
+                             name);
+            }
+        }
+        _townLeaderAirborneSaid.swap(airborne);
+    }
+    // Said once per flight: the names the last poll found airborne.
+    std::set<std::string> _townLeaderAirborneSaid;
+
     std::string TownJobFor(std::string const& name) const
     {
         return _heldInTown.count(name) ? std::string(OverseerDecisions::TOWN_HOLD_JOB)
@@ -18998,6 +19138,95 @@ private:
         return started;
     }
 
+    // WHAT STANDS ON THE LINE FROM A CATCHING-UP MEMBER TO ITS FAMILY (#697),
+    // at LONE_LEG_LIMITS. The straight line and not the surveyed route, for
+    // the reason the travel resolve's own walk reading gives (#300): the route
+    // is planned after this is asked, and an unread stretch can only hide a
+    // danger, never invent one. Kept on the escort and read again only when
+    // the aim changes or the member has moved LONE_LEG_REREAD_YARDS, because
+    // it is one pass over every creature spawn in the world.
+    OverseerDecisions::RouteVerdict ReadLoneLegGround(Player* bot, DungeonEscort& escort,
+                                                      std::string const& aim, float toX,
+                                                      float toY)
+    {
+        float const fromX = bot->GetPositionX();
+        float const fromY = bot->GetPositionY();
+        float const movedX = fromX - escort.legReadX;
+        float const movedY = fromY - escort.legReadY;
+        if (escort.legReadAim == aim &&
+            movedX * movedX + movedY * movedY <
+                LONE_LEG_REREAD_YARDS * LONE_LEG_REREAD_YARDS)
+            return escort.legGround;
+
+        escort.legReadAim = aim;
+        escort.legReadX = fromX;
+        escort.legReadY = fromY;
+        escort.legGround = OverseerDecisions::RouteVerdict{};
+
+        float const dx = toX - fromX;
+        float const dy = toY - fromY;
+        float const span = std::sqrt(dx * dx + dy * dy);
+        OverseerDecisions::RouteSampling const plan = OverseerDecisions::PlanRouteSamples(
+            span, TRAVEL_WALK_SAMPLE_YARDS, TRAVEL_WALK_MAX_YARDS);
+        if (!plan.samples || span <= 0.f)
+            return escort.legGround;
+        std::vector<std::pair<float, float>> points;
+        points.reserve(plan.samples);
+        for (std::size_t n = 0; n < plan.samples; ++n)
+        {
+            float const t = OverseerDecisions::RouteSampleAt(plan, n) / span;
+            points.emplace_back(fromX + dx * t, fromY + dy * t);
+        }
+        std::vector<NearbyThreat> ground;
+        HostileSpawnsNearEach(bot, bot->GetMapId(), points, TRAVEL_THREAT_RADIUS,
+                              bot->GetLevel() + LONE_LEG_LIMITS.levelGap - 1, false, ground);
+        OverseerDecisions::RouteReading reading;
+        reading.characterLevel = bot->GetLevel();
+        reading.sampleSpacingYards = plan.spacingYards;
+        reading.worstLevelAtSample.reserve(ground.size());
+        for (NearbyThreat const& threat : ground)
+            reading.worstLevelAtSample.push_back(threat.level);
+        escort.legGround = OverseerDecisions::JudgeRoute(
+            reading, OverseerDecisions::LoneLegRouteLimits(LONE_LEG_LIMITS));
+        return escort.legGround;
+    }
+
+    // ONE POLL'S VERDICT ON A CATCH-UP LEG (#697): the member's deaths on
+    // walks to its family, the ground on the line to it, its own hearthstone,
+    // and whether the family is about to meet at its inn. The ground is not
+    // read when the deaths already decide, and the family's run is looked up
+    // only when the answer is not to walk.
+    OverseerDecisions::LoneLegVerdict JudgeLoneLeg(std::string const& name, Player* bot,
+                                                   DungeonEscort& escort,
+                                                   std::string const& aim,
+                                                   WorldPosition const& to, float legYards)
+    {
+        OverseerDecisions::LoneLegFacts facts;
+        facts.legYards = legYards;
+        if (legYards <= LONE_LEG_LIMITS.minLegYards)
+            return OverseerDecisions::DecideLoneLeg(facts, LONE_LEG_LIMITS);
+        facts.legDeaths = FamilyLegDeaths(name);
+        if (facts.legDeaths < LONE_LEG_LIMITS.deaths)
+            facts.ground = ReadLoneLegGround(bot, escort, aim, to.GetPositionX(),
+                                             to.GetPositionY());
+        uint32 const stone = HearthstoneSpellOf(bot);
+        facts.hearthReady = stone && !bot->HasSpellCooldown(stone);
+        if (bot->m_homebindMapId == bot->GetMapId())
+        {
+            float const bx = bot->m_homebindX - to.GetPositionX();
+            float const by = bot->m_homebindY - to.GetPositionY();
+            facts.bindYardsFromLeader = std::sqrt(bx * bx + by * by);
+        }
+        OverseerDecisions::LoneLegVerdict verdict =
+            OverseerDecisions::DecideLoneLeg(facts, LONE_LEG_LIMITS);
+        if (verdict.step == OverseerDecisions::LoneLegStep::Walk)
+            return verdict;
+        auto const coord = _dungeonRunCoordinators.find(FamilyOfCharacter(name));
+        facts.hearthRegroupInPlay =
+            coord != _dungeonRunCoordinators.end() && RecoveryBringsTheFamily(coord->second);
+        return OverseerDecisions::DecideLoneLeg(facts, LONE_LEG_LIMITS);
+    }
+
     // Ends a catch-up the party's clock has stopped marking - the same shape
     // as SweepDungeonEscorts, for the entries that sweep leaves alone. The
     // ordinary end is DriveCatchUp's own, on the poll that measures the gap
@@ -19172,8 +19401,18 @@ private:
         // THE ORDINARY END OF A TOO-FAR HOLD: the leader came back within the
         // line. Asked before every return below so a follower back in
         // formation is let go on the first poll that sees it.
-        if (!split && gap <= CATCH_UP_FOOT_LIMIT_YARDS)
-            EndFarHold(name, "the leader is back within the line a catch-up may walk");
+        //
+        // ...AND A MEMBER HELD OFF A LETHAL LEG ONLY WHEN THE LEADER IS BESIDE
+        // IT (#697). The foot limit is 1,500 yards, and the ground inside it is
+        // the ground that kept killing it; `follow` takes it from beside him.
+        bool const lethalLeg = HeldOffLethalLeg(name);
+        float const holdLifts =
+            lethalLeg ? FOLLOW_CATCH_UP_DONE_YARDS : CATCH_UP_FOOT_LIMIT_YARDS;
+        if (!split && gap <= holdLifts)
+            EndFarHold(name, lethalLeg
+                                 ? "the leader is beside it, so it follows the family from "
+                                   "here rather than walking the leg that kept killing it"
+                                 : "the leader is back within the line a catch-up may walk");
 
         auto const it = _dungeonEscorts.find(name);
         bool const escorted = it != _dungeonEscorts.end();
@@ -19342,17 +19581,59 @@ private:
             auto const heldFar = _catchUpHeldFar.find(name);
             if (heldFar != _catchUpHeldFar.end())
             {
+                auto const lethal = _lethalLegHeld.find(name);
+                // ITS OWN HEARTHSTONE, WHEN IT LANDS BESIDE THE FAMILY (#697).
+                // Cast here rather than on the poll that held it: the hold has
+                // stopped it since, and a moving character refuses the cast.
+                // Once. A hearth that went out and landed ends the hold, and
+                // what follows is a doorstep walk the leg rule does not judge.
+                if (lethal != _lethalLegHeld.end() && lethal->second.hearth)
+                {
+                    if (!lethal->second.hearthTried && !HearthPendingFor(name))
+                    {
+                        lethal->second.hearthTried = true;
+                        char const* status = "error";
+                        std::string evidence;
+                        char const* const refusal =
+                            DoHearth(p, "use", status, evidence, _pendingHearths, 0);
+                        lethal->second.hearthCast = !refusal || !*refusal;
+                        if (lethal->second.hearthCast)
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' hearths to its bind beside the family "
+                                     "instead of walking the leg that {} (#697)",
+                                     name, OverseerDecisions::LoneLegReasonWord(
+                                               lethal->second.why));
+                        else
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' could not hearth to its family ({}) - it "
+                                     "stays held where it stands and its leader goes back for "
+                                     "it (#697)",
+                                     name, refusal);
+                    }
+                    else if (lethal->second.hearthCast && !HearthPendingFor(name))
+                    {
+                        EndFarHold(name, "its hearthstone has had its turn, and from its "
+                                         "bind the family is a doorstep away");
+                        return;
+                    }
+                }
                 if (OverseerDecisions::FarCatchUpStaysHeld(
-                        gap, CATCH_UP_FOOT_LIMIT_YARDS, std::time(nullptr) - heldFar->second,
+                        gap, holdLifts, std::time(nullptr) - heldFar->second,
                         CATCH_UP_FAR_HOLD_SECONDS))
                 {
                     HoldFarFromLeader(p, name);
                     _catchUpRefused[name] =
-                        "it is held where it stands, too far from the leader to walk and "
-                        "with no flight that carries it";
+                        lethal != _lethalLegHeld.end()
+                            ? std::string("it is held where it stands because ") +
+                                  OverseerDecisions::LoneLegReasonWord(lethal->second.why) +
+                                  ", and its leader comes back for it"
+                            : std::string("it is held where it stands, too far from the "
+                                          "leader to walk and with no flight that carries it");
                     return;
                 }
-                EndFarHold(name, "the hold is due to ask the flight again");
+                EndFarHold(name, lethal != _lethalLegHeld.end()
+                                     ? "the hold is due to judge the leg again"
+                                     : "the hold is due to ask the flight again");
             }
         }
         // And a follower held after a revival is standing still on purpose,
@@ -20034,6 +20315,7 @@ private:
                 facts.targetYards = target->GetDistance2d(leader);
             facts.aimRefused = !fetch.refusal.empty();
             facts.fetchingForSeconds = std::time(nullptr) - fetch.since;
+            facts.targetHeldOffLethalLeg = HeldOffLethalLeg(fetch.target);
             OverseerDecisions::FetchStep const step =
                 OverseerDecisions::ReadFetch(facts, FETCH_LIMITS);
             switch (step)
@@ -20045,8 +20327,12 @@ private:
                     // one finds the family regrouping and waits for it.
                     EndFetch(leaderName,
                              "it is " + std::to_string(static_cast<uint32>(facts.targetYards)) +
-                                 " yards away, back within the line a catch-up may walk, "
-                                 "so its hold lifts and it walks the rest");
+                                 (facts.targetHeldOffLethalLeg
+                                      ? std::string(" yards away, beside the family, so its hold "
+                                                    "lifts and it follows (#697)")
+                                      : std::string(" yards away, back within the line a "
+                                                    "catch-up may walk, so its hold lifts and "
+                                                    "it walks the rest")));
                     return;
                 case OverseerDecisions::FetchStep::GiveUp:
                     EndFetch(leaderName,
@@ -20117,6 +20403,7 @@ private:
             member.sameMap = member.seen && p->GetMapId() == leader->GetMapId();
             member.alive = p->IsAlive();
             member.heldTooFar = HeldWaitingForLeader(member.name);
+            member.heldOffLethalLeg = HeldOffLethalLeg(member.name);
             member.stoodDown = WithinFetchStandDown(member.name);
             if (member.sameMap)
                 member.yards = p->GetDistance2d(leader);
@@ -20141,14 +20428,18 @@ private:
         fetch.target = pick;
         fetch.since = std::time(nullptr);
         fetch.wanted = true;
+        bool const lethalLeg = HeldOffLethalLeg(pick);
         LOG_WARN("module.overseer",
                  "overseer: '{}' goes back for '{}', which is held {} yards away because "
-                 "that is too far to walk and no flight carries it - the leader walks or "
+                 "{} - the leader walks or "
                  "flies to where it stands and the family comes with him, rather than "
                  "carrying on without it. The hold lifts within {} yards; the fetch gives "
                  "up after {} minutes{}",
                  leaderName, pick, static_cast<uint32>(target->GetDistance2d(leader)),
-                 static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS),
+                 lethalLeg ? OverseerDecisions::LoneLegReasonWord(_lethalLegHeld[pick].why)
+                           : "that is too far to walk and no flight carries it",
+                 static_cast<uint32>(lethalLeg ? FOLLOW_CATCH_UP_DONE_YARDS
+                                               : CATCH_UP_FOOT_LIMIT_YARDS),
                  static_cast<uint32>(FETCH_CEILING_SECONDS / 60),
                  runAnswer == OverseerDecisions::FetchRunAnswer::RegatherFirst
                      ? ", and the dungeon run at BARRIER goes back to GATHERING to let "
@@ -22491,6 +22782,49 @@ private:
                     _dungeonEscorts.erase(walk);
                     HoldFarFromLeader(bot, name);
                     continue;
+                }
+
+                // A LONE MEMBER IS NOT WALKED DOWN A LEG THAT KEEPS KILLING IT
+                // (#697). Asked only once the walk is what is left - inside the
+                // foot limit, or after a flight carried it - so a flight a known
+                // route offers has already been taken, and what this judges is
+                // the walk from here. The measured case was a flight that
+                // landed 3,442 yards short and a walk across Ashenvale from it.
+                if (far == OverseerDecisions::FarCatchUpStep::Walk)
+                {
+                    OverseerDecisions::LoneLegVerdict const lone =
+                        JudgeLoneLeg(name, bot, walk->second, target, pos, distance);
+                    if (lone.step != OverseerDecisions::LoneLegStep::Walk)
+                    {
+                        OverseerDecisions::RouteVerdict const ground = walk->second.legGround;
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is {} yards from its family on its catch-up "
+                                 "walk to '{}', and {} - {} death(s) on walks to its family "
+                                 "in the last {} minutes, and the line to it crosses {} "
+                                 "unbroken yards of ground at level {} or more (worst {}). "
+                                 "It is not walked down that leg: its walk ends and it is "
+                                 "held where it stands ({}), and its leader goes back for it "
+                                 "with the family once the rest are gathered. The hold "
+                                 "lifts when the leader is within {} yards (#697)",
+                                 name, static_cast<uint32>(distance), target,
+                                 OverseerDecisions::LoneLegReasonWord(lone.why),
+                                 FamilyLegDeaths(name),
+                                 static_cast<uint32>(LONE_LEG_LIMITS.windowSeconds / 60),
+                                 static_cast<uint32>(ground.longestLethalRunYards),
+                                 bot->GetLevel() + LONE_LEG_LIMITS.levelGap, ground.worstLevel,
+                                 OverseerDecisions::LoneLegStepWord(lone.step),
+                                 static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS));
+                        _catchUpHeldFar[name] = std::time(nullptr);
+                        LethalLegHold& held = _lethalLegHeld[name];
+                        held = LethalLegHold{};
+                        held.why = lone.why;
+                        held.hearth = lone.step == OverseerDecisions::LoneLegStep::Hearth;
+                        // `state` IS DEAD AFTER THIS, as on the hold above.
+                        EndOneEscort(name, walk->second.granted);
+                        _dungeonEscorts.erase(walk);
+                        HoldFarFromLeader(bot, name);
+                        continue;
+                    }
                 }
             }
 
@@ -31382,6 +31716,10 @@ private:
         {
             if (name == leaderName)
                 continue;
+            // Asked before anything can `continue` past it: a member held off
+            // a lethal leg is the fact whatever else is true of it (#697).
+            if (HeldOffLethalLeg(name))
+                facts.memberHeldOffLethalLeg = true;
             Player* const bot = ObjectAccessor::FindPlayerByName(name);
             if (!SteerableAI(bot))
             {
@@ -41391,6 +41729,27 @@ private:
 
         if (batch.empty())
             return;
+
+        // A DEATH ON THE WALK TO THE FAMILY IS COUNTED AGAINST THE LEG (#697),
+        // not against the aim it happened to carry. Asked here, on the world
+        // thread and within a DEATH_FLUSH_MS of the death, while the catch-up
+        // that was walking the member is still standing: DriveCatchUp keeps a
+        // dead member's walk and re-aims it after the revival. A leader going
+        // back for a member rides the same lease and is not counted: he walks
+        // with the family, which is the answer this count exists to reach.
+        for (PendingDeath const& d : batch)
+            if (IsCatchingUp(d.characterName) && !LeaderIsFetching(d.characterName))
+            {
+                std::vector<int64_t>& times = _familyLegDeaths[d.characterName];
+                times.push_back(static_cast<int64_t>(std::time(nullptr)));
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' died on its catch-up walk to its family - {} "
+                         "death(s) on that walk in the last {} minutes; at {} it is held "
+                         "rather than walked down it again (#697)",
+                         d.characterName, FamilyLegDeaths(d.characterName),
+                         static_cast<uint32>(LONE_LEG_LIMITS.windowSeconds / 60),
+                         LONE_LEG_LIMITS.deaths);
+            }
 
         std::ostringstream ss;
         ss << "INSERT INTO overseer_death (character_name, character_guid, level, "

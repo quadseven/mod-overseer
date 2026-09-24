@@ -2822,6 +2822,10 @@ struct RunFailureFacts
     // group of five for its campaign's dungeon now.
     bool dungeonFinderReady{false};
     std::string dungeonFinderNote;
+    // A member is held where it stands because the walk to its family kept
+    // killing it or crosses ground well above its level (#697). A regroup
+    // wait cannot bring it in, and a hearth regroup can.
+    bool memberHeldOffLethalLeg{false};
 };
 
 // Yards past which a leader is "far" from the staging point: a walk that long
@@ -6270,6 +6274,33 @@ bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
 // status (a flight, a far grind spot, a camp) and the family is left behind.
 bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand);
 
+// A FLIGHT THE LEADER DID NOT ASK FOR TAKES THE FAMILY'S LEADER AWAY (#697).
+// Measured on the dev realm 2026-09-24: the Horde family waited in Orgrimmar
+// on its Ragefire campaign. At 11:49:06 the regroup hold on the leader ended
+// and handed `new rpg` back, at 11:49:07 his vendor errand ended, and the
+// party poll that takes the strategy off a town leader with no errand came
+// at 11:49:36. In those thirty seconds the leader took off. Nothing in this
+// module flew him (every flight it issues is said), which leaves upstream's
+// own RPG_TRAVEL_FLIGHT, rolled from idle: it picks a random zone in the bot's
+// level bracket when a flight master is within 500 yards, and the leader stood
+// about 50 yards from Orgrimmar's. His positions on the death rows read (730,-3613) at 11:50, (246,-2360) at 11:51, (2501,-1102) at 11:53
+// and Zoram'gar Outpost at 11:55. The family followed him to Ashenvale, and
+// that is the ground the member of #697 kept dying on.
+//
+// So a flight status the module did not issue is cancelled on a leader that
+// may not carry `new rpg` (LeaderCarriesNewRpg false), as long as it is still
+// on the ground. One already in the air is past saving without a teleport and
+// is only said.
+enum class UnissuedFlightStep : std::uint8_t
+{
+    Leave,    // not a flight, not this leader's to stop, or the module's own
+    Cancel,   // on the ground and walking to a flight master: back to idle
+    Airborne, // already flying: said, not stopped
+};
+
+UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTravelFlight,
+                                            bool moduleIssuedFlight, bool inFlight);
+
 // SplitFollowerDrivesItself for a family in town. A cut-off follower on an
 // errand of its own still runs it; one with an empty column stands where it is
 // instead of levelling there, because the family is waiting for it and a town
@@ -6634,6 +6665,11 @@ struct FetchCandidate
     bool alive{false};
     // The too-far-to-walk hold is in force on it, waiting for this leader.
     bool heldTooFar{false};
+    // ...and it is held because the walk itself kept killing it or crosses
+    // ground well above its level (#697), not because of the distance. Its
+    // hold lifts only when the leader is beside it, so it is gone back for
+    // until then rather than only until the foot limit.
+    bool heldOffLethalLeg{false};
     // It was fetched, or given up on, within the fetch stand-down.
     bool stoodDown{false};
     // How far from the leader, when `seen` and `sameMap`.
@@ -6650,6 +6686,11 @@ struct FetchLimits
     float gatheredYards{0.f};
     // How long one fetch may take, start to finish, before it is given up on.
     time_t ceilingSeconds{0};
+    // FOLLOW_CATCH_UP_DONE_YARDS. Where a fetch for a member held off a lethal
+    // leg arrives (#697): beside it, where `follow` takes it, because the
+    // ground between the foot limit and the member is the ground that killed
+    // it. Zero or negative reads as the foot limit.
+    float lethalArrivalYards{0.f};
 };
 
 // WHICH HELD MEMBER TO GO BACK FOR, OR NOBODY (empty).
@@ -6692,6 +6733,9 @@ struct FetchFacts
     // issue, so no aim at the member can be written.
     bool aimRefused{false};
     time_t fetchingForSeconds{0};
+    // The member is held off a lethal leg (#697): see
+    // FetchLimits::lethalArrivalYards.
+    bool targetHeldOffLethalLeg{false};
 };
 
 // THE ORDER IS THE BOUND. Anything that makes the fetch meaningless ends it
@@ -7714,6 +7758,114 @@ struct RouteVerdict
 // the guard fields below already carry and for the same reason: a caller that
 // did not measure has not made a claim.
 RouteVerdict JudgeRoute(RouteReading const& reading, RouteLimits const& limits);
+
+// ------------- a lone member is not walked down a leg that keeps killing it (#697) --
+//
+// MEASURED ON THE DEV REALM, 2026-09-24. A level 27-28 member was behind its
+// family in Ashenvale and was walked toward the leader by its catch-up walk.
+// It died about 37 times that day, most of them between 11:40 and 12:57 UTC
+// and two more at 13:43 and 13:47, to Ghostpaw Alphas (27-28), Wildthorn
+// Lurkers (28-29) and Searing Infernals (29-30). Each time it took the spirit
+// healer, and each time the walk aimed it at the leader again. The errand
+// death breaker never fired: it judges an errand over the errand's own life,
+// and a catch-up is aimed again whenever the leader moves, so every death
+// opened a fresh errand with a toll of zero.
+//
+// A player at that level does not walk alone through that ground to reach the
+// group. It waits where it is safe for the group to come back, takes a flight,
+// or hearths to where the group is. So a walk to the family is judged as a
+// LEG, whatever its aim string: the member's deaths on any walk to its family
+// inside the window, and the level of what stands along the straight line to
+// the family. A leg that fails either is not walked.
+struct LoneLegLimits
+{
+    // MORE THAN TWICE IN A SHORT WINDOW. Three is the errand breaker's count.
+    // The window is longer than that breaker's five minutes because the leg
+    // outlives any one aim: the measured deaths came every two to four
+    // minutes, and a held member asks again after CATCH_UP_FAR_HOLD_SECONDS
+    // (fifteen), which has to find the deaths still counted.
+    uint32_t deaths{3};
+    int64_t windowSeconds{30 * 60};
+    // A walk shorter than this is the family's doorstep and is not judged.
+    // FOLLOW_CATCH_UP_YARDS: the catch-up walk starts there.
+    float minLegYards{500.f};
+    // WELL ABOVE ITS LEVEL. Three levels is an orange con, the fight a lone
+    // character loses. JudgeRoute's party rule is ten levels over two hundred
+    // yards; a character alone gets less ground and fewer levels.
+    uint32_t levelGap{3};
+    // Unbroken ground holding something that far above it that a lone walker
+    // may still cross: four readings at the thirty yard spacing.
+    float lethalRunYards{120.f};
+    // A bind this close to the leader is a hearthstone that lands beside the
+    // family. FOLLOW_CATCH_UP_YARDS again: from there the ordinary walk is a
+    // doorstep.
+    float hearthNearYards{500.f};
+};
+
+// How many of `deathTimes` (epoch seconds) fall inside the window ending at
+// `now`. A time in the future is counted: the clock it came from is this one.
+uint32_t LoneLegDeathsInWindow(std::vector<int64_t> const& deathTimes, int64_t now,
+                               LoneLegLimits const& limits);
+
+// The RouteLimits a lone walker is judged by, so the ground reading and the
+// decision below cannot use two different numbers.
+RouteLimits LoneLegRouteLimits(LoneLegLimits const& limits);
+
+struct LoneLegFacts
+{
+    // How far the member still has to walk to its family.
+    float legYards{0.f};
+    // LoneLegDeathsInWindow over the member's deaths on walks to its family.
+    uint32_t legDeaths{0};
+    // JudgeRoute of the straight line from the member to the family, read at
+    // LoneLegRouteLimits. Unread is survivable, JudgeRoute's own convention.
+    RouteVerdict ground;
+    // It carries a hearthstone that is off cooldown.
+    bool hearthReady{false};
+    // Its bind to the leader, in yards, or negative when the bind is on
+    // another map or unread.
+    float bindYardsFromLeader{-1.f};
+    // The family's dungeon run has chosen, or is waiting out the backoff for,
+    // a recovery that brings the family together itself (a hearth regroup,
+    // the summon rung or the dungeon finder): that drive moves it.
+    bool hearthRegroupInPlay{false};
+};
+
+enum class LoneLegStep : std::uint8_t
+{
+    Walk,           // nothing against the leg: walk it as before
+    HearthRegroup,  // the family is meeting at its inn: stand still for that drive
+    Hearth,         // its bind is beside the family and the stone is ready
+    Wait,           // held where it stands; the leader comes back for it
+};
+
+enum class LoneLegReason : std::uint8_t
+{
+    None,
+    Deaths,   // it has died on walks to its family `deaths` times in the window
+    Ground,   // the line to its family crosses ground well above its level
+};
+
+struct LoneLegVerdict
+{
+    LoneLegStep step{LoneLegStep::Walk};
+    LoneLegReason why{LoneLegReason::None};
+};
+
+// THE ORDER IS THE PREFERENCE. The deaths are asked before the ground because
+// they need no theory of the danger. Then a hearth regroup, because the family
+// meeting at its inn is the regroup; then the member's own hearthstone, when it
+// lands beside the family; and otherwise it waits and the leader goes back for
+// it with the family, as a group. A flight is not a step here because it is
+// asked before this is: ConsiderFlight has already had its turn when the
+// travel drive asks, so what this judges is the walk that is left.
+LoneLegVerdict DecideLoneLeg(LoneLegFacts const& facts, LoneLegLimits const& limits);
+
+// "walk", "hearth regroup", "hearth", "wait".
+char const* LoneLegStepWord(LoneLegStep step);
+
+// The reason in words, for the log line and the regroup's refusal.
+char const* LoneLegReasonWord(LoneLegReason why);
 
 // One spawn of the wanted role standing on the character's own map. The
 // caller has already asked whether this character may interact with it, the
