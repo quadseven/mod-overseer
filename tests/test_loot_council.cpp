@@ -297,6 +297,23 @@ void SeatRoles()
     Expect(GearRoleForSeat(3, "damage") == GearRole::Ranged, "a hunter in a damage seat is ranged");
     Expect(GearRoleForSeat(8, "dps") == GearRole::Caster, "a mage in a dps seat is a caster");
     Expect(GearRoleForSeat(8, "") == GearRole::Unknown, "no seat is no opinion");
+    // A duty read off the talent tree beats the class rule.
+    Expect(GearRoleForSeat(5, "caster") == GearRole::Caster, "a Shadow priest's duty is caster");
+    Expect(GearRoleForSeat(11, "melee") == GearRole::Melee, "a Feral druid's duty is melee");
+    Expect(GearRoleForSeat(3, "ranged") == GearRole::Ranged, "a hunter's duty is ranged");
+    Expect(GearRoleForSeat(2, "main tank") == GearRole::Tank &&
+               GearRoleForSeat(2, "off tank") == GearRole::Tank,
+           "the main tank and an off tank tank");
+    Expect(GearRoleForSeat(5, "damage") == GearRole::Caster,
+           "a tree the site could not read is the class rule");
+
+    // Who the loot council gears first.
+    Expect(LootMainTank(true, true, true, "", false), "no named main tank: the tanking head");
+    Expect(!LootMainTank(true, false, true, "", false), "a head who does not tank is not");
+    Expect(LootMainTank(false, true, false, "main tank", true),
+           "a raid that names its main tank gears that raider first, family or not");
+    Expect(!LootMainTank(true, true, true, "off tank", true),
+           "and then the head in an off tank seat is an off tank");
     Expect(std::string(GearRoleName(GearRole::Tank)) == "tank", "role names are words");
     Expect(ClassWord(1) == "Warrior" && ClassWord(11) == "Druid", "class words");
     Expect(ClassWord(10).empty(), "no class 10");
@@ -366,9 +383,19 @@ void TheAdapterSeams()
                std::string::npos,
            "each candidate is told whether the drop is a piece for its role");
     Expect(module.find("candidates.back().tank && p->GetName() == family") != std::string::npos &&
-               module.find("candidates.back().tank && member->GetName() == family") !=
+               module.find("candidates.back().mainTank = OverseerDecisions::LootMainTank(") !=
                    std::string::npos,
-           "the family's head is its main tank on a roll and on master loot");
+           "the family's head is its main tank on a roll, and the raid's on master loot");
+    Expect(module.find("SELECT name, role, duty FROM overseer_raid_seat") != std::string::npos &&
+               module.find("SchemaHasColumns(\"overseer_raid_seat\", \"'duty'\", 1)") !=
+                   std::string::npos,
+           "a seat's duty is read where the realm has the column, and its role where not");
+
+    std::string const duty =
+        Read("data/sql/characters/base/2026_09_24_03_overseer_raid_seat_duty.sql");
+    Expect(duty.find("ADD COLUMN `duty` VARCHAR(16) NOT NULL DEFAULT ''") != std::string::npos &&
+               duty.find("INFORMATION_SCHEMA.COLUMNS") != std::string::npos,
+           "the duty column is added once, and a second apply is a no-op");
 
     std::string const patch =
         Read("patches/mod-playerbots/0015-a-module-can-steer-a-loot-roll-vote.patch");

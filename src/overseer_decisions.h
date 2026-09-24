@@ -4799,7 +4799,22 @@ char const* GearRoleName(GearRole role);
 // character the roster does not describe, so a guild raider is scored for the
 // job the lineup gave it. `classId` is the core's class id; a damage seat is
 // melee, ranged or caster by class.
+//
+// OR THE SEAT'S DUTY (`overseer_raid_seat`.`duty`, 2026_09_24_03), which the
+// site reads off the raider's talent tree: "main tank" and "off tank" tank,
+// "healer" heals, and "melee", "ranged" and "caster" are taken at their word,
+// so a Shadow priest is a caster and a Feral druid melee where the class rule
+// would guess. "damage" (a tree the site could not read) is the class rule.
 GearRole GearRoleForSeat(int classId, std::string const& seatRole);
+
+// The duty word the site writes for the raid's main tank.
+constexpr char const* RAID_DUTY_MAIN_TANK = "main tank";
+
+// IS THIS CANDIDATE THE MAIN TANK the loot council gears first? In a raid whose
+// seats name one (`raidNamesMainTank`), the one whose seat word is "main tank",
+// whether family or guild; otherwise the family's head, when the head tanks.
+bool LootMainTank(bool inFamily, bool tank, bool isHead, std::string const& seatWord,
+                  bool raidNamesMainTank);
 
 // Words for the council's question: the class ("Warrior") and the talent tree
 // a roster `spec_tab` names in the DBC's tab order ("Protection"). Empty for
