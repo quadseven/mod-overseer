@@ -6713,66 +6713,6 @@ private:
         sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
     }
 
-    // A FAMILY WAITING IN TOWN IS NOT FLOWN AWAY BY ITS LEADER (#697).
-    //
-    // The party poll takes `new rpg` off a town leader with no errand
-    // (LeaderCarriesNewRpg), but that poll is thirty seconds apart, and the
-    // strategy comes back between polls whenever a hold or an errand that took
-    // it ends. Measured 2026-09-24: the Horde leader's regroup hold ended at
-    // 11:49:06 and gave it back, his vendor errand ended a second later, and by
-    // the next party poll he was in the air to Zoram'gar Outpost, with the
-    // family walking after him into Ashenvale. Upstream rolls that flight from
-    // idle, and it begins with a walk to a flight master, which this five
-    // second poll can still catch on the ground. A leader already in the air
-    // is said once and left: stopping a taxi mid-route is a teleport.
-    void KeepTownLeadersGrounded()
-    {
-        std::set<std::string> airborne;
-        for (std::string const& name : _heldInTown)
-        {
-            Player* const leader = ObjectAccessor::FindPlayerByName(name);
-            if (!leader || !leader->IsInWorld() || !leader->GetGroup() ||
-                !LeadsItsParty(leader) || leader->GetGroup()->GetMembersCount() < 2)
-                continue;
-            PlayerbotAI* const ai = SteerableAI(leader);
-            if (!ai)
-                continue;
-            bool const onErrand = !_travelAims.TargetFor(name).empty() || IsEscorted(name);
-            bool const mayCarry =
-                OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(name), onErrand);
-            OverseerDecisions::UnissuedFlightStep const step =
-                OverseerDecisions::TownLeaderUnissuedFlight(
-                    mayCarry, ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT,  // NewRpgInfo.h:99
-                    onErrand, leader->IsInFlight());
-            if (step == OverseerDecisions::UnissuedFlightStep::Cancel)
-            {
-                ai->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
-                if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
-                    ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' leads a family waiting in town with no errand and "
-                         "was walking to a flight master on a flight this module did not "
-                         "issue - the flight is called off and `new rpg` taken off, so the "
-                         "family is not led to another zone by a random status (#697)",
-                         name);
-            }
-            else if (step == OverseerDecisions::UnissuedFlightStep::Airborne)
-            {
-                airborne.insert(name);
-                if (!_townLeaderAirborneSaid.count(name))
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' leads a family waiting in town and is already "
-                             "in the air on a flight this module did not issue - it cannot "
-                             "be stopped without a teleport, so the family will follow it "
-                             "to wherever it lands (#697)",
-                             name);
-            }
-        }
-        _townLeaderAirborneSaid.swap(airborne);
-    }
-    // Said once per flight: the names the last poll found airborne.
-    std::set<std::string> _townLeaderAirborneSaid;
-
     void KeepRosterAttended()
     {
         // The whole list is read every pass, because the event hooks need the
@@ -18840,6 +18780,66 @@ private:
     // and this is the half that takes back a strategy granted before the wait.
     // The job the town-hold decisions read for `name`: TOWN_HOLD_JOB while its
     // family waits in town, and "" (questing) otherwise.
+    // A FAMILY WAITING IN TOWN IS NOT FLOWN AWAY BY ITS LEADER (#697).
+    //
+    // The party poll takes `new rpg` off a town leader with no errand
+    // (LeaderCarriesNewRpg), but that poll is thirty seconds apart, and the
+    // strategy comes back between polls whenever a hold or an errand that took
+    // it ends. Measured 2026-09-24: the Horde leader's regroup hold ended at
+    // 11:49:06 and gave it back, his vendor errand ended a second later, and by
+    // the next party poll he was in the air to Zoram'gar Outpost, with the
+    // family walking after him into Ashenvale. Upstream rolls that flight from
+    // idle, and it begins with a walk to a flight master, which this five
+    // second poll can still catch on the ground. A leader already in the air
+    // is said once and left: stopping a taxi mid-route is a teleport.
+    void KeepTownLeadersGrounded()
+    {
+        std::set<std::string> airborne;
+        for (std::string const& name : _heldInTown)
+        {
+            Player* const leader = ObjectAccessor::FindPlayerByName(name);
+            if (!leader || !leader->IsInWorld() || !leader->GetGroup() ||
+                !LeadsItsParty(leader) || leader->GetGroup()->GetMembersCount() < 2)
+                continue;
+            PlayerbotAI* const ai = SteerableAI(leader);
+            if (!ai)
+                continue;
+            bool const onErrand = !_travelAims.TargetFor(name).empty() || IsEscorted(name);
+            bool const mayCarry =
+                OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(name), onErrand);
+            OverseerDecisions::UnissuedFlightStep const step =
+                OverseerDecisions::TownLeaderUnissuedFlight(
+                    mayCarry, ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT,  // NewRpgInfo.h:99
+                    onErrand, leader->IsInFlight());
+            if (step == OverseerDecisions::UnissuedFlightStep::Cancel)
+            {
+                ai->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
+                if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' leads a family waiting in town with no errand and "
+                         "was walking to a flight master on a flight this module did not "
+                         "issue - the flight is called off and `new rpg` taken off, so the "
+                         "family is not led to another zone by a random status (#697)",
+                         name);
+            }
+            else if (step == OverseerDecisions::UnissuedFlightStep::Airborne)
+            {
+                airborne.insert(name);
+                if (!_townLeaderAirborneSaid.count(name))
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' leads a family waiting in town and is already "
+                             "in the air on a flight this module did not issue - it cannot "
+                             "be stopped without a teleport, so the family will follow it "
+                             "to wherever it lands (#697)",
+                             name);
+            }
+        }
+        _townLeaderAirborneSaid.swap(airborne);
+    }
+    // Said once per flight: the names the last poll found airborne.
+    std::set<std::string> _townLeaderAirborneSaid;
+
     std::string TownJobFor(std::string const& name) const
     {
         return _heldInTown.count(name) ? std::string(OverseerDecisions::TOWN_HOLD_JOB)
