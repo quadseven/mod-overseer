@@ -45608,6 +45608,49 @@ private:
         return nullptr;
     }
 
+    // THE GUILD'S OWN MEMORY OF ITS BANK, WHICH THE CORE KEEPS PROTECTED
+    // (#496). `Guild::m_bankTabs` and `Guild::m_ranks` are `protected`, and
+    // every accessor over them (`_GetPurchasedTabsSize`, `GetBankTab`,
+    // `_GetRankBankTabRights`) is `private` at the pinned revision. The rows
+    // those vectors are saved to are written through CharacterDatabase's
+    // queued path, so a SELECT taken the instant after a purchase, a rank
+    // change or a rename can answer from before it - which is exactly how a
+    // paid-for tab was reported as a failure. The vectors are changed on the
+    // calling thread, before the handler returns, so they are the witness.
+    //
+    // A POINTER TO MEMBER TAKEN THROUGH A DERIVED CLASS is the standard's own
+    // way for a derived class to name a protected member of its base, and
+    // the pointer it yields has the base's type, so it applies to any Guild.
+    // Nothing is instantiated, nothing is written through it, and every call
+    // made on the elements (`GetName`, `GetIcon`, `GetBankTabRights`) is a
+    // public member of the element's class.
+    struct GuildBankMemory : Guild
+    {
+        static auto Tabs() { return &GuildBankMemory::m_bankTabs; }
+        static auto Ranks() { return &GuildBankMemory::m_ranks; }
+    };
+
+    static unsigned GuildPurchasedTabs(Guild const* guild)
+    {
+        return static_cast<unsigned>((guild->*GuildBankMemory::Tabs()).size());
+    }
+
+    // What the realm charges for bank tab `tabId`, from its own config - the
+    // switch `_GetGuildBankTabPrice` (Guild.cpp, file-static) makes.
+    static uint32 GuildBankTabPrice(unsigned tabId)
+    {
+        switch (tabId)
+        {
+            case 0: return sWorld->getIntConfig(CONFIG_GUILD_BANK_TAB_COST_0);
+            case 1: return sWorld->getIntConfig(CONFIG_GUILD_BANK_TAB_COST_1);
+            case 2: return sWorld->getIntConfig(CONFIG_GUILD_BANK_TAB_COST_2);
+            case 3: return sWorld->getIntConfig(CONFIG_GUILD_BANK_TAB_COST_3);
+            case 4: return sWorld->getIntConfig(CONFIG_GUILD_BANK_TAB_COST_4);
+            case 5: return sWorld->getIntConfig(CONFIG_GUILD_BANK_TAB_COST_5);
+            default: return 0;
+        }
+    }
+
     static char const* DoGuild(Player* who, std::string const& command,
                                std::string const& targetArg, char const*& status,
                                std::string& out)
@@ -46049,52 +46092,115 @@ private:
 
         if (request.verb == GuildVerb::BankBuyTab)
         {
+            using OverseerDecisions::GuildTabPurchase;
+            using OverseerDecisions::GuildTabPurchaseFacts;
+
             WorldSession* session = who->GetSession();
             if (!session)
                 return refuse("that character has no session to buy a guild bank tab through");
 
-            // The Guild cache owns the tab vector, but its count is private at
-            // this core revision. The table is the persisted witness available
-            // to the module: read it before and after the real handler, and do
-            // not claim success from a void method that may have refused.
-            QueryResult table = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM information_schema.tables "
-                "WHERE table_schema = DATABASE() AND table_name = 'guild_bank_tab'");
-            if (!table || table->Fetch()[0].Get<uint32>() == 0)
-                return refuse("the guild bank table is not installed on this realm (1146)");
+            // AT A VAULT, AS A PLAYER BUYS ONE. The client's purchase button
+            // lives in the guild bank window, which only opens at a Guild
+            // Vault; HandleBuyBankTab itself does not ask, so this does.
+            bool anyVaultInRange = false;
+            if (!GuildBankInReach(who, anyVaultInRange))
+                return refuse(anyVaultInRange
+                                  ? "a guild bank is nearby but this character cannot use it"
+                                  : "no guild bank in reach");
 
-            uint32 tabsBefore = 0;
-            if (QueryResult before = CharacterDatabase.Query(
-                    "SELECT COUNT(*) FROM guild_bank_tab WHERE guildid = {}",
-                    guild->GetId()))
-                tabsBefore = before->Fetch()[0].Get<uint32>();
-            else
-                return refuse("the guild bank table could not be read (1146)");
+            // FROM THE GUILD'S MEMORY, NOT FROM `guild_bank_tab` (#496). See
+            // GuildBankMemory, and GuildTabPurchaseVerdict for the witness.
+            GuildTabPurchaseFacts facts;
+            facts.tabsBefore = GuildPurchasedTabs(guild);
+            facts.price = GuildBankTabPrice(facts.tabsBefore);
+            facts.purseBefore = who->GetMoney();
+            int const wanted = request.bankTabNamed ? int(request.bankTab) : -1;
+            if (char const* why = OverseerDecisions::GuildTabPurchasePrecheck(
+                    facts.tabsBefore, wanted, facts.purseBefore, facts.price); *why)
+            {
+                std::ostringstream o;
+                o << "\"guild\":" << J(guild->GetName())
+                  << ",\"guild_id\":" << guild->GetId()
+                  << ",\"purchased_tabs\":" << facts.tabsBefore
+                  << ",\"price\":" << facts.price
+                  << ",\"purse\":" << facts.purseBefore;
+                note = o.str();
+                return refuse(why);
+            }
 
-            if (tabsBefore >= 8)
-                return refuse("the guild already has every bank tab");
+            guild->HandleBuyBankTab(session, static_cast<uint8>(facts.tabsBefore));
 
-            guild->HandleBuyBankTab(session, static_cast<uint8>(tabsBefore));
-
-            uint32 tabsAfter = 0;
-            if (QueryResult after = CharacterDatabase.Query(
-                    "SELECT COUNT(*) FROM guild_bank_tab WHERE guildid = {}",
-                    guild->GetId()))
-                tabsAfter = after->Fetch()[0].Get<uint32>();
-            else
-                return refuse("the guild bank table disappeared while buying the tab (1146)");
-
-            if (tabsAfter != tabsBefore + 1)
-                return refuse("the core did not buy the next guild bank tab");
+            facts.tabsAfter = GuildPurchasedTabs(guild);
+            facts.purseAfter = who->GetMoney();
+            GuildTabPurchase const verdict = OverseerDecisions::GuildTabPurchaseVerdict(facts);
 
             std::ostringstream o;
             o << "\"guild\":" << J(guild->GetName())
               << ",\"guild_id\":" << guild->GetId()
-              << ",\"tab_id\":" << tabsBefore;
+              << ",\"tab_id\":" << facts.tabsBefore
+              << ",\"price\":" << facts.price
+              << ",\"purchased_tabs\":" << facts.tabsAfter
+              << ",\"purse_before\":" << facts.purseBefore
+              << ",\"purse_after\":" << facts.purseAfter;
             note = o.str();
-            LOG_INFO("module.overseer", "overseer: {} bought guild '{}' bank tab {}",
-                     who->GetName(), guild->GetName(), tabsBefore);
+
+            if (verdict == GuildTabPurchase::Refused)
+                return refuse("the core did not sell the next guild bank tab - it refused without moving money or tabs");
+            if (verdict == GuildTabPurchase::Unexplained)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) bank tab purchase by {} moved something "
+                         "a purchase does not explain - tabs {} -> {}, purse {} -> {}, price {}",
+                         guild->GetName(), guild->GetId(), who->GetName(), facts.tabsBefore,
+                         facts.tabsAfter, facts.purseBefore, facts.purseAfter, facts.price);
+                return refuse("the guild bank tab purchase moved tabs or money without the other - read the guild before asking again");
+            }
+
+            LOG_INFO("module.overseer",
+                     "overseer: {} bought guild '{}' ({}) bank tab {} for {} copper - the guild now has {} tab(s)",
+                     who->GetName(), guild->GetName(), guild->GetId(), facts.tabsBefore,
+                     facts.price, facts.tabsAfter);
             describe("bought", "");
+            status = "applied";
+            return "";
+        }
+
+        if (request.verb == GuildVerb::BankNameTab)
+        {
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to name a guild bank tab through");
+            if (guild->GetLeaderGUID() != who->GetGUID())
+                return refuse("only the guild master names the guild bank tabs");
+            bool anyVaultInRange = false;
+            if (!GuildBankInReach(who, anyVaultInRange))
+                return refuse(anyVaultInRange
+                                  ? "a guild bank is nearby but this character cannot use it"
+                                  : "no guild bank in reach");
+            auto const& tabs = guild->*GuildBankMemory::Tabs();
+            if (request.bankTab >= tabs.size())
+                return refuse("the guild has not bought that bank tab");
+
+            // The same call CMSG_GUILD_BANK_UPDATE_TAB makes. BankTab::SetInfo
+            // sets the name in memory and queues its save, so the tab's own
+            // name, read back, is the witness.
+            guild->HandleSetBankTabInfo(session, request.bankTab, request.bankTabName,
+                                        request.bankTabIcon);
+            auto const& tab = tabs[request.bankTab];
+            if (tab.GetName() != request.bankTabName || tab.GetIcon() != request.bankTabIcon)
+                return refuse("the core did not rename the guild bank tab");
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"tab\":" << unsigned(request.bankTab)
+              << ",\"name\":" << J(request.bankTabName)
+              << ",\"icon\":" << J(request.bankTabIcon);
+            note = o.str();
+            LOG_INFO("module.overseer", "overseer: {} named guild '{}' bank tab {} '{}'",
+                     who->GetName(), guild->GetName(), unsigned(request.bankTab),
+                     request.bankTabName);
+            describe("named", "");
             status = "applied";
             return "";
         }
@@ -46107,66 +46213,43 @@ private:
             if (guild->GetLeaderGUID() != who->GetGUID())
                 return refuse("only the guild master may change guild bank rights");
 
-            // HandleSetRankInfo replaces the whole rank record. Read every
-            // existing field first, then alter only the deposit bits for the
-            // purchased tabs. Missing tables are an old-realm condition, not
-            // a reason to turn the whole guild command endpoint into a 503.
-            QueryResult rank = CharacterDatabase.Query(
-                "SELECT rname, rights, BankMoneyPerDay FROM guild_rank "
-                "WHERE guildid = {} AND rid = {}", guild->GetId(), request.bankRankId);
-            if (!rank)
-                return refuse("the guild rank table is not installed or the rank does not exist (1146)");
-
-            QueryResult tabs = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM information_schema.tables "
-                "WHERE table_schema = DATABASE() AND table_name IN "
-                "('guild_bank_tab','guild_bank_right')");
-            if (!tabs || tabs->Fetch()[0].Get<uint32>() != 2)
-                return refuse("the guild bank rights tables are not installed on this realm (1146)");
-
-            QueryResult purchased = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM guild_bank_tab WHERE guildid = {}", guild->GetId());
-            if (!purchased)
-                return refuse("the guild bank tab table could not be read (1146)");
-            uint32 const purchasedTabs = purchased->Fetch()[0].Get<uint32>();
+            // FROM THE GUILD'S MEMORY, BEFORE AND AFTER (#496's lesson, which
+            // this verb had too). HandleSetRankInfo replaces the whole rank
+            // record, so every field is read first and only the deposit bits
+            // on the purchased tabs change. The rank's rows in `guild_rank`
+            // and `guild_bank_right` are saved on the queued path, so a tab
+            // bought a moment ago is missing from `guild_bank_tab` and a
+            // grant made a moment ago is missing from `guild_bank_right`; the
+            // Guild object has both the instant they happen.
+            auto const& ranks = guild->*GuildBankMemory::Ranks();
+            if (request.bankRankId >= ranks.size())
+                return refuse("the guild has no rank with that id");
+            unsigned const purchasedTabs = GuildPurchasedTabs(guild);
             if (purchasedTabs == 0)
                 return refuse("the guild has no purchased bank tab to open");
 
+            auto const& rank = ranks[request.bankRankId];
             std::array<GuildBankRightsAndSlots, GUILD_BANK_MAX_TABS> rightsAndSlots{};
             for (uint8 tabId = 0; tabId < GUILD_BANK_MAX_TABS; ++tabId)
-                rightsAndSlots[tabId] = GuildBankRightsAndSlots(tabId);
-
-            QueryResult existing = CharacterDatabase.Query(
-                "SELECT TabId, gbright, SlotPerDay FROM guild_bank_right "
-                "WHERE guildid = {} AND rid = {}", guild->GetId(), request.bankRankId);
-            if (existing)
-            {
-                do
-                {
-                    Field* row = existing->Fetch();
-                    uint32 const tabId = row[0].Get<uint32>();
-                    if (tabId < GUILD_BANK_MAX_TABS)
-                        rightsAndSlots[tabId] = GuildBankRightsAndSlots(
-                            static_cast<uint8>(tabId), row[1].Get<uint32>(), row[2].Get<uint32>());
-                } while (existing->NextRow());
-            }
+                rightsAndSlots[tabId] = GuildBankRightsAndSlots(
+                    tabId, uint8(rank.GetBankTabRights(tabId)),
+                    uint32(rank.GetBankTabSlotsPerDay(tabId)));
 
             uint8 const depositRights = GUILD_BANK_RIGHT_VIEW_TAB | GUILD_BANK_RIGHT_PUT_ITEM;
             for (uint32 tabId = 0; tabId < purchasedTabs && tabId < GUILD_BANK_MAX_TABS; ++tabId)
                 rightsAndSlots[tabId].SetRights(rightsAndSlots[tabId].GetRights() | depositRights);
 
-            Field* rankFields = rank->Fetch();
-            std::string const rankName = rankFields[0].Get<std::string>();
-            uint32 const generalRights = rankFields[1].Get<uint32>();
-            uint32 const moneyPerDay = rankFields[2].Get<uint32>();
+            std::string const rankName = rank.GetName();
+            uint32 const generalRights = rank.GetRights();
+            uint32 const moneyPerDay = rank.GetBankMoneyPerDay();
             guild->HandleSetRankInfo(session, request.bankRankId, rankName,
                                      generalRights, moneyPerDay, rightsAndSlots);
 
-            QueryResult witnessed = CharacterDatabase.Query(
-                "SELECT COUNT(*) FROM guild_bank_right WHERE guildid = {} AND rid = {} "
-                "AND TabId < {} AND (gbright & {}) = {}", guild->GetId(),
-                request.bankRankId, purchasedTabs, depositRights, depositRights);
-            uint32 const openedTabs = witnessed ? witnessed->Fetch()[0].Get<uint32>() : 0;
+            uint32 openedTabs = 0;
+            for (uint32 tabId = 0; tabId < purchasedTabs && tabId < GUILD_BANK_MAX_TABS; ++tabId)
+                if ((uint8(ranks[request.bankRankId].GetBankTabRights(uint8(tabId))) & depositRights)
+                    == depositRights)
+                    ++openedTabs;
             if (openedTabs != purchasedTabs)
                 return refuse("the core did not open every purchased bank tab for that rank");
 
@@ -46266,14 +46349,15 @@ private:
 
         if (request.verb == GuildVerb::BankDepositItem)
         {
-            // TAB 0 ONLY, v1 (infra#3647 - see GuildVerb::BankDepositItem's
-            // own comment). Multi-tab selection - "whichever tab has free
-            // slots and this rank can deposit into", the design doc's own
-            // phrasing (mod-overseer/docs/design/guild-bank-deposit.md) - is
-            // deferred rather than guessed at: it needs a real read of which
-            // tabs the family's guild has actually purchased, which this
-            // session had no way to verify against the live database.
-            static constexpr uint8 GUILD_BANK_DEPOSIT_TAB_V1 = 0;
+            // THE TAB THE ROW NAMED, TAB 0 WHEN IT NAMED NONE (#684).
+            // The caller chooses the tab, because which tab an item belongs
+            // in (materials, gear kept for later, raid supplies) is the
+            // guild's bank policy and not something the executor can see.
+            // A tab the guild has not bought is refused here by name rather
+            // than left to SwapItemsWithInventory's silent no-op.
+            uint8 const depositTab = request.bankTab;
+            if (depositTab >= GuildPurchasedTabs(guild))
+                return refuse("the guild has not bought that bank tab");
 
             WorldSession* session = who->GetSession();
             if (!session)
@@ -46315,6 +46399,24 @@ private:
             uint8 const srcBag = item->GetBagSlot();
             uint8 const srcSlot = item->GetSlot();
 
+            // HOW MUCH OF THIS ITEM THE TAB HOLDS, from the Guild object's own
+            // tab (GuildBankMemory, #684). Counted by entry rather than by
+            // guid because the core may merge the deposit into a stack that
+            // is already there, after which the deposited guid is gone.
+            auto tabHolds = [&]() -> uint32
+            {
+                auto const& tabs = guild->*GuildBankMemory::Tabs();
+                if (depositTab >= tabs.size())
+                    return 0;
+                uint32 held = 0;
+                for (uint8 slot = 0; slot < GUILD_BANK_MAX_SLOTS; ++slot)
+                    if (Item const* there = tabs[depositTab].GetItem(slot))
+                        if (there->GetEntry() == itemEntry)
+                            held += there->GetCount();
+                return held;
+            };
+            uint32 const tabHeldBefore = tabHolds();
+
             // READ BEFORE / WITNESS AFTER, the same discipline the money
             // branch above keeps. `SwapItemsWithInventory` is `void` and,
             // verified at the pinned core revision (Guild.cpp), silently
@@ -46327,7 +46429,7 @@ private:
             // item actually left the character's bags, the only way to tell
             // a real deposit from a refusal the core made without saying so.
             guild->SwapItemsWithInventory(who, /*toChar=*/false,
-                                           GUILD_BANK_DEPOSIT_TAB_V1, NULL_SLOT,
+                                           depositTab, NULL_SLOT,
                                            srcBag, srcSlot, /*splitedAmount=*/0);
 
             Item* stillCarried = FindCarriedItem(who, /*byGuid=*/true, itemGuid.GetCounter());
@@ -46340,60 +46442,31 @@ private:
                          "full",
                          guild->GetName(), guild->GetId(), itemGuid.GetCounter(), itemEntry,
                          itemName, itemCount, who->GetName(),
-                         uint32(GUILD_BANK_DEPOSIT_TAB_V1));
+                         uint32(depositTab));
                 return refuse("the core did not move the item - no purchased bank tab, "
                               "this rank cannot deposit into it, or the tab is full");
             }
 
-            // SECOND WITNESS (Grug - Elder, PR #452 review): absence from the
-            // character's bags is necessary but not sufficient - it does not
-            // prove the item landed IN the bank tab. A full tab or a
-            // rank-lacking deposit both no-op inside Guild::_MoveItems
-            // (Guild.cpp:2730 - an early `return` before either side is
-            // touched), so if the item is truly gone from both places this
-            // check is moot; the case this guards is the core leaving it
-            // somewhere neither of those two reads expects.
-            //
-            // The correct positive read would be the in-memory bank tab
-            // itself - Guild::GetBankTab(tabId)->GetItem(slotId) - but at the
-            // pinned core revision (mod-playerbots/azerothcore-wotlk@4796018)
-            // `GetBankTab` and `_GetItem` are both `private` on `Guild`
-            // (Guild.h:818 `private:`, :826, :863) with no `friend`
-            // declaration anywhere in the header (grepped, none). This module
-            // is not part of the core and cannot reach either one - there is
-            // no public Guild accessor that returns a bank tab's contents at
-            // this SHA.
-            //
-            // The only other read is `guild_bank_item`, the table this
-            // deposit's own INSERT (CHAR_INS_GUILD_BANK_ITEM) writes to. That
-            // INSERT rides the same CharacterDatabaseTransaction as the
-            // removal from the character and is committed through
-            // `DatabaseWorkerPool::CommitTransaction`, which *enqueues* the
-            // commit onto an async worker thread (DatabaseWorkerPool.cpp:257)
-            // rather than executing it before `SwapItemsWithInventory`
-            // returns. A query issued the instant control resumes here can
-            // race that commit, so a miss below is NOT proof the deposit
-            // failed - it is logged as unconfirmed, not refused on, and
-            // `status` stays "applied" on the absence check alone, exactly as
-            // it did before this check existed.
-            bool bankRowConfirmed = false;
-            if (QueryResult bankRow = CharacterDatabase.Query(
-                    "SELECT 1 FROM guild_bank_item WHERE guildid = {} AND TabId = {} "
-                    "AND item_guid = {}",
-                    guild->GetId(), uint32(GUILD_BANK_DEPOSIT_TAB_V1), itemGuid.GetCounter()))
-            {
-                bankRowConfirmed = true;
-            }
-            else
+            // SECOND WITNESS: THE TAB ITSELF. Absence from the character's
+            // bags proves the item left, not that it landed in the tab. The
+            // old second witness read `guild_bank_item`, which the deposit's
+            // transaction commits on another thread, so it could only ever
+            // say "not yet". The Guild object's tab is changed before
+            // SwapItemsWithInventory returns, and it is now in reach
+            // (GuildBankMemory), so the count of this entry in the tab is
+            // read again and must have grown by exactly the stack deposited.
+            uint32 const tabHeldAfter = tabHolds();
+            bool const bankRowConfirmed = tabHeldAfter >= tabHeldBefore
+                && tabHeldAfter - tabHeldBefore == itemCount;
+            if (!bankRowConfirmed)
             {
                 LOG_WARN("module.overseer",
                          "overseer: guild '{}' ({}) - item guid {} entry {} ({}) x{} left "
-                         "{}'s bags but guild_bank_item does not show it in tab {} yet - "
-                         "this deposit's own commit is async and may just be racing this "
-                         "read; reconcile manually if this guid never appears",
+                         "{}'s bags but bank tab {} holds {} of that entry where it held {} - "
+                         "the deposit did not land as one whole stack in that tab",
                          guild->GetName(), guild->GetId(), itemGuid.GetCounter(), itemEntry,
-                         itemName, itemCount, who->GetName(),
-                         uint32(GUILD_BANK_DEPOSIT_TAB_V1));
+                         itemName, itemCount, who->GetName(), uint32(depositTab),
+                         tabHeldAfter, tabHeldBefore);
             }
 
             std::ostringstream o;
@@ -46403,14 +46476,14 @@ private:
               << ",\"entry\":" << itemEntry
               << ",\"name\":" << J(itemName)
               << ",\"count\":" << itemCount
-              << ",\"tab\":" << uint32(GUILD_BANK_DEPOSIT_TAB_V1)
+              << ",\"tab\":" << uint32(depositTab)
               << ",\"bank_row_confirmed\":" << (bankRowConfirmed ? "true" : "false");
             note = o.str();
 
             LOG_INFO("module.overseer",
                      "overseer: {} deposited {} x{} (guid {}) into guild '{}' ({}) bank tab {}",
                      who->GetName(), itemName, itemCount, itemGuid.GetCounter(),
-                     guild->GetName(), guild->GetId(), uint32(GUILD_BANK_DEPOSIT_TAB_V1));
+                     guild->GetName(), guild->GetId(), uint32(depositTab));
 
             describe("deposited", "");
             status = "applied";

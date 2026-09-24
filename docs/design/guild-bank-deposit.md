@@ -158,3 +158,15 @@ selection (needs a real read of which tabs the guild has purchased - tab 0
 is a placeholder, not a decision), and wiring this into an automatic loop
 the way `_guild_bank_once` does for gold. See infra#3647 for the follow-up
 issue this is filed against.
+
+**Update 2026-09-24: tabs, and the witness read from memory (#684, #496).**
+The Guild object's tab and rank vectors are `protected`, and a pointer to
+member taken through a derived class (`GuildBankMemory` in
+`mod_overseer.cpp`) reaches them without a core change. Every guild-bank verb
+now witnesses from that memory rather than from rows the core commits on
+another thread: `buy-tab` from the tab count and the buyer's purse
+(`GuildTabPurchaseVerdict`), `grant-deposit` from the rank's tab rights, and
+`deposit-item` from the count of the entry in the tab. `deposit-item` takes
+`tab:N`, `buy-tab` takes `tab:N` and refuses any tab but the next one, and
+`name-tab tab:N icon:<icon> <name>` names a tab. Which item goes to which
+tab is the caller's policy, not the executor's.

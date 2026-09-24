@@ -14674,10 +14674,14 @@ enum class GuildVerb : std::uint8_t
     // acting character's purse. The core remains the authority for rank
     // rights and daily allowance, and the executor witnesses both balances.
     BankWithdraw,
-    // `bank buy-tab` - buy the next guild-bank tab through the core's own
-    // purchase handler. v1 intentionally has no tab argument: the core only
-    // accepts the next tab in order, and the executor reads that state from
-    // the guild-bank table before and after the call.
+    // `bank buy-tab` or `bank buy-tab tab:<n>` - buy the next guild-bank tab
+    // through the core's own purchase handler, at a guild vault, as a player
+    // does. The core only ever sells the next tab in order. `tab:<n>` names
+    // the tab the caller means to pay for, and the executor refuses when the
+    // next tab is any other one: a caller whose count is stale must never be
+    // sold the next, dearer tab instead (#496). The purchase is witnessed from
+    // the Guild object's own tab count and the buyer's purse, never from the
+    // `guild_bank_tab` row, which the core writes on another thread.
     BankBuyTab,
     // `bank grant-deposit rank:<id>` - preserve a rank's existing general
     // rights and money allowance while enabling item deposits on purchased
@@ -14701,7 +14705,18 @@ enum class GuildVerb : std::uint8_t
     // itself no-ops when `tabId >= _GetPurchasedTabsSize()`), never a crash
     // and never a partial move. Which tab, whether to try other tabs, and
     // withdraw are all explicitly deferred - see the design doc.
+    //
+    // A TAB MAY NOW BE NAMED (#684): `bank deposit-item
+    // guid:<n> tab:<t>` puts the item into tab `t`, so a guild can keep its
+    // materials, its gear for later and its raid supplies apart the way a
+    // raid guild's officers do. No `tab:` is tab 0, the v1 behaviour.
     BankDepositItem,
+    // `bank name-tab tab:<n> icon:<icon> <name>` - the guild master names a
+    // purchased tab at a vault, through the core's own
+    // Guild::HandleSetBankTabInfo, which is what the client's tab editor
+    // sends. The name is what a player sees on the tab; an organised bank is
+    // one whose tabs say what goes in them.
+    BankNameTab,
     // `raid` - the seating plan for the whole guild: who tanks, who heals, and
     // which of groups 1 through 8 each member stands in. READ-ONLY: it forms
     // nothing, moves nobody and changes no row, exactly the way `shortlist` is
@@ -14744,6 +14759,14 @@ struct GuildRequest
     // it the same way a missing spec is refused.
     bool itemByGuid{false};
     std::uint32_t itemKey{0};
+    // BankDepositItem, BankNameTab and a BankBuyTab that named its tab: the
+    // guild bank tab, 0 to GUILD_BANK_TABS - 1. `bankTabNamed` says whether
+    // the row gave one, because 0 is both the default and a legal tab.
+    std::uint8_t bankTab{0};
+    bool bankTabNamed{false};
+    // BankNameTab only: the tab's new name and icon, as the core stores them.
+    std::string bankTabName;
+    std::string bankTabIcon;
     // None only, and one of GuildRefusal's literals rather than a built
     // string. The adapter puts this straight into the command row's
     // `detail` column, which is written AFTER the executor has returned, so
@@ -14773,6 +14796,17 @@ struct GuildRequest
 // not also define.
 constexpr std::uint32_t GUILD_DEPOSIT_MAX_COPPER = 0x7FFFFFFFu - 1u;
 
+// The core's own tab count (Guild.h `GUILD_BANK_MAX_TABS = 6` at the pinned
+// revision), duplicated for the reason GUILD_DEPOSIT_MAX_COPPER is: this file
+// compiles with no core in its include path. A 3.3.5 guild bank has six tabs;
+// the executor's old `>= 8` ceiling was never the core's number.
+constexpr unsigned GUILD_BANK_TABS = 6;
+// The width of `guild_bank_tab.TabName`, VARCHAR(16) in the characters
+// schema. A longer name would be cut by the save and read back as another.
+constexpr unsigned GUILD_BANK_TAB_NAME_MAX = 16;
+// And of `TabIcon`, VARCHAR(100).
+constexpr unsigned GUILD_BANK_TAB_ICON_MAX = 100;
+
 // The default size of a shortlist when the row does not say. Ten is a list a
 // person can read in one go; the point of the verb is a decision somebody makes
 // rather than a queue somebody drains.
@@ -14795,13 +14829,15 @@ namespace GuildRefusal
 {
 constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, remove, tabard, bank or raid";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
-constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N>`, `buy-tab` or `grant-deposit rank:N`";
-constexpr char const* BankBuyTabTrailing = "bank buy-tab takes no argument";
+constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N> [tab:N]`, `buy-tab [tab:N]`, `name-tab tab:N icon:<icon> <name>` or `grant-deposit rank:N`";
+constexpr char const* BankBuyTabTrailing = "bank buy-tab takes tab:N or nothing";
+constexpr char const* BankTabInvalid = "a guild bank tab is tab:0 to tab:5";
+constexpr char const* BankNameTabInvalid = "bank name-tab takes tab:N icon:<icon> and a name of at most 16 characters";
 constexpr char const* BankGrantDepositInvalid = "bank grant-deposit takes rank:N and nothing else";
 constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount and nothing else";
 constexpr char const* BankAmountIsZero = "a deposit of nothing is not a request";
 constexpr char const* BankAmountTooBig = "that deposit is larger than a character can ever carry";
-constexpr char const* BankItemSpecInvalid = "bank deposit-item takes guid:<item_instance.guid> or entry:<item id> and nothing else";
+constexpr char const* BankItemSpecInvalid = "bank deposit-item takes guid:<item_instance.guid> or entry:<item id>, then tab:N or nothing";
 constexpr char const* TabardNeedsFive = "tabard takes five numbers: style, colour, border style, border colour, background";
 constexpr char const* TabardNotANumber = "tabard takes five numbers and nothing else";
 constexpr char const* TabardValueTooBig = "a tabard value is stored as one byte; 255 is the most any of the five can be";
@@ -14813,6 +14849,57 @@ constexpr char const* CountIsZero = "a shortlist of nothing is not a question";
 }  // namespace GuildRefusal
 
 GuildRequest ParseGuildRequest(std::string const& command);
+
+// -- buying a guild bank tab (#496) -------------------------------------------
+//
+// THE OLD WITNESS COULD NOT SEE A PURCHASE THAT HAD HAPPENED. The executor
+// counted `guild_bank_tab` rows before and after Guild::HandleBuyBankTab, but
+// the core's _CreateNewBankTab writes that row through CommitTransaction,
+// which queues it for another thread. The read after the call beat the
+// commit, a purchase that had been paid for came back `error`, and the next
+// pass, reading the row that had landed by then, would have asked for the
+// next and dearer tab.
+//
+// TWO WITNESSES THAT ARE WRITTEN BEFORE THE CALL RETURNS. The Guild object's
+// own tab vector grows inside _CreateNewBankTab, and the buyer's purse is
+// debited by Player::ModifyMoney, both on the calling thread. HandleBuyBankTab
+// is void and refuses by returning early, before either is touched, so a
+// refusal leaves both exactly as they were and a purchase moves both: one tab
+// more, and the price gone from the purse. The adapter reads the four numbers
+// and this judges them, so the verdict is pinned by a test with no world.
+struct GuildTabPurchaseFacts
+{
+    // Purchased tabs in the Guild object's memory, before and after the call.
+    unsigned tabsBefore{0};
+    unsigned tabsAfter{0};
+    // The buyer's purse, in copper, before and after the call.
+    std::uint32_t purseBefore{0};
+    std::uint32_t purseAfter{0};
+    // The price the core charges for tab `tabsBefore`, read from the realm's
+    // own config (CONFIG_GUILD_BANK_TAB_COST_<n>).
+    std::uint32_t price{0};
+};
+
+enum class GuildTabPurchase : std::uint8_t
+{
+    // One tab more and exactly the price gone: the core sold the tab.
+    Bought,
+    // Nothing moved: the core refused, and said nothing.
+    Refused,
+    // Something moved that a purchase does not explain. Never reported as
+    // bought, and never as a clean refusal a caller could retry into a
+    // second purchase.
+    Unexplained,
+};
+
+GuildTabPurchase GuildTabPurchaseVerdict(GuildTabPurchaseFacts const& facts);
+
+// Why a purchase would be refused before the core is asked, or "" to ask it.
+// `wanted` is the tab the row named, or -1 when it named none. The core
+// refuses every one of these by returning early and saying nothing, so each
+// is named here instead of being found by its silence.
+char const* GuildTabPurchasePrecheck(unsigned tabsNow, int wanted,
+                                     std::uint32_t purse, std::uint32_t price);
 
 // -- taking a member out -------------------------------------------------------
 //

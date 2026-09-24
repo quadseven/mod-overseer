@@ -1164,9 +1164,11 @@ void BankDepositParses()
                 BankNeedsDeposit);
     Check("bank buy-tab parses", ParseGuildRequest("bank buy-tab").verb
               == GuildVerb::BankBuyTab);
-    CheckString("bank buy-tab takes no trailing argument",
+    CheckString("bank buy-tab takes no bare trailing argument",
                 ParseGuildRequest("bank buy-tab 1").error,
                 BankBuyTabTrailing);
+    Check("bank buy-tab with no tab names none",
+          !ParseGuildRequest("bank buy-tab").bankTabNamed);
     GuildRequest const grant = ParseGuildRequest("bank grant-deposit rank:1");
     Check("grant-deposit parses", grant.verb == GuildVerb::BankGrantDeposit);
     CheckUnsigned("and carries the rank id", grant.bankRankId, 1);
@@ -1246,6 +1248,108 @@ void BankDepositItemParses()
                 BankItemSpecInvalid);
 }
 
+void ATabCanBeNamedOnEveryBankVerbThatTouchesOne()
+{
+    using namespace OverseerDecisions::GuildRefusal;
+
+    GuildRequest const buy = ParseGuildRequest("bank buy-tab tab:1");
+    Check("buy-tab tab:1 parses", buy.verb == GuildVerb::BankBuyTab);
+    Check("and says it named a tab", buy.bankTabNamed);
+    CheckUnsigned("the tab it named", buy.bankTab, 1);
+    CheckString("a tab past the core's six is refused",
+                ParseGuildRequest("bank buy-tab tab:6").error, BankTabInvalid);
+    CheckString("so is a tab that is not a number",
+                ParseGuildRequest("bank buy-tab tab:x").error, BankTabInvalid);
+    CheckString("and anything after the tab",
+                ParseGuildRequest("bank buy-tab tab:1 now").error, BankBuyTabTrailing);
+
+    GuildRequest const put = ParseGuildRequest("bank deposit-item guid:77 tab:2");
+    Check("deposit-item takes a tab", put.verb == GuildVerb::BankDepositItem);
+    CheckUnsigned("into that tab", put.bankTab, 2);
+    CheckUnsigned("and still the item", put.itemKey, 77);
+    Check("no tab is tab 0, the old behaviour",
+          ParseGuildRequest("bank deposit-item guid:77").bankTab == 0
+              && !ParseGuildRequest("bank deposit-item guid:77").bankTabNamed);
+    CheckString("a deposit into tab 9 is refused",
+                ParseGuildRequest("bank deposit-item guid:77 tab:9").error, BankTabInvalid);
+    CheckString("a word after the tab is refused",
+                ParseGuildRequest("bank deposit-item guid:77 tab:1 now").error,
+                BankItemSpecInvalid);
+
+    GuildRequest const named = ParseGuildRequest("bank name-tab tab:1 icon:INV_Chest_Plate04 Raid Gear");
+    Check("name-tab parses", named.verb == GuildVerb::BankNameTab);
+    CheckUnsigned("for that tab", named.bankTab, 1);
+    CheckString("with that icon", named.bankTabIcon.c_str(), "INV_Chest_Plate04");
+    CheckString("and a name with a space in it", named.bankTabName.c_str(), "Raid Gear");
+    CheckString("a name past the column's sixteen is refused",
+                ParseGuildRequest("bank name-tab tab:1 icon:X Seventeen letters").error,
+                BankNameTabInvalid);
+    Check("exactly sixteen is a legal name",
+          ParseGuildRequest("bank name-tab tab:1 icon:X Sixteen letters").verb
+              == GuildVerb::BankNameTab);
+    CheckString("no icon is refused",
+                ParseGuildRequest("bank name-tab tab:1 Raid Gear").error, BankNameTabInvalid);
+    CheckString("no name is refused",
+                ParseGuildRequest("bank name-tab tab:1 icon:X").error, BankNameTabInvalid);
+    CheckString("a quote in the name is refused",
+                ParseGuildRequest("bank name-tab tab:1 icon:X Grug's").error, BankNameTabInvalid);
+}
+
+// #496. The purchase is judged from the Guild object's tab count and the
+// buyer's purse, both written before HandleBuyBankTab returns. The row the
+// old witness counted was committed on another thread and was still missing
+// when it looked, so a paid purchase read as a failure.
+void ATabPurchaseIsJudgedFromTheGuildAndThePurseNotFromTheRow()
+{
+    using OverseerDecisions::GuildTabPurchase;
+    using OverseerDecisions::GuildTabPurchaseFacts;
+    using OverseerDecisions::GuildTabPurchasePrecheck;
+    using OverseerDecisions::GuildTabPurchaseVerdict;
+
+    GuildTabPurchaseFacts bought;
+    bought.tabsBefore = 0;
+    bought.tabsAfter = 1;
+    bought.purseBefore = 1981599;
+    bought.purseAfter = 981599;
+    bought.price = 1000000;
+    Check("one tab more and the price gone is a purchase",
+          GuildTabPurchaseVerdict(bought) == GuildTabPurchase::Bought);
+
+    GuildTabPurchaseFacts refused = bought;
+    refused.tabsAfter = 0;
+    refused.purseAfter = refused.purseBefore;
+    Check("nothing moved is a refusal",
+          GuildTabPurchaseVerdict(refused) == GuildTabPurchase::Refused);
+
+    GuildTabPurchaseFacts odd = bought;
+    odd.purseAfter = bought.purseBefore;
+    Check("a tab with no money gone is never called bought",
+          GuildTabPurchaseVerdict(odd) == GuildTabPurchase::Unexplained);
+    GuildTabPurchaseFacts odder = bought;
+    odder.tabsAfter = 0;
+    Check("money gone with no tab is never called a clean refusal",
+          GuildTabPurchaseVerdict(odder) == GuildTabPurchase::Unexplained);
+
+    CheckString("the next tab, affordable, is asked",
+                GuildTabPurchasePrecheck(1, 1, 3000000, 2500000), "");
+    CheckString("no tab named is the next tab", GuildTabPurchasePrecheck(1, -1, 3000000, 2500000), "");
+    CheckString("a stale count asking for tab 0 again is not sold tab 1",
+                GuildTabPurchasePrecheck(1, 0, 3000000, 2500000),
+                "that bank tab is already bought");
+    CheckString("a tab past the next is refused",
+                GuildTabPurchasePrecheck(1, 2, 9000000, 2500000),
+                "that is not the next bank tab - the core sells them in order");
+    CheckString("a short purse is refused by name",
+                GuildTabPurchasePrecheck(0, 0, 501, 1000000),
+                "the guild master cannot pay for the next bank tab");
+    CheckString("six tabs is every tab",
+                GuildTabPurchasePrecheck(6, -1, 900000000, 0),
+                "the guild already has every bank tab");
+    CheckString("a tab the realm prices at nothing is not for sale",
+                GuildTabPurchasePrecheck(0, 0, 100, 0),
+                "the realm sells no bank tab at that position");
+}
+
 void ABadRowIsRefusedByNameAndNeverSilently()
 {
     using namespace OverseerDecisions::GuildRefusal;
@@ -1296,6 +1400,9 @@ void ABadRowIsRefusedByNameAndNeverSilently()
                                     BankAmountIsZero,
                                     BankAmountTooBig,
                                     BankItemSpecInvalid,
+                                    BankBuyTabTrailing,
+                                    BankTabInvalid,
+                                    BankNameTabInvalid,
                                     TabardNeedsFive,
                                     TabardNotANumber,
                                     TabardValueTooBig,
@@ -1337,6 +1444,8 @@ int main()
     ATabardIsFiveBytesOrItIsRefused();
     BankDepositParses();
     BankDepositItemParses();
+    ATabCanBeNamedOnEveryBankVerbThatTouchesOne();
+    ATabPurchaseIsJudgedFromTheGuildAndThePurseNotFromTheRow();
     ABadRowIsRefusedByNameAndNeverSilently();
     ARemoveGoesToTheCoreOnlyWhenEveryGatePasses();
     TheRemoveGatesAreAskedInOrder();
