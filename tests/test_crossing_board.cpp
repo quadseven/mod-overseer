@@ -369,6 +369,20 @@ void DockedIsTheCoresOwnInterval()
     CheckInt("with thirty seconds left", static_cast<long>(later.dwellLeftMs), 30000);
 }
 
+// The ride from leaving one stop to reaching the other, including a path whose
+// arrival comes round again at the start of the next period.
+void TheRideIsMeasuredRoundThePeriod()
+{
+    CheckInt("stop one to stop two", static_cast<long>(OverseerDecisions::TransportRideMs(
+                                         70000, 200000, 400000)),
+             130000);
+    CheckInt("stop two round to stop one",
+             static_cast<long>(OverseerDecisions::TransportRideMs(260000, 10000, 400000)),
+             150000);
+    CheckInt("no period is no ride",
+             static_cast<long>(OverseerDecisions::TransportRideMs(260000, 10000, 0)), 0);
+}
+
 void NoClockIsNeverDocked()
 {
     Check("a zero period is not docked", ReadDock(10000, 0, TwoStops()).docked, false);
@@ -571,6 +585,7 @@ int main()
 
     DockedIsTheCoresOwnInterval();
     NoClockIsNeverDocked();
+    TheRideIsMeasuredRoundThePeriod();
 
     TheRatchetPierIsFoundAndTheWaterIsNot();
     TheOrgrimmarPlatformIsLevelWithTheZeppelinDeck();

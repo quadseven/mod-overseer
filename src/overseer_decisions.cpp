@@ -6085,6 +6085,18 @@ DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
     return reading;
 }
 
+std::uint32_t TransportRideMs(std::uint32_t departMs, std::uint32_t arriveMs,
+                              std::uint32_t periodMs)
+{
+    if (!periodMs)
+        return 0;
+    // Both ends are brought into the period first, so the sum below cannot
+    // go negative and cannot overflow: each term is under `periodMs`.
+    std::uint32_t const depart = departMs % periodMs;
+    std::uint32_t const arrive = arriveMs % periodMs;
+    return (arrive + (periodMs - depart)) % periodMs;
+}
+
 int PickBerth(std::vector<BerthCandidate> const& candidates, float mooringX, float mooringY,
               std::vector<float> const& deckLevels, BerthLimits const& limits)
 {

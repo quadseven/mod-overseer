@@ -32336,8 +32336,12 @@ private:
             offer.landingToGoalYards =
                 b.berthKnown ? std::hypot(b.berthX - goalX, b.berthY - goalY) : 0.f;
             uint32 const period = info.pathTimeMs;
+            // No period is no clock, which prices as unreadable rather than
+            // as a free ride.
             offer.rideSeconds =
-                period ? float((b.arriveMs + period - a.departMs % period) % period) / 1000.f
+                period ? float(OverseerDecisions::TransportRideMs(a.departMs, b.arriveMs,
+                                                                  period)) /
+                             1000.f
                        : -1.f;
             offer.periodSeconds = float(period) / 1000.f;
             offers.push_back(offer);

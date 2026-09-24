@@ -7273,6 +7273,13 @@ struct DockReading
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
                      std::vector<TransportStop> const& stops);
 
+// How long the ride is from leaving one stop to arriving at another, on the
+// same clock, in milliseconds. The arrival can be earlier in the period than
+// the departure - the path wraps round - so the difference is taken modulo
+// the period. Zero for a zero period.
+std::uint32_t TransportRideMs(std::uint32_t departMs, std::uint32_t arriveMs,
+                              std::uint32_t periodMs);
+
 // ------------------------------------- the berth, from the survey (#279) --
 //
 // THE PIER IS NOT DERIVED FROM THE MOORING. It is read out of the travel
