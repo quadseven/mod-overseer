@@ -4928,6 +4928,20 @@ public:
         return it == _state.end() ? std::string() : it->second.target;
     }
 
+    // WHERE THE DRIVE SENT THIS CHARACTER, once it has resolved and sent it
+    // (#639): the spawn a keyword errand resolved to, or the point of a ground
+    // aim. False before the first send, which is "not measured yet".
+    bool ResolvedPoint(std::string const& name, uint32& mapId, float& x, float& y) const
+    {
+        auto const it = _state.find(name);
+        if (it == _state.end() || !it->second.pinned)
+            return false;
+        mapId = it->second.mapId;
+        x = it->second.x;
+        y = it->second.y;
+        return true;
+    }
+
     // WHETHER THE AIM IN THIS CHARACTER'S COLUMN IS ONE THE DRIVE REFUSED TO
     // WALK, read without creating a record, for the reason TargetFor gives: the
     // party flight asks it about every member it seats.
@@ -25652,6 +25666,15 @@ private:
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
         bool loggedTravelConflict{false};
+        // A SHORT TOWN STOP ON THE APPROACH (#639): the foreign aim GATHERING
+        // is waiting on, when it was first seen, what `stagingSince` read
+        // then (so staging's clock stands still while it waits), and whether
+        // each of the two lines about it has been said for this aim.
+        std::string townStopAim;
+        time_t townStopSince{0};
+        time_t townStopStagingSince{0};
+        bool loggedTownStop{false};
+        bool loggedTownStopRefused{false};
         bool loggedCampaignOver{false};
         // Rations the line that says a job named a withheld door (#582).
         bool loggedWithheld{false};
@@ -28284,6 +28307,86 @@ private:
         WriteRunEnded(coord, leaderName, 0, "reset_failed", reason);
         _travelAims.Release(leaderName);
         coord = DungeonRunCoordinatorState();
+    }
+
+    // A SHORT TOWN STOP ON THE APPROACH (#639). The bridge makes one between
+    // runs: a mailbox, a banker or a guild vault in the town the family is
+    // passing (wow-overseer#276). While it stands in the head's column this
+    // run's leg claim is refused as a foreign errand, and before this the run
+    // read that as an errand written over, re-armed at WARN every poll, and let
+    // GATHERING's backstop run on. OverseerDecisions::StagingWaitsForTownStop
+    // says when the run waits for the stop instead; while it does, staging's
+    // clock stands still, and nothing is claimed.
+    //
+    // Returns true when this poll is spent waiting. False hands the poll back
+    // to GATHERING exactly as before: no foreign errand, or one that is not a
+    // short stop, or one that has had its window.
+    bool WaitForTownStop(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                         Player* leader, std::string const& legAim)
+    {
+        std::string const inFlight = _travelAims.TargetFor(leaderName);
+        bool const foreign = !inFlight.empty() && inFlight != legAim &&
+                             !_travelAims.RunOwns(leaderName, inFlight);
+        time_t const now = std::time(nullptr);
+        if (!foreign)
+        {
+            if (!coord.townStopAim.empty())
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} - leader '{}' is done with the town stop "
+                         "at '{}' after {}s, and staging walks on (#639)",
+                         coord.runNumber, leaderName, coord.townStopAim,
+                         uint32(now - coord.townStopSince));
+                // The next claim is a new leg rather than a re-arm: the stop
+                // was waited on, not lost.
+                coord.legAim[leaderName].clear();
+            }
+            coord.townStopAim.clear();
+            return false;
+        }
+        if (coord.townStopAim != inFlight)
+        {
+            coord.townStopAim = inFlight;
+            coord.townStopSince = now;
+            coord.townStopStagingSince = coord.stagingSince;
+            coord.loggedTownStop = false;
+            coord.loggedTownStopRefused = false;
+        }
+        float yards = -1.f;
+        uint32 mapId = 0;
+        float x = 0.f;
+        float y = 0.f;
+        if (_travelAims.ResolvedPoint(leaderName, mapId, x, y) && mapId == leader->GetMapId())
+            yards = leader->GetDistance2d(x, y);
+        uint32 const held = uint32(now - coord.townStopSince);
+        if (!OverseerDecisions::StagingWaitsForTownStop(true, yards, held))
+        {
+            if (!coord.loggedTownStopRefused)
+            {
+                coord.loggedTownStopRefused = true;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} does not wait on leader '{}''s errand "
+                         "'{}' ({:.0f} yards, {}s) - it is not a short town stop on the "
+                         "approach (at most {:.0f} yards and {}s) (#639)",
+                         coord.runNumber, leaderName, inFlight, yards, held,
+                         OverseerDecisions::TOWN_STOP_NEAR_YARDS,
+                         OverseerDecisions::TOWN_STOP_MAX_SECONDS);
+            }
+            return false;
+        }
+        if (coord.townStopStagingSince)
+            coord.stagingSince = coord.townStopStagingSince + (now - coord.townStopSince);
+        if (!coord.loggedTownStop)
+        {
+            coord.loggedTownStop = true;
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} lets leader '{}' make a short town stop at "
+                     "'{}' ({:.0f} yards) on the approach - staging waits for it, at most "
+                     "{}s, and its clock stands still (#639)",
+                     coord.runNumber, leaderName, inFlight, yards,
+                     OverseerDecisions::TOWN_STOP_MAX_SECONDS);
+        }
+        return true;
     }
 
     // A STAGING THAT WILL NOT FINISH IS CLOSED, NOT NARRATED (#165).
@@ -32608,6 +32711,13 @@ private:
             OverseerDecisions::ApproachGap const gap = legAim.gap;
             bool const onTheCorridor =
                 legAim.leg == OverseerDecisions::ApproachLeg::ToWaypoint;
+
+            // A SHORT TOWN STOP IN THE COLUMN IS WAITED ON, NOT RE-ARMED OVER
+            // (#639). See WaitForTownStop: the claim, the stall ladder and the
+            // backstop below all sit this poll out.
+            if (onTheOutsideMap && legAim.usable &&
+                WaitForTownStop(coord, leaderName, leader, legAim.aim))
+                return;
 
             // AND THE AIM FOLLOWS THE LEG, AND IS RE-ASSERTED ON EVERY POLL
             // (#367). A leg that ends hands the leader on to the next point in

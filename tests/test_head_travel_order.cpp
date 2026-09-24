@@ -61,7 +61,7 @@ HeadTravelFacts Facts(bool inside, bool staging, bool bags)
 void AnIdleHeadMayBeTakenByAnyone()
 {
     HeadTravelFacts const idle = Facts(false, false, false);
-    for (HeadErrand who : {HeadErrand::ActiveRun, HeadErrand::CampaignApproach,
+    for (HeadErrand who : {HeadErrand::ActiveRun, HeadErrand::CampaignApproach, HeadErrand::TownStop,
                            HeadErrand::BagUpkeep, HeadErrand::TrainerTrip, HeadErrand::Other})
         Check("idle head", HeadErrandMayTravel(who, idle), true);
     Check("no reason when it may", std::string(HeadErrandWaitReason(HeadErrand::Other, idle)).empty(),
