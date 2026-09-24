@@ -1929,6 +1929,8 @@ char const* RunRecoveryWord(RunRecovery recovery)
         case RunRecovery::Replan:        return "replan";
         case RunRecovery::ResetInstance: return "reset_instance";
         case RunRecovery::HearthRegroup: return "hearth_regroup";
+        case RunRecovery::Summon:        return "summon";
+        case RunRecovery::DungeonFinder: return "dungeon_finder";
     }
     return "reset_instance";
 }
@@ -1939,10 +1941,13 @@ namespace
 // point at nothing, and the order the options are offered in. HearthRegroup is
 // last so the four-rung fallback (`tried.size() % 4`) is unchanged, and it is
 // only ever a candidate when the facts carry an inn (RunRecoveryApplicable).
+// The two fallback rungs come after it for the same reason, and are only ever
+// candidates once the streak and the door open them.
 RunRecovery const RUN_RECOVERY_LADDER[] = {
     RunRecovery::RestageNearer, RunRecovery::Regroup,  RunRecovery::Replan,
     RunRecovery::OneCopy,       RunRecovery::ResetInstance, RunRecovery::WaitForClient,
-    RunRecovery::TownForBags,   RunRecovery::HearthRegroup,
+    RunRecovery::TownForBags,   RunRecovery::HearthRegroup, RunRecovery::Summon,
+    RunRecovery::DungeonFinder,
 };
 
 bool TriedTwiceRunning(std::vector<RunRecovery> const& tried, RunRecovery r)
@@ -1991,7 +1996,13 @@ std::string RunRecoveryOptions()
 
 bool RunRecoveryApplicable(RunRecovery recovery, RunFailureFacts const& facts)
 {
-    return recovery != RunRecovery::HearthRegroup || facts.hearthRegroupReady;
+    switch (recovery)
+    {
+        case RunRecovery::HearthRegroup: return facts.hearthRegroupReady;
+        case RunRecovery::Summon:        return RunRecoverySummonOpen(facts);
+        case RunRecovery::DungeonFinder: return RunRecoveryFinderOpen(facts);
+        default:                         return true;
+    }
 }
 
 std::string RunRecoveryOptions(RunFailureFacts const& facts)
@@ -2039,6 +2050,19 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
         return RunRecovery::TownForBags;
     if (!facts.everyoneSteerable)
         return pick(RunRecovery::WaitForClient);
+
+    // THE FALLBACK LADDER (2026-09-24). Once walking has failed
+    // `summonAfter` times in a row, the family stops being asked to walk to
+    // its door: the stone summons whoever is not there, and once that has had
+    // its turn the dungeon finder puts the family inside. Asked before the
+    // failure's own facts on purpose, because those facts are what every
+    // walk and wait of this streak has already been chosen from. Neither is
+    // chosen a third time running; the ladder below takes over then, and the
+    // rung comes round again.
+    if (RunRecoveryFinderOpen(facts) && !TriedTwiceRunning(facts.tried, RunRecovery::DungeonFinder))
+        return RunRecovery::DungeonFinder;
+    if (RunRecoverySummonOpen(facts) && !TriedTwiceRunning(facts.tried, RunRecovery::Summon))
+        return RunRecovery::Summon;
 
     // A party on both sides of the door, or in two copies of it, is collected
     // by RESET's walk out and then enters together.
@@ -2109,6 +2133,17 @@ std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery ch
         case RunRecovery::HearthRegroup:
             why = "the family was spread across zones and most of it is bound at one inn, "
                   "so it hearths there, meets, and walks to the door together";
+            break;
+        case RunRecovery::Summon:
+            why = std::to_string(facts.streak) +
+                  " attempts in a row never got inside, so the leader walks to the "
+                  "meeting stone and the stone summons whoever is not there";
+            break;
+        case RunRecovery::DungeonFinder:
+            why = std::to_string(facts.streak) +
+                  " attempts in a row never got inside and the summon rung has had its "
+                  "turn, so the family queues for its own dungeon in the dungeon finder "
+                  "(the last resort)";
             break;
     }
     if (TimesTried(facts.tried, chosen) > 0)
@@ -14127,6 +14162,9 @@ bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts)
             return facts.stopYards >= 0.f && facts.stopYards <= TOWN_STOP_NEAR_YARDS;
         return who == HeadErrand::ActiveRun || who == HeadErrand::CampaignApproach;
     }
+    // The summon rung and the dungeon finder hold the head as staging does.
+    if (facts.recoveryHoldsTheLeader)
+        return who == HeadErrand::ActiveRun || who == HeadErrand::CampaignApproach;
     // Between attempts of an armed campaign, a trainer trip goes only to a
     // trainer in the town the head stands in (#688). Unmeasured is not near.
     if (facts.campaignBetweenAttempts && who == HeadErrand::TrainerTrip)
@@ -14149,6 +14187,9 @@ char const* HeadErrandWaitReason(HeadErrand who, HeadTravelFacts const& facts)
     if (who == HeadErrand::TownStop)
         return "a dungeon run is staging, and a town stop may go on the approach only "
                "when its counter is in the town the head is passing";
+    if (facts.recoveryHoldsTheLeader)
+        return "the family's campaign is summoning at its door's meeting stone or queued "
+               "in the dungeon finder, and the leader stays with it";
     if (facts.hearthRegroup && who == HeadErrand::Other)
         return "the family's campaign is regrouping by hearthstone at its shared inn, "
                "which is the regroup this wait stands in for";
@@ -14548,6 +14589,308 @@ bool TrainingStopEnds(TrainingStopStep step, bool stopOpen)
     if (!stopOpen)
         return false;
     return step != TrainingStopStep::Walk && step != TrainingStopStep::ColumnTaken;
+}
+
+// ------------------ the fallback ladder: summon, then the dungeon finder --
+
+unsigned SummonsTriedThisStreak(RunFailureFacts const& facts)
+{
+    if (facts.streak < 2 || facts.tried.empty())
+        return 0;
+    std::size_t const earlier = std::min<std::size_t>(facts.streak - 1, facts.tried.size());
+    unsigned count = 0;
+    for (std::size_t i = facts.tried.size() - earlier; i < facts.tried.size(); ++i)
+        if (facts.tried[i] == RunRecovery::Summon)
+            ++count;
+    return count;
+}
+
+bool RunRecoverySummonOpen(RunFailureFacts const& facts)
+{
+    return facts.summonReady && facts.summonAfter > 0 && facts.streak >= facts.summonAfter;
+}
+
+bool RunRecoveryFinderOpen(RunFailureFacts const& facts)
+{
+    if (!facts.dungeonFinderReady || facts.summonAfter == 0 ||
+        facts.streak < facts.summonAfter)
+        return false;
+    // ONLY AFTER THE SUMMON RUNG FAILED: it was applied after an earlier
+    // failure of this streak, and this failure followed it. A door with no
+    // stone has no summon rung to wait for.
+    return SummonsTriedThisStreak(facts) > 0 || !facts.summonReady;
+}
+
+SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
+                              unsigned triesPerMember)
+{
+    SummonRungPlan plan;
+    SummonRungMember const* leader = nullptr;
+    std::vector<SummonRungMember const*> clickers;
+    for (SummonRungMember const& m : family)
+    {
+        if (m.leader && !leader)
+            leader = &m;
+        if (m.atStone)
+        {
+            plan.atStone.push_back(m.name);
+            if (m.inWorld && m.alive && !m.inCombat)
+                clickers.push_back(&m);
+        }
+        else
+            plan.away.push_back(m.name);
+    }
+
+    if (plan.away.empty())
+    {
+        plan.step = SummonRungStep::Done;
+        plan.why = "every member stands at the meeting stone";
+        return plan;
+    }
+    if (!leader || !leader->atStone)
+    {
+        plan.step = SummonRungStep::WalkToStone;
+        plan.why = leader ? "the leader is not at the meeting stone yet"
+                          : "the family names no leader to walk to the stone";
+        return plan;
+    }
+    if (clickers.size() < 2)
+    {
+        plan.step = SummonRungStep::WaitForClickers;
+        plan.why = "the stone needs two members standing at it to click, and " +
+                   std::to_string(clickers.size()) + " can";
+        return plan;
+    }
+
+    SummonRungMember const* target = nullptr;
+    std::string skipped;
+    for (SummonRungMember const& m : family)
+    {
+        if (m.atStone)
+            continue;
+        char const* skip = nullptr;
+        if (!m.inWorld)
+            skip = "is not in the world";
+        else if (!m.alive)
+            skip = "is dead";
+        else if (m.inCombat)
+            skip = "is in combat";
+        else if (!m.summonable)
+            skip = "is nothing the summon can move";
+        else if (m.tries >= triesPerMember)
+            skip = "has had its tries";
+        if (skip)
+        {
+            skipped += (skipped.empty() ? "" : "; ") + m.name + " " + skip;
+            continue;
+        }
+        target = &m;
+        break;
+    }
+    if (!target)
+    {
+        plan.step = SummonRungStep::NobodyLeft;
+        plan.why = "nobody away from the stone can be summoned now (" + skipped + ")";
+        return plan;
+    }
+
+    // The leader clicks when he can: he is the one who walked there. The
+    // helper is the first other clicker.
+    SummonRungMember const* summoner = clickers.front();
+    for (SummonRungMember const* c : clickers)
+        if (c->leader)
+            summoner = c;
+    SummonRungMember const* helper = nullptr;
+    for (SummonRungMember const* c : clickers)
+        if (c != summoner)
+        {
+            helper = c;
+            break;
+        }
+
+    plan.step = SummonRungStep::Summon;
+    plan.summoner = summoner->name;
+    plan.helper = helper->name;
+    plan.target = target->name;
+    plan.why = "'" + target->name + "' is away from the stone (try " +
+               std::to_string(target->tries + 1) + " of " + std::to_string(triesPerMember) +
+               ")";
+    return plan;
+}
+
+char const* SummonRungStepWord(SummonRungStep step)
+{
+    switch (step)
+    {
+        case SummonRungStep::Done:            return "done";
+        case SummonRungStep::WalkToStone:     return "walk to the stone";
+        case SummonRungStep::WaitForClickers: return "wait for clickers";
+        case SummonRungStep::Summon:          return "summon";
+        case SummonRungStep::NobodyLeft:      return "nobody left";
+    }
+    return "unknown";
+}
+
+std::string SummonRungRowSource(std::uint32_t campaignId, unsigned attempt,
+                                std::string const& target, unsigned tryNumber)
+{
+    std::string source = "run_recovery summon c" + std::to_string(campaignId) + " a" +
+                         std::to_string(attempt) + " " + target + " t" +
+                         std::to_string(tryNumber);
+    if (source.size() > 64)
+        source.resize(64);
+    return source;
+}
+
+bool SummonRowFinished(std::string const& status)
+{
+    return status != "pending" && status != "claimed" && status != "verifying";
+}
+
+std::uint8_t FinderRoleMask(unsigned classId, bool leader)
+{
+    std::uint8_t mask = leader ? FINDER_ROLE_LEADER : 0;
+    if (ClassCanFill(classId, GuildRole::Tank))
+        mask |= FINDER_ROLE_TANK;
+    if (ClassCanFill(classId, GuildRole::Healer))
+        mask |= FINDER_ROLE_HEALER;
+    if (ClassCanFill(classId, GuildRole::Ranged) || ClassCanFill(classId, GuildRole::Melee))
+        mask |= FINDER_ROLE_DAMAGE;
+    return mask;
+}
+
+char const* FinderLockWord(std::uint32_t lock)
+{
+    switch (lock)
+    {
+        case 0:    return "none";
+        case 1:    return "insufficient expansion";
+        case 2:    return "too low level";
+        case 3:    return "too high level";
+        case 4:    return "gear score too low";
+        case 5:    return "gear score too high";
+        case 6:    return "locked to a saved instance or disabled";
+        case 1001: return "attunement level too low";
+        case 1002: return "attunement level too high";
+        case 1022: return "a required quest is not done";
+        case 1025: return "a required item is missing";
+        case 1031: return "not in season";
+        case 1034: return "a required achievement is missing";
+    }
+    return "locked";
+}
+
+char const* FinderJoinResultWord(std::uint32_t result)
+{
+    switch (result)
+    {
+        case 0:  return "joined";
+        case 1:  return "the role check failed";
+        case 2:  return "the group is full";
+        case 4:  return "an internal dungeon finder error";
+        case 5:  return "the requirements are not met";
+        case 6:  return "a party member does not meet the requirements";
+        case 7:  return "dungeons and raids were mixed";
+        case 8:  return "the dungeon does not take several realms";
+        case 9:  return "a party member is disconnected or has an invite pending";
+        case 10: return "party information could not be read";
+        case 11: return "the dungeon is not valid";
+        case 12: return "a deserter debuff";
+        case 13: return "a party member has a deserter debuff";
+        case 14: return "the random dungeon cooldown";
+        case 15: return "a party member is on the random dungeon cooldown";
+        case 16: return "more than five party members";
+        case 17: return "a battleground or arena queue";
+    }
+    return "an unknown result";
+}
+
+FinderReadiness ReadFinderReadiness(FinderFacts const& facts, bool now)
+{
+    FinderReadiness out;
+    auto no = [&out](std::string const& why) {
+        out.ready = false;
+        out.whyNot = why;
+        return out;
+    };
+    if (!facts.enabled)
+        return no("Overseer.Recovery.DungeonFinder is off");
+    if (!facts.finderOn)
+        return no("the realm's DungeonFinder.OptionsMask does not carry the dungeon finder");
+    if (!facts.dungeonId)
+        return no("the campaign's dungeon has no dungeon finder entry");
+    if (!facts.groupExists)
+        return no("the head is in no group");
+    if (facts.groupIsFinders)
+        return no("the group is already a dungeon finder group");
+    if (facts.groupIsRaid)
+        return no("the group is a raid, and the finder queues a party");
+    if (!facts.headLeads)
+        return no("the head does not lead the group");
+    if (facts.family.size() != FINDER_GROUP_SIZE || facts.groupSize != FINDER_GROUP_SIZE)
+        return no("the finder takes the family as one group of " +
+                  std::to_string(FINDER_GROUP_SIZE) + ", and the family is " +
+                  std::to_string(facts.family.size()) + " with " +
+                  std::to_string(facts.groupSize) + " in the group");
+
+    std::string why;
+    auto add = [&why](std::string const& part) { why += (why.empty() ? "" : "; ") + part; };
+    for (FinderMember const& m : facts.family)
+    {
+        if (!m.inWorld)
+            add("'" + m.name + "' is not in the world");
+        else if (!m.inHeadsGroup)
+            add("'" + m.name + "' is not in the head's group");
+        else if (now && !m.alive)
+            add("'" + m.name + "' is dead");
+        else if (now && m.inCombat)
+            add("'" + m.name + "' is in combat");
+        else if (m.lock)
+        {
+            std::string part = "'" + m.name + "' is locked out of it (" +
+                               FinderLockWord(m.lock) + ")";
+            if ((m.lock == 2 || m.lock == 3) && facts.dbcMaxLevel)
+                part += " - the finder's range for it is " + std::to_string(facts.dbcMinLevel) +
+                        "-" + std::to_string(facts.dbcMaxLevel) +
+                        " unless the realm sets DungeonAccessRequirements.LFGLevelDBCOverride";
+            add(part);
+        }
+    }
+    if (!why.empty())
+        return no(why);
+    out.ready = true;
+    return out;
+}
+
+FinderStep FinderNext(FinderPollFacts const& facts)
+{
+    if (facts.familySize && facts.inside >= facts.familySize)
+        return FinderStep::Inside;
+    if (facts.waitedSeconds >= facts.ceilingSeconds)
+        return FinderStep::GiveUp;
+    if (facts.anyoneNotReady)
+        return FinderStep::Wait;
+    if (!facts.joined)
+        return FinderStep::Join;
+    if (facts.state == FinderState::None)
+        return FinderStep::GiveUp;
+    if (facts.proposalSeen &&
+        (facts.state == FinderState::Proposal || facts.state == FinderState::Queued))
+        return FinderStep::Accept;
+    return FinderStep::Wait;
+}
+
+char const* FinderStepWord(FinderStep step)
+{
+    switch (step)
+    {
+        case FinderStep::Join:   return "join";
+        case FinderStep::Wait:   return "wait";
+        case FinderStep::Accept: return "accept";
+        case FinderStep::Inside: return "inside";
+        case FinderStep::GiveUp: return "give up";
+    }
+    return "unknown";
 }
 
 }  // namespace OverseerDecisions

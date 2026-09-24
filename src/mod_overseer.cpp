@@ -222,6 +222,7 @@
 // without anybody having to declare it (mod-overseer#184).
 #include "GitRevision.h"
 #include "Group.h"
+#include "LFGMgr.h"
 #include "LootRollAction.h"
 #include "GroupMgr.h"
 #include "Guild.h"
@@ -19803,7 +19804,7 @@ private:
         // meet at its inn by hearthstone (2026-09-24): then the fetch is the
         // one member flown after while the rest are elsewhere.
         if (coord->second.phase == DungeonRunPhase::Recovering)
-            return OverseerDecisions::RecoveringFetchPhase(HearthRegroupInPlay(coord->second));
+            return OverseerDecisions::RecoveringFetchPhase(RecoveryBringsTheFamily(coord->second));
         return FetchRunPhaseOf(coord->second.phase);
     }
 
@@ -27538,6 +27539,23 @@ private:
         // OverseerDecisions::HEARTH_REGROUP_LEAVE_YARDS) and the member is held
         // there rather than handed back to a `follow` that walks it off.
         std::set<std::string> hearthArrived;
+        // THE SUMMON RUNG (RunRecovery::Summon): the summons tried per member,
+        // the kind='summon' row in flight (found again by its `source`), and
+        // whether the leader's restage walk has handed over to the stone.
+        std::map<std::string, unsigned> summonTries;
+        std::string summonRowSource;
+        std::string summonRowTarget;
+        std::time_t summonRowSince{0};
+        bool summonWalkedIn{false};
+        std::string summonSaid;
+        // THE DUNGEON FINDER RUNG (RunRecovery::DungeonFinder): whether the
+        // family was queued, when, for which finder dungeon, and which proposal
+        // each member has already been answered for.
+        bool finderJoined{false};
+        std::time_t finderSince{0};
+        uint32 finderDungeonId{0};
+        std::map<std::string, uint32> finderAccepted;
+        std::string finderSaid;
         // MAKING ROOM INSIDE (see MakeRoomInside): who has had the loot rule
         // set this run, and who was told once that no grey was left.
         std::set<std::string> roomLootRuleSet;
@@ -27916,6 +27934,10 @@ private:
     // ...AND WHICH OF THEM BELONG TO A FAMILY WHOSE CAMPAIGN IS REGROUPING BY
     // HEARTHSTONE (2026-09-24), rebuilt beside it and read the same way.
     std::set<std::string> _hearthRegroupMembers;
+    // ...AND WHICH BELONG TO A FAMILY ON THE SUMMON RUNG OR IN THE DUNGEON
+    // FINDER (RunRecovery::Summon, DungeonFinder), whose leader nothing else
+    // may walk (HeadTravelFacts::recoveryHoldsTheLeader).
+    std::set<std::string> _recoveryHoldMembers;
 
     // WHICH ROSTER MEMBERS BELONG TO A FAMILY WITH NO BAG ROOM, member ->
     // family (#631). Written by DriveDungeonRunFor on the world thread and
@@ -27957,7 +27979,84 @@ public:
             player->IsAlive(), SteerableAI(player) != nullptr);
     }
 
+    // WHAT THE DUNGEON FINDER LAST TOLD EACH CHARACTER (RunRecovery::
+    // DungeonFinder). The core sends a proposal's id to the members in
+    // SMSG_LFG_PROPOSAL_UPDATE and a refused join's reason in
+    // SMSG_LFG_JOIN_RESULT, and has no call that hands either to anybody else,
+    // so OverseerFinderScript reads them off the packets as they are sent (a
+    // bot's as well as a client's: the hook runs before the socket check). The
+    // proposal id is what the accept names, exactly as a client's button would.
+    // Written from whichever thread sends the packet, so behind a lock.
+    struct FinderBookEntry
+    {
+        uint32 proposalId{0};
+        uint8 proposalState{0};
+        std::time_t proposalAt{0};
+        uint32 joinResult{0};
+        uint32 joinState{0};
+        std::time_t joinAt{0};
+    };
+
+    static void NoteFinderProposal(std::string const& name, uint32 proposalId, uint8 state)
+    {
+        std::lock_guard<std::mutex> guard(FinderBookLock());
+        FinderBookEntry& entry = FinderBook()[name];
+        entry.proposalId = proposalId;
+        entry.proposalState = state;
+        entry.proposalAt = std::time(nullptr);
+    }
+
+    static void NoteFinderJoinResult(std::string const& name, uint32 result, uint32 state)
+    {
+        std::lock_guard<std::mutex> guard(FinderBookLock());
+        FinderBookEntry& entry = FinderBook()[name];
+        entry.joinResult = result;
+        entry.joinState = state;
+        entry.joinAt = std::time(nullptr);
+    }
+
+    // Only characters the rung asks about are ever kept past a clear, so the
+    // book is bounded by the families; a stranger's packets are noted and
+    // then never read.
+    static bool IsFinderWatched(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(FinderBookLock());
+        return FinderWatched().count(name) > 0;
+    }
+
 private:
+    static std::mutex& FinderBookLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+    static std::map<std::string, FinderBookEntry>& FinderBook()
+    {
+        static std::map<std::string, FinderBookEntry> book;
+        return book;
+    }
+    static std::set<std::string>& FinderWatched()
+    {
+        static std::set<std::string> watched;
+        return watched;
+    }
+    static FinderBookEntry FinderBookFor(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(FinderBookLock());
+        auto const it = FinderBook().find(name);
+        return it == FinderBook().end() ? FinderBookEntry() : it->second;
+    }
+    // Forget what the finder said to these characters, and watch them from now.
+    static void ClearFinderBook(std::vector<std::string> const& names)
+    {
+        std::lock_guard<std::mutex> guard(FinderBookLock());
+        for (std::string const& name : names)
+        {
+            FinderBook().erase(name);
+            FinderWatched().insert(name);
+        }
+    }
+
     static void MarkFamilyBagHeld(std::string const& family,
                                   std::vector<std::string> const& members, bool held)
     {
@@ -28003,6 +28102,7 @@ private:
             }
         }
         facts.hearthRegroup = _hearthRegroupMembers.count(name) > 0;
+        facts.recoveryHoldsTheLeader = _recoveryHoldMembers.count(name) > 0;
         // AN ORDERED RAID OWNS THE HEAD THE SAME WAY (mod-overseer#634): FORM,
         // ASSEMBLE and ENTER walk him to the door, INSIDE holds him there, and
         // the family's lower claimants yield to it exactly as they yield to a
@@ -31176,6 +31276,153 @@ private:
             PlanFamilyHearthRegroup(leaderName, members, portal);
         facts.hearthRegroupReady = inn.ready;
         facts.hearthRegroupNote = HearthRegroupPlanLine(inn);
+
+        // THE FALLBACK LADDER (2026-09-24). The streak is set by
+        // EnterRecovering, which is the one place that knows it; what is read
+        // here is whether each rung could run at all.
+        facts.summonAfter = RecoverySummonAfter();
+        float stoneYards = -1.f;
+        GameObjectData const* const stone = DoorMeetingStone(portal, &stoneYards);
+        facts.summonReady = stone != nullptr;
+        facts.summonNote =
+            stone ? "the door's meeting stone stands " +
+                        std::to_string(static_cast<uint32>(stoneYards)) +
+                        "y from its trigger (summon opens at " +
+                        std::to_string(facts.summonAfter) + " in a row)"
+                  : "no meeting stone within " +
+                        std::to_string(static_cast<uint32>(
+                            OverseerDecisions::SUMMON_RUNG_STONE_SEARCH_YARDS)) +
+                        "y of the door, so no summon";
+        OverseerDecisions::FinderReadiness const finder = OverseerDecisions::ReadFinderReadiness(
+            ReadFinderFacts(leaderName, members, portal), false);
+        facts.dungeonFinderReady = finder.ready;
+        facts.dungeonFinderNote = finder.ready ? "the dungeon finder can queue the family"
+                                               : "no dungeon finder (" + finder.whyNot + ")";
+        return facts;
+    }
+
+    // -------------------------------------------- the fallback ladder's reads --
+
+    // Overseer.Recovery.SummonAfterFailures: the streak at which the summon
+    // rung opens. Zero keeps both fallback rungs shut.
+    static unsigned RecoverySummonAfter()
+    {
+        return sConfigMgr->GetOption<uint32>(
+            "Overseer.Recovery.SummonAfterFailures",
+            OverseerDecisions::RUN_RECOVERY_SUMMON_AFTER_DEFAULT);
+    }
+
+    // Overseer.Recovery.DungeonFinder: may the last rung queue the family in
+    // the dungeon finder. Off unless a realm's conf turns it on.
+    static bool RecoveryFinderEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.Recovery.DungeonFinder",
+                                           OverseerDecisions::RUN_RECOVERY_FINDER_DEFAULT);
+    }
+
+    // THE MEETING STONE THAT SERVES A DOOR: the nearest GAMEOBJECT_TYPE_
+    // MEETINGSTONE spawn to the door's entrance areatrigger, on the trigger's
+    // map, within SUMMON_RUNG_STONE_SEARCH_YARDS. Read from the core's own
+    // spawn and template tables, never a coordinate written here; the tables
+    // are loaded once at start-up, so the answer is kept per trigger.
+    static GameObjectData const* DoorMeetingStone(DungeonPortal const& portal,
+                                                  float* yardsOut = nullptr)
+    {
+        static std::map<uint32, std::pair<GameObjectData const*, float>> s_stones;
+        auto const known = s_stones.find(portal.entryTriggerId);
+        if (known != s_stones.end())
+        {
+            if (yardsOut)
+                *yardsOut = known->second.second;
+            return known->second.first;
+        }
+        GameObjectData const* best = nullptr;
+        float bestYards = -1.f;
+        if (AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.entryTriggerId))
+        {
+            for (auto const& itr : sObjectMgr->GetAllGOData())
+            {
+                GameObjectData const& data = itr.second;
+                if (data.mapid != door->map)
+                    continue;
+                GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(data.id);
+                if (!tmpl || tmpl->type != GAMEOBJECT_TYPE_MEETINGSTONE)
+                    continue;
+                float const dx = data.posX - door->x;
+                float const dy = data.posY - door->y;
+                float const yards = std::sqrt(dx * dx + dy * dy);
+                if (yards > OverseerDecisions::SUMMON_RUNG_STONE_SEARCH_YARDS)
+                    continue;
+                if (!best || yards < bestYards)
+                {
+                    best = &data;
+                    bestYards = yards;
+                }
+            }
+        }
+        s_stones[portal.entryTriggerId] = {best, bestYards};
+        if (yardsOut)
+            *yardsOut = bestYards;
+        return best;
+    }
+
+    // WHAT THE DUNGEON FINDER WOULD SAY ABOUT THIS FAMILY NOW. The locks are
+    // the core's own (LFGMgr::InitializeLockedDungeons, the call the client's
+    // lock-info request makes), read for the campaign's dungeon at normal
+    // difficulty.
+    OverseerDecisions::FinderFacts ReadFinderFacts(std::string const& leaderName,
+                                                   std::vector<std::string> const& members,
+                                                   DungeonPortal const& portal)
+    {
+        OverseerDecisions::FinderFacts facts;
+        facts.enabled = RecoveryFinderEnabled();
+        facts.finderOn = sLFGMgr->isOptionEnabled(lfg::LFG_OPTION_ENABLE_DUNGEON_FINDER);
+        LFGDungeonEntry const* dungeon =
+            GetLFGDungeon(portal.insideMapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (dungeon && dungeon->TypeID == lfg::LFG_TYPE_DUNGEON)
+        {
+            facts.dungeonId = dungeon->ID;
+            facts.dbcMinLevel = dungeon->MinLevel;
+            facts.dbcMaxLevel = dungeon->MaxLevel;
+        }
+        Player* const head = ObjectAccessor::FindPlayerByName(leaderName);
+        Group* const group = head ? head->GetGroup() : nullptr;
+        if (group)
+        {
+            facts.groupExists = true;
+            facts.groupSize = group->GetMembersCount();
+            facts.groupIsRaid = group->isRaidGroup();
+            facts.groupIsFinders = group->isLFGGroup();
+            facts.headLeads = group->GetLeaderGUID() == head->GetGUID();
+        }
+        std::vector<std::string> names{leaderName};
+        for (std::string const& name : members)
+            if (name != leaderName)
+                names.push_back(name);
+        for (std::string const& name : names)
+        {
+            OverseerDecisions::FinderMember m;
+            m.name = name;
+            m.leader = name == leaderName;
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (p && p->IsInWorld())
+            {
+                m.inWorld = true;
+                m.alive = p->IsAlive();
+                m.inCombat = p->IsInCombat();
+                m.inHeadsGroup = group && p->GetGroup() == group;
+                m.classId = p->getClass();
+                if (facts.dungeonId)
+                {
+                    sLFGMgr->InitializeLockedDungeons(p, p->GetGroup());
+                    lfg::LfgLockMap const& locks = sLFGMgr->GetLockedDungeons(p->GetGUID());
+                    auto const lock = locks.find(dungeon->ID + (dungeon->TypeID << 24));
+                    if (lock != locks.end())
+                        m.lock = lock->second;
+                }
+            }
+            facts.family.push_back(m);
+        }
         return facts;
     }
 
@@ -31232,15 +31479,22 @@ private:
         return line.str();
     }
 
-    // IS A HEARTH REGROUP THIS FAMILY'S BUSINESS NOW? Chosen, or the answer the
+    // DOES THE RECOVERY BRING THE FAMILY TO THE LEADER? The hearth regroup
+    // (everybody to the inn), the summon rung (everybody to the stone, 2026-09-24)
+    // and the dungeon finder (everybody inside). Chosen, or the answer the
     // backoff is waiting out. What the fetch, the regroup wait and the head's
-    // errands read (see RecoveringFetchPhase and HeadTravelFacts::hearthRegroup).
-    static bool HearthRegroupInPlay(DungeonRunCoordinatorState const& coord)
+    // errands read (see RecoveringFetchPhase and HeadTravelFacts::hearthRegroup):
+    // the leader is not lent to fetch one member across the map and is not held
+    // still for a straggler, because the recovery is what brings the stragglers.
+    static bool RecoveryBringsTheFamily(DungeonRunCoordinatorState const& coord)
     {
         if (coord.phase != DungeonRunPhase::Recovering)
             return false;
-        return (coord.recoveryChosen ? coord.recovery : coord.recoveryHeuristic) ==
-               OverseerDecisions::RunRecovery::HearthRegroup;
+        OverseerDecisions::RunRecovery const r =
+            coord.recoveryChosen ? coord.recovery : coord.recoveryHeuristic;
+        return r == OverseerDecisions::RunRecovery::HearthRegroup ||
+               r == OverseerDecisions::RunRecovery::Summon ||
+               r == OverseerDecisions::RunRecovery::DungeonFinder;
     }
 
     // IS THE HEARTH REGROUP APPLIED AND WALKING NOW? Narrower than
@@ -31250,6 +31504,19 @@ private:
     {
         return coord.phase == DungeonRunPhase::Recovering && coord.recoveryChosen &&
                coord.recovery == OverseerDecisions::RunRecovery::HearthRegroup;
+    }
+
+    // THE SUMMON RUNG AND THE DUNGEON FINDER HOLD THE LEADER: chosen, or the
+    // answer the backoff is waiting out. A trainer trip in town, which a
+    // hearth regroup lets go, would walk him off the stone.
+    static bool RecoveryHoldsTheLeader(DungeonRunCoordinatorState const& coord)
+    {
+        if (coord.phase != DungeonRunPhase::Recovering)
+            return false;
+        OverseerDecisions::RunRecovery const r =
+            coord.recoveryChosen ? coord.recovery : coord.recoveryHeuristic;
+        return r == OverseerDecisions::RunRecovery::Summon ||
+               r == OverseerDecisions::RunRecovery::DungeonFinder;
     }
 
     static std::string RecoveryFactsLine(OverseerDecisions::RunFailureFacts const& facts)
@@ -31276,6 +31543,10 @@ private:
             line << ' ' << OverseerDecisions::RunRecoveryWord(r);
         if (!facts.hearthRegroupNote.empty())
             line << "; " << facts.hearthRegroupNote;
+        if (!facts.summonNote.empty())
+            line << "; " << facts.summonNote;
+        if (!facts.dungeonFinderNote.empty())
+            line << "; " << facts.dungeonFinderNote;
         return line.str();
     }
 
@@ -31287,10 +31558,14 @@ private:
     // ResumeRecovery): no second row is written, and the bridge's answer on
     // that row is what DriveRecovering reads.
     void EnterRecovering(DungeonRunCoordinatorState& coord, std::string const& leaderName,
-                         OverseerDecisions::RunFailureFacts const& facts, unsigned attempt,
+                         OverseerDecisions::RunFailureFacts const& failure, unsigned attempt,
                          uint32 alreadyWaited, bool resumed = false)
     {
         std::time_t const now = std::time(nullptr);
+        // THE STREAK IS WHAT OPENS THE FALLBACK RUNGS, and this is the one
+        // place that knows it.
+        OverseerDecisions::RunFailureFacts facts = failure;
+        facts.streak = attempt;
         coord.phase = DungeonRunPhase::Recovering;
         coord.recoveryStreak = attempt;
         coord.recoveryAttempt = attempt;
@@ -31587,6 +31862,37 @@ private:
                              OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic));
             }
 
+            // THE TWO FALLBACK RUNGS ARE READ AGAIN WHEN APPLIED, for the reason
+            // the hearth regroup is: the backoff can be a quarter of an hour.
+            // The stone is a spawn and does not move, so only the finder is
+            // asked again - a group that re-formed, a member who logged out, a
+            // switch turned off. No longer possible means the heuristic again.
+            if (chosen == OverseerDecisions::RunRecovery::DungeonFinder)
+            {
+                OverseerDecisions::FinderReadiness const finder =
+                    OverseerDecisions::ReadFinderReadiness(
+                        ReadFinderFacts(leaderName, members, portal), false);
+                if (!finder.ready)
+                {
+                    coord.recoveryFacts.dungeonFinderReady = false;
+                    coord.recoveryFacts.dungeonFinderNote = "no dungeon finder (" + finder.whyNot + ")";
+                    chosen = OverseerDecisions::RunRecoveryHeuristic(coord.recoveryFacts);
+                    LOG_ERROR("module.overseer",
+                              "overseer: dungeon campaign {} for '{}' was to go in by the "
+                              "DUNGEON FINDER, but the family no longer can - {}. '{}' is "
+                              "applied instead",
+                              coord.campaignId, leaderName, finder.whyNot,
+                              OverseerDecisions::RunRecoveryWord(chosen));
+                    chosenBy = "heuristic";
+                }
+            }
+            if (chosen == OverseerDecisions::RunRecovery::Summon &&
+                !DoorMeetingStone(portal))
+            {
+                coord.recoveryFacts.summonReady = false;
+                chosen = OverseerDecisions::RunRecoveryHeuristic(coord.recoveryFacts);
+                chosenBy = "heuristic";
+            }
             // A HEARTH REGROUP IS READ AGAIN WHEN IT IS APPLIED. The backoff
             // can be fifteen minutes, and a stone used, a member dead or a bind
             // moved in that time changes the plan. No inn any more means the
@@ -31611,6 +31917,23 @@ private:
                     chosenBy = "heuristic";
                 }
             }
+
+            coord.summonTries.clear();
+            coord.summonRowSource.clear();
+            coord.summonRowTarget.clear();
+            coord.summonRowSince = 0;
+            coord.summonWalkedIn = false;
+            coord.summonSaid.clear();
+            coord.finderJoined = false;
+            coord.finderSince = 0;
+            coord.finderDungeonId = 0;
+            coord.finderAccepted.clear();
+            coord.finderSaid.clear();
+            // HOW OFTEN THE CLASSIC ROAD HAS FAILED TODAY, read before this
+            // row is marked (the mark is queued) and counted with it.
+            unsigned finderUsesToday = 0;
+            if (chosen == OverseerDecisions::RunRecovery::DungeonFinder)
+                finderUsesToday = FinderUsesToday(FamilyOfCoordinator(coord)) + 1;
 
             coord.recoveryChosen = true;
             coord.recovery = chosen;
@@ -31677,6 +32000,32 @@ private:
                                  : JoinNames(coord.hearthPlan.travel),
                              portal.keyword);
                     return;
+                case OverseerDecisions::RunRecovery::Summon:
+                    LOG_WARN("module.overseer",
+                             "overseer: dungeon campaign {} for '{}' SUMMONS AT THE DOOR - "
+                             "{} attempts in a row never got inside. '{}' walks to the '{}' "
+                             "meeting stone with no staging clock, and once a second member "
+                             "stands there the stone summons everybody who does not "
+                             "(kind='summon', at most {} tries each)",
+                             coord.campaignId, leaderName, coord.recoveryAttempt, leaderName,
+                             portal.keyword, OverseerDecisions::SUMMON_RUNG_TRIES_PER_MEMBER);
+                    return;
+                case OverseerDecisions::RunRecovery::DungeonFinder:
+                    _travelAims.Release(leaderName, "the run's dungeon finder recovery");
+                    // LOUD ON PURPOSE, EVERY TIME: each of these is the walk and
+                    // the summon both having failed, and the count is what tells
+                    // an operator how often that happens.
+                    LOG_ERROR("module.overseer",
+                              "overseer: DUNGEON FINDER - dungeon campaign {} for family '{}' "
+                              "('{}') queues the family for its own dungeon '{}' (map {}) as "
+                              "the LAST RESORT: {} attempts in a row never got inside and the "
+                              "summon rung has had its turn ({} summon recovery(s) this streak; "
+                              "{}). Used {} time(s) today for this family",
+                              coord.campaignId, FamilyOfCoordinator(coord), leaderName,
+                              portal.keyword, portal.insideMapId, coord.recoveryAttempt,
+                              OverseerDecisions::SummonsTriedThisStreak(coord.recoveryFacts),
+                              coord.recoveryFacts.summonNote, finderUsesToday);
+                    return;
                 case OverseerDecisions::RunRecovery::RestageNearer:
                 case OverseerDecisions::RunRecovery::WaitForClient:
                     return;
@@ -31726,90 +32075,26 @@ private:
                 doneWhy = "every member is at the inn";
                 break;
             case OverseerDecisions::RunRecovery::RestageNearer:
-            {
                 wait.ceilingSeconds = DUNGEON_RECOVERY_WALK_CEILING_SECONDS;
-                doneWhy = "the leader is near the staging point";
-                if (!leaderSteerable)
-                    break;   // wait for him; the ceiling still runs
-                if (leader->GetMapId() != portal.outsideMapId ||
-                    !OverseerDecisions::StagingPointUsable(coord.stageX, coord.stageY,
-                                                           coord.stageZ))
-                {
-                    // Nothing this walk can do from another map, or toward a
-                    // point that is not a place: the attempt's own travel and
-                    // RESETTING's derivation are what answer those.
-                    wait.satisfied = true;
-                    doneWhy = "the leader is not on the door's map, so the next attempt "
-                              "walks him";
-                    break;
-                }
-
-                // THE TOWN FIRST, WHERE THE PORTAL ROW NAMES ONE, then the
-                // approach the staging walk would take - with no staging clock.
-                OverseerDecisions::CampaignHomeAnchor const town = DungeonHomeAnchor(portal);
-                std::string aim;
-                float yards = 0.f;
-                if (town.known && !coord.recoveryTownReached)
-                {
-                    yards = leader->GetExactDist2d(town.x, town.y);
-                    if (yards <= DUNGEON_RECOVERY_NEAR_YARDS)
-                    {
-                        coord.recoveryTownReached = true;
-                        coord.recoveryBest = -1.f;
-                        coord.recoveryBestAt = now;
-                        LOG_INFO("module.overseer",
-                                 "overseer: '{}' reached the '{}' town on its restage walk "
-                                 "and goes on toward the door",
-                                 leaderName, portal.keyword);
-                    }
-                    else
-                    {
-                        std::ostringstream at;
-                        at << "at:" << portal.outsideMapId << ':' << town.x << ',' << town.y
-                           << ',' << town.z;
-                        aim = at.str();
-                    }
-                }
-                if (aim.empty())
-                {
-                    DungeonApproachAim const legAim = DungeonApproachAimFor(
-                        portal, coord.approach[leaderName], leader, coord.stageX,
-                        coord.stageY, coord.stageZ);
-                    if (!legAim.usable)
-                    {
-                        wait.satisfied = true;
-                        doneWhy = "no usable aim toward the door, so the next attempt plans it";
-                        break;
-                    }
-                    aim = legAim.aim;
-                    yards = leader->GetExactDist2d(coord.stageX, coord.stageY);
-                    wait.satisfied = yards <= DUNGEON_RECOVERY_NEAR_YARDS;
-                }
-                if (wait.satisfied)
-                    break;
-
-                // CLAIMED EVERY POLL, the way BARRIER and GATHERING claim:
-                // Claim returns at once while the errand is live, and renews
-                // it when something else ended it.
-                _travelAims.Claim(leaderName, aim, OverseerDecisions::TravelOwner::Run);
-                if (coord.recoveryBest < 0.f ||
-                    yards < coord.recoveryBest - DUNGEON_RECOVERY_WALK_PROGRESS_YARDS)
-                {
-                    coord.recoveryBest = yards;
-                    coord.recoveryBestAt = now;
-                }
-                else if (now - coord.recoveryBestAt >=
-                         static_cast<std::time_t>(DUNGEON_RECOVERY_WALK_STALL_SECONDS))
-                {
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' has got no nearer than {:.0f}y on its restage "
-                             "walk for {}s; the walk ends and the next attempt opens from "
-                             "where he stands",
-                             leaderName, coord.recoveryBest,
-                             DUNGEON_RECOVERY_WALK_STALL_SECONDS);
-                    wait.satisfied = true;
-                    doneWhy = "the walk stopped making progress";
-                }
+                wait.satisfied =
+                    RestageWalkPoll(coord, leaderName, leader, leaderSteerable, portal, now,
+                                    doneWhy);
+                break;
+            case OverseerDecisions::RunRecovery::Summon:
+                wait.ceilingSeconds = DUNGEON_RECOVERY_WALK_CEILING_SECONDS;
+                wait.satisfied = DriveSummonRung(coord, leaderName, leader, leaderSteerable,
+                                                 members, portal, now, doneWhy);
+                break;
+            case OverseerDecisions::RunRecovery::DungeonFinder:
+            {
+                // The rung's own clock is FINDER_CEILING_SECONDS from its join;
+                // this ceiling is the backstop behind it.
+                wait.ceilingSeconds = OverseerDecisions::FINDER_CEILING_SECONDS * 2;
+                FinderRungOutcome const outcome =
+                    DriveFinderRung(coord, leaderName, members, portal, now, doneWhy);
+                if (outcome == FinderRungOutcome::Inside)
+                    return;   // the coordinator is STAGED_INSIDE now
+                wait.satisfied = outcome == FinderRungOutcome::Over;
                 break;
             }
             default:
@@ -31860,9 +32145,612 @@ private:
                      : std::string("reached its ceiling"),
                  static_cast<uint32>(now - coord.recoveryActSince), coord.runNumber,
                  coord.campaignId);
-        if (coord.recovery == OverseerDecisions::RunRecovery::RestageNearer)
+        if (coord.recovery == OverseerDecisions::RunRecovery::RestageNearer ||
+            coord.recovery == OverseerDecisions::RunRecovery::Summon)
             _travelAims.Release(leaderName, "the run's restage walk ending");
+        if (coord.recovery == OverseerDecisions::RunRecovery::DungeonFinder)
+            LeaveTheFinderQueue(leaderName, coord, "the dungeon finder recovery ended");
         RearmAfterRecovery(coord, false);
+    }
+
+    // ONE POLL OF THE RESTAGE WALK: the town first where the portal row names
+    // one, then the approach the staging walk would take, with no staging
+    // clock. True when the walk is over, `doneWhy` saying why. Shared by the
+    // restage_nearer recovery and the summon rung's walk to the door.
+    bool RestageWalkPoll(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                         Player* leader, bool leaderSteerable, DungeonPortal const& portal,
+                         std::time_t now, char const*& doneWhy)
+    {
+        doneWhy = "the leader is near the staging point";
+        if (!leaderSteerable)
+            return false;   // wait for him; the ceiling still runs
+        if (leader->GetMapId() != portal.outsideMapId ||
+            !OverseerDecisions::StagingPointUsable(coord.stageX, coord.stageY,
+                                                   coord.stageZ))
+        {
+            // Nothing this walk can do from another map, or toward a
+            // point that is not a place: the attempt's own travel and
+            // RESETTING's derivation are what answer those.
+            doneWhy = "the leader is not on the door's map, so the next attempt "
+                      "walks him";
+            return true;
+        }
+
+        // THE TOWN FIRST, WHERE THE PORTAL ROW NAMES ONE, then the
+        // approach the staging walk would take - with no staging clock.
+        OverseerDecisions::CampaignHomeAnchor const town = DungeonHomeAnchor(portal);
+        std::string aim;
+        float yards = 0.f;
+        if (town.known && !coord.recoveryTownReached)
+        {
+            yards = leader->GetExactDist2d(town.x, town.y);
+            if (yards <= DUNGEON_RECOVERY_NEAR_YARDS)
+            {
+                coord.recoveryTownReached = true;
+                coord.recoveryBest = -1.f;
+                coord.recoveryBestAt = now;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' reached the '{}' town on its restage walk "
+                         "and goes on toward the door",
+                         leaderName, portal.keyword);
+            }
+            else
+            {
+                std::ostringstream at;
+                at << "at:" << portal.outsideMapId << ':' << town.x << ',' << town.y
+                   << ',' << town.z;
+                aim = at.str();
+            }
+        }
+        if (aim.empty())
+        {
+            DungeonApproachAim const legAim = DungeonApproachAimFor(
+                portal, coord.approach[leaderName], leader, coord.stageX,
+                coord.stageY, coord.stageZ);
+            if (!legAim.usable)
+            {
+                doneWhy = "no usable aim toward the door, so the next attempt plans it";
+                return true;
+            }
+            aim = legAim.aim;
+            yards = leader->GetExactDist2d(coord.stageX, coord.stageY);
+            if (yards <= DUNGEON_RECOVERY_NEAR_YARDS)
+                return true;
+        }
+
+        // CLAIMED EVERY POLL, the way BARRIER and GATHERING claim:
+        // Claim returns at once while the errand is live, and renews
+        // it when something else ended it.
+        _travelAims.Claim(leaderName, aim, OverseerDecisions::TravelOwner::Run);
+        if (coord.recoveryBest < 0.f ||
+            yards < coord.recoveryBest - DUNGEON_RECOVERY_WALK_PROGRESS_YARDS)
+        {
+            coord.recoveryBest = yards;
+            coord.recoveryBestAt = now;
+        }
+        else if (now - coord.recoveryBestAt >=
+                 static_cast<std::time_t>(DUNGEON_RECOVERY_WALK_STALL_SECONDS))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' has got no nearer than {:.0f}y on its restage "
+                     "walk for {}s; the walk ends and the next attempt opens from "
+                     "where he stands",
+                     leaderName, coord.recoveryBest,
+                     DUNGEON_RECOVERY_WALK_STALL_SECONDS);
+            doneWhy = "the walk stopped making progress";
+            return true;
+        }
+        return false;
+    }
+
+    // --------------------------------------------- rung two: the summon --
+    //
+    // ONE POLL OF THE SUMMON RUNG (RunRecovery::Summon). True when it is over.
+    //
+    // THE SUMMON ITSELF IS kind='summon', ASKED FOR THROUGH THE QUEUE. That
+    // verb is the whole meeting-stone chain (#313, #355, #365): both clickers
+    // walked the last yards to the stone under a hold, the click, the portal,
+    // the second click, the summoner's selection held through the settle, the
+    // accept driven through the core's own handler, and the read-back of where
+    // the summoned character actually is. Writing its row is how this rung
+    // uses every piece of that without a second copy, and the row is a record
+    // an operator already knows how to read. The rung finds it again by its
+    // `source` (SummonRungRowSource), and waits for its verdict before asking
+    // for the next.
+    //
+    // BEFORE THAT, THE LEADER WALKS TO THE STONE: the restage walk to the door
+    // first (the town, then the approach, with no staging clock), then an `at:`
+    // aim at the stone's own spawn. The family follows him as it always does,
+    // and the summon is for whoever does not arrive with him.
+    bool DriveSummonRung(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                         Player* leader, bool leaderSteerable,
+                         std::vector<std::string> const& members, DungeonPortal const& portal,
+                         std::time_t now, char const*& doneWhy)
+    {
+        GameObjectData const* const stone = DoorMeetingStone(portal);
+        if (!stone)
+        {
+            doneWhy = "the door has no meeting stone";
+            return true;
+        }
+
+        // A ROW IN FLIGHT IS WAITED FOR, and its verdict is read before
+        // anything else is asked. Not found yet is a row whose insert is still
+        // queued, and is waited for the same way.
+        if (!coord.summonRowSource.empty())
+        {
+            std::string status;
+            std::string detail;
+            bool const found = ReadSummonRow(coord.summonRowSource, status, detail);
+            bool const finished = found && OverseerDecisions::SummonRowFinished(status);
+            if (!finished &&
+                now - coord.summonRowSince <
+                    static_cast<std::time_t>(OverseerDecisions::SUMMON_RUNG_ROW_CEILING_SECONDS))
+                return false;
+            unsigned const tries = ++coord.summonTries[coord.summonRowTarget];
+            if (finished && status == "applied")
+                LOG_INFO("module.overseer",
+                         "overseer: summon rung - '{}' was summoned to the '{}' meeting stone "
+                         "(row '{}')",
+                         coord.summonRowTarget, portal.keyword, coord.summonRowSource);
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: summon rung - the summon of '{}' did not bring it to the "
+                         "'{}' meeting stone ({}); try {} of {}",
+                         coord.summonRowTarget, portal.keyword,
+                         finished ? status + ": " + detail
+                                  : "no verdict within " +
+                                        std::to_string(
+                                            OverseerDecisions::SUMMON_RUNG_ROW_CEILING_SECONDS) +
+                                        "s",
+                         tries, OverseerDecisions::SUMMON_RUNG_TRIES_PER_MEMBER);
+            coord.summonRowSource.clear();
+            coord.summonRowTarget.clear();
+            coord.summonRowSince = 0;
+        }
+
+        // THE FAMILY AS THE RUNG READS IT: who stands at the stone, outside
+        // any instance, and who could be moved by the verb.
+        std::vector<std::string> names{leaderName};
+        for (std::string const& name : members)
+            if (name != leaderName)
+                names.push_back(name);
+        std::vector<OverseerDecisions::SummonRungMember> family;
+        for (std::string const& name : names)
+        {
+            OverseerDecisions::SummonRungMember m;
+            m.name = name;
+            m.leader = name == leaderName;
+            m.tries = coord.summonTries[name];
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (p && p->IsInWorld())
+            {
+                m.inWorld = true;
+                m.alive = p->IsAlive();
+                m.inCombat = p->IsInCombat();
+                m.atStone = p->GetMapId() == stone->mapid && p->GetInstanceId() == 0 &&
+                            p->GetExactDist2d(stone->posX, stone->posY) <=
+                                OverseerDecisions::SUMMON_RUNG_AT_STONE_YARDS;
+                m.summonable = GET_PLAYERBOT_AI(p) != nullptr;
+            }
+            family.push_back(m);
+        }
+        OverseerDecisions::SummonRungPlan const plan = OverseerDecisions::PlanSummonRung(family);
+        std::string const said =
+            std::string(OverseerDecisions::SummonRungStepWord(plan.step)) + ": " + plan.why;
+        bool const changed = said != coord.summonSaid;
+        if (changed)
+        {
+            coord.summonSaid = said;
+            LOG_INFO("module.overseer",
+                     "overseer: summon rung for '{}' at the '{}' door - {}. At the stone: {}; "
+                     "away: {}",
+                     leaderName, portal.keyword, said,
+                     plan.atStone.empty() ? std::string("nobody") : JoinNames(plan.atStone),
+                     plan.away.empty() ? std::string("nobody") : JoinNames(plan.away));
+        }
+
+        switch (plan.step)
+        {
+            case OverseerDecisions::SummonRungStep::Done:
+                doneWhy = "every member stands at the meeting stone";
+                return true;
+            case OverseerDecisions::SummonRungStep::NobodyLeft:
+                doneWhy = "nobody left away from the meeting stone can be summoned";
+                return true;
+            case OverseerDecisions::SummonRungStep::WaitForClickers:
+                // He stands at the stone; whatever walked him there ends, once.
+                if (changed)
+                    _travelAims.Release(leaderName, "the summon rung holds him at the stone");
+                return false;
+            case OverseerDecisions::SummonRungStep::Summon:
+            {
+                if (changed)
+                    _travelAims.Release(leaderName, "the summon rung holds him at the stone");
+                unsigned const tryNumber = coord.summonTries[plan.target] + 1;
+                std::string const source = OverseerDecisions::SummonRungRowSource(
+                    coord.campaignId, coord.recoveryAttempt, plan.target, tryNumber);
+                CharacterDatabase.Execute(
+                    "INSERT INTO overseer_command (target_name, command, kind, target_arg, source) "
+                    "VALUES ('{}', 'use {}', 'summon', '{}', '{}')",
+                    Esc(plan.summoner), Esc(plan.target), Esc(plan.helper), Esc(source));
+                coord.summonRowSource = source;
+                coord.summonRowTarget = plan.target;
+                coord.summonRowSince = now;
+                LOG_WARN("module.overseer",
+                         "overseer: summon rung - '{}' and '{}' click the '{}' meeting stone to "
+                         "summon '{}' (try {} of {}); the kind='summon' row carries source '{}'",
+                         plan.summoner, plan.helper, portal.keyword, plan.target, tryNumber,
+                         OverseerDecisions::SUMMON_RUNG_TRIES_PER_MEMBER, source);
+                return false;
+            }
+            case OverseerDecisions::SummonRungStep::WalkToStone:
+                break;
+        }
+
+        // THE WALK: the restage walk to the door first, then the stone.
+        if (!leaderSteerable)
+            return false;   // wait for him; the ceiling still runs
+        if (!coord.summonWalkedIn)
+        {
+            char const* walkWhy = "";
+            if (!RestageWalkPoll(coord, leaderName, leader, leaderSteerable, portal, now,
+                                 walkWhy))
+                return false;
+            if (leader->GetMapId() != stone->mapid)
+            {
+                doneWhy = "the leader is not on the door's map, so the next attempt walks him";
+                return true;
+            }
+            coord.summonWalkedIn = true;
+            coord.recoveryBest = -1.f;
+            coord.recoveryBestAt = now;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is at the '{}' door ({}) and walks the last of the way "
+                     "to its meeting stone",
+                     leaderName, portal.keyword, walkWhy);
+        }
+
+        float const yards = leader->GetExactDist2d(stone->posX, stone->posY);
+        std::ostringstream at;
+        at << "at:" << stone->mapid << ':' << stone->posX << ',' << stone->posY << ','
+           << stone->posZ;
+        _travelAims.Claim(leaderName, at.str(), OverseerDecisions::TravelOwner::Run);
+        if (coord.recoveryBest < 0.f ||
+            yards < coord.recoveryBest - DUNGEON_RECOVERY_WALK_PROGRESS_YARDS)
+        {
+            coord.recoveryBest = yards;
+            coord.recoveryBestAt = now;
+        }
+        else if (now - coord.recoveryBestAt >=
+                 static_cast<std::time_t>(DUNGEON_RECOVERY_WALK_STALL_SECONDS))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' has got no nearer than {:.0f}y to the '{}' meeting stone "
+                     "for {}s; the summon rung ends and the next attempt opens from where he "
+                     "stands",
+                     leaderName, coord.recoveryBest, portal.keyword,
+                     DUNGEON_RECOVERY_WALK_STALL_SECONDS);
+            doneWhy = "the walk to the meeting stone stopped making progress";
+            return true;
+        }
+        return false;
+    }
+
+    // The verdict of the summon row the rung wrote, newest first. False when
+    // the row is not there yet.
+    static bool ReadSummonRow(std::string const& source, std::string& status,
+                              std::string& detail)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT status, detail FROM overseer_command "
+            "WHERE kind = 'summon' AND source = '{}' ORDER BY id DESC LIMIT 1",
+            Esc(source));
+        if (!result)
+            return false;
+        Field* row = result->Fetch();
+        status = row[0].Get<std::string>();
+        detail = row[1].Get<std::string>();
+        return true;
+    }
+
+    // ------------------------------------- rung three: the dungeon finder --
+    //
+    // ONE POLL OF THE LAST RESORT (RunRecovery::DungeonFinder), read through
+    // OverseerDecisions::FinderNext. The family joins as one group of five for
+    // its campaign's own dungeon through LFGMgr::JoinLfg, the call the
+    // client's join packet ends in; the leader's roles go with the join and
+    // every other member answers the role check through the core's own
+    // handler; each member accepts the proposal through the core's own handler
+    // too, named by the proposal id the core sent it. The last accept is what
+    // makes the core's MakeNewGroup teleport the group in. Nothing here moves
+    // anybody.
+    enum class FinderRungOutcome
+    {
+        Waiting,
+        Over,
+        Inside,
+    };
+
+    static OverseerDecisions::FinderState FinderStateOf(lfg::LfgState state)
+    {
+        switch (state)
+        {
+            case lfg::LFG_STATE_NONE:      return OverseerDecisions::FinderState::None;
+            case lfg::LFG_STATE_ROLECHECK: return OverseerDecisions::FinderState::RoleCheck;
+            case lfg::LFG_STATE_QUEUED:    return OverseerDecisions::FinderState::Queued;
+            case lfg::LFG_STATE_PROPOSAL:  return OverseerDecisions::FinderState::Proposal;
+            case lfg::LFG_STATE_DUNGEON:   return OverseerDecisions::FinderState::Dungeon;
+            default:                       return OverseerDecisions::FinderState::Other;
+        }
+    }
+
+    // THE ONE PIECE OF mod-playerbots #2754 THIS RUNG NEEDS, TAKEN HERE. A
+    // bot sends no movement packets, so m_lastFallZ is never walked down with
+    // it, and Player::IsFalling - a Z test against that height - reads a bot
+    // standing still below it as falling; LFGMgr::TeleportPlayer then refuses
+    // it LFG_TELEPORTERROR_FALLING. Re-anchored on the same test upstream
+    // uses (Unit::IsFalling, the movement flags), so a real fall keeps its
+    // height, and only for a family member about to be teleported.
+    static void ReanchorFallForTheFinder(Player* p)
+    {
+        if (p && p->IsInWorld() && !p->Unit::IsFalling())
+            p->SetFallInformation(GameTime::GetGameTime().count(), p->GetPositionZ());
+    }
+
+    FinderRungOutcome DriveFinderRung(DungeonRunCoordinatorState& coord,
+                                      std::string const& leaderName,
+                                      std::vector<std::string> const& members,
+                                      DungeonPortal const& portal, std::time_t now,
+                                      char const*& doneWhy)
+    {
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+        Group* const group = leader ? leader->GetGroup() : nullptr;
+        std::vector<std::string> names{leaderName};
+        for (std::string const& name : members)
+            if (name != leaderName)
+                names.push_back(name);
+
+        OverseerDecisions::FinderPollFacts poll;
+        poll.joined = coord.finderJoined;
+        poll.state = FinderStateOf(group ? sLFGMgr->GetState(group->GetGUID())
+                                         : lfg::LFG_STATE_NONE);
+        poll.familySize = static_cast<unsigned>(names.size());
+        uint32 const headInstance =
+            leader && leader->IsInWorld() && leader->GetMapId() == portal.insideMapId
+                ? leader->GetInstanceId()
+                : 0;
+        for (std::string const& name : names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (!p || !p->IsInWorld() || !p->IsAlive() || p->IsInCombat())
+                poll.anyoneNotReady = true;
+            if (p && p->IsInWorld() && headInstance && p->GetMapId() == portal.insideMapId &&
+                p->GetInstanceId() == headInstance)
+                ++poll.inside;
+            if (coord.finderJoined)
+            {
+                FinderBookEntry const entry = FinderBookFor(name);
+                if (entry.proposalId && entry.proposalAt >= coord.finderSince)
+                    poll.proposalSeen = true;
+            }
+        }
+        poll.waitedSeconds =
+            coord.finderSince ? static_cast<unsigned>(now - coord.finderSince) : 0;
+
+        OverseerDecisions::FinderStep const step = OverseerDecisions::FinderNext(poll);
+        std::string const said = std::string(OverseerDecisions::FinderStepWord(step)) + " " +
+                                 std::to_string(static_cast<unsigned>(poll.state)) + " " +
+                                 std::to_string(poll.inside);
+        bool const sayIt = said != coord.finderSaid;
+        coord.finderSaid = said;
+
+        switch (step)
+        {
+            case OverseerDecisions::FinderStep::Inside:
+                LOG_ERROR("module.overseer",
+                          "overseer: DUNGEON FINDER - the family of '{}' is inside map {}, all "
+                          "{} of it, {}s after it was queued for its own dungeon. Run {} of "
+                          "campaign {} is STAGED_INSIDE exactly as if it had walked in, and it "
+                          "leaves by the same door",
+                          leaderName, portal.insideMapId, poll.inside, poll.waitedSeconds,
+                          coord.runNumber, coord.campaignId);
+                _travelAims.Release(leaderName, "the dungeon finder took the family in");
+                StageInsideAfterFinder(coord);
+                return FinderRungOutcome::Inside;
+
+            case OverseerDecisions::FinderStep::GiveUp:
+            {
+                FinderBookEntry const told = FinderBookFor(leaderName);
+                std::string const why =
+                    poll.waitedSeconds >= poll.ceilingSeconds
+                        ? "nothing took the family in within " +
+                              std::to_string(poll.ceilingSeconds) + "s"
+                        : std::string("the core let the family go (") +
+                              (told.joinAt >= coord.finderSince && told.joinResult
+                                   ? OverseerDecisions::FinderJoinResultWord(told.joinResult)
+                                   : "a failed role check or a proposal that did not hold") +
+                              ")";
+                LOG_ERROR("module.overseer",
+                          "overseer: DUNGEON FINDER - the family of '{}' did not get into map "
+                          "{} - {}. The queue is left, and run {} of campaign {} is attempted "
+                          "again the ordinary way",
+                          leaderName, portal.insideMapId, why, coord.runNumber,
+                          coord.campaignId);
+                LeaveTheFinderQueue(leaderName, coord, "the dungeon finder rung gave up");
+                doneWhy = "the dungeon finder did not take the family in";
+                return FinderRungOutcome::Over;
+            }
+
+            case OverseerDecisions::FinderStep::Join:
+            {
+                OverseerDecisions::FinderFacts const facts =
+                    ReadFinderFacts(leaderName, members, portal);
+                OverseerDecisions::FinderReadiness const ready =
+                    OverseerDecisions::ReadFinderReadiness(facts, true);
+                if (!ready.ready || !leader || !group)
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: DUNGEON FINDER - the family of '{}' cannot be queued "
+                              "for map {}: {}. Run {} of campaign {} is attempted again the "
+                              "ordinary way",
+                              leaderName, portal.insideMapId,
+                              ready.ready ? std::string("the head is in no group") : ready.whyNot,
+                              coord.runNumber, coord.campaignId);
+                    doneWhy = "the family could not be queued in the dungeon finder";
+                    return FinderRungOutcome::Over;
+                }
+                ClearFinderBook(names);
+                for (std::string const& name : names)
+                    ReanchorFallForTheFinder(ObjectAccessor::FindPlayerByName(name));
+
+                lfg::LfgDungeonSet dungeons;
+                dungeons.insert(facts.dungeonId);
+                sLFGMgr->JoinLfg(leader, OverseerDecisions::FinderRoleMask(leader->getClass(), true),
+                                 dungeons, "");
+                // EVERY OTHER MEMBER ANSWERS THE ROLE CHECK the way its client
+                // would: CMSG_LFG_SET_ROLES, one byte of role bits, handed to
+                // WorldSession::HandleLfgSetRolesOpcode.
+                for (std::string const& name : names)
+                {
+                    if (name == leaderName)
+                        continue;
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    if (!p || !p->GetSession())
+                        continue;
+                    WorldPacket roles(CMSG_LFG_SET_ROLES, 1);
+                    roles << uint8(OverseerDecisions::FinderRoleMask(p->getClass(), false));
+                    roles.rpos(0);
+                    p->GetSession()->HandleLfgSetRolesOpcode(roles);
+                }
+                coord.finderJoined = true;
+                coord.finderSince = now;
+                coord.finderDungeonId = facts.dungeonId;
+                LOG_WARN("module.overseer",
+                         "overseer: DUNGEON FINDER - '{}' queued the family for finder dungeon "
+                         "{} ('{}', map {}); after the role check the group is in state {}",
+                         leaderName, facts.dungeonId, portal.keyword, portal.insideMapId,
+                         static_cast<unsigned>(FinderStateOf(sLFGMgr->GetState(group->GetGUID()))));
+                return FinderRungOutcome::Waiting;
+            }
+
+            case OverseerDecisions::FinderStep::Accept:
+            {
+                // EVERY MEMBER IS RE-ANCHORED BEFORE ANY ACCEPT, because the
+                // last accept teleports all five in the same call.
+                for (std::string const& name : names)
+                    ReanchorFallForTheFinder(ObjectAccessor::FindPlayerByName(name));
+                for (std::string const& name : names)
+                {
+                    FinderBookEntry const entry = FinderBookFor(name);
+                    if (!entry.proposalId || entry.proposalAt < coord.finderSince ||
+                        coord.finderAccepted[name] == entry.proposalId)
+                        continue;
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    if (!p || !p->GetSession())
+                        continue;
+                    coord.finderAccepted[name] = entry.proposalId;
+                    LOG_INFO("module.overseer",
+                             "overseer: DUNGEON FINDER - '{}' accepts proposal {} for map {}",
+                             name, entry.proposalId, portal.insideMapId);
+                    // CMSG_LFG_PROPOSAL_RESULT: the proposal id and one byte of
+                    // agreement, handed to the core's own handler.
+                    WorldPacket answer(CMSG_LFG_PROPOSAL_RESULT, 4 + 1);
+                    answer << uint32(entry.proposalId);
+                    answer << uint8(1);
+                    answer.rpos(0);
+                    p->GetSession()->HandleLfgProposalResultOpcode(answer);
+                }
+                return FinderRungOutcome::Waiting;
+            }
+
+            case OverseerDecisions::FinderStep::Wait:
+                if (sayIt)
+                    LOG_INFO("module.overseer",
+                             "overseer: DUNGEON FINDER - the family of '{}' waits: state {}, {} "
+                             "of {} inside, {}{}s since it was queued",
+                             leaderName, static_cast<unsigned>(poll.state), poll.inside,
+                             poll.familySize,
+                             poll.anyoneNotReady ? "a member is dead, in combat or away, " : "",
+                             poll.waitedSeconds);
+                return FinderRungOutcome::Waiting;
+        }
+        return FinderRungOutcome::Waiting;
+    }
+
+    // Out of the finder's queue, when the family is still in it.
+    void LeaveTheFinderQueue(std::string const& leaderName, DungeonRunCoordinatorState const& coord,
+                             char const* why)
+    {
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+        Group* const group = leader ? leader->GetGroup() : nullptr;
+        if (!group)
+            return;
+        lfg::LfgState const state = sLFGMgr->GetState(group->GetGUID());
+        if (state != lfg::LFG_STATE_ROLECHECK && state != lfg::LFG_STATE_QUEUED &&
+            state != lfg::LFG_STATE_PROPOSAL)
+            return;
+        sLFGMgr->LeaveLfg(group->GetGUID());
+        LOG_WARN("module.overseer",
+                 "overseer: DUNGEON FINDER - the family of '{}' leaves the queue for campaign "
+                 "{}: {}",
+                 leaderName, coord.campaignId, why);
+    }
+
+    // THE FAMILY IS INSIDE: the run goes on from STAGED_INSIDE exactly as if
+    // ENTER had brought it through the door. The identity of the attempt is
+    // carried the way RearmAfterRecovery carries it; everything a phase before
+    // STAGED_INSIDE would have set up is not needed from here.
+    void StageInsideAfterFinder(DungeonRunCoordinatorState& coord)
+    {
+        DungeonRunCoordinatorState next;
+        next.phase = DungeonRunPhase::StagedInside;
+        next.portalKeyword = coord.portalKeyword;
+        next.stageX = coord.stageX;
+        next.stageY = coord.stageY;
+        next.stageZ = coord.stageZ;
+        next.campaignId = coord.campaignId;
+        next.runNumber = coord.runNumber;
+        next.runsWanted = coord.runsWanted;
+        next.capKnown = coord.capKnown;
+        next.recoveryStreak = coord.recoveryStreak;
+        coord = next;
+    }
+
+    // A DUNGEON FINDER GROUP CANNOT BE RESET (Group::ResetInstances returns at
+    // once for one), so once the family is back outside the finder's group is
+    // disbanded and the one-group rule (KeepFamilyGrouped) forms the family's
+    // party under its head again, as it does after any relog. Asked by
+    // RESETTING only when nobody is inside. True when it disbanded, so the
+    // reset waits a poll for the party.
+    bool LeaveTheFinderGroup(std::string const& leaderName, uint32 runNumber, uint32 mapId)
+    {
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+        Group* const group = leader ? leader->GetGroup() : nullptr;
+        if (!group || !group->isLFGGroup())
+            return false;
+        LOG_WARN("module.overseer",
+                 "overseer: dungeon run {} - the family of '{}' is still in the dungeon finder "
+                 "group that took it into map {}, and a finder group cannot reset its "
+                 "instances. The group is disbanded and the family's own party is formed "
+                 "again under its head before the reset",
+                 runNumber, leaderName, mapId);
+        group->Disband();
+        return true;
+    }
+
+    // HOW OFTEN THE LAST RUNG WAS NEEDED TODAY, per family: the rows marked
+    // 'dungeon_finder' since midnight on the database's clock.
+    unsigned FinderUsesToday(std::string const& family)
+    {
+        if (!RunRecoveryPresent())
+            return 0;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_run_recovery WHERE family = '{}' "
+            "AND kind = 'run_recovery' AND applied = 'dungeon_finder' "
+            "AND applied_at >= CURDATE()",
+            Esc(family));
+        return result ? static_cast<unsigned>(result->Fetch()[0].Get<uint64>()) : 0;
     }
 
     // THE STAGING STALL, CLOSED EARLY. The same accounting as FailStaging (a
@@ -35782,6 +36670,7 @@ private:
         // is driven, so a stale phase can never keep a drive yielding (#631).
         _familyRunPhaseByMember.clear();
         _hearthRegroupMembers.clear();
+        _recoveryHoldMembers.clear();
         if (rosters.empty())
             return;   // no roster, or the read failed: nothing is decided on no evidence
         std::vector<OverseerDecisions::FamilyRoster const*> const driven =
@@ -35831,12 +36720,16 @@ private:
                 members.push_back(member.name);
             DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
             bool const hearthRegroup =
-                HearthRegroupInPlay(_dungeonRunCoordinators[roster->family]);
+                RecoveryBringsTheFamily(_dungeonRunCoordinators[roster->family]);
+            bool const holdsTheLeader =
+                RecoveryHoldsTheLeader(_dungeonRunCoordinators[roster->family]);
             for (std::string const& name : members)
             {
                 _familyRunPhaseByMember[name] = _dungeonRunCoordinators[roster->family].phase;
                 if (hearthRegroup)
                     _hearthRegroupMembers.insert(name);
+                if (holdsTheLeader)
+                    _recoveryHoldMembers.insert(name);
             }
             // Compared with what was last WRITTEN rather than with the state at
             // the top of this poll, so a change made anywhere between two polls
@@ -37209,6 +38102,14 @@ private:
                 }
                 return;
             }
+
+            // A RUN THE DUNGEON FINDER TOOK IN LEAVES THE FAMILY IN A FINDER
+            // GROUP, and Group::ResetInstances returns at once for one; the
+            // reset would fail for ever. Nobody is inside by here, so the
+            // finder's group is let go and the reset waits a poll for the
+            // family's own party (RunRecovery::DungeonFinder).
+            if (LeaveTheFinderGroup(leaderName, coord.runNumber, portal->insideMapId))
+                return;
 
             std::string why;
             if (ResetGroupInstance(leaderName, members, portal->insideMapId, why))
@@ -55425,6 +56326,39 @@ private:
     }
 };
 
+// THE DUNGEON FINDER'S WORDS TO A FAMILY MEMBER (RunRecovery::DungeonFinder).
+//
+// WorldSession::SendPacket hands every packet to this hook before it looks for
+// a socket (WorldSession.cpp, OnPlayerbotPacketSent), so a bot's packets reach
+// it as well as a client's. Only the two the finder rung needs are read, and
+// only for characters it is watching; everything else leaves on the opcode
+// test. The layouts are the core's own writers: SendLfgUpdateProposal writes
+// the dungeon entry (uint32), the proposal state (uint8) and the proposal id
+// (uint32), and SendLfgJoinResult the result and the state (two uint32).
+class OverseerFinderScript : public PlayerbotScript
+{
+public:
+    OverseerFinderScript() : PlayerbotScript("OverseerFinderScript") {}
+
+    void OnPlayerbotPacketSent(Player* player, WorldPacket const* packet) override
+    {
+        if (!player || !packet)
+            return;
+        uint16 const opcode = packet->GetOpcode();
+        if (opcode != SMSG_LFG_PROPOSAL_UPDATE && opcode != SMSG_LFG_JOIN_RESULT)
+            return;
+        std::string const name = player->GetName();
+        if (!OverseerWorldScript::IsFinderWatched(name))
+            return;
+        if (opcode == SMSG_LFG_PROPOSAL_UPDATE && packet->size() >= 9)
+            OverseerWorldScript::NoteFinderProposal(name, packet->read<uint32>(5),
+                                                    packet->read<uint8>(4));
+        else if (opcode == SMSG_LFG_JOIN_RESULT && packet->size() >= 8)
+            OverseerWorldScript::NoteFinderJoinResult(name, packet->read<uint32>(0),
+                                                      packet->read<uint32>(4));
+    }
+};
+
 void Addmod_overseerScripts()
 {
     // The loot council's steer on the roster's roll votes (patches/
@@ -55434,4 +56368,5 @@ void Addmod_overseerScripts()
     new OverseerChatScript();
     new OverseerEventScript();
     new OverseerDoorScript();
+    new OverseerFinderScript();
 }
