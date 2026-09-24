@@ -3465,6 +3465,47 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
     return verdict;
 }
 
+bool GearPieceForRole(GearItem const& item, GearRole role)
+{
+    if (role != GearRole::Tank && role != GearRole::Healer)
+        return false;
+
+    // What the piece is worth to the role, without the item-level tiebreak
+    // (which belongs to no role), and the part of it the role wears gear for.
+    float const armourWeight = item.subClass == ARMOUR_SHIELD && item.itemClass == CLASS_ARMOUR
+                                   ? ShieldArmourWeight(role)
+                                   : ArmourWeight(role);
+    float const armour = armourWeight * static_cast<float>(item.armour);
+    float total = armour + DpsWeight(role) * item.dps;
+    float own = role == GearRole::Tank ? armour : 0.f;
+    bool healerStat = false;
+    for (GearStat const& stat : item.stats)
+    {
+        if (stat.value <= 0)
+            continue;
+        float const worth = StatWeight(role, stat.type) * static_cast<float>(stat.value);
+        total += worth;
+        bool counts = false;
+        if (role == GearRole::Tank)
+            counts = stat.type == MOD_STAMINA || stat.type == MOD_HEALTH ||
+                     stat.type == MOD_DEFENSE_RATING || stat.type == MOD_DODGE_RATING ||
+                     stat.type == MOD_PARRY_RATING || stat.type == MOD_BLOCK_RATING ||
+                     stat.type == MOD_BLOCK_VALUE;
+        else
+        {
+            bool const healerOwn =
+                stat.type == MOD_SPIRIT || stat.type == MOD_MANA_REGENERATION;
+            healerStat = healerStat || healerOwn;
+            counts = healerOwn || stat.type == MOD_INTELLECT || stat.type == MOD_SPELL_POWER;
+        }
+        if (counts)
+            own += worth;
+    }
+    if (total <= 0.f || own * 2.f < total)
+        return false;
+    return role == GearRole::Tank || healerStat;
+}
+
 float GearIncumbent(float mainHandScore, float offHandScore, bool takesBothHands)
 {
     if (!takesBothHands)
@@ -3793,6 +3834,17 @@ int LootCouncilCertainty(LootCandidate const& c)
 
 }  // namespace
 
+int LootCouncilPriority(LootCandidate const& c)
+{
+    if (LootCouncilCertainty(c) != 0 || !c.rolePiece)
+        return 3;
+    if (c.role == "tank")
+        return c.mainTank ? 0 : 1;
+    if (c.role == "healer")
+        return 2;
+    return 3;
+}
+
 LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidates)
 {
     std::vector<LootCandidate const*> eligible;
@@ -3809,6 +3861,10 @@ LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidate
                   int const cb = LootCouncilCertainty(*b);
                   if (ca != cb)
                       return ca < cb;
+                  int const fa = LootCouncilPriority(*a);
+                  int const fb = LootCouncilPriority(*b);
+                  if (fa != fb)
+                      return fa < fb;
                   int const pa = UpgradePercent(*a);
                   int const pb = UpgradePercent(*b);
                   if (pa != pb)
@@ -3832,7 +3888,30 @@ LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidate
     std::string const role = best.role.empty() || best.role == "unknown"
                                  ? std::string()
                                  : " as a " + best.role;
-    if (LootCouncilCertainty(best) == 0)
+    int const first = LootCouncilPriority(best);
+    if (first < 3)
+    {
+        // First call, said with what it cost: the biggest share somebody else
+        // in the same tier would have gained, when that is bigger.
+        char const* const call = first == 0   ? "the main tank"
+                                 : first == 1 ? "a tank"
+                                              : "a healer";
+        char const* const piece = first == 2 ? "a healer's piece" : "a tank's piece";
+        pick.why = std::string(call) + " in " + who + " has first call on " + piece + ": " +
+                   std::to_string(UpgradePercent(best)) + "% of its worth is new, " +
+                   (best.itemLevelGain > 0 ? "+" : "") +
+                   std::to_string(best.itemLevelGain) + " item levels over what is worn";
+        LootCandidate const* bigger = nullptr;
+        for (LootCandidate const* c : eligible)
+            if (c != &best && c->family == best.family && LootCouncilCertainty(*c) == 0 &&
+                UpgradePercent(*c) > UpgradePercent(best) &&
+                (!bigger || UpgradePercent(*c) > UpgradePercent(*bigger)))
+                bigger = c;
+        if (bigger)
+            pick.why += ", ahead of " + bigger->name + "'s " +
+                        std::to_string(UpgradePercent(*bigger)) + "%";
+    }
+    else if (LootCouncilCertainty(best) == 0)
         pick.why = "the biggest upgrade in " + who + role + ": " +
                    std::to_string(UpgradePercent(best)) + "% of its worth is new, " +
                    (best.itemLevelGain > 0 ? "+" : "") +
@@ -3932,6 +4011,9 @@ std::string LootCandidatesJson(std::vector<LootCandidate> const& candidates)
         out += ",\"class\":" + JsonString(c.className);
         out += ",\"spec\":" + JsonString(c.spec);
         out += ",\"tank\":" + std::string(c.tank ? "true" : "false");
+        out += ",\"main_tank\":" + std::string(c.mainTank ? "true" : "false");
+        out += ",\"role_piece\":" + std::string(c.rolePiece ? "true" : "false");
+        out += ",\"priority\":" + std::to_string(LootCouncilPriority(c));
         out += ",\"why\":" + JsonString(c.why);
         out += "}";
     }
