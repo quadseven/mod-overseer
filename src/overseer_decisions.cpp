@@ -2230,6 +2230,77 @@ bool DungeonMapHasIndependentWings(uint32_t mapId)
     return mapId == 189 || mapId == 429;
 }
 
+DoorReadinessReading ReadDoorReadiness(DoorPrerequisites const& door,
+                                       std::vector<DoorCandidate> const& party)
+{
+    DoorReadinessReading reading;
+    if (door.minLevel)
+        for (DoorCandidate const& member : party)
+            if (member.level < door.minLevel)
+                reading.underLevel.push_back(member.name);
+    if (!reading.underLevel.empty())
+    {
+        reading.verdict = DoorReadiness::UnderLevel;
+        return reading;
+    }
+
+    if (!door.keyDoorEntry || party.empty())
+        return reading;
+    // A NAMED DOOR WITH NO READABLE KEY IS REFUSED, NOT WAVED THROUGH. The row
+    // is the claim that this door is locked; a lock that resolves to nothing is
+    // a fact this module failed to read, and staging at it anyway is the defect
+    // this check exists to end.
+    if (door.keyItems.empty())
+    {
+        reading.verdict = DoorReadiness::KeyUnknown;
+        return reading;
+    }
+    for (DoorCandidate const& member : party)
+        if (member.carriesKey)
+            return reading;
+    reading.verdict = DoorReadiness::NoKey;
+    return reading;
+}
+
+std::string DoorReadinessReason(DoorReadinessReading const& reading,
+                                DoorPrerequisites const& door,
+                                std::vector<DoorCandidate> const& party)
+{
+    std::string out;
+    switch (reading.verdict)
+    {
+        case DoorReadiness::Ready:
+            return out;
+        case DoorReadiness::UnderLevel:
+            out = "the door minimum is level " + std::to_string(door.minLevel) + " and ";
+            for (std::size_t i = 0; i < reading.underLevel.size(); ++i)
+            {
+                std::string const& name = reading.underLevel[i];
+                std::uint32_t level = 0;
+                for (DoorCandidate const& member : party)
+                    if (member.name == name)
+                        level = member.level;
+                if (i)
+                    out += i + 1 == reading.underLevel.size() ? " and " : ", ";
+                out += "'" + name + "' is " + std::to_string(level);
+            }
+            return out;
+        case DoorReadiness::NoKey:
+        {
+            out = "gameobject " + std::to_string(door.keyDoorEntry) +
+                  " on the approach is locked and nobody in the party carries item ";
+            for (std::size_t i = 0; i < door.keyItems.size(); ++i)
+                out += (i ? " or " : "") + std::to_string(door.keyItems[i]);
+            return out;
+        }
+        case DoorReadiness::KeyUnknown:
+            return "gameobject " + std::to_string(door.keyDoorEntry) +
+                   " on the approach is named as locked, but its lock names no key item "
+                   "this module can check for";
+    }
+    return out;
+}
+
 char const* DungeonRunExitOutcome(bool provedComplete, bool stalled, bool evacuated)
 {
     // PROOF OUTRANKS SUSPICION. A run can be both: the clearing watchdog can

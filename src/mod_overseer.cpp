@@ -25591,6 +25591,14 @@ private:
         // is written beside the row, where the evidence for it is, and printed
         // once when a job asks for it.
         char const* withheld = nullptr;
+
+        // THE LOCKED DOOR ON THE APPROACH, OR 0 WHEN THERE IS NONE (#578). A
+        // gameobject entry, like the two trigger ids at the top of the row: the
+        // world names it, this row only says which one gates the walk in. The
+        // key that opens it is not written here. DoorPrerequisitesFor reads it
+        // from the door's lock in Lock.dbc, and the level floor from the core's
+        // own dungeon_access_template row, so neither can drift from the world.
+        uint32 keyDoorEntry = 0;
     };
 
     // Standoff from the portal trigger's own coordinates, chosen so the whole
@@ -25633,6 +25641,58 @@ private:
             if (keyword == portal.keyword)
                 return &portal;
         return nullptr;
+    }
+
+    // WHAT THE WORLD ASKS OF A PARTY AT THIS DOOR (#578), read from the world
+    // every time rather than cached, like the door's own coordinates: both are
+    // lookups in stores loaded once at startup.
+    //
+    // THE LEVEL is the core's own dungeon_access_template row for the inside
+    // map, the one Player::Satisfy reads at the knock. THE KEY is the
+    // LOCK_KEY_ITEM cases of the lock on the gameobject the row names, read from
+    // Lock.dbc through sLockStore; lock_dbc is empty in this world database, so
+    // the DBC is the only place the lock-to-key mapping lives.
+    static OverseerDecisions::DoorPrerequisites DoorPrerequisitesFor(
+        DungeonPortal const& portal)
+    {
+        OverseerDecisions::DoorPrerequisites out;
+        if (DungeonProgressionRequirements const* access =
+                sObjectMgr->GetAccessRequirement(portal.insideMapId, DUNGEON_DIFFICULTY_NORMAL))
+            out.minLevel = access->levelMin;
+
+        out.keyDoorEntry = portal.keyDoorEntry;
+        if (!portal.keyDoorEntry)
+            return out;
+        if (GameObjectTemplate const* door = sObjectMgr->GetGameObjectTemplate(portal.keyDoorEntry))
+            if (LockEntry const* lock = sLockStore.LookupEntry(door->GetLockId()))
+                for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+                    if (lock->Type[i] == LOCK_KEY_ITEM && lock->Index[i])
+                        out.keyItems.push_back(lock->Index[i]);
+        return out;
+    }
+
+    // The party as ReadDoorReadiness reads it: every member in the world, with
+    // its level and whether it carries any one of the door's keys. A member not
+    // in the world is left out rather than counted as level 0; whether a run
+    // can open without it is the census's question, not the door's.
+    static std::vector<OverseerDecisions::DoorCandidate> DoorPartyFor(
+        std::vector<std::string> const& members,
+        OverseerDecisions::DoorPrerequisites const& door)
+    {
+        std::vector<OverseerDecisions::DoorCandidate> party;
+        for (std::string const& name : members)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!member || !member->IsInWorld())
+                continue;
+            OverseerDecisions::DoorCandidate candidate;
+            candidate.name = name;
+            candidate.level = member->GetLevel();
+            for (std::uint32_t const item : door.keyItems)
+                candidate.carriesKey = candidate.carriesKey || member->HasItemCount(item, 1, false);
+            party.push_back(std::move(candidate));
+        }
+        return party;
     }
 
     static std::vector<DungeonPortal> const& DungeonPortals()
@@ -26283,8 +26343,10 @@ private:
             // need the key: a closed door on the approach is not in the navmesh,
             // and whether the walk is stopped by it has not been measured. Three
             // more lock 1562 doors stand inside map 429. The East
-            // wing needs no key. This module does not check for it (#578), so
-            // the ordering (an East wing run first) is on whoever starts the run.
+            // wing needs no key. Since #578 each of the three rows names its door
+            // in `keyDoorEntry`, and IDLE refuses to open a run on it until one
+            // member carries the key its lock names, so an East wing run first
+            // is what gets a family in.
             //
             // areatrigger: (3185,1,-4028.21,123.966,26.8109,0,9.833,4.583,15.69,0.4712)
             // areatrigger_teleport: (3185,'Dire Maul, East Wing [East] (Entrance)',429,9.31119,-837.085,-32.5305,0)
@@ -26306,19 +26368,22 @@ private:
             // areatrigger_teleport: (3187,'Dire Maul, West Wing [North] (Entrance)',429,31.5609,159.45,-3.4777,0.01)
             // areatrigger: (3191,429,24.5609,159.45,-3.46677,0,7.694,9.694,21.61,0)
             // areatrigger_teleport: (3191,'Dire Maul, West Wing [North](Exit)',1,-3747.96,1249.18,160.217,3.15827)
-            {"dire-maul-west-north", 1, 3187, 429, 3191, 0.f, 0.f, 0.f},
+            {"dire-maul-west-north", 1, 3187, 429, 3191, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             nullptr, 177189},
             // Crescent Key: gameobject 177188, see above.
             // areatrigger: (3186,1,-3837.79,1250.23,160.223,0,8.194,9.083,18.36,0)
             // areatrigger_teleport: (3186,'Dire Maul, West Wing [South] (Entrance)',429,-62.9658,159.867,-3.46206,3.14788)
             // areatrigger: (3190,429,-55.9658,159.867,-3.46206,0,7.222,10.08,19.56,0)
             // areatrigger_teleport: (3190,'Dire Maul, West Wing [South] (Exit)',1,-3831.79,1250.23,160.223,0)
-            {"dire-maul-west-south", 1, 3186, 429, 3190, 0.f, 0.f, 0.f},
+            {"dire-maul-west-south", 1, 3186, 429, 3190, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             nullptr, 177188},
             // Crescent Key: gameobject 177192, see above.
             // areatrigger: (3189,1,-3520.65,1068.72,161.128,0,9.861,11.86,23.22,0)
             // areatrigger_teleport: (3189,'Dire Maul, North Wing (Entrance)',429,255.249,-16.0561,-2.58737,4.7)
             // areatrigger: (3193,429,255.249,-9.05606,-2.58737,0,8.333,8.583,20.72,0)
             // areatrigger_teleport: (3193,'Dire Maul, North Wing (Exit)',1,-3520.65,1077.72,161.138,1.5009)
-            {"dire-maul-north", 1, 3189, 429, 3193, 0.f, 0.f, 0.f},
+            {"dire-maul-north", 1, 3189, 429, 3193, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             nullptr, 177192},
         };
         return portals;
     }
@@ -27522,6 +27587,9 @@ private:
         bool loggedCampaignOver{false};
         // Rations the line that says a job named a withheld door (#582).
         bool loggedWithheld{false};
+        // The last door refusal said (#578), so the line is said when the
+        // reason changes rather than on every poll it holds.
+        std::string loggedDoorRefusal;
         // AND THE TWO LINES THE RESET'S EVACUATION SAYS ONCE (#351).
         // `loggedWalkingOut` rations the sentence that explains why anybody is
         // being walked out of an instance at all; `loggedNoWayOut` rations the
@@ -35472,6 +35540,39 @@ private:
                 return;
             }
             coord.loggedWithheld = false;
+
+            // A DOOR THE PARTY CANNOT GET THROUGH IS NOT STAGED AT (#578). The
+            // core refuses an under-level member at the knock and a locked door
+            // on the approach does not open without its key, and before this
+            // both were found out by a backstop after the party had walked
+            // there. Nobody is reset, aimed or moved: the run opens on the first
+            // poll the party meets the door, and the job is left for whoever set
+            // it, since choosing another dungeon is not this coordinator's call.
+            {
+                OverseerDecisions::DoorPrerequisites const prerequisites =
+                    DoorPrerequisitesFor(*portal);
+                std::vector<OverseerDecisions::DoorCandidate> const party =
+                    DoorPartyFor(members, prerequisites);
+                OverseerDecisions::DoorReadinessReading const reading =
+                    OverseerDecisions::ReadDoorReadiness(prerequisites, party);
+                if (reading.verdict != OverseerDecisions::DoorReadiness::Ready)
+                {
+                    std::string const reason =
+                        OverseerDecisions::DoorReadinessReason(reading, prerequisites, party);
+                    if (coord.loggedDoorRefusal != reason)
+                    {
+                        coord.loggedDoorRefusal = reason;
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' has job '{}', and the '{}' door will not "
+                                 "let this party through - {}. No run is started, so "
+                                 "nobody is walked to a door that will not open; it "
+                                 "starts on the first poll the party meets it (#578)",
+                                 leaderName, leaderJob, portal->keyword, reason);
+                    }
+                    return;
+                }
+                coord.loggedDoorRefusal.clear();
+            }
 
             // ANOTHER FAMILY'S RUN IS ON THIS MAP, SO THIS ONE WAITS (#555).
             // overseer_dungeon_run allows one active row per instance map, and
