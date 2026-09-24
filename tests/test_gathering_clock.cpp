@@ -37,7 +37,7 @@ void Check(char const* what, bool ok)
 void TheFirstReadingIsABaseline()
 {
     StagingClock c{1000, -1.f};
-    c = StagingClockAfterReading(c, true, 5000.f, 1010, PROGRESS);
+    c = StagingClockAfterReading(c, true, 5000.f, 1010, PROGRESS, false);
     Check("the first reading does not restart the clock", c.since == 1000);
     Check("the first reading becomes the best", c.bestYards == 5000.f);
 }
@@ -45,7 +45,7 @@ void TheFirstReadingIsABaseline()
 void NoReadingChangesNothing()
 {
     StagingClock c{1000, 800.f};
-    c = StagingClockAfterReading(c, false, 10.f, 1500, PROGRESS);
+    c = StagingClockAfterReading(c, false, 10.f, 1500, PROGRESS, false);
     Check("an unmeasured poll keeps the clock", c.since == 1000 && c.bestYards == 800.f);
 }
 
@@ -62,7 +62,7 @@ void AWalkingLeaderIsNeverWrittenOff()
         float const yards = 5000.f - 5.f * static_cast<float>(t);
         if (yards < 0.f)
             break;
-        c = StagingClockAfterReading(c, true, yards, start + t, PROGRESS);
+        c = StagingClockAfterReading(c, true, yards, start + t, PROGRESS, false);
         if ((start + t) - c.since > BACKSTOP)
             writtenOff = true;
     }
@@ -74,13 +74,13 @@ void AStoppedLeaderIsWrittenOffAsBefore()
     StagingClock c{0, -1.f};
     time_t const start = 200000;
     c.since = start;
-    c = StagingClockAfterReading(c, true, 375.f, start, PROGRESS);
+    c = StagingClockAfterReading(c, true, 375.f, start, PROGRESS, false);
     bool writtenOff = false;
     for (int t = 5; t <= 13 * 60; t += 5)
     {
         // Jitter on the spot, as a leader stuck on the level above does.
         float const yards = 375.f + ((t / 5) % 2 ? 3.f : -3.f);
-        c = StagingClockAfterReading(c, true, yards, start + t, PROGRESS);
+        c = StagingClockAfterReading(c, true, yards, start + t, PROGRESS, false);
         if ((start + t) - c.since > BACKSTOP)
             writtenOff = true;
     }
@@ -90,9 +90,9 @@ void AStoppedLeaderIsWrittenOffAsBefore()
 void SmallStepsDoNotRestartIt()
 {
     StagingClock c{3000, 400.f};
-    c = StagingClockAfterReading(c, true, 360.f, 3100, PROGRESS);
+    c = StagingClockAfterReading(c, true, 360.f, 3100, PROGRESS, false);
     Check("forty yards is not progress enough", c.since == 3000 && c.bestYards == 400.f);
-    c = StagingClockAfterReading(c, true, 349.f, 3200, PROGRESS);
+    c = StagingClockAfterReading(c, true, 349.f, 3200, PROGRESS, false);
     Check("fifty-one yards restarts it", c.since == 3200 && c.bestYards == 349.f);
 }
 
