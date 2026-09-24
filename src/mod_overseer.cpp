@@ -27117,6 +27117,198 @@ private:
         WriteRunTimeline(FamilyOfCoordinator(coord), leaderName, "", event);
     }
 
+    // ---- a failed EXIT hearths out (2026-09-24) -------------------------------
+    //
+    // WHY, MEASURED. On the dev realm a leader stood alone inside Ragefire Chasm
+    // for an hour while the coordinator adopted him, set EXIT, gave up on the
+    // walk to the exit trigger five minutes later, went back to IDLE and adopted
+    // him again. The operator got him out with a kind='hearth' row. A person
+    // whose walk to the door fails hearths out; so does this.
+    //
+    // THE CAST IS DoHearth's, NOT A SECOND COPY OF IT, the way the repair leg
+    // calls DoRepair. That executor owns every gate the core applies, the hold
+    // that stands the character still and takes it off its mount, and the
+    // verdict read back from where the character lands. It refuses a moving
+    // character, so a moving one is held still first (the hold kind='hearth'
+    // places on its own refusal) and cast for on a later poll. Its check is
+    // parked with command id 0, which no row carries, so the verdict is logged
+    // and nothing is written to overseer_command.
+    //
+    // AN EPISODE, NOT A CALL. What EXIT leaves behind is remembered per family
+    // so an IDLE poll can keep asking (a member that was moving, one in combat,
+    // a cast that never started) and hold adoption back while it does. Without
+    // that the next poll adopts the member still casting and walks it at the
+    // same failed door. The episode ends when nobody is inside, when no hearth
+    // is possible, or at its ceiling; the campaign is never touched.
+    struct ExitHearthEpisode
+    {
+        uint32 mapId{0};
+        uint32 runId{0};
+        uint32 campaignId{0};
+        uint32 runNumber{0};
+        std::string portal;
+        std::time_t since{0};
+        std::map<std::string, unsigned> attempts;
+        std::map<std::string, std::string> lastStep;
+    };
+    std::map<std::string, ExitHearthEpisode> _exitHearths;
+
+    static uint32 HearthstoneSpellOf(Player* who)
+    {
+        Item* stone = who ? who->GetItemByEntry(HEARTHSTONE_ITEM_ENTRY) : nullptr;
+        ItemTemplate const* proto = stone ? stone->GetTemplate() : nullptr;
+        if (!proto)
+            return 0;
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+            if (proto->Spells[i].SpellId > 0 &&
+                proto->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
+                return static_cast<uint32>(proto->Spells[i].SpellId);
+        return 0;
+    }
+
+    bool HearthPendingFor(std::string const& name) const
+    {
+        for (HearthCheck const& check : _pendingHearths)
+            if (check.targetName == name)
+                return true;
+        return false;
+    }
+
+    void WriteExitHearthEvent(std::string const& family, std::string const& leaderName,
+                              std::string const& characterName,
+                              ExitHearthEpisode const& episode, char const* phase,
+                              char const* kind, std::string const& detail)
+    {
+        OverseerDecisions::RunTimelineEvent event;
+        event.runId = episode.runId;
+        event.campaignId = episode.campaignId;
+        event.runNumber = episode.runNumber;
+        event.portal = episode.portal;
+        event.phase = phase;
+        event.kind = kind;
+        event.detail = OverseerDecisions::RunTimelineDetail(detail);
+        WriteRunTimeline(family, leaderName, characterName, event);
+    }
+
+    // ONE PASS OVER THE FAMILY: every member still on the instance map is cast
+    // for, held still, waited on or named as impossible. Returns whether a
+    // hearth is in play, which is what holds adoption back.
+    bool DriveExitHearths(std::string const& family, std::string const& leaderName,
+                          std::vector<std::string> const& members, ExitHearthEpisode& episode,
+                          char const* phase)
+    {
+        using OverseerDecisions::ExitHearthStep;
+
+        std::vector<ExitHearthStep> steps;
+        for (std::string const& name : members)
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            OverseerDecisions::ExitHearthFacts facts;
+            facts.inWorld = bot && bot->IsInWorld();
+            facts.onInsideMap = facts.inWorld && bot->GetMapId() == episode.mapId;
+            if (facts.onInsideMap)
+            {
+                uint32 const spellId = HearthstoneSpellOf(bot);
+                facts.alive = bot->IsAlive();
+                facts.carriesStone = spellId != 0;
+                facts.onCooldown = spellId && bot->HasSpellCooldown(spellId);
+                facts.inCombat = bot->IsInCombat();
+                facts.moving = bot->isMoving();
+                facts.pending = HearthPendingFor(name);
+                facts.attempts = episode.attempts[name];
+            }
+
+            ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
+            steps.push_back(step);
+            if (step == ExitHearthStep::NotInside)
+                continue;
+
+            // Said and written once per member per step, not every poll.
+            std::string const word = OverseerDecisions::ExitHearthStepWord(step);
+            bool const changed = episode.lastStep[name] != word;
+            episode.lastStep[name] = word;
+
+            switch (step)
+            {
+                case ExitHearthStep::Cast:
+                {
+                    char const* status = "error";
+                    std::string evidence;
+                    ++episode.attempts[name];
+                    char const* const answer =
+                        DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+                    std::string const refusal = answer ? answer : "";
+                    if (refusal.empty())
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: EXIT HEARTH - '{}' is hearthing out of map {} "
+                                 "(attempt {} of {}) because the walk to the exit door "
+                                 "failed; the campaign stays as it is and the next run "
+                                 "starts normally",
+                                 name, episode.mapId, episode.attempts[name],
+                                 OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                        WriteExitHearthEvent(
+                            family, leaderName, name, episode, phase, "exit_hearth",
+                            "hearth cast for " + name + " on map " +
+                                std::to_string(episode.mapId) +
+                                " after EXIT could not walk the party out (attempt " +
+                                std::to_string(episode.attempts[name]) + ")");
+                    }
+                    else
+                    {
+                        // Refused by the executor on a gate this pass could not
+                        // see. Counted, and asked again next poll until spent.
+                        LOG_WARN("module.overseer",
+                                 "overseer: EXIT HEARTH - '{}' could not hearth out of map "
+                                 "{}: {} (attempt {} of {})",
+                                 name, episode.mapId, refusal, episode.attempts[name],
+                                 OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                        WriteExitHearthEvent(family, leaderName, name, episode, phase,
+                                             "exit_hearth_refused",
+                                             name + ": " + refusal);
+                    }
+                    break;
+                }
+
+                case ExitHearthStep::StopFirst:
+                {
+                    // THE WAY kind='hearth' EXPECTS IT: the hold goes on, the
+                    // cast waits for a poll that finds the character standing.
+                    CastHoldReport report;
+                    HoldStillAndReport(bot, name, "hearth", report);
+                    if (changed)
+                        LOG_INFO("module.overseer",
+                                 "overseer: EXIT HEARTH - '{}' is moving on map {}, so it is "
+                                 "held still first and the hearth is cast on a later poll",
+                                 name, episode.mapId);
+                    break;
+                }
+
+                case ExitHearthStep::Waiting:
+                    break;
+
+                case ExitHearthStep::Impossible:
+                    if (changed)
+                    {
+                        char const* const why =
+                            OverseerDecisions::ExitHearthImpossibleReason(facts);
+                        LOG_WARN("module.overseer",
+                                 "overseer: EXIT HEARTH - '{}' is still on map {} and cannot "
+                                 "hearth out: {}",
+                                 name, episode.mapId, why);
+                        WriteExitHearthEvent(family, leaderName, name, episode, phase,
+                                             "exit_no_hearth", name + ": " + why);
+                    }
+                    break;
+
+                case ExitHearthStep::NotInside:
+                    break;
+            }
+        }
+        return OverseerDecisions::ExitHearthHoldsAdoption(
+            steps, static_cast<uint32>(std::time(nullptr) - episode.since));
+    }
+
     // WHERE A RUN STANDS, in the words the fetch rule reads (2026-09-23). Here
     // rather than beside DriveFetch because a parameter type has to be declared
     // before the declaration that names it. See RunLetsTheLeaderFetch.
@@ -33766,6 +33958,29 @@ private:
                         break;
                     }
                 }
+            // A FAILED EXIT'S HEARTH IS LET FINISH BEFORE THE RUN IS ADOPTED
+            // AGAIN (2026-09-24). Adopting here set EXIT on the next poll and
+            // walked the same member at the same failed door for another five
+            // minutes, once an episode, for an hour. The episode is dropped the
+            // moment nobody is inside, nobody can hearth, or its ceiling passes,
+            // and adoption then goes on exactly as before.
+            {
+                auto const episode = _exitHearths.find(family);
+                if (episode != _exitHearths.end())
+                {
+                    if (activeInside && activeInside->GetMapId() == episode->second.mapId &&
+                        DriveExitHearths(family, leaderName, members, episode->second, "IDLE"))
+                        return;
+                    if (activeInside && activeInside->GetMapId() == episode->second.mapId)
+                        LOG_WARN("module.overseer",
+                                 "overseer: EXIT HEARTH - the episode on map {} is over "
+                                 "with a member still inside and no hearth in play, so "
+                                 "the run is adopted again",
+                                 episode->second.mapId);
+                    _exitHearths.erase(episode);
+                }
+            }
+
             if (!IsDungeonJob(leaderJob) && !activeInside)
                 return;
 
@@ -35689,6 +35904,50 @@ private:
                                   "if this repeats, the party cannot reach its own exit",
                                   triggerId, portal->insideMapId);
                         _travelAims.Release(leaderName, "the dungeon run coordinator");
+                        // AND WHOEVER IS STILL INSIDE HEARTHS OUT (2026-09-24),
+                        // the way a person would once the walk to the door has
+                        // failed. The coordinator still returns to IDLE and the
+                        // campaign is left exactly as it is; what changes is that
+                        // IDLE holds off re-adopting the run while the hearth is
+                        // in play. See ExitHearthEpisode.
+                        {
+                            ExitHearthEpisode episode;
+                            episode.mapId = portal->insideMapId;
+                            episode.runId = coord.runId ? coord.runId
+                                                        : ActiveRunIdOnMap(portal->insideMapId);
+                            episode.campaignId = coord.campaignId;
+                            episode.runNumber = coord.runNumber;
+                            episode.portal = coord.portalKeyword;
+                            episode.since = std::time(nullptr);
+                            bool const inPlay =
+                                DriveExitHearths(family, leaderName, members, episode, "EXIT");
+                            if (inPlay)
+                            {
+                                LOG_WARN("module.overseer",
+                                         "overseer: EXIT HEARTH - the walk out of map {} "
+                                         "failed, so every member still inside with a "
+                                         "hearthstone off cooldown hearths out instead; "
+                                         "IDLE will not re-adopt the run while that is in "
+                                         "play (at most {} minutes)",
+                                         portal->insideMapId,
+                                         OverseerDecisions::EXIT_HEARTH_EPISODE_SECONDS / 60);
+                                _exitHearths[family] = episode;
+                            }
+                            else
+                            {
+                                LOG_WARN("module.overseer",
+                                         "overseer: EXIT HEARTH - nobody left inside map {} "
+                                         "can hearth out, so the coordinator returns to "
+                                         "IDLE as before and the run is adopted again",
+                                         portal->insideMapId);
+                                WriteExitHearthEvent(family, leaderName, "", episode, "EXIT",
+                                                     "exit_no_hearth",
+                                                     "EXIT failed and no member inside map " +
+                                                         std::to_string(portal->insideMapId) +
+                                                         " can hearth out; back to IDLE");
+                                _exitHearths.erase(family);
+                            }
+                        }
                         coord = DungeonRunCoordinatorState();
                         return;
 
@@ -46109,11 +46368,14 @@ private:
                     break;
             }
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(HearthJson(check.ev, outcome, detail)), check.id,
-                g_runToken);
+            // Id 0 is a hearth the dungeon coordinator asked for (a failed
+            // EXIT), which has no row to write; its verdict is the log line.
+            if (check.id)
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    status, detail, EscLong(HearthJson(check.ev, outcome, detail)), check.id,
+                    g_runToken);
         }
 
         _pendingHearths.swap(stillCasting);

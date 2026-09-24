@@ -15576,6 +15576,75 @@ bool ClassicRankAllowed(uint32_t rankMaxSkill);
 bool ClassicRecipeAllowed(uint32_t reqSkillRank);
 }  // namespace Classic
 
+// -- a failed dungeon EXIT hearths out (2026-09-24) ---------------------------
+//
+// WHAT IT ENDS, measured on the dev realm. A leader alone inside Ragefire
+// Chasm, the rest of the family outside, and the walk to the exit trigger
+// failing: the coordinator adopted him, set EXIT, gave up five minutes later,
+// went back to IDLE and adopted him again, for an hour. The operator got him out
+// with this module's own kind='hearth' row. A person whose walk to the door
+// fails hearths out, and now the coordinator does too.
+//
+// ONE MEMBER'S FACTS AT THE MOMENT EXIT HAS GIVEN UP (or at an IDLE poll after
+// it, while the episode is open). `pending` is a hearth this module already
+// has in flight for the character; `attempts` counts casts asked in this
+// episode.
+struct ExitHearthFacts
+{
+    bool inWorld{false};
+    bool onInsideMap{false};
+    bool alive{false};
+    bool carriesStone{false};
+    bool onCooldown{false};
+    bool inCombat{false};
+    bool moving{false};
+    bool pending{false};
+    unsigned attempts{0};
+};
+
+enum class ExitHearthStep
+{
+    NotInside,   // not on the instance map (or not in the world): nothing to do
+    Cast,        // drive the hearth executor now
+    StopFirst,   // moving: hold it still this poll, cast on a later one
+    Waiting,     // a hearth is in flight, or combat has to end first
+    Impossible   // dead, no stone, stone on cooldown, or the attempts are spent
+};
+
+// How many casts one episode may ask of one character. A cast that never
+// starts leaves the cooldown clear, so without a bound the same member could be
+// asked every poll for ever.
+constexpr unsigned EXIT_HEARTH_ATTEMPTS = 3;
+
+// How long an episode may hold adoption back. Past this the coordinator adopts
+// as it did before, so a member held in combat, or a hold that never settles,
+// cannot keep the run unowned for good.
+constexpr uint32_t EXIT_HEARTH_EPISODE_SECONDS = 5 * 60;
+
+ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts,
+                                     unsigned maxAttempts = EXIT_HEARTH_ATTEMPTS);
+
+// The word the log and the run timeline use for a step.
+char const* ExitHearthStepWord(ExitHearthStep step);
+
+// Why a member cannot hearth, in the words the log and the timeline use; empty
+// for a member that can, or is not inside.
+char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts,
+                                       unsigned maxAttempts = EXIT_HEARTH_ATTEMPTS);
+
+// Whether a hearth is in play for the family: some member inside is being
+// cast for, stopped for, or waited on. False when every member inside is
+// Impossible, which is the one case the coordinator falls back to IDLE and
+// re-adopts as it always did.
+bool ExitFailureHearthInPlay(std::vector<ExitHearthStep> const& steps);
+
+// Whether the IDLE coordinator holds off adopting the run a failed EXIT left
+// behind. Only while a hearth is in play and the episode is younger than its
+// ceiling; adopting would only walk the same party at the same failed door.
+bool ExitHearthHoldsAdoption(std::vector<ExitHearthStep> const& steps,
+                             uint32_t episodeSeconds,
+                             uint32_t ceilingSeconds = EXIT_HEARTH_EPISODE_SECONDS);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
