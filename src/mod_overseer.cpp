@@ -48091,12 +48091,24 @@ private:
     };
 
     // FAR WALKS STARTED, per bot, for the budget (#633). World thread only,
-    // like the pending list; pruned to one hour on every ask, and a name whose
-    // starts have all left the window is dropped.
+    // like the pending list. BOUNDED BY THE WINDOW: PruneFarWalkBudget runs on
+    // every walk poll and every far ask, and drops each start older than an
+    // hour and each name with none left, so the map only ever holds the bots
+    // that set off on a far walk in the last hour.
     static std::map<std::string, std::vector<int64_t>>& FarWalkStarts()
     {
         static std::map<std::string, std::vector<int64_t>> starts;
         return starts;
+    }
+
+    static void PruneFarWalkBudget(int64_t nowSeconds)
+    {
+        auto& budget = FarWalkStarts();
+        for (auto it = budget.begin(); it != budget.end();)
+        {
+            OverseerDecisions::PruneFarWalkStarts(it->second, nowSeconds);
+            it = it->second.empty() ? budget.erase(it) : std::next(it);
+        }
     }
 
     struct MailWalkCheck
@@ -48729,12 +48741,8 @@ private:
         {
             if (!D::FarWalkMapAllowed(ev.mapId))
                 return refuse(D::FarWalkRefusal::NotOnAContinent);
+            PruneFarWalkBudget(nowSeconds);
             auto& budget = FarWalkStarts();
-            for (auto it = budget.begin(); it != budget.end();)
-            {
-                D::PruneFarWalkStarts(it->second, nowSeconds);
-                it = it->second.empty() ? budget.erase(it) : std::next(it);
-            }
             uint32 underWay = 0;
             for (MailWalkCheck const& check : walking)
                 if (check.ev.far)
@@ -48892,12 +48900,13 @@ private:
     void ResolveMailWalks(uint32 elapsedMs)
     {
         namespace D = OverseerDecisions;
+        time_t const now = std::time(nullptr);
+        PruneFarWalkBudget(static_cast<int64_t>(now));
         if (_pendingMailWalks.empty())
             return;
 
         std::vector<MailWalkCheck> still;
         still.reserve(_pendingMailWalks.size());
-        time_t const now = std::time(nullptr);
 
         for (MailWalkCheck& check : _pendingMailWalks)
         {
