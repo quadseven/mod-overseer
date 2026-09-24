@@ -15510,6 +15510,7 @@ bool MailWalkMadeProgress(float bestYards, float nowYards);
 // way `walk-to-mailbox` rides kind='mail' and `use` rides kind='cast':
 //
 //   kind='cast'  walk-to-trainer skill:<id> [learn:<spell>[,<spell>...]] [max:<yards>]
+//   kind='cast'  walk-to-trainer talents:<tree> [max:<yards>]   (a talent reset, #692)
 //   kind='buy'   walk-to-vendor item:<entry> [max:<yards>]
 //
 // A trainer walk ends AT the trainer: on arrival the adapter buys the next rank
@@ -15554,9 +15555,15 @@ struct TrainerWalkRequest
     uint32_t skill{0};
     std::vector<uint32_t> learn;  // trainer spell ids, in the order written
     float maxYards{ERRAND_WALK_MAX_YARDS};
+    // A TALENT RESET INSTEAD OF A TRADE (#692): the talent tree, 0 to 2, the
+    // walk buys a reset for and spends the points in. -1 on a trade walk.
+    int32_t talentTab{-1};
     char const* error{""};        // empty when it parsed
 };
 
+// A TALENTS WALK (#692) names `talents:<0..2>` in place of `skill:` and carries
+// no `learn:`; exactly one of `skill:` and `talents:` is present.
+//
 // `skill:` is required and must be a non-zero id. `learn:` is optional, a comma
 // list of non-zero ids with no repeats and at most TRAINER_WALK_MAX_LEARN of
 // them. `max:` is optional and no larger than FAR_WALK_MAX_YARDS (#633). Each key at
@@ -15612,6 +15619,13 @@ constexpr char const* VendorStalled    = "stopped getting nearer the vendor";
 // What a trainer visit that arrived can end with.
 constexpr char const* NothingToLearn   = "the trainer had nothing left to teach that was asked for";
 constexpr char const* TaughtNothing    = "the trainer taught nothing, most likely for want of money";
+
+// A talents walk (#692), judged before it walks by the roster reset's own
+// JudgeRespec, and a map with no trainer of the walker's class.
+constexpr char const* TalentsTooLow       = "the character is below the level a trainer resets talents at";
+constexpr char const* TalentsInTree       = "the character's talents are already in that tree";
+constexpr char const* TalentsCannotAfford = "the character cannot afford the talent reset";
+constexpr char const* NoClassTrainerOnMap = "no trainer of this character's class on this map resets talents";
 }  // namespace ErrandWalkRefusal
 
 // The refusal a walk to `goal` gives where the mailbox walk gives `mailboxWall`.
@@ -16015,6 +16029,27 @@ char const* RespecStepWord(RespecStep step);
 // money, or a trainer that would not.
 bool RespecTook(uint32_t outsideBefore, uint32_t outsideAfter, uint32_t freeBefore,
                 uint32_t freeAfter);
+
+// ------------------------------------- a guild raider's talent reset (#692) --
+//
+// THE SAME RESET, FOR A CHARACTER OFF THE ROSTER. Both guilds were four
+// healers short of a Molten Core lineup on 2026-09-24, and the hybrids that
+// could heal were guild raiders in damage trees. A raider is a random bot walked
+// by the guild-bot errand walks, so the reset rides `walk-to-trainer
+// talents:<tab>`: judged before it walks by JudgeRespec, bought at the trainer
+// through the same door as RespecOnArrival, and spent with mod-playerbots'
+// premade build for the tree.
+
+// Why a talents walk may not start, or "" when it may. `facts` is the raider's
+// own reading; the travel column, a run and the retry clock are roster matters
+// and are not asked.
+char const* TalentWalkRefusal(RespecFacts const& facts);
+
+// What the visit came to: Learned when the reset took and every spent point now
+// sits in `tree`, TaughtNothing otherwise (the reset refused, or the points not
+// spent where they were meant to go).
+TrainerVisitOutcome JudgeTalentVisit(bool resetTook, uint32_t const (&pointsAfter)[3],
+                                     uint8_t tree);
 
 // THE TANK STRATEGIES. mod-playerbots answers PlayerbotAI::IsTank for a bot by
 // asking its combat engine for a STRATEGY_TYPE_TANK strategy, and the dungeon
