@@ -640,6 +640,29 @@ constexpr int64 GRAVEYARD_REPEAT_SECONDS = 5 * 60;
 constexpr int64 REVIVAL_HOLD_SECONDS = 20;
 constexpr float REVIVAL_AGGRO_RADIUS = 30.0f;
 
+// CORPSE RUN, SPIRIT HEALER OR WAIT (#664). See
+// OverseerDecisions::DecideGhostRecovery for the rules and the measurement.
+//
+// The repeat test is this character's own deaths within GHOST_REPEAT_RADIUS of
+// the corpse inside GHOST_REPEAT_MINUTES, read from overseer_death like the trap
+// test above but tighter, because it answers a smaller question: not "is the
+// graveyard feeding it to something" but "did reclaiming here already fail".
+// The repeat deaths it was cut to were 32 and 0 yards apart.
+constexpr float GHOST_REPEAT_RADIUS = 60.0f;
+constexpr uint32 GHOST_REPEAT_MINUTES = 10;
+// Hostiles are read within the core's own reclaim radius of the corpse
+// (CORPSE_RECLAIM_RADIUS, Corpse.h): anywhere inside it is where the dead
+// engine may reclaim, and so where the next fight starts.
+constexpr float GHOST_CORPSE_THREAT_RADIUS = float(CORPSE_RECLAIM_RADIUS);
+// How long a ghost is walked toward a spirit healer before the stuck-revival
+// ladder is left to take it. A released ghost starts at the graveyard, so this
+// is a walk back of however far the dead engine carried it in one poll.
+constexpr int64 GHOST_HEALER_WALK_SECONDS = 120;
+// How far round the ghost to look for the spirit healer itself.
+constexpr float GHOST_HEALER_SWEEP_YARDS = 60.0f;
+// Two deaths here, three levels above, ninety seconds of waiting.
+constexpr OverseerDecisions::GhostRecoveryLimits GHOST_RECOVERY_LIMITS{2, 3, 90};
+
 // The living party member the dungeon module could send to a corpse, or null.
 //
 // Re-derived from DcRezRecovery::CanRecover (DcRezRecovery.cpp:361-377) with
@@ -24096,6 +24119,7 @@ private:
                 }
 
                 _healerExpected.erase(name);
+                EndGhostRecovery(botAI, name);
                 ReleaseRevivalHold(botAI, name);
                 continue;
             }
@@ -24321,6 +24345,12 @@ private:
             // Alive again, or released and now a ghost: either way this is no
             // longer a character waiting on a prompt.
             _awaitingRelease.erase(name);
+
+            // A GHOST ON ITS CORPSE'S MAP IS ASKED WHAT A PLAYER WOULD DO
+            // (#664) before the ladder below is: run back, take the
+            // spirit healer, or wait. True means this poll is spoken for.
+            if (DriveGhostRecovery(bot, botAI, name, corpse))
+                continue;
 
             int64 const deadFor = time(nullptr) - ghostTime;
             if (deadFor < STUCK_REVIVAL_DEAD_SECONDS)
@@ -24885,6 +24915,341 @@ private:
     {
         auto const hold = _revivalHoldUntil.find(name);
         return hold != _revivalHoldUntil.end() && time(nullptr) < hold->second.first;
+    }
+
+    // ------------------------------------------------ a ghost and its corpse --
+    //
+    // CORPSE RUN, SPIRIT HEALER OR WAIT (#664). The dead engine
+    // mod-playerbots runs for a released character walks the ghost back to its
+    // corpse and reclaims it (FindCorpseAction, ReviveFromCorpseAction). Its
+    // only exit from a corpse that keeps killing it is `death count` reaching
+    // five, which is the loop already run five times, and that exit is skipped
+    // outright for a character whose master has a game client. So a family
+    // that dies beside monsters above its level reclaims beside them and dies
+    // again: measured in Ashenvale, one member
+    // died at 09:05:36, was back at its corpse through the corpse run with no
+    // revival from this module in between, and died 32 yards away at 09:06:33.
+    //
+    // This asks OverseerDecisions::DecideGhostRecovery what a player would do
+    // and carries it out:
+    //
+    //   corpse run     nothing here; the dead engine carries on as before
+    //   wait           the dead engine's corpse run is leased off and the
+    //                  ghost stands where it is, untouchable, until the corpse
+    //                  clears or the wait runs out
+    //   spirit healer  the corpse run is leased off, the ghost is walked to the
+    //                  graveyard's spirit healer, and the healer is asked the
+    //                  way a client asks it: CMSG_SPIRIT_HEALER_ACTIVATE to the
+    //                  core's own handler, which checks the ghost is standing at
+    //                  a spirit healer it may talk to and then applies
+    //                  resurrection sickness and durability loss
+    //                  (WorldSession::SendSpiritResurrect)
+    //   ladder         the corpse run is leased off and the stuck-revival
+    //                  ladder below takes the ghost, because the healer's own
+    //                  graveyard failed the safety test that ladder already has
+    //
+    // THE LEASE is the same one the raid run-back takes (WalkRaidGhostsBack):
+    // strategies are taken off the dead engine only if it carries them, named
+    // here, and handed back the moment the character is alive, the corpse run
+    // is chosen after all, or the death this was about is over.
+    struct GhostRecoveryState
+    {
+        int64 ghostTime{0};  // which death this is about
+        uint32 mapId{0};
+        float corpseX{0.f};
+        float corpseY{0.f};
+        unsigned deathsHere{0};
+        NearbyThreat spawnThreat;  // hostile spawns above its level near the corpse
+        GraveyardStruct const* healerGrave{nullptr};
+        std::string healerRefused;  // why the healer's graveyard is unsafe, or empty
+        bool choseHealer{false};
+        int64 healerSince{0};
+        bool healerWalkSpent{false};
+        bool healerWalkIssued{false};
+        bool saidAny{false};
+        OverseerDecisions::GhostRecovery said{OverseerDecisions::GhostRecovery::CorpseRun};
+        std::vector<std::string> leased;  // dead-engine strategies taken off
+    };
+
+    // Living creatures near the corpse that could fight a character of this
+    // level again: alive, hostile to it, attackable, not a critter, and at or
+    // above `minLevel`.
+    struct GhostThreatCheck
+    {
+        Player const* ghost;
+        float x;
+        float y;
+        float range;
+        uint32 minLevel;
+        bool operator()(Creature* creature) const
+        {
+            static constexpr uint32 CANNOT_FIGHT =
+                UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_SELECTABLE;
+            return creature->IsAlive() && !creature->IsCritter() &&
+                   creature->GetLevel() >= minLevel &&
+                   creature->GetExactDist2d(x, y) <= range &&
+                   !creature->HasUnitFlag(UnitFlags(CANNOT_FIGHT)) &&
+                   creature->IsHostileTo(ghost);
+        }
+    };
+
+    // Spirit healers near the ghost, alive (they are, to a ghost).
+    struct SpiritHealerCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_SPIRITHEALER) &&
+                   from->IsWithinDistInMap(creature, range);
+        }
+    };
+    static constexpr uint32 GHOST_HEALER_POINT_ID = 0;
+
+    // Take the corpse run off the dead engine. `walking` also takes `stay`
+    // off, because its default action stops any movement it finds and would
+    // end the walk to the healer the moment it began.
+    void LeaseCorpseRun(Player* bot, PlayerbotAI* botAI, GhostRecoveryState& st, bool walking)
+    {
+        std::vector<char const*> wanted = {"dead", "follow"};
+        if (walking)
+            wanted.push_back("stay");
+        bool tookAny = false;
+        for (char const* strategy : wanted)
+        {
+            if (!botAI->HasStrategy(strategy, BOT_STATE_DEAD))
+                continue;
+            botAI->ChangeStrategy(std::string("-") + strategy, BOT_STATE_DEAD);
+            st.leased.emplace_back(strategy);
+            tookAny = true;
+        }
+        // The corpse run it was on stops here, not wherever it was heading.
+        if (tookAny && !walking)
+        {
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+        }
+    }
+
+    // Hand back every strategy LeaseCorpseRun took, and only those.
+    static void ReturnCorpseRun(PlayerbotAI* botAI, GhostRecoveryState& st)
+    {
+        for (std::string const& strategy : st.leased)
+            if (!botAI->HasStrategy(strategy, BOT_STATE_DEAD))
+                botAI->ChangeStrategy("+" + strategy, BOT_STATE_DEAD);
+        st.leased.clear();
+    }
+
+    // The death is over: the character is alive again.
+    void EndGhostRecovery(PlayerbotAI* botAI, std::string const& name)
+    {
+        auto const it = _ghostRecovery.find(name);
+        if (it == _ghostRecovery.end())
+            return;
+        ReturnCorpseRun(botAI, it->second);
+        _ghostRecovery.erase(it);
+    }
+
+    // The choice goes on this character's newest death row, so a GROUP BY over
+    // overseer_death can count how deaths were recovered from. Written on each
+    // change, so the row carries the last choice made.
+    static void RecordGhostRecovery(std::string const& name, OverseerDecisions::GhostRecovery choice)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_death SET ghost_recovery = '{}' WHERE character_name = '{}' "
+            "ORDER BY id DESC LIMIT 1",
+            OverseerDecisions::GhostRecoveryWord(choice), Esc(name));
+    }
+
+    // One poll for one ghost. True when this poll is spoken for and the
+    // stuck-revival ladder must not act on it; false to let the ladder run as
+    // it always has.
+    bool DriveGhostRecovery(Player* bot, PlayerbotAI* botAI, std::string const& name, Corpse* corpse)
+    {
+        // Open world only, and only a released ghost whose corpse is on the
+        // map it stands on. Instances, battlegrounds and dungeon runs have
+        // their own recoveries above and below, and a corpse on another map
+        // is not one the dead engine can run to at all.
+        bool const mine = corpse && bot->HasPlayerFlag(PLAYER_FLAGS_GHOST) &&
+                          !bot->GetMap()->Instanceable() && !InDungeonRun(bot);
+        if (!mine)
+        {
+            EndGhostRecovery(botAI, name);
+            return false;
+        }
+
+        int64 const ghostTime = corpse->GetGhostTime();
+        GhostRecoveryState& st = _ghostRecovery[name];
+        if (st.ghostTime != ghostTime)
+        {
+            // A new death: hand back anything the last one leased, and read
+            // what does not change while this ghost walks.
+            ReturnCorpseRun(botAI, st);
+            st = GhostRecoveryState{};
+            st.ghostTime = ghostTime;
+            st.mapId = corpse->GetMapId();
+            st.corpseX = corpse->GetPositionX();
+            st.corpseY = corpse->GetPositionY();
+
+            uint64 deaths = 0;
+            if (QueryResult row = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+                    "AND created_at >= NOW() - INTERVAL {} MINUTE AND map = {} "
+                    "AND POW(pos_x - {}, 2) + POW(pos_y - {}, 2) <= {}",
+                    Esc(name), GHOST_REPEAT_MINUTES, st.mapId, st.corpseX, st.corpseY,
+                    GHOST_REPEAT_RADIUS * GHOST_REPEAT_RADIUS))
+                deaths = row->Fetch()[0].Get<uint64>();
+            // This death's own row may still be in the flush queue; it is a
+            // death here all the same.
+            st.deathsHere = static_cast<unsigned>(std::max<uint64>(deaths, 1));
+
+            st.spawnThreat = HostileSpawnsNear(bot, st.mapId, st.corpseX, st.corpseY,
+                                               GHOST_CORPSE_THREAT_RADIUS, bot->GetLevel());
+            st.healerGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
+            if (st.healerGrave)
+                st.healerRefused = GraveyardRefusal(bot, *st.healerGrave);
+        }
+
+        // Live: what is standing near the corpse NOW at or above its level.
+        uint32 const level = bot->GetLevel();
+        std::list<Creature*> threats;
+        GhostThreatCheck check{bot, st.corpseX, st.corpseY, GHOST_CORPSE_THREAT_RADIUS, level};
+        Acore::CreatureListSearcher<GhostThreatCheck> searcher(bot, threats, check);
+        Cell::VisitObjects(st.corpseX, st.corpseY, bot->GetMap(), searcher,
+                           GHOST_CORPSE_THREAT_RADIUS);
+        uint32 strongest = st.spawnThreat.level;
+        std::string strongestName = st.spawnThreat.name;
+        for (Creature* creature : threats)
+            if (creature->GetLevel() > strongest)
+            {
+                strongest = creature->GetLevel();
+                strongestName = creature->GetName();
+            }
+
+        int64 const now = time(nullptr);
+        OverseerDecisions::GhostRecoveryFacts facts;
+        facts.level = level;
+        facts.deathsHere = st.deathsHere;
+        facts.strongestNearCorpse = strongest;
+        facts.liveThreatsNearCorpse = static_cast<unsigned>(threats.size());
+        facts.ghostSeconds = static_cast<long>(now - ghostTime);
+        facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty();
+        facts.choseHealer = st.choseHealer;
+        OverseerDecisions::GhostRecoveryVerdict const verdict =
+            OverseerDecisions::DecideGhostRecovery(facts, GHOST_RECOVERY_LIMITS);
+
+        // Said once per death per choice, and written to the death row.
+        if (!st.saidAny || st.said != verdict.choice)
+        {
+            st.saidAny = true;
+            st.said = verdict.choice;
+            RecordGhostRecovery(name, verdict.choice);
+            LOG_INFO("module.overseer",
+                     "overseer: ghost recovery for '{}' (level {}) is '{}' - {}. Corpse at map {} "
+                     "({:.0f}, {:.0f}), {:.0f} yards away; {} death(s) within {:.0f} yards in "
+                     "{}min; strongest hostile within {:.0f} yards of the corpse level {}{}{}; "
+                     "{} live hostile(s) there at or above its level; spirit healer graveyard "
+                     "'{}'{}{}",
+                     name, level, OverseerDecisions::GhostRecoveryWord(verdict.choice),
+                     OverseerDecisions::GhostRecoveryReasonText(verdict.reason), st.mapId,
+                     st.corpseX, st.corpseY, bot->GetExactDist2d(st.corpseX, st.corpseY),
+                     st.deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
+                     GHOST_CORPSE_THREAT_RADIUS, strongest, strongestName.empty() ? "" : " '",
+                     strongestName.empty() ? "" : strongestName + "'", threats.size(),
+                     st.healerGrave ? st.healerGrave->name : std::string("none"),
+                     st.healerRefused.empty() ? "" : " refused: ", st.healerRefused);
+        }
+
+        switch (verdict.choice)
+        {
+            case OverseerDecisions::GhostRecovery::CorpseRun:
+                ReturnCorpseRun(botAI, st);
+                return false;
+            case OverseerDecisions::GhostRecovery::Wait:
+                LeaseCorpseRun(bot, botAI, st, false);
+                return true;
+            case OverseerDecisions::GhostRecovery::Ladder:
+                LeaseCorpseRun(bot, botAI, st, false);
+                return false;
+            case OverseerDecisions::GhostRecovery::SpiritHealer:
+                break;
+        }
+
+        if (!st.choseHealer)
+        {
+            st.choseHealer = true;
+            st.healerSince = now;
+        }
+        if (st.healerWalkSpent)
+            return false;
+        if (now - st.healerSince > GHOST_HEALER_WALK_SECONDS)
+        {
+            st.healerWalkSpent = true;
+            LeaseCorpseRun(bot, botAI, st, false);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' chose the spirit healer at '{}' {}s ago and never stood "
+                     "at one - the ghost is kept off its corpse and the stuck-revival ladder "
+                     "takes it from here",
+                     name, st.healerGrave->name, now - st.healerSince);
+            return false;
+        }
+        LeaseCorpseRun(bot, botAI, st, true);
+
+        // The nearest spirit healer, and whether the core would let this ghost
+        // talk to it from where it stands - the same gate its handler applies.
+        std::list<Creature*> healers;
+        SpiritHealerCheck healerCheck{bot, GHOST_HEALER_SWEEP_YARDS};
+        Acore::CreatureListSearcher<SpiritHealerCheck> healerSearcher(bot, healers, healerCheck);
+        Cell::VisitObjects(bot, healerSearcher, GHOST_HEALER_SWEEP_YARDS);
+        Creature* nearest = nullptr;
+        for (Creature* creature : healers)
+            if (!nearest || bot->GetExactDist2d(creature) < bot->GetExactDist2d(nearest))
+                nearest = creature;
+
+        if (nearest && bot->GetNPCIfCanInteractWith(nearest->GetGUID(), UNIT_NPC_FLAG_SPIRITHEALER))
+        {
+            std::string const healerName = nearest->GetName();
+            WorldPacket packet(CMSG_SPIRIT_HEALER_ACTIVATE, 8);
+            packet << nearest->GetGUID();
+            bot->GetSession()->HandleSpiritHealerActivateOpcode(packet);
+            if (!bot->IsAlive())
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' stands at spirit healer '{}' and the core's "
+                         "CMSG_SPIRIT_HEALER_ACTIVATE handler did not resurrect it - tried "
+                         "again next poll, and the stuck-revival ladder takes it after {}s",
+                         name, healerName, GHOST_HEALER_WALK_SECONDS);
+                return true;
+            }
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' took the spirit healer's resurrection from '{}' at '{}' "
+                     "instead of reclaiming its corpse at ({:.0f}, {:.0f}) - resurrection "
+                     "sickness and durability loss included, as for any player who does",
+                     name, healerName, st.healerGrave->name, st.corpseX, st.corpseY);
+            ReturnCorpseRun(botAI, st);
+            _ghostRecovery.erase(name);
+            HoldAfterRevival(bot, botAI, name, bot->GetMapId(), bot->GetPositionX(),
+                             bot->GetPositionY());
+            return true;
+        }
+
+        // Not there yet: walk to the healer if one is in sight, else to the
+        // graveyard it stands at. A walk this drive already started is left
+        // alone; the first one clears whatever point the corpse run was
+        // walking to, which is the same kind of movement and would otherwise
+        // pass for it.
+        MotionMaster* motion = bot->GetMotionMaster();
+        if (st.healerWalkIssued && bot->isMoving() &&
+            motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+            return true;
+        motion->Clear();
+        st.healerWalkIssued = true;
+        float const x = nearest ? nearest->GetPositionX() : st.healerGrave->x;
+        float const y = nearest ? nearest->GetPositionY() : st.healerGrave->y;
+        float const z = nearest ? nearest->GetPositionZ() : st.healerGrave->z;
+        motion->MovePoint(GHOST_HEALER_POINT_ID, x, y, z, FORCED_MOVEMENT_NONE, 0.f, 0.f,
+                          /*generatePath*/ true, /*forceDestination*/ false);
+        return true;
     }
 
     // ------------------------------------------------------ dungeon run: gather --
@@ -53180,6 +53545,14 @@ private:
     // costs nothing, because a restart also resets every bot's strategies
     // to upstream's defaults and there is no `stay` left to take off.
     std::map<std::string, std::pair<int64, bool>> _revivalHoldUntil;
+
+    // WHAT EACH GHOST WAS DECIDED TO DO ABOUT ITS CORPSE (#664), keyed by
+    // name and tied to one death by its ghost time. World thread only, from
+    // DriveStuckRevival. Lost on restart, which costs one repeated decision:
+    // a restart rebuilds every dead engine from upstream's defaults, and the
+    // saved strategy list is only ever added on top of those, so nothing this
+    // module leased off is left missing.
+    std::map<std::string, GhostRecoveryState> _ghostRecovery;
 
     // What KeepRosterFollowing knew about each follower's position last
     // time round, so a stall is measured against ITS OWN best position
