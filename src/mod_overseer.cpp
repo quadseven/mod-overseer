@@ -32280,6 +32280,14 @@ private:
         std::string priced;
     };
 
+    // Level with the berth: within a step onto a deck of its height. PickBerth
+    // admitted the berth only within the same step of the deck.
+    static bool LevelWithBerth(Player* who, CrossingRoute const& route)
+    {
+        return who && route.world.berthKnown &&
+               std::fabs(who->GetPositionZ() - route.berthZ) <= CROSSING_DECK_STEP_YARDS;
+    }
+
     // WHICH TRANSPORT, PRICED (#389). Every catalogue transport whose own path
     // names both maps is an offer; each is judged by whose crew it carries,
     // whether both its ends have a berth level with its deck, and what it
@@ -32514,11 +32522,20 @@ private:
             // MEANINGLESS UNLESS THERE IS A BERTH AND THIS MEMBER IS ON ITS
             // MAP, and zero rather than a stale number in every other case,
             // because the decision reads it against an arrival tolerance.
-            member.berthDistance =
-                (route.world.berthKnown && !member.aboard &&
-                 member.mapId == route.world.originMap)
-                    ? p->GetDistance2d(route.berthX, route.berthY)
-                    : 0.f;
+            //
+            // AND A LEVEL AWAY IS NOT AT THE BERTH (#279). A zeppelin's berth
+            // is on top of a tower whose ramp winds round beneath it, so a
+            // leader on the ramp can be a few yards from the berth on the plane
+            // and twenty below it. The travel drive does not call that arrived
+            // (TRAVEL_ARRIVED_VERTICAL_YARDS), and neither may this, or the
+            // crossing would stop the walk half way up.
+            member.berthDistance = 0.f;
+            if (route.world.berthKnown && !member.aboard &&
+                member.mapId == route.world.originMap)
+                member.berthDistance =
+                    std::fabs(p->GetPositionZ() - route.berthZ) <= TRAVEL_ARRIVED_VERTICAL_YARDS
+                        ? p->GetDistance2d(route.berthX, route.berthY)
+                        : std::numeric_limits<float>::max();
             // How far behind its leader, on the same map and on foot. A
             // member elsewhere reads a number no gather limit admits.
             member.leaderDistance =
@@ -32636,8 +32653,11 @@ private:
                 // the travel drive has probably already given back on arrival.
                 // The leader is HELD on the pier, which is a different thing:
                 // it stops his own strategies walking him off it while the
-                // boat is away, and claims no errand.
-                holdTheLeader();
+                // boat is away, and claims no errand. Only when he is level
+                // with the berth: a hold is a root, and a leader rooted a few
+                // yards short on a ramp below it could never step aboard.
+                if (LevelWithBerth(leader, route))
+                    holdTheLeader();
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is at the berth for '{}' on map {} - {}",
@@ -32710,6 +32730,17 @@ private:
                 // would walk him back off the deck he is stepping onto.
                 if (fresh)
                     _travelAims.Release(leaderName, "the dungeon run coordinator");
+                if (!LevelWithBerth(leader, route))
+                {
+                    if (fresh)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is by the berth for '{}' but {:.1f} yards "
+                                 "above or below it, more than a step onto a deck, so he "
+                                 "does not step - {}",
+                                 leaderName, boat,
+                                 std::fabs(leader->GetPositionZ() - route.berthZ), why);
+                    break;
+                }
                 holdTheLeader();
 
                 CrossingTransportInfo const* info = CatalogueEntry(route.transportEntry);
