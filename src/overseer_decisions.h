@@ -2690,11 +2690,19 @@ enum class RunRecovery : std::uint8_t
     Replan,
     // Go straight to REPAIRING and RESET, the pre-recovery behaviour.
     ResetInstance,
+    // HEARTH TO THE INN MOST OF THE FAMILY SHARES, MEET THERE, AND WALK TO THE
+    // DOOR TOGETHER (2026-09-24). What a group of players does when it is
+    // spread across zones: everybody bound at that inn uses the hearthstone,
+    // anybody bound elsewhere or with the stone on cooldown walks or flies to
+    // the inn, and the leader then walks the family to the door the way
+    // RestageNearer does. Offered only when PlanHearthRegroup finds such an
+    // inn. See the hearth regroup section at the end of this file.
+    HearthRegroup,
 };
 
 // "restage_nearer", "regroup", "town_for_bags", "wait_for_client",
-// "one_copy", "replan", "reset_instance". The word a log line, a table row and
-// the bridge all use.
+// "one_copy", "replan", "reset_instance", "hearth_regroup". The word a log
+// line, a table row and the bridge all use.
 char const* RunRecoveryWord(RunRecovery recovery);
 
 // The recovery a word names, or false when it names none. The bridge's answer
@@ -2702,8 +2710,7 @@ char const* RunRecoveryWord(RunRecovery recovery);
 // can never be executed.
 bool ParseRunRecovery(std::string const& word, RunRecovery& out);
 
-// Every recovery word, comma separated, in ladder order: what the module
-// offers the bridge.
+// Every recovery word, comma separated, in ladder order.
 std::string RunRecoveryOptions();
 
 // What the module knows about a failed attempt when it chooses a recovery.
@@ -2729,6 +2736,12 @@ struct RunFailureFacts
     unsigned stagingRearms{0};
     // The recoveries already applied in this streak, oldest first.
     std::vector<RunRecovery> tried;
+    // PlanHearthRegroup found an inn most of the family is bound at, on the
+    // door's map, with enough hearthstones ready to put most of the family
+    // there. What makes HearthRegroup offerable at all.
+    bool hearthRegroupReady{false};
+    // What that plan found, in words, for the facts line the bridge reads.
+    std::string hearthRegroupNote;
 };
 
 // Yards past which a leader is "far" from the staging point: a walk that long
@@ -2736,6 +2749,12 @@ struct RunFailureFacts
 constexpr float RUN_RECOVERY_FAR_YARDS = 1000.f;
 // Yards past which a member is a straggler worth regrouping for.
 constexpr float RUN_RECOVERY_STRAGGLER_YARDS = 150.f;
+// Yards past which a member is SPREAD rather than straggling: past the
+// module's own follow reach and past what a catch-up walk will cover
+// (CATCH_UP_FOOT_LIMIT_YARDS is 1500; the regroup wait already names members
+// 1,044 yards back as past anything `follow` will do). A family spread this
+// far with an inn most of it shares hearths there (HearthRegroup).
+constexpr float RUN_RECOVERY_HEARTH_SPREAD_YARDS = 1000.f;
 
 // THE HEURISTIC, and the fallback whenever Jev does not answer or is not
 // confident. Reads the failure's own facts first (bags, clients, copies,
@@ -2743,6 +2762,17 @@ constexpr float RUN_RECOVERY_STRAGGLER_YARDS = 150.f;
 // recovery a third time running: a recovery that has not worked twice is not
 // going to work because it was asked again.
 RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts);
+
+// What the module offers the bridge for one failure: every word, less
+// hearth_regroup when the facts carry no inn to regroup at. A word the family
+// cannot carry out is never put in front of Jev.
+std::string RunRecoveryOptions(RunFailureFacts const& facts);
+
+// May this recovery be applied to this failure? Every recovery may, except a
+// hearth regroup with no inn to regroup at. The module asks this of the
+// bridge's answer as well as of its own, so a word that stopped being
+// possible falls back to the heuristic.
+bool RunRecoveryApplicable(RunRecovery recovery, RunFailureFacts const& facts);
 
 // Why the heuristic chose what it chose, in one clause, for the log and the
 // request row.
@@ -6420,6 +6450,9 @@ enum class FetchRunPhase : std::uint8_t
     Gathering,  // the leader is aimed at the staging point
     Barrier,    // the leader is escorted and held at the staging point
     Committed,  // ENTER onward, or a repair or town leg the run is walking
+    // RECOVERING with a hearth regroup chosen, or offered as the heuristic's
+    // answer while the backoff runs: the family is about to meet at its inn.
+    HearthRegroup,
 };
 
 enum class FetchRunAnswer : std::uint8_t
@@ -6439,6 +6472,18 @@ enum class FetchRunAnswer : std::uint8_t
 // inside, and a repair or town leg is the run walking the leader somewhere it
 // needs him; those keep him.
 FetchRunAnswer RunLetsTheLeaderFetch(FetchRunPhase phase);
+
+// A RUN BETWEEN ATTEMPTS, as the fetch reads it (2026-09-24). RECOVERING used
+// to read as no run at all, which is right for a regroup recovery and wrong for
+// a hearth regroup. Measured on the dev realm: with the Horde family spread
+// over Stonetalon and Ashenvale, and four of the five bound at one inn, the
+// leader "goes back for 'Uzza', which is held 3964 yards away" and flew across
+// the continent toward the ground where three members had died more than ten
+// times that day. A group of players with a shared inn does not fetch one
+// member while the others are elsewhere; everybody hearths and meets there.
+// So a hearth regroup that is chosen, or is the answer waiting out the
+// backoff, refuses the fetch. Every other recovery lends the leader as before.
+FetchRunPhase RecoveringFetchPhase(bool hearthRegroupInPlay);
 
 // ------------- and an aim at the bottom of a lake is not an aim (#503) ------
 //
@@ -15672,6 +15717,19 @@ struct HeadTravelFacts
     // How far the head stands from a town stop's counter, or below zero when
     // nobody has measured it. Read only for HeadErrand::TownStop (#639).
     float stopYards{-1.f};
+    // The family's dungeon campaign is armed and between attempts: RECOVERING
+    // or REPAIRING. Nobody is walking to a door, but the run has not ended
+    // either, and the leader is the one it will stage with (2026-09-24).
+    bool campaignBetweenAttempts{false};
+    // How far the head stands from the class trainer a talent reset would
+    // walk to, or below zero when nobody has measured it. Read only for
+    // HeadErrand::TrainerTrip while `campaignBetweenAttempts`.
+    float trainerYards{-1.f};
+    // The campaign's hearth regroup has the family (RunRecovery::
+    // HearthRegroup): meeting at the inn IS the regroup, so the regroup wait
+    // (HeadErrand::Other) stands down rather than holding the leader for a
+    // member it is about to hearth.
+    bool hearthRegroup{false};
 };
 
 // A COUNTER IN THE SAME TOWN (#639). The bridge's own reading of "short": the
@@ -15685,6 +15743,15 @@ constexpr float TOWN_STOP_NEAR_YARDS = 150.f;
 constexpr uint32_t TOWN_STOP_MAX_SECONDS = 300;
 
 // May `who` put its aim on the head right now?
+//
+// A TRAINER TRIP WAITS FOR AN ARMED CAMPAIGN BETWEEN ATTEMPTS TOO
+// (2026-09-24), unless the trainer is in the town the head stands in
+// (`trainerYards` within TOWN_STOP_NEAR_YARDS). Measured on the dev realm: the
+// Horde head, leading a Ragefire campaign that was RECOVERING, was "sent to
+// 'class trainer' - creature 26332 at 2375 yards" for a talent reset, twice in
+// six minutes, while the run needed him to regroup the family and stage. A
+// player saves the respec for after the run, or buys it in the town the group
+// meets in.
 bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts);
 
 // Why it may not, for the log line; "" when it may.
@@ -15860,6 +15927,95 @@ bool ExitFailureHearthInPlay(std::vector<ExitHearthStep> const& steps);
 bool ExitHearthHoldsAdoption(std::vector<ExitHearthStep> const& steps,
                              uint32_t episodeSeconds,
                              uint32_t ceilingSeconds = EXIT_HEARTH_EPISODE_SECONDS);
+
+// -- a spread family hearths to the inn most of it shares (2026-09-24) -------
+//
+// MEASURED ON THE DEV REALM, 2026-09-24 08:00-08:09. The Horde family's
+// Ragefire Chasm campaign had failed five attempts in a row before entry. The
+// leader stood in Stonetalon, one member elsewhere in Stonetalon, and three in
+// Ashenvale beside Demon Fall Canyon, where they had died more than ten times
+// that day. Four of the five were bound at one inn in the Valley of Trials, a
+// short walk from Orgrimmar and the dungeon's door. In ninety seconds the
+// leader was sent to a class trainer 2,375 yards away, held still for a member
+// 1,044 yards behind, and flown across the continent to fetch another; the
+// recovery on offer was a restage walk from 5,549 yards out. Earlier the same
+// day the operator had unstuck this family twice with this module's own
+// kind='hearth' command, and every member arrived home at once.
+//
+// WHAT A GROUP OF PLAYERS DOES, AND WHAT THIS PLANS: everybody bound at the
+// inn most of the family shares uses the hearthstone; a member bound
+// elsewhere, or with the stone on cooldown, walks or flies to that inn; the
+// family meets there and walks to the door together. The cast is DoHearth's,
+// exactly as the failed EXIT's hearth is, and nothing is teleported by any
+// other road.
+
+// ONE MEMBER, AS THE PLAN READS IT. `bind` is m_homebind*, the place the
+// hearthstone's own spell lands on (TARGET_DEST_HOME).
+struct HearthRegroupMember
+{
+    std::string name;
+    bool leader{false};
+    bool inWorld{false};
+    bool alive{false};
+    HomeBind bind;
+    bool carriesStone{false};
+    bool onCooldown{false};
+};
+
+// Two binds within this many yards are one inn: the same distance the
+// bridge's movement kind reads an inn by (jev_movement.INN_YARDS).
+constexpr float HEARTH_REGROUP_INN_YARDS = 100.f;
+
+struct HearthRegroupPlan
+{
+    // There is an inn, on the door's map, that more than half the family is
+    // bound at, and more than half the family can hearth to it now.
+    bool ready{false};
+    // The inn: a member's own bind point, the leader's when he is bound there.
+    HomeBind inn;
+    unsigned familySize{0};
+    unsigned boundThere{0};
+    bool leaderBoundThere{false};
+    // Bound at the inn, in the world, alive, carrying a stone that is off
+    // cooldown: these hearth.
+    std::vector<std::string> hearth;
+    // Everybody else walks or flies to the inn.
+    std::vector<std::string> travel;
+    // Why the plan is not ready, for the facts line; empty when it is.
+    std::string whyNot;
+};
+
+// THE MAJORITY INN. Each known bind on the door's map is a candidate, and the
+// one with the most members bound within `innYards` of it wins; a tie goes to
+// the leader's bind, then to the earlier member. Ready only when more than half
+// the family is bound there AND more than half the family can hearth there now.
+// A family of one has nobody to regroup with and is never ready.
+HearthRegroupPlan PlanHearthRegroup(std::vector<HearthRegroupMember> const& family,
+                                    uint32_t doorMapId,
+                                    float innYards = HEARTH_REGROUP_INN_YARDS);
+
+// WHAT ONE POLL OF A HEARTH REGROUP DOES FOR ONE MEMBER.
+enum class HearthRegroupStep : uint8_t
+{
+    AtInn,          // within HEARTH_REGROUP_INN_YARDS of the inn: nothing to do
+    Hearth,         // drive the hearth executor (or hold it still first)
+    WaitForLeader,  // in the hearth set, and the leader is neither at the inn
+                    // nor hearthing there: a member landed at an inn the leader
+                    // is not at would be left behind somewhere new
+    Travel,         // walk or fly to the inn under the run's escort
+};
+
+// `yardsFromInn` is below zero when the member is on another map or unseen.
+// `leaderComing` is true when the leader stands at the inn or is himself in
+// the hearth set; for the leader it is always true. `hearthImpossible` is the
+// executor's own gates read ahead (dead, no stone, stone on cooldown, casts
+// spent), and turns a hearth into a walk.
+HearthRegroupStep HearthRegroupStepFor(bool inHearthSet, float yardsFromInn, bool leaderComing,
+                                       bool hearthImpossible,
+                                       float innYards = HEARTH_REGROUP_INN_YARDS);
+
+// "at the inn", "hearth", "wait for the leader", "travel".
+char const* HearthRegroupStepWord(HearthRegroupStep step);
 
 }  // namespace OverseerDecisions
 
