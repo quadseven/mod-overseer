@@ -42572,7 +42572,7 @@ private:
                 detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Spawn, status,
                                 rowResult, _pendingMailWalks, id);
             else if (kind == "job")
-                detail = DoJob(player, command, status);
+                detail = DoJob(player, command, status, rowResult);
             else if (kind == "sell" && OverseerDecisions::IsDestroyRow(command))
                 // THE SAME `kind`, A SECOND GRAMMAR (#614), routed on the first
                 // word as `cast` routes a learn, so no ENUM migration is needed.
@@ -43135,7 +43135,8 @@ private:
     // jobs map read at the top of its loop) reacts to this column today -
     // every mode besides 'quest' means "the quest drive stands down", full
     // stop, until each mode gets its own drive built.
-    static char const* DoJob(Player* player, std::string const& command, char const*& status)
+    static char const* DoJob(Player* player, std::string const& command, char const*& status,
+                             std::string& result)
     {
         std::string const mode = LowerName(command);
         auto const& modes = JobModes();
@@ -43148,11 +43149,71 @@ private:
         if (!knownMode && !knownDungeon && !knownRaid)
             return "unknown job mode";
 
+        QueryResult before = CharacterDatabase.Query(
+            "SELECT job FROM overseer_roster WHERE name = '{}'", Esc(player->GetName()));
+        std::string beforeJob;
+        bool const hadRosterRow = static_cast<bool>(before);
+        if (hadRosterRow)
+            beforeJob = before->Fetch()[0].Get<std::string>();
+
         CharacterDatabase.DirectExecute(
             "UPDATE overseer_roster SET job = '{}' WHERE name = '{}'",
             mode, player->GetName());
 
-        status = "delivered";
+        QueryResult after = CharacterDatabase.Query(
+            "SELECT job FROM overseer_roster WHERE name = '{}'", Esc(player->GetName()));
+        if (!after)
+        {
+            result = "{\"outcome\":\"error\",\"mode\":" + J(mode) +
+                     ",\"before\":" + (hadRosterRow ? J(beforeJob) : "null") +
+                     ",\"after\":null,\"reason\":\"no roster row\"}";
+            status = "error";
+            LOG_ERROR("module.overseer",
+                      "overseer: job '{}' for '{}' error - read back no roster row",
+                      mode, player->GetName());
+            return "no roster row";
+        }
+
+        std::string const afterJob = after->Fetch()[0].Get<std::string>();
+        if (!hadRosterRow)
+        {
+            result = "{\"outcome\":\"error\",\"mode\":" + J(mode) +
+                     ",\"before\":null,\"after\":" + J(afterJob) +
+                     ",\"reason\":\"no roster row before write\"}";
+            status = "error";
+            LOG_ERROR("module.overseer",
+                      "overseer: job '{}' for '{}' error - no roster row before write, "
+                      "read back '{}'",
+                      mode, player->GetName(), afterJob);
+            return "no roster row";
+        }
+
+        bool const applied = beforeJob != mode;
+        char const* outcome = afterJob == mode ? (applied ? "applied" : "unchanged") : "error";
+        result = "{\"outcome\":" + J(outcome) + ",\"mode\":" + J(mode) +
+                 ",\"before\":" + (hadRosterRow ? J(beforeJob) : "null") +
+                 ",\"after\":" + J(afterJob) + "}";
+        if (afterJob != mode)
+        {
+            result = "{\"outcome\":\"error\",\"mode\":" + J(mode) +
+                     ",\"before\":" + J(beforeJob) + ",\"after\":" + J(afterJob) +
+                     ",\"reason\":\"job read-back did not match requested mode\"}";
+            status = "error";
+            LOG_ERROR("module.overseer",
+                      "overseer: job '{}' for '{}' error - read back '{}'",
+                      mode, player->GetName(), afterJob);
+            return "job read-back did not match requested mode";
+        }
+
+        status = outcome;
+        if (applied)
+            LOG_INFO("module.overseer",
+                     "overseer: job '{}' for '{}' applied - read back '{}' (was '{}')",
+                     mode, player->GetName(), afterJob, beforeJob);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: job '{}' for '{}' unchanged - read back '{}' (was '{}')",
+                     mode, player->GetName(), afterJob, beforeJob);
         return "";
     }
 
