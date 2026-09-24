@@ -12280,17 +12280,17 @@ namespace Classic
 {
 bool IsExpansionContinent(uint32_t mapId)
 {
-    return mapId == OUTLAND_MAP || mapId == NORTHREND_MAP;
+    return mapId == OUTLAND_MAP_ID || mapId == NORTHREND_MAP_ID;
 }
 
 bool ClassicRankAllowed(uint32_t rankMaxSkill)
 {
-    return rankMaxSkill <= MAX_PROFESSION_SKILL;
+    return rankMaxSkill <= PROFESSION_SKILL_CAP;
 }
 
 bool ClassicRecipeAllowed(uint32_t reqSkillRank)
 {
-    return reqSkillRank <= MAX_PROFESSION_SKILL;
+    return reqSkillRank <= PROFESSION_SKILL_CAP;
 }
 }  // namespace Classic
 

@@ -14696,10 +14696,10 @@ bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bo
 // cap that only Outland and Northrend trainers teach.
 namespace Classic
 {
-constexpr uint32_t MAX_LEVEL = 60;
-constexpr uint32_t MAX_PROFESSION_SKILL = 300;
-constexpr uint32_t OUTLAND_MAP = 530;
-constexpr uint32_t NORTHREND_MAP = 571;
+constexpr uint32_t LEVEL_CAP = 60;
+constexpr uint32_t PROFESSION_SKILL_CAP = 300;
+constexpr uint32_t OUTLAND_MAP_ID = 530;
+constexpr uint32_t NORTHREND_MAP_ID = 571;
 
 // Outland or Northrend. A walk or a travel aim that would start or end on one
 // of these is refused. The Blood Elf and Draenei starting lands are physically

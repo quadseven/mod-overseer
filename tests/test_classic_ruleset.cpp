@@ -63,10 +63,10 @@ void CheckText(char const* what, std::string const& got, char const* want)
 
 void TheNumbers()
 {
-    CheckNumber("the level cap", C::MAX_LEVEL, 60);
-    CheckNumber("the profession cap", C::MAX_PROFESSION_SKILL, 300);
-    CheckNumber("Outland", C::OUTLAND_MAP, 530);
-    CheckNumber("Northrend", C::NORTHREND_MAP, 571);
+    CheckNumber("the level cap", C::LEVEL_CAP, 60);
+    CheckNumber("the profession cap", C::PROFESSION_SKILL_CAP, 300);
+    CheckNumber("Outland", C::OUTLAND_MAP_ID, 530);
+    CheckNumber("Northrend", C::NORTHREND_MAP_ID, 571);
 }
 
 void OnlyOutlandAndNorthrendAreOutside()
