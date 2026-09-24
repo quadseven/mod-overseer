@@ -14971,4 +14971,62 @@ RosterTraining RosterTrainingFor(bool factoryGrants)
     return training;
 }
 
+// ------------------------------------------------------------------ keep --
+
+bool KeepReservationCovers(KeepReservation const& r, std::string const& character, unsigned itemEntry,
+                           unsigned itemGuid)
+{
+    if (r.character != character)
+        return false;
+    if (r.itemGuid)
+        return r.itemGuid == itemGuid;
+    return r.itemEntry && r.itemEntry == itemEntry;
+}
+
+KeepReservation const* KeepReservationFor(std::vector<KeepReservation> const& reservations,
+                                          std::string const& character, unsigned itemEntry, unsigned itemGuid)
+{
+    for (KeepReservation const& r : reservations)
+        if (KeepReservationCovers(r, character, itemEntry, itemGuid))
+            return &r;
+    return nullptr;
+}
+
+KeepStep KeepStepFor(unsigned level, unsigned untilLevel, KeepPlace place, bool bankerInReach)
+{
+    if (!untilLevel || place == KeepPlace::Missing)
+        return KeepStep::None;
+    if (level < untilLevel)
+    {
+        if (place == KeepPlace::Equipped)
+            return KeepStep::Unequip;
+        if (place == KeepPlace::Bags && bankerInReach)
+            return KeepStep::Deposit;
+        return KeepStep::None;
+    }
+    if (place == KeepPlace::Bank)
+        return bankerInReach ? KeepStep::Withdraw : KeepStep::None;
+    if (place == KeepPlace::Bags)
+        return KeepStep::Equip;
+    return KeepStep::None;
+}
+
+char const* KeepStepWord(KeepStep step)
+{
+    switch (step)
+    {
+        case KeepStep::None:
+            return "none";
+        case KeepStep::Unequip:
+            return "unequip";
+        case KeepStep::Deposit:
+            return "deposit";
+        case KeepStep::Withdraw:
+            return "withdraw";
+        case KeepStep::Equip:
+            return "equip";
+    }
+    return "unknown";
+}
+
 }  // namespace OverseerDecisions

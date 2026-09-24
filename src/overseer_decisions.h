@@ -17208,6 +17208,67 @@ struct RosterTraining
 
 RosterTraining RosterTrainingFor(bool factoryGrants);
 
+// ------------------------------------------------------------------ keep --
+//
+// AN ITEM A CHARACTER MUST KEEP, whatever else wants it (overseer_keep). The
+// operator reserves an item on a character - one instance by its guid, or
+// every instance of an entry - and nothing this module does may sell it,
+// destroy it, give it, trade it, mail it, auction it or put it in a guild
+// bank. The reservation can also say where the item lives: below
+// `untilLevel` it is not worn (the character cannot use it) and waits in the
+// character's own bank; at or above it, it comes out and is worn again.
+//
+// The first case is a sword the character earned and cannot wield after its
+// level is lowered: it must survive the lowering and every clean-up of bags
+// that follows, and come back when the character can use it.
+
+struct KeepReservation
+{
+    std::string character;
+    unsigned itemEntry{0};   // 0: the guid alone names it
+    unsigned itemGuid{0};    // 0: every instance of the entry
+    unsigned untilLevel{0};  // 0: kept wherever it is, never moved
+    std::string reason;
+};
+
+// Does this reservation cover this item on this character? A guid names one
+// instance; an entry with no guid names them all. A reservation naming
+// neither covers nothing.
+bool KeepReservationCovers(KeepReservation const& reservation, std::string const& character,
+                           unsigned itemEntry, unsigned itemGuid);
+
+// The first reservation covering the item, or nullptr.
+KeepReservation const* KeepReservationFor(std::vector<KeepReservation> const& reservations,
+                                          std::string const& character, unsigned itemEntry, unsigned itemGuid);
+
+// The refusal every item-moving executor gives a reserved item. No quotes.
+constexpr char KEEP_REFUSAL[] = "the item is reserved to be kept (overseer_keep)";
+
+enum class KeepPlace : std::uint8_t
+{
+    Missing,    // not on the character at all (in the mail, say)
+    Equipped,
+    Bags,
+    Bank,
+};
+
+enum class KeepStep : std::uint8_t
+{
+    None,
+    Unequip,    // to the bags: it cannot be worn at this level
+    Deposit,    // bags to the character's own bank, at a banker
+    Withdraw,   // bank to the bags, at a banker
+    Equip,      // bags to where it is worn
+};
+
+// Where the item should go next. Below `untilLevel` it is taken off at once
+// and banked when a banker is in reach; at or above it, it is taken out of
+// the bank at a banker and worn. Nothing moves when `untilLevel` is 0.
+KeepStep KeepStepFor(unsigned level, unsigned untilLevel, KeepPlace place, bool bankerInReach);
+
+// "none", "unequip", "deposit", "withdraw", "equip".
+char const* KeepStepWord(KeepStep step);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
