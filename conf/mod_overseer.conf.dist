@@ -375,3 +375,36 @@
 #        Default:     1
 #
 #Overseer.Train.Factory = 1
+#
+########################################
+#
+#    EVERYTHING NATURAL
+#
+#    Overseer.Natural.Enabled
+#        Description: Whether kind='naturalize' rows run at all. All four
+#                     modes are irreversible: reset-level-1 takes a guild bot
+#                     back to level 1 at its race's start; strip-family-grants
+#                     removes a family character's GM-issued items, riding,
+#                     untrained weapon skills and free class spells;
+#                     lower-to-natural-level level:<N> takes a family character
+#                     down to N with what no trainer would sell it at N; and
+#                     discard-unearned-gold removes the guild dues the guild's
+#                     bots mailed a family character. Each
+#                     has a dry run that writes what it would remove and changes
+#                     nothing; the dry run is refused while this is off too.
+#
+#        Default:     0
+#
+#Overseer.Natural.Enabled = 0
+#
+#    Overseer.Natural.Guilds
+#        Description: The guilds, by name, comma separated, whose characters a
+#                     naturalize row may touch. Anyone outside them is refused.
+#                     A reset also refuses unless mod-playerbots'
+#                     AiPlayerbot.NaturalGuild names the guild, because the bot
+#                     factory would re-kit a level 1 bot on its next randomize.
+#
+#        Example:     Overseer.Natural.Guilds = "My Guild,Other Guild"
+#        Default:     "" (empty - nobody)
+#
+#Overseer.Natural.Guilds = ""

@@ -15095,4 +15095,661 @@ char const* KeepStepWord(KeepStep step)
     return "unknown";
 }
 
+// ------------------------------------------------------------ naturalize --
+
+namespace
+{
+std::string LowerAscii(std::string s)
+{
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return s;
+}
+
+std::string TrimAscii(std::string const& s)
+{
+    std::size_t b = 0;
+    std::size_t e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\t'))
+        ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t'))
+        --e;
+    return s.substr(b, e - b);
+}
+
+std::vector<std::string> SplitOn(std::string const& s, char sep)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s)
+    {
+        if (c == sep)
+        {
+            out.push_back(cur);
+            cur.clear();
+        }
+        else
+            cur.push_back(c);
+    }
+    out.push_back(cur);
+    return out;
+}
+
+bool AllDigits(std::string const& s)
+{
+    if (s.empty())
+        return false;
+    for (char c : s)
+        if (c < '0' || c > '9')
+            return false;
+    return true;
+}
+}  // namespace
+
+NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
+{
+    NaturalizeRequest req;
+    std::vector<std::string> words;
+    for (std::string const& w : SplitOn(command, ' '))
+        if (!TrimAscii(w).empty())
+            words.push_back(TrimAscii(w));
+
+    if (words.empty())
+    {
+        req.error = "empty; say reset-level-1, strip-family-grants, lower-to-natural-level or discard-unearned-gold";
+        return req;
+    }
+
+    std::string const mode = LowerAscii(words[0]);
+    if (mode == "reset-level-1")
+        req.mode = NaturalizeMode::ResetLevelOne;
+    else if (mode == "strip-family-grants")
+        req.mode = NaturalizeMode::StripFamilyGrants;
+    else if (mode == "lower-to-natural-level")
+        req.mode = NaturalizeMode::LowerToNaturalLevel;
+    else if (mode == "discard-unearned-gold")
+        req.mode = NaturalizeMode::DiscardUnearnedGold;
+    else
+    {
+        req.error = "unknown mode; say reset-level-1, strip-family-grants, lower-to-natural-level or "
+                    "discard-unearned-gold";
+        return req;
+    }
+
+    bool sawParts = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        std::string const w = LowerAscii(words[i]);
+        if (w == "dry-run")
+        {
+            if (req.dryRun)
+            {
+                req.error = "dry-run given twice";
+                return req;
+            }
+            req.dryRun = true;
+            continue;
+        }
+        if (w.rfind("parts:", 0) == 0)
+        {
+            if (req.mode != NaturalizeMode::StripFamilyGrants)
+            {
+                req.error = "parts: applies to strip-family-grants only";
+                return req;
+            }
+            if (sawParts)
+            {
+                req.error = "parts: given twice";
+                return req;
+            }
+            sawParts = true;
+            for (std::string const& p : SplitOn(w.substr(6), ','))
+            {
+                std::string const part = TrimAscii(p);
+                if (part == "items")
+                    req.parts |= NATURALIZE_PART_ITEMS;
+                else if (part == "riding")
+                    req.parts |= NATURALIZE_PART_RIDING;
+                else if (part == "weapons")
+                    req.parts |= NATURALIZE_PART_WEAPONS;
+                else if (part == "spells")
+                    req.parts |= NATURALIZE_PART_SPELLS;
+                else
+                {
+                    req.error = "unknown part; say items, riding, weapons or spells";
+                    return req;
+                }
+            }
+            continue;
+        }
+        if (w.rfind("level:", 0) == 0)
+        {
+            if (req.mode != NaturalizeMode::LowerToNaturalLevel)
+            {
+                req.error = "level: applies to lower-to-natural-level only";
+                return req;
+            }
+            if (req.targetLevel)
+            {
+                req.error = "level: given twice";
+                return req;
+            }
+            std::string const n = w.substr(6);
+            if (!AllDigits(n) || n.size() > 3 || std::stoul(n) < 1 || std::stoul(n) > 79)
+            {
+                req.error = "level: must be a whole number from 1 to 79";
+                return req;
+            }
+            req.targetLevel = static_cast<unsigned>(std::stoul(n));
+            continue;
+        }
+        req.error = "unexpected word; the grammar is <mode> [dry-run] [parts:a,b] [level:N]";
+        return req;
+    }
+
+    if (req.mode == NaturalizeMode::LowerToNaturalLevel && !req.targetLevel)
+    {
+        req.error = "lower-to-natural-level needs level:<N>";
+        return req;
+    }
+
+    if (req.mode == NaturalizeMode::ResetLevelOne)
+        req.parts = NATURALIZE_PART_RESET;
+    else if (req.mode == NaturalizeMode::LowerToNaturalLevel)
+        req.parts = NATURALIZE_PART_LOWER;
+    else if (req.mode == NaturalizeMode::DiscardUnearnedGold)
+        req.parts = NATURALIZE_PART_GOLD;
+    else if (!sawParts)
+        req.parts = NATURALIZE_STRIP_PARTS;
+
+    req.ok = true;
+    return req;
+}
+
+char const* NaturalizeModeWord(NaturalizeMode mode)
+{
+    switch (mode)
+    {
+        case NaturalizeMode::ResetLevelOne:
+            return "reset-level-1";
+        case NaturalizeMode::StripFamilyGrants:
+            return "strip-family-grants";
+        case NaturalizeMode::LowerToNaturalLevel:
+            return "lower-to-natural-level";
+        case NaturalizeMode::DiscardUnearnedGold:
+            return "discard-unearned-gold";
+        case NaturalizeMode::Unknown:
+            break;
+    }
+    return "unknown";
+}
+
+char const* NaturalizePartWord(unsigned part)
+{
+    switch (part)
+    {
+        case NATURALIZE_PART_RESET:
+            return "reset";
+        case NATURALIZE_PART_ITEMS:
+            return "items";
+        case NATURALIZE_PART_RIDING:
+            return "riding";
+        case NATURALIZE_PART_WEAPONS:
+            return "weapons";
+        case NATURALIZE_PART_SPELLS:
+            return "spells";
+        case NATURALIZE_PART_LOWER:
+            return "lower";
+        case NATURALIZE_PART_GOLD:
+            return "gold";
+        default:
+            break;
+    }
+    return "unknown";
+}
+
+std::vector<std::string> ParseNameList(std::string const& csv)
+{
+    std::vector<std::string> out;
+    for (std::string const& p : SplitOn(csv, ','))
+    {
+        std::string const name = TrimAscii(p);
+        if (!name.empty())
+            out.push_back(name);
+    }
+    return out;
+}
+
+bool NameListHas(std::vector<std::string> const& list, std::string const& name)
+{
+    if (name.empty())
+        return false;
+    std::string const want = LowerAscii(TrimAscii(name));
+    for (std::string const& n : list)
+        if (LowerAscii(n) == want)
+            return true;
+    return false;
+}
+
+NaturalizeRefusal NaturalizeVerdictFor(NaturalizeRequest const& request, NaturalizeFacts const& facts,
+                                       bool asDryRun)
+{
+    if (!facts.enabled)
+        return NaturalizeRefusal::Disabled;
+    if (!request.ok)
+        return NaturalizeRefusal::BadRequest;
+    if (!facts.exists)
+        return NaturalizeRefusal::NoSuchCharacter;
+    if (!facts.guildListed)
+        return NaturalizeRefusal::NotInNaturalGuild;
+
+    bool const reset = request.mode == NaturalizeMode::ResetLevelOne;
+    if (reset && facts.inFamily)
+        return NaturalizeRefusal::FamilyMember;
+    if (!reset && !facts.inFamily)
+        return NaturalizeRefusal::NotFamily;
+    if (reset && facts.deathKnight)
+        return NaturalizeRefusal::DeathKnight;
+    bool const lower = request.mode == NaturalizeMode::LowerToNaturalLevel;
+    if (lower && request.targetLevel >= facts.level)
+        return NaturalizeRefusal::LevelNotLower;
+
+    if (asDryRun)
+        return NaturalizeRefusal::None;
+
+    if (reset && (facts.openAuctions || facts.openBids))
+        return NaturalizeRefusal::OpenAuction;
+    if (reset && facts.codMail)
+        return NaturalizeRefusal::CodMail;
+    if (reset && !facts.playerbotsGateCovers)
+        return NaturalizeRefusal::PlayerbotsGateOff;
+    if (request.mode == NaturalizeMode::StripFamilyGrants && facts.trainFactoryOn)
+        return NaturalizeRefusal::TrainFactoryOn;
+    if (facts.clientAttached)
+        return NaturalizeRefusal::ClientAttached;
+    if ((request.parts & ~facts.partsAlreadyDone) == 0)
+        return NaturalizeRefusal::AlreadyDone;
+    return NaturalizeRefusal::None;
+}
+
+char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal)
+{
+    switch (refusal)
+    {
+        case NaturalizeRefusal::None:
+            return "";
+        case NaturalizeRefusal::Disabled:
+            return "naturalize is off; set Overseer.Natural.Enabled = 1";
+        case NaturalizeRefusal::BadRequest:
+            return "the command did not parse";
+        case NaturalizeRefusal::NoSuchCharacter:
+            return "no character by that name";
+        case NaturalizeRefusal::NotInNaturalGuild:
+            return "not in a guild named in Overseer.Natural.Guilds";
+        case NaturalizeRefusal::FamilyMember:
+            return "a family character is never reset";
+        case NaturalizeRefusal::NotFamily:
+            return "only a family character is stripped";
+        case NaturalizeRefusal::DeathKnight:
+            return "a death knight starts at 55, so it has no level 1 to go back to";
+        case NaturalizeRefusal::OpenAuction:
+            return "it has an open auction or bid, which would deliver after the reset";
+        case NaturalizeRefusal::CodMail:
+            return "a COD mail is waiting, which only its sender can take back";
+        case NaturalizeRefusal::PlayerbotsGateOff:
+            return "AiPlayerbot.NaturalGuild does not name its guild, so the factory would re-kit it";
+        case NaturalizeRefusal::TrainFactoryOn:
+            return "Overseer.Train.Factory is on, so TrainRoster would re-teach it on the next level";
+        case NaturalizeRefusal::LevelNotLower:
+            return "the target level is not below the level it has";
+        case NaturalizeRefusal::ClientAttached:
+            return "a game client is logged in as it; log the client out first";
+        case NaturalizeRefusal::AlreadyDone:
+            return "already done for this character; the ledger holds every part asked for";
+    }
+    return "refused";
+}
+
+ResetTreatment ResetTreatmentFor(ResetPart part)
+{
+    switch (part)
+    {
+        case ResetPart::Identity:
+        case ResetPart::GuildMembership:
+        case ResetPart::GuildRank:
+        case ResetPart::PlayedTime:
+            return ResetTreatment::Keep;
+        case ResetPart::InboxMail:
+        case ResetPart::Pets:
+        case ResetPart::Achievements:
+            return ResetTreatment::Remove;
+        case ResetPart::Level:
+        case ResetPart::Items:
+        case ResetPart::Money:
+        case ResetPart::Skills:
+        case ResetPart::Spells:
+        case ResetPart::Talents:
+        case ResetPart::Quests:
+        case ResetPart::Reputation:
+        case ResetPart::TaxiNodes:
+        case ResetPart::HomeAndPosition:
+            return ResetTreatment::RestoreToStart;
+    }
+    // An unlisted part is kept: a reset that does not know what something is
+    // must not destroy it.
+    return ResetTreatment::Keep;
+}
+
+char const* ResetPartWord(ResetPart part)
+{
+    switch (part)
+    {
+        case ResetPart::Identity:
+            return "identity";
+        case ResetPart::GuildMembership:
+            return "guild_membership";
+        case ResetPart::GuildRank:
+            return "guild_rank";
+        case ResetPart::PlayedTime:
+            return "played_time";
+        case ResetPart::Level:
+            return "level";
+        case ResetPart::Items:
+            return "items";
+        case ResetPart::InboxMail:
+            return "inbox_mail";
+        case ResetPart::Money:
+            return "money";
+        case ResetPart::Skills:
+            return "skills";
+        case ResetPart::Spells:
+            return "spells";
+        case ResetPart::Talents:
+            return "talents";
+        case ResetPart::Quests:
+            return "quests";
+        case ResetPart::Reputation:
+            return "reputation";
+        case ResetPart::Pets:
+            return "pets";
+        case ResetPart::TaxiNodes:
+            return "taxi_nodes";
+        case ResetPart::HomeAndPosition:
+            return "home_and_position";
+        case ResetPart::Achievements:
+            return "achievements";
+    }
+    return "unknown";
+}
+
+char const* ResetTreatmentWord(ResetTreatment treatment)
+{
+    switch (treatment)
+    {
+        case ResetTreatment::Keep:
+            return "keep";
+        case ResetTreatment::Remove:
+            return "remove";
+        case ResetTreatment::RestoreToStart:
+            return "restore_to_start";
+    }
+    return "unknown";
+}
+
+std::vector<BotValueAction> ResetRandomBotValues()
+{
+    return {
+        {"level", BotValueStep::Set, 1, "what RandomizeFirst records for a level 1 start"},
+        {"dead", BotValueStep::Clear, 0, "the old life's death timer"},
+        {"revive", BotValueStep::Clear, 0, "a revive would refresh and grind-teleport the new life"},
+        {"randomize", BotValueStep::Leave, 0,
+         "clearing it randomizes on the next update, which below level 3 is the full factory kit"},
+        {"teleport", BotValueStep::Leave, 0, "level-appropriate teleports are kept; the patch skips the refresh"},
+        {"add", BotValueStep::Leave, 0, "keeps it in the random-bot pool its guild keeps online"},
+        {"logout", BotValueStep::Leave, 0, "session bookkeeping, not its kit"},
+    };
+}
+
+StripSpellDecision StripSpellDecisionFor(StripSpellFacts const& f)
+{
+    if (f.dependent)
+        return {StripVerdict::Keep, "learned through another spell; it follows that spell"};
+    if (f.profession)
+        return {StripVerdict::Keep, "a profession spell; professions stay"};
+    if (f.talent)
+        return {StripVerdict::Keep, "bought with the character's own talent points"};
+    if (f.autoLearned)
+        return {StripVerdict::Keep, "every character of this race and class has it with the skill"};
+    if (f.questReward)
+        return {StripVerdict::Keep, "a quest the character completed teaches it"};
+    if (f.trainerRecord)
+        return {StripVerdict::Keep, "a trainer purchase is recorded"};
+    if (f.riding)
+        return {StripVerdict::Remove, "riding is trained for gold and no purchase is recorded"};
+    if (f.classTrainer)
+        return {StripVerdict::Remove, "a class trainer sells it and no purchase is recorded"};
+    if (f.questTaught)
+        return {StripVerdict::Remove, "only a quest teaches it and the character has not completed one"};
+    return {StripVerdict::Keep, "no trainer or quest teaches it (an item, a racial, a mount or a companion)"};
+}
+
+StripWeaponSkillDecision StripWeaponSkillDecisionFor(StripWeaponSkillFacts const& f)
+{
+    if (f.defense)
+        return {StripVerdict::Keep, f.value, "defense rises every time the character is struck"};
+    if (!f.startingSkill && !f.trainerRecord)
+        return {StripVerdict::Remove, 0, "not a starting weapon and no weapon master visit is recorded"};
+
+    unsigned const cap = f.usedLevel ? 5 * f.usedLevel : 1;
+    if (f.value <= cap)
+        return {StripVerdict::Keep, f.value, "within what its recorded use reaches"};
+    if (!f.usedLevel)
+        return {StripVerdict::SetValue, cap, "never recorded wielding one, so it keeps the value a fresh one has"};
+    return {StripVerdict::SetValue, cap, "capped at 5 x the highest level it is recorded wielding one"};
+}
+
+bool ParseGmAdditem(std::string const& command, unsigned& entry, unsigned& count)
+{
+    std::vector<std::string> words;
+    for (std::string const& w : SplitOn(TrimAscii(command), ' '))
+        if (!w.empty())
+            words.push_back(w);
+    if (words.size() < 2 || words.size() > 3 || LowerAscii(words[0]) != ".additem")
+        return false;
+    if (!AllDigits(words[1]) || words[1].size() > 9)
+        return false;
+    unsigned n = 1;
+    if (words.size() == 3)
+    {
+        if (!AllDigits(words[2]) || words[2].size() > 9)
+            return false;   // a negative count took items away
+        n = static_cast<unsigned>(std::stoul(words[2]));
+    }
+    unsigned const e = static_cast<unsigned>(std::stoul(words[1]));
+    if (!e || !n)
+        return false;
+    entry = e;
+    count = n;
+    return true;
+}
+
+GmAttribution GmIssuedInstancesOf(std::string const& target, std::vector<GmIssue> const& issues,
+                                  std::vector<GmHolding> const& familyHoldings)
+{
+    GmAttribution out;
+
+    // entry -> recipient -> count issued
+    std::map<unsigned, std::map<std::string, unsigned>> issued;
+    for (GmIssue const& i : issues)
+        if (i.entry && i.count)
+            issued[i.entry][i.character] += i.count;
+
+    auto byGuid = [](GmHolding const& a, GmHolding const& b) { return a.itemGuid < b.itemGuid; };
+
+    for (auto const& [entry, perChar] : issued)
+    {
+        std::vector<GmHolding> held;
+        for (GmHolding const& h : familyHoldings)
+            if (h.entry == entry && !h.naturalRecord)
+                held.push_back(h);
+        std::sort(held.begin(), held.end(), byGuid);
+
+        std::vector<unsigned> attributed;
+        unsigned remainder = 0;
+        for (auto const& [recipient, count] : perChar)
+        {
+            unsigned taken = 0;
+            for (GmHolding const& h : held)
+            {
+                if (h.holder != recipient || taken == count)
+                    continue;
+                attributed.push_back(h.itemGuid);
+                if (h.holder == target)
+                    out.itemGuids.push_back(h.itemGuid);
+                ++taken;
+            }
+            remainder += count - taken;
+        }
+
+        std::vector<GmHolding> others;
+        for (GmHolding const& h : held)
+            if (!perChar.count(h.holder))
+                others.push_back(h);
+
+        if (remainder && !others.empty())
+        {
+            if (others.size() <= remainder)
+            {
+                for (GmHolding const& h : others)
+                {
+                    attributed.push_back(h.itemGuid);
+                    if (h.holder == target)
+                        out.itemGuids.push_back(h.itemGuid);
+                }
+            }
+            else if (std::any_of(others.begin(), others.end(),
+                                 [&](GmHolding const& h) { return h.holder == target; }))
+                out.notes.push_back("entry " + std::to_string(entry) + ": more held than the GM issue left " +
+                                    "unaccounted, so none of it is attributed");
+        }
+
+        for (GmHolding const& h : held)
+            if (h.holder == target &&
+                std::find(attributed.begin(), attributed.end(), h.itemGuid) == attributed.end())
+                out.notes.push_back("entry " + std::to_string(entry) + " item " + std::to_string(h.itemGuid) +
+                                    " has no GM record of its own; unverified, kept");
+    }
+
+    std::sort(out.itemGuids.begin(), out.itemGuids.end());
+    return out;
+}
+
+bool IsLevelAchievement(unsigned id)
+{
+    return id >= 6 && id <= 13;
+}
+
+std::vector<unsigned> BoostLevelAchievements(std::vector<CompletedAchievement> const& completed,
+                                             std::vector<std::int64_t> const& levelCommandTimes,
+                                             unsigned slackSeconds)
+{
+    std::vector<unsigned> out;
+    for (CompletedAchievement const& a : completed)
+    {
+        if (!IsLevelAchievement(a.id))
+            continue;
+        for (std::int64_t t : levelCommandTimes)
+        {
+            std::int64_t const gap = a.at > t ? a.at - t : t - a.at;
+            if (gap <= static_cast<std::int64_t>(slackSeconds))
+            {
+                out.push_back(a.id);
+                break;
+            }
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::uint64_t DuesAmountFromSource(std::string const& source)
+{
+    std::string const prefix = "guilddues:";
+    if (source.rfind(prefix, 0) != 0)
+        return 0;
+    std::string const n = source.substr(prefix.size());
+    if (!AllDigits(n) || n.size() > 12)
+        return 0;
+    return std::stoull(n);
+}
+
+DuesDiscard DuesDiscardFor(std::vector<DuesLetter> const& letters, std::uint64_t purse)
+{
+    DuesDiscard out;
+    for (DuesLetter const& l : letters)
+    {
+        if (l.money)
+        {
+            out.lettersToEmpty.push_back(l.mailId);
+            out.unopenedMoney += l.money;
+        }
+        else if (l.sentMoney)
+            out.takenMoney += l.sentMoney;
+        else
+            ++out.takenWithNoRecord;
+    }
+    out.fromPurse = std::min(out.takenMoney, purse);
+    return out;
+}
+
+NaturalLevel NaturalLevelFor(std::vector<std::uint64_t> const& xpForLevel, unsigned baseLevel,
+                             std::uint64_t baseXp, std::uint64_t earnedXp, unsigned divisor)
+{
+    NaturalLevel out;
+    out.level = baseLevel;
+    out.xpInto = baseXp + (divisor ? earnedXp / divisor : earnedXp);
+    while (out.level < xpForLevel.size() && xpForLevel[out.level] && out.xpInto >= xpForLevel[out.level])
+    {
+        out.xpInto -= xpForLevel[out.level];
+        ++out.level;
+    }
+    return out;
+}
+
+std::uint64_t ExperienceBetween(std::vector<std::uint64_t> const& xpForLevel, unsigned fromLevel,
+                                std::uint64_t fromXp, unsigned toLevel, std::uint64_t toXp)
+{
+    if (toLevel < fromLevel || (toLevel == fromLevel && toXp <= fromXp))
+        return 0;
+    std::uint64_t total = 0;
+    for (unsigned l = fromLevel; l < toLevel && l < xpForLevel.size(); ++l)
+        total += xpForLevel[l];
+    return total + toXp - fromXp;
+}
+
+StripSpellDecision LowerSpellDecisionFor(LowerSpellFacts const& f, unsigned targetLevel)
+{
+    if (f.talent)
+        return {StripVerdict::Keep, "a talent; the talents are reset and spent again"};
+    if (f.questReward)
+        return {StripVerdict::Keep, "a quest it completed teaches it"};
+    if (f.trainerLevel > targetLevel)
+        return {StripVerdict::Remove, "no trainer sells it below a higher level"};
+    if (f.recipeRank && f.recipeRank > f.tradeMaxAfter)
+        return {StripVerdict::Remove, "its trade no longer reaches the rank it needs"};
+    return {StripVerdict::Keep, "learnable at the new level"};
+}
+
+unsigned LoweredSkillValue(unsigned value, unsigned targetLevel)
+{
+    unsigned const cap = 5 * targetLevel;
+    return value > cap ? cap : value;
+}
+
+unsigned MailsNeededFor(unsigned items)
+{
+    return (items + NATURALIZE_MAIL_ITEMS - 1) / NATURALIZE_MAIL_ITEMS;
+}
+
 }  // namespace OverseerDecisions

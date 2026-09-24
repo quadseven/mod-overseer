@@ -242,6 +242,7 @@
 #include "ObjectMgr.h"
 #include "QuestDef.h"
 #include "Player.h"
+#include "Pet.h"
 #include "Bag.h"
 #include "BankPackets.h"
 #include "DBCStores.h"
@@ -6111,6 +6112,61 @@ public:
     }
 };
 
+// The naturalize block's names, brought into the adapter's functions with one
+// `using namespace` rather than a list in each of them.
+namespace NaturalizeNames
+{
+using OverseerDecisions::BoostLevelAchievements;
+using OverseerDecisions::BotValueAction;
+using OverseerDecisions::BotValueStep;
+using OverseerDecisions::CompletedAchievement;
+using OverseerDecisions::GmAttribution;
+using OverseerDecisions::GmHolding;
+using OverseerDecisions::GmIssue;
+using OverseerDecisions::GmIssuedInstancesOf;
+using OverseerDecisions::MailsNeededFor;
+using OverseerDecisions::NameListHas;
+using OverseerDecisions::NATURALIZE_MAIL_ITEMS;
+using OverseerDecisions::NATURALIZE_PART_ITEMS;
+using OverseerDecisions::NATURALIZE_PART_RESET;
+using OverseerDecisions::NATURALIZE_PART_RIDING;
+using OverseerDecisions::NATURALIZE_PART_SPELLS;
+using OverseerDecisions::NATURALIZE_PART_WEAPONS;
+using OverseerDecisions::NaturalizeFacts;
+using OverseerDecisions::NaturalizeMode;
+using OverseerDecisions::NaturalizeModeWord;
+using OverseerDecisions::NaturalizePartWord;
+using OverseerDecisions::NaturalizeRefusal;
+using OverseerDecisions::NaturalizeRefusalSaid;
+using OverseerDecisions::NaturalizeRequest;
+using OverseerDecisions::NaturalizeVerdictFor;
+using OverseerDecisions::ParseGmAdditem;
+using OverseerDecisions::ParseNaturalizeRequest;
+using OverseerDecisions::RESET_PARTS;
+using OverseerDecisions::ResetPart;
+using OverseerDecisions::ResetPartWord;
+using OverseerDecisions::ResetRandomBotValues;
+using OverseerDecisions::ResetTreatmentFor;
+using OverseerDecisions::ResetTreatmentWord;
+using OverseerDecisions::StripSpellDecision;
+using OverseerDecisions::StripSpellDecisionFor;
+using OverseerDecisions::StripSpellFacts;
+using OverseerDecisions::StripVerdict;
+using OverseerDecisions::StripWeaponSkillDecision;
+using OverseerDecisions::StripWeaponSkillDecisionFor;
+using OverseerDecisions::StripWeaponSkillFacts;
+using OverseerDecisions::ExperienceBetween;
+using OverseerDecisions::LoweredSkillValue;
+using OverseerDecisions::LowerSpellDecisionFor;
+using OverseerDecisions::LowerSpellFacts;
+using OverseerDecisions::NATURALIZE_PART_LOWER;
+using OverseerDecisions::NATURALIZE_PART_GOLD;
+using OverseerDecisions::DuesAmountFromSource;
+using OverseerDecisions::DuesDiscard;
+using OverseerDecisions::DuesDiscardFor;
+using OverseerDecisions::DuesLetter;
+}  // namespace NaturalizeNames
+
 class OverseerWorldScript : public WorldScript
 {
 public:
@@ -6650,6 +6706,11 @@ private:
 
         for (std::string const& name : names)
         {
+            // A naturalize row logged this character in with no client and is
+            // about to act on it; evicting it now would lose the row.
+            if (NaturalizeHolds(name))
+                continue;
+
             Player* player = ObjectAccessor::FindPlayerByName(name);
             if (!player)
             {
@@ -41922,6 +41983,10 @@ private:
         // reason the casts come after the conjures.
         ResolveLearnChecks(sincePollMs);
 
+        // ...and the naturalize rows, which wait for a clean logout and a
+        // fresh login before they act, and for a reset's walk home after.
+        ResolveNaturalizeChecks(sincePollMs);
+
         // ...and the mailbox walks, which are driven as well as judged: each
         // poll reads where the walker is and hands it its next leg (#569).
         ResolveMailWalks(sincePollMs);
@@ -42025,6 +42090,7 @@ private:
                 && kind != "hearth" && kind != "conjure" && kind != "cast"
                 && kind != "summon"
                 && kind != "guild"
+                && kind != "naturalize"
                 && kind != "mail")
             {
                 // The verb is the first word - `nc`, `co`, `d`. What the rest
@@ -42117,7 +42183,12 @@ private:
             ++executed;
 
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
-            if (!player)
+            if (kind == "naturalize")
+                // BEFORE the online test, and the only kind that is: its
+                // target may be offline, and when it is online it is logged
+                // out before anything is done to it (see DoNaturalize).
+                detail = DoNaturalize(targetName, command, id, status, rowResult);
+            else if (!player)
                 detail = "target not online";
             else if (kind == "chat")
                 detail = DoChat(player, channel, command, targetArg, status);
@@ -46916,6 +46987,1546 @@ private:
             case 5: return sWorld->getIntConfig(CONFIG_GUILD_BANK_TAB_COST_5);
             default: return 0;
         }
+    }
+
+    // ---------------------------------------------------------- naturalize --
+    //
+    // kind='naturalize': give back what a character was handed rather than
+    // earned. The four modes, the grammar and every keep-or-remove rule are in
+    // OverseerDecisions (the naturalize block, pinned by
+    // tests/test_naturalize.cpp); this section reads the facts, acts through the
+    // core's own calls, and writes down what it did.
+    //
+    // WHY THE CHARACTER IS LOGGED OUT AND BACK IN FIRST. The operator's rule for
+    // an irreversible verb: act on a character that is offline or has just
+    // been logged out cleanly, never on one in the middle of a trade, a loot
+    // roll, a cast, an errand or a group. A headless bot is logged out through
+    // the holder that owns it (EvictHeadlessBot, which saves it), then logged
+    // back in with no client, and the verb runs on the Player the login loaded
+    // from the database. A character with a real client attached is refused:
+    // there is no clean way to log a client out from here, and the family's
+    // clients are its cameras.
+    //
+    // WHY IT IS LOGGED OUT AGAIN AFTERWARDS. What a bot's AI has cached about
+    // its bags, spells, travel and level belongs to the character it just
+    // stopped being. The random-bot manager logs a guild bot back in (the
+    // guild is kept online), and the family's camera sessions log theirs in,
+    // and either way the next login starts from what was saved.
+    //
+    // WHERE THE CORE HAS NO CALL. Only this module's own tables are written as
+    // SQL: the ledger (overseer_naturalized), and the roster's trained_level
+    // after a lowering. The reset's playerbots values go through
+    // RandomPlayerbotMgr::SetValue so its in-memory cache agrees with its table.
+    // Pets that are not summoned are deleted with Pet::DeleteFromDB, the core's
+    // static for exactly that.
+
+    struct NaturalizeCheck
+    {
+        uint32 id{0};
+        ObjectGuid guid;
+        std::string name;
+        std::string command;
+        OverseerDecisions::NaturalizeRequest request;
+        uint32 waitedMs{0};
+        // After a reset: the character is walking through the teleport to its
+        // race's start, and is logged out once it lands.
+        bool teleporting{false};
+    };
+
+    std::vector<NaturalizeCheck> _pendingNaturalizes;
+
+    // Two minutes to come back into the world, and two more to land a
+    // teleport. A bot login is a few seconds; a character that takes longer
+    // than this is not coming, and the row says so rather than waiting forever.
+    static constexpr uint32 NATURALIZE_LOGIN_CEILING_MS = 120000;
+    static constexpr uint32 NATURALIZE_TELEPORT_CEILING_MS = 120000;
+
+    // A level achievement stamped within this of a GM level command was the
+    // command's, not the character's.
+    static constexpr unsigned NATURALIZE_BOOST_SLACK_SECONDS = 5;
+
+    static bool NaturalEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.Natural.Enabled", false);
+    }
+
+    static std::vector<std::string> NaturalGuilds()
+    {
+        return OverseerDecisions::ParseNameList(
+            sConfigMgr->GetOption<std::string>("Overseer.Natural.Guilds", ""));
+    }
+
+    // The playerbots key that makes the factory skip a guild's members, added
+    // by a deployment's mod-playerbots patch. Read here, not called, because
+    // the call exists only in a patched mod-playerbots and this module also
+    // builds against an unpatched one. Quiet when the key is absent: most
+    // worlds do not have it.
+    static std::vector<std::string> PlayerbotsNaturalGuilds()
+    {
+        return OverseerDecisions::ParseNameList(
+            sConfigMgr->GetOption<std::string>("AiPlayerbot.NaturalGuild", "", false));
+    }
+
+    bool NaturalizeHolds(std::string const& name) const
+    {
+        for (NaturalizeCheck const& check : _pendingNaturalizes)
+            if (check.name == name)
+                return true;
+        return false;
+    }
+
+    template <typename... Args>
+    static uint32 CountQuery(std::string_view sql, Args&&... args)
+    {
+        if (QueryResult r = CharacterDatabase.Query(sql, std::forward<Args>(args)...))
+            return static_cast<uint32>(r->Fetch()[0].Get<uint64>());
+        return 0;
+    }
+
+    static std::string GuildNameOf(ObjectGuid guid, Player* live)
+    {
+        uint32 guildId = 0;
+        if (live)
+            guildId = live->GetGuildId();
+        else if (CharacterCacheEntry const* cache = sCharacterCache->GetCharacterCacheByGuid(guid))
+            guildId = cache->GuildId;
+        if (Guild* guild = guildId ? sGuildMgr->GetGuildById(guildId) : nullptr)
+            return guild->GetName();
+        return "";
+    }
+
+    static OverseerDecisions::NaturalizeFacts ReadNaturalizeFacts(ObjectGuid guid, std::string const& name,
+                                                                  Player* live)
+    {
+        using namespace NaturalizeNames;
+        NaturalizeFacts facts;
+        facts.enabled = NaturalEnabled();
+        CharacterCacheEntry const* cache = guid ? sCharacterCache->GetCharacterCacheByGuid(guid) : nullptr;
+        facts.exists = cache != nullptr;
+        if (!cache)
+            return facts;
+
+        std::string const guild = GuildNameOf(guid, live);
+        facts.guildListed = NameListHas(NaturalGuilds(), guild);
+        facts.playerbotsGateCovers = NameListHas(PlayerbotsNaturalGuilds(), guild);
+        // TrainRoster's factory grants (Overseer.Train.Factory): a strip refuses
+        // while they are on, because the next level would teach it all back.
+        facts.trainFactoryOn = RosterFactoryGrants();
+        facts.deathKnight = cache->Class == CLASS_DEATH_KNIGHT;
+        facts.level = live ? live->GetLevel() : cache->Level;
+        facts.clientAttached = live && ClientAttached(live);
+
+        // Either family: any overseer_roster row, enabled or not.
+        facts.inFamily = CountQuery("SELECT COUNT(*) FROM overseer_roster WHERE name = '{}'", Esc(name)) > 0;
+
+        uint32 const low = guid.GetCounter();
+        facts.openAuctions = CountQuery("SELECT COUNT(*) FROM auctionhouse WHERE itemowner = {}", low);
+        facts.openBids = CountQuery("SELECT COUNT(*) FROM auctionhouse WHERE buyguid = {}", low);
+        facts.codMail = CountQuery("SELECT COUNT(*) FROM mail WHERE receiver = {} AND cod > 0", low);
+
+        if (QueryResult r = CharacterDatabase.Query(
+                "SELECT part FROM overseer_naturalized WHERE guid = {}", low))
+        {
+            do
+            {
+                std::string const part = r->Fetch()[0].Get<std::string>();
+                for (unsigned bit : {NATURALIZE_PART_RESET, NATURALIZE_PART_ITEMS, NATURALIZE_PART_RIDING,
+                                     NATURALIZE_PART_WEAPONS, NATURALIZE_PART_SPELLS, NATURALIZE_PART_LOWER,
+                                     NATURALIZE_PART_GOLD})
+                    if (part == NaturalizePartWord(bit))
+                        facts.partsAlreadyDone |= bit;
+            } while (r->NextRow());
+        }
+        return facts;
+    }
+
+    // THE ROW. Refused, answered at once from a live character for a dry run,
+    // or put in flight: logged out if it is a headless bot, logged back in,
+    // and finished by ResolveNaturalizeChecks.
+    char const* DoNaturalize(std::string const& targetName, std::string const& command, uint32 id,
+                             char const*& status, std::string& out)
+    {
+        using namespace NaturalizeNames;
+        NaturalizeRequest const request = ParseNaturalizeRequest(command);
+
+        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(targetName);
+        Player* live = guid ? ObjectAccessor::FindConnectedPlayer(guid) : nullptr;
+        NaturalizeFacts const facts = ReadNaturalizeFacts(guid, targetName, live);
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(reason) << ",\"character\":" << J(targetName)
+              << ",\"request\":" << J(command) << '}';
+            out = o.str();
+            return reason;
+        };
+
+        NaturalizeRefusal const refusal = NaturalizeVerdictFor(request, facts, request.dryRun);
+        if (refusal == NaturalizeRefusal::BadRequest)
+            return refuse(request.error);
+        if (refusal != NaturalizeRefusal::None)
+            return refuse(NaturalizeRefusalSaid(refusal));
+
+        for (NaturalizeCheck const& pending : _pendingNaturalizes)
+            if (pending.guid == guid)
+                return refuse("another naturalize row for this character is still in flight");
+
+        if (live && live->IsInWorld() && request.dryRun)
+        {
+            (void)NaturalizeRun(live, request, facts, false, out);
+            status = "delivered";
+            return "";
+        }
+
+        if (live && !live->IsInWorld())
+            return refuse("logging in or out right now; retry in a minute");
+
+        if (live)
+        {
+            WorldSession* session = live->GetSession();
+            if (!session || !session->IsBot())
+                return refuse("in the world with a session this module cannot log out cleanly; retry in a minute");
+            LOG_INFO("module.overseer",
+                     "overseer: naturalize {} for '{}' ({}{}) - logging the headless bot out cleanly first",
+                     id, targetName, NaturalizeModeWord(request.mode), request.dryRun ? ", dry run" : "");
+            EvictHeadlessBot(live);   // frees the Player
+            live = nullptr;
+        }
+
+        NaturalizeCheck check;
+        check.id = id;
+        check.guid = guid;
+        check.name = targetName;
+        check.command = command;
+        check.request = request;
+        _pendingNaturalizes.push_back(check);
+
+        if (!sRandomPlayerbotMgr.GetPlayerBot(guid))
+            sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+
+        std::ostringstream o;
+        o << "{\"outcome\":\"logging_in\",\"character\":" << J(targetName) << ",\"request\":" << J(command)
+          << ",\"note\":\"acts on the character as the database loads it, then logs it out again\"}";
+        out = o.str();
+        status = "verifying";
+        return "";
+    }
+
+    void FinishNaturalize(NaturalizeCheck const& check, char const* status, std::string const& detail,
+                          std::string const& result)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            status, Esc(detail), EscLong(result), check.id, g_runToken);
+    }
+
+    void ResolveNaturalizeChecks(uint32 elapsedMs)
+    {
+        using namespace NaturalizeNames;
+        std::vector<NaturalizeCheck> still;
+        still.reserve(_pendingNaturalizes.size());
+
+        for (NaturalizeCheck& check : _pendingNaturalizes)
+        {
+            check.waitedMs += elapsedMs;
+            Player* player = ObjectAccessor::FindPlayer(check.guid);
+
+            if (check.teleporting)
+            {
+                bool const landed = player && player->IsInWorld() && !player->IsBeingTeleported();
+                if (!landed && check.waitedMs < NATURALIZE_TELEPORT_CEILING_MS)
+                {
+                    still.push_back(check);
+                    continue;
+                }
+                if (player && player->IsInWorld())
+                    EvictHeadlessBot(player);   // saves it where it stands
+                LOG_INFO("module.overseer",
+                         "overseer: naturalize {} for '{}' - {} its start and logged out; it comes back "
+                         "on its next login",
+                         check.id, check.name, landed ? "landed at" : "did not land at");
+                continue;
+            }
+
+            bool const ready = player && player->IsInWorld() && !player->IsBeingTeleported() &&
+                               GET_PLAYERBOT_AI(player);
+            if (!ready)
+            {
+                if (check.waitedMs < NATURALIZE_LOGIN_CEILING_MS)
+                {
+                    still.push_back(check);
+                    continue;
+                }
+                FinishNaturalize(check, "error", "did not come back into the world within two minutes",
+                                 "{\"outcome\":\"not_logged_in\",\"character\":" + J(check.name) + "}");
+                continue;
+            }
+
+            // Asked again of the character the login loaded: its guild, its
+            // family and its client may have changed while it logged in.
+            NaturalizeFacts const facts = ReadNaturalizeFacts(check.guid, check.name, player);
+            NaturalizeRefusal const refusal = NaturalizeVerdictFor(check.request, facts, check.request.dryRun);
+            if (refusal != NaturalizeRefusal::None)
+            {
+                char const* said = NaturalizeRefusalSaid(refusal);
+                FinishNaturalize(check, "error", said,
+                                 "{\"outcome\":\"refused\",\"reason\":" + J(said) + ",\"character\":" +
+                                     J(check.name) + "}");
+                continue;
+            }
+
+            std::string result;
+            NaturalizeOutcome const outcome = NaturalizeRun(player, check.request, facts, !check.request.dryRun, result);
+            char const* rowStatus = outcome == NaturalizeOutcome::Planned   ? "delivered"
+                                    : outcome == NaturalizeOutcome::Changed ? "applied"
+                                    : outcome == NaturalizeOutcome::Blocked ? "error"
+                                                                            : "unchanged";
+            FinishNaturalize(check, rowStatus,
+                             outcome == NaturalizeOutcome::Blocked ? "the world refused the change; see result" : "",
+                             result);
+            if (outcome == NaturalizeOutcome::Blocked)
+            {
+                EvictHeadlessBot(player);
+                continue;
+            }
+
+            if (check.request.dryRun)
+            {
+                // Logged in for the reading only; back out, as it came.
+                EvictHeadlessBot(player);
+                continue;
+            }
+
+            if (check.request.mode == NaturalizeMode::ResetLevelOne)
+            {
+                // To the race's start, and logged out once there. The bot's AI
+                // answers the teleport the way it answers any other.
+                PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(), player->getClass());
+                if (info && player->TeleportTo(info->mapId, info->positionX, info->positionY, info->positionZ,
+                                               info->orientation))
+                {
+                    check.teleporting = true;
+                    check.waitedMs = 0;
+                    still.push_back(check);
+                    continue;
+                }
+            }
+            EvictHeadlessBot(player);
+        }
+
+        _pendingNaturalizes.swap(still);
+    }
+
+    // ---- facts about spells and skills, from the core's own tables ----
+
+    static bool SkillLineIsCategory(uint32 skill, int32 category)
+    {
+        SkillLineEntry const* line = sSkillLineStore.LookupEntry(skill);
+        return line && line->categoryId == category;
+    }
+
+    // What a trainer asks for a spell.
+    struct NaturalizeOffer
+    {
+        uint32 cost{0};
+        uint32 level{0};
+        uint32 skill{0};   // a trade recipe's required skill line, else 0
+        uint32 rank{0};    // and the rank it needs
+    };
+
+    // (price, level) for each spell the class trainers valid for this
+    // character sell, and optionally the riding trainers.
+    static std::map<uint32, std::pair<uint32, uint32>> ClassTrainerSpells(Player* player, bool mountTrainers)
+    {
+        std::map<uint32, std::pair<uint32, uint32>> out;
+        for (auto const& [spellId, offer] : NaturalizeTrainerOffers(player, mountTrainers, false))
+            out[spellId] = {offer.cost, offer.level};
+        return out;
+    }
+
+    // Every spell a trainer would teach this character, with the LOWEST level
+    // any of them asks (and that offer's price and required trade rank). Class
+    // trainers only when valid for the character; riding and trade trainers
+    // when asked for. A castable trainer spell teaches through its learn
+    // effects, so those are what the character holds.
+    static std::map<uint32, NaturalizeOffer> NaturalizeTrainerOffers(Player* player, bool mountTrainers,
+                                                                    bool tradeTrainers)
+    {
+        std::map<uint32, NaturalizeOffer> out;
+        for (auto const& [entry, tmpl] : *sObjectMgr->GetCreatureTemplates())
+        {
+            (void)tmpl;
+            Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
+            if (!trainer)
+                continue;
+            Trainer::Type const type = trainer->GetTrainerType();
+            if (!(type == Trainer::Type::Class || (mountTrainers && type == Trainer::Type::Mount) ||
+                  (tradeTrainers && type == Trainer::Type::Tradeskill)))
+                continue;
+            if (type == Trainer::Type::Class && !trainer->IsTrainerValidForPlayer(player))
+                continue;
+            for (Trainer::Spell const& spell : trainer->GetSpells())
+            {
+                std::vector<uint32> taught;
+                if (spell.IsCastable())
+                {
+                    if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.SpellId))
+                        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                            if (info->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL && info->Effects[i].TriggerSpell)
+                                taught.push_back(info->Effects[i].TriggerSpell);
+                }
+                else
+                    taught.push_back(spell.SpellId);
+                for (uint32 learned : taught)
+                {
+                    auto it = out.find(learned);
+                    if (it == out.end() || spell.ReqLevel < it->second.level)
+                        out[learned] = {spell.MoneyCost, spell.ReqLevel, spell.ReqSkillLine, spell.ReqSkillRank};
+                }
+            }
+        }
+        return out;
+    }
+
+    // spell -> the quests that teach it (their reward spell, what that spell
+    // teaches, and the displayed reward spell).
+    static std::map<uint32, std::vector<uint32>> QuestTaughtSpells()
+    {
+        std::map<uint32, std::vector<uint32>> out;
+        for (auto const& [questId, quest] : sObjectMgr->GetQuestTemplates())
+        {
+            std::vector<uint32> spells;
+            if (quest->GetRewSpell())
+                spells.push_back(quest->GetRewSpell());
+            if (quest->GetRewSpellCast() > 0)
+            {
+                uint32 const cast = static_cast<uint32>(quest->GetRewSpellCast());
+                spells.push_back(cast);
+                if (SpellInfo const* info = sSpellMgr->GetSpellInfo(cast))
+                    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                        if (info->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL && info->Effects[i].TriggerSpell)
+                            spells.push_back(info->Effects[i].TriggerSpell);
+            }
+            for (uint32 s : spells)
+                out[s].push_back(questId);
+        }
+        return out;
+    }
+
+    static bool SpellAutoLearned(Player* player, uint32 spellId, PlayerInfo const* info)
+    {
+        if (info)
+            for (uint32 custom : info->customSpells)
+                if (custom == spellId)
+                    return true;
+        uint32 const raceMask = player->getRaceMask();
+        uint32 const classMask = player->getClassMask();
+        SkillLineAbilityMapBounds const bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+        for (auto it = bounds.first; it != bounds.second; ++it)
+        {
+            SkillLineAbilityEntry const* ability = it->second;
+            if (ability->AcquireMethod != SKILL_LINE_ABILITY_LEARNED_ON_SKILL_VALUE &&
+                ability->AcquireMethod != SKILL_LINE_ABILITY_LEARNED_ON_SKILL_LEARN)
+                continue;
+            if (ability->RaceMask && !(ability->RaceMask & raceMask))
+                continue;
+            if (ability->ClassMask && !(ability->ClassMask & classMask))
+                continue;
+            if (!player->HasSkill(ability->SkillLine))
+                continue;
+            if (player->GetPureSkillValue(ability->SkillLine) < ability->MinSkillLineRank)
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    static uint32 SpellSkillLine(uint32 spellId, bool& profession, bool& riding)
+    {
+        profession = false;
+        riding = false;
+        uint32 line = 0;
+        SkillLineAbilityMapBounds const bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+        for (auto it = bounds.first; it != bounds.second; ++it)
+        {
+            uint32 const skill = it->second->SkillLine;
+            line = skill;
+            if (skill == SKILL_RIDING)
+                riding = true;
+            else if (SkillLineIsCategory(skill, SKILL_CATEGORY_PROFESSION) ||
+                     SkillLineIsCategory(skill, SKILL_CATEGORY_SECONDARY))
+                profession = true;
+        }
+        return line;
+    }
+
+    static std::string SpellNameOf(uint32 spellId)
+    {
+        if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId))
+            return info->SpellName[0] ? info->SpellName[0] : "";
+        return "";
+    }
+
+    // ---- the run itself ----
+
+    // Plans (apply false) or does (apply true) one request on a live
+    // character, and writes what it found or did into `out`. Returns whether
+    // anything changed.
+    // What a run came to: a plan (dry run), nothing to change, a change, or a
+    // real run the world would not let happen (nothing recorded in the ledger).
+    enum class NaturalizeOutcome : uint8
+    {
+        Planned,
+        Unchanged,
+        Changed,
+        Blocked,
+    };
+
+    NaturalizeOutcome NaturalizeRun(Player* player, OverseerDecisions::NaturalizeRequest const& request,
+                                    OverseerDecisions::NaturalizeFacts const& facts, bool apply, std::string& out)
+    {
+        using namespace NaturalizeNames;
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(apply ? "applied" : "planned")
+          << ",\"mode\":" << J(NaturalizeModeWord(request.mode)) << ",\"dry_run\":" << (apply ? "false" : "true")
+          << ",\"character\":" << J(player->GetName()) << ",\"level\":" << uint32(player->GetLevel())
+          << ",\"guild\":" << J(GuildNameOf(player->GetGUID(), player));
+
+        if (!apply)
+        {
+            NaturalizeRefusal const would = NaturalizeVerdictFor(request, facts, false);
+            o << ",\"a_real_run_would\":"
+              << J(would == NaturalizeRefusal::None ? "proceed" : NaturalizeRefusalSaid(would));
+        }
+
+        bool changed = false;
+        bool blocked = false;
+        if (request.mode == NaturalizeMode::ResetLevelOne)
+            changed = NaturalizeReset(player, apply, o);
+        else if (request.mode == NaturalizeMode::LowerToNaturalLevel)
+            changed = NaturalizeLower(player, request.targetLevel, apply, o, blocked);
+        else if (request.mode == NaturalizeMode::DiscardUnearnedGold)
+            changed = NaturalizeDiscardGold(player, apply, o);
+        else
+            changed = NaturalizeStrip(player, request.parts, apply, o);
+        o << '}';
+        out = o.str();
+
+        if (!apply)
+            return NaturalizeOutcome::Planned;
+        if (blocked)
+        {
+            if (changed)
+                player->SaveToDB(false, false);
+            LOG_WARN("module.overseer", "overseer: naturalize {} on '{}' was blocked: {}",
+                     NaturalizeModeWord(request.mode), player->GetName(), out.substr(0, 400));
+            return NaturalizeOutcome::Blocked;
+        }
+
+        {
+            // THE LEDGER, this module's own table, one row per part: what makes
+            // a second real run refuse. INSERT IGNORE so a part recorded by an
+            // earlier run keeps its first date.
+            for (unsigned bit : {NATURALIZE_PART_RESET, NATURALIZE_PART_ITEMS, NATURALIZE_PART_RIDING,
+                                 NATURALIZE_PART_WEAPONS, NATURALIZE_PART_SPELLS, NATURALIZE_PART_LOWER,
+                                 NATURALIZE_PART_GOLD})
+                if (request.parts & bit)
+                    CharacterDatabase.Execute(
+                        "INSERT IGNORE INTO overseer_naturalized (guid, part, name) VALUES ({}, '{}', '{}')",
+                        player->GetGUID().GetCounter(), NaturalizePartWord(bit), Esc(player->GetName()));
+
+            // In the character's own event record, whoever it is.
+            QueueEvent(player, "naturalized", request.parts, NaturalizeModeWord(request.mode),
+                       "the operator's naturalize verb ran", EventExtra());
+
+            player->SaveToDB(false, false);
+            LOG_INFO("module.overseer", "overseer: naturalize {} ran on '{}': {}",
+                     NaturalizeModeWord(request.mode), player->GetName(), out.substr(0, 400));
+        }
+        return changed ? NaturalizeOutcome::Changed : NaturalizeOutcome::Unchanged;
+    }
+
+    // RESET TO LEVEL 1. Each step is the call the core itself makes for it:
+    // `.reset level` for the level, Player::Create for the starting outfit,
+    // Player::resetSpells for the spells, the mail-delete handler's state for
+    // the mail. Order matters in three places, each marked.
+    bool NaturalizeReset(Player* player, bool apply, std::ostringstream& o)
+    {
+        using namespace NaturalizeNames;
+
+        o << ",\"parts\":{";
+        bool first = true;
+        for (ResetPart part : RESET_PARTS)
+        {
+            o << (first ? "" : ",") << J(ResetPartWord(part)) << ':' << J(ResetTreatmentWord(ResetTreatmentFor(part)));
+            first = false;
+        }
+        o << '}';
+
+        // ---- what there is, counted before anything moves ----
+        uint32 items = 0;
+        auto countAt = [&](uint8 slot)
+        {
+            if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            {
+                ++items;
+                if (Bag* bag = item->ToBag())
+                    for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                        if (bag->GetItemByPos(j))
+                            ++items;
+            }
+        };
+        for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            countAt(i);
+        for (uint8 i = BANK_SLOT_ITEM_START; i < BANK_SLOT_BAG_END; ++i)
+            countAt(i);
+        for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
+            countAt(i);
+        uint32 buyback = 0;
+        for (uint8 i = BUYBACK_SLOT_START; i < BUYBACK_SLOT_END; ++i)
+            if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                ++buyback;
+
+        uint32 mails = 0;
+        uint32 mailItems = 0;
+        uint32 mailMoney = 0;
+        for (Mail const* mail : player->GetMails())
+        {
+            if (mail->state == MAIL_STATE_DELETED)
+                continue;
+            ++mails;
+            mailItems += static_cast<uint32>(mail->items.size());
+            mailMoney += mail->money;
+        }
+
+        uint32 reputations = 0;
+        for (auto const& [listId, state] : player->GetReputationMgr().GetStateList())
+        {
+            (void)listId;
+            if (state.Standing != 0)
+                ++reputations;
+        }
+
+        uint32 pets = player->GetPet() ? 1 : 0;
+        if (PetStable const* stable = player->GetPetStable())
+        {
+            pets = (stable->CurrentPet ? 1 : 0) + static_cast<uint32>(stable->UnslottedPets.size());
+            for (auto const& slot : stable->StabledPets)
+                if (slot)
+                    ++pets;
+        }
+
+        uint32 activeQuests = 0;
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            if (player->GetQuestSlotQuestId(slot))
+                ++activeQuests;
+
+        PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(), player->getClass());
+        // Level 1, whatever the realm's configured start level: the mode's name
+        // and the operator's decision are both level 1.
+        uint32 const startLevel = OverseerDecisions::NATURALIZE_RESET_LEVEL;
+        uint32 const startMoney = sWorld->getIntConfig(CONFIG_START_PLAYER_MONEY);
+
+        o << ",\"removes\":{\"level\":" << uint32(player->GetLevel()) << ",\"items\":" << items
+          << ",\"buyback\":" << buyback << ",\"inbox_mail\":" << mails << ",\"inbox_mail_items\":" << mailItems
+          << ",\"inbox_mail_money\":" << mailMoney << ",\"money\":" << player->GetMoney()
+          << ",\"skills\":" << player->GetSkillStatusMap().size() << ",\"spells\":" << player->GetSpellMap().size()
+          << ",\"quests_rewarded\":" << player->GetRewardedQuestCount() << ",\"quests_in_log\":" << activeQuests
+          << ",\"reputations\":" << reputations << ",\"pets\":" << pets
+          << ",\"achievements\":" << player->GetAchievementMgr()->GetCompletedAchievements().size() << '}';
+        o << ",\"start\":{\"level\":" << startLevel << ",\"money\":" << startMoney;
+        if (info)
+            o << ",\"map\":" << info->mapId << ",\"area\":" << info->areaId << ",\"x\":" << info->positionX
+              << ",\"y\":" << info->positionY << ",\"z\":" << info->positionZ;
+        o << '}';
+
+        o << ",\"playerbots_values\":[";
+        first = true;
+        for (BotValueAction const& a : ResetRandomBotValues())
+        {
+            o << (first ? "" : ",") << "{\"event\":" << J(a.event) << ",\"step\":"
+              << J(a.step == BotValueStep::Set ? "set" : a.step == BotValueStep::Clear ? "clear" : "leave")
+              << ",\"why\":" << J(a.why) << '}';
+            first = false;
+        }
+        o << ']';
+
+        if (!apply)
+            return false;
+
+        // ---- the reset ----
+        if (player->isDead())
+        {
+            player->ResurrectPlayer(1.0f);
+            player->SpawnCorpseBones();
+        }
+        if (player->GetGroup())
+            player->RemoveFromGroup();
+
+        // Pets: the summoned one through RemovePet, the rest with the core's
+        // static delete, and the stable slots bought with the old gold.
+        if (Pet* pet = player->GetPet())
+            player->RemovePet(pet, PET_SAVE_AS_DELETED);
+        if (PetStable* stable = player->GetPetStable())
+        {
+            if (stable->CurrentPet)
+                Pet::DeleteFromDB(stable->CurrentPet->PetNumber);
+            stable->CurrentPet.reset();
+            for (auto& slot : stable->StabledPets)
+            {
+                if (slot)
+                    Pet::DeleteFromDB(slot->PetNumber);
+                slot.reset();
+            }
+            for (PetStable::PetInfo const& unslotted : stable->UnslottedPets)
+                Pet::DeleteFromDB(unslotted.PetNumber);
+            stable->UnslottedPets.clear();
+            stable->MaxStabledPets = 0;
+        }
+
+        // ORDER 1: quests before spells, so resetSpells relearns no quest
+        // reward spell. The log the way an abandon clears it, then the rest.
+        for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            if (uint32 const questId = player->GetQuestSlotQuestId(slot))
+            {
+                player->SetQuestSlot(slot, 0);
+                player->RemoveActiveQuest(questId, false);
+            }
+        }
+        std::vector<uint32> statusQuests;
+        for (auto const& [questId, status] : player->getQuestStatusMap())
+        {
+            (void)status;
+            statusQuests.push_back(questId);
+        }
+        for (uint32 questId : statusQuests)
+            player->RemoveActiveQuest(questId, false);
+        std::vector<uint32> const rewarded(player->getRewardedQuests().begin(), player->getRewardedQuests().end());
+        for (uint32 questId : rewarded)
+            player->RemoveRewardedQuest(questId, false);
+        player->ResetDailyQuestStatus();
+        player->ResetWeeklyQuestStatus();
+        player->ResetMonthlyQuestStatus();
+
+        // Every item, everywhere. DestroyItem on a bag takes its contents too.
+        for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+            if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                player->DestroyItem(INVENTORY_SLOT_BAG_0, i, true);
+        for (uint8 i = BANK_SLOT_ITEM_START; i < BANK_SLOT_BAG_END; ++i)
+            if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                player->DestroyItem(INVENTORY_SLOT_BAG_0, i, true);
+        for (uint8 i = KEYRING_SLOT_START; i < CURRENCYTOKEN_SLOT_END; ++i)
+            if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                player->DestroyItem(INVENTORY_SLOT_BAG_0, i, true);
+        for (uint8 i = BUYBACK_SLOT_START; i < BUYBACK_SLOT_END; ++i)
+            if (player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                player->RemoveItemFromBuyBackSlot(i, true);
+
+        // The inbox, as WorldSession::HandleMailDelete leaves it: marked
+        // deleted, and _SaveMail deletes the rows and their items on the save
+        // below. COD mail was refused before this ran.
+        for (Mail* mail : player->GetMails())
+            mail->state = MAIL_STATE_DELETED;
+        player->m_mailsUpdated = true;
+
+        // Talents and glyphs, one spec. Dual spec was bought with the old gold.
+        if (player->GetSpecsCount() > 1)
+        {
+            if (player->GetActiveSpec() != 0)
+                player->ActivateSpec(0);
+            player->UpdateSpecCount(1);
+        }
+        player->resetTalents(true);
+        for (uint8 slot = 0; slot < MAX_GLYPH_SLOT_INDEX; ++slot)
+        {
+            if (uint32 const glyph = player->GetGlyph(slot))
+            {
+                if (GlyphPropertiesEntry const* props = sGlyphPropertiesStore.LookupEntry(glyph))
+                    player->RemoveAurasDueToSpell(props->SpellId);
+                player->SetGlyph(slot, 0, true);
+            }
+        }
+
+        // ORDER 2: the level before the skills, so the defaults come back at
+        // level 1 values. This is cs_reset.cpp's HandleResetLevelCommand and
+        // its helper, line for line, except that it does not fire
+        // OnPlayerLevelChanged: the only listeners here would record a level
+        // 60 to 1 as a level_up, and the `naturalized` event below says what
+        // happened instead.
+        if (ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(player->getClass()))
+        {
+            if (!player->HasShapeshiftAura())
+                player->SetShapeshiftForm(FORM_NONE);
+            player->SetFactionForRace(player->getRace());
+            player->SetUInt32Value(UNIT_FIELD_BYTES_0, (player->getRace()) | (player->getClass() << 8) |
+                                                           (player->getGender() << 16) |
+                                                           (classEntry->powerType << 24));
+            if (player->GetShapeshiftForm() == FORM_NONE)
+                player->InitDisplayIds();
+            player->SetByteValue(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_PVP);
+            player->ReplaceAllUnitFlags(UNIT_FLAG_PLAYER_CONTROLLED);
+            player->SetUInt32Value(PLAYER_FIELD_WATCHED_FACTION_INDEX, uint32(-1));
+        }
+        player->_ApplyAllLevelScaleItemMods(false);
+        player->SetLevel(static_cast<uint8>(startLevel));
+        player->InitRunes();
+        player->InitStatsForLevel(true);
+        player->InitGlyphsForLevel();
+        player->InitTalentForLevel();
+        player->SetUInt32Value(PLAYER_XP, 0);
+        player->_ApplyAllLevelScaleItemMods(true);
+
+        // ORDER 3: skills off, then Player::resetSpells, which removes every
+        // spell left and relearns the race and class defaults and skills.
+        std::vector<uint16> skills;
+        for (auto const& [skill, status] : player->GetSkillStatusMap())
+            if (status.uState != SKILL_DELETED)
+                skills.push_back(skill);
+        for (uint16 skill : skills)
+            player->SetSkill(skill, 0, 0, 0);
+        player->resetSpells();
+        player->InitPrimaryProfessions();
+
+        // Reputation to base, one faction at a time and without spillover
+        // (the two-argument SetReputation would spill into the others).
+        std::vector<uint32> factions;
+        for (auto const& [listId, state] : player->GetReputationMgr().GetStateList())
+        {
+            (void)listId;
+            if (state.Standing != 0)
+                factions.push_back(state.ID);
+        }
+        for (uint32 factionId : factions)
+            if (FactionEntry const* faction = sFactionStore.LookupEntry(factionId))
+                player->GetReputationMgr().SetOneFactionReputation(
+                    faction, float(player->GetReputationMgr().GetBaseReputation(faction)), false);
+
+        // Known flight paths: cleared, then the race's starting nodes.
+        {
+            std::string zeros;
+            for (std::size_t i = 0; i < TaxiMaskSize; ++i)
+                zeros += i ? " 0" : "0";
+            player->m_taxi.LoadTaxiMask(zeros);
+            player->m_taxi.ClearTaxiDestinations();
+            player->InitTaxiNodesForLevel();
+        }
+
+        player->SetMoney(startMoney);
+        player->ResetAchievements();
+
+        // The starting outfit, as Player::Create hands it out.
+        if (CharStartOutfitEntry const* outfit =
+                GetCharStartOutfitEntry(player->getRace(), player->getClass(), player->getGender()))
+        {
+            for (int j = 0; j < MAX_OUTFIT_ITEMS; ++j)
+            {
+                if (outfit->ItemId[j] <= 0)
+                    continue;
+                uint32 const itemId = static_cast<uint32>(outfit->ItemId[j]);
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+                if (!proto)
+                    continue;
+                uint32 count = proto->BuyCount;
+                if (proto->Class == ITEM_CLASS_CONSUMABLE && proto->SubClass == ITEM_SUBCLASS_FOOD)
+                {
+                    switch (proto->Spells[0].SpellCategory)
+                    {
+                        case SPELL_CATEGORY_FOOD:
+                            count = 4;
+                            break;
+                        case SPELL_CATEGORY_DRINK:
+                            count = 2;
+                            break;
+                    }
+                    if (proto->GetMaxStackSize() < count)
+                        count = proto->GetMaxStackSize();
+                }
+                player->StoreNewItemInBestSlots(itemId, count);
+            }
+        }
+        if (info)
+            for (PlayerCreateInfoItem const& item : info->item)
+                player->StoreNewItemInBestSlots(item.item_id, item.item_amount);
+        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+        {
+            Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i);
+            if (!item)
+                continue;
+            uint16 dest;
+            if (player->CanEquipItem(NULL_SLOT, dest, item, false) == EQUIP_ERR_OK)
+            {
+                player->RemoveItem(INVENTORY_SLOT_BAG_0, i, true);
+                player->EquipItem(dest, item, true);
+            }
+        }
+
+        if (info)
+            player->SetHomebind(WorldLocation(info->mapId, info->positionX, info->positionY, info->positionZ,
+                                              info->orientation),
+                                info->areaId);
+
+        player->UpdateAllStats();
+        player->SetFullHealth();
+        if (player->getPowerType() == POWER_MANA)
+            player->SetPower(POWER_MANA, player->GetMaxPower(POWER_MANA));
+
+        // The playerbots per-bot values (ResetRandomBotValues says which and
+        // why; `randomize` is deliberately left alone).
+        uint32 const low = player->GetGUID().GetCounter();
+        for (BotValueAction const& a : ResetRandomBotValues())
+        {
+            if (a.step == BotValueStep::Set)
+                sRandomPlayerbotMgr.SetValue(low, a.event, a.value);
+            else if (a.step == BotValueStep::Clear)
+                sRandomPlayerbotMgr.SetValue(low, a.event, 0);
+        }
+        return true;
+    }
+
+    // LOWER TO THE NATURAL LEVEL. The level through the core's `.character
+    // level` path (GiveLevel, InitTalentForLevel, experience to the start of
+    // the level), then everything above it: trainer spells, riding and trade
+    // ranks no trainer sells below a higher level, recipes past a trade's new
+    // ceiling, weapon skill above 5 x level. Talents are reset and spent again
+    // in the roster's tree. Items are kept; the ones it can no longer equip
+    // are listed.
+    bool NaturalizeLower(Player* player, unsigned targetLevel, bool apply, std::ostringstream& o, bool& blocked)
+    {
+        using namespace NaturalizeNames;
+        uint32 const fromLevel = player->GetLevel();
+        std::map<uint32, NaturalizeOffer> const offers = NaturalizeTrainerOffers(player, true, true);
+        std::map<uint32, std::vector<uint32>> const questSpells = QuestTaughtSpells();
+
+        std::set<uint32> talentTaught;
+        for (auto const& [spellId, spell] : player->GetSpellMap())
+        {
+            if (spell->State == PLAYERSPELL_REMOVED || !GetTalentSpellCost(spellId))
+                continue;
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                    if (si->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL && si->Effects[i].TriggerSpell)
+                        talentTaught.insert(si->Effects[i].TriggerSpell);
+        }
+
+        auto factsFor = [&](uint32 spellId) {
+            LowerSpellFacts f;
+            f.talent = GetTalentSpellCost(spellId) > 0 || talentTaught.count(spellId) > 0;
+            auto const q = questSpells.find(spellId);
+            if (q != questSpells.end())
+                for (uint32 questId : q->second)
+                    if (player->IsQuestRewarded(questId))
+                        f.questReward = true;
+            auto const t = offers.find(spellId);
+            if (t != offers.end())
+                f.trainerLevel = t->second.level;
+            return f;
+        };
+
+        // PASS 1: the ranks (spells that set a skill's ceiling), so each
+        // trade's ceiling after the lowering is known before any recipe is
+        // judged against it.
+        std::vector<std::tuple<uint32, uint32, char const*>> remove;   // spell, trainer level, why
+        std::map<uint32, uint32> ceilingAfter;                         // trade skill -> max after
+        for (auto const& [spellId, spell] : player->GetSpellMap())
+        {
+            if (spell->State == PLAYERSPELL_REMOVED)
+                continue;
+            SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(spellId);
+            if (!node)
+                continue;
+            LowerSpellFacts const f = factsFor(spellId);
+            StripSpellDecision const d = LowerSpellDecisionFor(f, targetLevel);
+            if (d.verdict == StripVerdict::Remove)
+                remove.emplace_back(spellId, f.trainerLevel, d.why);
+            else if (SkillLineIsCategory(node->skill, SKILL_CATEGORY_PROFESSION) ||
+                     SkillLineIsCategory(node->skill, SKILL_CATEGORY_SECONDARY))
+                ceilingAfter[node->skill] = std::max<uint32>(ceilingAfter[node->skill], node->maxvalue);
+        }
+
+        // PASS 2: everything else, recipes against the ceilings above.
+        for (auto const& [spellId, spell] : player->GetSpellMap())
+        {
+            if (spell->State == PLAYERSPELL_REMOVED || sSpellMgr->GetSpellLearnSkill(spellId))
+                continue;
+            LowerSpellFacts f = factsFor(spellId);
+            auto const t = offers.find(spellId);
+            if (t != offers.end() && t->second.skill && t->second.rank &&
+                (SkillLineIsCategory(t->second.skill, SKILL_CATEGORY_PROFESSION) ||
+                 SkillLineIsCategory(t->second.skill, SKILL_CATEGORY_SECONDARY)))
+            {
+                f.recipeRank = t->second.rank;
+                auto const c = ceilingAfter.find(t->second.skill);
+                f.tradeMaxAfter = c == ceilingAfter.end() ? 0 : c->second;
+            }
+            StripSpellDecision const d = LowerSpellDecisionFor(f, targetLevel);
+            if (d.verdict == StripVerdict::Remove)
+                remove.emplace_back(spellId, f.trainerLevel, d.why);
+        }
+
+        // Highest rank first: removing a rank sets its skill to the rank
+        // below, so the ranks must come off from the top down.
+        std::sort(remove.begin(), remove.end(),
+                  [](auto const& a, auto const& b) { return std::get<1>(a) > std::get<1>(b); });
+
+        // Level-range skills (weapons, defense) above 5 x the new level.
+        std::vector<std::pair<uint16, uint32>> clamp;   // skill, new value
+        for (auto const& [skill, status] : player->GetSkillStatusMap())
+        {
+            if (status.uState == SKILL_DELETED || !SkillLineIsCategory(skill, SKILL_CATEGORY_WEAPON))
+                continue;
+            uint32 const value = player->GetPureSkillValue(skill);
+            uint32 const lowered = LoweredSkillValue(value, targetLevel);
+            if (lowered != value)
+                clamp.emplace_back(skill, lowered);
+        }
+
+        // Items it can no longer equip, wherever they are. Kept.
+        std::vector<Item*> unusable;
+        auto noteItem = [&](Item* item) {
+            if (item && item->GetTemplate()->RequiredLevel > targetLevel)
+                unusable.push_back(item);
+        };
+        auto walk = [&](uint8 from, uint8 to) {
+            for (uint8 i = from; i < to; ++i)
+                if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                {
+                    noteItem(item);
+                    if (Bag* bag = item->ToBag())
+                        for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                            noteItem(bag->GetItemByPos(j));
+                }
+        };
+        walk(EQUIPMENT_SLOT_START, INVENTORY_SLOT_ITEM_END);
+        walk(BANK_SLOT_ITEM_START, BANK_SLOT_BAG_END);
+
+        uint32 specTab = MAX_TALENT_TAB + 1;
+        if (QueryResult r = CharacterDatabase.Query(
+                "SELECT spec_tab FROM overseer_roster WHERE name = '{}'", Esc(player->GetName())))
+            specTab = r->Fetch()[0].Get<uint8>();
+
+        o << ",\"level\":{\"from\":" << fromLevel << ",\"to\":" << targetLevel << ",\"xp_from\":"
+          << player->GetUInt32Value(PLAYER_XP) << ",\"xp_to\":0}";
+        o << ",\"spells_removed\":[";
+        for (std::size_t i = 0; i < remove.size(); ++i)
+            o << (i ? "," : "") << "{\"id\":" << std::get<0>(remove[i]) << ",\"name\":"
+              << J(SpellNameOf(std::get<0>(remove[i]))) << ",\"trainer_level\":" << std::get<1>(remove[i])
+              << ",\"why\":" << J(std::get<2>(remove[i])) << '}';
+        o << "],\"skills_lowered\":[";
+        for (std::size_t i = 0; i < clamp.size(); ++i)
+            o << (i ? "," : "") << "{\"skill\":" << clamp[i].first << ",\"from\":"
+              << player->GetPureSkillValue(clamp[i].first) << ",\"to\":" << clamp[i].second << '}';
+        o << "],\"trade_ceilings_after\":{";
+        bool first = true;
+        for (auto const& [skill, ceiling] : ceilingAfter)
+        {
+            o << (first ? "" : ",") << '"' << skill << "\":" << ceiling;
+            first = false;
+        }
+        o << "},\"talents\":{\"spec_tab\":" << specTab << ",\"points_now\":" << player->CalculateTalentsPoints()
+          << ",\"reset_and_spent_again\":true},\"items_it_can_no_longer_equip\":[";
+        for (std::size_t i = 0; i < unusable.size(); ++i)
+            o << (i ? "," : "") << "{\"item_guid\":" << unusable[i]->GetGUID().GetCounter() << ",\"entry\":"
+              << unusable[i]->GetEntry() << ",\"name\":" << J(unusable[i]->GetTemplate()->Name1)
+              << ",\"required_level\":" << unusable[i]->GetTemplate()->RequiredLevel << ",\"equipped\":"
+              << (unusable[i]->IsEquipped() ? "true" : "false") << '}';
+        o << ']';
+
+        if (!apply)
+            return false;
+
+        // The trades' values before any rank comes off: removeSpell drops a
+        // trade to 1 when it steps a rank down, and the value was earned.
+        std::map<uint16, uint32> tradeValues;
+        for (auto const& [skill, status] : player->GetSkillStatusMap())
+            if (status.uState != SKILL_DELETED && (SkillLineIsCategory(skill, SKILL_CATEGORY_PROFESSION) ||
+                                                   SkillLineIsCategory(skill, SKILL_CATEGORY_SECONDARY)))
+                tradeValues[skill] = player->GetPureSkillValue(skill);
+
+        // GiveLevel asks the scripts first and does nothing, silently, if one
+        // says no. Asked here, before anything is touched, and read back after.
+        if (!sScriptMgr->OnPlayerCanGiveLevel(player, static_cast<uint8>(targetLevel)))
+        {
+            blocked = true;
+            o << ",\"blocked\":" << J("a script refused the level change; nothing was changed");
+            return false;
+        }
+
+        // THE LEVEL FIRST, AND NOTHING ELSE UNTIL IT HAS READ BACK. If the
+        // level does not move, the run stops having changed nothing, so a retry
+        // starts from the same character.
+        player->GiveLevel(static_cast<uint8>(targetLevel));
+        if (player->GetLevel() != targetLevel)
+        {
+            blocked = true;
+            o << ",\"blocked\":" << J("the level did not change; nothing was changed");
+            return false;
+        }
+        player->InitTalentForLevel();
+        player->SetUInt32Value(PLAYER_XP, 0);
+        player->resetTalents(true);
+
+        for (auto const& entry : remove)
+            player->removeSpell(std::get<0>(entry), SPEC_MASK_ALL, false);
+
+        for (auto const& [skill, before] : tradeValues)
+        {
+            if (!player->HasSkill(skill))
+                continue;
+            uint16 const max = player->GetPureMaxSkillValue(skill);
+            uint16 const value = static_cast<uint16>(std::min<uint32>(before, max));
+            if (player->GetPureSkillValue(skill) != value)
+                player->SetSkill(skill, player->GetSkillStep(skill), value, max);
+        }
+
+        for (auto const& [skill, value] : clamp)
+            if (player->HasSkill(skill))
+                player->SetSkill(skill, player->GetSkillStep(skill), static_cast<uint16>(value),
+                                 player->GetPureMaxSkillValue(skill));
+
+        if (specTab <= MAX_TALENT_TAB)
+            SpendTalents(player, specTab);
+        player->SendTalentsInfoData(false);
+        CharacterDatabase.Execute("UPDATE overseer_roster SET trained_level = {} WHERE name = '{}'", targetLevel,
+                                  Esc(player->GetName()));
+        return true;
+    }
+
+    // DISCARD THE GUILD DUES. The bridge had the factory-made guild bots mail
+    // a share of their gold to the family's head as guild dues, and that gold
+    // was never earned. A dues letter is one this character received from a
+    // member of its own guild who is not on the roster, with the subject the
+    // bridge writes, "Guild dues". A sealed one is emptied the way the core
+    // empties a letter whose gold is taken (money 0, the letter marked
+    // changed, saved with the character). One already opened is found in the
+    // bridge's own rows - the send whose result names this letter, else the
+    // send from that bot to this character within two minutes of the letter's
+    // delivery, whose source tag carries the amount - and that much comes out
+    // of the purse through ModifyMoney, never more than the purse holds.
+    bool NaturalizeDiscardGold(Player* player, bool apply, std::ostringstream& o)
+    {
+        using namespace NaturalizeNames;
+        uint32 const guildId = player->GetGuildId();
+        std::set<std::string> family;
+        if (QueryResult r = CharacterDatabase.Query("SELECT name FROM overseer_roster"))
+            do
+                family.insert(r->Fetch()[0].Get<std::string>());
+            while (r->NextRow());
+
+        std::vector<DuesLetter> letters;
+        std::vector<std::string> senders;
+        for (Mail const* mail : player->GetMails())
+        {
+            if (mail->state == MAIL_STATE_DELETED || mail->messageType != MAIL_NORMAL || mail->subject != "Guild dues")
+                continue;
+            ObjectGuid const senderGuid = ObjectGuid::Create<HighGuid::Player>(mail->sender);
+            std::string sender;
+            if (!sCharacterCache->GetCharacterNameByGuid(senderGuid, sender) || family.count(sender) ||
+                !guildId || sCharacterCache->GetCharacterGuildIdByGuid(senderGuid) != guildId)
+                continue;
+
+            DuesLetter letter;
+            letter.mailId = mail->messageID;
+            letter.money = mail->money;
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT CAST(JSON_EXTRACT(result, '$.mail.money') AS UNSIGNED) FROM overseer_command "
+                    "WHERE source LIKE 'guilddues:%' AND CASE WHEN JSON_VALID(result) "
+                    "THEN CAST(JSON_EXTRACT(result, '$.mail.id') AS UNSIGNED) = {} ELSE 0 END LIMIT 1",
+                    mail->messageID))
+                letter.sentMoney = r->Fetch()[0].Get<uint64>();
+            else if (QueryResult r2 = CharacterDatabase.Query(
+                         "SELECT source FROM overseer_command WHERE source LIKE 'guilddues:%' "
+                         "AND target_name = '{}' AND target_arg = '{}' "
+                         "AND ABS(CAST(UNIX_TIMESTAMP(created_at) AS SIGNED) - {}) <= 120 "
+                         "ORDER BY ABS(CAST(UNIX_TIMESTAMP(created_at) AS SIGNED) - {}) LIMIT 1",
+                         Esc(sender), Esc(player->GetName()), int64(mail->deliver_time), int64(mail->deliver_time)))
+                letter.sentMoney = DuesAmountFromSource(r2->Fetch()[0].Get<std::string>());
+            letters.push_back(letter);
+            senders.push_back(sender);
+        }
+
+        uint64 const purse = player->GetMoney();
+        DuesDiscard const d = DuesDiscardFor(letters, purse);
+
+        o << ",\"dues_letters\":[";
+        for (std::size_t i = 0; i < letters.size(); ++i)
+            o << (i ? "," : "") << "{\"mail_id\":" << letters[i].mailId << ",\"from\":" << J(senders[i])
+              << ",\"money_now\":" << letters[i].money << ",\"sent_with\":" << letters[i].sentMoney << ",\"state\":"
+              << J(letters[i].money ? "sealed" : "taken") << '}';
+        o << "],\"unopened_money_deleted\":" << d.unopenedMoney << ",\"taken_money\":" << d.takenMoney
+          << ",\"purse_now\":" << purse << ",\"removed_from_purse\":" << d.fromPurse
+          << ",\"purse_after\":" << (purse - d.fromPurse) << ",\"taken_letters_with_no_record\":" << d.takenWithNoRecord;
+
+        if (!apply || (d.lettersToEmpty.empty() && !d.fromPurse))
+            return false;
+
+        for (Mail* mail : player->GetMails())
+            if (std::find(d.lettersToEmpty.begin(), d.lettersToEmpty.end(), mail->messageID) != d.lettersToEmpty.end())
+            {
+                mail->money = 0;
+                mail->state = MAIL_STATE_CHANGED;
+            }
+        player->m_mailsUpdated = true;
+        if (d.fromPurse)
+            player->ModifyMoney(-static_cast<int32>(d.fromPurse));
+        return true;
+    }
+
+    // STRIP A FAMILY CHARACTER. Four parts; the request says which.
+    bool NaturalizeStrip(Player* player, unsigned parts, bool apply, std::ostringstream& o)
+    {
+        using namespace NaturalizeNames;
+        bool changed = false;
+        uint32 const low = player->GetGUID().GetCounter();
+        std::string const name = player->GetName();
+        PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(), player->getClass());
+
+        // ---- items ----
+        if (parts & NATURALIZE_PART_ITEMS)
+        {
+            std::vector<std::string> family;
+            if (QueryResult r = CharacterDatabase.Query("SELECT name FROM overseer_roster"))
+                do
+                    family.push_back(r->Fetch()[0].Get<std::string>());
+                while (r->NextRow());
+            auto inFamily = [&](std::string const& n)
+            { return std::find(family.begin(), family.end(), n) != family.end(); };
+
+            std::vector<GmIssue> issues;
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT target_name, command FROM overseer_command WHERE kind = 'gm' "
+                    "AND status = 'delivered' AND command LIKE '.additem %'"))
+                do
+                {
+                    Field* f = r->Fetch();
+                    unsigned entry = 0;
+                    unsigned count = 0;
+                    std::string const who = f[0].Get<std::string>();
+                    if (inFamily(who) && ParseGmAdditem(f[1].Get<std::string>(), entry, count))
+                        issues.push_back({who, entry, count});
+                } while (r->NextRow());
+
+            std::set<uint32> natural;
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT DISTINCT item_guid FROM overseer_event WHERE item_guid <> 0 "
+                    "AND kind IN ('item_loot', 'quest_reward', 'craft')"))
+                do
+                    natural.insert(r->Fetch()[0].Get<uint32>());
+                while (r->NextRow());
+            std::set<std::pair<std::string, uint32>> bought;
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT target_name, command FROM overseer_command WHERE kind = 'buy' "
+                    "AND status = 'delivered' AND command LIKE 'entry:%'"))
+                do
+                {
+                    Field* f = r->Fetch();
+                    std::string const cmd = f[1].Get<std::string>();
+                    std::size_t const colon = cmd.find(':');
+                    std::size_t const space = cmd.find(' ');
+                    uint32 const entry = static_cast<uint32>(
+                        std::strtoul(cmd.substr(colon + 1, space == std::string::npos ? std::string::npos
+                                                                                       : space - colon - 1)
+                                         .c_str(),
+                                     nullptr, 10));
+                    bought.insert({f[0].Get<std::string>(), entry});
+                } while (r->NextRow());
+
+            std::vector<GmHolding> holdings;
+            if (!issues.empty())
+            {
+                std::ostringstream entries;
+                for (std::size_t i = 0; i < issues.size(); ++i)
+                    entries << (i ? "," : "") << issues[i].entry;
+                if (QueryResult r = CharacterDatabase.Query(
+                        "SELECT c.name, ii.itemEntry, ii.guid FROM character_inventory ci "
+                        "JOIN item_instance ii ON ii.guid = ci.item JOIN characters c ON c.guid = ci.guid "
+                        "WHERE c.name IN (SELECT name FROM overseer_roster) AND ii.itemEntry IN ({})",
+                        entries.str()))
+                    do
+                    {
+                        Field* f = r->Fetch();
+                        std::string const holder = f[0].Get<std::string>();
+                        uint32 const entry = f[1].Get<uint32>();
+                        uint32 const itemGuid = f[2].Get<uint32>();
+                        holdings.push_back({holder, entry, itemGuid,
+                                            natural.count(itemGuid) > 0 || bought.count({holder, entry}) > 0});
+                    } while (r->NextRow());
+            }
+
+            GmAttribution const mine = GmIssuedInstancesOf(name, issues, holdings);
+            o << ",\"items\":[";
+            bool first = true;
+            for (uint32 itemGuid : mine.itemGuids)
+            {
+                Item* item = player->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuid));
+                uint32 contents = 0;
+                if (item)
+                    if (Bag* bag = item->ToBag())
+                        for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                            if (bag->GetItemByPos(j))
+                                ++contents;
+                o << (first ? "" : ",") << "{\"item_guid\":" << itemGuid << ",\"entry\":"
+                  << (item ? item->GetEntry() : 0) << ",\"name\":"
+                  << J(item ? item->GetTemplate()->Name1 : std::string("not carried now"))
+                  << ",\"contents_mailed_to_itself\":" << contents << ",\"mails\":" << MailsNeededFor(contents)
+                  << '}';
+                first = false;
+                if (!apply || !item)
+                    continue;
+
+                // A bag's contents are the character's own: mailed to it, as
+                // the core mails an item it cannot equip, never destroyed.
+                if (Bag* bag = item->ToBag())
+                {
+                    uint8 const bagSlot = item->GetSlot();
+                    std::vector<Item*> moved;
+                    for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                        if (Item* inner = bag->GetItemByPos(j))
+                        {
+                            player->MoveItemFromInventory(bagSlot, static_cast<uint8>(j), true);
+                            moved.push_back(inner);
+                        }
+                    for (std::size_t start = 0; start < moved.size(); start += NATURALIZE_MAIL_ITEMS)
+                    {
+                        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+                        MailDraft draft("Your things from a bag that was taken back",
+                                        "The bag was issued by a GM, not earned. Everything that was in it is here.");
+                        for (std::size_t k = start; k < moved.size() && k < start + NATURALIZE_MAIL_ITEMS; ++k)
+                        {
+                            moved[k]->DeleteFromInventoryDB(trans);
+                            moved[k]->SaveToDB(trans);
+                            draft.AddItem(moved[k]);
+                        }
+                        draft.SendMailTo(trans, MailReceiver(player), MailSender(player), MAIL_CHECK_MASK_COPIED);
+                        CharacterDatabase.CommitTransaction(trans);
+                    }
+                }
+                player->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+                changed = true;
+            }
+            o << "],\"item_notes\":[";
+            first = true;
+            for (std::string const& note : mine.notes)
+            {
+                o << (first ? "" : ",") << J(note);
+                first = false;
+            }
+            o << ']';
+        }
+
+        // ---- riding ----
+        if (parts & NATURALIZE_PART_RIDING)
+        {
+            std::vector<uint32> ridingSpells;
+            for (auto const& [spellId, spell] : player->GetSpellMap())
+            {
+                if (spell->State == PLAYERSPELL_REMOVED)
+                    continue;
+                bool profession = false;
+                bool riding = false;
+                SpellSkillLine(spellId, profession, riding);
+                if (riding)
+                    ridingSpells.push_back(spellId);
+            }
+            o << ",\"riding\":{\"skill\":" << (player->HasSkill(SKILL_RIDING) ? player->GetPureSkillValue(SKILL_RIDING) : 0)
+              << ",\"spells\":[";
+            for (std::size_t i = 0; i < ridingSpells.size(); ++i)
+                o << (i ? "," : "") << "{\"id\":" << ridingSpells[i] << ",\"name\":" << J(SpellNameOf(ridingSpells[i]))
+                  << '}';
+            o << "]}";
+            if (apply && (player->HasSkill(SKILL_RIDING) || !ridingSpells.empty()))
+            {
+                for (uint32 spellId : ridingSpells)
+                    player->removeSpell(spellId, SPEC_MASK_ALL, false);
+                if (player->HasSkill(SKILL_RIDING))
+                    player->SetSkill(SKILL_RIDING, 0, 0, 0);
+                changed = true;
+            }
+        }
+
+        // ---- weapon skills ----
+        if (parts & NATURALIZE_PART_WEAPONS)
+        {
+            std::set<uint32> trainerSkills;
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT DISTINCT subject_id FROM overseer_event WHERE character_guid = {} AND kind = 'learn'",
+                    low))
+                do
+                    trainerSkills.insert(r->Fetch()[0].Get<uint32>());
+                while (r->NextRow());
+
+            std::map<uint32, uint32> usedLevel;   // skill -> highest level wielded
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT subject_id, CAST(MAX(level) AS UNSIGNED) FROM overseer_event WHERE character_guid = {} "
+                    "AND kind = 'item_equip' GROUP BY subject_id",
+                    low))
+                do
+                {
+                    Field* f = r->Fetch();
+                    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(f[0].Get<uint32>()))
+                        if (proto->Class == ITEM_CLASS_WEAPON)
+                            if (uint32 const skill = proto->GetSkill())
+                                usedLevel[skill] = std::max(usedLevel[skill], static_cast<uint32>(f[1].Get<uint64>()));
+                } while (r->NextRow());
+            for (uint8 slot : {EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND, EQUIPMENT_SLOT_RANGED})
+                if (Item* weapon = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    if (weapon->GetTemplate()->Class == ITEM_CLASS_WEAPON)
+                        if (uint32 const skill = weapon->GetTemplate()->GetSkill())
+                            usedLevel[skill] = player->GetLevel();
+
+            std::vector<uint16> weaponSkills;
+            for (auto const& [skill, status] : player->GetSkillStatusMap())
+                if (status.uState != SKILL_DELETED && SkillLineIsCategory(skill, SKILL_CATEGORY_WEAPON))
+                    weaponSkills.push_back(skill);
+
+            o << ",\"weapons\":[";
+            bool first = true;
+            for (uint16 skill : weaponSkills)
+            {
+                StripWeaponSkillFacts f;
+                f.defense = skill == SKILL_DEFENSE;
+                if (info)
+                    for (PlayerCreateInfoSkill const& start : info->skills)
+                        if (start.SkillId == skill)
+                            f.startingSkill = true;
+                f.trainerRecord = trainerSkills.count(skill) > 0;
+                f.value = player->GetPureSkillValue(skill);
+                auto const used = usedLevel.find(skill);
+                f.usedLevel = used == usedLevel.end() ? 0 : used->second;
+                StripWeaponSkillDecision const d = StripWeaponSkillDecisionFor(f);
+
+                SkillLineEntry const* line = sSkillLineStore.LookupEntry(skill);
+                o << (first ? "" : ",") << "{\"skill\":" << skill << ",\"name\":"
+                  << J(line && line->name[0] ? line->name[0] : "") << ",\"value\":" << f.value
+                  << ",\"max\":" << player->GetPureMaxSkillValue(skill) << ",\"verdict\":"
+                  << J(d.verdict == StripVerdict::Remove ? "remove" : d.verdict == StripVerdict::SetValue ? "set" : "keep")
+                  << ",\"new_value\":" << d.value << ",\"why\":" << J(d.why) << '}';
+                first = false;
+
+                if (!apply)
+                    continue;
+                if (d.verdict == StripVerdict::Remove)
+                {
+                    player->SetSkill(skill, 0, 0, 0);
+                    changed = true;
+                }
+                else if (d.verdict == StripVerdict::SetValue)
+                {
+                    player->SetSkill(skill, player->GetSkillStep(skill), static_cast<uint16>(d.value),
+                                     player->GetPureMaxSkillValue(skill));
+                    changed = true;
+                }
+            }
+            o << ']';
+        }
+
+        // ---- spells ----
+        if (parts & NATURALIZE_PART_SPELLS)
+        {
+            std::map<uint32, std::pair<uint32, uint32>> const trainer = ClassTrainerSpells(player, true);
+            std::map<uint32, std::vector<uint32>> const questSpells = QuestTaughtSpells();
+
+            std::set<uint32> talentTaught;
+            for (auto const& [spellId, spell] : player->GetSpellMap())
+            {
+                if (spell->State == PLAYERSPELL_REMOVED || !GetTalentSpellCost(spellId))
+                    continue;
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId))
+                    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                        if (si->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL && si->Effects[i].TriggerSpell)
+                            talentTaught.insert(si->Effects[i].TriggerSpell);
+            }
+
+            std::vector<std::pair<uint32, char const*>> remove;
+            std::map<std::string, uint32> kept;
+            uint64 rebuy = 0;
+            for (auto const& [spellId, spell] : player->GetSpellMap())
+            {
+                if (spell->State == PLAYERSPELL_REMOVED)
+                    continue;
+                StripSpellFacts f;
+                SpellSkillLine(spellId, f.profession, f.riding);
+                if (f.riding)
+                    continue;   // the riding part's business
+                f.talent = GetTalentSpellCost(spellId) > 0 || talentTaught.count(spellId) > 0;
+                f.autoLearned = SpellAutoLearned(player, spellId, info);
+                auto const q = questSpells.find(spellId);
+                f.questTaught = q != questSpells.end();
+                if (f.questTaught)
+                    for (uint32 questId : q->second)
+                        if (player->IsQuestRewarded(questId))
+                            f.questReward = true;
+                // No class-trainer purchase is recorded anywhere: this module
+                // records trainer visits for professions only, and those are
+                // kept whole.
+                f.trainerRecord = false;
+                f.classTrainer = trainer.count(spellId) > 0;
+                StripSpellDecision const d = StripSpellDecisionFor(f);
+                if (d.verdict == StripVerdict::Remove)
+                {
+                    remove.push_back({spellId, d.why});
+                    auto const t = trainer.find(spellId);
+                    if (t != trainer.end())
+                        rebuy += t->second.first;
+                }
+                else
+                    ++kept[d.why];
+            }
+
+            o << ",\"spells\":{\"remove\":[";
+            for (std::size_t i = 0; i < remove.size(); ++i)
+            {
+                auto const t = trainer.find(remove[i].first);
+                o << (i ? "," : "") << "{\"id\":" << remove[i].first << ",\"name\":" << J(SpellNameOf(remove[i].first))
+                  << ",\"trainer_level\":" << (t == trainer.end() ? 0 : t->second.second) << ",\"why\":"
+                  << J(remove[i].second) << '}';
+            }
+            o << "],\"rebuy_copper\":" << rebuy << ",\"money\":" << player->GetMoney() << ",\"kept\":{";
+            bool first = true;
+            for (auto const& [why, n] : kept)
+            {
+                o << (first ? "" : ",") << J(why) << ':' << n;
+                first = false;
+            }
+            o << "}}";
+
+            if (apply && !remove.empty())
+            {
+                for (auto const& [spellId, why] : remove)
+                {
+                    (void)why;
+                    player->removeSpell(spellId, SPEC_MASK_ALL, false);
+                }
+                changed = true;
+            }
+        }
+
+        // ---- boost achievements: listed for the operator, never removed ----
+        {
+            std::vector<CompletedAchievement> completed;
+            for (auto const& [id, data] : player->GetAchievementMgr()->GetCompletedAchievements())
+                completed.push_back({id, static_cast<std::int64_t>(data.date)});
+            std::vector<std::int64_t> times;
+            if (QueryResult r = CharacterDatabase.Query(
+                    "SELECT CAST(UNIX_TIMESTAMP(created_at) AS SIGNED), CAST(UNIX_TIMESTAMP(updated_at) AS SIGNED) FROM overseer_command "
+                    "WHERE kind = 'gm' AND status = 'delivered' AND target_name = '{}' "
+                    "AND (command LIKE '.character level %' OR command LIKE '.levelup%')",
+                    Esc(name)))
+                do
+                {
+                    times.push_back(r->Fetch()[0].Get<int64>());
+                    times.push_back(r->Fetch()[1].Get<int64>());
+                } while (r->NextRow());
+            std::vector<unsigned> const boost =
+                BoostLevelAchievements(completed, times, NATURALIZE_BOOST_SLACK_SECONDS);
+            o << ",\"boost_achievements_for_the_operator\":[";
+            for (std::size_t i = 0; i < boost.size(); ++i)
+                o << (i ? "," : "") << boost[i];
+            o << ']';
+        }
+        return changed;
     }
 
     static char const* DoGuild(Player* who, std::string const& command,
