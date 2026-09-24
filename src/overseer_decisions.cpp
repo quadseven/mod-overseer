@@ -3837,10 +3837,17 @@ char const* GearRoleName(GearRole role)
 
 GearRole GearRoleForSeat(int classId, std::string const& seatRole)
 {
-    if (seatRole == "tank")
+    if (seatRole == "tank" || seatRole == RAID_DUTY_MAIN_TANK || seatRole == "off tank")
         return GearRole::Tank;
     if (seatRole == "healer")
         return GearRole::Healer;
+    // A duty read off the talent tree names the kind outright.
+    if (seatRole == "melee")
+        return GearRole::Melee;
+    if (seatRole == "ranged")
+        return GearRole::Ranged;
+    if (seatRole == "caster")
+        return GearRole::Caster;
     // raidlineup.py writes "damage"; "dps" is accepted as the same seat.
     if (seatRole != "damage" && seatRole != "dps")
         return GearRole::Unknown;
@@ -3862,6 +3869,14 @@ GearRole GearRoleForSeat(int classId, std::string const& seatRole)
         default:
             return GearRole::Unknown;
     }
+}
+
+bool LootMainTank(bool inFamily, bool tank, bool isHead, std::string const& seatWord,
+                  bool raidNamesMainTank)
+{
+    if (raidNamesMainTank)
+        return seatWord == RAID_DUTY_MAIN_TANK;
+    return inFamily && tank && isHead;
 }
 
 std::string ClassWord(int classId)

@@ -15477,21 +15477,34 @@ private:
         _councilOpenRolls[rollKey] = CouncilOpenRoll{std::time(nullptr), false};
     }
 
-    // name -> seat role for a family's ordered raid, so a guild raider the
-    // roster does not describe is scored for the job the lineup gave it.
+    // name -> seat word for a family's ordered raid, so a guild raider the
+    // roster does not describe is scored for the job the lineup gave it: the
+    // seat's duty (main tank, off tank, healer, melee, ranged, caster), read
+    // off the raider's talent tree by the site, where the realm has the column
+    // (2026_09_24_03_overseer_raid_seat_duty.sql) and the row carries one, and
+    // the seat's role (tank, healer, dps) otherwise.
+    SchemaColumns _raidSeatDutyColumn{SchemaColumns::Unknown};
     std::map<std::string, std::string> LoadSeatRoles(std::string const& family)
     {
         std::map<std::string, std::string> roles;
         if (!RaidSeatsPresent())
             return roles;
+        if (_raidSeatDutyColumn == SchemaColumns::Unknown)
+            _raidSeatDutyColumn = SchemaHasColumns("overseer_raid_seat", "'duty'", 1)
+                                      ? SchemaColumns::Present
+                                      : SchemaColumns::Absent;
+        bool const duty = _raidSeatDutyColumn == SchemaColumns::Present;
         QueryResult result = CharacterDatabase.Query(
-            "SELECT name, role FROM overseer_raid_seat WHERE family = '{}'", Esc(family));
+            duty ? "SELECT name, role, duty FROM overseer_raid_seat WHERE family = '{}'"
+                 : "SELECT name, role, '' FROM overseer_raid_seat WHERE family = '{}'",
+            Esc(family));
         if (!result)
             return roles;
         do
         {
             Field* row = result->Fetch();
-            roles[row[0].Get<std::string>()] = row[1].Get<std::string>();
+            std::string const word = row[2].Get<std::string>();
+            roles[row[0].Get<std::string>()] = word.empty() ? row[1].Get<std::string>() : word;
         } while (result->NextRow());
         return roles;
     }
@@ -15560,6 +15573,10 @@ private:
             }
 
             std::map<std::string, std::string> const seats = LoadSeatRoles(family);
+            bool raidNamesMainTank = false;
+            for (auto const& [seated, word] : seats)
+                raidNamesMainTank =
+                    raidNamesMainTank || word == OverseerDecisions::RAID_DUTY_MAIN_TANK;
             std::vector<OverseerDecisions::LootCandidate> candidates;
             for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
             {
@@ -15576,8 +15593,9 @@ private:
                 candidates.push_back(CouncilCandidate(
                     member, proto, drop.randomPropertyId, inFamily,
                     seat == seats.end() ? std::string() : seat->second));
-                candidates.back().mainTank =
-                    inFamily && candidates.back().tank && member->GetName() == family;
+                candidates.back().mainTank = OverseerDecisions::LootMainTank(
+                    inFamily, candidates.back().tank, member->GetName() == family,
+                    seat == seats.end() ? std::string() : seat->second, raidNamesMainTank);
             }
 
             CouncilDrop open;
