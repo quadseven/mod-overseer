@@ -309,6 +309,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 // std::exception, for the one catch in this file. Pulled in
 // transitively by several of the headers above, but a catch that
 // compiles only by accident of somebody else's include is a catch
@@ -4205,6 +4206,16 @@ struct MoveReading
 std::mutex g_moveMutex;
 std::map<std::string, MoveReading> g_moveHistory;  // key: lowercased name
 
+struct FallSample
+{
+    uint16 mapId = 0;
+    float x = 0.f, y = 0.f, z = 0.f;
+    time_t sampledAt = 0;
+    OverseerDecisions::MoveGenerator movement = OverseerDecisions::MoveGenerator::Unsampled;
+};
+constexpr size_t FALL_SAMPLE_RING_SIZE = 12;
+std::map<std::string, std::deque<FallSample>> g_fallSamples;
+
 // The last terrain-recovery remedy this module issued for a character, so a
 // death a few seconds later can be attributed to it rather than guessed at
 // (#188). A remedy is the one movement this module knows it caused, which
@@ -4336,6 +4347,16 @@ void RememberMovement(std::string const& name, uint16 mapId, float x, float y,
     r.sampledAt = std::time(nullptr);
 }
 
+void RememberFallSample(std::string const& name, uint16 mapId, float x, float y, float z,
+                        OverseerDecisions::MoveGenerator movement)
+{
+    std::lock_guard<std::mutex> guard(g_moveMutex);
+    std::deque<FallSample>& samples = g_fallSamples[LowerName(name)];
+    samples.push_back(FallSample{mapId, x, y, z, std::time(nullptr), movement});
+    while (samples.size() > FALL_SAMPLE_RING_SIZE)
+        samples.pop_front();
+}
+
 // Called from DriveBelowTerrainRecovery, world thread only.
 void RememberRecovery(std::string const& name, uint8 prevRung, uint8 rung)
 {
@@ -4420,6 +4441,10 @@ struct PendingDeath
     int32 lastSeenSeconds = -1;    // age of the sample below, -1 = none
     float lastX = 0.f, lastY = 0.f, lastZ = 0.f;
     float yardsFallen = -1.f;      // -1 = unsampled, 0 = it did not fall
+    bool fallStartSeen = false;
+    uint16 fallStartMap = 0;
+    float fallStartX = 0.f, fallStartY = 0.f, fallStartZ = 0.f;
+    std::string fallStartMovement;
 
     // The LEADER'S last sampled position, which is what makes a party split
     // visible on the row that matters. Taken from the same cache rather than
@@ -4567,6 +4592,28 @@ void RecordDeath(Player* player)
             d.lastY = it->second.y;
             d.lastZ = it->second.z;
             d.yardsFallen = OverseerDecisions::YardsFallen(true, it->second.z, d.z);
+            if (d.yardsFallen > 10.f)
+            {
+                auto const ring = g_fallSamples.find(lower);
+                if (ring != g_fallSamples.end())
+                {
+                    std::vector<OverseerDecisions::FallTraceSample> trace;
+                    for (FallSample const& sample : ring->second)
+                        trace.push_back({sample.mapId, sample.x, sample.y, sample.z,
+                                         sample.movement});
+                    auto const start = OverseerDecisions::FindFallStart(trace, d.mapId, d.z, 10.f);
+                    if (start.found)
+                    {
+                        d.fallStartSeen = true;
+                        d.fallStartMap = start.sample.mapId;
+                        d.fallStartX = start.sample.x;
+                        d.fallStartY = start.sample.y;
+                        d.fallStartZ = start.sample.z;
+                        d.fallStartMovement = OverseerDecisions::MoveGeneratorName(
+                            start.sample.movement);
+                    }
+                }
+            }
         }
 
         // The leader's own last sample, by the name the Group already cached.
@@ -6209,6 +6256,7 @@ public:
     {
         _commandTimer += diff;
         _snapshotTimer += diff;
+        _movementTimer += diff;
         _watchTimer += diff;
         _sweepTimer += diff;
         _chatFlushTimer += diff;
@@ -6264,6 +6312,11 @@ public:
         {
             _snapshotTimer = 0;
             WriteSnapshot();
+        }
+        if (_movementTimer >= 1000)
+        {
+            _movementTimer = 0;
+            SampleFallMovement();
         }
         if (_watchTimer >= WATCH_RELOAD_MS)
         {
@@ -41788,6 +41841,8 @@ private:
               "job, quest_aim, travel_target, grouped, group_size, group_leader, "
               "driver, movement_generator, in_combat, last_seen_seconds, "
               "last_pos_x, last_pos_y, last_pos_z, yards_fallen, "
+              "fall_start_map, fall_start_x, fall_start_y, fall_start_z, "
+              "fall_start_movement_generator, "
               "leader_seen, leader_map, leader_pos_x, leader_pos_y, leader_pos_z, "
               "recovery_rung, recovery_prev_rung, recovery_seconds, "
               "fall_guard_standdown, fall_guard_seconds) VALUES ";
@@ -41835,6 +41890,12 @@ private:
                << ',' << d.lastSeenSeconds
                << ',' << d.lastX << ',' << d.lastY << ',' << d.lastZ
                << ',' << d.yardsFallen
+               << ',' << (d.fallStartSeen ? std::to_string(d.fallStartMap) : std::string("NULL"))
+               << ',' << (d.fallStartSeen ? std::to_string(d.fallStartX) : std::string("NULL"))
+               << ',' << (d.fallStartSeen ? std::to_string(d.fallStartY) : std::string("NULL"))
+               << ',' << (d.fallStartSeen ? std::to_string(d.fallStartZ) : std::string("NULL"))
+               << ',' << (d.fallStartSeen ? std::string("'") + Esc(d.fallStartMovement) + "'"
+                                           : std::string("NULL"))
                << ',' << static_cast<uint32>(d.leaderSeen)
                << ',' << static_cast<uint32>(d.leaderMap)
                << ',' << d.leaderX << ',' << d.leaderY << ',' << d.leaderZ
@@ -57539,6 +57600,17 @@ private:
         ev.bestYards = choice.yards;
         ev.nowYards = choice.yards;
 
+        // Creature-targeted send and walk rows use the same cliff/drop guard
+        // as every other module-issued walk. A destination whose first safe
+        // step cannot be found is refused before the hold or movement point is
+        // installed, so a creature spawn cannot pull a character over a rim.
+        if (goal == D::WalkGoal::Spawn && !ev.spawnIsObject)
+        {
+            WorldPosition step;
+            if (!GroundedStep(who, WorldPosition(ev.mapId, ev.boxX, ev.boxY, ev.boxZ), step))
+                return refuse("the first step toward the creature goes over a drop");
+        }
+
         // ---- near or far (#633) ----------------------------------------------
         //
         // FAR ONLY WHEN THE DESTINATION IS, and only where a far walk may go:
@@ -58427,6 +58499,22 @@ private:
         return "";
     }
 
+    void SampleFallMovement()
+    {
+        for (auto const& itr : ObjectAccessor::GetPlayers())
+        {
+            Player* p = itr.second;
+            if (!p || !p->IsInWorld() || !OnRoster(p->GetName()))
+                continue;
+            MotionMaster const* motion = p->GetMotionMaster();
+            RememberFallSample(
+                p->GetName(), static_cast<uint16>(p->GetMapId()), p->GetPositionX(),
+                p->GetPositionY(), p->GetPositionZ(),
+                motion ? FoldMovementGenerator(motion->GetCurrentMovementGeneratorType())
+                       : OverseerDecisions::MoveGenerator::Unsampled);
+        }
+    }
+
     void WriteSnapshot()
     {
         auto const& allPlayers = ObjectAccessor::GetPlayers();
@@ -58507,6 +58595,7 @@ private:
 
     uint32 _commandTimer = 0;
     uint32 _snapshotTimer = 0;
+    uint32 _movementTimer = 0;
     uint32 _watchTimer = 0;
     uint32 _sweepTimer = 0;
     uint32 _chatFlushTimer = 0;

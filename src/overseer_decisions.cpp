@@ -5174,6 +5174,21 @@ char const* MoveGeneratorName(MoveGenerator generator)
     return "";
 }
 
+FallStartReading FindFallStart(std::vector<FallTraceSample> const& samples,
+                               uint16_t deathMap, float deathZ,
+                               float minimumFallYards)
+{
+    FallStartReading result;
+    for (FallTraceSample const& sample : samples)
+        if (sample.mapId == deathMap && sample.z - deathZ > minimumFallYards &&
+            (!result.found || sample.z > result.sample.z))
+        {
+            result.found = true;
+            result.sample = sample;
+        }
+    return result;
+}
+
 DeathDriver NameTheDriver(DeathAttribution const& a)
 {
     if (!a.sampled || a.movement == MoveGenerator::Unsampled)
