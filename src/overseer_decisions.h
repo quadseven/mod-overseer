@@ -17181,6 +17181,33 @@ FinderStep FinderNext(FinderPollFacts const& facts);
 // "join", "wait", "accept", "inside", "give up".
 char const* FinderStepWord(FinderStep step);
 
+// ------------------------- what a level-up hands the roster (the operator) --
+//
+// TrainRoster runs on every level change of a roster character. With factory
+// grants ON (the default, and the module's behaviour before this switch) it
+// hands out, with no trainer and no gold:
+//
+//   - skills: every weapon skill of the class at level x 5, and the riding
+//     ranks at 20, 40 and 60 (PlayerbotFactory::InitSkills);
+//   - class spells: the class's spells (InitClassSpells);
+//   - trainer spells: every rank any trainer in the world would teach
+//     (InitAvailableSpells), with the first rank of a primary profession held
+//     shut.
+//
+// Overseer.Train.Factory = 0 turns all three off. The family then
+// learns only at a real trainer and pays for it (the training stop walks it
+// there), and gains weapon skill by using the weapon. Talent points are still
+// spent, because a character earns them by levelling.
+struct RosterTraining
+{
+    bool skills{false};
+    bool classSpells{false};
+    bool trainerSpells{false};
+    bool talents{false};
+};
+
+RosterTraining RosterTrainingFor(bool factoryGrants);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

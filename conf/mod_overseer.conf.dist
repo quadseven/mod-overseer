@@ -344,3 +344,34 @@
 #        Default:     0
 #
 #Overseer.Recovery.DungeonFinder = 0
+
+########################################
+#
+#    TRAINING THE ROSTER
+#
+#    Each time a roster character changes level the module trains it. It
+#    always spends the character's free talent points in its roster tree.
+#    The key below decides whether it also HANDS OUT skills and spells.
+#
+
+#
+#    Overseer.Train.Factory
+#        Description: Grant the roster, on every level change and with no
+#                     trainer and no gold: every weapon skill of the class
+#                     at level x 5, the riding ranks at 20, 40 and 60, the
+#                     class spells, and every rank a trainer in the world
+#                     would teach (mod-playerbots' InitSkills,
+#                     InitClassSpells and InitAvailableSpells).
+#
+#                     1 is how the module has always behaved.
+#
+#                     0 is "everything natural": the roster learns spells
+#                     and trades only at a real trainer and pays for them
+#                     (the training stop walks the family there), and gains
+#                     weapon skill by using the weapon. Nothing already
+#                     learned is taken away. Each level change logs
+#                     "factory grants are off".
+#
+#        Default:     1
+#
+#Overseer.Train.Factory = 1
