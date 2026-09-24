@@ -14944,26 +14944,69 @@ SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
 }
 
 RitualSummonerChoice ChooseRitualSummoner(
-    std::vector<RitualSummonerCandidate> const& candidates)
+    std::vector<RitualSummonerCandidate> const& candidates,
+    RitualSummonerPool pool)
 {
     RitualSummonerChoice choice;
-    for (RitualSummonerCandidate const& candidate : candidates)
+    if (pool == RitualSummonerPool::None)
     {
-        if (!candidate.guildMember || !candidate.warlock)
-            continue;
-        if (!candidate.inWorld || !candidate.alive || candidate.inCombat)
-            continue;
-        if (!candidate.knowsRitual || !candidate.carriesSoulShard)
-            continue;
-
-        choice.name = candidate.name;
-        choice.why = candidate.inFamily
-                         ? "guild warlock in the family knows Ritual of Summoning and carries "
-                           "a Soul Shard"
-                         : "guild warlock knows Ritual of Summoning and carries a Soul Shard";
+        choice.why = "the ritual summoner pool is disabled";
         return choice;
     }
-    choice.why = "no online guild warlock both knows Ritual of Summoning and carries a Soul Shard";
+
+    auto eligible = [](RitualSummonerCandidate const& candidate)
+    {
+        return candidate.warlock && candidate.inWorld && candidate.alive &&
+               !candidate.inCombat && candidate.knowsRitual && candidate.carriesSoulShard;
+    };
+    auto ranksAhead = [](RitualSummonerCandidate const& candidate,
+                         RitualSummonerCandidate const& current)
+    {
+        if (candidate.onDoorMap != current.onDoorMap)
+            return candidate.onDoorMap;
+        if (candidate.distanceToDoor != current.distanceToDoor)
+            return candidate.distanceToDoor < current.distanceToDoor;
+        return candidate.level > current.level;
+    };
+    auto select = [&](bool guildOnly, char const* why)
+    {
+        RitualSummonerCandidate const* best = nullptr;
+        for (RitualSummonerCandidate const& candidate : candidates)
+        {
+            if (!eligible(candidate) || (guildOnly ? !candidate.guildMember : !candidate.inFamily))
+                continue;
+            if (!best || ranksAhead(candidate, *best))
+                best = &candidate;
+        }
+        if (!best)
+            return false;
+        choice.name = best->name;
+        choice.why = why;
+        return true;
+    };
+
+    if (pool == RitualSummonerPool::Guild)
+    {
+        if (select(true, "guild warlock knows Ritual of Summoning and carries a Soul Shard"))
+            return choice;
+        if (select(false, "no eligible guild warlock; family fallback knows Ritual of Summoning "
+                          "and carries a Soul Shard"))
+            return choice;
+        choice.why = "no eligible guild warlock or family fallback knows Ritual of Summoning and "
+                     "carries a Soul Shard";
+        return choice;
+    }
+
+    if (pool == RitualSummonerPool::Family)
+    {
+        if (select(false, "family warlock knows Ritual of Summoning and carries a Soul Shard"))
+            return choice;
+        choice.why = "no eligible family warlock knows Ritual of Summoning and carries a Soul "
+                     "Shard";
+        return choice;
+    }
+
+    choice.why = "unknown ritual summoner pool";
     return choice;
 }
 

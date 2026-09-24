@@ -32875,50 +32875,79 @@ private:
     // first (the town, then the approach, with no staging clock), then an `at:`
     // aim at the stone's own spawn. The family follows him as it always does,
     // and the summon is for whoever does not arrive with him.
-    static bool RecoverySummonerPoolAllows()
+    static OverseerDecisions::RitualSummonerPool RecoverySummonerPool()
     {
-        return sConfigMgr->GetOption<std::string>("Overseer.Recovery.SummonerPool",
-                                                   "any guild warlock") ==
-               "any guild warlock";
+        std::string const value = sConfigMgr->GetOption<std::string>(
+            "Overseer.Recovery.SummonerPool", "guild");
+        if (value == "guild")
+            return OverseerDecisions::RitualSummonerPool::Guild;
+        if (value == "family")
+            return OverseerDecisions::RitualSummonerPool::Family;
+        if (value == "none")
+            return OverseerDecisions::RitualSummonerPool::None;
+        return OverseerDecisions::RitualSummonerPool::Invalid;
     }
 
     static OverseerDecisions::RitualSummonerChoice ChooseRecoverySummoner(
-        Player* leader, std::vector<std::string> const& members)
+        Player* leader, std::vector<std::string> const& members,
+        GameObjectData const* stone)
     {
         OverseerDecisions::RitualSummonerChoice none;
-        none.why = "Overseer.Recovery.SummonerPool does not allow the default guild-warlock pool";
-        if (!leader || !RecoverySummonerPoolAllows() || !leader->GetGuildId())
+        OverseerDecisions::RitualSummonerPool const pool = RecoverySummonerPool();
+        if (!leader || !stone)
+        {
+            none.why = "the leader or meeting stone is unavailable";
             return none;
+        }
+        if (pool == OverseerDecisions::RitualSummonerPool::Invalid)
+        {
+            none.why = "Overseer.Recovery.SummonerPool must be guild, family, or none";
+            return none;
+        }
 
         std::set<std::string> family(members.begin(), members.end());
         family.insert(leader->GetName());
+        std::set<std::string> names;
         std::vector<OverseerDecisions::RitualSummonerCandidate> candidates;
-        QueryResult rows = CharacterDatabase.Query(
-            "SELECT c.name FROM guild_member gm JOIN characters c ON c.guid = gm.guid "
-            "WHERE gm.guildid = {} AND c.class = 9 ORDER BY c.name",
-            leader->GetGuildId());
-        if (!rows)
-            return none;
-        do
+        uint32 const guildId = leader->GetGuildId();
+        if (guildId)
         {
-            std::string const name = rows->Fetch()[0].Get<std::string>();
+            QueryResult rows = CharacterDatabase.Query(
+                "SELECT c.name FROM guild_member gm JOIN characters c ON c.guid = gm.guid "
+                "WHERE gm.guildid = {} AND c.class = 9 ORDER BY c.name", guildId);
+            if (rows)
+                do
+                {
+                    names.insert(rows->Fetch()[0].Get<std::string>());
+                } while (rows->NextRow());
+        }
+        names.insert(family.begin(), family.end());
+
+        for (std::string const& name : names)
+        {
             OverseerDecisions::RitualSummonerCandidate candidate;
             candidate.name = name;
-            candidate.guildMember = true;
-            candidate.warlock = true;
             candidate.inFamily = family.count(name) != 0;
             Player* const warlock = ObjectAccessor::FindPlayerByName(name);
             if (warlock && warlock->IsInWorld())
             {
+                candidate.warlock = warlock->getClass() == CLASS_WARLOCK;
+                candidate.guildMember = guildId && warlock->GetGuildId() == guildId;
                 candidate.inWorld = true;
                 candidate.alive = warlock->IsAlive();
                 candidate.inCombat = warlock->IsInCombat();
                 candidate.knowsRitual = warlock->HasSpell(698);
                 candidate.carriesSoulShard = warlock->GetItemCount(6265, false) > 0;
+                candidate.onDoorMap = warlock->GetMapId() == stone->mapid &&
+                                      warlock->GetInstanceId() == 0;
+                candidate.distanceToDoor = candidate.onDoorMap
+                    ? warlock->GetExactDist2d(stone->posX, stone->posY)
+                    : std::numeric_limits<float>::max();
+                candidate.level = warlock->GetLevel();
             }
             candidates.push_back(candidate);
-        } while (rows->NextRow());
-        return OverseerDecisions::ChooseRitualSummoner(candidates);
+        }
+        return OverseerDecisions::ChooseRitualSummoner(candidates, pool);
     }
 
     // Keep a five-person run a party. The core has no reversible
@@ -33090,10 +33119,10 @@ private:
                 OverseerDecisions::SUMMON_RUNG_AT_STONE_YARDS)
         {
             OverseerDecisions::RitualSummonerChoice const choice =
-                ChooseRecoverySummoner(leader, members);
+                ChooseRecoverySummoner(leader, members, stone);
             if (choice.name.empty())
             {
-                doneWhy = "no natural guild warlock is online with Ritual of Summoning and a Soul "
+                doneWhy = "no eligible warlock is online with Ritual of Summoning and a Soul "
                           "Shard (" + choice.why + ")";
                 if (coord.summonSaid != "ritual unavailable: " + choice.why)
                 {
@@ -33105,7 +33134,7 @@ private:
             }
             if (!PrepareRitualSummoner(coord, leader, members, stone, choice.name))
             {
-                doneWhy = "the selected guild warlock cannot join the party without a raid conversion";
+                doneWhy = "the selected warlock cannot join the party without a raid conversion";
                 return false;
             }
             ritualSummoner = coord.ritualSummoner;

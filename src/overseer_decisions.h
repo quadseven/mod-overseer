@@ -17251,6 +17251,17 @@ struct RitualSummonerCandidate
     bool knowsRitual{false};
     bool carriesSoulShard{false};
     bool inFamily{false};
+    bool onDoorMap{false};
+    float distanceToDoor{0.f};
+    uint32_t level{0};
+};
+
+enum class RitualSummonerPool : std::uint8_t
+{
+    Guild,
+    Family,
+    None,
+    Invalid,
 };
 
 struct RitualSummonerChoice
@@ -17259,11 +17270,12 @@ struct RitualSummonerChoice
     std::string why;
 };
 
-// Select one naturally earned guild warlock. Candidate order is the stable
-// guild order supplied by the adapter. An empty name means that no character
-// currently satisfies every live gate.
+// Select one naturally earned guild or family warlock according to the pool.
+// Candidates are ranked by door map, distance, then level. An empty name means
+// that no character currently satisfies every live gate.
 RitualSummonerChoice ChooseRitualSummoner(
-    std::vector<RitualSummonerCandidate> const& candidates);
+    std::vector<RitualSummonerCandidate> const& candidates,
+    RitualSummonerPool pool = RitualSummonerPool::Guild);
 
 enum class SummonRungStep : std::uint8_t
 {
