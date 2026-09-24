@@ -11,6 +11,8 @@
 
 #include "overseer_decisions.h"
 
+#include <utility>
+
 namespace OverseerDecisions
 {
 
@@ -20,6 +22,13 @@ LockboxStep LockboxNext(LockboxFacts const& facts)
         || !facts.hasLockpickingSkill)
         return LockboxStep::Refuse;
     return LockboxStep::UnlockAndOpen;
+}
+
+void RememberDamage(DamageHistory& history, DamageTaken sample)
+{
+    if (history.size() == DEATH_DAMAGE_HISTORY_SIZE)
+        history.erase(history.begin());
+    history.push_back(std::move(sample));
 }
 
 std::map<std::string, uint32_t> QuestAimsAfterRead(
