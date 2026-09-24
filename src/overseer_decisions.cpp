@@ -12460,16 +12460,84 @@ GuildRequest ParseGuildRequest(std::string const& command)
         while (i < rest.size() && rest[i] != ' ')
             ++i;
         std::string const sub = rest.substr(wordBegin, i - wordBegin);
+        // `tab:<n>`, 0 to GUILD_BANK_TABS - 1, or -1 for anything else.
+        auto parseTab = [](std::string const& word) -> int
+        {
+            if (word.size() < 5 || word.compare(0, 4, "tab:") != 0)
+                return -1;
+            std::string const digits = word.substr(4);
+            if (digits.size() > 2
+                || digits.find_first_not_of("0123456789") != std::string::npos)
+                return -1;
+            unsigned const tab = static_cast<unsigned>(std::stoul(digits));
+            return tab < GUILD_BANK_TABS ? static_cast<int>(tab) : -1;
+        };
+        auto nextWord = [&rest](std::size_t& at) -> std::string
+        {
+            while (at < rest.size() && rest[at] == ' ')
+                ++at;
+            std::size_t const begin = at;
+            while (at < rest.size() && rest[at] != ' ')
+                ++at;
+            return rest.substr(begin, at - begin);
+        };
         if (sub == "buy-tab")
         {
-            while (i < rest.size() && rest[i] == ' ')
-                ++i;
-            if (i != rest.size())
+            std::string const tabWord = nextWord(i);
+            std::string const trailing = nextWord(i);
+            if (!trailing.empty())
             {
                 request.error = GuildRefusal::BankBuyTabTrailing;
                 return request;
             }
+            if (!tabWord.empty())
+            {
+                int const tab = parseTab(tabWord);
+                if (tab < 0)
+                {
+                    request.error = tabWord.compare(0, 4, "tab:") == 0
+                                        ? GuildRefusal::BankTabInvalid
+                                        : GuildRefusal::BankBuyTabTrailing;
+                    return request;
+                }
+                request.bankTab = static_cast<std::uint8_t>(tab);
+                request.bankTabNamed = true;
+            }
             request.verb = GuildVerb::BankBuyTab;
+            return request;
+        }
+        if (sub == "name-tab")
+        {
+            // `tab:<n> icon:<icon> <name ...>`. The name is the rest of the
+            // row, so a tab can be called "Raid Gear"; the icon is one word
+            // because the core stores a texture name, never a phrase.
+            int const tab = parseTab(nextWord(i));
+            std::string const iconWord = nextWord(i);
+            while (i < rest.size() && rest[i] == ' ')
+                ++i;
+            std::string tabName = rest.substr(i);
+            while (!tabName.empty() && tabName.back() == ' ')
+                tabName.pop_back();
+            bool const iconOk = iconWord.size() > 5
+                && iconWord.compare(0, 5, "icon:") == 0
+                && iconWord.size() - 5 <= GUILD_BANK_TAB_ICON_MAX
+                && iconWord.find_first_not_of(
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_", 5)
+                       == std::string::npos;
+            bool nameOk = !tabName.empty() && tabName.size() <= GUILD_BANK_TAB_NAME_MAX;
+            for (char const ch : tabName)
+                nameOk = nameOk && ch >= 0x20 && ch < 0x7f && ch != 0x27 && ch != 0x22
+                         && ch != 0x5c;
+            if (tab < 0 || !iconOk || !nameOk)
+            {
+                request.error = GuildRefusal::BankNameTabInvalid;
+                return request;
+            }
+            request.verb = GuildVerb::BankNameTab;
+            request.bankTab = static_cast<std::uint8_t>(tab);
+            request.bankTabNamed = true;
+            request.bankTabIcon = iconWord.substr(5);
+            request.bankTabName = tabName;
             return request;
         }
         if (sub == "grant-deposit")
@@ -12522,15 +12590,27 @@ GuildRequest ParseGuildRequest(std::string const& command)
             while (i < rest.size() && rest[i] != ' ')
                 ++i;
             std::string const specWord = rest.substr(specBegin, i - specBegin);
-            while (i < rest.size() && rest[i] == ' ')
-                ++i;
-            // Trailing content after the spec ("deposit-item guid:5 extra")
-            // is refused, not silently dropped - the same rule the money
-            // amount above keeps.
-            if (i != rest.size())
+            // An optional `tab:<n>` after the spec, and nothing after that.
+            // Any other trailing content ("deposit-item guid:5 extra") is
+            // refused, not silently dropped - the same rule the money amount
+            // above keeps.
+            std::string const tabWord = nextWord(i);
+            std::string const trailing = nextWord(i);
+            if (!trailing.empty() || (!tabWord.empty() && tabWord.compare(0, 4, "tab:") != 0))
             {
                 request.error = GuildRefusal::BankItemSpecInvalid;
                 return request;
+            }
+            if (!tabWord.empty())
+            {
+                int const tab = parseTab(tabWord);
+                if (tab < 0)
+                {
+                    request.error = GuildRefusal::BankTabInvalid;
+                    return request;
+                }
+                request.bankTab = static_cast<std::uint8_t>(tab);
+                request.bankTabNamed = true;
             }
             std::string::size_type const colon = specWord.find(':');
             if (colon == std::string::npos)
@@ -12625,6 +12705,40 @@ GuildRequest ParseGuildRequest(std::string const& command)
     request.error = GuildRefusal::NoVerb;
     return request;
 }
+
+GuildTabPurchase GuildTabPurchaseVerdict(GuildTabPurchaseFacts const& facts)
+{
+    bool const tabAdded = facts.tabsAfter == facts.tabsBefore + 1;
+    bool const tabsSame = facts.tabsAfter == facts.tabsBefore;
+    bool const purseSame = facts.purseAfter == facts.purseBefore;
+    bool const pricePaid = facts.purseBefore >= facts.purseAfter
+                           && facts.purseBefore - facts.purseAfter == facts.price;
+    if (tabAdded && pricePaid && facts.price > 0)
+        return GuildTabPurchase::Bought;
+    if (tabsSame && purseSame)
+        return GuildTabPurchase::Refused;
+    return GuildTabPurchase::Unexplained;
+}
+
+char const* GuildTabPurchasePrecheck(unsigned tabsNow, int wanted,
+                                     std::uint32_t purse, std::uint32_t price)
+{
+    if (tabsNow >= GUILD_BANK_TABS)
+        return "the guild already has every bank tab";
+    // THE ROW'S TAB IS A PROMISE ABOUT THE PRICE (#496). The core sells only
+    // the next tab, and each costs more than the one before, so a caller that
+    // counted wrong is refused here rather than sold a dearer tab.
+    if (wanted >= 0 && static_cast<unsigned>(wanted) != tabsNow)
+        return wanted < static_cast<int>(tabsNow)
+                   ? "that bank tab is already bought"
+                   : "that is not the next bank tab - the core sells them in order";
+    if (price == 0)
+        return "the realm sells no bank tab at that position";
+    if (purse < price)
+        return "the guild master cannot pay for the next bank tab";
+    return "";
+}
+
 TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
                                       bool carriesStrategy)
 {
