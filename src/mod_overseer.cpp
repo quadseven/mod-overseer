@@ -4163,6 +4163,7 @@ struct HpReading
     uint32 maxHealth = 0;
     time_t lastFullHealthAt = 0;   // 0 = never seen at full since this cache warmed
     time_t sampledAt = 0;
+    OverseerDecisions::DamageHistory damage;
 };
 std::mutex g_hpHistoryMutex;
 std::map<std::string, HpReading> g_hpHistory;  // key: lowercased character name
@@ -4267,6 +4268,11 @@ void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
 {
     std::lock_guard<std::mutex> guard(g_hpHistoryMutex);
     HpReading& r = g_hpHistory[LowerName(name)];
+    if (r.sampledAt && r.health > health)
+    {
+        OverseerDecisions::RememberDamage(
+            r.damage, {r.health - health, 0, {}, r.sampledAt});
+    }
     r.health = health;
     r.maxHealth = maxHealth;
     r.sampledAt = std::time(nullptr);
@@ -4395,6 +4401,7 @@ struct PendingDeath
     uint32 healthAtDeath = 0;           // last SAMPLED reading - see cache comment above
     uint32 maxHealthAtDeath = 0;
     uint32 secondsSinceFullHealth = 0;  // 0 if never sampled at full since cache warmed
+    OverseerDecisions::DamageHistory damage;
 
     std::string job;
     uint32 questAim = 0;
@@ -4494,6 +4501,11 @@ void RecordDeath(Player* player)
             d.secondsSinceFullHealth = it->second.lastFullHealthAt
                 ? static_cast<uint32>(now - it->second.lastFullHealthAt)
                 : 0;
+            d.damage = it->second.damage;
+            for (OverseerDecisions::DamageTaken& sample : d.damage)
+                sample.secondsBeforeDeath = sample.sampledAt
+                    ? static_cast<uint32>(now - sample.sampledAt)
+                    : 0;
         }
     }
 
@@ -4608,6 +4620,10 @@ void RecordDeath(Player* player)
     }
     d.killerType = OverseerDecisions::KillerKindName(OverseerDecisions::NameTheKiller(
         hookFired, d.killerType, d.killerName, d.characterName));
+
+    for (OverseerDecisions::DamageTaken& sample : d.damage)
+        if (sample.source.empty())
+            sample.source = d.killerName.empty() ? d.killerType : d.killerName;
 
     std::lock_guard<std::mutex> guard(g_deathMutex);
     if (g_deathQueue.size() >= MAX_DEATH_QUEUE)
@@ -41755,6 +41771,9 @@ private:
         ss << "INSERT INTO overseer_death (character_name, character_guid, level, "
               "map, zone, pos_x, pos_y, pos_z, killer_type, killer_name, killer_entry, "
               "health_at_death, max_health_at_death, seconds_since_full_health, "
+              "damage_1, damage_1_seconds, damage_1_source, "
+              "damage_2, damage_2_seconds, damage_2_source, "
+              "damage_3, damage_3_seconds, damage_3_source, "
               "job, quest_aim, travel_target, grouped, group_size, group_leader, "
               "driver, movement_generator, in_combat, last_seen_seconds, "
               "last_pos_x, last_pos_y, last_pos_z, yards_fallen, "
@@ -41777,8 +41796,23 @@ private:
                << ',' << d.killerEntry
                << ',' << d.healthAtDeath
                << ',' << d.maxHealthAtDeath
-               << ',' << d.secondsSinceFullHealth
-               << ",'" << Esc(d.job) << "'"
+               << ',' << d.secondsSinceFullHealth;
+            for (std::size_t i = 0; i < OverseerDecisions::DEATH_DAMAGE_HISTORY_SIZE; ++i)
+            {
+                if (i >= d.damage.size())
+                    ss << ",NULL,NULL,NULL";
+                else
+                {
+                    OverseerDecisions::DamageTaken const& sample = d.damage[i];
+                    ss << ',' << sample.amount
+                       << ',' << sample.secondsBeforeDeath;
+                    if (sample.source.empty())
+                        ss << ",NULL";
+                    else
+                        ss << ",'" << Esc(sample.source) << "'";
+                }
+            }
+            ss << "','" << Esc(d.job) << "'"
                << ',' << d.questAim
                << ",'" << Esc(d.travelTarget) << "'"
                << ',' << static_cast<uint32>(d.grouped)

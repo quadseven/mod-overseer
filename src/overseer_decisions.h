@@ -73,6 +73,23 @@ enum class LockboxStep : std::uint8_t
 
 LockboxStep LockboxNext(LockboxFacts const& facts);
 
+// The bounded evidence retained for a death. An empty source means that the
+// sampler could see health fall but could not identify the damage source.
+struct DamageTaken
+{
+    std::uint32_t amount{0};
+    std::uint32_t secondsBeforeDeath{0};
+    std::string source;
+    std::time_t sampledAt{0};
+};
+
+using DamageHistory = std::vector<DamageTaken>;
+
+constexpr std::size_t DEATH_DAMAGE_HISTORY_SIZE = 3;
+
+// Keep only the most recent damage observations, in chronological order.
+void RememberDamage(DamageHistory& history, DamageTaken sample);
+
 // A failed aim read is not the same thing as a successful read of an empty
 // column. Keep the last known council decision through a transient database
 // failure; otherwise one failed poll turns a steady aim into 0 and the next
