@@ -17254,6 +17254,45 @@ struct SummonRungMember
     unsigned tries{0};
 };
 
+// A real Ritual of Summoning source. The adapter fills these facts from the
+// live character and guild tables; this layer never grants a spell or item.
+struct RitualSummonerCandidate
+{
+    std::string name;
+    bool guildMember{false};
+    bool warlock{false};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    bool knowsRitual{false};
+    bool carriesSoulShard{false};
+    bool inFamily{false};
+    bool onDoorMap{false};
+    float distanceToDoor{0.f};
+    uint32_t level{0};
+};
+
+enum class RitualSummonerPool : std::uint8_t
+{
+    Guild,
+    Family,
+    None,
+    Invalid,
+};
+
+struct RitualSummonerChoice
+{
+    std::string name;
+    std::string why;
+};
+
+// Select one naturally earned guild or family warlock according to the pool.
+// Candidates are ranked by door map, distance, then level. An empty name means
+// that no character currently satisfies every live gate.
+RitualSummonerChoice ChooseRitualSummoner(
+    std::vector<RitualSummonerCandidate> const& candidates,
+    RitualSummonerPool pool = RitualSummonerPool::Guild);
+
 enum class SummonRungStep : std::uint8_t
 {
     // Every member stands at the stone.
@@ -17286,7 +17325,8 @@ struct SummonRungPlan
 // who can click. Stragglers are taken in family order, skipping any that
 // cannot be summoned now and any that have had their tries.
 SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
-                              unsigned triesPerMember = SUMMON_RUNG_TRIES_PER_MEMBER);
+                              unsigned triesPerMember = SUMMON_RUNG_TRIES_PER_MEMBER,
+                              std::string const& ritualSummoner = "");
 
 // "done", "walk to the stone", "wait for clickers", "summon", "nobody left".
 char const* SummonRungStepWord(SummonRungStep step);

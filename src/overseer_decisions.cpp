@@ -14851,7 +14851,7 @@ bool RunRecoveryFinderOpen(RunFailureFacts const& facts)
 }
 
 SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
-                              unsigned triesPerMember)
+                              unsigned triesPerMember, std::string const& ritualSummoner)
 {
     SummonRungPlan plan;
     SummonRungMember const* leader = nullptr;
@@ -14883,7 +14883,7 @@ SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
                           : "the family names no leader to walk to the stone";
         return plan;
     }
-    if (clickers.size() < 2)
+    if (ritualSummoner.empty() && clickers.size() < 2)
     {
         plan.step = SummonRungStep::WaitForClickers;
         plan.why = "the stone needs two members standing at it to click, and " +
@@ -14895,7 +14895,7 @@ SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
     std::string skipped;
     for (SummonRungMember const& m : family)
     {
-        if (m.atStone)
+        if (m.atStone || m.name == ritualSummoner)
             continue;
         char const* skip = nullptr;
         if (!m.inWorld)
@@ -14923,12 +14923,22 @@ SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
         return plan;
     }
 
-    // The leader clicks when he can: he is the one who walked there. The
-    // helper is the first other clicker.
-    SummonRungMember const* summoner = clickers.front();
-    for (SummonRungMember const* c : clickers)
-        if (c->leader)
-            summoner = c;
+    // A selected guild warlock may be outside the family and still be walked
+    // to the stone by kind='summon'. The family member at the stone is then
+    // the helper; the old path keeps the leader as summoner when no warlock
+    // was selected.
+    SummonRungMember const* summoner = nullptr;
+    if (!ritualSummoner.empty())
+        for (SummonRungMember const& m : family)
+            if (m.name == ritualSummoner)
+                summoner = &m;
+    if (!summoner)
+    {
+        summoner = clickers.front();
+        for (SummonRungMember const* c : clickers)
+            if (c->leader)
+                summoner = c;
+    }
     SummonRungMember const* helper = nullptr;
     for (SummonRungMember const* c : clickers)
         if (c != summoner)
@@ -14937,6 +14947,12 @@ SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
             break;
         }
 
+    if (!helper)
+    {
+        plan.step = SummonRungStep::WaitForClickers;
+        plan.why = "the selected ritual summoner needs one family member at the stone to click";
+        return plan;
+    }
     plan.step = SummonRungStep::Summon;
     plan.summoner = summoner->name;
     plan.helper = helper->name;
@@ -14945,6 +14961,73 @@ SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
                std::to_string(target->tries + 1) + " of " + std::to_string(triesPerMember) +
                ")";
     return plan;
+}
+
+RitualSummonerChoice ChooseRitualSummoner(
+    std::vector<RitualSummonerCandidate> const& candidates,
+    RitualSummonerPool pool)
+{
+    RitualSummonerChoice choice;
+    if (pool == RitualSummonerPool::None)
+    {
+        choice.why = "the ritual summoner pool is disabled";
+        return choice;
+    }
+
+    auto eligible = [](RitualSummonerCandidate const& candidate)
+    {
+        return candidate.warlock && candidate.inWorld && candidate.alive &&
+               !candidate.inCombat && candidate.knowsRitual && candidate.carriesSoulShard;
+    };
+    auto ranksAhead = [](RitualSummonerCandidate const& candidate,
+                         RitualSummonerCandidate const& current)
+    {
+        if (candidate.onDoorMap != current.onDoorMap)
+            return candidate.onDoorMap;
+        if (candidate.distanceToDoor != current.distanceToDoor)
+            return candidate.distanceToDoor < current.distanceToDoor;
+        return candidate.level > current.level;
+    };
+    auto select = [&](bool guildOnly, char const* why)
+    {
+        RitualSummonerCandidate const* best = nullptr;
+        for (RitualSummonerCandidate const& candidate : candidates)
+        {
+            if (!eligible(candidate) || (guildOnly ? !candidate.guildMember : !candidate.inFamily))
+                continue;
+            if (!best || ranksAhead(candidate, *best))
+                best = &candidate;
+        }
+        if (!best)
+            return false;
+        choice.name = best->name;
+        choice.why = why;
+        return true;
+    };
+
+    if (pool == RitualSummonerPool::Guild)
+    {
+        if (select(true, "guild warlock knows Ritual of Summoning and carries a Soul Shard"))
+            return choice;
+        if (select(false, "no eligible guild warlock; family fallback knows Ritual of Summoning "
+                          "and carries a Soul Shard"))
+            return choice;
+        choice.why = "no eligible guild warlock or family fallback knows Ritual of Summoning and "
+                     "carries a Soul Shard";
+        return choice;
+    }
+
+    if (pool == RitualSummonerPool::Family)
+    {
+        if (select(false, "family warlock knows Ritual of Summoning and carries a Soul Shard"))
+            return choice;
+        choice.why = "no eligible family warlock knows Ritual of Summoning and carries a Soul "
+                     "Shard";
+        return choice;
+    }
+
+    choice.why = "unknown ritual summoner pool";
+    return choice;
 }
 
 char const* SummonRungStepWord(SummonRungStep step)
