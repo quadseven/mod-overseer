@@ -39,6 +39,7 @@ char const* Name(TravelClaim claim)
     switch (claim)
     {
         case TravelClaim::Write:             return "write";
+        case TravelClaim::Outrank:           return "write (a live run outranks it)";
         case TravelClaim::RefusedProfession: return "refused (profession)";
         case TravelClaim::RefusedForeign:    return "refused (foreign)";
     }
@@ -123,12 +124,15 @@ void ARunClaimOverAnEmptyColumnIsWritten()
 {
     CheckClaim("a run's aim with learn_skill set over an empty column is written",
                ReadTravelClaim(RunFacts(186, "")), TravelClaim::Write);
-    CheckClaim("a run's aim over a trainer walk is still refused",
-               ReadTravelClaim(RunFacts(186, "trainer")),
-               TravelClaim::RefusedProfession);
-    CheckClaim("a run's aim over the bridge's mailbox walk is still refused",
+    // #656: a live run outranks a trainer walk and a positional walk. The
+    // coordinator still defers the leader's staging for any errand he carries,
+    // before it claims at all, so this reaches a leader only once the run is
+    // under way.
+    CheckClaim("a run's aim over a trainer walk outranks it",
+               ReadTravelClaim(RunFacts(186, "trainer")), TravelClaim::Outrank);
+    CheckClaim("a run's aim over the bridge's mailbox walk outranks it",
                ReadTravelClaim(RunFacts(186, "at:1:-443.7,-2649.1,95.8")),
-               TravelClaim::RefusedProfession);
+               TravelClaim::Outrank);
     CheckClaim("a run's aim over a vendor errand is refused as foreign",
                ReadTravelClaim(RunFacts(0, "vendor")), TravelClaim::RefusedForeign);
     CheckClaim("a run's aim with nothing set is written",
@@ -193,8 +197,8 @@ void TheSameAimAgainIsWritten()
     other.learnSkill = 186;
     other.column = "trainer";
     other.target = STAGING;
-    CheckClaim("a run over a trainer walk is still refused",
-               ReadTravelClaim(other), TravelClaim::RefusedProfession);
+    CheckClaim("a run over a trainer walk outranks it (#656)",
+               ReadTravelClaim(other), TravelClaim::Outrank);
 
     TravelClaimFacts vendor(OverseerDecisions::TravelOwner::Run);
     vendor.column = "vendor";

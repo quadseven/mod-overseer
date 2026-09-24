@@ -4798,7 +4798,8 @@ public:
     //
     // `owner` says whose walk the aim is, and every caller names it (#598).
     // A catch-up walk and every walk a dungeon run makes are let past a
-    // profession errand whose column is empty; the home errand is not. See
+    // profession errand whose column is empty; the home errand is not. A live
+    // run's walk also writes over a trainer walk or a positional aim (#656). See
     // OverseerDecisions::TravelOwner and ReadTravelClaim for the argument. It
     // has no default on purpose: the BARRIER escort once called this with
     // nothing said and was fenced as a stranger's claim.
@@ -4835,7 +4836,9 @@ public:
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
         facts.target = target;
         OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
-        if (verdict != OverseerDecisions::TravelClaim::Write)
+        bool const writes = verdict == OverseerDecisions::TravelClaim::Write ||
+                            verdict == OverseerDecisions::TravelClaim::Outrank;
+        if (!writes)
         {
             // SAID ONCE PER STATE, NOT ONCE PER POLL (#560). A catch-up is
             // re-asked on every party poll and a refusal can stand for as long
@@ -4859,6 +4862,20 @@ public:
             return false;
         }
         _claimRefusalSaid.erase(name);
+        // A LIVE RUN TAKING THE COLUMN OVER SOMEBODY'S WALK IS SAID, ONCE PER
+        // TAKEOVER (#656). The next claim finds the aim is the book's own and
+        // writes quietly, so this prints once for each aim it replaces.
+        if (verdict == OverseerDecisions::TravelClaim::Outrank)
+            LOG_INFO("module.overseer",
+                     "overseer: a live dungeon run takes the travel column for '{}' - "
+                     "'{}' replaces '{}'{}. The run outranks a trainer trip and a "
+                     "positional walk, and releasing its aim blanks only the column, so "
+                     "the trainer trip is walked after the run (#656)",
+                     name, target, facts.column,
+                     facts.learnSkill != 0
+                         ? ", with a profession errand (skill " +
+                               std::to_string(facts.learnSkill) + ") left pending"
+                         : std::string());
 
         // Esc() rather than a bare interpolation, the same discipline every
         // other write in this file applies: the name came out of a table a

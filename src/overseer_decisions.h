@@ -3306,9 +3306,26 @@ LandedErrand LandedErrandStep(std::string const& landedAim,
 // AN AIM THIS BOOK ALREADY WROTE IS NOBODY ELSE'S. A catch-up re-aim, or a
 // run's next leg, replaces the book's own previous aim; the foreign fence
 // exists for aims the book did not issue, which is what its own log line says.
+//
+// A LIVE RUN OUTRANKS A TRAINER TRIP AND A POSITIONAL WALK (#656). A human
+// group on its way to a dungeon does not break off to visit a trainer or walk
+// to some other spot. The trainer trip waits until after the run. The fences
+// above read "this book did not write it" from `_claimed`, which lives in
+// memory, so after a restart the book's own catch-up aim is read as a
+// stranger's.
+// Measured on the dev realm 2026-09-24: a far catch-up aimed three members at
+// the spot their leader hearthed to at 03:51. The worldserver restarted,
+// and at 05:36 the Ragefire run's BARRIER claim for each of them was refused
+// for a pending learn (skills 197, 182, 393) over that two-hour-old aim. The
+// members were 2,400 yards out when staging timed out. A run's claim therefore
+// writes over any positional aim or keyword in the column except a counter
+// errand, which the run's maintenance hold already waits for. `learn_skill`
+// is left alone, and the run's release blanks only the column, so the
+// trainer trip is walked after the run.
 enum class TravelClaim : uint8_t
 {
     Write,              // write the aim
+    Outrank,            // write the aim over a walk a live run outranks (#656)
     RefusedProfession,  // a profession errand is outstanding and would be overwritten
     RefusedForeign,     // the column holds an errand this book did not issue
 };
@@ -3342,6 +3359,12 @@ enum class TravelOwner : uint8_t
 // trips while the column is taken, and a tank who cannot tank is what keeps the
 // family's runs from starting at all.
 bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner);
+
+// IS THIS OWNER A LIVE DUNGEON RUN (#656)? `Run` and `WalkBackIn`, the walks a
+// run makes while it is armed. A run claims only while it is live, so the
+// owner is enough to know it. These are the claims that outrank a pending
+// trainer trip and a positional walk. See TravelClaim::Outrank.
+bool TravelOwnerIsALiveRun(TravelOwner owner);
 
 struct TravelClaimFacts
 {
