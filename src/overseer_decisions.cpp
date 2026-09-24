@@ -7817,12 +7817,74 @@ bool RouteCursorAdvanced(long seen, long now)
     return now >= 0 && seen >= 0 && now > seen;
 }
 
+bool RouteMarkAdvanced(RouteMark seen, RouteMark now)
+{
+    return now.route != 0 && now.route == seen.route && RouteCursorAdvanced(seen.at, now.at);
+}
+
 bool EntryUnreachable(bool computed, bool meshAbsent, bool noPath, float endGapYards,
                       float toleranceYards)
 {
     if (!computed || meshAbsent)
         return false;
     return noPath || endGapYards > toleranceYards;
+}
+
+bool RoadMayPassNear(float ax, float ay, float bx, float by, float pathYards,
+                     float x, float y, float reachYards)
+{
+    if (!(pathYards >= 0.f) || !(reachYards >= 0.f))
+        return false;
+    return PlaneDistance(ax, ay, x, y) + PlaneDistance(bx, by, x, y) <=
+           pathYards + 2.f * reachYards;
+}
+
+RoadJoin JoinRoad(std::vector<RoutePoint> const& path, float x, float y,
+                  float reachYards)
+{
+    RoadJoin join;
+    if (path.size() < 2 || !(reachYards >= 0.f))
+        return join;
+    // The last point is the far node and is never a join; see the header.
+    for (std::uint32_t i = 0; i + 1 < path.size(); ++i)
+    {
+        float const d = PlaneDistance(path[i].x, path[i].y, x, y);
+        if (d > reachYards)
+            continue;
+        if (!join.found || d < join.yards)
+        {
+            join.found = true;
+            join.index = i;
+            join.yards = d;
+        }
+    }
+    if (!join.found)
+        return join;
+    for (std::uint32_t i = join.index; i + 1 < path.size(); ++i)
+        join.remainingYards +=
+            PlaneDistance(path[i].x, path[i].y, path[i + 1].x, path[i + 1].y);
+    return join;
+}
+
+std::size_t ChooseRoadJoin(std::vector<RoadJoinOption> const& options,
+                           float fromAimYards, float minGainYards)
+{
+    std::size_t best = options.size();
+    float bestYards = 0.f;
+    for (std::size_t i = 0; i < options.size(); ++i)
+    {
+        RoadJoinOption const& o = options[i];
+        if (!(o.endsFromAimYards >= 0.f) ||
+            o.endsFromAimYards + minGainYards > fromAimYards)
+            continue;
+        float const total = o.remainingYards + o.onwardYards + o.endsFromAimYards;
+        if (best == options.size() || total < bestYards)
+        {
+            best = i;
+            bestYards = total;
+        }
+    }
+    return best;
 }
 
 RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
@@ -9328,8 +9390,14 @@ char const* PartyFlightVerdictWord(PartyFlightVerdict verdict)
 }
 
 StagingClock StagingClockAfterReading(StagingClock clock, bool measured, float yards,
-                                      time_t now, float minProgressYards)
+                                      time_t now, float minProgressYards,
+                                      bool walkedOnRoute)
 {
+    // Asked before the reading, because a leader on his route is progressing
+    // whether or not this poll could measure him, and a route that heads away
+    // from the door is exactly the walk whose straight line never improves.
+    if (walkedOnRoute)
+        clock.since = now;
     if (!measured)
         return clock;
     if (clock.bestYards < 0.f)

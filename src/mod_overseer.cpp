@@ -1764,6 +1764,15 @@ constexpr unsigned TRAVEL_ROUTE_ENTRY_RETRIES = 3;
 // character, nine yards up and more, is not one it can walk to.
 constexpr float TRAVEL_ROUTE_ENTRY_REACH_YARDS = 10.0f;
 
+// HOW NEAR A SURVEYED ROAD'S RECORDED POINTS A CHARACTER MUST STAND TO JOIN IT
+// BETWEEN ITS NODES (2026-09-24). Asked only when no node is within
+// TRAVEL_ROUTE_ENTRY_YARDS. Under the route lookahead, so the join point is one
+// the first route step can aim at directly; and the navmesh is asked about the
+// point itself before it is taken, as it is about an entry node, so a road on a
+// ledge above the character is not joined through the rock. See
+// OverseerDecisions::JoinRoad.
+constexpr float TRAVEL_ROUTE_ROAD_JOIN_YARDS = 200.0f;
+
 // How far apart to read the ground along a leg. The same thirty yards
 // PlanRouteSamples already uses for the straight-line gate, so the two readings
 // of "what is standing on this ground" are taken at the same resolution and a
@@ -4655,7 +4664,21 @@ public:
         bool routeJoinsCorridor{false};
         std::vector<OverseerDecisions::RoutePoint> route;
         OverseerDecisions::RouteCursor routeCursor{};
+        // WHICH PLAN `routeCursor` COUNTS ALONG (2026-09-24). Taken from
+        // NextRouteSerial each time a route is planned, so two plans never share
+        // one, and read with the cursor as a RouteMark. See
+        // OverseerDecisions::RouteMarkAdvanced for why a cursor alone is not
+        // enough.
+        std::uint64_t routeSerial{0};
     };
+
+    // Never zero, which RouteMark reserves for "no route". World thread only,
+    // like the book it numbers.
+    static std::uint64_t NextRouteSerial()
+    {
+        static std::uint64_t serial = 0;
+        return ++serial;
+    }
 
     // Every enabled character with an outstanding errand, name -> target.
     // Absent means '', "stay with the family"
@@ -5137,6 +5160,19 @@ public:
         if (it == _state.end() || it->second.route.empty())
             return -1;
         return static_cast<long>(it->second.routeCursor.at);
+    }
+
+    // THE SAME READING, NAMING THE PLAN IT IS ON (2026-09-24). See
+    // OverseerDecisions::RouteMarkAdvanced.
+    OverseerDecisions::RouteMark RouteMarkOf(std::string const& name) const
+    {
+        OverseerDecisions::RouteMark mark;
+        auto const it = _state.find(name);
+        if (it == _state.end() || it->second.route.empty())
+            return mark;
+        mark.route = it->second.routeSerial;
+        mark.at = static_cast<long>(it->second.routeCursor.at);
+        return mark;
     }
 
     // DID A DUNGEON RUN ISSUE THIS ERRAND? Asked of the target as well as the
@@ -16562,11 +16598,11 @@ private:
     // far node and moving on (TravelNode.cpp:972-977). So does this: the node's
     // own position goes in as the single point for that leg, and the stepper
     // gets a long aim for one leg instead of no route at all.
-    static void AppendLeg(uint32 from, uint32 to,
-                          OverseerDecisions::RouteNode const& toNode,
-                          std::vector<OverseerDecisions::RoutePoint>& out)
+    // One leg's recorded points, in order, appended to `out`. Empty for a leg
+    // the survey carries no points for. See AppendLeg for what that means.
+    static void ReadLegPoints(uint32 from, uint32 to,
+                              std::vector<OverseerDecisions::RoutePoint>& out)
     {
-        std::size_t const before = out.size();
         if (QueryResult result = PlayerbotsDatabase.Query(
                 "SELECT x, y, z FROM playerbots_travelnode_path "
                 "WHERE node_id = {} AND to_node_id = {} ORDER BY nr",
@@ -16582,6 +16618,14 @@ private:
                 out.push_back(point);
             } while (result->NextRow());
         }
+    }
+
+    static void AppendLeg(uint32 from, uint32 to,
+                          OverseerDecisions::RouteNode const& toNode,
+                          std::vector<OverseerDecisions::RoutePoint>& out)
+    {
+        std::size_t const before = out.size();
+        ReadLegPoints(from, to, out);
         if (out.size() != before)
             return;
         OverseerDecisions::RoutePoint point;
@@ -17034,6 +17078,94 @@ private:
         return answer;
     }
 
+    // A SURVEYED ROAD JOINED BETWEEN ITS NODES (2026-09-24). See
+    // OverseerDecisions::JoinRoad for what was measured. `points` is what is
+    // left of the joined link from the join point on, ending on node `to`;
+    // `onward` says whether a plan from `to` was found worth walking, or
+    // whether the rest of the link is the whole route.
+    struct SurveyedRoadJoin
+    {
+        bool found{false};
+        uint32 from{0};
+        uint32 to{0};
+        OverseerDecisions::RoadJoin join;
+        std::vector<OverseerDecisions::RoutePoint> points;
+        std::size_t pointsOnLink{0};
+        bool onward{false};
+    };
+
+    // ASKED ONLY WHEN NO NODE IS NEAR. Every walk link on this map whose
+    // recorded path could pass within TRAVEL_ROUTE_ROAD_JOIN_YARDS of the
+    // character has its points read, the nearest one is asked of the navmesh
+    // the way an entry node is, and each join that holds is priced by planning
+    // on from its far node. Both directions of a road are separate links, so
+    // the choice between walking up it and down it is made here, on the whole
+    // journey, and never on which end is nearer. Reads points only for the few
+    // links that pass the cheap ellipse test, and only once per errand.
+    static SurveyedRoadJoin JoinSurveyedRoad(
+        Player* bot, TravelSurvey const& survey,
+        std::map<uint32, OverseerDecisions::RouteNode const*> const& byId,
+        float aimX, float aimY, OverseerDecisions::RoutePlanLimits const& limits)
+    {
+        float const x = bot->GetPositionX();
+        float const y = bot->GetPositionY();
+        std::vector<SurveyedRoadJoin> joins;
+        std::vector<OverseerDecisions::RoadJoinOption> options;
+        for (OverseerDecisions::RouteLink const& link : survey.links)
+        {
+            if (!link.onFoot)
+                continue;
+            auto const a = byId.find(link.from);
+            auto const b = byId.find(link.to);
+            if (a == byId.end() || b == byId.end())
+                continue;
+            if (!OverseerDecisions::RoadMayPassNear(a->second->x, a->second->y,
+                                                    b->second->x, b->second->y,
+                                                    link.yards, x, y,
+                                                    TRAVEL_ROUTE_ROAD_JOIN_YARDS))
+                continue;
+            SurveyedRoadJoin candidate;
+            candidate.from = link.from;
+            candidate.to = link.to;
+            ReadLegPoints(link.from, link.to, candidate.points);
+            candidate.join = OverseerDecisions::JoinRoad(candidate.points, x, y,
+                                                         TRAVEL_ROUTE_ROAD_JOIN_YARDS);
+            if (!candidate.join.found)
+                continue;
+            OverseerDecisions::RoutePoint const& at = candidate.points[candidate.join.index];
+            if (NavmeshRefusesEntry(bot, at.x, at.y, at.z))
+                continue;
+            OverseerDecisions::RoutePlan const onward = OverseerDecisions::PlanFootRoute(
+                survey.nodes, survey.links, bot->GetMapId(), b->second->x, b->second->y,
+                aimX, aimY, limits);
+            OverseerDecisions::RoadJoinOption option;
+            option.remainingYards = candidate.join.remainingYards;
+            if (onward.verdict == OverseerDecisions::RoutePlanVerdict::Planned)
+            {
+                candidate.onward = true;
+                option.onwardYards = onward.yards;
+                option.endsFromAimYards = onward.endsFromAimYards;
+            }
+            else
+            {
+                float const dx = b->second->x - aimX;
+                float const dy = b->second->y - aimY;
+                option.endsFromAimYards = std::sqrt(dx * dx + dy * dy);
+            }
+            joins.push_back(std::move(candidate));
+            options.push_back(option);
+        }
+        std::size_t const chosen = OverseerDecisions::ChooseRoadJoin(
+            options, bot->GetExactDist2d(aimX, aimY), limits.minGainYards);
+        if (chosen >= joins.size())
+            return SurveyedRoadJoin{};
+        SurveyedRoadJoin road = std::move(joins[chosen]);
+        road.found = true;
+        road.pointsOnLink = road.points.size();
+        road.points.erase(road.points.begin(), road.points.begin() + road.join.index);
+        return road;
+    }
+
     // THE WHOLE ROUTE FOR ONE ERRAND, planned once and then walked. Empty means
     // "there is no route to plan", which every caller must read as "aim at the
     // errand", never as an error: that is what this module did before #316 and
@@ -17183,11 +17315,57 @@ private:
         OverseerDecisions::RoutePlan plan;
         unsigned refusedEntries = 0;
         uint32 walkableEntry = 0;
+        // WHERE THE PLAN STARTS (2026-09-24): the character, or the far node of
+        // the surveyed road it joined between nodes, whose remaining points
+        // then lead the route. See JoinSurveyedRoad.
+        float planFromX = bot->GetPositionX();
+        float planFromY = bot->GetPositionY();
+        bool roadAsked = false;
+        SurveyedRoadJoin road;
         for (unsigned pass = 0; pass <= TRAVEL_ROUTE_GUARDED_PASSES;)
         {
             plan = OverseerDecisions::PlanFootRoute(
-                survey.nodes, survey.links, bot->GetMapId(), bot->GetPositionX(),
-                bot->GetPositionY(), aimX, aimY, limits);
+                survey.nodes, survey.links, bot->GetMapId(), planFromX,
+                planFromY, aimX, aimY, limits);
+            // NO NODE NEAR IS NOT THE SAME AS NO SURVEY NEAR (2026-09-24). A
+            // walk link can run 1906 yards between its two nodes, and a
+            // character in the middle of it is on the survey's own road. Asked
+            // once, and only here, so every journey that finds a node walks
+            // exactly the route it walked before.
+            if (plan.verdict == OverseerDecisions::RoutePlanVerdict::NoEntryNode &&
+                !roadAsked)
+            {
+                roadAsked = true;
+                OverseerDecisions::RoutePlanLimits joinLimits = limits;
+                joinLimits.refusedEntries.clear();
+                road = JoinSurveyedRoad(bot, survey, byId, aimX, aimY, joinLimits);
+                if (road.found)
+                {
+                    auto const farEnd = byId.find(road.to);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is sent to '{}' and no survey node is within "
+                             "{:.0f} yards of it, but it stands {:.0f} yards from the "
+                             "surveyed road from node {} to node {} - it joins that road at "
+                             "its point {} of {} and walks the {:.0f} yards left of it to "
+                             "node {}, and the route is planned on from there{} (#652)",
+                             name, target, limits.entryNodeYards, road.join.yards,
+                             road.from, road.to, static_cast<uint32>(road.join.index),
+                             static_cast<uint32>(road.pointsOnLink),
+                             road.join.remainingYards, road.to,
+                             road.onward ? "" : " (the road's end is as far as the survey helps)");
+                    if (!road.onward || farEnd == byId.end())
+                        break;
+                    // The far node is where the plan starts and is reached by the
+                    // road, so it is not asked of the navmesh from here; the join
+                    // point was. And what was refused as a way in from where the
+                    // character stands says nothing about the far node.
+                    planFromX = farEnd->second->x;
+                    planFromY = farEnd->second->y;
+                    walkableEntry = road.to;
+                    limits.refusedEntries.clear();
+                    continue;
+                }
+            }
             if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
                 break;
             // THE WAY IN MUST BE A PLACE THE CHARACTER CAN WALK TO (2026-09-23).
@@ -17230,6 +17408,17 @@ private:
             ++pass;
         }
 
+        // THE JOINED ROAD IS THE WHOLE ROUTE when nothing is worth planning
+        // past its end, or when the plan from its end did not hold up.
+        // JoinSurveyedRoad already checked it ends nearer the aim.
+        if (road.found && (!road.onward ||
+                           plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned))
+        {
+            route = road.points;
+            joinsCorridor = corridor.joinFirst && !route.empty();
+            return route;
+        }
+
         if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
         {
             // AND A JOIN LEG THAT CANNOT BE PLANNED DOES NOT BECOME THE ROAD
@@ -17260,6 +17449,8 @@ private:
             return route;
         }
 
+        if (road.found)
+            route = road.points;
         for (std::size_t i = 0; i + 1 < plan.nodes.size(); ++i)
         {
             auto const to = byId.find(plan.nodes[i + 1]);
@@ -17454,6 +17645,7 @@ private:
                 state.route = PlanRoute(bot, want, name, target,
                                         state.routeIsMeasured, state.routeJoinsCorridor);
                 state.routeCursor = OverseerDecisions::RouteCursor{};
+                state.routeSerial = TravelAimBook::NextRouteSerial();
             }
             if (state.route.empty())
                 return want;
@@ -26554,6 +26746,12 @@ private:
         // backstop counts time without progress. Reset with each leg and with
         // the clock. See OverseerDecisions::StagingClockAfterReading.
         float gatherBest{-1.f};
+        // THE LEADER'S PLACE ON HIS SURVEYED ROUTE as the GATHERING clock last
+        // read it, and whether that clock has said once this run that it was
+        // kept running by the route rather than by the straight line
+        // (2026-09-24). See OverseerDecisions::StagingClockAfterReading.
+        OverseerDecisions::RouteMark gatherRoute{};
+        bool loggedGatherRoute{false};
         // EACH MEMBER'S SURVEYED ROUTE POSITION AS THE WATCHDOG LAST READ IT
         // (2026-09-23). A position that moved on is progress along a way round
         // the straight-line gap cannot see. See RunStagingWatchdog.
@@ -35338,13 +35536,40 @@ private:
             // A new best by DUNGEON_GATHER_PROGRESS_YARDS restarts the whole-run
             // clock; a leader who stops is written off twelve minutes after he
             // stopped, as before. See OverseerDecisions::StagingClockAfterReading.
+            //
+            // AND SO DOES A LEADER GOING FORWARD ON HIS SURVEYED ROUTE
+            // (2026-09-24). The Zul'Farrak approach from Un'Goro Crater climbs
+            // out by the Marshlands ramp, which walks the first half of the
+            // route AWAY from the door, and twice the clock closed the attempt
+            // with the leader walking it well because no straight-line reading
+            // could set a new best. Read as a RouteMark, so a route planned
+            // again by a re-armed errand is not counted as a step along it.
             if (coord.stagingSince)
             {
+                OverseerDecisions::RouteMark const mark = _travelAims.RouteMarkOf(leaderName);
+                bool const walkedOnRoute =
+                    OverseerDecisions::RouteMarkAdvanced(coord.gatherRoute, mark);
+                coord.gatherRoute = mark;
                 OverseerDecisions::StagingClock const clock =
                     OverseerDecisions::StagingClockAfterReading(
                         {coord.stagingSince, coord.gatherBest}, gap.measured,
                         gap.horizontalYards, std::time(nullptr),
-                        DUNGEON_GATHER_PROGRESS_YARDS);
+                        DUNGEON_GATHER_PROGRESS_YARDS, walkedOnRoute);
+                if (walkedOnRoute && !coord.loggedGatherRoute &&
+                    gap.measured && coord.gatherBest >= 0.f &&
+                    gap.horizontalYards > coord.gatherBest)
+                {
+                    coord.loggedGatherRoute = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run {} keeps GATHERING open for leader '{}' "
+                             "because he is going forward on his surveyed route (point {}), "
+                             "though the straight line to the staging point reads {:.0f} "
+                             "yards against a best of {:.0f}. A route that first walks away "
+                             "from the door is progress, and the twelve-minute clock now "
+                             "counts from his last step along it (#652)",
+                             coord.runNumber, leaderName, mark.at, gap.horizontalYards,
+                             coord.gatherBest);
+                }
                 coord.stagingSince = clock.since;
                 coord.gatherBest = clock.bestYards;
             }

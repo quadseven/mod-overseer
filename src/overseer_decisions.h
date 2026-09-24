@@ -9122,6 +9122,75 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
 bool EntryUnreachable(bool computed, bool meshAbsent, bool noPath, float endGapYards,
                       float toleranceYards);
 
+// ------------ A CHARACTER ON A SURVEYED ROAD IS ON THE SURVEY (2026-09-24) --
+//
+// Measured 2026-09-24 on the dev realm. The Alliance leader was walked to the
+// Zul'Farrak staging point from the road between Thistleshrub Valley and the
+// Marshlands, the ramp that climbs from Un'Goro Crater into Tanaris. The
+// survey records that road as ONE walk link of 1906 yards with 457 recorded
+// points and no node between its two ends, so the middle of it stands more
+// than RoutePlanLimits::entryNodeYards from every node on the map. PlanFootRoute
+// answered "no travel node within reach", the leader was handed the door 1780
+// yards off across the crater wall, and the mover walked him onto that wall: 26
+// yards inside it by the terrain drive's reading, lifted onto a ledge, every
+// bearing refused from the ledge, and a 29-yard fall. He was standing on the
+// survey's own road the whole time and the planner could not see it, because
+// it only ever looks for nodes.
+//
+// So when no node is near, the recorded points of a walk link can be the way
+// in. These three answer the pure part of that: which links are worth reading
+// the points of, where on a link's points the character joins it, and which of
+// the joins found is the one to walk.
+
+// COULD THE RECORDED PATH OF THIS LINK PASS WITHIN `reachYards` OF (x, y)?
+// Asked of every walk link on the map, so it must be cheap and must never say
+// no to a link that does pass near. `(ax, ay)` and `(bx, by)` are the link's two
+// nodes and `pathYards` is the link's recorded length, which is never shorter
+// than the plane length of its points. Every point Q of such a path has
+// |AQ| + |QB| <= pathYards, so a character within `reachYards` of Q has
+// |AP| + |PB| <= pathYards + 2 * reachYards: outside that ellipse nothing on the
+// path can be near. A link that is not a distance is never near.
+bool RoadMayPassNear(float ax, float ay, float bx, float by, float pathYards,
+                     float x, float y, float reachYards);
+
+// WHERE A CHARACTER JOINS ONE LINK'S RECORDED POINTS. The nearest point within
+// `reachYards` of (x, y) on the plane, and the walking yards from it to the
+// link's end along the points (plane length, which is what the stepper walks
+// and what PlanFootRoute's own yards are compared on). The last point is never
+// a join: a character beside a link's far end is beside that NODE, and the
+// ordinary entry answers it. Not found for an empty or one-point path.
+struct RoadJoin
+{
+    bool found{false};
+    std::uint32_t index{0};
+    float yards{0.f};
+    float remainingYards{0.f};
+};
+RoadJoin JoinRoad(std::vector<RoutePoint> const& path, float x, float y,
+                  float reachYards);
+
+// ONE WAY OF WALKING ON FROM A JOIN. `remainingYards` is the rest of the joined
+// link, `onwardYards` the planned walk from the link's far node (zero when
+// nothing is planned from it), and `endsFromAimYards` how far from the aim the
+// whole thing stops.
+struct RoadJoinOption
+{
+    float remainingYards{0.f};
+    float onwardYards{0.f};
+    float endsFromAimYards{0.f};
+};
+
+// WHICH JOIN TO WALK. The one with the least ground in total - rest of the
+// link, the planned walk after it, and what is left to the aim - among those
+// that finish at least `minGainYards` nearer the aim than the character stands
+// now (`fromAimYards`), for the reason RoutePlanLimits::minGainYards gives: a
+// route that does not get the character anywhere nearer is the greedy
+// stepper's own failure with a route's clothes on. Both directions of a road
+// are separate links and so separate options, and this is what picks between
+// them. Returns options.size() when none qualifies.
+std::size_t ChooseRoadJoin(std::vector<RoadJoinOption> const& options,
+                           float fromAimYards, float minGainYards);
+
 // How far along its route a character has got. Held by the caller beside the
 // route itself, and thrown away with it.
 struct RouteCursor
@@ -9141,6 +9210,23 @@ struct RouteCursor
 // whatever the straight line says. `seen` and `now` are route point indexes,
 // below zero for no route; a new, shorter route is not progress by itself.
 bool RouteCursorAdvanced(long seen, long now);
+
+// WHERE A CHARACTER IS ON WHICH ROUTE (2026-09-24). A cursor alone cannot say
+// whether it moved on: every route starts again at point 0, so a leader whose
+// errand is ended and re-armed every few seconds reads 0, then the point he is
+// standing beside, then 0, and RouteCursorAdvanced calls each of those climbs
+// progress. `route` names the plan the cursor belongs to (0 for none) and is
+// never reused for another plan by the caller.
+struct RouteMark
+{
+    std::uint64_t route{0};
+    long at{-1};
+};
+
+// HAS THE CHARACTER GOT FURTHER ALONG THE SAME ROUTE? Only when both marks name
+// the same route and the point index grew. A new route, no route, or the first
+// reading of one is not progress, for the reasons RouteCursorAdvanced gives.
+bool RouteMarkAdvanced(RouteMark seen, RouteMark now);
 
 // A FOLLOWER IS LENT `new rpg` FOR A PARTY FLIGHT, AND GIVEN IT BACK ON LANDING
 // (2026-09-23). Every party flight on the dev realm was refused with "'Zrog' is
@@ -11557,13 +11643,24 @@ bool MemberFollowsForFlight(bool columnEmpty, bool catchingUp, bool aimInert,
 // per-character stall ladder still escalates him long before that. `bestYards`
 // below zero means no reading yet: the first reading is the baseline and does
 // not restart anything. A poll with no reading changes nothing.
+//
+// AND A LEADER GOING FORWARD ON HIS SURVEYED ROUTE IS CLOSING THE GAP, whatever
+// the straight line says (2026-09-24). Measured on the dev realm: the Alliance
+// leader was routed to Zul'Farrak from Un'Goro Crater along 6587 yards of
+// survey, out of the crater by the Marshlands ramp and back north across
+// Tanaris. The first half of that walks AWAY from the door - 976 yards out at
+// the start, 1807 at Thistleshrub Valley - so no reading ever set a new best,
+// and the clock closed the attempt at twelve minutes twice, both times with the
+// leader walking the route well. `walkedOnRoute` restarts the clock the way a
+// new best does; it is RouteMarkAdvanced's answer, and nothing else may set it.
 struct StagingClock
 {
     time_t since{0};
     float bestYards{-1.f};
 };
 StagingClock StagingClockAfterReading(StagingClock clock, bool measured, float yards,
-                                      time_t now, float minProgressYards);
+                                      time_t now, float minProgressYards,
+                                      bool walkedOnRoute);
 
 
 // -------------- the trip that follows a run, rather than one that never
