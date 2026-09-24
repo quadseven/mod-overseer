@@ -17446,6 +17446,10 @@ constexpr ResetPart RESET_PARTS[] = {
 };
 
 ResetTreatment ResetTreatmentFor(ResetPart part);
+
+// The level a reset takes a character to: 1, by name and by the operator's
+// decision, not the realm's configured start level (which a realm may raise).
+constexpr unsigned NATURALIZE_RESET_LEVEL = 1;
 char const* ResetPartWord(ResetPart part);
 char const* ResetTreatmentWord(ResetTreatment treatment);
 

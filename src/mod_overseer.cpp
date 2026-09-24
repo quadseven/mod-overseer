@@ -47616,7 +47616,9 @@ private:
                 ++activeQuests;
 
         PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(), player->getClass());
-        uint32 const startLevel = sWorld->getIntConfig(CONFIG_START_PLAYER_LEVEL);
+        // Level 1, whatever the realm's configured start level: the mode's name
+        // and the operator's decision are both level 1.
+        uint32 const startLevel = OverseerDecisions::NATURALIZE_RESET_LEVEL;
         uint32 const startMoney = sWorld->getIntConfig(CONFIG_START_PLAYER_MONEY);
 
         o << ",\"removes\":{\"level\":" << uint32(player->GetLevel()) << ",\"items\":" << items
@@ -48044,19 +48046,19 @@ private:
             return false;
         }
 
-        player->resetTalents(true);
+        // THE LEVEL FIRST, AND NOTHING ELSE UNTIL IT HAS READ BACK. If the
+        // level does not move, the run stops having changed nothing, so a retry
+        // starts from the same character.
         player->GiveLevel(static_cast<uint8>(targetLevel));
-        player->InitTalentForLevel();
-        player->SetUInt32Value(PLAYER_XP, 0);
         if (player->GetLevel() != targetLevel)
         {
             blocked = true;
-            o << ",\"blocked\":" << J("the level did not change; only the talents were reset, and they are spent "
-                                       "again below");
-            if (specTab <= MAX_TALENT_TAB)
-                SpendTalents(player, specTab);
-            return true;
+            o << ",\"blocked\":" << J("the level did not change; nothing was changed");
+            return false;
         }
+        player->InitTalentForLevel();
+        player->SetUInt32Value(PLAYER_XP, 0);
+        player->resetTalents(true);
 
         for (auto const& entry : remove)
             player->removeSpell(std::get<0>(entry), SPEC_MASK_ALL, false);

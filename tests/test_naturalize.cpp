@@ -45,6 +45,7 @@ using OverseerDecisions::DuesDiscardFor;
 using OverseerDecisions::DuesLetter;
 using OverseerDecisions::ExperienceBetween;
 using OverseerDecisions::NATURALIZE_PART_GOLD;
+using OverseerDecisions::NATURALIZE_RESET_LEVEL;
 using OverseerDecisions::LoweredSkillValue;
 using OverseerDecisions::LowerSpellDecisionFor;
 using OverseerDecisions::LowerSpellFacts;
@@ -329,6 +330,7 @@ void TestResetKeepsAndRemoves()
             wordsOk = false;
     }
     Check("exactly four parts survive a reset: identity, guild, rank, played time", kept == 4);
+    Check("a reset goes to level 1, not to a realm's configured start", NATURALIZE_RESET_LEVEL == 1);
     Check("every part and treatment has a word for the result", wordsOk);
 }
 
