@@ -14058,6 +14058,10 @@ constexpr char const* NoMailboxOnMap   = "no mailbox on this map";
 constexpr char const* MailboxTooFar    = "nearest mailbox is beyond the cap";
 constexpr char const* OtherSidesGround = "the way to the nearest mailbox crosses the other side's ground";
 constexpr char const* GroundRefused    = "the ground toward the mailbox does not hold";
+// The classic ruleset (Classic::IsExpansionContinent): no walk starts on
+// Outland or Northrend. Worth asking again: a random bot there is moved back to
+// the classic continents by its next random teleport.
+constexpr char const* ExpansionContinent = "character stands in Outland or Northrend, outside the classic world";
 
 // Endings of a walk that started.
 constexpr char const* EnteredCombat    = "entered combat on the way to the mailbox";
@@ -14674,6 +14678,44 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 // row, and only from another map (a teleport inside the instance is not a
 // crossing). A ghost is never refused: its corpse may be inside.
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered);
+
+// THE CLASSIC RULESET. The operator restricts these worlds to a classic
+// level-60 feel: characters stop at level 60, professions stop at skill 300,
+// and the world is Eastern Kingdoms, Kalimdor and the classic instances, never
+// Outland (map 530) or Northrend (map 571).
+//
+// MIRRORED, NOT SHARED. The overseer site keeps the same numbers in its own
+// classic.py, and a test there reads this block from the module it pins and
+// fails when the two disagree. Change both together.
+//
+// WHY THE MODULE NEEDS ITS OWN COPY. The site plans who walks where, but this
+// module is the half that moves a character and buys a rank, and a row written
+// by an older site, or by hand, reaches it just the same. Measured on the dev
+// world 2026-09-23: 410 random bots stood on map 530, a guild dues walk aimed a
+// guild member at an Outland mailbox, and 676 characters carried a 375 skill
+// cap that only Outland and Northrend trainers teach.
+namespace Classic
+{
+constexpr uint32_t MAX_LEVEL = 60;
+constexpr uint32_t MAX_PROFESSION_SKILL = 300;
+constexpr uint32_t OUTLAND_MAP = 530;
+constexpr uint32_t NORTHREND_MAP = 571;
+
+// Outland or Northrend. A walk or a travel aim that would start or end on one
+// of these is refused. The Blood Elf and Draenei starting lands are physically
+// on map 530 and count as Outland here on purpose: the ruleset names the map.
+bool IsExpansionContinent(uint32_t mapId);
+
+// May a trainer sell a profession rank whose ceiling is `rankMaxSkill` (the
+// core's SpellLearnSkillNode::maxvalue, step x 75)? Apprentice through Artisan
+// (75..300) yes; Master (375) and Grand Master (450) no. A rank of 0 names no
+// ceiling and is let through, so a spell that is not a rank is not judged here.
+bool ClassicRankAllowed(uint32_t rankMaxSkill);
+
+// May a trainer sell a recipe that needs `reqSkillRank` in its trade? Only one
+// a character inside the 300 cap could ever reach.
+bool ClassicRecipeAllowed(uint32_t reqSkillRank);
+}  // namespace Classic
 
 }  // namespace OverseerDecisions
 

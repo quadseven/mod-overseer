@@ -11224,6 +11224,18 @@ private:
                              uint32& outEntry, WorldPosition& outPos,
                              uint32 wantSkill = 0, std::string* outSaid = nullptr)
     {
+        // THE CLASSIC RULESET. Every branch below resolves on the character's
+        // own map, so one question here covers them all: a character standing
+        // in Outland or Northrend is aimed nowhere, and an `at:` aim naming
+        // 530 or 571 can only match a character already there. The caller's
+        // release path logs `said` and lets the errand go.
+        if (bot && OverseerDecisions::Classic::IsExpansionContinent(bot->GetMapId()))
+        {
+            if (outSaid)
+                *outSaid = "stands in Outland or Northrend, outside the classic world";
+            return false;
+        }
+
         // A PLACE, NOT A CREATURE: `at:<map>:<x>,<y>,<z>`. Answered before the
         // NPC index is even built, because no spawn is involved - the aim names
         // ground. This is what lets a party reach an instance portal, which is
@@ -11748,6 +11760,28 @@ private:
         return 0;
     }
 
+    // The skill ceiling a profession rank spell gives: the core's
+    // SpellLearnSkillNode::maxvalue, step x 75 (SpellMgr::LoadSpellLearnSkills),
+    // so 300 for Artisan and 375 for Master. Read through the same two shapes
+    // SkillStartedBySpell walks: the rank spell itself, or a wrapper whose
+    // SPELL_EFFECT_LEARN_SPELL names it. 0 when the spell teaches no skill.
+    static uint32 RankCeilingOfSpell(uint32 spellId)
+    {
+        if (SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(spellId))
+            return node->maxvalue;
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info)
+            return 0;
+        for (SpellEffectInfo const& effect : info->GetEffects())
+        {
+            if (!effect.IsEffect(SPELL_EFFECT_LEARN_SPELL) || !effect.TriggerSpell)
+                continue;
+            if (SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(effect.TriggerSpell))
+                return node->maxvalue;
+        }
+        return 0;
+    }
+
     // Every primary profession this trainer ENTRY can start somebody in.
     //
     // THIS IS WHAT MAKES THE ERRAND LAND SOMEWHERE USEFUL, and its absence was
@@ -11783,11 +11817,20 @@ private:
     // one place the refusals are legible: it folds "already known", "too low a
     // level", "wrong race or class" and - the one that matters most here - "no
     // free primary profession slot" into a single answer (Trainer.cpp:134-150).
+    //
+    // THE CLASSIC RULESET CAPS THE RANK AT ARTISAN (300). Master and Grand
+    // Master are sold only by Outland and Northrend trainers, but the core would
+    // sell one anywhere it stands, so the ceiling the rank would give is read
+    // and a rank above 300 is never the answer. A character already at Artisan
+    // is then offered no rank at all, which ends its errand as "nothing to
+    // learn" rather than walking it somewhere it may not go.
     static uint32 TrainerSpellForSkill(Trainer::Trainer* trainer, Player* bot, uint32 skill)
     {
         for (Trainer::Spell const& spell : trainer->GetSpells())
         {
             if (SkillStartedBySpell(spell.SpellId, true) != skill)
+                continue;
+            if (!OverseerDecisions::Classic::ClassicRankAllowed(RankCeilingOfSpell(spell.SpellId)))
                 continue;
             if (!trainer->CanTeachSpell(bot, &spell))
                 continue;
@@ -20190,7 +20233,10 @@ private:
             // a pinned errand, which is not re-resolving anything, and empty
             // for an ordinary choice the faction gate did not change.
             std::string said;
-            if (state.pinned && state.mapId == bot->GetMapId())
+            // A pin on Outland or Northrend is not reused: the resolve below
+            // refuses it under the classic ruleset and the errand is released.
+            if (state.pinned && state.mapId == bot->GetMapId()
+                && !OverseerDecisions::Classic::IsExpansionContinent(state.mapId))
             {
                 entry = state.entry;
                 pos = WorldPosition(state.mapId, state.x, state.y, state.z);
@@ -47627,9 +47673,13 @@ private:
     {
         rankSpell = TrainerSpellForSkill(trainer, who, ev.skill);
         spells.clear();
+        // Under the classic ruleset a recipe past skill 300 is never bought,
+        // even by a character whose cap an Outland trainer already raised.
         for (uint32 spellId : ev.learnAsked)
             if (Trainer::Spell const* spell = trainer->GetSpell(spellId))
-                if (spell->ReqSkillLine == ev.skill && trainer->CanTeachSpell(who, spell))
+                if (spell->ReqSkillLine == ev.skill
+                    && OverseerDecisions::Classic::ClassicRecipeAllowed(spell->ReqSkillRank)
+                    && trainer->CanTeachSpell(who, spell))
                     spells.push_back(spellId);
     }
 
@@ -47921,6 +47971,13 @@ private:
             ev.capYards = req.maxYards;
             ev.item = req.item;
         }
+
+        // THE CLASSIC RULESET. A walk is always on the walker's own map, so a
+        // guild member standing in Outland or Northrend would be walked to an
+        // Outland or Northrend mailbox, trainer or vendor. It is refused before
+        // anything is held, and the row says why.
+        if (D::Classic::IsExpansionContinent(ev.mapId))
+            return refuse(R::ExpansionContinent);
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(who);
         WorldSession* session = who->GetSession();
