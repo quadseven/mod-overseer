@@ -16055,6 +16055,110 @@ HearthRegroupStep HearthRegroupStepFor(bool inHearthSet, float yardsFromInn, boo
 // "at the inn", "hearth", "wait for the leader", "travel".
 char const* HearthRegroupStepWord(HearthRegroupStep step);
 
+// ------------------------------------------------ a ghost and its corpse --
+//
+// CORPSE RUN, SPIRIT HEALER OR WAIT: WHAT A PLAYER DECIDES AS A GHOST.
+//
+// The dead engine mod-playerbots runs for a released character walks the
+// ghost from the graveyard back to its corpse and reclaims it
+// (FindCorpseAction, ReviveFromCorpseAction). Its only way out of a corpse
+// that keeps killing it is `death count` reaching five, which is the loop
+// already run five times, and that branch is skipped outright for a character
+// whose master has a game client. So a corpse lying beside something that
+// killed it is reclaimed beside that thing, again and again.
+//
+// Measured on the dev realm: a Horde family at levels 25 to 27 died again and
+// again in Ashenvale near Demon Fall Canyon to Roaming Felguards and Searing
+// Infernals (levels 28 to 30, spawned 18 and 46 yards from the corpse point).
+// One member died at 09:05:36, came back at its corpse through the corpse run
+// with no revival from this module in between, and died 32 yards away 57
+// seconds later. Another died twice at the identical point three minutes
+// apart. A third Alliance character died to the same Plated Stegodon three
+// times in four minutes.
+//
+// A player does not do that. After dying twice in one place, or when the
+// thing near the corpse is well above its level, it takes the spirit healer
+// at the graveyard and accepts resurrection sickness. When what is near the
+// corpse could move off, it waits at a distance for a while first. That is
+// this decision.
+enum class GhostRecovery : uint8_t
+{
+    CorpseRun,     // leave the dead engine to walk back and reclaim the corpse
+    SpiritHealer,  // walk to the graveyard's spirit healer and take its resurrection
+    Wait,          // hold the ghost where it is until the corpse is clear
+    Ladder,        // hold the ghost and hand it to the stuck-revival ladder,
+                   // because the spirit healer's graveyard is itself unsafe
+};
+
+enum class GhostRecoveryReason : uint8_t
+{
+    Clear,            // nothing near the corpse argues against the corpse run
+    AlreadyChose,     // the spirit healer was chosen on an earlier poll
+    RepeatDeaths,     // died here already inside the repeat window
+    Outlevelled,      // a hostile well above its level stands near the corpse
+    HostilesNearby,   // a hostile at or above its level stands near the corpse now
+    WaitedOut,        // it waited and the corpse never cleared
+};
+
+struct GhostRecoveryFacts
+{
+    uint32_t level{0};
+    // This character's own deaths within the repeat radius of the corpse and
+    // inside the repeat window, THIS death included.
+    unsigned deathsHere{0};
+    // The highest level of any hostile near the corpse, spawn table or live
+    // grid, whichever is higher. 0 when there is none.
+    uint32_t strongestNearCorpse{0};
+    // Living hostiles near the corpse right now at or above the character's
+    // own level: the ones that can walk away, and the ones worth waiting for.
+    unsigned liveThreatsNearCorpse{0};
+    // Seconds since the release (the corpse's ghost time).
+    long ghostSeconds{0};
+    // The graveyard the ghost would take the spirit healer at passes the
+    // module's own graveyard safety test.
+    bool healerGraveyardSafe{false};
+    // An earlier poll of this same death already chose the spirit healer.
+    bool choseHealer{false};
+};
+
+struct GhostRecoveryLimits
+{
+    unsigned repeatDeaths{2};
+    uint32_t levelGap{3};
+    long waitSeconds{90};
+};
+
+struct GhostRecoveryVerdict
+{
+    GhostRecovery choice{GhostRecovery::CorpseRun};
+    GhostRecoveryReason reason{GhostRecoveryReason::Clear};
+};
+
+// FIVE RULES, IN THIS ORDER:
+//
+//   1. The spirit healer was already chosen for this death: keep it. A ghost
+//      halfway to the healer is not turned round because a patrol wandered off.
+//   2. It has died `repeatDeaths` times here inside the window: spirit healer.
+//   3. A hostile at least `levelGap` levels above it is near the corpse:
+//      spirit healer.
+//   4. A hostile at or above its level is near the corpse now: wait, and after
+//      `waitSeconds` since the release take the spirit healer instead.
+//   5. Otherwise: corpse run.
+//
+// Wherever rules 2 to 4 pick the spirit healer and its graveyard is unsafe,
+// the answer is Ladder instead: the ghost is still kept off the corpse, and
+// the existing revival ladder, which already knows how to refuse a graveyard,
+// takes it.
+GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
+                                         GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
+
+// "corpse_run", "spirit_healer", "wait", "ladder": the words written to
+// overseer_death.ghost_recovery and to the log.
+char const* GhostRecoveryWord(GhostRecovery choice);
+
+// A sentence fragment saying why, for the log line.
+char const* GhostRecoveryReasonText(GhostRecoveryReason reason);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

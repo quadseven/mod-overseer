@@ -13798,4 +13798,82 @@ char const* HearthRegroupStepWord(HearthRegroupStep step)
     return "unknown";
 }
 
+GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
+                                         GhostRecoveryLimits const& limits)
+{
+    GhostRecoveryVerdict verdict;
+
+    // Where the spirit healer is the answer, unless its graveyard is unsafe.
+    auto const healer = [&](GhostRecoveryReason why) {
+        verdict.choice = facts.healerGraveyardSafe ? GhostRecovery::SpiritHealer
+                                                   : GhostRecovery::Ladder;
+        verdict.reason = why;
+        return verdict;
+    };
+
+    // 1. A choice already made is kept.
+    if (facts.choseHealer)
+        return healer(GhostRecoveryReason::AlreadyChose);
+
+    // 2. It has already died here inside the window.
+    if (limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths)
+        return healer(GhostRecoveryReason::RepeatDeaths);
+
+    // 3. Something near the corpse is well above it.
+    if (facts.strongestNearCorpse &&
+        facts.strongestNearCorpse >= facts.level + limits.levelGap)
+        return healer(GhostRecoveryReason::Outlevelled);
+
+    // 4. Something near the corpse could kill it again, and may move off.
+    if (facts.liveThreatsNearCorpse)
+    {
+        if (facts.ghostSeconds < limits.waitSeconds)
+        {
+            verdict.choice = GhostRecovery::Wait;
+            verdict.reason = GhostRecoveryReason::HostilesNearby;
+            return verdict;
+        }
+        return healer(GhostRecoveryReason::WaitedOut);
+    }
+
+    // 5. Clear: the corpse run is what anybody would do.
+    return verdict;
+}
+
+char const* GhostRecoveryWord(GhostRecovery choice)
+{
+    switch (choice)
+    {
+        case GhostRecovery::CorpseRun:
+            return "corpse_run";
+        case GhostRecovery::SpiritHealer:
+            return "spirit_healer";
+        case GhostRecovery::Wait:
+            return "wait";
+        case GhostRecovery::Ladder:
+            return "ladder";
+    }
+    return "unknown";
+}
+
+char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
+{
+    switch (reason)
+    {
+        case GhostRecoveryReason::Clear:
+            return "nothing near the corpse argues against reclaiming it";
+        case GhostRecoveryReason::AlreadyChose:
+            return "the spirit healer was already chosen for this death";
+        case GhostRecoveryReason::RepeatDeaths:
+            return "it has already died here inside the repeat window";
+        case GhostRecoveryReason::Outlevelled:
+            return "a hostile well above its level stands near the corpse";
+        case GhostRecoveryReason::HostilesNearby:
+            return "a hostile at or above its level stands near the corpse right now";
+        case GhostRecoveryReason::WaitedOut:
+            return "it waited and the corpse never cleared";
+    }
+    return "unknown";
+}
+
 }  // namespace OverseerDecisions
