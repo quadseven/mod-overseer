@@ -25810,6 +25810,18 @@ private:
                     break;
             }
         }
+        // AN ORDERED RAID OWNS THE HEAD THE SAME WAY (mod-overseer#634): FORM,
+        // ASSEMBLE and ENTER walk him to the door, INSIDE holds him there, and
+        // the family's lower claimants yield to it exactly as they yield to a
+        // dungeon run in the same state.
+        auto const raid = _raidRunPhaseByMember.find(name);
+        if (raid != _raidRunPhaseByMember.end())
+        {
+            if (raid->second == OverseerDecisions::RaidRunPhase::Inside)
+                facts.runInside = true;
+            else if (raid->second != OverseerDecisions::RaidRunPhase::Idle)
+                facts.runStaging = true;
+        }
         facts.bagBlocked = !BagHeldFamilyOf(name).empty();
         return facts;
     }
@@ -30534,6 +30546,10 @@ private:
         std::string lastWhy;
     };
     std::map<std::string, RaidRunState> _raidRuns;
+    // Each roster member of a family whose raid run is not idle, and its phase,
+    // rebuilt on every DriveRaidRun, for HeadTravelFactsFor (#631's order of
+    // claimants on a head's travel column). World thread only.
+    std::map<std::string, OverseerDecisions::RaidRunPhase> _raidRunPhaseByMember;
     // Characters already told that the dungeon brain is held on a raid map, so
     // the line is said once per stay rather than every poll.
     std::set<std::string> _raidArmingHeldSaid;
@@ -30762,11 +30778,27 @@ private:
         using OverseerDecisions::RaidRunPhase;
 
         std::map<std::string, std::string> const jobs = LoadJobs();
+        _raidRunPhaseByMember.clear();
         for (OverseerDecisions::FamilyRoster const& roster : LoadFamilyRosters())
         {
             if (roster.leader.empty())
                 continue;
             RaidRunState& run = _raidRuns[roster.family];
+            // Whatever this poll decides, the phase the members are read at by
+            // the rest of the module is the one the run holds after it.
+            struct MarkMembers
+            {
+                std::map<std::string, OverseerDecisions::RaidRunPhase>& byMember;
+                OverseerDecisions::FamilyRoster const& roster;
+                RaidRunState const& run;
+                ~MarkMembers()
+                {
+                    if (run.phase == OverseerDecisions::RaidRunPhase::Idle)
+                        return;
+                    for (OverseerDecisions::FamilyMember const& member : roster.members)
+                        byMember[member.name] = run.phase;
+                }
+            } const mark{_raidRunPhaseByMember, roster, run};
             auto const job = jobs.find(roster.leader);
             std::string const keyword = OverseerDecisions::RaidKeywordForJob(
                 job == jobs.end() ? std::string() : job->second);
