@@ -133,8 +133,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_SHA: efe123fab543c5faf3c477674ec17a18fd59f09f
-  MODULE_SHA: 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312
+  CORE_SHA: 7f12e89ee5f467a50e62eba1d525eac7dc953d03
+  MODULE_SHA: 7bae1b5c58c76a0aa20381155edc08096d1485b2
   GHCR_IMAGE: ghcr.io/quadseven/mod-overseer
 
 jobs:

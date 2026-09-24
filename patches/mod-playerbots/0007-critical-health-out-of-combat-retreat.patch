@@ -84,8 +84,13 @@ separate design question this patch deliberately does not touch. This patch
 only ensures that WHEREVER a bot ends up after reviving, being at critical
 health and out of combat is not a state it can be stuck motionless in.
 
+REBASED 2026-09-24 onto mod-playerbots @ 7bae1b5c58c76a0aa20381155edc08096d1485b2 (upstream master). Only
+the diff below was regenerated, from a three-way rebase of this patch onto that
+tree; the reasoning above is unchanged, and any file:line it cites is at the SHA
+it was first written against.
+
 diff --git a/src/Ai/Base/ActionContext.h b/src/Ai/Base/ActionContext.h
-index aa5e4175..d6c4db29 100644
+index 6e41eb06..0db85451 100644
 --- a/src/Ai/Base/ActionContext.h
 +++ b/src/Ai/Base/ActionContext.h
 @@ -97,6 +97,7 @@ public:
@@ -105,10 +110,10 @@ index aa5e4175..d6c4db29 100644
      static Action* avoid_aoe(PlayerbotAI* botAI) { return new AvoidAoeAction(botAI); }
      static Action* combat_formation_move(PlayerbotAI* botAI) { return new CombatFormationMoveAction(botAI); }
 diff --git a/src/Ai/Base/Actions/MovementActions.cpp b/src/Ai/Base/Actions/MovementActions.cpp
-index 4ea6cbdb..cf1af5b2 100644
+index 45b6e4e8..3b30b9b7 100644
 --- a/src/Ai/Base/Actions/MovementActions.cpp
 +++ b/src/Ai/Base/Actions/MovementActions.cpp
-@@ -1840,6 +1840,22 @@ bool FleeAction::isUseful()
+@@ -1821,6 +1821,22 @@ bool FleeAction::isUseful()
      return true;
  }
  
@@ -132,11 +137,11 @@ index 4ea6cbdb..cf1af5b2 100644
  {
      if (bot->GetPet())
 diff --git a/src/Ai/Base/Actions/MovementActions.h b/src/Ai/Base/Actions/MovementActions.h
-index cbf44550..16b840f0 100644
+index 4b7ea265..55430ff4 100644
 --- a/src/Ai/Base/Actions/MovementActions.h
 +++ b/src/Ai/Base/Actions/MovementActions.h
-@@ -98,6 +98,31 @@ private:
-     float distance;
+@@ -94,6 +94,31 @@ public:
+     bool isUseful() override;
  };
  
 +// infra: FleeAction (above) needs AI_VALUE(Unit*, "current target") to pick a
@@ -190,7 +195,7 @@ index d8919309..a5ace870 100644
  
  void FleeFromAddsStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
 diff --git a/src/Ai/Base/Value/GrindTargetValue.cpp b/src/Ai/Base/Value/GrindTargetValue.cpp
-index c8cdfbeb..fcd5f074 100644
+index c33ead31..d0c63109 100644
 --- a/src/Ai/Base/Value/GrindTargetValue.cpp
 +++ b/src/Ai/Base/Value/GrindTargetValue.cpp
 @@ -44,6 +44,24 @@ Unit* GrindTargetValue::FindTargetForGrinding(uint32 assistCount)
@@ -219,10 +224,10 @@ index c8cdfbeb..fcd5f074 100644
      }
  
 diff --git a/src/Bot/Factory/AiFactory.cpp b/src/Bot/Factory/AiFactory.cpp
-index 1dbb382e..37de304c 100644
+index bb1fa527..4cd2d570 100644
 --- a/src/Bot/Factory/AiFactory.cpp
 +++ b/src/Bot/Factory/AiFactory.cpp
-@@ -506,6 +506,16 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
+@@ -508,6 +508,16 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
  {
      uint8 tab = GetPlayerSpecTab(player);
  
