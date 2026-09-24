@@ -33122,8 +33122,7 @@ private:
                 ChooseRecoverySummoner(leader, members, stone);
             if (choice.name.empty())
             {
-                doneWhy = "no eligible warlock is online with Ritual of Summoning and a Soul "
-                          "Shard (" + choice.why + ")";
+                doneWhy = "no eligible warlock is online with Ritual of Summoning and a Soul Shard";
                 if (coord.summonSaid != "ritual unavailable: " + choice.why)
                 {
                     coord.summonSaid = "ritual unavailable: " + choice.why;
