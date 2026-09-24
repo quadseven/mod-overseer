@@ -83,6 +83,17 @@ void FamilyWarlockNeedsNoPartySwap()
 
 void GuildFallsBackToFamilyAndFamilyPoolStaysScoped()
 {
+    RitualSummonerCandidate eligibleGuild = Warlock("GuildFarther");
+    eligibleGuild.inFamily = false;
+    eligibleGuild.distanceToDoor = 100.f;
+    RitualSummonerCandidate closerFamily = Warlock("FamilyCloser");
+    closerFamily.guildMember = false;
+    closerFamily.distanceToDoor = 1.f;
+    auto const guildFirst = ChooseRitualSummoner(
+        {closerFamily, eligibleGuild}, RitualSummonerPool::Guild);
+    Check("eligible guild warlock outranks a closer family warlock",
+          guildFirst.name == "GuildFarther", true);
+
     RitualSummonerCandidate guild = Warlock("UnavailableGuild");
     guild.inFamily = false;
     guild.inCombat = true;
