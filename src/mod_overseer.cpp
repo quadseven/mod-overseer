@@ -590,7 +590,8 @@ constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS, TERRAIN_RECOVERY_FORGET_SECONDS,
     TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS,
     TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
-    TERRAIN_RECOVERY_VOID_CATCH_YARDS};
+    TERRAIN_RECOVERY_VOID_CATCH_YARDS,
+    30.0f};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -24541,6 +24542,16 @@ private:
                         fromZ, rising, reading.surfaceAboveZ,
                         TERRAIN_RECOVERY_FOOTING_REACH_YARDS);
                     liftZ = nearestLayerZ + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS;
+                }
+                if (!OverseerDecisions::LiftDestinationIsValid(
+                        fromZ, liftZ, std::isfinite(nearestLayerZ),
+                        nearThePlane ? 0.f : TERRAIN_RECOVERY_LIMITS.maxLiftYards))
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' refused a terrain lift from z {:.1f} to "
+                              "invalid or over-cap destination z {:.1f}; giving up loudly",
+                              name, fromZ, liftZ);
+                    continue;
                 }
                 bot->TeleportTo(bot->GetMapId(), fromX, fromY, liftZ,
                                 bot->GetOrientation());
