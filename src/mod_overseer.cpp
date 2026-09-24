@@ -279,6 +279,23 @@
 #include "Mail.h"
 #include "RBAC.h"
 
+// PlayerbotsDatabase, the pool the travel-route and mooring reads query. It
+// used to be the core's: the core declared it in DatabaseEnv.h, so it arrived
+// with the include above and needed nothing of its own. mod-playerbots now owns
+// its database (the core's module-owned database support, and mod-playerbots
+// moving the pool into its own src/Db/PlayerbotsDatabase.h), and the core no
+// longer declares it anywhere.
+//
+// Asked for by name rather than assumed, so this file compiles against BOTH
+// layouts while the deployment moves from one to the other. Against the newer
+// pair the header is the module's; against the older one it is the core's
+// Implementation/PlayerbotsDatabase.h, which DatabaseEnv.h already pulled in,
+// and including it again is a no-op behind its guard. Either way `Query(sql)`
+// returns a QueryResult, so the six call sites read the same in both.
+#if __has_include("PlayerbotsDatabase.h")
+#include "PlayerbotsDatabase.h"
+#endif
+
 // The decisions this module makes that need nothing from the world. Its own
 // header so that something other than this translation unit can reach them -
 // see overseer_decisions.h for why that was worth a file.
@@ -311,6 +328,32 @@
 
 namespace
 {
+// Whether a session is on its way out. The core renamed the member it asks
+// with, WorldSession::isLogingOut() to IsLoggingOut(), in a spelling fix that
+// removed the old name outright. This asks whichever the core being compiled
+// against provides, so the module builds on both sides of the rename and every
+// call site reads one way. Overload resolution does the choosing: the `int`
+// candidate is preferred for the literal 0 and exists only when IsLoggingOut()
+// does; otherwise the `long` one, which exists only when isLogingOut() does.
+// A core that had both would still compile, and take the new name. Once no
+// deployed core predates the rename, this can become a direct call.
+template <typename Session>
+auto SessionIsLoggingOutImpl(Session const* session, int) -> decltype(session->IsLoggingOut())
+{
+    return session->IsLoggingOut();
+}
+
+template <typename Session>
+auto SessionIsLoggingOutImpl(Session const* session, long) -> decltype(session->isLogingOut())
+{
+    return session->isLogingOut();
+}
+
+bool SessionIsLoggingOut(WorldSession const* session)
+{
+    return SessionIsLoggingOutImpl(session, 0);
+}
+
 constexpr uint32 COMMAND_POLL_MS = 2000;
 constexpr uint32 SNAPSHOT_MS = 5000;
 
@@ -42403,7 +42446,7 @@ private:
             return refuse("in flight", "one of the characters is on a flight path");
         if (giver->HasUnitState(UNIT_STATE_STUNNED) || receiver->HasUnitState(UNIT_STATE_STUNNED))
             return refuse("stunned", "one of the characters is stunned");
-        if (giverSession->isLogingOut() || receiverSession->isLogingOut())
+        if (SessionIsLoggingOut(giverSession) || SessionIsLoggingOut(receiverSession))
             return refuse("logging out", "one of the characters is logging out");
         if (giver->GetTradeData() || receiver->GetTradeData())
             return refuse("already trading", "one of the characters is already in a trade");
@@ -43402,7 +43445,7 @@ private:
             return refuse("dead", "character is dead");
         if (who->IsInFlight())
             return refuse("in flight", "character is on a flight path");
-        if (session->isLogingOut())
+        if (SessionIsLoggingOut(session))
             return refuse("logging out", "character is logging out");
 
         // Not the server's rule but the client's: the bank frame does not open
@@ -44709,7 +44752,7 @@ private:
             return refuse(R::InFlight);
         if (player->HasUnitState(UNIT_STATE_STUNNED))
             return refuse(R::Stunned);
-        if (session->isLogingOut())
+        if (SessionIsLoggingOut(session))
             return refuse(R::LoggingOut);
         if (player->IsInCombat())
             return refuse(R::InCombat);
@@ -47577,7 +47620,7 @@ private:
             return refuse(Refusal::InCombat);
         if (who->HasUnitState(UNIT_STATE_STUNNED))
             return refuse(Refusal::Stunned);
-        if (who->GetSession()->isLogingOut())
+        if (SessionIsLoggingOut(who->GetSession()))
             return refuse(Refusal::LoggingOut);
         if (who->GetTradeData())
             return refuse(Refusal::Trading);
@@ -49198,7 +49241,7 @@ private:
             return refuse(Refusal::InCombat);
         if (who->HasUnitState(UNIT_STATE_STUNNED))
             return refuse(Refusal::Stunned);
-        if (session->isLogingOut())
+        if (SessionIsLoggingOut(session))
             return refuse(Refusal::LoggingOut);
         if (who->GetTradeData())
             return refuse(Refusal::Trading);
@@ -49967,7 +50010,7 @@ private:
             return refuse(Refusal::InCombat);
         if (who->HasUnitState(UNIT_STATE_STUNNED))
             return refuse(Refusal::Stunned);
-        if (session->isLogingOut())
+        if (SessionIsLoggingOut(session))
             return refuse(Refusal::LoggingOut);
         if (who->GetTradeData())
             return refuse(Refusal::Trading);
@@ -52707,7 +52750,7 @@ private:
             return refuse(R::InFlight);
         if (who->HasUnitState(UNIT_STATE_STUNNED))
             return refuse(R::Stunned);
-        if (session->isLogingOut())
+        if (SessionIsLoggingOut(session))
             return refuse(R::LoggingOut);
         if (who->IsInCombat())
             return refuse(R::InCombat);
@@ -53882,7 +53925,7 @@ private:
         D::MailWalkGateFacts gate;
         gate.hasBotAI = botAI != nullptr;
         gate.inWorld = who->IsInWorld() && map;
-        gate.loggingOut = !session || session->isLogingOut();
+        gate.loggingOut = !session || SessionIsLoggingOut(session);
         gate.alive = who->IsAlive();
         gate.inFlight = who->IsInFlight();
         gate.inCombat = who->IsInCombat();

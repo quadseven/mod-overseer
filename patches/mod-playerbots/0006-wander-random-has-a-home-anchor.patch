@@ -174,11 +174,16 @@ new is asked of the compiler beyond what this same file already includes and
 uses. `git apply --check` verified locally, in sequence after 0001-0005,
 against a fresh clone of the pinned SHA.
 
+REBASED 2026-09-24 onto mod-playerbots @ 7bae1b5c58c76a0aa20381155edc08096d1485b2 (upstream master). Only
+the diff below was regenerated, from a three-way rebase of this patch onto that
+tree; the reasoning above is unchanged, and any file:line it cites is at the SHA
+it was first written against.
+
 diff --git a/src/Ai/World/Rpg/Action/NewRpgAction.cpp b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
-index 8b521d38..c32440d2 100644
+index 4f188205..04f6858e 100644
 --- a/src/Ai/World/Rpg/Action/NewRpgAction.cpp
 +++ b/src/Ai/World/Rpg/Action/NewRpgAction.cpp
-@@ -100,7 +100,7 @@ bool TellRpgStatusAction::Execute(Event event)
+@@ -104,7 +104,7 @@ bool TellRpgStatusAction::Execute(Event event)
      }
      else if (status == RPG_WANDER_RANDOM)
      {
@@ -187,7 +192,7 @@ index 8b521d38..c32440d2 100644
          WhisperStatusChange(owner, "WANDER_RANDOM");
          return true;
      }
-@@ -245,7 +245,7 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
+@@ -249,7 +249,7 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
              // GO_GRIND -> WANDER_RANDOM
              if (bot->GetExactDist(originalPos) < 10.0f)
              {
@@ -196,7 +201,7 @@ index 8b521d38..c32440d2 100644
                  return true;
              }
              break;
-@@ -365,7 +365,15 @@ bool NewRpgWanderRandomAction::Execute(Event /*event*/)
+@@ -369,7 +369,15 @@ bool NewRpgWanderRandomAction::Execute(Event /*event*/)
      if (SearchQuestGiverAndAcceptOrReward())
          return true;
  
@@ -214,7 +219,7 @@ index 8b521d38..c32440d2 100644
  
  bool NewRpgWanderNpcAction::Execute(Event /*event*/)
 diff --git a/src/Ai/World/Rpg/Action/NewRpgAction.h b/src/Ai/World/Rpg/Action/NewRpgAction.h
-index 7d7b3a9c..0a041a89 100644
+index 9e9f7659..91e9cac3 100644
 --- a/src/Ai/World/Rpg/Action/NewRpgAction.h
 +++ b/src/Ai/World/Rpg/Action/NewRpgAction.h
 @@ -88,6 +88,10 @@ class NewRpgWanderRandomAction : public NewRpgBaseAction
@@ -229,10 +234,10 @@ index 7d7b3a9c..0a041a89 100644
  
  class NewRpgWanderNpcAction : public NewRpgBaseAction
 diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
-index 6a511817..00f7ef71 100644
+index 4941836d..57b39d0f 100644
 --- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
 +++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
-@@ -230,7 +230,7 @@ bool NewRpgBaseAction::MoveWorldObjectTo(ObjectGuid guid, float distance)
+@@ -237,7 +237,7 @@ bool NewRpgBaseAction::MoveWorldObjectTo(ObjectGuid guid, float distance)
      return MoveTo(mapId, x, y, z, false, false, false, true);
  }
  
@@ -241,7 +246,7 @@ index 6a511817..00f7ef71 100644
  {
      if (IsWaitingForLastMove(priority))
          return false;
-@@ -239,6 +239,27 @@ bool NewRpgBaseAction::MoveRandomNear(float moveStep, MovementPriority priority,
+@@ -246,6 +246,27 @@ bool NewRpgBaseAction::MoveRandomNear(float moveStep, MovementPriority priority,
      const float x = bot->GetPositionX();
      const float y = bot->GetPositionY();
      const float z = bot->GetPositionZ();
@@ -269,7 +274,7 @@ index 6a511817..00f7ef71 100644
      // Previously: attempts = 1. A single random sample often landed in
      // water / blocked geometry / unreachable poly, the function returned
      // false, and the caller had no fallback — bot stood still. Retry a
-@@ -247,11 +268,37 @@ bool NewRpgBaseAction::MoveRandomNear(float moveStep, MovementPriority priority,
+@@ -254,11 +275,37 @@ bool NewRpgBaseAction::MoveRandomNear(float moveStep, MovementPriority priority,
      for (int attempt = 0; attempt < 8; ++attempt)
      {
          float distance = (0.4f + rand_norm() * 0.6f) * moveStep;
@@ -308,7 +313,7 @@ index 6a511817..00f7ef71 100644
          PathGenerator path(bot);
          path.CalculatePath(dx, dy, dz);
          PathType type = path.GetPathType();
-@@ -1127,7 +1174,7 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
+@@ -1134,7 +1181,7 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
      {
          case RPG_WANDER_RANDOM:
          {
@@ -342,7 +347,7 @@ index 65222fd9..170e0b53 100644
  
      /* QUEST RELATED CHECK */
 diff --git a/src/Ai/World/Rpg/NewRpgInfo.cpp b/src/Ai/World/Rpg/NewRpgInfo.cpp
-index 7db0ba87..facf42cc 100644
+index 13f778a4..c5be934f 100644
 --- a/src/Ai/World/Rpg/NewRpgInfo.cpp
 +++ b/src/Ai/World/Rpg/NewRpgInfo.cpp
 @@ -41,10 +41,12 @@ void NewRpgInfo::ChangeToWanderNpc(uint32 npcEntry, WorldPosition pos)
@@ -359,9 +364,9 @@ index 7db0ba87..facf42cc 100644
 +    data = wander;
  }
  
- void NewRpgInfo::ChangeToDoQuest(uint32 questId, const Quest* quest)
+ void NewRpgInfo::ChangeToDoQuest(uint32 questId, Quest const* quest)
 diff --git a/src/Ai/World/Rpg/NewRpgInfo.h b/src/Ai/World/Rpg/NewRpgInfo.h
-index 415002c4..fffbe406 100644
+index 1216b81c..b0e653d7 100644
 --- a/src/Ai/World/Rpg/NewRpgInfo.h
 +++ b/src/Ai/World/Rpg/NewRpgInfo.h
 @@ -53,6 +53,10 @@ struct NewRpgInfo
@@ -381,6 +386,6 @@ index 415002c4..fffbe406 100644
      void ChangeToWanderNpc(uint32 npcEntry, WorldPosition pos);
 -    void ChangeToWanderRandom();
 +    void ChangeToWanderRandom(WorldPosition anchor);
-     void ChangeToDoQuest(uint32 questId, const Quest* quest);
+     void ChangeToDoQuest(uint32 questId, Quest const* quest);
      void ChangeToTravelFlight(uint32 flightMasterEntry, WorldPosition flightMasterPos, std::vector<uint32> path);
      void ChangeToOutdoorPvp(ObjectGuid::LowType capturePointSpawnId = 0);
