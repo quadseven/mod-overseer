@@ -22,7 +22,8 @@
  * everybody without an errand where the family is.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else, plus a read of
- * src/mod_overseer.cpp to pin the three places that ask.
+ * src/mod_overseer.cpp to pin the three places that ask and the family read
+ * they ask with.
  */
 
 #include "overseer_decisions.h"
@@ -32,8 +33,10 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using OverseerDecisions::CutOffFollowerRoams;
+using OverseerDecisions::FamilyHoldsInTown;
 using OverseerDecisions::HoldsInTown;
 using OverseerDecisions::LeaderCarriesNewRpg;
 using OverseerDecisions::SplitFollowerDrivesItself;
@@ -63,10 +66,24 @@ void TheWaitIsTheTownRunJob()
     Check("not a prefix", HoldsInTown("town"), false);
 }
 
+void AFamilyHalfMovedIntoTownWaitsInTown()
+{
+    // The job is written one row at a time. A family with one row on the wait
+    // waits, whichever row it is, and a row not read yet is questing.
+    Check("all five", FamilyHoldsInTown({"town run", "town run", "town run", "town run",
+                                         "town run"}),
+          true);
+    Check("only the leader", FamilyHoldsInTown({"town run", "", "", "", ""}), true);
+    Check("only a follower", FamilyHoldsInTown({"quest", "quest", "town run"}), true);
+    Check("questing", FamilyHoldsInTown({"", "quest", "quest"}), false);
+    Check("a dungeon", FamilyHoldsInTown({"dungeon:ragefire", "dungeon:ragefire"}), false);
+    Check("nobody", FamilyHoldsInTown(std::vector<std::string>{}), false);
+}
+
 void AQuestingLeaderAlwaysCarriesIt()
 {
-    // Unchanged: the questing family's one traveller, errand or not, and a
-    // job not read yet (before DriveQuests has run once) reads as questing.
+    // Unchanged: the questing family's one traveller, errand or not. An empty
+    // job is how a row off LoadJobs reads, and it is questing.
     Check("quest, no errand", LeaderCarriesNewRpg("quest", false), true);
     Check("quest, errand", LeaderCarriesNewRpg("quest", true), true);
     Check("unread job", LeaderCarriesNewRpg("", false), true);
@@ -131,12 +148,19 @@ void TheModuleAsksInTheThreePlaces()
     // The cut-off follower's grant, and MaySteerItself's take-back.
     Check("cut-off grant is gated", source.find("if (cutOffRoams)") != std::string::npos, true);
     Check("MaySteerItself asks",
-          source.find("OverseerDecisions::CutOffFollowerRoams(RememberedJob(name),") !=
+          source.find("OverseerDecisions::CutOffFollowerRoams(TownJobFor(name),") !=
               std::string::npos,
           true);
-    // The job it reads is the one DriveQuests remembers.
-    Check("RememberedJob exists",
-          source.find("std::string RememberedJob(std::string const& name)") != std::string::npos,
+    // The job they read is the family's, off the roster on this very poll,
+    // before the first grant - not a cache another drive fills later, which
+    // is empty for the first poll after a restart.
+    std::size_t const read = source.find("OverseerDecisions::FamilyHoldsInTown(familyJobs)");
+    std::size_t const grant = source.find("OverseerDecisions::LeaderCarriesNewRpg(");
+    Check("the family is read", read != std::string::npos, true);
+    Check("read before the leader's grant", read != std::string::npos && read < grant, true);
+    Check("read off the roster",
+          source.find("std::map<std::string, std::string> const jobs = LoadJobs();") !=
+              std::string::npos,
           true);
 }
 
@@ -145,6 +169,7 @@ void TheModuleAsksInTheThreePlaces()
 int main()
 {
     TheWaitIsTheTownRunJob();
+    AFamilyHalfMovedIntoTownWaitsInTown();
     AQuestingLeaderAlwaysCarriesIt();
     ALeaderInTownCarriesItOnlyToWalkAnErrand();
     AQuestingCutOffFollowerRoamsAsBefore();

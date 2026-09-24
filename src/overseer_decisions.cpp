@@ -5023,6 +5023,14 @@ bool HoldsInTown(std::string const& job)
     return job == TOWN_HOLD_JOB;
 }
 
+bool FamilyHoldsInTown(std::vector<std::string> const& jobs)
+{
+    for (std::string const& job : jobs)
+        if (HoldsInTown(job))
+            return true;
+    return false;
+}
+
 bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand)
 {
     return onAnErrand || !HoldsInTown(job);

@@ -4163,16 +4163,6 @@ void RememberAim(std::string const& name, std::string const& job, uint32 questAi
     }
 }
 
-// The job DriveQuests last saw on this character's row, "" before it has run
-// once. Read by the party poll, which has no job read of its own and needs one
-// only to tell a family waiting in town from one that is questing.
-std::string RememberedJob(std::string const& name)
-{
-    std::lock_guard<std::mutex> guard(g_aimMutex);
-    auto const it = g_aimSnapshot.find(LowerName(name));
-    return it == g_aimSnapshot.end() ? std::string() : it->second.job;
-}
-
 // Called from the two kill hooks below, whatever thread Unit::Kill happens to
 // be running the victim's death on - map-update, same as every other event
 // hook in this file (see the file header). Memory only, same discipline as
@@ -8770,6 +8760,36 @@ private:
         if (!leader)
             return;
 
+        // WHETHER THIS FAMILY WAITS IN TOWN FOR ITS CAMPAIGN (2026-09-24), read
+        // off the roster on every poll rather than remembered from another
+        // drive, so a restart or a job written a second ago is seen before
+        // anybody is granted a strategy. For the whole family at once: the job
+        // is written one row at a time, and a family half moved onto `town run`
+        // must not send the other half off. See FamilyHoldsInTown.
+        {
+            std::map<std::string, std::string> const jobs = LoadJobs();
+            auto const jobOf = [&jobs](std::string const& name) {
+                auto const it = jobs.find(name);
+                return it == jobs.end() ? std::string() : it->second;
+            };
+            std::vector<std::string> familyJobs{jobOf(leader->GetName())};
+            for (Player* p : present)
+                if (p)
+                    familyJobs.push_back(jobOf(p->GetName()));
+            bool const inTown = OverseerDecisions::FamilyHoldsInTown(familyJobs);
+            std::vector<Player*> everyone(present);
+            everyone.push_back(leader);
+            for (Player* p : everyone)
+            {
+                if (!p)
+                    continue;
+                if (inTown)
+                    _heldInTown.insert(p->GetName());
+                else
+                    _heldInTown.erase(p->GetName());
+            }
+        }
+
         // NOBODY IN THIS FAMILY IS EVER AWAY.
         //
         // The 3.3.5 client flags itself Away after a stretch with no keyboard
@@ -8964,7 +8984,7 @@ private:
             // through DriveTravel's own grant.
             std::string const leaderName = leader->GetName();
             bool const mayCarry = OverseerDecisions::LeaderCarriesNewRpg(
-                RememberedJob(leaderName),
+                TownJobFor(leaderName),
                 !_travelAims.TargetFor(leaderName).empty() || IsEscorted(leaderName));
             if (!mayCarry && leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 !HeldAfterRevival(leaderName) && !HeldStill(leaderName))
@@ -9215,7 +9235,7 @@ private:
                 OverseerDecisions::ReadSplitErrand(cutOffTarget) ==
                     OverseerDecisions::SplitErrand::Nothing;
             bool const cutOffRoams = cutOffIdle && OverseerDecisions::CutOffFollowerRoams(
-                                                       RememberedJob(p->GetName()), cutOffTarget);
+                                                       TownJobFor(p->GetName()), cutOffTarget);
             if (cutOffIdle && !cutOffRoams)
             {
                 auto const split = _partySplitSaid.find(p->GetName());
@@ -18330,11 +18350,19 @@ private:
     // EXCEPT WITH AN EMPTY COLUMN WHILE THE FAMILY WAITS IN TOWN (2026-09-24).
     // See OverseerDecisions::CutOffFollowerRoams: the grant is withheld there,
     // and this is the half that takes back a strategy granted before the wait.
+    // The job the town-hold decisions read for `name`: TOWN_HOLD_JOB while its
+    // family waits in town, and "" (questing) otherwise.
+    std::string TownJobFor(std::string const& name) const
+    {
+        return _heldInTown.count(name) ? std::string(OverseerDecisions::TOWN_HOLD_JOB)
+                                       : std::string();
+    }
+
     bool MaySteerItself(std::string const& name) const
     {
         return IsEscorted(name) ||
                (SplitFromLeader(name) &&
-                OverseerDecisions::CutOffFollowerRoams(RememberedJob(name),
+                OverseerDecisions::CutOffFollowerRoams(TownJobFor(name),
                                                        _travelAims.TargetFor(name)));
     }
 
@@ -52776,6 +52804,9 @@ private:
     // Who was last told it stays put while cut off from a family waiting in
     // town, keyed the same way, so the line is said once per split.
     std::map<std::string, uint32> _cutOffInTownSaid;
+    // Every member of a family KeepRosterFollowing last read as waiting in
+    // town (FamilyHoldsInTown), refreshed on each party poll before any grant.
+    std::set<std::string> _heldInTown;
 
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;

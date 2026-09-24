@@ -5922,6 +5922,13 @@ extern char const* const TOWN_HOLD_JOB;
 // DoJob stores the lowercased mode and nothing else writes the column.
 bool HoldsInTown(std::string const& job);
 
+// Whether a FAMILY waits in town: any one of its rows says so. The job is
+// written one row at a time, so for a moment some members carry it and some do
+// not, and a family half moved onto the wait must not send the other half off
+// on the questing rules. The party poll reads every row and asks this once, and
+// the two answers below are given the family's answer rather than each row's.
+bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
+
 // May the party leader carry `new rpg` on this poll? Always for a questing
 // family, whose leader is its one traveller. In town only while it has an aim or
 // an escort to walk: with neither, upstream turns the strategy into a random
