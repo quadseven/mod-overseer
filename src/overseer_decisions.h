@@ -17269,6 +17269,424 @@ KeepStep KeepStepFor(unsigned level, unsigned untilLevel, KeepPlace place, bool 
 // "none", "unequip", "deposit", "withdraw", "equip".
 char const* KeepStepWord(KeepStep step);
 
+// ------------------------------------------------------------ naturalize --
+//
+// kind='naturalize': undo what was handed to a character rather than earned,
+// one character per row. Two modes, both approved by the operator per
+// character list, both irreversible, both gated off by default:
+//
+//   reset-level-1        a guild bot of a listed guild starts over at level 1
+//                        at its race's start, keeping its character, name,
+//                        race, class, account, guild membership and rank.
+//   strip-family-grants  a family character loses what was granted to it
+//                        without a trainer, gold or loot: GM-issued items,
+//                        riding, untrained weapon skills and every class
+//                        spell it was taught for free. Its level, earned
+//                        gear, professions, gold, quests and talents stay.
+//
+//   lower-to-natural-level  a family character goes down to level:<N>, the
+//                        level its experience would have bought at the normal
+//                        rate. Everything above that level goes with it: the
+//                        spells, riding and profession ranks no trainer would
+//                        sell at N, weapon skill above 5 x N, and the talents,
+//                        which are reset and spent again in the roster's tree.
+//                        Items are kept; the dry run lists the ones it can no
+//                        longer equip.
+//   discard-unearned-gold  a family character loses the guild dues the
+//                        factory-made guild bots mailed it: the gold in dues
+//                        letters it has not opened, and, from its purse, the
+//                        dues it has already taken out (never more than the
+//                        purse holds).
+//
+// Grammar: `<mode> [dry-run] [parts:<p>,<p>...] [level:<N>]`. A dry run writes
+// exactly what the real run would remove to the row's result and changes
+// nothing. `parts:` limits a strip to some of items, riding, weapons and
+// spells; `level:` is required by lower-to-natural-level and refused by the
+// others.
+//
+// Everything below is decided here, with no world, so a test can pin what is
+// kept and what is removed. The adapter reads facts and does what these say.
+
+enum class NaturalizeMode : std::uint8_t
+{
+    Unknown,
+    ResetLevelOne,
+    StripFamilyGrants,
+    LowerToNaturalLevel,
+    DiscardUnearnedGold,
+};
+
+// The parts a run touches, as bits so a ledger row per part can say which
+// ones have already been done.
+enum NaturalizePart : unsigned
+{
+    NATURALIZE_PART_RESET = 1u << 0,
+    NATURALIZE_PART_ITEMS = 1u << 1,
+    NATURALIZE_PART_RIDING = 1u << 2,
+    NATURALIZE_PART_WEAPONS = 1u << 3,
+    NATURALIZE_PART_SPELLS = 1u << 4,
+    NATURALIZE_PART_LOWER = 1u << 5,
+    NATURALIZE_PART_GOLD = 1u << 6,
+};
+constexpr unsigned NATURALIZE_STRIP_PARTS = NATURALIZE_PART_ITEMS | NATURALIZE_PART_RIDING |
+                                            NATURALIZE_PART_WEAPONS | NATURALIZE_PART_SPELLS;
+
+struct NaturalizeRequest
+{
+    bool ok{false};
+    NaturalizeMode mode{NaturalizeMode::Unknown};
+    bool dryRun{false};
+    unsigned parts{0};
+    // lower-to-natural-level only: the level to go down to (level:<N>).
+    unsigned targetLevel{0};
+    // Why it did not parse, for the row's detail. Literal, no quotes.
+    char const* error{""};
+};
+
+NaturalizeRequest ParseNaturalizeRequest(std::string const& command);
+
+// "reset-level-1", "strip-family-grants".
+char const* NaturalizeModeWord(NaturalizeMode mode);
+// "reset", "items", "riding", "weapons", "spells": the ledger's part column.
+char const* NaturalizePartWord(unsigned part);
+
+// A comma list of names from the config (`Overseer.Natural.Guilds`,
+// `AiPlayerbot.NaturalGuild`). Ends trimmed, empty entries dropped; the match
+// ignores case, as the core's guild lookup by name does.
+std::vector<std::string> ParseNameList(std::string const& csv);
+bool NameListHas(std::vector<std::string> const& list, std::string const& name);
+
+// What the adapter reads before it touches anything. The character need not be
+// online for any of it.
+struct NaturalizeFacts
+{
+    bool enabled{false};             // Overseer.Natural.Enabled
+    bool exists{false};              // a character by that name exists
+    bool guildListed{false};         // its guild is in Overseer.Natural.Guilds
+    bool inFamily{false};            // it is on overseer_roster
+    bool deathKnight{false};
+    bool clientAttached{false};      // a real game client holds its session now
+    unsigned openAuctions{0};        // auctions it owns
+    unsigned openBids{0};            // auctions it holds the high bid on
+    unsigned codMail{0};             // COD mail waiting in its inbox
+    bool playerbotsGateCovers{false};// AiPlayerbot.NaturalGuild names its guild
+    bool trainFactoryOn{true};       // Overseer.Train.Factory
+    unsigned partsAlreadyDone{0};    // ledger bits already recorded for it
+    unsigned level{0};               // its level now
+};
+
+enum class NaturalizeRefusal : std::uint8_t
+{
+    None,
+    Disabled,
+    BadRequest,
+    NoSuchCharacter,
+    NotInNaturalGuild,
+    FamilyMember,        // reset: never a family character
+    NotFamily,           // strip: only a family character
+    DeathKnight,         // reset: the class starts at 55, so level 1 is not a start
+    OpenAuction,         // reset: an auction or bid would deliver after it
+    CodMail,             // reset: a COD mail cannot be deleted by its receiver
+    PlayerbotsGateOff,   // reset: the factory would re-kit a level 1 bot
+    TrainFactoryOn,      // strip: TrainRoster would re-teach on the next level
+    LevelNotLower,       // lower: the target is not below the level it has
+    ClientAttached,      // real run: a live client is not logged out for it
+    AlreadyDone,         // real run: every requested part is in the ledger
+};
+
+// The first gate that fails, in the enum's order. A DRY RUN IS REFUSED ONLY BY
+// THE GATES THAT SAY THE ROW IS WRONG (disabled, bad request, no character,
+// wrong guild, wrong mode for the character). The gates that say "not yet"
+// (auctions, COD mail, the playerbots gate, the train factory, a client, the
+// ledger) do not stop a dry run, whose job is to show the operator what a
+// real run would do; the adapter reports what a real run would refuse on.
+NaturalizeRefusal NaturalizeVerdictFor(NaturalizeRequest const& request, NaturalizeFacts const& facts,
+                                       bool asDryRun);
+
+// Literals for the row's detail; none carries a quote character.
+char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal);
+
+// THE RESET, PART BY PART. The adapter walks RESET_PARTS and asks each one
+// what to do; the dry run lists the same table, so the report and the action
+// cannot disagree about what is kept.
+enum class ResetPart : std::uint8_t
+{
+    Identity,        // character, name, race, class, gender, account
+    GuildMembership,
+    GuildRank,
+    PlayedTime,
+    Level,           // and experience
+    Items,           // equipped, backpack, bags, bank, keyring, currency, buyback
+    InboxMail,       // its mail, the items and gold attached
+    Money,
+    Skills,
+    Spells,          // mounts and companions are spells
+    Talents,         // and glyphs
+    Quests,          // log, completed, daily, weekly, monthly
+    Reputation,
+    Pets,            // current, stabled, unslotted, and bought stable slots
+    TaxiNodes,
+    HomeAndPosition,
+    Achievements,
+};
+
+enum class ResetTreatment : std::uint8_t
+{
+    Keep,
+    Remove,          // gone, nothing in its place
+    RestoreToStart,  // gone, and what a new character of the race and class has put back
+};
+
+constexpr ResetPart RESET_PARTS[] = {
+    ResetPart::Identity,     ResetPart::GuildMembership, ResetPart::GuildRank,  ResetPart::PlayedTime,
+    ResetPart::Level,        ResetPart::Items,           ResetPart::InboxMail,  ResetPart::Money,
+    ResetPart::Skills,       ResetPart::Spells,          ResetPart::Talents,    ResetPart::Quests,
+    ResetPart::Reputation,   ResetPart::Pets,            ResetPart::TaxiNodes,  ResetPart::HomeAndPosition,
+    ResetPart::Achievements,
+};
+
+ResetTreatment ResetTreatmentFor(ResetPart part);
+char const* ResetPartWord(ResetPart part);
+char const* ResetTreatmentWord(ResetTreatment treatment);
+
+// THE PLAYERBOTS PER-BOT VALUES A RESET WRITES (playerbots_random_bots, through
+// RandomPlayerbotMgr's public SetValue so its in-memory cache agrees).
+//
+// NOT EVERY VALUE IS CLEARED, AND `randomize` IS THE ONE THAT MUST NOT BE. A
+// missing `randomize` makes RandomPlayerbotMgr::ProcessBot call Randomize on
+// the bot's next update, and below level 3 that routes to RandomizeFirst: the
+// whole factory kit, gear, bags, gold and skills, at level 1. Clearing it would
+// undo the reset within seconds. It is left for the NaturalGuild patch to make
+// inert. `level` is what RandomizeFirst records for a level 1 start. `dead`
+// and `revive` go, so a revive timer left over from the old life does not fire
+// Revive (a refresh and a grind teleport) at the new one.
+enum class BotValueStep : std::uint8_t
+{
+    Leave,
+    Clear,
+    Set,
+};
+
+struct BotValueAction
+{
+    char const* event;
+    BotValueStep step;
+    unsigned value;
+    char const* why;
+};
+
+std::vector<BotValueAction> ResetRandomBotValues();
+
+// ---- strip: spells ----
+
+struct StripSpellFacts
+{
+    // Learned through another spell (PlayerSpell::dependent); it goes and stays
+    // with that spell, so it is never judged on its own.
+    bool dependent{false};
+    // On a profession or secondary skill line other than riding. The operator
+    // kept professions whole.
+    bool profession{false};
+    bool riding{false};
+    // A talent rank, or taught by one: paid for with the character's own points.
+    bool talent{false};
+    // Learned with a skill every character of this race and class has
+    // (SkillLineAbility learned-on-skill), or a create-info spell.
+    bool autoLearned{false};
+    // A quest the character has completed teaches it.
+    bool questReward{false};
+    // A trainer purchase of it is recorded.
+    bool trainerRecord{false};
+    // A class trainer for this class sells it.
+    bool classTrainer{false};
+    // Some quest teaches it (completed or not).
+    bool questTaught{false};
+};
+
+enum class StripVerdict : std::uint8_t
+{
+    Keep,
+    Remove,
+    SetValue,   // weapon skills only
+};
+
+struct StripSpellDecision
+{
+    StripVerdict verdict{StripVerdict::Keep};
+    char const* why{""};
+};
+
+// Kept when any reason to keep holds; otherwise removed when a trainer or a
+// quest is where it comes from; anything else (an item's spell, a racial, a
+// mount or a companion) is kept, since nothing says it was handed out.
+StripSpellDecision StripSpellDecisionFor(StripSpellFacts const& facts);
+
+// ---- strip: weapon skills ----
+
+struct StripWeaponSkillFacts
+{
+    bool defense{false};
+    // One of the race and class starting skills (playercreateinfo_skills).
+    bool startingSkill{false};
+    bool trainerRecord{false};
+    unsigned value{0};
+    // The highest level at which the character is recorded wielding a weapon
+    // of this skill; its current level when one is equipped now; 0 if never.
+    unsigned usedLevel{0};
+};
+
+struct StripWeaponSkillDecision
+{
+    StripVerdict verdict{StripVerdict::Keep};
+    unsigned value{0};
+    char const* why{""};
+};
+
+// A weapon skill rises by use to 5 x level. So a trained one keeps its value
+// up to 5 x the highest level it is recorded being used at, a fresh one's 1
+// when it never was; an untrained one goes. Defense rises every time the
+// character is struck and is kept.
+StripWeaponSkillDecision StripWeaponSkillDecisionFor(StripWeaponSkillFacts const& facts);
+
+// ---- strip: GM-issued items ----
+
+// `.additem <entry> [count]`, the core's own command, as this module's gm verb
+// recorded it. False for anything else, a link instead of an entry, or a count
+// that is not positive: a negative count took items away.
+bool ParseGmAdditem(std::string const& command, unsigned& entry, unsigned& count);
+
+struct GmIssue
+{
+    std::string character;
+    unsigned entry{0};
+    unsigned count{0};
+};
+
+struct GmHolding
+{
+    std::string holder;
+    unsigned entry{0};
+    unsigned itemGuid{0};
+    // A loot, quest-reward or craft event names this instance, or the holder
+    // bought the entry through this module. Never attributed to a GM.
+    bool naturalRecord{false};
+};
+
+struct GmAttribution
+{
+    std::vector<unsigned> itemGuids;   // the target's instances to remove
+    std::vector<std::string> notes;    // what was left alone, and why
+};
+
+// WHICH INSTANCES A GM HANDED OUT. A GM command names an entry and a recipient,
+// not an item, and the recipient may since have handed some on (six bags
+// issued to one character, four of them now worn by two others). So: each
+// recipient's own instances are attributed first, lowest item guid first, up
+// to what it was issued; whatever it no longer holds is attributed to the
+// other family members holding the entry, but ONLY when they hold no more than
+// that remainder. When they hold more, nothing is attributed to any of them,
+// because there is no telling which. An instance nobody was issued is left
+// alone and named in the notes as unverified.
+GmAttribution GmIssuedInstancesOf(std::string const& target, std::vector<GmIssue> const& issues,
+                                  std::vector<GmHolding> const& familyHoldings);
+
+// ---- strip: boost achievements (reported, never removed) ----
+
+struct CompletedAchievement
+{
+    unsigned id{0};
+    std::int64_t at{0};
+};
+
+// Level 10 through 80 are achievements 6 through 13.
+bool IsLevelAchievement(unsigned id);
+
+// The level achievements completed within `slackSeconds` of a GM level
+// command on the character: stamped by the command, not by levelling.
+std::vector<unsigned> BoostLevelAchievements(std::vector<CompletedAchievement> const& completed,
+                                             std::vector<std::int64_t> const& levelCommandTimes,
+                                             unsigned slackSeconds);
+
+// ---- discard-unearned-gold ----
+
+// The bridge's dues rows carry their amount in the source tag,
+// `guilddues:<copper>`. The amount, or 0 for any other source.
+std::uint64_t DuesAmountFromSource(std::string const& source);
+
+// A dues letter: from a guild member who is not on the roster (a factory-made
+// guild bot), to a family character, subject "Guild dues". `money` is what it
+// still holds; `sentMoney` what it was sent with (0 when no record says).
+struct DuesLetter
+{
+    unsigned mailId{0};
+    std::uint64_t money{0};
+    std::uint64_t sentMoney{0};
+};
+
+struct DuesDiscard
+{
+    std::vector<unsigned> lettersToEmpty;   // unopened: their gold is deleted
+    std::uint64_t unopenedMoney{0};
+    std::uint64_t takenMoney{0};            // already in the purse
+    std::uint64_t fromPurse{0};             // what the purse loses
+    unsigned takenWithNoRecord{0};          // taken letters whose amount nothing records
+};
+
+// Unopened letters are emptied. What was taken comes out of the purse, but
+// never more than the purse holds; a taken letter with no record of its
+// amount counts as nothing rather than as a guess.
+DuesDiscard DuesDiscardFor(std::vector<DuesLetter> const& letters, std::uint64_t purse);
+
+// ---- lower-to-natural-level ----
+
+// THE NATURAL LEVEL. `xpForLevel[l]` is the experience level l needs to reach
+// l + 1 (player_xp_for_level; index 0 unused). Starting from `baseLevel` with
+// `baseXp` into it, add `earnedXp / divisor` - the experience earned at a
+// `divisor` times rate, as it would have come at the normal one - and say
+// where that lands: the level and the experience into it. Stops at the end of
+// the table.
+struct NaturalLevel
+{
+    unsigned level{0};
+    std::uint64_t xpInto{0};
+};
+
+NaturalLevel NaturalLevelFor(std::vector<std::uint64_t> const& xpForLevel, unsigned baseLevel,
+                             std::uint64_t baseXp, std::uint64_t earnedXp, unsigned divisor);
+
+// The experience between (fromLevel, fromXp) and (toLevel, toXp), by the same
+// table. 0 when `to` is not after `from`.
+std::uint64_t ExperienceBetween(std::vector<std::uint64_t> const& xpForLevel, unsigned fromLevel,
+                                std::uint64_t fromXp, unsigned toLevel, std::uint64_t toXp);
+
+struct LowerSpellFacts
+{
+    // Spent from talent points; the talents are reset and spent again, so
+    // they are not judged here.
+    bool talent{false};
+    // A quest it completed teaches it: earned, kept at any level.
+    bool questReward{false};
+    // The lowest level any trainer that would teach it asks; 0 when no
+    // trainer sells it.
+    unsigned trainerLevel{0};
+    // A trade recipe a trainer sells: the rank it needs, and the most the
+    // character's skill in that trade can be once the ranks above the new
+    // level are gone. 0 when not a recipe.
+    unsigned recipeRank{0};
+    unsigned tradeMaxAfter{0};
+};
+
+// Removed when a trainer would not sell it at the new level, or its trade
+// would no longer reach the rank it needs. Everything else stays.
+StripSpellDecision LowerSpellDecisionFor(LowerSpellFacts const& facts, unsigned targetLevel);
+
+// A weapon or defense skill cannot be above 5 x level. The new value.
+unsigned LoweredSkillValue(unsigned value, unsigned targetLevel);
+
+// A mail carries at most this many items (MAX_MAIL_ITEMS in the core).
+constexpr unsigned NATURALIZE_MAIL_ITEMS = 12;
+unsigned MailsNeededFor(unsigned items);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
