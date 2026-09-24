@@ -3566,6 +3566,293 @@ std::string GearNeedWinner(std::vector<GearContender> const& contenders)
     return winner;
 }
 
+// ------------------------------------------------------ the loot council --
+
+LootRules LootRulesFor(bool raid)
+{
+    LootRules rules;
+    rules.threshold = LOOT_QUALITY_UNCOMMON;
+    if (raid)
+    {
+        rules.method = LootMethodId::MasterLoot;
+        rules.leaderIsMasterLooter = true;
+        rules.said = "master loot";
+    }
+    else
+    {
+        rules.method = LootMethodId::NeedBeforeGreed;
+        rules.leaderIsMasterLooter = false;
+        rules.said = "need before greed";
+    }
+    return rules;
+}
+
+bool LootRulesDiffer(LootRules const& wanted, int method, int threshold,
+                     bool masterLooterIsLeader)
+{
+    if (method != wanted.method || threshold != wanted.threshold)
+        return true;
+    return wanted.leaderIsMasterLooter && !masterLooterIsLeader;
+}
+
+bool LootCouncilJudges(int itemClass)
+{
+    return itemClass == 2 || itemClass == 4;  // ITEM_CLASS_WEAPON, ITEM_CLASS_ARMOR
+}
+
+int UpgradePercent(LootCandidate const& candidate)
+{
+    if (candidate.gain <= 0.f || candidate.score <= 0.f)
+        return 0;
+    float const share = candidate.gain / candidate.score;
+    int const percent = static_cast<int>(std::lround(share * 100.f));
+    return std::max(0, std::min(100, percent));
+}
+
+char const* GearRoleName(GearRole role)
+{
+    switch (role)
+    {
+        case GearRole::Tank: return "tank";
+        case GearRole::Melee: return "melee";
+        case GearRole::Ranged: return "ranged";
+        case GearRole::Healer: return "healer";
+        case GearRole::Caster: return "caster";
+        case GearRole::Unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+GearRole GearRoleForSeat(int classId, std::string const& seatRole)
+{
+    if (seatRole == "tank")
+        return GearRole::Tank;
+    if (seatRole == "healer")
+        return GearRole::Healer;
+    // raidlineup.py writes "damage"; "dps" is accepted as the same seat.
+    if (seatRole != "damage" && seatRole != "dps")
+        return GearRole::Unknown;
+    switch (classId)
+    {
+        case 1:   // warrior
+        case 2:   // paladin
+        case 4:   // rogue
+        case 6:   // death knight
+        case 7:   // shaman (enhancement is the dps seat a lineup gives one)
+            return GearRole::Melee;
+        case 3:   // hunter
+            return GearRole::Ranged;
+        case 5:   // priest (shadow)
+        case 8:   // mage
+        case 9:   // warlock
+        case 11:  // druid (balance)
+            return GearRole::Caster;
+        default:
+            return GearRole::Unknown;
+    }
+}
+
+std::string ClassWord(int classId)
+{
+    switch (classId)
+    {
+        case 1: return "Warrior";
+        case 2: return "Paladin";
+        case 3: return "Hunter";
+        case 4: return "Rogue";
+        case 5: return "Priest";
+        case 6: return "Death Knight";
+        case 7: return "Shaman";
+        case 8: return "Mage";
+        case 9: return "Warlock";
+        case 11: return "Druid";
+        default: return "";
+    }
+}
+
+std::string SpecTreeName(int classId, int specTab)
+{
+    static char const* const trees[12][3] = {
+        {"", "", ""},
+        {"Arms", "Fury", "Protection"},
+        {"Holy", "Protection", "Retribution"},
+        {"Beast Mastery", "Marksmanship", "Survival"},
+        {"Assassination", "Combat", "Subtlety"},
+        {"Discipline", "Holy", "Shadow"},
+        {"Blood", "Frost", "Unholy"},
+        {"Elemental", "Enhancement", "Restoration"},
+        {"Arcane", "Fire", "Frost"},
+        {"Affliction", "Demonology", "Destruction"},
+        {"", "", ""},
+        {"Balance", "Feral Combat", "Restoration"},
+    };
+    if (classId < 1 || classId > 11 || specTab < 0 || specTab > 2)
+        return "";
+    return trees[classId][specTab];
+}
+
+namespace
+{
+
+// 0 a certain upgrade, 1 one the numbers cannot settle, 2 none.
+int LootCouncilCertainty(LootCandidate const& c)
+{
+    if (!c.wearable || c.comparison == GearComparison::NotBetter)
+        return 2;
+    if (c.comparison == GearComparison::Better && c.gain > 0.f)
+        return 0;
+    if (c.comparison == GearComparison::Undecided)
+        return 1;
+    return 2;
+}
+
+}  // namespace
+
+LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidates)
+{
+    std::vector<LootCandidate const*> eligible;
+    for (LootCandidate const& c : candidates)
+        if (LootCouncilCertainty(c) < 2)
+            eligible.push_back(&c);
+
+    std::sort(eligible.begin(), eligible.end(),
+              [](LootCandidate const* a, LootCandidate const* b)
+              {
+                  if (a->family != b->family)
+                      return a->family;
+                  int const ca = LootCouncilCertainty(*a);
+                  int const cb = LootCouncilCertainty(*b);
+                  if (ca != cb)
+                      return ca < cb;
+                  int const pa = UpgradePercent(*a);
+                  int const pb = UpgradePercent(*b);
+                  if (pa != pb)
+                      return pa > pb;
+                  if (a->gain != b->gain)
+                      return a->gain > b->gain;
+                  return a->name < b->name;
+              });
+
+    LootCouncilPick pick;
+    for (LootCandidate const* c : eligible)
+        pick.ranked.push_back(c->name);
+    if (eligible.empty())
+    {
+        pick.why = "it is not an upgrade for anybody who could take it";
+        return pick;
+    }
+    LootCandidate const& best = *eligible.front();
+    pick.recipient = best.name;
+    std::string const who = best.family ? "the family" : "the guild's raiders";
+    std::string const role = best.role.empty() || best.role == "unknown"
+                                 ? std::string()
+                                 : " as a " + best.role;
+    if (LootCouncilCertainty(best) == 0)
+        pick.why = "the biggest upgrade in " + who + role + ": " +
+                   std::to_string(UpgradePercent(best)) + "% of its worth is new, " +
+                   (best.itemLevelGain > 0 ? "+" : "") +
+                   std::to_string(best.itemLevelGain) + " item levels over what is worn";
+    else
+        pick.why = "an upgrade in " + who + role +
+                   " the numbers cannot settle (" + best.why + "), and nobody gains more";
+    return pick;
+}
+
+LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
+                                   std::string const& voter, long openSeconds)
+{
+    if (!decided)
+        return openSeconds >= LOOT_COUNCIL_ROLL_LAST_SECONDS ? LootCouncilVote::Upstream
+                                                              : LootCouncilVote::Hold;
+    if (recipient.empty())
+        return LootCouncilVote::Greed;
+    return recipient == voter ? LootCouncilVote::Need : LootCouncilVote::Pass;
+}
+
+std::string LootCouncilRollKey(std::uint64_t rollItemGuid)
+{
+    return "roll:" + std::to_string(rollItemGuid);
+}
+
+std::string LootCouncilMasterKey(std::uint64_t sourceGuid, unsigned slot)
+{
+    return "ml:" + std::to_string(sourceGuid) + ":" + std::to_string(slot);
+}
+
+namespace
+{
+
+std::string JsonString(std::string const& text)
+{
+    std::string out = "\"";
+    for (unsigned char ch : text)
+    {
+        if (ch == '"' || ch == '\\')
+        {
+            out += '\\';
+            out += static_cast<char>(ch);
+        }
+        else if (ch < 0x20)
+        {
+            char buffer[8];
+            std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
+            out += buffer;
+        }
+        else
+            out += static_cast<char>(ch);
+    }
+    return out + "\"";
+}
+
+std::string JsonNumber(float value)
+{
+    if (!std::isfinite(value))
+        return "0";
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%.1f", static_cast<double>(value));
+    return buffer;
+}
+
+char const* ComparisonName(GearComparison comparison)
+{
+    switch (comparison)
+    {
+        case GearComparison::Better: return "better";
+        case GearComparison::NotBetter: return "not_better";
+        case GearComparison::Undecided: return "undecided";
+    }
+    return "not_better";
+}
+
+}  // namespace
+
+std::string LootCandidatesJson(std::vector<LootCandidate> const& candidates)
+{
+    std::string out = "[";
+    bool first = true;
+    for (LootCandidate const& c : candidates)
+    {
+        if (!first)
+            out += ",";
+        first = false;
+        out += "{\"name\":" + JsonString(c.name);
+        out += ",\"family\":" + std::string(c.family ? "true" : "false");
+        out += ",\"wearable\":" + std::string(c.wearable ? "true" : "false");
+        out += ",\"comparison\":" + JsonString(ComparisonName(c.comparison));
+        out += ",\"gain\":" + JsonNumber(c.gain);
+        out += ",\"score\":" + JsonNumber(c.score);
+        out += ",\"upgrade_percent\":" + std::to_string(UpgradePercent(c));
+        out += ",\"item_level_gain\":" + std::to_string(c.itemLevelGain);
+        out += ",\"role\":" + JsonString(c.role);
+        out += ",\"class\":" + JsonString(c.className);
+        out += ",\"spec\":" + JsonString(c.spec);
+        out += ",\"tank\":" + std::string(c.tank ? "true" : "false");
+        out += ",\"why\":" + JsonString(c.why);
+        out += "}";
+    }
+    return out + "]";
+}
+
 // ------------------------------------------ what an equip displaced (#372) --
 
 void GearSlotCleared(GearSlotShadow& shadow, std::uint64_t stamp)
@@ -11983,6 +12270,8 @@ std::string ItemLootDetail(std::string const& via, std::string const& source)
         out = "won on a need roll";
     else if (via == ItemVia::Greed)
         out = "won on a greed roll";
+    else if (via == ItemVia::Council)
+        out = "awarded by the loot council";
     else
         out = "looted";
     if (!source.empty())

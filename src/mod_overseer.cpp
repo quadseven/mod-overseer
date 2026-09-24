@@ -2155,6 +2155,10 @@ constexpr uint32 PROFESSION_POLL_MS = 30000;
 // string. No database query, no pathfinding, no packet. This is the cheapest
 // drive in the file and it runs at the same rate as the most expensive one.
 constexpr uint32 GEAR_POLL_MS = 5000;
+// The loot council's poll (DriveLootCouncil). Two seconds, because a roll is
+// open for sixty and the council's wait is twenty: a slower poll would spend
+// the wait noticing the roll rather than deciding it.
+constexpr uint32 LOOT_COUNCIL_POLL_MS = 2000;
 
 // How long a dungeon run's heartbeat may go cold before it is considered over.
 // The arming drive touches it on every pass while anyone from the roster is
@@ -3601,6 +3605,131 @@ void RecordItemGiven(Player* giver, Player const* receiver, std::string const& r
     OverseerDecisions::FitItemStoryColumn(extra.source);
     QueueEvent(giver, "item_given", itemEntry, proto->Name1,
                OverseerDecisions::ItemGivenDetail(via, toName, source), extra);
+}
+
+// ------------------------------------------------------- the loot council --
+//
+// WHAT CROSSES THREADS AND WHY. A bot votes on a group-loot roll from its own
+// AI update, which runs on a map update thread; the council's rows are read
+// and written by the world thread's DriveLootCouncil. So the two meet here,
+// under one lock, and nowhere else:
+//
+//   the steer (map threads)   reads the roster and the decided verdicts, and
+//                             notes each roll it is asked about the first time
+//   the kill hooks (map)      note each creature a family's raid kills
+//   the roll hook (map)       notes who won a roll the council decided
+//   DriveLootCouncil (world)  turns the notes into rows, reads the decisions
+//                             back into verdicts, and hands master-loot drops
+//                             over
+//
+// Everything is bounded: a roll is forgotten a minute and a half after it was
+// first seen, and a kill is taken off the list on the next poll.
+struct CouncilRoll
+{
+    uint64 groupGuid{0};
+    uint32 itemId{0};
+    int32 randomPropertyId{0};
+    std::vector<ObjectGuid> voters;
+    time_t firstSeen{0};
+    bool written{false};
+};
+
+struct CouncilKill
+{
+    ObjectGuid creature;
+    ObjectGuid killer;
+};
+
+struct CouncilRollWon
+{
+    uint64 rollGuid{0};
+    std::string winner;
+    uint32 itemGuid{0};
+};
+
+std::mutex g_councilMutex;
+std::set<uint64> g_councilRoster;              // raw guids of enabled roster characters
+std::map<uint64, CouncilRoll> g_councilRolls;  // by the roll's item guid
+std::map<uint64, std::string> g_councilVerdicts;  // roll item guid -> recipient ("" = nobody)
+std::vector<CouncilKill> g_councilKills;
+std::vector<CouncilRollWon> g_councilWon;
+
+// How long a roll's note is kept after it was first seen: longer than the
+// sixty seconds a roll is open, so its winner can still be matched to it.
+constexpr time_t COUNCIL_ROLL_FORGET_SECONDS = 90;
+
+// THE STEER (patches/mod-playerbots/0015). Asked by LootRollAction before its
+// own rule, on a map thread, for every open roll this bot has not voted on.
+// Only a roster character in a party (not a raid, which runs master loot)
+// voting on a weapon or a piece of armour is the council's; everything else
+// returns false and keeps the upstream vote.
+bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
+{
+    if (!bot || !roll)
+        return false;
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll->itemid);
+    if (!proto || !OverseerDecisions::LootCouncilJudges(static_cast<int>(proto->Class)))
+        return false;
+    Group* group = bot->GetGroup();
+    if (!group || group->isRaidGroup() || group->isBGGroup() || group->isBFGroup() ||
+        group->isLFGGroup())
+        return false;
+
+    uint64 const key = roll->itemGUID.GetRawValue();
+    time_t const now = std::time(nullptr);
+    std::lock_guard<std::mutex> guard(g_councilMutex);
+    if (g_councilRoster.find(bot->GetGUID().GetRawValue()) == g_councilRoster.end())
+        return false;
+
+    auto noted = g_councilRolls.find(key);
+    if (noted == g_councilRolls.end())
+    {
+        CouncilRoll fresh;
+        fresh.groupGuid = group->GetGUID().GetRawValue();
+        fresh.itemId = roll->itemid;
+        fresh.randomPropertyId = roll->itemRandomPropId
+                                     ? roll->itemRandomPropId
+                                     : -static_cast<int32>(roll->itemRandomSuffix);
+        for (auto const& [voter, cast] : roll->playerVote)
+            if (cast != NOT_VALID)
+                fresh.voters.push_back(voter);
+        fresh.firstSeen = now;
+        noted = g_councilRolls.emplace(key, fresh).first;
+    }
+
+    auto const verdict = g_councilVerdicts.find(key);
+    bool const decided = verdict != g_councilVerdicts.end();
+    switch (OverseerDecisions::LootCouncilVoteFor(
+        decided, decided ? verdict->second : std::string(), bot->GetName(),
+        static_cast<long>(now - noted->second.firstSeen)))
+    {
+        case OverseerDecisions::LootCouncilVote::Hold: vote = NOT_EMITED_YET; return true;
+        case OverseerDecisions::LootCouncilVote::Need: vote = NEED; return true;
+        case OverseerDecisions::LootCouncilVote::Greed: vote = GREED; return true;
+        case OverseerDecisions::LootCouncilVote::Pass: vote = PASS; return true;
+        case OverseerDecisions::LootCouncilVote::Upstream: return false;
+    }
+    return false;
+}
+
+// A creature a family's raid killed, for the master looter to hand out. Only
+// kills by a roster character's raid under master loot are kept.
+void NoteCouncilKill(Player* killer, Creature* killed)
+{
+    if (!killer || !killed)
+        return;
+    Group* group = killer->GetGroup();
+    if (!group || !group->isRaidGroup() || group->GetLootMethod() != MASTER_LOOT)
+        return;
+    std::lock_guard<std::mutex> guard(g_councilMutex);
+    bool family = false;
+    for (GroupReference* ref = group->GetFirstMember(); ref && !family; ref = ref->next())
+        if (Player* member = ref->GetSource())
+            family = g_councilRoster.count(member->GetGUID().GetRawValue()) != 0;
+    if (!family)
+        return;
+    if (g_councilKills.size() < 256)
+        g_councilKills.push_back(CouncilKill{killed->GetGUID(), killer->GetGUID()});
 }
 
 // ----------------------------------------- what an equip displaced (#372) --
@@ -5405,6 +5534,11 @@ public:
         // #572. Notes what a store put in the bags while the Item is alive,
         // because the two hooks above may be handed one that is not.
         PLAYERHOOK_ON_STORE_NEW_ITEM,
+        // The loot council: a family's raid kill leaves a corpse the master
+        // looter hands out. Both return on an integer test unless the killer
+        // is in a raid on master loot.
+        PLAYERHOOK_ON_CREATURE_KILL,
+        PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
     }) {}
 
     // NINETEEN ARRAY READS, ONCE (#372). Player::GetItemByPos on
@@ -5598,7 +5732,19 @@ public:
     void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count,
                                      RollVote voteType, Roll* roll) override
     {
+        // THE LOOT COUNCIL'S ROLL, WON. Noted before the notable test below,
+        // because the council hands out greens as well, and before the item
+        // pointer is trusted: only the name and the roll's own guid are read
+        // here, plus the item's guid when the store hook found it alive.
         Item* live = TakeLootedItem(player, item, count);
+        if (player && roll)
+        {
+            std::lock_guard<std::mutex> guard(g_councilMutex);
+            uint64 const key = roll->itemGUID.GetRawValue();
+            if (g_councilRolls.count(key) && g_councilWon.size() < 256)
+                g_councilWon.push_back(CouncilRollWon{
+                    key, player->GetName(), live ? live->GetGUID().GetCounter() : 0});
+        }
         if (!live)
             return;
         Loot* loot = roll ? roll->getLoot() : nullptr;
@@ -5608,6 +5754,18 @@ public:
                        voteType == NEED ? OverseerDecisions::ItemVia::Need
                                         : OverseerDecisions::ItemVia::Greed,
                        source);
+    }
+
+    // A family's raid kill, for the loot council's master looter (Unit::Kill
+    // calls both after the corpse's loot is filled).
+    void OnPlayerCreatureKill(Player* killer, Creature* killed) override
+    {
+        NoteCouncilKill(killer, killed);
+    }
+
+    void OnPlayerCreatureKilledByPet(Player* owner, Creature* killed) override
+    {
+        NoteCouncilKill(owner, killed);
     }
 
     // Who landed the killing blow, captured while `killer` is still a live
@@ -5725,6 +5883,7 @@ public:
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
+        _councilTimer += diff;
         _eventTimer += diff;
         _engagementTimer += diff;
         _terrainRecoveryTimer += diff;
@@ -5932,6 +6091,13 @@ public:
         {
             _gearTimer = 0;
             DriveGear();
+        }
+        // The loot council runs after the gear drive, whose AnswerOpenRolls
+        // asks the steer again for every roll it is holding.
+        if (_councilTimer >= LOOT_COUNCIL_POLL_MS)
+        {
+            _councilTimer = 0;
+            DriveLootCouncil();
         }
         if (_chatFlushTimer >= CHAT_FLUSH_MS)
         {
@@ -14804,6 +14970,11 @@ private:
     // tested: GearScore, GearIsUpgrade, GearIncumbent and GearNeedWinner are
     // the rule itself and are what a future patch would re-express. Only the
     // call site that could never run is gone.
+    //
+    // THE PATCH EXISTS NOW (#642), and it re-expresses nothing: 0015 lets a
+    // module steer the vote from inside LootRollAction, and CouncilSteerRoll
+    // casts the loot council's answer there - the recipient needs, everybody
+    // else passes - with this file's own GearScore behind the council.
 
     // Every enabled character's talent tree, which is the only thing this drive
     // needs out of the roster table. Read on its own, on the same terms as
@@ -14852,6 +15023,734 @@ private:
 
         for (GearMember& member : members)
             SweepGear(member.bot, member.who);
+    }
+
+    // ---------------------------------------------------- the loot council --
+    //
+    // See OverseerDecisions::LootRulesFor for the two rules and why, and the
+    // file-scope block beside CouncilSteerRoll for what crosses threads. This
+    // half runs on the world thread only, every LOOT_COUNCIL_POLL_MS:
+    //
+    //   1. every family's group runs its rules (need before greed, or master
+    //      loot under the leader), set the way the leader's own loot-method
+    //      packet sets them (WorldSession::HandleLootMethodOpcode)
+    //   2. every roll the steer noted, and every drop on a family raid's
+    //      corpse, becomes an `overseer_loot_council` row with its candidates
+    //      scored by the gear drive's own rule
+    //   3. a decided row becomes a verdict the steer votes by, or a drop the
+    //      master looter hands over
+    //   4. a row nobody decided inside its wait is decided by the heuristic
+
+    SchemaColumns _councilTable{SchemaColumns::Unknown};
+    bool CouncilTablePresent()
+    {
+        if (_councilTable == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_loot_council",
+                "'council_key','candidates','heuristic','status','recipient','reason'", 6);
+            _councilTable = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: loot council is off - overseer_loot_council is missing "
+                         "(2026_09_24_01_overseer_loot_council.sql has not been applied), so "
+                         "rolls keep the upstream vote and a raid's loot rules are left as "
+                         "they are");
+            else
+            {
+                // A fortnight is what the Chronicle reads; older rows are gone.
+                CharacterDatabase.Execute(
+                    "DELETE FROM overseer_loot_council "
+                    "WHERE opened_at < NOW() - INTERVAL 14 DAY");
+                LOG_INFO("module.overseer",
+                         "overseer: loot council is on - need before greed for a family's "
+                         "party, master loot for its raid, each drop judged for {}s "
+                         "(roll) or {}s (master loot) before the heuristic decides",
+                         OverseerDecisions::LOOT_COUNCIL_ROLL_WAIT_SECONDS,
+                         OverseerDecisions::LOOT_COUNCIL_MASTER_WAIT_SECONDS);
+            }
+        }
+        return _councilTable == SchemaColumns::Present;
+    }
+
+    // name -> spec_tab and name -> family, re-read every half minute, and the
+    // roster's guids pushed to the steer.
+    std::map<std::string, uint8> _councilSpecs;
+    std::map<std::string, std::string> _councilFamilies;
+    time_t _councilRosterAt{0};
+    void RefreshCouncilRoster(time_t now)
+    {
+        if (now - _councilRosterAt < 30)
+            return;
+        _councilRosterAt = now;
+        _councilSpecs = LoadGearSpecs();
+        _councilFamilies = LoadRosterFamilies();
+        std::set<uint64> guids;
+        for (auto const& [name, spec] : _councilSpecs)
+        {
+            ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(name);
+            if (!guid.IsEmpty())
+                guids.insert(guid.GetRawValue());
+        }
+        std::lock_guard<std::mutex> guard(g_councilMutex);
+        g_councilRoster.swap(guids);
+    }
+
+    // Rule 1. Every family head's group, whatever its size.
+    void KeepLootRules()
+    {
+        std::set<Group*> seen;
+        for (auto const& [name, family] : _councilFamilies)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            Group* group = member && member->IsInWorld() ? member->GetGroup() : nullptr;
+            if (!group || !seen.insert(group).second)
+                continue;
+            if (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup())
+                continue;
+            OverseerDecisions::LootRules const wanted =
+                OverseerDecisions::LootRulesFor(group->isRaidGroup());
+            bool const masterIsLeader = group->GetMasterLooterGuid() == group->GetLeaderGUID();
+            if (!OverseerDecisions::LootRulesDiffer(wanted, static_cast<int>(group->GetLootMethod()),
+                                                    static_cast<int>(group->GetLootThreshold()),
+                                                    masterIsLeader))
+                continue;
+            group->SetLootMethod(static_cast<LootMethod>(wanted.method));
+            group->SetMasterLooterGuid(wanted.leaderIsMasterLooter ? group->GetLeaderGUID()
+                                                                    : ObjectGuid::Empty);
+            group->SetLootThreshold(static_cast<ItemQualities>(wanted.threshold));
+            group->SendUpdate();
+            LOG_INFO("module.overseer",
+                     "overseer: loot council set family '{}''s {} of {} to {} at uncommon and "
+                     "up{}{}",
+                     family.empty() ? name : family, group->isRaidGroup() ? "raid" : "party",
+                     group->GetMembersCount(), wanted.said,
+                     wanted.leaderIsMasterLooter ? ", master looter " : "",
+                     wanted.leaderIsMasterLooter ? group->GetLeaderName() : "");
+        }
+    }
+
+    // One member scored for one drop: the gear drive's own GearScore against
+    // what the member wears where the core would put it, the same comparison
+    // SweepGear makes (a two-hander against both hands, a ring or trinket
+    // against the worse of the two).
+    OverseerDecisions::LootCandidate CouncilCandidate(Player* bot, ItemTemplate const* proto,
+                                                      int32 randomPropertyId, bool family,
+                                                      std::string const& seatRole)
+    {
+        OverseerDecisions::LootCandidate c;
+        c.name = bot->GetName();
+        c.family = family;
+        c.className = OverseerDecisions::ClassWord(static_cast<int>(bot->getClass()));
+
+        auto const spec = _councilSpecs.find(c.name);
+        uint8 const specTab = spec == _councilSpecs.end() ? 255 : spec->second;
+        OverseerDecisions::GearWearer who = GearWearerFor(bot, specTab);
+        if (who.role == OverseerDecisions::GearRole::Unknown && !seatRole.empty())
+            who.role = OverseerDecisions::GearRoleForSeat(static_cast<int>(bot->getClass()),
+                                                          seatRole);
+        c.spec = OverseerDecisions::SpecTreeName(static_cast<int>(bot->getClass()), specTab);
+        c.role = OverseerDecisions::GearRoleName(who.role);
+        c.tank = who.role == OverseerDecisions::GearRole::Tank;
+
+        // A drop's random property has not been rolled onto an Item yet, so
+        // its stats cannot be read; the score is then a floor, and says so.
+        OverseerDecisions::GearResolvedProperty random;
+        random.unresolved = randomPropertyId != 0;
+        OverseerDecisions::GearVerdict const candidate = GearScoreFor(bot, who, proto, random);
+        c.wearable = candidate.wearable;
+        c.score = candidate.score;
+        c.why = candidate.why;
+        if (!candidate.wearable)
+            return c;
+
+        uint8 const found = bot->FindEquipSlot(proto, NULL_SLOT, true);
+        if (found == NULL_SLOT || found >= EQUIPMENT_SLOT_END)
+        {
+            c.wearable = false;
+            c.why = "no slot it can go in";
+            return c;
+        }
+        uint8 target = found;
+        OverseerDecisions::GearIncumbentScore incumbent = GearWornIncumbent(bot, who, found);
+        if (proto->InventoryType == INVTYPE_2HWEAPON && found == EQUIPMENT_SLOT_MAINHAND)
+            incumbent = OverseerDecisions::GearIncumbentPair(
+                incumbent, GearWornIncumbent(bot, who, EQUIPMENT_SLOT_OFFHAND));
+        else if (found == EQUIPMENT_SLOT_FINGER1 || found == EQUIPMENT_SLOT_TRINKET1)
+        {
+            uint8 const other = static_cast<uint8>(found + 1);
+            OverseerDecisions::GearIncumbentScore const second = GearWornIncumbent(bot, who, other);
+            if (second.score < incumbent.score)
+            {
+                target = other;
+                incumbent = second;
+            }
+        }
+        c.comparison = OverseerDecisions::GearCompare(candidate, incumbent);
+        c.gain = candidate.score - incumbent.score;
+        Item* const worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, target);
+        ItemTemplate const* wornProto = worn ? worn->GetTemplate() : nullptr;
+        c.itemLevelGain = static_cast<int>(proto->ItemLevel) -
+                          static_cast<int>(wornProto ? wornProto->ItemLevel : 0);
+        return c;
+    }
+
+    // Write one council row, synchronously, so the heuristic's later UPDATE
+    // can never overtake it. Returns the heuristic's pick for the caller.
+    OverseerDecisions::LootCouncilPick OpenCouncilRow(
+        std::string const& key, char const* kind, std::string const& family,
+        std::string const& source, uint32 mapId, ItemTemplate const* proto,
+        std::vector<OverseerDecisions::LootCandidate> const& candidates)
+    {
+        OverseerDecisions::LootCouncilPick const pick =
+            OverseerDecisions::LootCouncilHeuristic(candidates);
+        std::string why = pick.why;
+        OverseerDecisions::FitItemStoryColumn(why);
+        std::string src = source;
+        OverseerDecisions::FitItemStoryColumn(src);
+        CharacterDatabase.DirectExecute(
+            "INSERT IGNORE INTO overseer_loot_council (council_key, kind, family, source, map, "
+            "item_entry, item_name, item_quality, candidates, heuristic, heuristic_why) "
+            "VALUES ('{}', '{}', '{}', '{}', {}, {}, '{}', {}, '{}', '{}', '{}')",
+            Esc(key), kind, Esc(family), Esc(src), mapId, proto->ItemId, Esc(proto->Name1),
+            static_cast<uint32>(proto->Quality),
+            EscLong(OverseerDecisions::LootCandidatesJson(candidates)), Esc(pick.recipient),
+            Esc(why));
+        LOG_INFO("module.overseer",
+                 "overseer: loot council opened on {} for family '{}' ({}, {} candidates) - "
+                 "the heuristic would give it to {} because {}",
+                 proto->Name1, family, kind, uint32(candidates.size()),
+                 pick.recipient.empty() ? std::string("nobody") : pick.recipient, pick.why);
+        return pick;
+    }
+
+    // Local state for rows this worldserver opened and has not closed.
+    struct CouncilOpenRoll
+    {
+        time_t openedAt{0};
+        bool decided{false};
+    };
+    std::map<uint64, CouncilOpenRoll> _councilOpenRolls;
+
+    struct CouncilDrop
+    {
+        ObjectGuid creature;
+        ObjectGuid anchor;        // a raid member, to reach the corpse's map
+        unsigned slot{0};
+        uint32 itemId{0};
+        std::string family;
+        std::string source;
+        time_t openedAt{0};
+        std::vector<std::string> ranked;
+        bool decided{false};
+        std::string recipient;
+        std::string reason;
+        std::string decidedBy;
+        bool masterAwaySaid{false};
+    };
+    std::map<std::string, CouncilDrop> _councilDrops;
+
+    struct CouncilCorpse
+    {
+        ObjectGuid creature;
+        ObjectGuid anchor;
+        time_t seen{0};
+    };
+    std::vector<CouncilCorpse> _councilCorpses;
+
+    // Step 2 for a roll the steer noted.
+    void OpenRollCouncil(uint64 rollKey, CouncilRoll const& roll)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll.itemId);
+        if (!proto)
+            return;
+        std::string family;
+        std::vector<Player*> voters;
+        for (ObjectGuid const& guid : roll.voters)
+        {
+            Player* p = ObjectAccessor::FindPlayer(guid);
+            if (!p || !p->IsInWorld())
+                continue;
+            voters.push_back(p);
+            auto const f = _councilFamilies.find(p->GetName());
+            if (family.empty() && f != _councilFamilies.end())
+                family = f->second;
+        }
+        std::vector<OverseerDecisions::LootCandidate> candidates;
+        for (Player* p : voters)
+        {
+            auto const f = _councilFamilies.find(p->GetName());
+            bool const inFamily = f != _councilFamilies.end() && f->second == family;
+            candidates.push_back(
+                CouncilCandidate(p, proto, roll.randomPropertyId, inFamily, std::string()));
+        }
+        uint32 const mapId = voters.empty() ? 0u : voters.front()->GetMapId();
+        OpenCouncilRow(OverseerDecisions::LootCouncilRollKey(rollKey), "roll", family,
+                       std::string(), mapId, proto, candidates);
+        _councilOpenRolls[rollKey] = CouncilOpenRoll{std::time(nullptr), false};
+    }
+
+    // name -> seat role for a family's ordered raid, so a guild raider the
+    // roster does not describe is scored for the job the lineup gave it.
+    std::map<std::string, std::string> LoadSeatRoles(std::string const& family)
+    {
+        std::map<std::string, std::string> roles;
+        if (!RaidSeatsPresent())
+            return roles;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, role FROM overseer_raid_seat WHERE family = '{}'", Esc(family));
+        if (!result)
+            return roles;
+        do
+        {
+            Field* row = result->Fetch();
+            roles[row[0].Get<std::string>()] = row[1].Get<std::string>();
+        } while (result->NextRow());
+        return roles;
+    }
+
+    // Step 2 for a raid corpse: every unlooted weapon or armour piece at or
+    // above the group's threshold opens a row. Anything else above it (a
+    // pattern, a bar, a bag) is not gear, and the master looter takes it for
+    // the guild's stores the way a raid's loot master would.
+    // Returns false once the corpse has nothing left to hand out.
+    bool ScanCouncilCorpse(CouncilCorpse const& corpse, time_t now)
+    {
+        Player* anchor = ObjectAccessor::FindPlayer(corpse.anchor);
+        if (!anchor || !anchor->IsInWorld())
+            return false;
+        Creature* creature = ObjectAccessor::GetCreature(*anchor, corpse.creature);
+        if (!creature)
+            return false;
+        Group* group = anchor->GetGroup();
+        if (!group || !group->isRaidGroup() || group->GetLootMethod() != MASTER_LOOT)
+            return false;
+        Loot& loot = creature->loot;
+        if (loot.empty())
+            return false;
+
+        std::string family;
+        auto const f = _councilFamilies.find(anchor->GetName());
+        if (f != _councilFamilies.end())
+            family = f->second;
+        for (GroupReference* ref = group->GetFirstMember(); ref && family.empty();
+             ref = ref->next())
+            if (Player* member = ref->GetSource())
+            {
+                auto const mf = _councilFamilies.find(member->GetName());
+                if (mf != _councilFamilies.end())
+                    family = mf->second;
+            }
+
+        bool pending = false;
+        for (unsigned slot = 0; slot < loot.items.size(); ++slot)
+        {
+            LootItem const& drop = loot.items[slot];
+            if (drop.is_looted || drop.freeforall || drop.count == 0 || drop.is_underthreshold)
+                continue;
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(drop.itemid);
+            if (!proto || proto->Quality < uint32(group->GetLootThreshold()))
+                continue;
+            std::string const key =
+                OverseerDecisions::LootCouncilMasterKey(corpse.creature.GetRawValue(), slot);
+            if (_councilDrops.count(key))
+            {
+                pending = true;
+                continue;
+            }
+            if (!OverseerDecisions::LootCouncilJudges(static_cast<int>(proto->Class)))
+            {
+                Player* master = ObjectAccessor::FindPlayer(group->GetMasterLooterGuid());
+                std::string why;
+                if (master && MasterLootGive(group, creature, slot, master, why))
+                    LOG_INFO("module.overseer",
+                             "overseer: loot council - master looter '{}' takes {} from {} "
+                             "for the guild's stores; it is not gear",
+                             master->GetName(), proto->Name1, creature->GetName());
+                else
+                    pending = true;
+                continue;
+            }
+
+            std::map<std::string, std::string> const seats = LoadSeatRoles(family);
+            std::vector<OverseerDecisions::LootCandidate> candidates;
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member || !member->IsInWorld())
+                    continue;
+                bool canLoot = member->IsAtLootRewardDistance(creature) ||
+                               creature->HasAllowedLooter(member->GetGUID());
+                if (!canLoot || !drop.AllowedForPlayer(member, loot.sourceWorldObjectGUID))
+                    continue;
+                auto const mf = _councilFamilies.find(member->GetName());
+                bool const inFamily = mf != _councilFamilies.end() && mf->second == family;
+                auto const seat = seats.find(member->GetName());
+                candidates.push_back(CouncilCandidate(
+                    member, proto, drop.randomPropertyId, inFamily,
+                    seat == seats.end() ? std::string() : seat->second));
+            }
+
+            CouncilDrop open;
+            open.creature = corpse.creature;
+            open.anchor = corpse.anchor;
+            open.slot = slot;
+            open.itemId = drop.itemid;
+            open.family = family;
+            open.source = creature->GetName();
+            open.openedAt = now;
+            open.ranked = OpenCouncilRow(key, "master", family, open.source,
+                                         creature->GetMapId(), proto, candidates)
+                              .ranked;
+            _councilDrops[key] = open;
+            pending = true;
+        }
+        return pending;
+    }
+
+    // The core's own master-loot give (WorldSession::HandleLootMasterGiveOpcode),
+    // made for a master looter whose loot window nobody opens: the same checks
+    // (the master looter is the group's, the target is in the raid, can carry
+    // it and is allowed it), the same store, the same notification. The loot
+    // window check is replaced by the master looter standing at the corpse.
+    bool MasterLootGive(Group* group, Creature* creature, unsigned slot, Player* target,
+                        std::string& why)
+    {
+        Loot& loot = creature->loot;
+        if (slot >= loot.items.size())
+        {
+            why = "the drop is gone";
+            return false;
+        }
+        LootItem& drop = loot.items[slot];
+        if (drop.is_looted || drop.count == 0)
+        {
+            why = "the drop is gone";
+            return false;
+        }
+        Player* master = ObjectAccessor::FindPlayer(group->GetMasterLooterGuid());
+        if (!master || !master->IsInWorld() || group->GetLootMethod() != MASTER_LOOT)
+        {
+            why = "the raid has no master looter in the world";
+            return false;
+        }
+        if (!master->IsAtLootRewardDistance(creature))
+        {
+            why = "the master looter is not at the corpse";
+            return false;
+        }
+        if (!target || !target->IsInWorld() || !master->IsInRaidWith(target))
+        {
+            why = "the recipient is not in the raid";
+            return false;
+        }
+        if (!target->IsAtLootRewardDistance(creature) &&
+            !creature->HasAllowedLooter(target->GetGUID()))
+        {
+            why = "the recipient is too far from the corpse";
+            return false;
+        }
+        ItemPosCountVec dest;
+        InventoryResult msg =
+            target->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, drop.itemid, drop.count);
+        if (!drop.AllowedForPlayer(target, loot.sourceWorldObjectGUID))
+            msg = EQUIP_ERR_YOU_CAN_NEVER_USE_THAT_ITEM;
+        if (msg != EQUIP_ERR_OK)
+        {
+            why = msg == EQUIP_ERR_INVENTORY_FULL      ? "the recipient's bags are full"
+                  : msg == EQUIP_ERR_CANT_CARRY_MORE_OF_THIS ? "the recipient already has one"
+                                                             : "the recipient cannot take it";
+            return false;
+        }
+        AllowedLooterSet looters = drop.GetAllowedLooters();
+        Item* newitem = target->StoreNewItem(dest, drop.itemid, true, drop.randomPropertyId, looters);
+        if (!newitem)
+        {
+            why = "the store refused it";
+            return false;
+        }
+        uint32 const itemGuid = newitem->GetGUID().GetCounter();
+        target->SendNewItem(newitem, uint32(drop.count), false, false, true);
+        target->UpdateLootAchievements(&drop, &loot);
+        drop.count = 0;
+        drop.is_looted = true;
+        loot.NotifyItemRemoved(static_cast<uint8>(slot));
+        --loot.unlootedCount;
+        why = std::to_string(itemGuid);
+        return true;
+    }
+
+    // Step 3: read every row this worldserver is waiting on.
+    void ReadCouncilDecisions()
+    {
+        std::vector<std::string> keys;
+        for (auto const& [rollKey, open] : _councilOpenRolls)
+            if (!open.decided)
+                keys.push_back(OverseerDecisions::LootCouncilRollKey(rollKey));
+        for (auto const& [key, drop] : _councilDrops)
+            if (!drop.decided)
+                keys.push_back(key);
+        if (keys.empty())
+            return;
+        std::string list;
+        for (std::string const& key : keys)
+            list += (list.empty() ? "'" : ",'") + Esc(key) + "'";
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT council_key, recipient, reason, decided_by, item_name "
+            "FROM overseer_loot_council WHERE status = 'decided' AND council_key IN ({})",
+            list);
+        if (!result)
+            return;
+        do
+        {
+            Field* row = result->Fetch();
+            std::string const key = row[0].Get<std::string>();
+            std::string const recipient = row[1].Get<std::string>();
+            std::string const reason = row[2].Get<std::string>();
+            std::string const by = row[3].Get<std::string>();
+            std::string const item = row[4].Get<std::string>();
+            LOG_INFO("module.overseer",
+                     "overseer: loot council decided {} - {} ({}: {})", item,
+                     recipient.empty() ? std::string("nobody") : recipient,
+                     by.empty() ? std::string("heuristic") : by, reason);
+            if (key.rfind("roll:", 0) == 0)
+            {
+                uint64 const rollKey = std::strtoull(key.c_str() + 5, nullptr, 10);
+                auto open = _councilOpenRolls.find(rollKey);
+                if (open != _councilOpenRolls.end())
+                    open->second.decided = true;
+                std::lock_guard<std::mutex> guard(g_councilMutex);
+                g_councilVerdicts[rollKey] = recipient;
+                continue;
+            }
+            auto drop = _councilDrops.find(key);
+            if (drop == _councilDrops.end())
+                continue;
+            drop->second.decided = true;
+            drop->second.recipient = recipient;
+            drop->second.reason = reason;
+            drop->second.decidedBy = by;
+        } while (result->NextRow());
+    }
+
+    // Step 4: the heuristic decides a row nobody answered in time. The row
+    // itself is updated, only while still open, so a site answer that landed
+    // first wins and the next read carries whichever did.
+    void LapseCouncil(time_t now)
+    {
+        std::vector<std::string> lapsed;
+        for (auto const& [rollKey, open] : _councilOpenRolls)
+            if (!open.decided &&
+                now - open.openedAt >= OverseerDecisions::LOOT_COUNCIL_ROLL_WAIT_SECONDS)
+                lapsed.push_back(OverseerDecisions::LootCouncilRollKey(rollKey));
+        for (auto const& [key, drop] : _councilDrops)
+            if (!drop.decided &&
+                now - drop.openedAt >= OverseerDecisions::LOOT_COUNCIL_MASTER_WAIT_SECONDS)
+                lapsed.push_back(key);
+        for (std::string const& key : lapsed)
+        {
+            CharacterDatabase.DirectExecute(
+                "UPDATE overseer_loot_council SET status = 'decided', recipient = heuristic, "
+                "reason = heuristic_why, decided_by = 'heuristic', decided_at = NOW() "
+                "WHERE council_key = '{}' AND status = 'open'",
+                Esc(key));
+            LOG_INFO("module.overseer",
+                     "overseer: loot council heard nothing on {} in time, so the heuristic "
+                     "decides it", key);
+        }
+    }
+
+    // The master looter hands each decided drop over: the recipient, then the
+    // rest of the ranking, then the master looter himself. A drop whose master
+    // looter is not at the corpse yet waits for him.
+    void GiveCouncilDrops()
+    {
+        for (auto it = _councilDrops.begin(); it != _councilDrops.end();)
+        {
+            CouncilDrop& drop = it->second;
+            if (!drop.decided)
+            {
+                ++it;
+                continue;
+            }
+            Player* anchor = ObjectAccessor::FindPlayer(drop.anchor);
+            Creature* creature =
+                anchor && anchor->IsInWorld() ? ObjectAccessor::GetCreature(*anchor, drop.creature)
+                                              : nullptr;
+            Group* group = anchor ? anchor->GetGroup() : nullptr;
+            if (!creature || !group)
+            {
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_loot_council SET status = 'failed', outcome = '{}' "
+                    "WHERE council_key = '{}'",
+                    Esc("the corpse was gone before the master looter handed it over"),
+                    Esc(it->first));
+                LOG_WARN("module.overseer",
+                         "overseer: loot council could not hand over {} - the corpse was gone",
+                         it->first);
+                it = _councilDrops.erase(it);
+                continue;
+            }
+
+            std::vector<std::string> order;
+            if (!drop.recipient.empty())
+                order.push_back(drop.recipient);
+            for (std::string const& name : drop.ranked)
+                if (name != drop.recipient)
+                    order.push_back(name);
+            Player* master = ObjectAccessor::FindPlayer(group->GetMasterLooterGuid());
+            if (master && std::find(order.begin(), order.end(), master->GetName()) == order.end())
+                order.push_back(master->GetName());
+
+            if (!master || !master->IsAtLootRewardDistance(creature))
+            {
+                if (!drop.masterAwaySaid)
+                {
+                    drop.masterAwaySaid = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: loot council - {} waits for the master looter to "
+                             "reach {}", it->first, creature->GetName());
+                }
+                ++it;
+                continue;
+            }
+
+            std::string given;
+            uint32 itemGuid = 0;
+            std::string refusals;
+            for (std::string const& name : order)
+            {
+                Player* target = ObjectAccessor::FindPlayerByName(name);
+                std::string why;
+                if (MasterLootGive(group, creature, drop.slot, target, why))
+                {
+                    given = name;
+                    itemGuid = static_cast<uint32>(std::strtoul(why.c_str(), nullptr, 10));
+                    break;
+                }
+                if (why == "the drop is gone")
+                    break;
+                refusals += (refusals.empty() ? "" : "; ") + name + ": " + why;
+            }
+
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(drop.itemId);
+            std::string const itemName = proto ? proto->Name1 : std::to_string(drop.itemId);
+            if (given.empty())
+            {
+                std::string outcome = refusals.empty() ? "the drop was already gone" : refusals;
+                OverseerDecisions::FitItemStoryColumn(outcome);
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_loot_council SET status = 'failed', outcome = '{}' "
+                    "WHERE council_key = '{}'",
+                    Esc(outcome), Esc(it->first));
+                LOG_WARN("module.overseer",
+                         "overseer: loot council could not hand {} to anybody - {}", itemName,
+                         outcome);
+                it = _councilDrops.erase(it);
+                continue;
+            }
+
+            std::string outcome = given == drop.recipient
+                                      ? std::string("handed over by the master looter")
+                                      : (drop.recipient.empty()
+                                             ? "nobody it upgrades; the master looter holds it"
+                                             : "handed to " + given + " instead - " + refusals);
+            OverseerDecisions::FitItemStoryColumn(outcome);
+            CharacterDatabase.Execute(
+                "UPDATE overseer_loot_council SET status = 'given', given_to = '{}', "
+                "item_guid = {}, outcome = '{}', given_at = NOW() WHERE council_key = '{}'",
+                Esc(given), itemGuid, Esc(outcome), Esc(it->first));
+            LOG_INFO("module.overseer",
+                     "overseer: loot council gave {} from {} to '{}' by master loot ({}: {})",
+                     itemName, drop.source, given,
+                     drop.decidedBy.empty() ? std::string("heuristic") : drop.decidedBy,
+                     drop.reason);
+            if (Player* receiver = ObjectAccessor::FindPlayerByName(given))
+                if (Item* item = receiver->GetItemByGuid(
+                        ObjectGuid::Create<HighGuid::Item>(itemGuid)))
+                    RecordItemLoot(receiver, item, OverseerDecisions::ItemVia::Council,
+                                   drop.source);
+            it = _councilDrops.erase(it);
+        }
+    }
+
+    void DriveLootCouncil()
+    {
+        if (!CouncilTablePresent())
+            return;
+        time_t const now = std::time(nullptr);
+        RefreshCouncilRoster(now);
+        KeepLootRules();
+
+        std::vector<CouncilKill> kills;
+        std::vector<CouncilRollWon> won;
+        std::vector<std::pair<uint64, CouncilRoll>> fresh;
+        {
+            std::lock_guard<std::mutex> guard(g_councilMutex);
+            kills.swap(g_councilKills);
+            won.swap(g_councilWon);
+            for (auto it = g_councilRolls.begin(); it != g_councilRolls.end();)
+            {
+                if (now - it->second.firstSeen >= COUNCIL_ROLL_FORGET_SECONDS)
+                {
+                    g_councilVerdicts.erase(it->first);
+                    it = g_councilRolls.erase(it);
+                    continue;
+                }
+                if (!it->second.written)
+                {
+                    it->second.written = true;
+                    fresh.emplace_back(it->first, it->second);
+                }
+                ++it;
+            }
+        }
+        for (auto it = _councilOpenRolls.begin(); it != _councilOpenRolls.end();)
+        {
+            if (now - it->second.openedAt >= COUNCIL_ROLL_FORGET_SECONDS)
+            {
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_loot_council SET status = 'lapsed', "
+                    "outcome = 'the roll ended without a winner the council could see' "
+                    "WHERE council_key = '{}' AND status IN ('open', 'decided')",
+                    Esc(OverseerDecisions::LootCouncilRollKey(it->first)));
+                it = _councilOpenRolls.erase(it);
+            }
+            else
+                ++it;
+        }
+
+        for (auto const& [rollKey, roll] : fresh)
+            OpenRollCouncil(rollKey, roll);
+
+        for (CouncilKill const& kill : kills)
+            _councilCorpses.push_back(CouncilCorpse{kill.creature, kill.killer, now});
+        for (auto it = _councilCorpses.begin(); it != _councilCorpses.end();)
+        {
+            // A corpse is looked at for five minutes, which is longer than any
+            // raid spends deciding its loot, and then let go.
+            if (now - it->seen > 300 || !ScanCouncilCorpse(*it, now))
+                it = _councilCorpses.erase(it);
+            else
+                ++it;
+        }
+
+        ReadCouncilDecisions();
+        LapseCouncil(now);
+        GiveCouncilDrops();
+
+        for (CouncilRollWon const& roll : won)
+        {
+            CharacterDatabase.Execute(
+                "UPDATE overseer_loot_council SET status = 'given', given_to = '{}', "
+                "item_guid = {}, outcome = 'won on the roll', given_at = NOW() "
+                "WHERE council_key = '{}'",
+                Esc(roll.winner), roll.itemGuid,
+                Esc(OverseerDecisions::LootCouncilRollKey(roll.rollGuid)));
+            LOG_INFO("module.overseer", "overseer: loot council roll {} was won by '{}'",
+                     roll.rollGuid, roll.winner);
+            _councilOpenRolls.erase(roll.rollGuid);
+        }
     }
 
     // Only `new rpg` walks a character to an NPC: it owns the `wander npc
@@ -51306,6 +52205,7 @@ private:
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
     uint32 _gearTimer = 0;
+    uint32 _councilTimer = 0;
     uint32 _engagementTimer = 0;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
@@ -51553,6 +52453,9 @@ private:
 
 void Addmod_overseerScripts()
 {
+    // The loot council's steer on the roster's roll votes (patches/
+    // mod-playerbots/0015). Installed before any bot can vote.
+    SetLootRollSteer(&CouncilSteerRoll);
     new OverseerWorldScript();
     new OverseerChatScript();
     new OverseerEventScript();

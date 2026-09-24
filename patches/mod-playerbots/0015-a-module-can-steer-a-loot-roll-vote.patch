@@ -1,0 +1,122 @@
+Subject: [PATCH] a module can steer a bot's loot roll vote
+
+WHY THIS PATCH EXISTS
+
+mod-overseer runs a loot council for the families it drives: a drop goes to
+whoever in the family it upgrades most, then to the guild's raiders, the way a
+guild hands loot out. For a party on need before greed that means the council's
+recipient needs and everybody else passes. The vote is cast here, and nowhere
+else can reach it first.
+
+mod-overseer's own comment on its removed need vote (mod_overseer.cpp, "WHY THIS
+DRIVE CASTS NO NEED/GREED VOTE") has the measurement: LootRollAction answers a
+roll from the SMSG_LOOT_START_ROLL packet, at relevance 100, and votes on every
+roll where its own vote is still NOT_EMITED_YET. World::Update runs every bot's
+AI before the module's OnUpdate, and Group::GroupLoot sends the packet before
+it pushes the roll onto RollId, so no poll and no packet hook in the module can
+act before this action does. That comment names this file as where the rule has
+to live.
+
+THE CHANGE
+
+A steer a module installs once at startup with SetLootRollSteer. For each open
+roll the bot has not voted on, Execute asks it first:
+
+  - false: the steer has no opinion, and the upstream rule votes as before.
+  - true with a vote: that vote is cast through Group::CountRollVote.
+  - true with NOT_EMITED_YET: nothing is cast this time. The vote stays
+    NOT_EMITED_YET, so the next Execute (the module calls this action from its
+    own drive every few seconds) asks again.
+
+The steer is one function pointer, set before any bot votes and only read
+afterwards. It is held in a std::atomic (release on the store, acquire on
+every read) so the map threads that read it agree with the startup that wrote
+it without relying on thread start order; whatever the module keeps behind it
+is the module's to guard.
+
+A steer that holds too long costs a pass: Group::EndRoll counts a vote never
+cast as a pass when the sixty seconds run out. mod-overseer's steer returns
+false after 45 seconds (LOOT_COUNCIL_ROLL_LAST_SECONDS) for exactly that reason.
+
+WHAT IT DELIBERATELY DOES NOT CHANGE
+
+The upstream rule, including 0008's greed on BAD_EQUIP, for every bot the
+steer returns false for: every bot on a realm without mod-overseer, every bot
+outside a family's party, and every item that is not a weapon or armour.
+MasterLootRollAction and RollAction are untouched.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream offering a script hook ahead of the bot's roll vote.
+
+APPLIES TO
+
+mod-playerbots @ 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312, on top of local
+patches 0001-0014. Touches only LootRollAction.h and LootRollAction::Execute.
+
+diff --git a/src/Ai/Base/Actions/LootRollAction.cpp b/src/Ai/Base/Actions/LootRollAction.cpp
+index 4737d63..e22aa29 100644
+--- a/src/Ai/Base/Actions/LootRollAction.cpp
++++ b/src/Ai/Base/Actions/LootRollAction.cpp
+@@ -13,6 +13,15 @@
+ #include "PlayerbotAIConfig.h"
+ #include "Playerbots.h"
+ 
++#include <atomic>
++
++// infra: see SetLootRollSteer in LootRollAction.h. Set once at startup, before
++// any bot votes, and read from every map thread afterwards; atomic, so the
++// write and every read agree without relying on when the threads started.
++static std::atomic<LootRollSteer> sLootRollSteer{nullptr};
++
++void SetLootRollSteer(LootRollSteer steer) { sLootRollSteer.store(steer, std::memory_order_release); }
++
+ bool LootRollAction::Execute(Event /*event*/)
+ {
+     Group* group = bot->GetGroup();
+@@ -27,6 +36,19 @@ bool LootRollAction::Execute(Event /*event*/)
+         if (voteItr == roll->playerVote.end() || voteItr->second != NOT_EMITED_YET)
+             continue;
+ 
++        // infra: a module's decision comes first. NOT_EMITED_YET holds the
++        // vote, so the roll stays open for this bot until the steer decides.
++        LootRollSteer const steer = sLootRollSteer.load(std::memory_order_acquire);
++        RollVote steered = NOT_EMITED_YET;
++        if (steer && steer(bot, roll, steered))
++        {
++            if (steered == NOT_EMITED_YET)
++                continue;
++            group->CountRollVote(bot->GetGUID(), roll->itemGUID, steered);
++            voted = true;
++            continue;
++        }
++
+         ObjectGuid guid = roll->itemGUID;
+         uint32 itemId = roll->itemid;
+         int32 randomProperty = 0;
+diff --git a/src/Ai/Base/Actions/LootRollAction.h b/src/Ai/Base/Actions/LootRollAction.h
+index 586d8c2..199fdf5 100644
+--- a/src/Ai/Base/Actions/LootRollAction.h
++++ b/src/Ai/Base/Actions/LootRollAction.h
+@@ -10,11 +10,21 @@
+ #include "QueryItemUsageAction.h"
+ 
+ class PlayerbotAI;
++class Player;
++class Roll;
+ 
+ struct ItemTemplate;
+ 
+ enum RollVote : uint8;
+ 
++// infra: a module may decide a bot's group-loot vote before this action does.
++// The steer is asked once per open roll the bot has not voted on. It returns
++// false to leave the vote to this action, or true having set `vote`: a real
++// vote to cast now, or NOT_EMITED_YET to cast nothing yet and be asked again
++// on the next call. mod-overseer's loot council is the one user.
++typedef bool (*LootRollSteer)(Player* bot, Roll const* roll, RollVote& vote);
++void SetLootRollSteer(LootRollSteer steer);
++
+ class LootRollAction : public QueryItemUsageAction
+ {
+ public:

@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <map>
 #include <stdexcept>
@@ -4563,6 +4564,159 @@ struct GearContender
 };
 
 std::string GearNeedWinner(std::vector<GearContender> const& contenders);
+
+// ------------------------------------------------------ the loot council --
+//
+// LOOT GOES TO WHOEVER IT UPGRADES MOST, THE WAY A GUILD HANDS IT OUT. Measured
+// on the dev realm 2026-09-24: the level 60 Alliance family wore the weakest
+// gear in its own raid (average item level 39 to 45 against the raiders' 67),
+// because a group-loot roll puts a drop on whoever won a random number and a
+// raid had no master looter at all. A real guild runs two rules, and so does
+// this:
+//
+//   a party (the family's five)   need before greed, threshold uncommon. The
+//                                 council names who needs; everybody else
+//                                 passes. Nobody it upgrades: everybody greeds.
+//   a raid (the forty)            master loot, threshold uncommon, the raid
+//                                 leader as master looter. The council names
+//                                 the recipient and the master looter hands it
+//                                 over, the way CMSG_LOOT_MASTER_GIVE does.
+//
+// THE COUNCIL IS ASKED FIRST AND THE HEURISTIC IS THE FALLBACK. The adapter
+// writes each drop worth judging to `overseer_loot_council` with every
+// candidate's upgrade already scored (GearScore against what they wear), and
+// the site's loot_council judgment answers it. A drop nobody answers inside
+// its wait is decided by `LootCouncilHeuristic` below, so a silent site costs
+// a few seconds and never a drop.
+
+// The core's LootMethod values (Group.h) and ItemQualities' uncommon, named
+// here so this file includes no core header.
+namespace LootMethodId
+{
+constexpr int FreeForAll = 0;
+constexpr int RoundRobin = 1;
+constexpr int MasterLoot = 2;
+constexpr int GroupLoot = 3;
+constexpr int NeedBeforeGreed = 4;
+}  // namespace LootMethodId
+constexpr int LOOT_QUALITY_UNCOMMON = 2;
+
+struct LootRules
+{
+    int method{LootMethodId::GroupLoot};
+    int threshold{LOOT_QUALITY_UNCOMMON};
+    // The group's leader is the master looter. Meaningful only for MasterLoot.
+    bool leaderIsMasterLooter{false};
+    // "need before greed" or "master loot", for the log line.
+    char const* said{""};
+};
+
+// The rules a family's group should run: master loot for a raid, need before
+// greed for a party.
+LootRules LootRulesFor(bool raid);
+
+// Does a group running `method` at `threshold`, whose master looter is or is
+// not its leader, need changing to `wanted`?
+bool LootRulesDiffer(LootRules const& wanted, int method, int threshold,
+                     bool masterLooterIsLeader);
+
+// How long a drop waits for the council before the heuristic decides it. A
+// group-loot roll is open for sixty seconds (Group.cpp passes 60000 to
+// SendLootStartRollToPlayer), so a roll's wait leaves forty of them for the
+// votes; a master-loot drop has no clock but the corpse's, and a person
+// running loot takes about this long to look at who wants it.
+constexpr long LOOT_COUNCIL_ROLL_WAIT_SECONDS = 20;
+constexpr long LOOT_COUNCIL_MASTER_WAIT_SECONDS = 30;
+// Past this a roll the adapter has not decided is left to the upstream vote,
+// so no roll can ever time out into a pass for everybody.
+constexpr long LOOT_COUNCIL_ROLL_LAST_SECONDS = 45;
+
+// Weapons and armour are what the council judges; everything else (a recipe,
+// a bag, cloth) keeps the upstream roll rule.
+bool LootCouncilJudges(int itemClass);
+
+// One member who could receive a drop, scored by the gear drive's own rule.
+struct LootCandidate
+{
+    std::string name;
+    // In the holder's family (the roster), or a guild raider.
+    bool family{false};
+    // GearScore said this character may wear it at all.
+    bool wearable{false};
+    // GearCompare of the drop against what is worn in its slot.
+    GearComparison comparison{GearComparison::NotBetter};
+    // Score over what is worn there, in the scorer's armour points, and the
+    // drop's score itself; `UpgradePercent` is the first over the second.
+    float gain{0.f};
+    float score{0.f};
+    int itemLevelGain{0};
+    // GearRoleName of the role the score was weighed for.
+    std::string role;
+    // The class, the talent tree and the family head's tank flag, as facts for
+    // the council's question.
+    std::string className;
+    std::string spec;
+    bool tank{false};
+    // GearVerdict::why, or the refusal sentence.
+    std::string why;
+};
+
+// How much of what the drop is worth to this character is new: 100 for an
+// empty slot, 0 for a sidegrade. Comparable across roles, which a raw score
+// gain is not (a tank's scale is armour, a caster's is intellect).
+int UpgradePercent(LootCandidate const& candidate);
+
+// "tank", "melee", "ranged", "healer", "caster" or "unknown".
+char const* GearRoleName(GearRole role);
+
+// A raid seat's role (`overseer_raid_seat`.`role`: tank, healer, damage) for a
+// character the roster does not describe, so a guild raider is scored for the
+// job the lineup gave it. `classId` is the core's class id; a damage seat is
+// melee, ranged or caster by class.
+GearRole GearRoleForSeat(int classId, std::string const& seatRole);
+
+// Words for the council's question: the class ("Warrior") and the talent tree
+// a roster `spec_tab` names in the DBC's tab order ("Protection"). Empty for
+// an id or a tab this does not know, including 255, "no tree chosen".
+std::string ClassWord(int classId);
+std::string SpecTreeName(int classId, int specTab);
+
+struct LootCouncilPick
+{
+    // Every candidate the drop upgrades, best first.
+    std::vector<std::string> ranked;
+    // ranked[0], or empty when it upgrades nobody.
+    std::string recipient;
+    std::string why;
+};
+
+// THE HEURISTIC A LOOT COUNCIL RUNS. Family first, then guild raiders; inside
+// each, a certain upgrade (GearComparison::Better) before one the numbers
+// cannot settle, and then the larger UpgradePercent, then the name. A drop
+// that is not an upgrade for anybody names nobody.
+LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidates);
+
+// What one member votes on an open group-loot roll the council is deciding.
+enum class LootCouncilVote
+{
+    Hold,      // not decided yet; cast nothing this time
+    Need,      // the council's recipient
+    Greed,     // the council named nobody: everybody greeds
+    Pass,      // somebody else's
+    Upstream,  // too late for the council; the upstream rule votes
+};
+
+LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
+                                   std::string const& voter, long openSeconds);
+
+// The row key: "roll:<roll item guid>" for a group-loot roll, and
+// "ml:<creature raw guid>:<loot slot>" for a master-loot drop.
+std::string LootCouncilRollKey(std::uint64_t rollItemGuid);
+std::string LootCouncilMasterKey(std::uint64_t sourceGuid, unsigned slot);
+
+// The candidates as the JSON array the site reads. Names, classes and specs
+// are the only strings and are escaped.
+std::string LootCandidatesJson(std::vector<LootCandidate> const& candidates);
 
 // ------------------------------------------ what an equip displaced (#372) --
 //
@@ -14368,6 +14522,8 @@ constexpr char const* Mail = "mail";
 constexpr char const* Loot = "loot";
 constexpr char const* Need = "need";
 constexpr char const* Greed = "greed";
+// Handed over by the raid's master looter on the loot council's word.
+constexpr char const* Council = "council";
 }  // namespace ItemVia
 
 // `detail` and `source` are VARCHAR(255). Trims `text` to that many bytes
