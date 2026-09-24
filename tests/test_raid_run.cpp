@@ -264,18 +264,14 @@ void InsideHoldsAndLetsStragglersThrough()
 {
     RaidRunFacts facts = Ready();
     facts.headInside = true;
+    facts.headAlive = true;
     facts.headAssembled = false;
     RaidRunStep const inside = StepRaidRun(RaidRunPhase::Enter, facts);
-    CheckPhase("the head inside is INSIDE", inside.phase, RaidRunPhase::Inside);
+    CheckPhase("the head inside is HOLD", inside.phase, RaidRunPhase::Hold);
     Check("stragglers at the door are still knocked", inside.knockMembers);
     Check("nothing walks the head anywhere", !inside.aimDoor && !inside.aimStaging);
     Check("and nothing forms", !inside.form);
-
-    facts.headInside = false;
-    RaidRunStep const left = StepRaidRun(RaidRunPhase::Inside, facts);
-    CheckPhase("a head who left holds INSIDE rather than walking back",
-               left.phase, RaidRunPhase::Inside);
-    Check("with nothing moving", !left.aimDoor && !left.aimStaging && !left.knockMembers);
+    Check("and the brain is not armed on arrival", !inside.armClear);
 }
 
 void ARaidMapIsNotArmedUntilClearingIsOrdered()

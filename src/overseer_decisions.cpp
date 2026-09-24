@@ -10869,7 +10869,7 @@ RaidDoor const* RaidDoorFor(std::string const& keyword)
     // See RaidDoor for where every number comes from.
     static RaidDoor const doors[] = {
         {"moltencore", "Molten Core", 0, 3529, 409, 2890,
-         -7508.32f, -1039.74f, 180.912f, 50},
+         -7508.32f, -1039.74f, 180.912f, 50, "moltencore"},
     };
     for (RaidDoor const& door : doors)
         if (keyword == door.keyword)
@@ -10894,10 +10894,170 @@ char const* RaidRunPhaseName(RaidRunPhase phase)
         case RaidRunPhase::Form:     return "FORM";
         case RaidRunPhase::Assemble: return "ASSEMBLE";
         case RaidRunPhase::Enter:    return "ENTER";
-        case RaidRunPhase::Inside:   return "INSIDE";
+        case RaidRunPhase::Hold:     return "HOLD";
+        case RaidRunPhase::Clear:    return "CLEAR";
+        case RaidRunPhase::Recover:  return "RECOVER";
     }
     return "IDLE";
 }
+
+bool RaidWiped(RaidRunFacts const& facts)
+{
+    unsigned const total = facts.insideAlive + facts.insideDead;
+    if (facts.insideDead == 0 || total == 0)
+        return false;
+    if (facts.insideAlive == 0)
+        return true;
+    return !facts.insideCombat && facts.insideDead * 100 >= total * RAID_WIPE_PCT;
+}
+
+bool RaidGhostMayBeWalked(long ghostSeconds)
+{
+    return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
+}
+
+RaidClearStallAction RaidClearStallDecision(bool stalled, unsigned regroupsSinceProgress,
+                                            unsigned maximumRegroups)
+{
+    if (!stalled)
+        return RaidClearStallAction::Nothing;
+    return regroupsSinceProgress < maximumRegroups ? RaidClearStallAction::Regroup
+                                                   : RaidClearStallAction::Skip;
+}
+
+namespace
+{
+// Once the raid has been through the door, the run is one of these.
+bool RaidRunIsInside(RaidRunPhase phase)
+{
+    return phase == RaidRunPhase::Hold || phase == RaidRunPhase::Clear ||
+           phase == RaidRunPhase::Recover;
+}
+
+// The raid, the head inside and alive, and no wipe: HOLD, or CLEAR.
+RaidRunStep StepRaidRunInside(RaidRunPhase current, RaidRunFacts const& facts)
+{
+    RaidRunStep step;
+    // Stragglers still standing in the door are let through: the raid they
+    // were walking with is inside. So is a ghost walking back to it.
+    step.knockMembers = true;
+    step.runBack = facts.ghosts > 0 && facts.headStreaming;
+
+    if (current == RaidRunPhase::Clear)
+    {
+        if (facts.stallRegroup)
+        {
+            step.phase = RaidRunPhase::Hold;
+            step.standDown = true;
+            step.prepare = true;
+            step.why = "CLEAR has not advanced; the raid regroups at HOLD and the "
+                       "brain is armed again from a clean state";
+            return step;
+        }
+        step.phase = RaidRunPhase::Clear;
+        step.armClear = !facts.cleared;
+        step.why = facts.cleared ? "every encounter is done; the raid holds for the "
+                                   "operator to end the order"
+                                 : "the dungeon brain is clearing";
+        return step;
+    }
+
+    step.phase = RaidRunPhase::Hold;
+    step.prepare = true;
+    if (current != RaidRunPhase::Hold)
+    {
+        step.why = current == RaidRunPhase::Recover
+                       ? "the raid is back inside; it gathers, rests and rebuffs"
+                       : "the head is inside; the raid gathers at the entrance";
+        return step;
+    }
+
+    bool const waited = facts.heldSeconds >= RAID_HOLD_WAIT_SECONDS;
+    if (facts.heldSeconds < RAID_HOLD_SETTLE_SECONDS)
+    {
+        step.why = "the raid settles and buffs at the entrance";
+        return step;
+    }
+    if (facts.insideCombat)
+    {
+        step.why = "something inside is fighting the raid at the entrance";
+        return step;
+    }
+    if (!waited && facts.inside < facts.inWorld)
+    {
+        step.why = "waiting for raid members still outside";
+        return step;
+    }
+    if (!waited && facts.insideDead > 0)
+    {
+        step.why = "waiting for the dead inside to be resurrected";
+        return step;
+    }
+    if (!waited && facts.insideResting > 0)
+    {
+        step.why = "waiting for the raid to eat and drink";
+        return step;
+    }
+    step.phase = RaidRunPhase::Clear;
+    step.armClear = !facts.cleared;
+    step.why = waited ? "the wait at the entrance is over; the raid clears with "
+                        "whoever is ready"
+                      : "the raid is in, alive and rested; the dungeon brain clears";
+    return step;
+}
+
+// A wipe, or the head outside after the raid has been in.
+RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
+{
+    RaidRunStep step;
+    step.phase = RaidRunPhase::Recover;
+    step.standDown = current == RaidRunPhase::Clear;
+    bool const wiped = RaidWiped(facts);
+    // The dead inside are released only when nobody standing can raise them.
+    step.releaseDead = wiped;
+    // Every ghost is walked back, with the head's client attached (nothing
+    // walks for a door the operator cannot watch); the bound is per ghost
+    // (RaidGhostMayBeWalked).
+    step.runBack = facts.headStreaming;
+    // Ghosts and the living at the door are knocked through; the head last.
+    step.knockMembers = true;
+
+    if (facts.headInside)
+    {
+        step.why = wiped ? "the raid wiped; the dead are released and run back"
+                         : "the raid runs back to the door while the head waits inside";
+        return step;
+    }
+
+    if (!facts.headStreaming)
+    {
+        // Nothing walks forty characters to a door the operator cannot watch,
+        // the run-back included. The release is not a walk and still happens.
+        step.runBack = false;
+        step.knockMembers = false;
+        step.why = "the head is not in the world with a game client attached, so "
+                   "the run-back holds";
+        return step;
+    }
+
+    if (facts.headAlive && !facts.headAssembled)
+    {
+        step.aimStaging = true;
+        step.why = wiped ? "the raid wiped; the head walks back to the door"
+                         : "the head is outside; he walks back to the door";
+        return step;
+    }
+    // At the door (or a ghost being walked there): cross last.
+    step.aimDoor = facts.headAlive;
+    step.knockHead = facts.headAssembled &&
+                     (facts.othersAssembled == 0 ||
+                      facts.heldSeconds >= RAID_ENTER_WAIT_SECONDS);
+    step.why = step.knockHead ? "the head crosses back in, last"
+                              : "the raid runs back and is knocked through the door; "
+                                "the head waits";
+    return step;
+}
+}  // namespace
 
 RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
 {
@@ -10910,15 +11070,26 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
         return step;
     }
 
-    // Stragglers still standing in the door are let through after the head:
-    // the raid they were walking with is inside.
-    if (facts.headInside)
+    // INSIDE, in the order of what overrides what (see StepRaidRun's header).
+    bool const wasInside = RaidRunIsInside(current);
+    if (wasInside || facts.headInside)
     {
-        step.phase = RaidRunPhase::Inside;
-        step.knockMembers = true;
-        step.why = "the head is inside; the raid holds at the entrance because "
-                   "clearing is not ordered";
-        return step;
+        if (RaidWiped(facts))
+            return StepRaidRunRecover(current, facts);
+        if (wasInside && !facts.headInside)
+            return StepRaidRunRecover(current, facts);
+        if (current == RaidRunPhase::Recover && facts.ghosts > 0)
+            return StepRaidRunRecover(current, facts);
+        if (!facts.headAlive)
+        {
+            step.phase = wasInside ? current : RaidRunPhase::Hold;
+            step.knockMembers = true;
+            step.armClear = step.phase == RaidRunPhase::Clear && !facts.cleared;
+            step.why = "the head is dead inside with the raid still standing; the "
+                       "raid's healers are expected to raise him";
+            return step;
+        }
+        return StepRaidRunInside(current, facts);
     }
 
     if (!facts.headStreaming)
@@ -11003,12 +11174,11 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             return step;
         }
 
-        case RaidRunPhase::Inside:
-            // The head was inside and is not now: he died and released, or
-            // walked out. Nothing here walks forty characters back in on its
-            // own; the order stands and the operator decides.
-            step.phase = RaidRunPhase::Inside;
-            step.why = "the head has left the instance; the raid holds";
+        case RaidRunPhase::Hold:
+        case RaidRunPhase::Clear:
+        case RaidRunPhase::Recover:
+            // Answered above: an inside phase never reaches the switch.
+            step.phase = current;
             return step;
     }
     return step;
@@ -12600,6 +12770,62 @@ std::vector<RunTimelineEvent> RunTimelineEvents(RunTimelineSnapshot const& befor
         if (before.phase == "IDLE" && !after.portal.empty())
             detail += " (" + after.portal + ", run " + std::to_string(after.runNumber) +
                       " of campaign " + std::to_string(after.campaignId) + ")";
+        add("phase", detail);
+    }
+    return events;
+}
+
+std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& before,
+                                                 RaidTimelineSnapshot const& after)
+{
+    std::vector<RunTimelineEvent> events;
+    // A run that went back to IDLE was reset with it, so its decisions belong
+    // to the snapshot before; a counter means something only within one run.
+    bool const wentIdle = after.phase == "IDLE";
+    RaidTimelineSnapshot const& who = wentIdle ? before : after;
+    bool const sameRun = !wentIdle && before.phase != "IDLE";
+
+    auto add = [&](std::string kind, std::string detail) {
+        RunTimelineEvent e;
+        e.runId = who.runId;
+        e.runNumber = who.wipes + 1;
+        e.portal = who.keyword;
+        e.phase = after.phase;
+        e.kind = std::move(kind);
+        e.detail = RunTimelineDetail(detail);
+        events.push_back(std::move(e));
+    };
+
+    if (sameRun)
+    {
+        if (after.mainTankMarked && !before.mainTankMarked)
+            add("main_tank", "the head is marked main tank, so the dungeon brain elects him");
+        if (after.bossesDone > before.bossesDone)
+            add("boss", std::to_string(after.bossesDone - before.bossesDone) + " encounter" +
+                            (after.bossesDone - before.bossesDone == 1 ? "" : "s") +
+                            " done, " + std::to_string(after.bossesDone) + " of " +
+                            std::to_string(after.bossesTotal) + " in all");
+        if (after.wipes > before.wipes)
+            add("wipe", "the raid wiped (wipe " + std::to_string(after.wipes) + ")");
+        if (after.released > before.released)
+            add("released", std::to_string(after.released - before.released) +
+                                " corpse" + (after.released - before.released == 1 ? "" : "s") +
+                                " released for the run back");
+        if (after.regroups > before.regroups)
+            add("regroup", "CLEAR stalled; regroup " + std::to_string(after.regroups) +
+                               " at HOLD and arm again");
+        if (after.skips > before.skips)
+            add("dc_skip", "CLEAR stalled past its regroups; 'dc skip' " +
+                               std::to_string(after.skips) + " issued");
+        if (after.cleared && !before.cleared)
+            add("cleared", "every encounter the instance keeps is done");
+    }
+
+    if (after.phase != before.phase)
+    {
+        std::string detail = before.phase + " -> " + after.phase;
+        if (!after.why.empty())
+            detail += ": " + after.why;
         add("phase", detail);
     }
     return events;
