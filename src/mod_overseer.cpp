@@ -37566,12 +37566,17 @@ private:
                 {
                     coord.loggedNoCompletionSignal = true;
                     LOG_WARN("module.overseer",
-                             "overseer: map {} has no DungeonEncounter rows, so this "
+                             "overseer: map {} {}, so this "
                              "coordinator cannot tell when a run on it is finished. The "
                              "run still ends the ways it always could - the clearing "
                              "watchdog, a job change, or the map emptying - and it will "
                              "never be recorded 'complete'",
-                             portal->insideMapId);
+                             portal->insideMapId,
+                             OverseerDecisions::DungeonMapHasIndependentWings(
+                                 portal->insideMapId)
+                                 ? "is split into wings its DungeonEncounter rows do not "
+                                   "tell apart (#431)"
+                                 : "has no DungeonEncounter rows");
                 }
             }
 
