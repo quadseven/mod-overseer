@@ -235,22 +235,57 @@ void TheWordRoundTrips()
 void EachMemberStepsTowardTheInn()
 {
     Check("at the inn is done",
-          HearthRegroupStepFor(true, 30.f, true, false) == HearthRegroupStep::AtInn);
+          HearthRegroupStepFor(true, 30.f, true, false, false) == HearthRegroupStep::AtInn);
     Check("a walker at the inn is done too",
-          HearthRegroupStepFor(false, 30.f, true, true) == HearthRegroupStep::AtInn);
+          HearthRegroupStepFor(false, 30.f, true, true, false) == HearthRegroupStep::AtInn);
     Check("a member of the hearth set hearths",
-          HearthRegroupStepFor(true, 4289.f, true, false) == HearthRegroupStep::Hearth);
+          HearthRegroupStepFor(true, 4289.f, true, false, false) == HearthRegroupStep::Hearth);
     Check("but not before the leader is coming",
-          HearthRegroupStepFor(true, 4289.f, false, false) ==
+          HearthRegroupStepFor(true, 4289.f, false, false, false) ==
               HearthRegroupStep::WaitForLeader);
     Check("a stone that cannot be used walks",
-          HearthRegroupStepFor(true, 4289.f, true, true) == HearthRegroupStep::Travel);
+          HearthRegroupStepFor(true, 4289.f, true, true, false) == HearthRegroupStep::Travel);
     Check("a member bound elsewhere walks or flies",
-          HearthRegroupStepFor(false, 3900.f, true, true) == HearthRegroupStep::Travel);
+          HearthRegroupStepFor(false, 3900.f, true, true, false) == HearthRegroupStep::Travel);
     Check("another map is not at the inn",
-          HearthRegroupStepFor(false, -1.f, true, true) == HearthRegroupStep::Travel);
+          HearthRegroupStepFor(false, -1.f, true, true, false) == HearthRegroupStep::Travel);
     Check("every step has a word",
           std::string(HearthRegroupStepWord(HearthRegroupStep::WaitForLeader)) != "unknown");
+}
+
+// THE MEASURED FLAP, 2026-09-24 11:10-11:20, campaign 13 (Alliance family,
+// recovery hearth_regroup applied 11:09:42). Every member hearthed and landed
+// 0 to 3 yards from the inn. Released to `follow`, each was walked toward a
+// leader 7,700 yards away, crossed out of the 100-yard inn radius, was escorted
+// back, read "at the inn" at 93, 64, 70, 76, 85 or 89 yards, and crossed out
+// again at 101 to 131 yards. "hearth regroup done" never fired.
+void AnArrivalIsNotUndoneByTheNextFewYards()
+{
+    // Grog: in at 93, then out at 131. Bork: in at 70, out at 103 and 104.
+    // Ugga: in at 76 and 89, out at 110 and 121. Og: in at 85, out at 122.
+    float const out[] = {131.f, 101.f, 103.f, 104.f, 110.f, 121.f, 122.f, 128.f};
+    for (float yards : out)
+    {
+        Check("a member that has arrived is still at the inn",
+              HearthRegroupStepFor(true, yards, true, true, true) == HearthRegroupStep::AtInn);
+        Check("a walker bound elsewhere that has arrived is still at the inn",
+              HearthRegroupStepFor(false, yards, true, true, true) ==
+                  HearthRegroupStep::AtInn);
+        Check("one that has not arrived is not there yet",
+              HearthRegroupStepFor(true, yards, true, true, false) ==
+                  HearthRegroupStep::Travel);
+    }
+    Check("arriving still takes the inn radius",
+          HearthRegroupStepFor(false, 93.f, true, true, false) == HearthRegroupStep::AtInn);
+    Check("past the leave radius an arrived member walks back",
+          HearthRegroupStepFor(true, HEARTH_REGROUP_LEAVE_YARDS + 1.f, true, true, true) ==
+              HearthRegroupStep::Travel);
+    Check("and one whose stone is ready hearths back",
+          HearthRegroupStepFor(true, 7700.f, true, false, true) == HearthRegroupStep::Hearth);
+    Check("another map is never at the inn, arrived or not",
+          HearthRegroupStepFor(false, -1.f, true, true, true) == HearthRegroupStep::Travel);
+    Check("leaving takes more than arriving",
+          HEARTH_REGROUP_LEAVE_YARDS > HEARTH_REGROUP_INN_YARDS);
 }
 
 void TheLeaderIsNotFetchedWhileTheFamilyMeetsAtItsInn()
@@ -344,6 +379,21 @@ void TheAdapterIsWired()
         "facts.hearthRegroup = _hearthRegroupMembers.count(name) > 0;");
     has("the talent reset measures its trainer between attempts",
         "head.trainerYards = bot->GetExactDist2d(trainerPos.GetPositionX(),");
+    has("arrival is remembered per member",
+        "coord.hearthArrived.insert(name);");
+    has("and read back into the step",
+        "hearths, yards, name == leaderName || leaderComing, impossible, arrivedBefore);");
+    has("an arrived member is held at the inn",
+        "HoldAtStagingPoint(bot, name, \"the hearth regroup holds it at the \"");
+    has("and keeps the run's escort, so no catch-up walk starts",
+        "EscortToward(name, innAim.str(), \"HEARTH REGROUP\", EscortPurpose::Assemble);\n"
+        "                    break;\n"
+        "\n"
+        "                case HearthRegroupStep::WaitForLeader:");
+    has("the barrier's sweep keeps the hold while the regroup is applied",
+        "HearthRegroupHolds(coord->second)))");
+    has("and the plan's reset forgets who arrived",
+        "coord.hearthArrived.clear();");
     // Nothing here moves a character by any road but the stone and the walk.
     std::size_t const begin = source.find("    bool DriveHearthRegroup(");
     std::size_t const end = source.find("    void DriveRecovering(", begin);
@@ -365,6 +415,7 @@ int main()
     NotAThirdTimeAndNeverWithoutAnInn();
     TheWordRoundTrips();
     EachMemberStepsTowardTheInn();
+    AnArrivalIsNotUndoneByTheNextFewYards();
     TheLeaderIsNotFetchedWhileTheFamilyMeetsAtItsInn();
     ATalentResetWaitsForAnArmedCampaignUnlessTheTrainerIsInTown();
     TheAdapterIsWired();

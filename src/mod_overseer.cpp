@@ -8126,7 +8126,8 @@ private:
     // the dev realm 2026-09-23 at Ragefire: 408 yards off the point 90 seconds
     // into BARRIER, with no travel focus at all. SweepTravelFocus spares a
     // character under this hold, so the stand-down lasts until it is lifted.
-    void HoldAtStagingPoint(Player* member, std::string const& name)
+    void HoldAtStagingPoint(Player* member, std::string const& name,
+                            char const* where = "the barrier holds it on the staging point")
     {
         PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
         if (!botAI)
@@ -8142,10 +8143,10 @@ private:
         std::string const took = TakeDownDiverters(name, botAI);
         if (!took.empty())
             LOG_INFO("module.overseer",
-                     "overseer: '{}' stops choosing where to go while the barrier holds "
-                     "it on the staging point - {} taken off its non-combat engine, and "
-                     "given back when the hold is lifted (staging hold keeps the focus)",
-                     name, took);
+                     "overseer: '{}' stops choosing where to go while {} - {} taken off "
+                     "its non-combat engine, and given back when the hold is lifted "
+                     "(staging hold keeps the focus)",
+                     name, where, took);
     }
 
     // Lift one, naming the reason a reader wants: why this character is walking
@@ -27421,6 +27422,10 @@ private:
         OverseerDecisions::HearthRegroupPlan hearthPlan;
         std::map<std::string, unsigned> hearthAttempts;
         std::map<std::string, std::string> hearthSaid;
+        // WHO HAS REACHED THE INN IN THIS REGROUP, so arrival is sticky (see
+        // OverseerDecisions::HEARTH_REGROUP_LEAVE_YARDS) and the member is held
+        // there rather than handed back to a `follow` that walks it off.
+        std::set<std::string> hearthArrived;
         // MAKING ROOM INSIDE (see MakeRoomInside): who has had the loot rule
         // set this run, and who was told once that no grey was left.
         std::set<std::string> roomLootRuleSet;
@@ -30972,6 +30977,43 @@ private:
         return result && result->Fetch()[0].Get<uint64>() > 0;
     }
 
+    // THE CAMPAIGN'S NEWEST RECOVERY REQUEST, for the IDLE gate (see
+    // OverseerDecisions::IdleCampaignRecovery): its attempt, whether it was
+    // applied, whether a run of the campaign started after it, the failure it
+    // was written for, and how long ago it was written, so a backoff a
+    // restart interrupted resumes from the row's own time. "After it" is past
+    // the shortest backoff, because the failure that wrote the row closes its
+    // own run row in the same second.
+    OverseerDecisions::CampaignRecoveryRow NewestCampaignRecovery(
+        std::string const& leaderName, uint32 campaignId, std::string& failure,
+        uint32& writtenSecondsAgo)
+    {
+        OverseerDecisions::CampaignRecoveryRow row;
+        if (!RunRecoveryPresent() || !campaignId)
+            return row;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT r.attempt, r.status, r.failure, "
+            "COALESCE(TIMESTAMPDIFF(SECOND, r.created_at, NOW()), 0), "
+            "(SELECT COUNT(*) FROM overseer_dungeon_run d WHERE d.campaign_id = r.campaign_id "
+            " AND d.started_at > r.created_at + INTERVAL {} SECOND) "
+            "FROM overseer_run_recovery r "
+            "WHERE r.leader_name = '{}' AND r.campaign_id = {} AND r.kind = 'run_recovery' "
+            "ORDER BY r.id DESC LIMIT 1",
+            DUNGEON_RECOVERY_BACKOFF_BASE_SECONDS, Esc(leaderName), campaignId);
+        if (!result)
+            return row;
+        Field* fields = result->Fetch();
+        row.present = true;
+        row.attempt = fields[0].Get<uint32>();
+        row.applied = fields[1].Get<std::string>() == "applied";
+        failure = fields[2].Get<std::string>();
+        // Expressions come back as BIGINT; see CampaignIdAfterTable.
+        int64 const ago = fields[3].Get<int64>();
+        writtenSecondsAgo = ago > 0 ? static_cast<uint32>(ago) : 0;
+        row.attemptOpenedSince = fields[4].Get<uint64>() > 0;
+        return row;
+    }
+
     // THE FACTS A RECOVERY IS CHOSEN FROM, read off the live world at the
     // moment the attempt fails.
     OverseerDecisions::RunFailureFacts ReadRunFailureFacts(
@@ -31089,6 +31131,15 @@ private:
                OverseerDecisions::RunRecovery::HearthRegroup;
     }
 
+    // IS THE HEARTH REGROUP APPLIED AND WALKING NOW? Narrower than
+    // HearthRegroupInPlay, which also answers during the backoff: only an
+    // applied regroup holds anybody at the inn.
+    static bool HearthRegroupHolds(DungeonRunCoordinatorState const& coord)
+    {
+        return coord.phase == DungeonRunPhase::Recovering && coord.recoveryChosen &&
+               coord.recovery == OverseerDecisions::RunRecovery::HearthRegroup;
+    }
+
     static std::string RecoveryFactsLine(OverseerDecisions::RunFailureFacts const& facts)
     {
         std::ostringstream line;
@@ -31119,9 +31170,13 @@ private:
     // INTO RECOVERING. `coord` already carries the next attempt's identity
     // (portal, staging point, campaign, run number, cap); this adds the
     // recovery and writes the request the bridge answers.
+    //
+    // `resumed` is a request row already written (IdleCampaignStep::
+    // ResumeRecovery): no second row is written, and the bridge's answer on
+    // that row is what DriveRecovering reads.
     void EnterRecovering(DungeonRunCoordinatorState& coord, std::string const& leaderName,
                          OverseerDecisions::RunFailureFacts const& facts, unsigned attempt,
-                         uint32 alreadyWaited)
+                         uint32 alreadyWaited, bool resumed = false)
     {
         std::time_t const now = std::time(nullptr);
         coord.phase = DungeonRunPhase::Recovering;
@@ -31144,6 +31199,25 @@ private:
                              "s unless Jev chooses another";
 
         std::string const factsLine = RecoveryFactsLine(facts);
+        if (resumed)
+        {
+            coord.recoveryNote = "attempt " + std::to_string(attempt) +
+                                 " resumed after a restart (" + facts.outcome + "); " +
+                                 OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic) +
+                                 " in " + std::to_string(coord.recoveryWaitSeconds) +
+                                 "s unless the bridge's answer on its row says another";
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon campaign {} for '{}' RESUMES its recovery for "
+                     "attempt {} - the request row was written {}s ago and never applied, "
+                     "so the worldserver restarted in the middle of it. No new row is "
+                     "written; the bridge's answer on that row is read in {}s, and the "
+                     "heuristic now says '{}' ({}). Facts, read again now: {}",
+                     coord.campaignId, leaderName, attempt, alreadyWaited,
+                     coord.recoveryWaitSeconds,
+                     OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic),
+                     coord.recoveryHeuristicWhy, factsLine);
+            return;
+        }
         WriteRecoveryRequest(FamilyOfCoordinator(coord), leaderName, coord.campaignId,
                              coord.runNumber, "run_recovery", attempt,
                              facts.outcome + ": " + facts.reason, factsLine,
@@ -31217,7 +31291,7 @@ private:
         Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
         float const leaderYards = yardsFromInn(leader);
         bool const leaderComing =
-            inSet(leaderName) ||
+            inSet(leaderName) || coord.hearthArrived.count(leaderName) ||
             (leaderYards >= 0.f && leaderYards <= OverseerDecisions::HEARTH_REGROUP_INN_YARDS);
 
         std::vector<std::string> names{leaderName};
@@ -31253,10 +31327,33 @@ private:
                                     castStep == OverseerDecisions::ExitHearthStep::NotInside;
 
             float const yards = yardsFromInn(bot);
+            bool const arrivedBefore = coord.hearthArrived.count(name) > 0;
             HearthRegroupStep const step = OverseerDecisions::HearthRegroupStepFor(
-                hearths, yards, name == leaderName || leaderComing, impossible);
+                hearths, yards, name == leaderName || leaderComing, impossible, arrivedBefore);
             if (step != HearthRegroupStep::AtInn)
                 everyoneThere = false;
+
+            // ARRIVAL IS STICKY, AND AN ARRIVED MEMBER IS HELD (2026-09-24). See
+            // OverseerDecisions::HEARTH_REGROUP_LEAVE_YARDS for the ten minutes
+            // measured without this: every member that reached the inn was
+            // handed back to `follow`, the catch-up walked it toward a leader
+            // thousands of yards away, and the regroup never had all five at
+            // once. So a member at the inn is held there with the staging hold
+            // the barrier uses (DriveDungeonRun's sweep keeps it while this
+            // regroup is in play, and it carries the diverter stand-down), and
+            // it keeps the run's escort, which is what stops a catch-up walk
+            // starting (CatchUpToward never touches a run's escort). One that
+            // was held and is no longer at the inn - a fight took it off, or it
+            // is past the leave radius - walks again on this same poll.
+            if (step == HearthRegroupStep::AtInn)
+                coord.hearthArrived.insert(name);
+            else
+            {
+                coord.hearthArrived.erase(name);
+                if (HasStagingHold(name))
+                    ReleaseStagingHold(name, "it is no longer at the family's inn, so the "
+                                             "hearth regroup walks it back");
+            }
 
             std::string const word = OverseerDecisions::HearthRegroupStepWord(step);
             bool const changed = coord.hearthSaid[name] != word;
@@ -31267,8 +31364,18 @@ private:
                 case HearthRegroupStep::AtInn:
                     if (changed)
                         LOG_INFO("module.overseer",
-                                 "overseer: hearth regroup - '{}' is at the inn ({} yards)",
-                                 name, static_cast<uint32>(yards));
+                                 "overseer: hearth regroup - '{}' is at the inn ({} yards) "
+                                 "and is held there until the family walks to the door; it "
+                                 "counts as there out to {} yards",
+                                 name, static_cast<uint32>(std::max(0.f, yards)),
+                                 static_cast<uint32>(
+                                     OverseerDecisions::HEARTH_REGROUP_LEAVE_YARDS));
+                    if (!SteerableAI(bot) || !bot->IsAlive())
+                        break;
+                    EndFarHold(name, "its dungeon run holds it at the family's inn");
+                    HoldAtStagingPoint(bot, name, "the hearth regroup holds it at the "
+                                                  "family's inn");
+                    EscortToward(name, innAim.str(), "HEARTH REGROUP", EscortPurpose::Assemble);
                     break;
 
                 case HearthRegroupStep::WaitForLeader:
@@ -31377,6 +31484,7 @@ private:
                 coord.hearthPlan = PlanFamilyHearthRegroup(leaderName, members, portal);
                 coord.hearthAttempts.clear();
                 coord.hearthSaid.clear();
+                coord.hearthArrived.clear();
                 if (!coord.hearthPlan.ready)
                 {
                     coord.recoveryFacts.hearthRegroupReady = false;
@@ -35516,16 +35624,23 @@ private:
         // coordinator is at BARRIER. One family assembling at its door must not
         // keep the other family's members pinned, and one family's barrier
         // opening must not release the other's.
+        //
+        // ...AND ON A MEMBER WHOSE FAMILY IS REGROUPING AT ITS INN
+        // (2026-09-24). DriveHearthRegroup holds an arrived member with
+        // this same hold, and lifts it per member; this lifts every one the
+        // poll the regroup is over, whichever way it ended.
         {
             std::set<std::string> atBarrier;
             for (auto const& [name, family] : LoadRosterFamilies())
             {
                 auto const coord = _dungeonRunCoordinators.find(family);
                 if (coord != _dungeonRunCoordinators.end() &&
-                    coord->second.phase == DungeonRunPhase::Barrier)
+                    (coord->second.phase == DungeonRunPhase::Barrier ||
+                     HearthRegroupHolds(coord->second)))
                     atBarrier.insert(name);
             }
-            ReleaseStagingHoldsExcept(atBarrier, "its run is no longer holding a barrier");
+            ReleaseStagingHoldsExcept(atBarrier, "its run is no longer holding a barrier or "
+                                                 "a hearth regroup");
         }
 
         // FIRST STATEMENT, BEFORE ANY `return` CAN HAPPEN (#122). Everything
@@ -36552,13 +36667,42 @@ private:
             // row's own end time rather than starting again) and after a
             // town_for_bags recovery, whose row already reads 'applied', so the
             // attempt it was for is opened now rather than recovered twice.
+            //
+            // AND A RECOVERY ALREADY ASKED FOR AND NEVER APPLIED IS RESUMED
+            // (2026-09-24), at its own attempt, rather than a fresh attempt
+            // opened over it. The run rows alone cannot see it: a refusal
+            // before GATHERING or BARRIER opens a run row writes none, so they
+            // count one attempt short. See IdleCampaignRecovery.
             uint32 const streak = TrailingUnenteredRuns(campaignId);
+            std::string rowFailure;
+            uint32 rowAgo = 0;
+            OverseerDecisions::CampaignRecoveryRow const newestRow =
+                NewestCampaignRecovery(leaderName, campaignId, rowFailure, rowAgo);
+            OverseerDecisions::IdleCampaignPlan const idlePlan =
+                OverseerDecisions::IdleCampaignRecovery(
+                    streak,
+                    OverseerDecisions::DungeonCampaignRecovers(streak) &&
+                        RecoveryAppliedFor(leaderName, campaignId, streak),
+                    newestRow);
             std::string lastOutcome;
             std::string lastReason;
             uint32 endedAgo = 0;
-            if (OverseerDecisions::DungeonCampaignRecovers(streak) &&
-                !RecoveryAppliedFor(leaderName, campaignId, streak) &&
-                LastAttemptOfCampaign(campaignId, lastOutcome, lastReason, endedAgo))
+            bool const resume =
+                idlePlan.step == OverseerDecisions::IdleCampaignStep::ResumeRecovery;
+            if (resume)
+            {
+                // The row's failure is "<outcome>: <reason>", as
+                // EnterRecovering wrote it.
+                std::size_t const colon = rowFailure.find(": ");
+                lastOutcome = colon == std::string::npos ? rowFailure
+                                                         : rowFailure.substr(0, colon);
+                lastReason = colon == std::string::npos ? std::string()
+                                                        : rowFailure.substr(colon + 2);
+                endedAgo = rowAgo;
+            }
+            if (resume ||
+                (idlePlan.step == OverseerDecisions::IdleCampaignStep::EnterRecovery &&
+                 LastAttemptOfCampaign(campaignId, lastOutcome, lastReason, endedAgo)))
             {
                 coord = DungeonRunCoordinatorState();
                 coord.portalKeyword = dungeonKeyword;
@@ -36573,7 +36717,7 @@ private:
                 EnterRecovering(coord, leaderName,
                                 ReadRunFailureFacts(coord, leaderName, members, *portal,
                                                     lastOutcome, lastReason),
-                                streak, endedAgo);
+                                idlePlan.attempt, endedAgo, resume);
                 return;
             }
 
