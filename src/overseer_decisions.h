@@ -2749,11 +2749,26 @@ enum class RunRecovery : std::uint8_t
     // RestageNearer does. Offered only when PlanHearthRegroup finds such an
     // inn. See the hearth regroup section at the end of this file.
     HearthRegroup,
+    // THE FALLBACK LADDER, RUNG TWO (2026-09-24): SUMMON THE STRAGGLERS AT THE
+    // DOOR. The leader walks to the dungeon's meeting stone with no staging
+    // clock (the restage walk, then the stone), and once two members stand
+    // there the stone summons every member who is not, one at a time, through
+    // kind='summon', the verb that already drives the ritual and the accept.
+    // Offered only after Overseer.Recovery.SummonAfterFailures attempts in a
+    // row have failed and only where the door has a meeting stone. See the
+    // fallback ladder section at the end of this file.
+    Summon,
+    // RUNG THREE, THE LAST RESORT: THE DUNGEON FINDER. The family queues as
+    // one group of five for its campaign's own dungeon and the core's LFGMgr
+    // teleports it in. Behind Overseer.Recovery.DungeonFinder (off by default),
+    // offered only once the summon rung has had its turn this streak, and said
+    // at ERROR every time with how often it has been needed that day.
+    DungeonFinder,
 };
 
 // "restage_nearer", "regroup", "town_for_bags", "wait_for_client",
-// "one_copy", "replan", "reset_instance", "hearth_regroup". The word a log
-// line, a table row and the bridge all use.
+// "one_copy", "replan", "reset_instance", "hearth_regroup", "summon",
+// "dungeon_finder". The word a log line, a table row and the bridge all use.
 char const* RunRecoveryWord(RunRecovery recovery);
 
 // The recovery a word names, or false when it names none. The bridge's answer
@@ -2793,6 +2808,20 @@ struct RunFailureFacts
     bool hearthRegroupReady{false};
     // What that plan found, in words, for the facts line the bridge reads.
     std::string hearthRegroupNote;
+    // THE FALLBACK LADDER (see the section at the end of this file).
+    // How many attempts in a row have now failed before entry, this one
+    // included: the recovery streak.
+    unsigned streak{0};
+    // The streak at which the summon rung opens (Overseer.Recovery.
+    // SummonAfterFailures). Zero keeps both rungs shut.
+    unsigned summonAfter{0};
+    // The door has a meeting stone the summon rung can use.
+    bool summonReady{false};
+    std::string summonNote;
+    // Overseer.Recovery.DungeonFinder is on and the family can queue as one
+    // group of five for its campaign's dungeon now.
+    bool dungeonFinderReady{false};
+    std::string dungeonFinderNote;
 };
 
 // Yards past which a leader is "far" from the staging point: a walk that long
@@ -2815,13 +2844,15 @@ constexpr float RUN_RECOVERY_HEARTH_SPREAD_YARDS = 1000.f;
 RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts);
 
 // What the module offers the bridge for one failure: every word, less
-// hearth_regroup when the facts carry no inn to regroup at. A word the family
+// hearth_regroup when the facts carry no inn to regroup at, and less the two
+// fallback rungs until the streak and the door allow them. A word the family
 // cannot carry out is never put in front of Jev.
 std::string RunRecoveryOptions(RunFailureFacts const& facts);
 
 // May this recovery be applied to this failure? Every recovery may, except a
-// hearth regroup with no inn to regroup at. The module asks this of the
-// bridge's answer as well as of its own, so a word that stopped being
+// hearth regroup with no inn to regroup at and the two fallback rungs (see
+// RunRecoverySummonOpen and RunRecoveryFinderOpen). The module asks this of
+// the bridge's answer as well as of its own, so a word that stopped being
 // possible falls back to the heuristic.
 bool RunRecoveryApplicable(RunRecovery recovery, RunFailureFacts const& facts);
 
@@ -6712,7 +6743,9 @@ FetchRunAnswer RunLetsTheLeaderFetch(FetchRunPhase phase);
 // times that day. A group of players with a shared inn does not fetch one
 // member while the others are elsewhere; everybody hearths and meets there.
 // So a hearth regroup that is chosen, or is the answer waiting out the
-// backoff, refuses the fetch. Every other recovery lends the leader as before.
+// backoff, refuses the fetch. The summon rung and the dungeon finder refuse it
+// for the same reason: the stone and the finder bring the stragglers. Every
+// other recovery lends the leader as before.
 FetchRunPhase RecoveringFetchPhase(bool hearthRegroupInPlay);
 
 // ------------- and an aim at the bottom of a lake is not an aim (#503) ------
@@ -16263,8 +16296,16 @@ struct HeadTravelFacts
     // The campaign's hearth regroup has the family (RunRecovery::
     // HearthRegroup): meeting at the inn IS the regroup, so the regroup wait
     // (HeadErrand::Other) stands down rather than holding the leader for a
-    // member it is about to hearth.
+    // member it is about to hearth. The summon rung and the dungeon finder
+    // (RunRecovery::Summon, DungeonFinder) set it too: the stone and the
+    // finder are what bring the stragglers, not a leader held still for them.
     bool hearthRegroup{false};
+    // The summon rung or the dungeon finder has the family (RunRecovery::
+    // Summon, DungeonFinder): the leader is walking to the stone, standing at
+    // it for the summons, or queued. Nothing but the run may move him then,
+    // not even a trainer in town, because a leader walked off the stone takes
+    // the clickers with him.
+    bool recoveryHoldsTheLeader{false};
 };
 
 // A COUNTER IN THE SAME TOWN (#639). The bridge's own reading of "short": the
@@ -16808,6 +16849,337 @@ char const* TrainingStopStepWord(TrainingStopStep step);
 // has nothing left to walk for any reason other than a taken column, which
 // only means the next leg waits.
 bool TrainingStopEnds(TrainingStopStep step, bool stopOpen);
+
+// ------------------ the fallback ladder: summon, then the dungeon finder --
+//
+// MEASURED ON THE DEV REALM, 2026-09-24. Walking and staging keep failing:
+// the Horde family's Ragefire Chasm campaign closed 21 of its 25 attempts
+// 'staging_failed', and the Alliance family's Zul'Farrak campaign 12 of 26.
+// Every recovery above is a walk or a wait, and they had each been tried
+// several times that day, so a family that cannot walk to its door kept being
+// asked to walk to its door.
+//
+// SO RUN RECOVERY NOW ESCALATES, the way a group of players would:
+//
+//   1. walk and stage (every recovery above);
+//   2. SUMMON: after Overseer.Recovery.SummonAfterFailures attempts in a row,
+//      the leader walks to the dungeon's meeting stone with no staging clock,
+//      and once a second member stands there the stone summons everybody who
+//      does not, through kind='summon' (the ritual, the accept and the
+//      read-back that verb already drives);
+//   3. THE DUNGEON FINDER, the last resort, behind Overseer.Recovery.
+//      DungeonFinder: the family queues as one group of five for its
+//      campaign's own dungeon and the core's LFGMgr teleports it in. Only once
+//      the summon rung has had its turn this streak, and said at ERROR every
+//      time with how often it was needed that day, so an operator can see how
+//      often the classic road fails.
+//
+// NEITHER RUNG STOPS A CAMPAIGN, and neither is an admin shortcut: the summon
+// is the game's own meeting stone clicked by two members, and the dungeon
+// finder is the game's own queue, with every gate the core keeps on both.
+
+// The default of Overseer.Recovery.SummonAfterFailures: the streak at which
+// the summon rung opens. Three is the point the campaign used to STOP at
+// before recovery existed, which is the operator's own measure of "walking
+// has had its chances".
+constexpr unsigned RUN_RECOVERY_SUMMON_AFTER_DEFAULT = 3;
+
+// How many summon recoveries were applied after this streak's earlier
+// failures: the newest `streak - 1` of `tried`, since each failure of the
+// streak before this one was answered by exactly one applied recovery.
+unsigned SummonsTriedThisStreak(RunFailureFacts const& facts);
+
+// RUNG TWO IS OPEN: the door has a stone, and the streak has reached
+// `summonAfter` (which is never zero here).
+bool RunRecoverySummonOpen(RunFailureFacts const& facts);
+
+// RUNG THREE IS OPEN: the finder is on and the family can queue, the streak
+// has reached `summonAfter`, and the summon rung has already been tried this
+// streak - or cannot be, because the door has no stone.
+bool RunRecoveryFinderOpen(RunFailureFacts const& facts);
+
+// -- rung two: the summon at the door ----------------------------------------
+
+// The meeting stone that serves a door is the nearest one to its entrance
+// areatrigger within this many yards, on the same map. Measured from the
+// world tables: Zul'Farrak's stone stands 58 yards from its trigger and
+// Ragefire Chasm's 25. Both are spawns read from the core, never a coordinate
+// written here.
+constexpr float SUMMON_RUNG_STONE_SEARCH_YARDS = 120.f;
+
+// A member within this many yards of the stone is AT THE DOOR. Inside the
+// forty yards kind='summon' will walk a clicker the last of (#355), so a
+// member counted here is one the verb can actually use.
+constexpr float SUMMON_RUNG_AT_STONE_YARDS = 35.f;
+
+// A straggler is summoned at most this many times per rung; a summon that
+// has failed twice for one character is not going to work because it was
+// asked a third time.
+constexpr unsigned SUMMON_RUNG_TRIES_PER_MEMBER = 2;
+
+// How long one summon row may stay unfinished before the rung stops waiting
+// for it. The verb's own walk, portal and settle ceilings add up to under a
+// minute (SUMMON_APPROACH_CEILING_MS, SUMMON_PORTAL_CEILING_MS,
+// SUMMON_SETTLE_CEILING_MS), and a row also waits its turn in the queue.
+constexpr unsigned SUMMON_RUNG_ROW_CEILING_SECONDS = 150;
+
+struct SummonRungMember
+{
+    std::string name;
+    bool leader{false};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    // On the stone's map, outside any instance, within
+    // SUMMON_RUNG_AT_STONE_YARDS of it.
+    bool atStone{false};
+    // Something kind='summon' can move: a character with the bot AI that
+    // answers the far teleport (a real client answers its own; the verb says
+    // which it refuses).
+    bool summonable{true};
+    // Summons already tried for this member in this rung.
+    unsigned tries{0};
+};
+
+enum class SummonRungStep : std::uint8_t
+{
+    // Every member stands at the stone.
+    Done,
+    // The leader is not at the stone: walk him there (no staging clock).
+    WalkToStone,
+    // The leader is there and fewer than two members who could click are:
+    // the family following him is still arriving.
+    WaitForClickers,
+    // Summon `target`, with `summoner` and `helper` clicking.
+    Summon,
+    // Nobody left away from the stone can be summoned (dead, out of the
+    // world, not movable by the verb, or tried out).
+    NobodyLeft,
+};
+
+struct SummonRungPlan
+{
+    SummonRungStep step{SummonRungStep::WalkToStone};
+    std::string summoner;
+    std::string helper;
+    std::string target;
+    std::vector<std::string> atStone;
+    std::vector<std::string> away;
+    std::string why;
+};
+
+// ONE POLL OF THE RUNG. The summoner is the leader when he can click, since
+// he is the one who walked there; the helper is another member at the stone
+// who can click. Stragglers are taken in family order, skipping any that
+// cannot be summoned now and any that have had their tries.
+SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
+                              unsigned triesPerMember = SUMMON_RUNG_TRIES_PER_MEMBER);
+
+// "done", "walk to the stone", "wait for clickers", "summon", "nobody left".
+char const* SummonRungStepWord(SummonRungStep step);
+
+// The overseer_command.source a rung's summon row carries, which is how the
+// coordinator finds the row it wrote: `run_recovery summon c<campaign>
+// a<attempt> <target> t<try>`. The try is in it so a second summon of the
+// same member is never mistaken for the first one's finished row while its
+// own insert is still queued. Never longer than the column's 64.
+std::string SummonRungRowSource(std::uint32_t campaignId, unsigned attempt,
+                                std::string const& target, unsigned tryNumber);
+
+// A kind='summon' row that has reached a verdict: anything but 'pending',
+// 'claimed' and 'verifying'.
+bool SummonRowFinished(std::string const& status);
+
+// -- rung three: the dungeon finder ------------------------------------------
+//
+// WHY THE CORE'S OWN QUEUE AND NOT mod-playerbots'. #63 measured that the
+// playerbots LFG actions do nothing for a roster character (the random-bot
+// gate) and cannot be steered to one dungeon, since LfgJoinAction queues
+// every eligible one. LFGMgr::JoinLfg takes exactly one dungeon from the
+// caller, runs the role check, queues the group, and on a full group of five
+// makes the proposal at once; every member accepting is what calls
+// MakeNewGroup, which teleports the group in. Every gate is the core's:
+// deserter, battleground, level lock, group size, the role check, combat and
+// falling at the teleport.
+//
+// THE ONE UPSTREAM FIX IT NEEDS IS TAKEN HERE, NOT WAITED FOR. mod-playerbots
+// #2754 re-anchors a bot's fall height every tick, because a bot sends no
+// movement packets, so Player::IsFalling (a Z test against m_lastFallZ)
+// reads a bot standing still as falling and LFGMgr::TeleportPlayer refuses it
+// LFG_TELEPORTERROR_FALLING. The pinned fork predates it. This rung does the
+// same re-anchor, on the same test (not Unit::IsFalling, so a real fall keeps
+// its height), for its own members right before each accept, and so works
+// with or without the port.
+//
+// AND THE LEVEL LOCK IS REAL ON THIS REALM. LFGDungeons.dbc gives Ragefire
+// Chasm 15-21 and Zul'Farrak 41-51, and both families are above those ranges
+// (the Horde family at 26-29, the Alliance family at 60), so the core locks
+// the dungeon TOO_HIGH_LEVEL unless the realm sets DungeonAccessRequirements.
+// LFGLevelDBCOverride, which reads the level range from
+// dungeon_access_template instead (Ragefire 8 and up, Zul'Farrak 35 and up,
+// neither with a ceiling). The readiness reads the core's own lock and names
+// it, rather than guessing at levels here.
+
+// Default of Overseer.Recovery.DungeonFinder: off. The dev realm turns it on
+// in its own conf.
+constexpr bool RUN_RECOVERY_FINDER_DEFAULT = false;
+
+// The dungeon finder's role bits (lfg::LfgRoles).
+constexpr std::uint8_t FINDER_ROLE_LEADER = 0x01;
+constexpr std::uint8_t FINDER_ROLE_TANK = 0x02;
+constexpr std::uint8_t FINDER_ROLE_HEALER = 0x04;
+constexpr std::uint8_t FINDER_ROLE_DAMAGE = 0x08;
+
+// The group size the finder queues and the rung insists on.
+constexpr unsigned FINDER_GROUP_SIZE = 5;
+
+// How long the rung waits, from its join, for the family to be inside. The
+// core's own role check and proposal each expire on their own clocks
+// (LFG_TIME_ROLECHECK, LFG_TIME_PROPOSAL); this bounds the whole.
+constexpr unsigned FINDER_CEILING_SECONDS = 180;
+
+// WHICH FINDER DUNGEON IS THIS DOOR? LFGDungeons.dbc can hold several rows on
+// one map: Scarlet Monastery, Maraudon, Dire Maul, Blackrock Depths and
+// Stratholme are each several wings of one map, and the core's
+// GetLFGDungeon(map, difficulty) returns whichever comes first. So a door with
+// more than one candidate is matched by where the finder would land the group
+// (lfg_dungeon_template) against where the door itself lands it; a candidate
+// with no row there lands on the map's shared entrance and cannot be told
+// apart. The finder is never pointed at a wing the campaign did not ask for.
+constexpr float FINDER_WING_MATCH_YARDS = 60.f;
+
+struct FinderDungeonCandidate
+{
+    std::uint32_t id{0};
+    bool hasEntrance{false};
+    float x{0.f};
+    float y{0.f};
+};
+
+// The finder dungeon for a door whose areatrigger lands at (landingX,
+// landingY), or 0 with `why` saying which of the two reasons it is.
+std::uint32_t ChooseFinderDungeon(std::vector<FinderDungeonCandidate> const& candidates,
+                                  float landingX, float landingY, std::string& why);
+
+// CAN THESE CLASSES MAKE THE GROUP THE FINDER INSISTS ON: one tank, one healer
+// and the rest damage (LFGMgr::CheckGroupRoles)? Asked of the role masks
+// FinderRoleMask gives, so a family with no healer class is told so before
+// the last rung is spent on a role check the core would fail.
+bool FinderRolesFit(std::vector<std::uint8_t> const& masks);
+
+// Every role a class could be asked to fill, as the finder's bits, with the
+// leader bit on the leader. The core's CheckGroupRoles then finds the one
+// tank, one healer and three damage the group can make.
+std::uint8_t FinderRoleMask(unsigned classId, bool leader);
+
+struct FinderMember
+{
+    std::string name;
+    bool leader{false};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    // In the same group as the head.
+    bool inHeadsGroup{false};
+    unsigned classId{0};
+    // The core's lock on the dungeon for this member (LfgLockStatusType), or
+    // zero when it may queue.
+    std::uint32_t lock{0};
+};
+
+struct FinderFacts
+{
+    // Overseer.Recovery.DungeonFinder.
+    bool enabled{false};
+    // DungeonFinder.OptionsMask carries the dungeon finder.
+    bool finderOn{false};
+    // The finder's id for the campaign's dungeon (LFGDungeons.dbc, normal
+    // difficulty), zero when the dungeon has none.
+    std::uint32_t dungeonId{0};
+    // Why there is no dungeon id, when there is none (ChooseFinderDungeon).
+    std::string dungeonWhy;
+    // Its level range in the DBC, for the words when a member is locked.
+    unsigned dbcMinLevel{0};
+    unsigned dbcMaxLevel{0};
+    // The head's group.
+    bool groupExists{false};
+    unsigned groupSize{0};
+    bool groupIsRaid{false};
+    bool groupIsFinders{false};
+    bool headLeads{false};
+    std::vector<FinderMember> family;
+};
+
+struct FinderReadiness
+{
+    bool ready{false};
+    std::string whyNot;
+};
+
+// Can the family queue? The family is exactly the group: five members, one
+// party (not a raid, not already a finder group) led by the head, every member
+// in the world and not locked. With `now`, every member must also be alive and
+// out of combat; without it (when a failure is being recorded, and the rung
+// may not run for a quarter of an hour) those two passing states are left to
+// the rung itself, which waits them out.
+FinderReadiness ReadFinderReadiness(FinderFacts const& facts, bool now);
+
+// The core's lock status in words: "too high level", "too low level", ...
+char const* FinderLockWord(std::uint32_t lock);
+
+// The core's join result (LfgJoinResult) in words, for the log.
+char const* FinderJoinResultWord(std::uint32_t result);
+
+// The finder's state for the family's group, as this rung reads it.
+enum class FinderState : std::uint8_t
+{
+    None,       // not in the finder
+    RoleCheck,  // the role check is running
+    Queued,     // queued
+    Proposal,   // a proposal is out
+    Dungeon,    // in a finder group, in its dungeon
+    Other,      // boot, raid browser, a finished dungeon
+};
+
+struct FinderPollFacts
+{
+    bool joined{false};
+    FinderState state{FinderState::None};
+    unsigned familySize{0};
+    // Members on the dungeon's map, in the head's copy.
+    unsigned inside{0};
+    // A proposal id for this family has been seen.
+    bool proposalSeen{false};
+    // A member is dead, in combat or out of the world: the core would refuse
+    // its teleport, so nothing is joined or accepted until that passes.
+    bool anyoneNotReady{false};
+    unsigned waitedSeconds{0};
+    unsigned ceilingSeconds{FINDER_CEILING_SECONDS};
+};
+
+enum class FinderStep : std::uint8_t
+{
+    Join,     // queue the family
+    Wait,     // the core is working (role check, queue, a member in combat)
+    Accept,   // accept the proposal for every member
+    Teleport, // the finder group is made and a member is still outside: press
+              // the finder's own "teleport in" for it (a refused teleport -
+              // falling, combat - is not retried by the core)
+    Inside,   // the whole family is in: the run is staged inside
+    GiveUp,   // out of time, or the core let the family go
+};
+
+// ONE POLL. Inside is asked first: a family that is in is in, whatever the
+// clock says; and at the ceiling a finder group with anybody inside is inside,
+// because STAGED_INSIDE walks the rest in through the door, which a finder
+// group may use for its own dungeon. Nothing is joined or accepted while a member is not ready. A
+// joined family the core has put back to None was refused (a failed role
+// check or a declined proposal) and the rung gives up rather than queueing
+// again inside one recovery.
+FinderStep FinderNext(FinderPollFacts const& facts);
+
+// "join", "wait", "accept", "inside", "give up".
+char const* FinderStepWord(FinderStep step);
 
 }  // namespace OverseerDecisions
 

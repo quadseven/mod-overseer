@@ -296,3 +296,51 @@
 #        Default:     "" (empty - nobody is spawned without a client)
 #
 #Overseer.HeadlessRoster = ""
+#
+########################################
+#
+#    RUN RECOVERY: THE FALLBACK LADDER
+#
+#    A dungeon campaign never stops on failures; each attempt that never gets
+#    the family inside is answered by a recovery (restage, regroup, hearth
+#    regroup, ...). These two keys add the rungs past walking.
+#
+#    Overseer.Recovery.SummonAfterFailures
+#        Description: After this many attempts in a row that never got inside,
+#                     the summon rung opens: the leader walks to the dungeon's
+#                     meeting stone with no staging clock, and once a second
+#                     member stands there the stone summons every member who
+#                     does not, through kind='summon'. Offered only where the
+#                     door has a meeting stone within 120 yards of its
+#                     entrance. 0 keeps both fallback rungs shut.
+#
+#                     WHO SUMMONS. The stone is clicked by two members of the
+#                     family itself, which is the game's own meeting stone and
+#                     nothing a character was granted.
+#
+#        Default:     3
+#
+#Overseer.Recovery.SummonAfterFailures = 3
+#
+#    Overseer.Recovery.DungeonFinder
+#        Description: May the LAST rung queue the family in the dungeon finder.
+#                     Only after the summon rung has had its turn this streak
+#                     (or where the door has no stone), the family queues as
+#                     one group of five for its campaign's own dungeon through
+#                     the core's LFGMgr, accepts the proposal, and is
+#                     teleported in by the core; the run then goes on from
+#                     STAGED_INSIDE and leaves by the same door. Every use is
+#                     logged at ERROR with how many times that family needed
+#                     it that day.
+#
+#                     OFF BY DEFAULT. It is a Wrath system on a realm that may
+#                     be run under a classic policy, so a realm turns it on in
+#                     its own conf. The core also locks a dungeon to members
+#                     above its LFGDungeons.dbc level range (Ragefire Chasm
+#                     15-21, Zul'Farrak 41-51) unless worldserver.conf sets
+#                     DungeonAccessRequirements.LFGLevelDBCOverride = 1; the
+#                     rung reads the core's own lock and names it.
+#
+#        Default:     0
+#
+#Overseer.Recovery.DungeonFinder = 0

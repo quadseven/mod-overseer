@@ -372,7 +372,7 @@ void TheAdapterIsWired()
     has("then the family walks to the door",
         "coord.recovery = OverseerDecisions::RunRecovery::RestageNearer;");
     has("the fetch reads the recovery",
-        "OverseerDecisions::RecoveringFetchPhase(HearthRegroupInPlay(coord->second))");
+        "OverseerDecisions::RecoveringFetchPhase(RecoveryBringsTheFamily(coord->second))");
     has("the head's facts know a campaign between attempts",
         "facts.campaignBetweenAttempts = true;");
     has("and a hearth regroup",
