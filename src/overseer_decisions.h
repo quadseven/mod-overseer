@@ -4853,6 +4853,65 @@ std::string LootCouncilMasterKey(std::uint64_t sourceGuid, unsigned slot);
 // are the only strings and are escaped.
 std::string LootCandidatesJson(std::vector<LootCandidate> const& candidates);
 
+// ------------------------------------------ a quest at its giver (kind='quest') --
+//
+// WHY THIS EXISTS. Attunement to the Core, the Molten Core attunement, is
+// given and taken back by Lothos Riftwaker on Blackrock Mountain, and the
+// Alliance row (7848) is not shareable, so kind='share' cannot move it: each
+// member has to take it from him in person. Nothing in the module takes a quest
+// from a giver on request. A roster bot picks up quests by its own rpg
+// strategy, when that strategy happens to want them, which the site cannot
+// order. So the site (wow-overseer's attunement step) walks the family to him
+// and writes one kind='quest' row per member: `take quest:<id>` or
+// `turnin quest:<id>`.
+//
+// THE CORE'S OWN CALLS, AND ITS OWN CHECKS, THE SAME SET DoShare MAKES.
+// Player::CanTakeQuest (level, race, class, prerequisites, exclusive group),
+// SatisfyQuestStatus, SatisfyQuestLog and CanAddQuest before
+// AddQuestAndCheckCompletion; CanRewardQuest before RewardQuest. The giver
+// must be a live creature whose quest-starter (or ender) relation names the
+// quest, within TRAVEL_ARRIVED_YARDS of the character: the radius the travel
+// errand arrives at. A quest that offers a choice of reward is refused rather
+// than chosen for, since no choice here would be a player's. The outcome is
+// read back from the character's log, never assumed from the call.
+
+enum class QuestErrandVerb
+{
+    None,
+    Take,
+    TurnIn,
+};
+
+struct QuestErrand
+{
+    QuestErrandVerb verb{QuestErrandVerb::None};
+    std::uint32_t questId{0};
+};
+
+// "take quest:7848" or "turnin quest:7848"; anything else is None.
+QuestErrand ParseQuestErrand(std::string const& command);
+
+// What the adapter read, for one row. `status` is the core's QuestStatus
+// (0 none, 1 complete, 3 incomplete, 5 failed, 6 rewarded).
+struct QuestErrandFacts
+{
+    bool questKnown{false};
+    bool giverInReach{false};
+    bool rewarded{false};
+    int status{0};
+    // Take: CanTakeQuest, SatisfyQuestStatus and CanAddQuest together.
+    bool eligible{false};
+    bool logHasRoom{false};
+    // Turn in: CanRewardQuest.
+    bool rewardable{false};
+    bool rewardChoice{false};
+};
+
+// Why this row must not run, as the reason the row records, or empty when it
+// may. Checked in the order a person would: the quest, the giver, then the
+// character.
+std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const& facts);
+
 // ------------------------------------------ what an equip displaced (#372) --
 //
 // WHAT `kind='item_equip'` COULD NOT SAY, AND WHY IT COULD NOT. The row records

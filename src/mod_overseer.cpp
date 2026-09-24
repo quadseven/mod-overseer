@@ -39593,7 +39593,8 @@ private:
             // trigger, so nothing they do can be overwritten by the row
             // after them.
             if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
-                && kind != "trade" && kind != "share" && kind != "job" && kind != "sell"
+                && kind != "trade" && kind != "share" && kind != "quest" && kind != "job"
+                && kind != "sell"
                 && kind != "repair" && kind != "buy"
                 && kind != "bank" && kind != "auction" && kind != "bind"
                 && kind != "hearth" && kind != "conjure" && kind != "cast"
@@ -39705,6 +39706,8 @@ private:
                 detail = DoTrade(player, targetArg, command, status, rowResult);
             else if (kind == "share")
                 detail = DoShare(player, targetArg, command, status, rowResult);
+            else if (kind == "quest")
+                detail = DoQuest(player, command, status, rowResult);
             else if (kind == "job")
                 detail = DoJob(player, command, status);
             else if (kind == "sell" && OverseerDecisions::IsDestroyRow(command))
@@ -53426,6 +53429,114 @@ private:
                  questId, quest->GetTitle(), holder->GetName(), taker->GetName());
 
         describe("shared", "", int32(after));
+        status = "delivered";
+        return "";
+    }
+
+    // kind='quest': take a quest from its giver, or hand it in to its taker,
+    // standing in reach of the creature (OverseerDecisions::ParseQuestErrand
+    // for the grammar, QuestErrandRefusal for the checks, both pinned in
+    // tests/test_quest_errand.cpp). The site writes these for the Molten Core
+    // attunement at Lothos Riftwaker; nothing here is specific to it.
+    //
+    // The creature is found through the core's own quest relations
+    // (creature_queststarter / creature_questender, loaded into ObjectMgr's
+    // relation maps), so a row can only ever reach a creature the world
+    // database says gives or takes that quest. Every exit writes `out`, and
+    // 'delivered' is set only once the log has been read back.
+    static Creature* QuestCreatureInReach(Player* player, uint32 questId, bool starter)
+    {
+        QuestRelations const* relations = starter
+                                              ? sObjectMgr->GetCreatureQuestRelationMap()
+                                              : sObjectMgr->GetCreatureQuestInvolvedRelationMap();
+        if (!relations)
+            return nullptr;
+        for (auto const& [entry, quest] : *relations)
+        {
+            if (quest != questId)
+                continue;
+            Creature* npc = player->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+            if (npc && npc->IsAlive())
+                return npc;
+        }
+        return nullptr;
+    }
+
+    static char const* DoQuest(Player* player, std::string const& command, char const*& status,
+                               std::string& out)
+    {
+        OverseerDecisions::QuestErrand const errand = OverseerDecisions::ParseQuestErrand(command);
+        bool const take = errand.verb == OverseerDecisions::QuestErrandVerb::Take;
+        Quest const* quest =
+            errand.questId ? sObjectMgr->GetQuestTemplate(errand.questId) : nullptr;
+
+        OverseerDecisions::QuestErrandFacts facts;
+        facts.questKnown = quest != nullptr;
+        Creature* npc = nullptr;
+        if (quest && errand.verb != OverseerDecisions::QuestErrandVerb::None)
+        {
+            npc = QuestCreatureInReach(player, errand.questId, take);
+            facts.giverInReach = npc != nullptr;
+            facts.rewarded = player->GetQuestRewardStatus(errand.questId);
+            facts.status = static_cast<int>(player->GetQuestStatus(errand.questId));
+            if (take)
+            {
+                facts.logHasRoom = player->SatisfyQuestLog(false);
+                facts.eligible = player->CanTakeQuest(quest, false) &&
+                                 player->SatisfyQuestStatus(quest, false) &&
+                                 player->CanAddQuest(quest, false);
+            }
+            else
+            {
+                facts.rewardChoice = quest->GetRewChoiceItemsCount() > 0;
+                facts.rewardable = player->CanRewardQuest(quest, false);
+            }
+        }
+
+        auto describe = [&](char const* outcome, std::string const& reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(reason)
+              << ",\"who\":" << J(player->GetName()) << ",\"quest_id\":" << errand.questId
+              << ",\"giver\":" << (npc ? npc->GetEntry() : 0)
+              << ",\"status\":" << static_cast<int>(player->GetQuestStatus(errand.questId))
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+
+        std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
+        if (!refusal.empty())
+        {
+            describe("refused", refusal);
+            LOG_INFO("module.overseer", "overseer: quest errand '{}' for '{}' refused: {}",
+                     command, player->GetName(), refusal);
+            return "refused";
+        }
+
+        if (take)
+        {
+            player->AddQuestAndCheckCompletion(quest, npc);
+            if (player->GetQuestStatus(errand.questId) == QUEST_STATUS_NONE)
+            {
+                describe("error", "the quest did not land in the log");
+                return "the quest did not land in the log";
+            }
+            LOG_INFO("module.overseer", "overseer: '{}' took quest {} ({}) from '{}'",
+                     player->GetName(), errand.questId, quest->GetTitle(), npc->GetName());
+            describe("taken", "");
+        }
+        else
+        {
+            player->RewardQuest(quest, 0, npc);
+            if (!player->GetQuestRewardStatus(errand.questId))
+            {
+                describe("error", "the quest was not rewarded");
+                return "the quest was not rewarded";
+            }
+            LOG_INFO("module.overseer", "overseer: '{}' handed quest {} ({}) in to '{}'",
+                     player->GetName(), errand.questId, quest->GetTitle(), npc->GetName());
+            describe("handed in", "");
+        }
         status = "delivered";
         return "";
     }
