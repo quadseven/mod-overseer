@@ -5748,6 +5748,23 @@ enum class DeathDriver
 char const* DeathDriverName(DeathDriver driver);
 char const* MoveGeneratorName(MoveGenerator generator);
 
+struct FallTraceSample
+{
+    uint16_t mapId{0};
+    float x{0.f}, y{0.f}, z{0.f};
+    MoveGenerator movement{MoveGenerator::Unsampled};
+};
+
+struct FallStartReading
+{
+    bool found{false};
+    FallTraceSample sample;
+};
+
+FallStartReading FindFallStart(std::vector<FallTraceSample> const& samples,
+                               uint16_t deathMap, float deathZ,
+                               float minimumFallYards);
+
 // One death's worth of attribution, as the adapter sampled it.
 struct DeathAttribution
 {
