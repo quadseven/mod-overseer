@@ -14,6 +14,14 @@
 namespace OverseerDecisions
 {
 
+LockboxStep LockboxNext(LockboxFacts const& facts)
+{
+    if (!facts.rogue || !facts.holdsLockedBox || !facts.hasPickLockSpell
+        || !facts.hasLockpickingSkill)
+        return LockboxStep::Refuse;
+    return LockboxStep::UnlockAndOpen;
+}
+
 std::map<std::string, uint32_t> QuestAimsAfterRead(
     std::map<std::string, uint32_t> const& previous,
     std::map<std::string, uint32_t> const& loaded, bool readSucceeded)
