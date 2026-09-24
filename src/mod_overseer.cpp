@@ -3390,6 +3390,69 @@ bool OnRoster(std::string const& name)
     return g_rosterLower.find(LowerName(name)) != g_rosterLower.end();
 }
 
+// ------------------------------------------------------ overseer_keep ------
+//
+// The items the operator has reserved on a character, read on the roster poll
+// and asked by every executor that moves an item off a character and by the
+// core's own sell, mail and trade hooks (OverseerKeepScript), which run on
+// map threads: hence the lock. The rule is in OverseerDecisions
+// (KeepReservationFor), pinned by tests/test_keep.cpp.
+std::mutex g_keepMutex;
+std::vector<OverseerDecisions::KeepReservation> g_keep;
+
+void SetKeepReservations(std::vector<OverseerDecisions::KeepReservation> reservations)
+{
+    std::lock_guard<std::mutex> guard(g_keepMutex);
+    g_keep = std::move(reservations);
+}
+
+std::vector<OverseerDecisions::KeepReservation> KeepReservationsNow()
+{
+    std::lock_guard<std::mutex> guard(g_keepMutex);
+    return g_keep;
+}
+
+bool ItemKept(Player const* who, Item const* item)
+{
+    if (!who || !item)
+        return false;
+    std::lock_guard<std::mutex> guard(g_keepMutex);
+    return OverseerDecisions::KeepReservationFor(g_keep, who->GetName(), item->GetEntry(),
+                                                 item->GetGUID().GetCounter()) != nullptr;
+}
+
+// READ, AND A FAILED READ IS NOT AN EMPTY TABLE. A reservation that vanished
+// for one poll because the database hiccuped would let the next sell row take
+// the item. So the count is asked first: a count that does not come back
+// (the table missing on a world that has not run the migration, or a failed
+// query) keeps whatever was read last; a count of 0 is a real empty table.
+void ReloadKeepReservations()
+{
+    QueryResult count = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_keep");
+    if (!count)
+        return;
+    std::vector<OverseerDecisions::KeepReservation> reservations;
+    if (count->Fetch()[0].Get<uint64>() > 0)
+    {
+        QueryResult rows = CharacterDatabase.Query(
+            "SELECT character_name, item_entry, item_guid, until_level, reason FROM overseer_keep");
+        if (!rows)
+            return;
+        do
+        {
+            Field* f = rows->Fetch();
+            OverseerDecisions::KeepReservation r;
+            r.character = f[0].Get<std::string>();
+            r.itemEntry = f[1].Get<uint32>();
+            r.itemGuid = f[2].Get<uint32>();
+            r.untilLevel = f[3].Get<uint8>();
+            r.reason = f[4].Get<std::string>();
+            reservations.push_back(std::move(r));
+        } while (rows->NextRow());
+    }
+    SetKeepReservations(std::move(reservations));
+}
+
 // Exactly the unique key of overseer_event. Keeping the two identical is what
 // makes the in-memory coalescing and the ON DUPLICATE KEY UPDATE agree: a
 // repeat that collapses in RAM is the same repeat that would collapse in the
@@ -6122,6 +6185,10 @@ public:
         {
             _rosterTimer = 0;
             KeepRosterAttended();
+            // Same cadence: a reservation is written by hand, rarely, and
+            // where a kept item should sit changes with a level or a banker.
+            ReloadKeepReservations();
+            KeepReservedItems();
         }
         if (_partyTimer >= PARTY_POLL_MS)
         {
@@ -43153,6 +43220,8 @@ private:
             return refuse("item not found",
                           spec.byGuid ? "no carried item with that guid on the giver"
                                       : "no carried item with that entry on the giver");
+        if (ItemKept(giver, item))
+            return refuse("item reserved", OverseerDecisions::KEEP_REFUSAL);
 
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto)
@@ -43470,6 +43539,8 @@ private:
             return refuse("item not found",
                           spec.byGuid ? "no carried item with that guid on the giver"
                                       : "no carried item with that entry on the giver");
+        if (ItemKept(giver, item))
+            return refuse("item reserved", OverseerDecisions::KEEP_REFUSAL);
 
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto)
@@ -43789,6 +43860,8 @@ private:
         Item* item = FindCarriedItem(seller, true, spec.guid);
         if (!item)
             return refuse("item not carried");
+        if (ItemKept(seller, item))
+            return refuse(OverseerDecisions::KEEP_REFUSAL);
 
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto)
@@ -44058,6 +44131,8 @@ private:
         Item* item = FindCarriedItem(holder, true, spec.guid);
         if (!item)
             return refuse("item not carried");
+        if (ItemKept(holder, item))
+            return refuse(OverseerDecisions::KEEP_REFUSAL);
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto)
             return refuse("item has no template");
@@ -44342,6 +44417,128 @@ private:
         if (!pick)
             return nullptr;
         return byId[pick];
+    }
+
+    // WHERE A KEPT ITEM WAITS (overseer_keep). A reservation with an
+    // until_level says the item cannot be worn below that level: taken off at
+    // once, into the bags, and banked in the character's own bank the next
+    // time a banker is in reach; at or above the level it comes out of the
+    // bank at a banker and is worn again. Only the character's own bank:
+    // never the mail, never another character, never a guild bank.
+    //
+    // It moves only a character that is standing still and able: alive, out
+    // of combat, not flying and not trading. Taking off and putting on go
+    // through Player::SwapItem, the core's own move (the one the client's
+    // drag drives), and the bank through DoBank, the bank verb's executor, so
+    // the checks and the read-back are that verb's.
+    //
+    // Said once per character and step: a sword waiting for a banker is a
+    // state, not news, until it changes.
+    std::map<std::string, std::string> _keepSaid;
+
+    void KeepReservedItems()
+    {
+        using OverseerDecisions::KeepPlace;
+        using OverseerDecisions::KeepStep;
+        using OverseerDecisions::KeepStepFor;
+        using OverseerDecisions::KeepStepWord;
+
+        for (OverseerDecisions::KeepReservation const& r : KeepReservationsNow())
+        {
+            if (!r.untilLevel)
+                continue;
+            Player* who = ObjectAccessor::FindPlayerByName(r.character);
+            if (!who || !who->IsInWorld() || !who->IsAlive() || who->IsInCombat() || who->IsInFlight() ||
+                who->GetTradeData())
+                continue;
+
+            Item* item = nullptr;
+            if (r.itemGuid)
+                item = who->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(r.itemGuid));
+            else
+            {
+                // By entry: the bags and what is worn first, then the bank.
+                item = who->GetItemByEntry(r.itemEntry);
+                for (uint8 i = BANK_SLOT_ITEM_START; !item && i < BANK_SLOT_ITEM_END; ++i)
+                    if (Item* banked = who->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                        if (banked->GetEntry() == r.itemEntry)
+                            item = banked;
+                for (uint8 i = BANK_SLOT_BAG_START; !item && i < BANK_SLOT_BAG_END; ++i)
+                    if (Bag* bag = who->GetBagByPos(i))
+                        for (uint32 j = 0; !item && j < bag->GetBagSize(); ++j)
+                            if (Item* banked = bag->GetItemByPos(j))
+                                if (banked->GetEntry() == r.itemEntry)
+                                    item = banked;
+            }
+
+            KeepPlace place = KeepPlace::Missing;
+            if (item)
+            {
+                uint16 const pos = item->GetPos();
+                place = Player::IsEquipmentPos(pos) ? KeepPlace::Equipped
+                        : Player::IsBankPos(pos)    ? KeepPlace::Bank
+                                                    : KeepPlace::Bags;
+            }
+
+            uint32 const level = who->GetLevel();
+            bool const wantsBanker = (level < r.untilLevel && place == KeepPlace::Bags) ||
+                                     (level >= r.untilLevel && place == KeepPlace::Bank);
+            bool anyBanker = false;
+            bool const bankerInReach = wantsBanker && BankerInReach(who, anyBanker) != nullptr;
+            KeepStep const step = KeepStepFor(level, r.untilLevel, place, bankerInReach);
+
+            std::string said;
+            char const* status = "error";
+            std::string out;
+            switch (step)
+            {
+                case KeepStep::None:
+                    said = wantsBanker ? "waiting for a banker" : "";
+                    break;
+                case KeepStep::Unequip:
+                {
+                    ItemPosCountVec dest;
+                    if (who->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false) == EQUIP_ERR_OK && !dest.empty())
+                    {
+                        who->SwapItem(item->GetPos(), dest.front().pos);
+                        said = Player::IsEquipmentPos(item->GetPos()) ? "could not take it off" : "taken off into the bags";
+                    }
+                    else
+                        said = "no room in the bags to take it off";
+                    break;
+                }
+                case KeepStep::Deposit:
+                    DoBank(who, "deposit guid:" + std::to_string(item->GetGUID().GetCounter()), status, out);
+                    said = std::string("banked: ") + status;
+                    break;
+                case KeepStep::Withdraw:
+                    DoBank(who, "withdraw guid:" + std::to_string(item->GetGUID().GetCounter()), status, out);
+                    said = std::string("taken out of the bank: ") + status;
+                    break;
+                case KeepStep::Equip:
+                {
+                    uint16 dest = 0;
+                    if (who->CanEquipItem(NULL_SLOT, dest, item, true) == EQUIP_ERR_OK)
+                    {
+                        who->SwapItem(item->GetPos(), dest);
+                        said = Player::IsEquipmentPos(item->GetPos()) ? "worn again" : "could not put it on";
+                    }
+                    else
+                        said = "cannot put it on yet";
+                    break;
+                }
+            }
+
+            std::string const key = r.character + ":" + std::to_string(r.itemGuid ? r.itemGuid : r.itemEntry);
+            if (!said.empty() && _keepSaid[key] != said)
+            {
+                _keepSaid[key] = said;
+                LOG_INFO("module.overseer",
+                         "overseer: kept item {} on '{}' (level {}, until level {}): {} ({}){}{}",
+                         r.itemGuid ? r.itemGuid : r.itemEntry, r.character, level, r.untilLevel, said,
+                         KeepStepWord(step), out.empty() ? "" : " - ", out.substr(0, 300));
+            }
+        }
     }
 
     static char const* DoBank(Player* who, std::string const& command, char const*& status,
@@ -45796,6 +45993,8 @@ private:
             Item* item = FindCarriedItem(player, true, req.itemGuid);
             if (!item)
                 return refuse(R::ItemNotCarried);
+            if (ItemKept(player, item))
+                return refuse(D::KEEP_REFUSAL);
             ItemTemplate const* proto = item->GetTemplate();
             facts.haveItem = true;
             facts.itemGuid = item->GetGUID().GetCounter();
@@ -47435,6 +47634,8 @@ private:
                 return refuse(request.itemByGuid
                                   ? "no carried item with that guid on this character"
                                   : "no carried item with that entry on this character");
+            if (ItemKept(who, item))
+                return refuse(OverseerDecisions::KEEP_REFUSAL);
 
             // Same two checks DoGive makes before moving an item off a
             // character, and for the same reason: a guild bank deposit is
@@ -53944,6 +54145,8 @@ private:
                     : FindCarriedItem(who, true, req.itemGuid);
                 if (!item)
                     return refuse(R::ItemNotCarried);
+                if (ItemKept(who, item))
+                    return refuse(D::KEEP_REFUSAL);
 
                 ItemTemplate const* proto = item->GetTemplate();
                 if (!proto)
@@ -56396,6 +56599,52 @@ private:
 // both land. Refusing it is what a group that agreed to go to town first does
 // at the door: it does not go in. Only a held family, only onto a map with a
 // portal row, only an alive character this module steers.
+// THE CORE'S OWN GATES FOR A KEPT ITEM (overseer_keep). The executors above
+// refuse a reserved item by name, but a character can also be sold from, mailed
+// from or traded from by something that is not this module: the bot's own AI
+// at a vendor, a client, another module. These three hooks are asked by the
+// core's own handlers (HandleSellItemOpcode, HandleSendMail, HandleSetTradeItem)
+// before they move anything, so a reserved item cannot leave that way at all.
+// Destroying, auctioning and guild-banking have no such hook in the core; for
+// those, the executors are the gate.
+class OverseerKeepScript : public PlayerScript
+{
+public:
+    OverseerKeepScript() : PlayerScript("OverseerKeepScript", {
+        PLAYERHOOK_CAN_SELL_ITEM,
+        PLAYERHOOK_CAN_SEND_MAIL,
+        PLAYERHOOK_CAN_SET_TRADE_ITEM,
+    }) {}
+
+    bool OnPlayerCanSellItem(Player* player, Item* item, Creature* /*creature*/) override
+    {
+        return !Refused(player, item, "sell");
+    }
+
+    bool OnPlayerCanSendMail(Player* player, ObjectGuid /*receiverGuid*/, ObjectGuid /*mailbox*/,
+                             std::string& /*subject*/, std::string& /*body*/, uint32 /*money*/,
+                             uint32 /*COD*/, Item* item) override
+    {
+        return !Refused(player, item, "mail");
+    }
+
+    bool OnPlayerCanSetTradeItem(Player* player, Item* tradedItem, uint8 /*tradeSlot*/) override
+    {
+        return !Refused(player, tradedItem, "trade");
+    }
+
+private:
+    static bool Refused(Player* player, Item* item, char const* what)
+    {
+        if (!ItemKept(player, item))
+            return false;
+        LOG_INFO("module.overseer", "overseer: refused to {} item {} ({}) on '{}': {}", what,
+                 item->GetGUID().GetCounter(), item->GetEntry(), player->GetName(),
+                 OverseerDecisions::KEEP_REFUSAL);
+        return true;
+    }
+};
+
 class OverseerDoorScript : public PlayerScript
 {
 public:
@@ -56485,4 +56734,5 @@ void Addmod_overseerScripts()
     new OverseerEventScript();
     new OverseerDoorScript();
     new OverseerFinderScript();
+    new OverseerKeepScript();
 }
