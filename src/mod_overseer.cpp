@@ -375,6 +375,10 @@ constexpr uint32 FISH_POLL_MS = 20000;
 // is renewed here, and a poll slower than the lease would mean the traveller
 // spent part of every five minutes wandering off on its own.
 constexpr uint32 TRAVEL_POLL_MS = 15000;
+// How many travel polls ask for leftover point aims before the startup sweep
+// counts as done with nothing found (#658): a minute, so a read that failed at
+// startup is retried, and anything this book claims meanwhile is its own.
+constexpr uint32 LEFTOVER_SWEEP_POLLS = 4;
 
 // How often the engagement-safety drive checks the roster for a character
 // that is both unaccompanied and unaimed (infra#2925/#2891 - watched live:
@@ -5210,7 +5214,8 @@ public:
     void ForgetLeftover(std::string const& name, std::string const& target)
     {
         CharacterDatabase.DirectExecute(
-            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND travel_npc = '{}'",
+            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND travel_npc = '{}' "
+            "AND enabled = 1",
             Esc(name), Esc(target));
         _lastEnd[name] = ErrandEnd{"a point aim left from before this worldserver started (#658)",
                                    false};
@@ -20612,13 +20617,18 @@ private:
     // Load, because the only aims it can be wrong about are the ones written
     // before this process started; every later aim this book writes it also
     // remembers. Each point aim found is said once, whichever way it goes.
-    void SweepLeftoverAims()
+    //
+    // True when the sweep is done. An empty answer cannot be told from a
+    // failed read here, so it is asked again on the next few polls before the
+    // sweep counts as done (LEFTOVER_SWEEP_POLLS): a read that failed at
+    // startup is retried, and an honest "none" costs a few cheap queries.
+    bool SweepLeftoverAims()
     {
         QueryResult result = CharacterDatabase.Query(
             "SELECT name, travel_npc, `lead` FROM overseer_roster "
             "WHERE enabled = 1 AND travel_npc LIKE 'at:%'");
         if (!result)
-            return;  // no point aims, or a schema without the columns
+            return false;  // none, a failed read, or a schema without the columns
         do
         {
             Field* fields = result->Fetch();
@@ -20646,15 +20656,14 @@ private:
                          "and it is kept - {} (#658)",
                          name, target, OverseerDecisions::LeftoverAimName(verdict));
         } while (result->NextRow());
+        return true;
     }
 
     void DriveTravel()
     {
         if (!_leftoverAimsSwept)
-        {
-            _leftoverAimsSwept = true;
-            SweepLeftoverAims();
-        }
+            _leftoverAimsSwept =
+                SweepLeftoverAims() || ++_leftoverSweepPolls >= LEFTOVER_SWEEP_POLLS;
         // THE SAME READ THE QUEST DRIVE'S ARBITRATION USES (infra#2846), so the
         // two can never be looking at different answers to "who is on an
         // errand". The WHERE clause that used to live here lives in the loader:
@@ -52935,8 +52944,9 @@ private:
     // thread only, like everything else on these loops.
     TravelAimBook _travelAims;
     // Whether the first travel poll has cleared the point aims a previous
-    // process left in the roster (#658).
+    // process left in the roster (#658), and how many polls have asked.
     bool _leftoverAimsSwept = false;
+    uint32 _leftoverSweepPolls = 0;
     // The talent reset errand (#626). Who is walking to a class trainer for
     // one, and the tree the reset is for; when the last walk ended without a
     // reset; which reason not to walk was last said; and how many arrival polls

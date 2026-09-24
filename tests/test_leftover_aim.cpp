@@ -121,12 +121,19 @@ void TheFirstTravelPollSweeps()
         return;
     }
     std::size_t const drive = source.find("    void DriveTravel()\n");
-    std::size_t const sweep = source.find("SweepLeftoverAims();", drive);
+    std::size_t const sweep = source.find("SweepLeftoverAims() ||", drive);
     std::size_t const load = source.find("_travelAims.Load();", drive);
     Check("DriveTravel exists", drive != std::string::npos);
     Check("DriveTravel sweeps", sweep != std::string::npos);
     Check("before its first read of the column", sweep < load);
     Check("once per process", source.find("if (!_leftoverAimsSwept)") != std::string::npos);
+    // An empty read cannot be told from a failed one, so it is asked again for
+    // a bounded number of polls rather than given up on at the first.
+    Check("retried when nothing came back",
+          source.find("SweepLeftoverAims() || ++_leftoverSweepPolls >= LEFTOVER_SWEEP_POLLS") !=
+              std::string::npos);
+    Check("an empty read does not count as done",
+          source.find("return false;  // none, a failed read") != std::string::npos);
     Check("asks the decision",
           source.find("OverseerDecisions::ReadLeftoverAim(facts)") != std::string::npos);
     Check("the book's own claim is what 'written here' means",
@@ -135,7 +142,7 @@ void TheFirstTravelPollSweeps()
     // Cleared by a compare-and-swap on the aim, leaving learn_skill alone.
     Check("compare-and-swap",
           source.find("UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND "
-                      "travel_npc = '{}'") != std::string::npos);
+                      "travel_npc = '{}' \"\n            \"AND enabled = 1\"") != std::string::npos);
 }
 
 }  // namespace
