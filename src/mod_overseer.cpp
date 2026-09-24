@@ -10194,7 +10194,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
                 "outcome = '{}', ended_reason = '{}' WHERE id = {} AND state = 'active'",
-                outcome, Esc(reason), runId);
+                Esc(outcome), Esc(reason), runId);
         else
             // No outcome column to write to. The run is still closed, because
             // leaving it open is the thing that actually breaks the next run.
@@ -38447,7 +38447,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    "left the world before the change could be read back", check.id,
+                    Esc("left the world before the change could be read back"), check.id,
                     g_runToken);
                 continue;
             }
@@ -38513,7 +38513,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                 "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(o.str()), check.id, g_runToken);
+                status, Esc(detail), EscLong(o.str()), check.id, g_runToken);
         }
 
         _pendingChecks.swap(stillWaiting);
@@ -38962,12 +38962,12 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = '{}', detail = '{}' "
                     "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
-                    status, detail, id, g_runToken);
+                    status, Esc(detail), id, g_runToken);
             else
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
-                    status, detail, EscLong(rowResult), id, g_runToken);
+                    status, Esc(detail), EscLong(rowResult), id, g_runToken);
         } while (result->NextRow());
 
         // AND SAY HOW THAT WENT, IF IT IS WORTH SAYING (mod-overseer#230).
@@ -45497,7 +45497,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    gone, EscLong(ConjureJson(check.ev, "unreadable", gone)), check.id,
+                    Esc(gone), EscLong(ConjureJson(check.ev, "unreadable", gone)), check.id,
                     g_runToken);
                 continue;
             }
@@ -45677,7 +45677,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Refusal::NoBotAI,
+                    Esc(Refusal::NoBotAI),
                     EscLong(ConjureJson(check.ev, ConjureOutcomeWord(check.ev.verdict),
                                         Refusal::NoBotAI)),
                     check.id, g_runToken);
@@ -45807,7 +45807,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                 "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(ConjureJson(check.ev, outcome, detail)), check.id,
+                status, Esc(detail), EscLong(ConjureJson(check.ev, outcome, detail)), check.id,
                 g_runToken);
         }
 
@@ -46485,7 +46485,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    "left the world before the hearth could be read back",
+                    Esc("left the world before the hearth could be read back"),
                     EscLong(HearthJson(check.ev, "unreadable",
                                        "left the world before the hearth could be read back")),
                     check.id, g_runToken);
@@ -46599,7 +46599,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    status, detail, EscLong(HearthJson(check.ev, outcome, detail)), check.id,
+                    status, Esc(detail), EscLong(HearthJson(check.ev, outcome, detail)), check.id,
                     g_runToken);
         }
 
@@ -47281,7 +47281,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    gone, EscLong(CastJson(check.ev, "unreadable", gone)), check.id,
+                    Esc(gone), EscLong(CastJson(check.ev, "unreadable", gone)), check.id,
                     g_runToken);
                 continue;
             }
@@ -47444,7 +47444,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                 "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(CastJson(check.ev, outcome, detail)), check.id,
+                status, Esc(detail), EscLong(CastJson(check.ev, outcome, detail)), check.id,
                 g_runToken);
         }
 
@@ -47954,7 +47954,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    gone, EscLong(LearnJson(check.ev, "unreadable", gone)), check.id,
+                    Esc(gone), EscLong(LearnJson(check.ev, "unreadable", gone)), check.id,
                     g_runToken);
                 continue;
             }
@@ -48031,7 +48031,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                 "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(LearnJson(check.ev, outcome, detail)), check.id,
+                status, Esc(detail), EscLong(LearnJson(check.ev, outcome, detail)), check.id,
                 g_runToken);
         }
 
@@ -49654,7 +49654,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                 "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(SummonJson(check.ev, "refused", detail)), check.id,
+                status, Esc(detail), EscLong(SummonJson(check.ev, "refused", detail)), check.id,
                 g_runToken);
             return false;
         };
@@ -49811,7 +49811,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                 "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(SummonJson(check.ev, "refused", detail)), check.id,
+                status, Esc(detail), EscLong(SummonJson(check.ev, "refused", detail)), check.id,
                 g_runToken);
             return false;
         };
@@ -49962,7 +49962,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    "the character to summon logged out before the summon could be read back",
+                    Esc("the character to summon logged out before the summon could be read back"),
                     EscLong(SummonJson(check.ev, "unreadable",
                                        "the character to summon logged out before the summon "
                                        "could be read back")),
@@ -50141,7 +50141,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                 "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, detail, EscLong(SummonJson(check.ev, outcome, detail)), check.id,
+                status, Esc(detail), EscLong(SummonJson(check.ev, outcome, detail)), check.id,
                 g_runToken);
         }
 
@@ -52004,7 +52004,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    status, reason, EscLong(MailWalkJson(ev, word, reason)), check.id,
+                    status, Esc(reason), EscLong(MailWalkJson(ev, word, reason)), check.id,
                     g_runToken);
             };
 
