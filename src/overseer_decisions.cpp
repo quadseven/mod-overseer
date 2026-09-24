@@ -2212,7 +2212,22 @@ bool DungeonMapHasIndependentWings(uint32_t mapId)
     // Scarlet Monastery's four wings share map 189 but have separate entrance
     // triggers. The core exposes encounters by map, not by wing, so the union
     // cannot prove any one wing complete.
-    return mapId == 189;
+    //
+    // DIRE MAUL IS THE SAME SHAPE, AND WORSE (#431). Six doors lead into map
+    // 429, and DungeonEncounter.dbc credits sixteen encounters on it across
+    // three wings that do not connect inside: East (Zevrim Thornhoof,
+    // Hydrospawn, Lethtendris, Alzzin the Wildshaper, encounter bits 0 to 3),
+    // West (Illyanna Ravenoak, Magister Kalendris, Immol'thar, Tendris Warpwood,
+    // Prince Tortheldrin, bits 4 to 8) and North (Guard Mol'dar through King
+    // Gordok, bits 9 to 15). mod-dungeon-clear's wing registry marks it
+    // isolated and clears one wing per run, so a run on any Dire Maul row could
+    // only ever read NotYet and end at the clearing watchdog as 'stalled'.
+    //
+    // MARAUDON IS NOT. Its two doors (map 349) open on one connected interior,
+    // which that registry marks as a label and not a filter: every boss,
+    // Princess Theradras included, is cleared from either door, so the whole
+    // map's mask is the right expectation and a run there can be proved.
+    return mapId == 189 || mapId == 429;
 }
 
 char const* DungeonRunExitOutcome(bool provedComplete, bool stalled, bool evacuated)

@@ -148,6 +148,13 @@ int main()
           DungeonMapHasIndependentWings(189), true);
     CheckBool("Deadmines is not a split-wing map",
           DungeonMapHasIndependentWings(36), false);
+    // #431: Dire Maul's three wings share map 429 and do not connect inside.
+    CheckBool("Dire Maul is a split-wing map",
+          DungeonMapHasIndependentWings(429), true);
+    // Maraudon's two doors share map 349 and one connected interior, so a run
+    // from either door can clear every encounter the map credits.
+    CheckBool("Maraudon is not a split-wing map",
+          DungeonMapHasIndependentWings(349), false);
     AMapThatCreditsNothingIsNeverFinished();
     EveryCreditedEncounterMeansComplete();
     OneEncounterShortIsNotFinished();
