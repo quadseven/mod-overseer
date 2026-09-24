@@ -11525,7 +11525,7 @@ bool MailWalkRefusalRetryable(std::string const& reason)
         || reason == R::HeldByAnother || reason == R::GroundRefused
         || reason == R::EnteredCombat || reason == R::Died || reason == R::LeftWorld
         || reason == R::LeftMap || reason == R::TookFlight || reason == R::TimedOut
-        || reason == R::Stalled;
+        || reason == R::Stalled || reason == R::ExpansionContinent;
 }
 
 char const* MailWalkGate(MailWalkGateFacts const& facts)
@@ -12275,5 +12275,23 @@ bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bo
 {
     return familyBagHeld && enteringDungeonMap && alive && steered;
 }
+
+namespace Classic
+{
+bool IsExpansionContinent(uint32_t mapId)
+{
+    return mapId == OUTLAND_MAP_ID || mapId == NORTHREND_MAP_ID;
+}
+
+bool ClassicRankAllowed(uint32_t rankMaxSkill)
+{
+    return rankMaxSkill <= PROFESSION_SKILL_CAP;
+}
+
+bool ClassicRecipeAllowed(uint32_t reqSkillRank)
+{
+    return reqSkillRank <= PROFESSION_SKILL_CAP;
+}
+}  // namespace Classic
 
 }  // namespace OverseerDecisions
