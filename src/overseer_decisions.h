@@ -3428,6 +3428,50 @@ bool TravelFocusOutlivesItsErrand(TravelFocusFacts const& facts);
 // caller cannot pair a plural subject with a singular verb.
 std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing);
 
+// ------------- a point aim left over from before a restart (#658) ------------
+//
+// TravelAimBook remembers which aims it wrote in memory only. After a restart
+// a catch-up point it wrote is a stranger's errand to every fence: the release
+// skips the column write, and the travel drive still walks it. On the dev realm
+// on 2026-09-24 a far catch-up from 03:51 (the spot the leader landed after a
+// hearth) was walked again at 05:30:06, taking three members 2,282 yards away
+// from where the family was, and it stayed in their columns for two hours.
+//
+// So on its first poll the travel drive reads each point aim it finds against
+// the facts below, once, and clears the ones only a process that is gone could
+// have written. A follower's `at:` aim is exactly that: the bridge aims only a
+// leader, and every module owner of a follower's point (a catch-up, an escort,
+// a run's walk) kept it in memory that the restart took. The catch-up aims a
+// member afresh at where its leader stands now, if it is still behind, a live
+// run claims its members again, and `learn_skill` is left pending.
+enum class LeftoverAim : uint8_t
+{
+    // Not a point aim: a keyword or a creature entry names a place that has not
+    // moved, and its own writer or backstop ends it.
+    NotAPoint,
+    // Written by this process since it started. Its owner still knows it.
+    WrittenHere,
+    // The family's leader carries it. A leader's point is a bridge pass's walk
+    // (a gathering field, a flight master, a leveling hub) or the run's own
+    // staging walk, which the coordinator adopts after a restart (#596), and
+    // each of those has an owner that re-reads it.
+    TheLeadersOwn,
+    // A follower's point with nobody left who wrote it. Cleared. A live run
+    // that still wants the member somewhere claims it again on its next poll,
+    // into an empty column.
+    Release,
+};
+
+struct LeftoverAimFacts
+{
+    std::string target;           // the travel_npc column
+    bool writtenHere = false;     // this process's book claimed exactly this aim
+    bool leadsFamily = false;     // overseer_roster.lead
+};
+
+LeftoverAim ReadLeftoverAim(LeftoverAimFacts const& facts);
+char const* LeftoverAimName(LeftoverAim verdict);
+
 enum class MaintenanceHold : uint8_t
 {
     Open,         // nothing is outstanding; the run may start
