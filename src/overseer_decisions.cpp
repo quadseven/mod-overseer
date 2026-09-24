@@ -12512,9 +12512,14 @@ bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts)
     // rest may all go; the column decides between them (see the header).
     if (facts.bagBlocked)
         return who != HeadErrand::ActiveRun && who != HeadErrand::CampaignApproach;
-    // Staging: nothing below the approach may take or pin the head.
+    // Staging: nothing below the approach may take or pin the head, except a
+    // town stop whose counter is in the town the head is passing (#639).
     if (facts.runStaging)
+    {
+        if (who == HeadErrand::TownStop)
+            return facts.stopYards >= 0.f && facts.stopYards <= TOWN_STOP_NEAR_YARDS;
         return who == HeadErrand::ActiveRun || who == HeadErrand::CampaignApproach;
+    }
     return true;
 }
 
@@ -12528,8 +12533,21 @@ char const* HeadErrandWaitReason(HeadErrand who, HeadTravelFacts const& facts)
     if (facts.bagBlocked)
         return "the family has no bag room, so the campaign waits for town upkeep to "
                "make some";
+    if (who == HeadErrand::TownStop)
+        return "a dungeon run is staging, and a town stop may go on the approach only "
+               "when its counter is in the town the head is passing";
     return "a dungeon run is staging and walks the head to its door; BARRIER gathers "
            "the family there, so nothing lower may take or pin the head";
+}
+
+bool StagingWaitsForTownStop(bool foreignErrand, float stopYards, uint32_t heldSeconds)
+{
+    if (!foreignErrand || heldSeconds >= TOWN_STOP_MAX_SECONDS)
+        return false;
+    HeadTravelFacts staging;
+    staging.runStaging = true;
+    staging.stopYards = stopYards;
+    return HeadErrandMayTravel(HeadErrand::TownStop, staging);
 }
 
 EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool insideMapHasPortal)

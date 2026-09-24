@@ -14937,6 +14937,12 @@ bool GearTankWeighsShieldPair(GearRole role, bool twoHanderInMainHand);
 //
 //   1. ActiveRun         - the family is inside its run. Everything waits.
 //   2. CampaignApproach  - the run is staging: reset, gather, barrier, door.
+//   2a. TownStop         - a short stop at a mailbox, a banker or a guild
+//                          vault in the town the head is passing (#639). Under
+//                          the approach, and allowed during it only when the
+//                          counter is within TOWN_STOP_NEAR_YARDS: a player
+//                          checks the post on the way to the dungeon, and
+//                          does not cross the zone for it.
 //   3. BagUpkeep         - the family has no bag room. The campaign yields to
 //                          town (sell, bank, destroy, mail) until there is.
 //   4. TrainerTrip       - a talent reset or a trainer visit. Only when the
@@ -14952,6 +14958,7 @@ enum class HeadErrand : uint8_t
 {
     ActiveRun,
     CampaignApproach,
+    TownStop,
     BagUpkeep,
     TrainerTrip,
     Other,
@@ -14962,13 +14969,48 @@ struct HeadTravelFacts
     bool runInside{false};   // the coordinator is STAGED_INSIDE, CLEARING or EXIT
     bool runStaging{false};  // the coordinator is RESET, GATHERING, BARRIER or ENTER
     bool bagBlocked{false};  // a member is at or below the town trip's bag floor
+    // How far the head stands from a town stop's counter, or below zero when
+    // nobody has measured it. Read only for HeadErrand::TownStop (#639).
+    float stopYards{-1.f};
 };
+
+// A COUNTER IN THE SAME TOWN (#639). The bridge's own reading of "short": the
+// vendor and the guild vault its first lease was measured between are 121
+// yards apart, and 150 covers that and no more than the town.
+constexpr float TOWN_STOP_NEAR_YARDS = 150.f;
+// HOW LONG A STAGING RUN WAITS FOR ONE. 150 yards at the 112 yards a minute the
+// travel backstop measures is 80 seconds, and the counter work is seconds; 300
+// is the bridge's own stop window (240) and one more poll of slack. Past it the
+// run stops waiting quietly and says so.
+constexpr uint32_t TOWN_STOP_MAX_SECONDS = 300;
 
 // May `who` put its aim on the head right now?
 bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts);
 
 // Why it may not, for the log line; "" when it may.
 char const* HeadErrandWaitReason(HeadErrand who, HeadTravelFacts const& facts);
+
+// ------------------------ a short town stop on the approach (#639) ----------
+//
+// MEASURED ON THE DEV REALM, 2026-09-24. Neither family had collected its post
+// or used a bank for days: Grug held 22 letters with 2,609 gold in them, Zug 6
+// with 1,042, and the ten members had one item in their personal banks between
+// them. The Horde family's campaign owned its head the whole time, in the town
+// it was staging from, so the bridge's mail and bank passes waited for ever.
+//
+// The bridge now makes a short stop between runs (wow-overseer#276). If its
+// aim is in the column while this run is staging, the run's next leg claim is
+// refused as a foreign errand; the old reading of that was "the errand had
+// ended or been written over", a WARN and a re-arm every poll, and GATHERING's
+// backstop running on. This is the order's answer instead: a stop the order
+// lets through during staging is waited on, for at most TOWN_STOP_MAX_SECONDS,
+// and staging's clock does not run while it waits.
+//
+// `foreignErrand` is an aim in the column this run did not write. `stopYards`
+// is the head's distance to where the travel drive resolved it, below zero
+// when there is no resolved point yet. `heldSeconds` is how long this run has
+// seen that same aim.
+bool StagingWaitsForTownStop(bool foreignErrand, float stopYards, uint32_t heldSeconds);
 
 // ------------------ a run the family cannot loot and nobody owns (#631) -----
 //
