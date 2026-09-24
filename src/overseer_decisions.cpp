@@ -13359,4 +13359,65 @@ bool ClassicRecipeAllowed(uint32_t reqSkillRank)
 }
 }  // namespace Classic
 
+ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxAttempts)
+{
+    if (!facts.inWorld || !facts.onInsideMap)
+        return ExitHearthStep::NotInside;
+    // A hearth already in flight is waited on before anything else is judged:
+    // its own cast is what puts the cooldown on.
+    if (facts.pending)
+        return ExitHearthStep::Waiting;
+    if (*ExitHearthImpossibleReason(facts, maxAttempts))
+        return ExitHearthStep::Impossible;
+    // The executor refuses both of these, and both pass on their own.
+    if (facts.inCombat)
+        return ExitHearthStep::Waiting;
+    if (facts.moving)
+        return ExitHearthStep::StopFirst;
+    return ExitHearthStep::Cast;
+}
+
+char const* ExitHearthStepWord(ExitHearthStep step)
+{
+    switch (step)
+    {
+        case ExitHearthStep::NotInside:  return "not_inside";
+        case ExitHearthStep::Cast:       return "cast";
+        case ExitHearthStep::StopFirst:  return "stop_first";
+        case ExitHearthStep::Waiting:    return "waiting";
+        case ExitHearthStep::Impossible: return "impossible";
+    }
+    return "unknown";
+}
+
+char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned maxAttempts)
+{
+    if (!facts.inWorld || !facts.onInsideMap)
+        return "";
+    if (!facts.alive)
+        return "dead";
+    if (!facts.carriesStone)
+        return "carries no hearthstone";
+    if (facts.onCooldown)
+        return "hearthstone on cooldown";
+    if (facts.attempts >= maxAttempts)
+        return "hearth attempts spent";
+    return "";
+}
+
+bool ExitFailureHearthInPlay(std::vector<ExitHearthStep> const& steps)
+{
+    for (ExitHearthStep step : steps)
+        if (step == ExitHearthStep::Cast || step == ExitHearthStep::StopFirst ||
+            step == ExitHearthStep::Waiting)
+            return true;
+    return false;
+}
+
+bool ExitHearthHoldsAdoption(std::vector<ExitHearthStep> const& steps, uint32_t episodeSeconds,
+                             uint32_t ceilingSeconds)
+{
+    return episodeSeconds < ceilingSeconds && ExitFailureHearthInPlay(steps);
+}
+
 }  // namespace OverseerDecisions
