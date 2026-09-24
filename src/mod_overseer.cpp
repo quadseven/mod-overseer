@@ -19223,7 +19223,7 @@ private:
             return verdict;
         auto const coord = _dungeonRunCoordinators.find(FamilyOfCharacter(name));
         facts.hearthRegroupInPlay =
-            coord != _dungeonRunCoordinators.end() && HearthRegroupInPlay(coord->second);
+            coord != _dungeonRunCoordinators.end() && RecoveryBringsTheFamily(coord->second);
         return OverseerDecisions::DecideLoneLeg(facts, LONE_LEG_LIMITS);
     }
 

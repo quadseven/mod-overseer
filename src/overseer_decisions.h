@@ -7826,7 +7826,8 @@ struct LoneLegFacts
     // another map or unread.
     float bindYardsFromLeader{-1.f};
     // The family's dungeon run has chosen, or is waiting out the backoff for,
-    // a hearth regroup: everybody meets at the inn, and that drive moves it.
+    // a recovery that brings the family together itself (a hearth regroup,
+    // the summon rung or the dungeon finder): that drive moves it.
     bool hearthRegroupInPlay{false};
 };
 
