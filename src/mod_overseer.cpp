@@ -25700,7 +25700,11 @@ private:
 
     // WHERE EACH ROSTER MEMBER'S FAMILY RUN STANDS, for the drives that must
     // yield to it (#631). Rebuilt on every DriveDungeonRun from the
-    // coordinators, on the world thread, and read only there.
+    // coordinators, on the world thread, and read only there: its one reader,
+    // HeadTravelFactsFor, is called by KeepTheFamilyTogether (through
+    // KeepRosterFollowing) and DriveRespec, both from OnUpdate. The teleport
+    // hook, which a map thread can call, never reads it; DoorShutFor reads only
+    // BagHeldMembers, under BagHeldLock.
     std::map<std::string, DungeonRunPhase> _familyRunPhaseByMember;
 
     // WHICH ROSTER MEMBERS BELONG TO A FAMILY WITH NO BAG ROOM, member ->
@@ -48863,14 +48867,19 @@ public:
         std::string const name = player->GetName();
         bool sayIt = false;
         {
+            // ONE ENTRY PER CHARACTER, holding the last map it was refused
+            // onto, so the record is bounded by the roster and a refusal onto
+            // a different map is still said.
             std::lock_guard<std::mutex> guard(SaidLock());
-            sayIt = Said().insert(name + ":" + std::to_string(mapid)).second;
+            auto const [it, fresh] = Said().try_emplace(name, mapid);
+            sayIt = fresh || it->second != mapid;
+            it->second = mapid;
         }
         if (sayIt)
             LOG_WARN("module.overseer",
                      "overseer: '{}' was about to cross into dungeon map {} while its family "
                      "'{}' has no bag room - the teleport is refused and the family goes to "
-                     "town first (#631). Said once per character and map for this process",
+                     "town first (#631). Said again only when it is refused onto another map",
                      name, mapid, OverseerWorldScript::BagHeldFamilyOf(name));
         return false;
     }
@@ -48881,9 +48890,9 @@ private:
         static std::mutex lock;
         return lock;
     }
-    static std::set<std::string>& Said()
+    static std::map<std::string, uint32>& Said()
     {
-        static std::set<std::string> said;
+        static std::map<std::string, uint32> said;
         return said;
     }
 };
