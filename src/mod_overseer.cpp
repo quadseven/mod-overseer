@@ -21743,6 +21743,7 @@ private:
             if (OverseerDecisions::ForgetDcOnRecord(bot && bot->IsInWorld(), true))
             {
                 _dcOnIssued.erase(name);
+                _raidArmingHeldSaid.erase(name);
                 continue;
             }
 
@@ -30797,17 +30798,20 @@ private:
                     else if (member->GetMapId() == door->outsideMapId &&
                              member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
                                  OverseerDecisions::RAID_ASSEMBLE_YARDS)
+                    {
                         ++facts.assembled;
+                        // THE HEAD IS TOLD APART IN THE SAME LOOP that counts
+                        // him, so "everyone else at the door" can never
+                        // subtract a head this loop did not count.
+                        if (member == head)
+                            facts.headAssembled = true;
+                        else
+                            ++facts.othersAssembled;
+                    }
                 }
             }
-            if (head && door)
-            {
+            if (head && door && head->IsInWorld())
                 facts.headInside = head->GetMapId() == door->insideMapId;
-                facts.headAssembled = head->GetMapId() == door->outsideMapId &&
-                                      head->GetDistance(door->stageX, door->stageY,
-                                                        door->stageZ) <=
-                                          OverseerDecisions::RAID_ASSEMBLE_YARDS;
-            }
             // Seats that could still join, read without changing anything, so
             // FORM is left only when formation has nothing more to do.
             for (auto const& [name, subgroup] : seats)

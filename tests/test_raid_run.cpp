@@ -75,6 +75,7 @@ RaidRunFacts Ready()
     facts.addable = 0;
     facts.inWorld = 35;
     facts.assembled = 35;
+    facts.othersAssembled = 34;
     facts.headAssembled = true;
     return facts;
 }
@@ -214,6 +215,7 @@ void TheHeadCrossesLast()
 {
     RaidRunFacts facts = Ready();
     facts.assembled = 12;   // the head and eleven still outside
+    facts.othersAssembled = 11;
     facts.inside = 23;
     facts.heldSeconds = 30;
     RaidRunStep const waiting = StepRaidRun(RaidRunPhase::Enter, facts);
@@ -222,11 +224,22 @@ void TheHeadCrossesLast()
     Check("the head waits for them", !waiting.knockHead);
 
     facts.assembled = 1;   // only the head
+    facts.othersAssembled = 0;
     facts.inside = 34;
     RaidRunStep const last = StepRaidRun(RaidRunPhase::Enter, facts);
     Check("the head crosses once he is the last one out", last.knockHead);
 
+    // THE HEAD NOT COUNTED AT THE DOOR (out of the world, or walked off) is not
+    // subtracted from the others: one member still outside keeps him waiting.
+    facts.assembled = 1;
+    facts.othersAssembled = 1;
+    facts.headAssembled = false;
+    RaidRunStep const notHim = StepRaidRun(RaidRunPhase::Enter, facts);
+    Check("a member still outside is not mistaken for the head", !notHim.knockHead);
+    facts.headAssembled = true;
+
     facts.assembled = 12;
+    facts.othersAssembled = 11;
     facts.heldSeconds = RAID_ENTER_WAIT_SECONDS;
     RaidRunStep const waited = StepRaidRun(RaidRunPhase::Enter, facts);
     Check("and after the wait at the door, whatever is left", waited.knockHead);

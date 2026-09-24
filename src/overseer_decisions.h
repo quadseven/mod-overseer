@@ -13411,6 +13411,9 @@ struct RaidRunFacts
     // Raid members on the outside map within RAID_ASSEMBLE_YARDS of the staging
     // point, the head included.
     unsigned assembled{0};
+    // The same count without the head, taken in the same pass, so ENTER's
+    // "everyone else has crossed" never subtracts a head that was not counted.
+    unsigned othersAssembled{0};
     // Raid members on the inside map.
     unsigned inside{0};
     bool headAssembled{false};

@@ -10740,14 +10740,10 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             step.phase = RaidRunPhase::Enter;
             step.aimDoor = true;
             step.knockMembers = true;
-            unsigned const othersOutside =
-                facts.assembled > (facts.headAssembled ? 1u : 0u)
-                    ? facts.assembled - (facts.headAssembled ? 1u : 0u)
-                    : 0u;
-            step.knockHead =
-                othersOutside == 0 || facts.heldSeconds >= RAID_ENTER_WAIT_SECONDS;
+            step.knockHead = facts.othersAssembled == 0 ||
+                             facts.heldSeconds >= RAID_ENTER_WAIT_SECONDS;
             step.why = step.knockHead
-                           ? (othersOutside == 0 ? "everyone else at the door has "
+                           ? (facts.othersAssembled == 0 ? "everyone else at the door has "
                                                    "crossed; the head goes last"
                                                  : "the wait at the door is over; the "
                                                    "head crosses and the rest follow")
