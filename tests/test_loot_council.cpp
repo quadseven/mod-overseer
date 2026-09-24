@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace OverseerDecisions;
@@ -157,6 +158,119 @@ void TiesAreSettledByName()
            "an exact tie never depends on the walk order");
 }
 
+GearItem Piece(int itemClass, int subClass, int armour, std::vector<GearStat> stats,
+               float dps = 0.f)
+{
+    GearItem item;
+    item.itemClass = itemClass;
+    item.subClass = subClass;
+    item.armour = armour;
+    item.itemLevel = 50;
+    item.stats = std::move(stats);
+    item.dps = dps;
+    return item;
+}
+
+void WhatMakesARolePiece()
+{
+    // ItemModType ids: 3 agility, 4 strength, 5 intellect, 6 spirit, 7 stamina,
+    // 12 defense, 31 hit, 32 crit, 43 mana regeneration, 45 spell power.
+    // Big Bad Pauldrons (9476), as the dev realm's item_template has it.
+    GearItem const pauldrons = Piece(4, 4, 396, {{4, 12}, {7, 12}, {32, 8}});
+    Expect(GearPieceForRole(pauldrons, GearRole::Tank),
+           "plate that is mostly armour and stamina is a tank's piece");
+    Expect(!GearPieceForRole(pauldrons, GearRole::Melee),
+           "only a tank or a healer gets first call");
+
+    GearItem const sword = Piece(2, 7, 0, {{4, 5}}, 30.f);
+    Expect(!GearPieceForRole(sword, GearRole::Tank), "a weapon is damage, not a tank's piece");
+    GearItem const ring = Piece(4, 0, 0, {{3, 8}, {31, 5}});
+    Expect(!GearPieceForRole(ring, GearRole::Tank), "a ring of agility and hit is not");
+    GearItem const defense = Piece(4, 0, 0, {{12, 10}, {3, 4}});
+    Expect(GearPieceForRole(defense, GearRole::Tank), "a ring of defense is");
+
+    // Necklace of Calisea (1714): intellect, spirit, stamina.
+    GearItem const necklace = Piece(4, 0, 0, {{5, 7}, {6, 7}, {7, 8}});
+    Expect(GearPieceForRole(necklace, GearRole::Healer),
+           "intellect and spirit make a healer's piece");
+    GearItem const casterHood = Piece(4, 1, 60, {{5, 10}, {45, 12}});
+    Expect(!GearPieceForRole(casterHood, GearRole::Healer),
+           "intellect and spell power alone are a caster's as much as a healer's");
+    GearItem const mp5 = Piece(4, 1, 60, {{5, 6}, {43, 4}});
+    Expect(GearPieceForRole(mp5, GearRole::Healer), "mana regeneration makes a healer's piece");
+    Expect(!GearPieceForRole(Piece(4, 0, 0, {}), GearRole::Tank), "nothing on it is nothing");
+}
+
+LootCandidate Seat(std::string const& name, std::string const& role, float gain, float score,
+                   bool rolePiece, bool mainTank = false, bool family = true,
+                   GearComparison comparison = GearComparison::Better)
+{
+    LootCandidate c = Candidate(name, family, comparison, gain, score, 8, role);
+    c.tank = role == "tank";
+    c.mainTank = mainTank;
+    c.rolePiece = rolePiece;
+    return c;
+}
+
+void TheMainTankIsGearedFirst()
+{
+    // The dev realm, 2026-09-24: Big Bad Pauldrons from Zul'Farrak went to the
+    // Retribution paladin (40% new) over the main tank (36% new).
+    std::vector<LootCandidate> c = {
+        Seat("Grug", "tank", 169.f, 467.f, true, true),
+        Seat("Grog", "melee", 76.3f, 191.8f, false),
+    };
+    LootCouncilPick const pick = LootCouncilHeuristic(c);
+    Expect(pick.recipient == "Grug", "the main tank gets a tank's piece first");
+    Expect(pick.why.find("the main tank in the family has first call on a tank's piece") !=
+               std::string::npos,
+           "the reason says it is the main tank's call");
+    Expect(pick.why.find("ahead of Grog's 40%") != std::string::npos,
+           "and whose bigger share it went ahead of");
+    Expect(LootCouncilPriority(c[0]) == 0 && LootCouncilPriority(c[1]) == 3,
+           "the main tank on a tank's piece has first call, a paladin in melee none");
+
+    // The same drop, not a tank's piece: the biggest share wins as before.
+    c[0].rolePiece = false;
+    Expect(LootCouncilHeuristic(c).recipient == "Grog",
+           "off a tank's piece the size of the upgrade decides");
+
+    // First call is for a certain upgrade only.
+    std::vector<LootCandidate> unsure = {
+        Seat("Grug", "tank", -38.5f, 342.f, true, true, true, GearComparison::Undecided),
+        Seat("Grog", "melee", -15.6f, 119.4f, false, false, true, GearComparison::Undecided),
+    };
+    Expect(LootCouncilPriority(unsure[0]) == 3, "an unsettled upgrade has no first call");
+    Expect(LootCouncilHeuristic(unsure).recipient == "Grog",
+           "an unsettled tank's piece is ranked by the numbers");
+}
+
+void TanksThenHealersThenTheRest()
+{
+    std::vector<LootCandidate> c = {
+        Seat("Offtank", "tank", 20.f, 100.f, true),
+        Seat("Grug", "tank", 10.f, 100.f, true, true),
+    };
+    Expect(LootCouncilHeuristic(c).recipient == "Grug", "the main tank before an off-tank");
+
+    std::vector<LootCandidate> h = {
+        Seat("Og", "caster", 60.f, 100.f, false),
+        Seat("Ugga", "healer", 30.f, 100.f, true),
+    };
+    LootCouncilPick const pick = LootCouncilHeuristic(h);
+    Expect(pick.recipient == "Ugga", "a healer gets a healer's piece first");
+    Expect(pick.why.find("a healer in the family has first call on a healer's piece") !=
+               std::string::npos,
+           "and the reason says so");
+
+    // The family still comes before a raider's first call.
+    std::vector<LootCandidate> f = {
+        Seat("Raidtank", "tank", 50.f, 100.f, true, false, false),
+        Seat("Grog", "melee", 5.f, 100.f, false),
+    };
+    Expect(LootCouncilHeuristic(f).recipient == "Grog", "the family first, even over a tank");
+}
+
 void VotesOnAnOpenRoll()
 {
     Expect(LootCouncilVoteFor(false, "", "Og", 3) == LootCouncilVote::Hold,
@@ -215,6 +329,16 @@ void KeysAndJson()
     Expect(json.find("\"item_level_gain\":7") != std::string::npos, "item levels are written");
     Expect(json.find("\"spec\":\"Protection\"") != std::string::npos, "the spec is written");
     Expect(json.find("\"tank\":true") != std::string::npos, "the tank flag is written");
+    Expect(json.find("\"main_tank\":false") != std::string::npos, "the main tank flag is written");
+    Expect(json.find("\"role_piece\":false") != std::string::npos, "the role piece is written");
+    Expect(json.find("\"priority\":3") != std::string::npos, "the first call is written");
+    c.mainTank = true;
+    c.rolePiece = true;
+    std::string const first = LootCandidatesJson({c});
+    Expect(first.find("\"main_tank\":true") != std::string::npos &&
+               first.find("\"role_piece\":true") != std::string::npos &&
+               first.find("\"priority\":0") != std::string::npos,
+           "a main tank's first call is written");
     Expect(json.find("400 \\\"armour\\\"") != std::string::npos, "quotes are escaped");
     Expect(LootCandidatesJson({}) == "[]", "no candidates is an empty array");
 }
@@ -238,6 +362,13 @@ void TheAdapterSeams()
     Expect(module.find("void AnswerOpenRolls(std::vector<GearMember> const& members)") !=
                std::string::npos,
            "the open-roll reaction is kept");
+    Expect(module.find("c.rolePiece = OverseerDecisions::GearPieceForRole(") !=
+               std::string::npos,
+           "each candidate is told whether the drop is a piece for its role");
+    Expect(module.find("candidates.back().tank && p->GetName() == family") != std::string::npos &&
+               module.find("candidates.back().tank && member->GetName() == family") !=
+                   std::string::npos,
+           "the family's head is its main tank on a roll and on master loot");
 
     std::string const patch =
         Read("patches/mod-playerbots/0015-a-module-can-steer-a-loot-roll-vote.patch");
@@ -264,6 +395,9 @@ int main()
     ACertainUpgradeBeatsAnUnsettledOne();
     NobodyItUpgrades();
     TiesAreSettledByName();
+    WhatMakesARolePiece();
+    TheMainTankIsGearedFirst();
+    TanksThenHealersThenTheRest();
     VotesOnAnOpenRoll();
     SeatRoles();
     KeysAndJson();

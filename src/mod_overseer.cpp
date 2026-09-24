@@ -15323,6 +15323,7 @@ private:
         c.why = candidate.why;
         if (!candidate.wearable)
             return c;
+        c.rolePiece = OverseerDecisions::GearPieceForRole(GearItemFor(proto, random), who.role);
 
         uint8 const found = bot->FindEquipSlot(proto, NULL_SLOT, true);
         if (found == NULL_SLOT || found >= EQUIPMENT_SLOT_END)
@@ -15443,6 +15444,9 @@ private:
             bool const inFamily = f != _councilFamilies.end() && f->second == family;
             candidates.push_back(
                 CouncilCandidate(p, proto, roll.randomPropertyId, inFamily, std::string()));
+            // The family's head is its main tank when the head tanks.
+            candidates.back().mainTank =
+                inFamily && candidates.back().tank && p->GetName() == family;
         }
         uint32 const mapId = voters.empty() ? 0u : voters.front()->GetMapId();
         OpenCouncilRow(OverseerDecisions::LootCouncilRollKey(rollKey), "roll", family,
@@ -15549,6 +15553,8 @@ private:
                 candidates.push_back(CouncilCandidate(
                     member, proto, drop.randomPropertyId, inFamily,
                     seat == seats.end() ? std::string() : seat->second));
+                candidates.back().mainTank =
+                    inFamily && candidates.back().tank && member->GetName() == family;
             }
 
             CouncilDrop open;

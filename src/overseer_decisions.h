@@ -4465,6 +4465,29 @@ struct GearVerdict
 
 GearVerdict GearScore(GearItem const& item, GearWearer const& who);
 
+// IS THIS A PIECE FOR THE ROLE? What a raiding guild's loot council asks before
+// it gives a tank or a healer first call on a drop, measured with the role's own
+// weights above rather than a list of item names.
+//
+// A TANK'S PIECE is one where survival - armour, stamina, health, defense,
+// dodge, parry, block and block value - is at least half of what the piece is
+// worth to a tank. Measured on the dev realm on 2026-09-24: Big Bad Pauldrons
+// (plate, 396 armour, 12 strength, 12 stamina, 8 crit) is 90% survival to a
+// tank and went to the Retribution paladin, because 40% of it was new to him
+// against 36% to the main tank. A tank's weapon is mostly damage and is not a
+// tank's piece; neither is a ring of agility and hit.
+//
+// A HEALER'S PIECE carries the healer's own stats, spirit or mana regeneration,
+// and intellect, spirit, mana regeneration and spell power are at least half of
+// what it is worth to a healer. Intellect and spell power alone do not make one:
+// on this realm healing and spell damage are the same spell power, so a mage's
+// piece and a priest's are told apart only by spirit and mana regeneration. An
+// equip spell is not read, the same as GearScore.
+//
+// Every other role answers false: melee, ranged and caster pieces are shared
+// out by the size of the upgrade, as before.
+bool GearPieceForRole(GearItem const& item, GearRole role);
+
 struct GearUsability
 {
     bool usable{false};
@@ -4754,6 +4777,12 @@ struct LootCandidate
     std::string className;
     std::string spec;
     bool tank{false};
+    // The family's head and a tank: the one the raid is geared around. A
+    // raiding guild gears its main tank first on a tank's piece.
+    bool mainTank{false};
+    // GearPieceForRole for the role above: the piece is what this role wears
+    // gear FOR (survival for a tank, healing for a healer).
+    bool rolePiece{false};
     // GearVerdict::why, or the refusal sentence.
     std::string why;
 };
@@ -4787,10 +4816,19 @@ struct LootCouncilPick
     std::string why;
 };
 
+// WHO HAS FIRST CALL on a certain upgrade, the way a raiding guild's council
+// runs it: 0 the main tank on a tank's piece, 1 another tank on a tank's piece,
+// 2 a healer on a healer's piece, 3 everybody else. An upgrade the numbers
+// cannot settle, or no upgrade at all, is 3: first call is for a piece the
+// council is sure of.
+int LootCouncilPriority(LootCandidate const& candidate);
+
 // THE HEURISTIC A LOOT COUNCIL RUNS. Family first, then guild raiders; inside
 // each, a certain upgrade (GearComparison::Better) before one the numbers
-// cannot settle, and then the larger UpgradePercent, then the name. A drop
-// that is not an upgrade for anybody names nobody.
+// cannot settle, then LootCouncilPriority (the main tank, then the other tanks,
+// on a tank's piece; a healer on a healer's piece), and then the larger
+// UpgradePercent, then the name. A drop that is not an upgrade for anybody
+// names nobody.
 LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidates);
 
 // What one member votes on an open group-loot roll the council is deciding.
