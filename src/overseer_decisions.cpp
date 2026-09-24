@@ -1906,6 +1906,7 @@ char const* RunRecoveryWord(RunRecovery recovery)
         case RunRecovery::OneCopy:       return "one_copy";
         case RunRecovery::Replan:        return "replan";
         case RunRecovery::ResetInstance: return "reset_instance";
+        case RunRecovery::HearthRegroup: return "hearth_regroup";
     }
     return "reset_instance";
 }
@@ -1913,11 +1914,13 @@ char const* RunRecoveryWord(RunRecovery recovery)
 namespace
 {
 // Ladder order: the order the heuristic walks when the failure's own facts
-// point at nothing, and the order the options are offered in.
+// point at nothing, and the order the options are offered in. HearthRegroup is
+// last so the four-rung fallback (`tried.size() % 4`) is unchanged, and it is
+// only ever a candidate when the facts carry an inn (RunRecoveryApplicable).
 RunRecovery const RUN_RECOVERY_LADDER[] = {
     RunRecovery::RestageNearer, RunRecovery::Regroup,  RunRecovery::Replan,
     RunRecovery::OneCopy,       RunRecovery::ResetInstance, RunRecovery::WaitForClient,
-    RunRecovery::TownForBags,
+    RunRecovery::TownForBags,   RunRecovery::HearthRegroup,
 };
 
 bool TriedTwiceRunning(std::vector<RunRecovery> const& tried, RunRecovery r)
@@ -1964,6 +1967,25 @@ std::string RunRecoveryOptions()
     return out;
 }
 
+bool RunRecoveryApplicable(RunRecovery recovery, RunFailureFacts const& facts)
+{
+    return recovery != RunRecovery::HearthRegroup || facts.hearthRegroupReady;
+}
+
+std::string RunRecoveryOptions(RunFailureFacts const& facts)
+{
+    std::string out;
+    for (RunRecovery r : RUN_RECOVERY_LADDER)
+    {
+        if (!RunRecoveryApplicable(r, facts))
+            continue;
+        if (!out.empty())
+            out += ',';
+        out += RunRecoveryWord(r);
+    }
+    return out;
+}
+
 RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
 {
     // A candidate the facts point at, unless it has already failed twice
@@ -1976,7 +1998,7 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
         for (RunRecovery r : RUN_RECOVERY_LADDER)
         {
             if (r == wanted || r == RunRecovery::TownForBags ||
-                r == RunRecovery::WaitForClient)
+                r == RunRecovery::WaitForClient || !RunRecoveryApplicable(r, facts))
                 continue;
             unsigned const times = TimesTried(facts.tried, r);
             if (times < fewest)
@@ -2006,6 +2028,14 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
     // failing.
     if (facts.outcome == "reset_failed")
         return pick(RunRecovery::ResetInstance);
+
+    // A FAMILY SPREAD ACROSS ZONES WITH AN INN MOST OF IT SHARES MEETS THERE
+    // (2026-09-24). Asked before the restage walk and the regroup wait because
+    // it answers both: measured with the leader 5,549 yards from the door and a
+    // member 4,289 yards from him, a restage walk and a regroup had each been
+    // tried twice that morning and neither got the family together.
+    if (facts.hearthRegroupReady && facts.farthestMemberYards > RUN_RECOVERY_HEARTH_SPREAD_YARDS)
+        return pick(RunRecovery::HearthRegroup);
 
     // A staging that timed out with the leader far from the door never had a
     // chance: the walk does not fit in the clock.
@@ -2053,6 +2083,10 @@ std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery ch
         case RunRecovery::Replan:
             why = "the approach itself failed (a ledge or a leader whose errand kept "
                   "being taken back)";
+            break;
+        case RunRecovery::HearthRegroup:
+            why = "the family was spread across zones and most of it is bound at one inn, "
+                  "so it hearths there, meets, and walks to the door together";
             break;
     }
     if (TimesTried(facts.tried, chosen) > 0)
@@ -5307,9 +5341,15 @@ FetchRunAnswer RunLetsTheLeaderFetch(FetchRunPhase phase)
         case FetchRunPhase::Barrier:
             return FetchRunAnswer::RegatherFirst;
         case FetchRunPhase::Committed:
+        case FetchRunPhase::HearthRegroup:
             return FetchRunAnswer::Refuse;
     }
     return FetchRunAnswer::Refuse;
+}
+
+FetchRunPhase RecoveringFetchPhase(bool hearthRegroupInPlay)
+{
+    return hearthRegroupInPlay ? FetchRunPhase::HearthRegroup : FetchRunPhase::NoRun;
 }
 
 bool CatchUpAimIsStale(CatchUpAimFacts const& facts, CatchUpAimLimits const& limits)
@@ -13366,8 +13406,9 @@ char const* RespecStepWord(RespecStep step)
         case RespecStep::CannotAfford: return "cannot afford the reset";
         case RespecStep::NotNow: return "not free to walk";
         case RespecStep::RunOwnsTravel:
-            return "the family's dungeon run is staging or under way, and a talent reset "
-                   "walks only when the head is idle or in town";
+            return "the family's dungeon run is staging, under way or between attempts, "
+                   "and a talent reset walks only when the head is idle or its trainer is "
+                   "in the town it stands in";
         case RespecStep::ColumnBusy: return "another errand holds the travel column";
         case RespecStep::Resting: return "waiting out the retry after a missed reset";
         case RespecStep::Walk: return "walk to its class trainer";
@@ -13445,6 +13486,12 @@ bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts)
             return facts.stopYards >= 0.f && facts.stopYards <= TOWN_STOP_NEAR_YARDS;
         return who == HeadErrand::ActiveRun || who == HeadErrand::CampaignApproach;
     }
+    // Between attempts of an armed campaign, a trainer trip goes only to a
+    // trainer in the town the head stands in. Unmeasured is not near.
+    if (facts.campaignBetweenAttempts && who == HeadErrand::TrainerTrip)
+        return facts.trainerYards >= 0.f && facts.trainerYards <= TOWN_STOP_NEAR_YARDS;
+    if (facts.hearthRegroup && who == HeadErrand::Other)
+        return false;
     return true;
 }
 
@@ -13461,6 +13508,13 @@ char const* HeadErrandWaitReason(HeadErrand who, HeadTravelFacts const& facts)
     if (who == HeadErrand::TownStop)
         return "a dungeon run is staging, and a town stop may go on the approach only "
                "when its counter is in the town the head is passing";
+    if (facts.hearthRegroup && who == HeadErrand::Other)
+        return "the family's campaign is regrouping by hearthstone at its shared inn, "
+               "which is the regroup this wait stands in for";
+    if (facts.campaignBetweenAttempts && !facts.runStaging)
+        return "the family's dungeon campaign is armed and between attempts, and a "
+               "trainer trip waits for it unless the trainer is in the town the head "
+               "stands in";
     return "a dungeon run is staging and walks the head to its door; BARRIER gathers "
            "the family there, so nothing lower may take or pin the head";
 }
@@ -13564,6 +13618,102 @@ bool ExitHearthHoldsAdoption(std::vector<ExitHearthStep> const& steps, uint32_t 
                              uint32_t ceilingSeconds)
 {
     return episodeSeconds < ceilingSeconds && ExitFailureHearthInPlay(steps);
+}
+
+HearthRegroupPlan PlanHearthRegroup(std::vector<HearthRegroupMember> const& family,
+                                    uint32_t doorMapId, float innYards)
+{
+    HearthRegroupPlan plan;
+    plan.familySize = static_cast<unsigned>(family.size());
+    if (family.size() < 2)
+    {
+        plan.whyNot = "a family of one has nobody to regroup with";
+        return plan;
+    }
+
+    auto near = [&](HomeBind const& a, HomeBind const& b) {
+        if (!a.known || !b.known || a.mapId != b.mapId)
+            return false;
+        float const dx = a.x - b.x;
+        float const dy = a.y - b.y;
+        return std::sqrt(dx * dx + dy * dy) <= innYards;
+    };
+
+    // THE CANDIDATE WITH THE MOST MEMBERS BOUND BESIDE IT. The leader's bind
+    // wins a tie, so when he is bound there the inn is exactly where his own
+    // stone lands him.
+    int best = -1;
+    unsigned bestCount = 0;
+    bool bestIsLeader = false;
+    for (std::size_t i = 0; i < family.size(); ++i)
+    {
+        HomeBind const& candidate = family[i].bind;
+        if (!candidate.known || candidate.mapId != doorMapId)
+            continue;
+        unsigned count = 0;
+        for (HearthRegroupMember const& m : family)
+            if (near(candidate, m.bind))
+                ++count;
+        bool const isLeader = family[i].leader;
+        if (count > bestCount || (count == bestCount && isLeader && !bestIsLeader))
+        {
+            best = static_cast<int>(i);
+            bestCount = count;
+            bestIsLeader = isLeader;
+        }
+    }
+    if (best < 0)
+    {
+        plan.whyNot = "nobody is bound on the dungeon's own continent";
+        return plan;
+    }
+
+    plan.inn = family[static_cast<std::size_t>(best)].bind;
+    plan.boundThere = bestCount;
+    for (HearthRegroupMember const& m : family)
+    {
+        bool const boundHere = near(plan.inn, m.bind);
+        if (m.leader && boundHere)
+            plan.leaderBoundThere = true;
+        bool const ready =
+            boundHere && m.inWorld && m.alive && m.carriesStone && !m.onCooldown;
+        (ready ? plan.hearth : plan.travel).push_back(m.name);
+    }
+
+    unsigned const half = plan.familySize / 2;
+    if (plan.boundThere <= half)
+        plan.whyNot = "no inn has more than half the family bound at it (" +
+                      std::to_string(plan.boundThere) + " of " +
+                      std::to_string(plan.familySize) + " at the best one)";
+    else if (plan.hearth.size() <= half)
+        plan.whyNot = "only " + std::to_string(plan.hearth.size()) + " of " +
+                      std::to_string(plan.familySize) +
+                      " can hearth to the shared inn now (a stone on cooldown, missing, "
+                      "or its holder dead or away)";
+    plan.ready = plan.whyNot.empty();
+    return plan;
+}
+
+HearthRegroupStep HearthRegroupStepFor(bool inHearthSet, float yardsFromInn, bool leaderComing,
+                                       bool hearthImpossible, float innYards)
+{
+    if (yardsFromInn >= 0.f && yardsFromInn <= innYards)
+        return HearthRegroupStep::AtInn;
+    if (inHearthSet && !hearthImpossible)
+        return leaderComing ? HearthRegroupStep::Hearth : HearthRegroupStep::WaitForLeader;
+    return HearthRegroupStep::Travel;
+}
+
+char const* HearthRegroupStepWord(HearthRegroupStep step)
+{
+    switch (step)
+    {
+        case HearthRegroupStep::AtInn: return "at the inn";
+        case HearthRegroupStep::Hearth: return "hearth";
+        case HearthRegroupStep::WaitForLeader: return "wait for the leader";
+        case HearthRegroupStep::Travel: return "travel";
+    }
+    return "unknown";
 }
 
 }  // namespace OverseerDecisions

@@ -19603,6 +19603,11 @@ private:
         auto const coord = _dungeonRunCoordinators.find(FamilyOfCharacter(leaderName));
         if (coord == _dungeonRunCoordinators.end())
             return OverseerDecisions::FetchRunPhase::NoRun;
+        // A RUN BETWEEN ATTEMPTS LENDS THE LEADER, unless the family is about to
+        // meet at its inn by hearthstone (2026-09-24): then the fetch is the
+        // one member flown after while the rest are elsewhere.
+        if (coord->second.phase == DungeonRunPhase::Recovering)
+            return OverseerDecisions::RecoveringFetchPhase(HearthRegroupInPlay(coord->second));
         return FetchRunPhaseOf(coord->second.phase);
     }
 
@@ -26834,6 +26839,13 @@ private:
         std::time_t recoveryBestAt{0};
         bool recoveryTownReached{false};
         std::string recoveryNote;
+        // A HEARTH REGROUP (RunRecovery::HearthRegroup), read fresh from the
+        // family when it is applied: who hearths, who walks, and the inn. Casts
+        // asked per member, and the step last said per member so each line is
+        // said once.
+        OverseerDecisions::HearthRegroupPlan hearthPlan;
+        std::map<std::string, unsigned> hearthAttempts;
+        std::map<std::string, std::string> hearthSaid;
         // MAKING ROOM INSIDE (see MakeRoomInside): who has had the loot rule
         // set this run, and who was told once that no grey was left.
         std::set<std::string> roomLootRuleSet;
@@ -27215,6 +27227,9 @@ private:
     // hook, which a map thread can call, never reads it; DoorShutFor reads only
     // BagHeldMembers, under BagHeldLock.
     std::map<std::string, DungeonRunPhase> _familyRunPhaseByMember;
+    // ...AND WHICH OF THEM BELONG TO A FAMILY WHOSE CAMPAIGN IS REGROUPING BY
+    // HEARTHSTONE (2026-09-24), rebuilt beside it and read the same way.
+    std::set<std::string> _hearthRegroupMembers;
 
     // WHICH ROSTER MEMBERS BELONG TO A FAMILY WITH NO BAG ROOM, member ->
     // family (#631). Written by DriveDungeonRunFor on the world thread and
@@ -27291,10 +27306,17 @@ private:
                 case DungeonRunPhase::Exiting:
                     facts.runInside = true;
                     break;
+                // BETWEEN ATTEMPTS (2026-09-24): nobody walks to a door, but
+                // the campaign is armed and will stage with this head again.
+                case DungeonRunPhase::Recovering:
+                case DungeonRunPhase::Repairing:
+                    facts.campaignBetweenAttempts = true;
+                    break;
                 default:
                     break;
             }
         }
+        facts.hearthRegroup = _hearthRegroupMembers.count(name) > 0;
         // AN ORDERED RAID OWNS THE HEAD THE SAME WAY (mod-overseer#634): FORM,
         // ASSEMBLE and ENTER walk him to the door, INSIDE holds him there, and
         // the family's lower claimants yield to it exactly as they yield to a
@@ -30427,7 +30449,75 @@ private:
         }
         facts.farthestMemberYards = farthest;
         facts.tried = RecoveriesTried(leaderName, coord.campaignId, 8);
+        OverseerDecisions::HearthRegroupPlan const inn =
+            PlanFamilyHearthRegroup(leaderName, members, portal);
+        facts.hearthRegroupReady = inn.ready;
+        facts.hearthRegroupNote = HearthRegroupPlanLine(inn);
         return facts;
+    }
+
+    // THE FAMILY, AS PlanHearthRegroup READS IT (2026-09-24): each member's own
+    // bind point, and whether its hearthstone could be used now. The leader is
+    // read whether or not `members` names him.
+    OverseerDecisions::HearthRegroupPlan PlanFamilyHearthRegroup(
+        std::string const& leaderName, std::vector<std::string> const& members,
+        DungeonPortal const& portal)
+    {
+        std::vector<std::string> names{leaderName};
+        for (std::string const& name : members)
+            if (name != leaderName)
+                names.push_back(name);
+        std::vector<OverseerDecisions::HearthRegroupMember> family;
+        for (std::string const& name : names)
+        {
+            OverseerDecisions::HearthRegroupMember m;
+            m.name = name;
+            m.leader = name == leaderName;
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            if (bot && bot->IsInWorld())
+            {
+                uint32 const spellId = HearthstoneSpellOf(bot);
+                m.inWorld = true;
+                m.alive = bot->IsAlive();
+                m.carriesStone = spellId != 0;
+                m.onCooldown = spellId && bot->HasSpellCooldown(spellId);
+                m.bind.known = true;
+                m.bind.mapId = static_cast<uint32_t>(bot->m_homebindMapId);
+                m.bind.areaId = static_cast<uint32_t>(bot->m_homebindAreaId);
+                m.bind.x = bot->m_homebindX;
+                m.bind.y = bot->m_homebindY;
+                m.bind.z = bot->m_homebindZ;
+            }
+            family.push_back(m);
+        }
+        return OverseerDecisions::PlanHearthRegroup(family, portal.outsideMapId);
+    }
+
+    static std::string HearthRegroupPlanLine(OverseerDecisions::HearthRegroupPlan const& plan)
+    {
+        std::ostringstream line;
+        if (!plan.ready)
+        {
+            line << "no hearth regroup (" << plan.whyNot << ")";
+            return line.str();
+        }
+        line << plan.boundThere << " of " << plan.familySize << " bound at one inn (map "
+             << plan.inn.mapId << " area " << plan.inn.areaId << "), "
+             << plan.hearth.size() << " can hearth there now";
+        if (!plan.travel.empty())
+            line << ", " << JoinNames(plan.travel) << " would walk or fly to it";
+        return line.str();
+    }
+
+    // IS A HEARTH REGROUP THIS FAMILY'S BUSINESS NOW? Chosen, or the answer the
+    // backoff is waiting out. What the fetch, the regroup wait and the head's
+    // errands read (see RecoveringFetchPhase and HeadTravelFacts::hearthRegroup).
+    static bool HearthRegroupInPlay(DungeonRunCoordinatorState const& coord)
+    {
+        if (coord.phase != DungeonRunPhase::Recovering)
+            return false;
+        return (coord.recoveryChosen ? coord.recovery : coord.recoveryHeuristic) ==
+               OverseerDecisions::RunRecovery::HearthRegroup;
     }
 
     static std::string RecoveryFactsLine(OverseerDecisions::RunFailureFacts const& facts)
@@ -30452,6 +30542,8 @@ private:
             line << " nothing yet";
         for (OverseerDecisions::RunRecovery r : facts.tried)
             line << ' ' << OverseerDecisions::RunRecoveryWord(r);
+        if (!facts.hearthRegroupNote.empty())
+            line << "; " << facts.hearthRegroupNote;
         return line.str();
     }
 
@@ -30486,7 +30578,7 @@ private:
         WriteRecoveryRequest(FamilyOfCoordinator(coord), leaderName, coord.campaignId,
                              coord.runNumber, "run_recovery", attempt,
                              facts.outcome + ": " + facts.reason, factsLine,
-                             OverseerDecisions::RunRecoveryOptions(),
+                             OverseerDecisions::RunRecoveryOptions(facts),
                              OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic),
                              coord.recoveryHeuristicWhy);
 
@@ -30526,6 +30618,152 @@ private:
         coord = next;
     }
 
+    // ONE POLL OF A HEARTH REGROUP (2026-09-24). Every member of the plan's
+    // hearth set is cast for by DoHearth, held still first when it is moving,
+    // exactly as a failed EXIT hearths out (DriveExitHearths); a member whose
+    // stone turns out to be unusable joins the walkers. Every walker, and the
+    // leader when he is not bound at the inn, is escorted there by the run's
+    // own escort, which takes over a catch-up walk and lifts a too-far hold,
+    // and which the travel drive walks or flies. The members of the hearth set
+    // wait for the leader when he is walking, so nobody lands at an inn he is
+    // not at. True when every member stands at the inn.
+    bool DriveHearthRegroup(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                            std::vector<std::string> const& members)
+    {
+        using OverseerDecisions::HearthRegroupStep;
+        OverseerDecisions::HearthRegroupPlan const& plan = coord.hearthPlan;
+        OverseerDecisions::HomeBind const& inn = plan.inn;
+        std::ostringstream innAim;
+        innAim << "at:" << inn.mapId << ':' << inn.x << ',' << inn.y << ',' << inn.z;
+
+        auto inSet = [&](std::string const& name) {
+            return std::find(plan.hearth.begin(), plan.hearth.end(), name) != plan.hearth.end();
+        };
+        auto yardsFromInn = [&](Player* bot) {
+            if (!bot || !bot->IsInWorld() || bot->GetMapId() != inn.mapId)
+                return -1.f;
+            return bot->GetExactDist2d(inn.x, inn.y);
+        };
+
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+        float const leaderYards = yardsFromInn(leader);
+        bool const leaderComing =
+            inSet(leaderName) ||
+            (leaderYards >= 0.f && leaderYards <= OverseerDecisions::HEARTH_REGROUP_INN_YARDS);
+
+        std::vector<std::string> names{leaderName};
+        for (std::string const& name : members)
+            if (name != leaderName)
+                names.push_back(name);
+
+        bool everyoneThere = true;
+        for (std::string const& name : names)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            bool const hearths = inSet(name);
+
+            OverseerDecisions::ExitHearthFacts cast;
+            cast.inWorld = bot && bot->IsInWorld();
+            // "Still where the hearth is for": the exit's own reading, here
+            // meaning a member of the hearth set that is not at the inn yet.
+            cast.onInsideMap = cast.inWorld && hearths;
+            if (cast.onInsideMap)
+            {
+                uint32 const spellId = HearthstoneSpellOf(bot);
+                cast.alive = bot->IsAlive();
+                cast.carriesStone = spellId != 0;
+                cast.onCooldown = spellId && bot->HasSpellCooldown(spellId);
+                cast.inCombat = bot->IsInCombat();
+                cast.moving = bot->isMoving();
+                cast.pending = HearthPendingFor(name);
+                cast.attempts = coord.hearthAttempts[name];
+            }
+            OverseerDecisions::ExitHearthStep const castStep =
+                OverseerDecisions::ExitFailureHearthStep(cast);
+            bool const impossible = castStep == OverseerDecisions::ExitHearthStep::Impossible ||
+                                    castStep == OverseerDecisions::ExitHearthStep::NotInside;
+
+            float const yards = yardsFromInn(bot);
+            HearthRegroupStep const step = OverseerDecisions::HearthRegroupStepFor(
+                hearths, yards, name == leaderName || leaderComing, impossible);
+            if (step != HearthRegroupStep::AtInn)
+                everyoneThere = false;
+
+            std::string const word = OverseerDecisions::HearthRegroupStepWord(step);
+            bool const changed = coord.hearthSaid[name] != word;
+            coord.hearthSaid[name] = word;
+
+            switch (step)
+            {
+                case HearthRegroupStep::AtInn:
+                    if (changed)
+                        LOG_INFO("module.overseer",
+                                 "overseer: hearth regroup - '{}' is at the inn ({} yards)",
+                                 name, static_cast<uint32>(yards));
+                    break;
+
+                case HearthRegroupStep::WaitForLeader:
+                    if (changed)
+                        LOG_INFO("module.overseer",
+                                 "overseer: hearth regroup - '{}' waits to hearth until '{}' "
+                                 "is at the inn, so it does not land where the leader is not",
+                                 name, leaderName);
+                    break;
+
+                case HearthRegroupStep::Hearth:
+                    if (castStep == OverseerDecisions::ExitHearthStep::Cast)
+                    {
+                        char const* status = "error";
+                        std::string evidence;
+                        ++coord.hearthAttempts[name];
+                        char const* const refusal =
+                            DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+                        if (!refusal || !*refusal)
+                            LOG_WARN("module.overseer",
+                                     "overseer: hearth regroup - '{}' is hearthing to the "
+                                     "family's inn {} yards away (attempt {} of {})",
+                                     name, static_cast<uint32>(std::max(0.f, yards)),
+                                     coord.hearthAttempts[name],
+                                     OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                        else
+                            LOG_WARN("module.overseer",
+                                     "overseer: hearth regroup - '{}' could not hearth: {} "
+                                     "(attempt {} of {})",
+                                     name, refusal, coord.hearthAttempts[name],
+                                     OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                    }
+                    else if (castStep == OverseerDecisions::ExitHearthStep::StopFirst)
+                    {
+                        CastHoldReport report;
+                        HoldStillAndReport(bot, name, "hearth", report);
+                        if (changed)
+                            LOG_INFO("module.overseer",
+                                     "overseer: hearth regroup - '{}' is moving, so it is "
+                                     "held still first and the hearth is cast on a later poll",
+                                     name);
+                    }
+                    break;
+
+                case HearthRegroupStep::Travel:
+                    if (!SteerableAI(bot))
+                        break;   // the ceiling bounds a member nobody can steer
+                    if (changed)
+                        LOG_INFO("module.overseer",
+                                 "overseer: hearth regroup - '{}' walks or flies to the "
+                                 "family's inn ({}), {} yards away{}",
+                                 name, innAim.str(),
+                                 yards < 0.f ? std::string("an unmeasured number of")
+                                             : std::to_string(static_cast<uint32>(yards)),
+                                 hearths ? " - its hearthstone cannot take it there now"
+                                         : " - it is bound somewhere else");
+                    EndFarHold(name, "its dungeon run walks it to the family's inn");
+                    EscortToward(name, innAim.str(), "HEARTH REGROUP", EscortPurpose::Assemble);
+                    break;
+            }
+        }
+        return everyoneThere;
+    }
+
     // One poll of RECOVERING: wait out the backoff, choose, and then either
     // hand straight to the next attempt or walk or wait until the recovery has
     // done its work (or reached its ceiling).
@@ -30546,7 +30784,8 @@ private:
                                    coord.recoveryAttempt, answer, by))
             {
                 OverseerDecisions::RunRecovery parsed;
-                if (OverseerDecisions::ParseRunRecovery(answer, parsed))
+                if (OverseerDecisions::ParseRunRecovery(answer, parsed) &&
+                    OverseerDecisions::RunRecoveryApplicable(parsed, coord.recoveryFacts))
                 {
                     chosen = parsed;
                     chosenBy = by.empty() ? std::string("bridge") : by;
@@ -30558,6 +30797,30 @@ private:
                              "is applied instead",
                              answer, leaderName, OverseerDecisions::RunRecoveryOptions(),
                              OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic));
+            }
+
+            // A HEARTH REGROUP IS READ AGAIN WHEN IT IS APPLIED. The backoff
+            // can be fifteen minutes, and a stone used, a member dead or a bind
+            // moved in that time changes the plan. No inn any more means the
+            // heuristic is asked again without one.
+            if (chosen == OverseerDecisions::RunRecovery::HearthRegroup)
+            {
+                coord.hearthPlan = PlanFamilyHearthRegroup(leaderName, members, portal);
+                coord.hearthAttempts.clear();
+                coord.hearthSaid.clear();
+                if (!coord.hearthPlan.ready)
+                {
+                    coord.recoveryFacts.hearthRegroupReady = false;
+                    coord.recoveryFacts.hearthRegroupNote = HearthRegroupPlanLine(coord.hearthPlan);
+                    chosen = OverseerDecisions::RunRecoveryHeuristic(coord.recoveryFacts);
+                    LOG_WARN("module.overseer",
+                             "overseer: dungeon campaign {} for '{}' was to regroup by "
+                             "hearthstone, but the family no longer can - {}. '{}' is applied "
+                             "instead",
+                             coord.campaignId, leaderName, coord.hearthPlan.whyNot,
+                             OverseerDecisions::RunRecoveryWord(chosen));
+                    chosenBy = "heuristic";
+                }
             }
 
             coord.recoveryChosen = true;
@@ -30608,6 +30871,23 @@ private:
                     // family to him.
                     _travelAims.Release(leaderName, "the run's regroup recovery");
                     return;
+                case OverseerDecisions::RunRecovery::HearthRegroup:
+                    // Whatever walk the leader was on ends; the stone or the
+                    // run's own escort to the inn takes him from here.
+                    _travelAims.Release(leaderName, "the run's hearth regroup recovery");
+                    LOG_WARN("module.overseer",
+                             "overseer: dungeon campaign {} for '{}' REGROUPS BY HEARTHSTONE "
+                             "- {}. {} hearth there; {} walk or fly to it; then the family "
+                             "walks to the '{}' door together. The cast is DoHearth's, the "
+                             "same one kind='hearth' runs",
+                             coord.campaignId, leaderName,
+                             HearthRegroupPlanLine(coord.hearthPlan),
+                             JoinNames(coord.hearthPlan.hearth),
+                             coord.hearthPlan.travel.empty()
+                                 ? std::string("nobody has to")
+                                 : JoinNames(coord.hearthPlan.travel),
+                             portal.keyword);
+                    return;
                 case OverseerDecisions::RunRecovery::RestageNearer:
                 case OverseerDecisions::RunRecovery::WaitForClient:
                     return;
@@ -30651,6 +30931,11 @@ private:
                 doneWhy = "every member is back beside the leader";
                 break;
             }
+            case OverseerDecisions::RunRecovery::HearthRegroup:
+                wait.ceilingSeconds = DUNGEON_RECOVERY_WALK_CEILING_SECONDS;
+                wait.satisfied = DriveHearthRegroup(coord, leaderName, members);
+                doneWhy = "every member is at the inn";
+                break;
             case OverseerDecisions::RunRecovery::RestageNearer:
             {
                 wait.ceilingSeconds = DUNGEON_RECOVERY_WALK_CEILING_SECONDS;
@@ -30747,6 +31032,35 @@ private:
         OverseerDecisions::RecoveryWaitStep const step = OverseerDecisions::RecoveryWaitNext(wait);
         if (step == OverseerDecisions::RecoveryWaitStep::Wait)
             return;
+
+        // THE FAMILY MET AT ITS INN, AND NOW WALKS TO THE DOOR TOGETHER. The
+        // inn is a town away from the door at best, so the next attempt's
+        // staging clock would start from there; the restage walk carries the
+        // leader (and the family following him) to the door with no clock
+        // running, exactly as a restage_nearer recovery does. At the ceiling
+        // too: whoever is still on the road catches up with a family that is
+        // walking the right way.
+        if (coord.recovery == OverseerDecisions::RunRecovery::HearthRegroup)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' hearth regroup {} after {}s - the family walks to the "
+                     "'{}' door together (the restage walk, no staging clock), and run {} "
+                     "of campaign {} opens once the leader is near it",
+                     leaderName,
+                     step == OverseerDecisions::RecoveryWaitStep::Done
+                         ? std::string("done: ") + doneWhy
+                         : std::string("reached its ceiling"),
+                     static_cast<uint32>(now - coord.recoveryActSince), portal.keyword,
+                     coord.runNumber, coord.campaignId);
+            coord.recovery = OverseerDecisions::RunRecovery::RestageNearer;
+            coord.recoveryActSince = now;
+            coord.recoveryBest = -1.f;
+            coord.recoveryBestAt = now;
+            coord.recoveryTownReached = false;
+            coord.recoveryNote = "attempt " + std::to_string(coord.recoveryAttempt) +
+                                 ": hearth_regroup, then the restage walk";
+            return;
+        }
 
         LOG_INFO("module.overseer",
                  "overseer: RECOVERING ends for '{}' - '{}' {} after {}s; run {} of campaign "
@@ -34096,6 +34410,7 @@ private:
         // Rebuilt below from this poll's coordinators, and empty when nothing
         // is driven, so a stale phase can never keep a drive yielding (#631).
         _familyRunPhaseByMember.clear();
+        _hearthRegroupMembers.clear();
         if (rosters.empty())
             return;   // no roster, or the read failed: nothing is decided on no evidence
         std::vector<OverseerDecisions::FamilyRoster const*> const driven =
@@ -34144,8 +34459,14 @@ private:
             for (OverseerDecisions::FamilyMember const& member : roster->members)
                 members.push_back(member.name);
             DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
+            bool const hearthRegroup =
+                HearthRegroupInPlay(_dungeonRunCoordinators[roster->family]);
             for (std::string const& name : members)
+            {
                 _familyRunPhaseByMember[name] = _dungeonRunCoordinators[roster->family].phase;
+                if (hearthRegroup)
+                    _hearthRegroupMembers.insert(name);
+            }
             // Compared with what was last WRITTEN rather than with the state at
             // the top of this poll, so a change made anywhere between two polls
             // is still caught here.
@@ -37492,14 +37813,31 @@ private:
             facts.available = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
                               bot->GetMap() && !bot->GetMap()->Instanceable();
             facts.columnFree = column.empty() || column == OverseerDecisions::RESPEC_AIM;
-            // A TALENT RESET IS A TRAINER TRIP, BELOW THE RUN AND ITS APPROACH
-            // (#631). It walks when the head is idle or in town, never over a
-            // run that is staging or inside.
-            facts.runOwnsTravel = !OverseerDecisions::HeadErrandMayTravel(
-                OverseerDecisions::HeadErrand::TrainerTrip, HeadTravelFactsFor(name));
             auto const missed = _respecMissedAt.find(name);
             if (missed != _respecMissedAt.end())
                 facts.sinceLastMiss = static_cast<uint32>(std::max<time_t>(0, now - missed->second));
+            // A TALENT RESET IS A TRAINER TRIP, BELOW THE RUN AND ITS APPROACH
+            // (#631). It walks when the head is idle or in town, never over a
+            // run that is staging or inside.
+            //
+            // ...AND FOR A CAMPAIGN BETWEEN ATTEMPTS (2026-09-24), unless the
+            // trainer is in the town the head stands in. The trainer is found
+            // the way the walk would find it, and only for a character the
+            // judgment would otherwise walk, so the spawn search is not paid
+            // for every roster row on every poll.
+            OverseerDecisions::HeadTravelFacts head = HeadTravelFactsFor(name);
+            if (head.campaignBetweenAttempts &&
+                OverseerDecisions::JudgeRespec(facts) == OverseerDecisions::RespecStep::Walk)
+            {
+                uint32 trainerEntry = 0;
+                WorldPosition trainerPos;
+                if (ResolveTravelTarget(bot, OverseerDecisions::RESPEC_AIM, trainerEntry,
+                                        trainerPos))
+                    head.trainerYards = bot->GetExactDist2d(trainerPos.GetPositionX(),
+                                                            trainerPos.GetPositionY());
+            }
+            facts.runOwnsTravel = !OverseerDecisions::HeadErrandMayTravel(
+                OverseerDecisions::HeadErrand::TrainerTrip, head);
 
             OverseerDecisions::RespecStep const step = OverseerDecisions::JudgeRespec(facts);
             uint32 const outside = OverseerDecisions::PointsOutsideTree(facts.pointsByTree, specTab);
