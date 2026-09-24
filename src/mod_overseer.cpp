@@ -97,9 +97,10 @@
  *                     core's own handlers, and not one of them decides where
  *                     anybody goes - GameObject::Use reads the destination off
  *                     the clicker's selection and the core does the rest. THE
- *                     ONLY THING IN THIS MODULE THAT CAN REJOIN A FAMILY SPLIT
- *                     ACROSS TWO CONTINENTS: the boat cannot board anybody
- *                     (#279), the crossing is never consulted for a leader
+ *                     ONE THING IN THIS MODULE THAT CAN REJOIN A FAMILY ALREADY
+ *                     SPLIT ACROSS TWO CONTINENTS: the boat boards a family
+ *                     that is together at its berth (#279) and nobody left
+ *                     behind on the far side, the crossing is never consulted for a leader
  *                     already across (#304), and a hearthstone only moves a
  *                     character to a home that is on the wrong continent
  *                     already (#308). It is deliberately NOT a teleport, and
@@ -294,6 +295,7 @@
 // that stops compiling when they tidy up.
 #include <exception>
 #include <iomanip>
+#include <limits>
 #include <list>
 #include <map>
 #include <mutex>
@@ -1268,15 +1270,48 @@ constexpr float CROSSING_BERTH_ARRIVED_YARDS = 12.0f;
 // than the drive reads "arrived" is what closes that loop, and asserting it
 // here is what stops somebody closing the gap again by tuning one number.
 
-// How many polls a route is believed for after the transport was last actually
-// seen. A crossing transport spends much of its period on the far map, where
-// Map::GetAllTransports on THIS map cannot see it, so some memory is required
-// or the route would read as gone every other minute. Bounded so that a
-// transport genuinely removed or rerouted stops being claimed rather than being
-// believed for ever: at DUNGEON_RUN_POLL_MS this is a little over ten minutes,
-// which is longer than any continent transport's period and far shorter than a
-// person's patience.
-constexpr uint32 CROSSING_ROUTE_MEMORY_POLLS = 128;
+// WHAT A BERTH IS, AS NUMBERS (#279). A surveyed point is a berth for a stop
+// when it is within CROSSING_BERTH_REACH_YARDS of the mooring on the plane and
+// within CROSSING_DECK_STEP_YARDS of a deck level. Measured over the six
+// transports that join Kalimdor and the Eastern Kingdoms: the chosen berths sit
+// 0.9 to 15.0 yards from their moorings and 0.02 to 0.65 yards off the deck, and
+// the nearest wrong answer - the ground at the foot of Grom'gol's tower - is 25
+// yards below the lowest deck. Forty yards is the length of a ship's hull; three
+// is a step a character takes without falling.
+constexpr float CROSSING_BERTH_REACH_YARDS = 40.0f;
+constexpr float CROSSING_DECK_STEP_YARDS = 3.0f;
+// How far from a stop frame the survey's own node for that stop may be. The
+// survey placed its transport nodes on the stop frames exactly (0.0 yards on
+// all twelve read); anything beyond this belongs to another stop.
+constexpr float CROSSING_MOORING_NODE_YARDS = 5.0f;
+
+// THE PARTY BOARDS TOGETHER. Every member on the pier must be this close to
+// the leader before he steps aboard. Half upstream's sixty-yard boarding assist
+// (FollowActions.cpp), so a follower that is inside this when he steps is still
+// inside that when the assist looks.
+constexpr float CROSSING_GATHER_YARDS = 30.0f;
+// How much of the stop must be left to start the step aboard. The step is a few
+// yards; the followers' assist runs on the bot AI's own tick after it. Measured
+// stops are 60 seconds at each end of the Menethil-Theramore path.
+constexpr uint32 CROSSING_MIN_BOARD_DWELL_MS = 15000;
+// The farthest the leader is walked in a straight line onto a deck, and off it.
+// Onto: a deck point within a hull's length of him. Off: he may stand anywhere
+// on a deck twice that long, and the landing is surveyed ground level with it.
+constexpr float CROSSING_BOARD_REACH_YARDS = 40.0f;
+constexpr float CROSSING_WALK_OFF_REACH_YARDS = 80.0f;
+// How long the hold lets a step on or off the deck run before the sweep may
+// re-take the slot. Eighty yards at run speed is under twelve seconds.
+constexpr uint32 CROSSING_STEP_WALK_SECONDS = 15;
+// Time on the water, priced in yards at a character's run speed, so a boat
+// that saves a long walk is taken and one that saves nothing is not.
+constexpr float CROSSING_PRICE_YARDS_PER_SECOND = 7.0f;
+// The verb the crossing's hold is recorded under, spelled once, so its release
+// lets go of its own hold and nothing else.
+constexpr char const* CROSSING_HOLD_VERB = "cross";
+// The id handed to MotionMaster::MovePoint for the step on or off a deck. Zero,
+// for SUMMON_APPROACH_POINT_ID's reason: a player's point generator informs
+// nobody, so the number reaches no dispatch table.
+constexpr uint32 CROSSING_STEP_POINT_ID = 0;
 
 // How long a crossing may be under way before it is given up on.
 //
@@ -1757,10 +1792,13 @@ constexpr float TRAVEL_ROUTE_GAIN_YARDS = 200.0f;
 // TravelNodePathType (TravelNode.h:55-63) is none 0, walk 1, portal 2,
 // transport 3, flightPath 4, teleportSpell 5. A flight carries one passenger
 // and leaves the other four standing, which is why the flight leg was declined
-// and still is; a transport is a boat on a timetable this module refuses to
-// board (#279); a portal changes maps and nothing here can rejoin a party split
+// and still is; a transport is a boat on a timetable, ridden by the continent
+// crossing and never by a foot route (#279); a portal changes maps and nothing here can rejoin a party split
 // across two of them (#241). Of the 15041 links shipped, 13885 are walks.
 constexpr uint32 TRAVEL_ROUTE_LINK_WALK = 1;
+// ...and the transport link, which the crossing reads for its berths (#279):
+// the walk legs INTO a transport link's node end on that transport's pier.
+constexpr uint32 TRAVEL_ROUTE_LINK_TRANSPORT = 3;
 
 // HOW OFTEN A ROUTE MAY BE RE-PLANNED WHILE IT LEARNS WHAT ITS LEGS CROSS
 // (#326).
@@ -7961,6 +7999,17 @@ private:
             // in the air, and re-anchoring means the landing is where the hold
             // means rather than a drift of hundreds of yards to take over.
             if (facts.inFlight)
+            {
+                AnchorHoldWhereItStands(record, who);
+                continue;
+            }
+
+            // A CHARACTER STANDING ON A BOAT UNDER A HOLD IS LEFT ALONE TOO, and
+            // for the taxi's reason (#279): the transport moves it every tick,
+            // so its distance from a world-space anchor is the boat's voyage and
+            // not a drag. Re-taking the slot would be this sweep fighting the
+            // ship. The anchor follows it, and means the landing once it is off.
+            if (facts.present && who->GetTransport())
             {
                 AnchorHoldWhereItStands(record, who);
                 continue;
@@ -27702,19 +27751,11 @@ private:
         float crossingSweptY{0.f};
         bool crossingBerthGuarded{false};
         uint32 crossingBerthGuardLevel{0};
-        // THE PIER DOES NOT DISAPPEAR WHEN THE BOAT SAILS, AND NEITHER MAY THIS.
-        // Map::GetAllTransports only reports transports currently ON that map,
-        // and a crossing transport spends half its period on the far one:
-        // DelayedTeleportTransport removes it from this Map and adds it to the
-        // other (Transport.cpp:716-721). So a live lookup alone would answer
-        // "no transport serves that map" for minutes at a time, which is false
-        // and is exactly the kind of log line that teaches an operator the
-        // feature does not work. What is actually being asked is whether a
-        // ROUTE exists, and a route is a property of the transport's path
-        // rather than of where the boat is standing this second. So the berth
-        // is remembered for as long as the crossing is the same one, and the
-        // live lookup only ever improves on it.
-        // THE ROUTE IS REMEMBERED BY IDENTITY, NOT BY COORDINATES. The first
+        // THE ROUTE IS A PROPERTY OF THE TRANSPORT'S PATH, NOT OF WHERE THE
+        // BOAT IS THIS SECOND. It is chosen from the static catalogue (#279),
+        // so a boat on the far map no longer reads as "no route", and the
+        // choice is kept while the crossing is the same one (PriceCrossings'
+        // incumbent). THE ROUTE IS REMEMBERED BY IDENTITY, NOT BY COORDINATES. The first
         // version remembered a berth and then read those remembered numbers as
         // proof that a route still existed, with no identity and no expiry, so
         // a transport that was removed or rerouted would have left a leader
@@ -27722,7 +27763,6 @@ private:
         uint32 crossingRouteEntry{0};
         uint32 crossingOriginMap{0};
         uint32 crossingDestinationMap{0};
-        uint32 crossingRouteAgePolls{0};
         bool crossingMooringKnown{false};
         std::string crossingTransportName;
         // When the crossing first moved anybody. Zero while nothing is under
@@ -31850,58 +31890,369 @@ private:
 
     // ------------------------------------------- crossing a continent (#241) --
     //
-    // WHAT THIS ADAPTER READS, AND WHAT IT NO LONGER CLAIMS. The pure decision
-    // beside it needs facts only the worldserver holds. This reads them. It
-    // boards nobody, teleports nobody and simulates no packet, because boarding
-    // and riding and the map hop are already done by code that is already
+    // WHAT THIS ADAPTER READS, AND WHAT IT DOES WITH IT. The pure decision
+    // beside it needs facts only the worldserver holds. This reads them, and
+    // since #279 it also takes the two steps a crossing could never take: onto
+    // a docked deck, and off it at the far end. It boards nobody and teleports
+    // nobody. Boarding, riding and the map hop are done by code that is already
     // running: the bot AI polls Map::GetTransportForPos once a second and
     // boards whatever transport the MAP says the character is standing on
     // (PlayerbotAI.cpp:383-400), MotionTransport::UpdatePassengerPositions
-    // relocates passengers every tick (Transport.cpp:726), and
-    // DelayedTeleportTransport teleports them when the path changes map
-    // (Transport.cpp:706).
+    // relocates passengers every tick, and DelayedTeleportTransport teleports
+    // them when the path changes map. What was missing was only ever the few
+    // yards between a pier and a deck.
     //
-    // THE CORRECTION THIS FILE IS BUILT AROUND. The first version treated a
-    // transport's STOP FRAME as the pier and aimed the party leader at it. That
-    // was wrong, and wrong in the exact way #121 is about. A stop frame is the
-    // SHIP's own world-space origin at its mooring: it is over water, beside a
-    // pier, at the hull's height, and nothing about it is a place a character
-    // may stand. Reading it out of the right table does not make it a
-    // destination.
+    // A STOP FRAME IS STILL NOT A PIER. The first version aimed the party
+    // leader at a transport's stop frame, which is the SHIP's own world-space
+    // origin at its mooring, over water. That is still never an aim. The berth
+    // is read out of the travel survey mod-playerbots ships (the last points of
+    // its navmesh-walked legs into the transport's own node) and admitted only
+    // when it is level with the transport's deck, whose height is the mooring
+    // plus the height the transport's own crew stands at (PickBerth).
     //
-    // AND THE LAST SIXTY YARDS ARE NOT SOLVED EITHER. There is no navmesh on a
-    // moving transport, so an `at:` aim cannot path onto a deck. Upstream gets
-    // a bot aboard with a straight-line MovePoint(generatePath = false) over
-    // the last sixty yards, and it only ever does that because the MASTER is
-    // already aboard and supplies the point (FollowActions.cpp:134-190). The
-    // party leader has no master. So the one character this module would have
-    // to put on a boat is the one character nothing can put on a boat.
+    // THE LAST YARDS ARE UPSTREAM'S OWN MOVE, GIVEN TO THE LEADER. Upstream
+    // boards a follower with a straight-line MovePoint(generatePath = false)
+    // onto a deck point its master stands on (FollowActions.cpp:100-190). The
+    // leader has no master, so the deck point comes from the transport's crew
+    // instead: a crew member's offset, placed on the docked transport by the
+    // transport's own CalculatePassengerPosition, CONFIRMED by
+    // Map::GetTransportForPos, and walked back toward the leader to the edge
+    // nearest him - FindBoardingPointOnTransport's own probe. The step is only
+    // ever taken from the berth, with the transport docked, so it is a few
+    // yards across level planking and never a straight line over ground
+    // nobody proved.
     //
-    // SO THE CROSSING REFUSES, AND THE REFUSAL IS THE DELIVERABLE FOR NOW. What
-    // is kept is everything that is true and useful: the transport is found by
-    // its own path rather than by a hardcoded entry, its mooring on each map is
-    // read and LOGGED so a person can go and look at the pier beside it,
-    // passengers are tracked from their own transport pointer so a family that
-    // does somehow end up aboard is supervised rather than abandoned, and the
-    // one place a boardable point would plug in is marked and named. Walking
-    // the family across a continent to stand on a pier they cannot board from
-    // would cost deaths and gain nothing, which is why nothing is aimed.
-    static bool TransportStopFrameOnMap(MotionTransport const* transport,
-                                        uint32 mapId, float& x, float& y, float& z)
+    // THE CATALOGUE OF TRANSPORTS IS READ ONCE. Which transports exist, their
+    // stops, their crews and their surveyed berths are all static world data;
+    // only where each boat is at this second is live.
+    struct CrossingStopInfo
     {
-        TransportTemplate const* tmpl = transport ? transport->GetTransportTemplate() : nullptr;
-        if (!tmpl)
-            return false;
-        for (KeyFrame const& frame : tmpl->keyFrames)
+        uint32 mapId{0};
+        uint32 arriveMs{0};
+        uint32 departMs{0};
+        float mooringX{0.f};
+        float mooringY{0.f};
+        float mooringZ{0.f};
+        bool berthKnown{false};
+        float berthX{0.f};
+        float berthY{0.f};
+        float berthZ{0.f};
+    };
+
+    struct CrossingCrewMember
+    {
+        uint32 faction{0};
+        float x{0.f};  // offsets on the transport, as its spawn rows hold them
+        float y{0.f};
+        float z{0.f};
+    };
+
+    struct CrossingTransportInfo
+    {
+        uint32 entry{0};
+        std::string name;
+        uint32 pathTimeMs{0};
+        std::set<uint32> mapsUsed;
+        std::vector<CrossingStopInfo> stops;
+        std::vector<CrossingCrewMember> crew;
+    };
+
+    // World thread only, like the travel survey it reads alongside.
+    static std::vector<CrossingTransportInfo>& CrossingCatalogue()
+    {
+        static std::vector<CrossingTransportInfo> catalogue;
+        return catalogue;
+    }
+
+    // THE SURVEY'S GROUND NEAREST EACH MOORING. Every walk link into a
+    // transport's own survey node carries navmesh-walked points, the last of
+    // which is the mooring itself; the few before it are where the walk stood
+    // at the water's edge. Read per mooring node, three points per leg.
+    static void ReadBerthCandidates(uint32 transportEntry,
+                                    std::map<uint32, std::vector<std::pair<OverseerDecisions::BerthCandidate, std::pair<float, float>>>>& byMap)
+    {
+        // The transport's own nodes: every node a transport link leaves from.
+        QueryResult moorings = PlayerbotsDatabase.Query(
+            "SELECT DISTINCT n.id, n.map_id, n.x, n.y FROM playerbots_travelnode_link l "
+            "JOIN playerbots_travelnode n ON n.id = l.node_id "
+            "WHERE l.type = {} AND l.object = {}",
+            TRAVEL_ROUTE_LINK_TRANSPORT, transportEntry);
+        if (!moorings)
+            return;
+        do
         {
-            if (!frame.Node || frame.Node->mapid != mapId || !frame.IsStopFrame())
+            Field* node = moorings->Fetch();
+            uint32 const nodeId = node[0].Get<uint32>();
+            uint32 const mapId = node[1].Get<uint32>();
+            float const nodeX = node[2].Get<float>();
+            float const nodeY = node[3].Get<float>();
+
+            QueryResult legs = PlayerbotsDatabase.Query(
+                "SELECT node_id FROM playerbots_travelnode_link "
+                "WHERE to_node_id = {} AND type = {}",
+                nodeId, TRAVEL_ROUTE_LINK_WALK);
+            if (!legs)
                 continue;
-            x = frame.Node->x;
-            y = frame.Node->y;
-            z = frame.Node->z;
-            return true;
+            do
+            {
+                uint32 const from = legs->Fetch()[0].Get<uint32>();
+                // The last four points, newest first; the first of them is the
+                // mooring node itself and is skipped.
+                QueryResult tail = PlayerbotsDatabase.Query(
+                    "SELECT x, y, z FROM playerbots_travelnode_path "
+                    "WHERE node_id = {} AND to_node_id = {} ORDER BY nr DESC LIMIT 4",
+                    from, nodeId);
+                if (!tail)
+                    continue;
+                bool first = true;
+                do
+                {
+                    Field* point = tail->Fetch();
+                    if (first)
+                    {
+                        first = false;
+                        continue;
+                    }
+                    OverseerDecisions::BerthCandidate candidate;
+                    candidate.x = point[0].Get<float>();
+                    candidate.y = point[1].Get<float>();
+                    candidate.z = point[2].Get<float>();
+                    byMap[mapId].push_back({candidate, {nodeX, nodeY}});
+                } while (tail->NextRow());
+            } while (legs->NextRow());
+        } while (moorings->NextRow());
+    }
+
+    // READ ONCE, AND `read` IS SET BEFORE THE QUERIES RUN, for the survey's own
+    // reason: a realm without the tables must not retry every poll.
+    static std::vector<CrossingTransportInfo> const& ReadCrossingCatalogue()
+    {
+        static bool read = false;
+        std::vector<CrossingTransportInfo>& catalogue = CrossingCatalogue();
+        if (read)
+            return catalogue;
+        read = true;
+
+        QueryResult transports = WorldDatabase.Query("SELECT entry FROM transports");
+        if (!transports)
+            return catalogue;
+
+        // The crew of every transport, from spawn data rather than live
+        // passengers: a transport on an unloaded grid has not spawned its crew,
+        // and whose boat it is must not depend on whether somebody is nearby.
+        std::map<uint32, std::vector<CrossingCrewMember>> crewByMap;
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+        {
+            (void)spawnId;
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
+            if (!tmpl)
+                continue;
+            crewByMap[data.mapid].push_back(
+                CrossingCrewMember{tmpl->faction, data.posX, data.posY, data.posZ});
         }
+
+        do
+        {
+            uint32 const entry = transports->Fetch()[0].Get<uint32>();
+            TransportTemplate const* tmpl = sTransportMgr->GetTransportTemplate(entry);
+            GameObjectTemplate const* go = sObjectMgr->GetGameObjectTemplate(entry);
+            if (!tmpl || !go || tmpl->inInstance || tmpl->mapsUsed.size() < 2)
+                continue;
+
+            CrossingTransportInfo info;
+            info.entry = entry;
+            info.name = go->name;
+            info.pathTimeMs = tmpl->pathTime;
+            info.mapsUsed = tmpl->mapsUsed;
+            auto const crew = crewByMap.find(go->moTransport.mapID);
+            if (crew != crewByMap.end())
+                info.crew = crew->second;
+            for (KeyFrame const& frame : tmpl->keyFrames)
+            {
+                if (!frame.Node || !frame.IsStopFrame())
+                    continue;
+                CrossingStopInfo stop;
+                stop.mapId = frame.Node->mapid;
+                stop.arriveMs = frame.ArriveTime;
+                stop.departMs = frame.DepartureTime;
+                stop.mooringX = frame.Node->x;
+                stop.mooringY = frame.Node->y;
+                stop.mooringZ = frame.Node->z;
+                info.stops.push_back(stop);
+            }
+
+            std::map<uint32, std::vector<std::pair<OverseerDecisions::BerthCandidate, std::pair<float, float>>>> candidates;
+            ReadBerthCandidates(entry, candidates);
+
+            OverseerDecisions::BerthLimits limits;
+            limits.reachYards = CROSSING_BERTH_REACH_YARDS;
+            limits.deckStepYards = CROSSING_DECK_STEP_YARDS;
+            for (CrossingStopInfo& stop : info.stops)
+            {
+                // Only the survey points of THIS stop's own node: the node sits
+                // on the stop frame, so it is matched by position on the map.
+                std::vector<OverseerDecisions::BerthCandidate> mine;
+                for (auto const& [candidate, node] : candidates[stop.mapId])
+                    if (std::hypot(node.first - stop.mooringX, node.second - stop.mooringY) <=
+                        CROSSING_MOORING_NODE_YARDS)
+                        mine.push_back(candidate);
+                std::vector<float> decks;
+                for (CrossingCrewMember const& c : info.crew)
+                    decks.push_back(stop.mooringZ + c.z);
+                int const pick = OverseerDecisions::PickBerth(mine, stop.mooringX, stop.mooringY,
+                                                              decks, limits);
+                if (pick < 0)
+                    continue;
+                stop.berthKnown = true;
+                stop.berthX = mine[pick].x;
+                stop.berthY = mine[pick].y;
+                stop.berthZ = mine[pick].z;
+            }
+
+            LOG_INFO("module.overseer",
+                     "overseer: crossing catalogue - '{}' ({}) has {} stop(s), {} of them with "
+                     "a surveyed berth level with its deck, and {} crew",
+                     info.name, entry, static_cast<uint32>(info.stops.size()),
+                     static_cast<uint32>(std::count_if(
+                         info.stops.begin(), info.stops.end(),
+                         [](CrossingStopInfo const& s) { return s.berthKnown; })),
+                     static_cast<uint32>(info.crew.size()));
+            catalogue.push_back(std::move(info));
+        } while (transports->NextRow());
+        return catalogue;
+    }
+
+    static CrossingTransportInfo const* CatalogueEntry(uint32 entry)
+    {
+        for (CrossingTransportInfo const& info : CrossingCatalogue())
+            if (info.entry == entry)
+                return &info;
+        return nullptr;
+    }
+
+    // The stop on `mapId` a party would use: the one with a berth nearest
+    // (x, y), or failing any berth, the first on that map. -1 for none.
+    static int StopOnMap(CrossingTransportInfo const& info, uint32 mapId, float x, float y)
+    {
+        int best = -1;
+        float bestYards = 0.f;
+        for (std::size_t i = 0; i < info.stops.size(); ++i)
+        {
+            CrossingStopInfo const& stop = info.stops[i];
+            if (stop.mapId != mapId)
+                continue;
+            float const yards = stop.berthKnown
+                                    ? std::hypot(stop.berthX - x, stop.berthY - y)
+                                    : std::numeric_limits<float>::max();
+            if (best < 0 || yards < bestYards)
+            {
+                best = static_cast<int>(i);
+                bestYards = yards;
+            }
+        }
+        return best;
+    }
+
+    // The live transport of this entry that the character can see: the one it
+    // is standing on, or one on its own map. Null while the boat is on the
+    // other map, which is a fact about where the boat is and not about the
+    // route.
+    static MotionTransport* LiveCrossingTransport(Player* who, uint32 entry)
+    {
+        if (!who || !entry)
+            return nullptr;
+        if (Transport* riding = who->GetTransport())
+            if (MotionTransport* mo = riding->ToMotionTransport())
+                if (mo->GetEntry() == entry)
+                    return mo;
+        if (!who->GetMap())
+            return nullptr;
+        for (Transport* candidate : who->GetMap()->GetAllTransports())
+        {
+            MotionTransport* mo = candidate ? candidate->ToMotionTransport() : nullptr;
+            if (mo && mo->GetEntry() == entry)
+                return mo;
+        }
+        return nullptr;
+    }
+
+    static std::vector<OverseerDecisions::TransportStop> StopsOf(CrossingTransportInfo const& info)
+    {
+        std::vector<OverseerDecisions::TransportStop> stops;
+        for (CrossingStopInfo const& s : info.stops)
+            stops.push_back(OverseerDecisions::TransportStop{s.mapId, s.arriveMs, s.departMs});
+        return stops;
+    }
+
+    // IS THE MAP'S ANSWER AT THIS POINT THIS TRANSPORT? Asked at four heights
+    // around the deck, which is upstream's own tolerant probe
+    // (FollowActions.cpp GetTransportForPosTolerant): the ray starts two yards
+    // above the point asked, so a point a hair under the planking would miss.
+    static bool MapSaysOnTransport(Player* who, Transport* transport, float x, float y, float z)
+    {
+        Map* map = who ? who->GetMap() : nullptr;
+        if (!map || !transport)
+            return false;
+        for (float const probe : {z, z + 0.5f, z + 1.5f, z - 0.5f})
+            if (map->GetTransportForPos(who->GetPhaseMask(), x, y, probe, who) == transport)
+                return true;
         return false;
+    }
+
+    // THE DECK POINT NEAREST THE LEADER, CONFIRMED BY THE MAP. Each crew
+    // member's offset is placed on the docked transport where it stands now;
+    // the ones level with the leader, within reach, and on the deck by the
+    // map's own ray are candidates; the nearest is walked back toward the
+    // leader in upstream's 0.75-yard steps to the last point the map still
+    // puts on this transport, which is the deck edge nearest him.
+    static bool DeckEdgeToward(Player* who, MotionTransport* transport,
+                               CrossingTransportInfo const& info, float& outX, float& outY,
+                               float& outZ)
+    {
+        if (!who || !transport)
+            return false;
+        float bestX = 0.f, bestY = 0.f, bestZ = 0.f, bestYards = 0.f;
+        bool found = false;
+        for (CrossingCrewMember const& c : info.crew)
+        {
+            float x = c.x, y = c.y, z = c.z;
+            transport->CalculatePassengerPosition(x, y, z);
+            if (std::fabs(z - who->GetPositionZ()) > CROSSING_DECK_STEP_YARDS)
+                continue;
+            float const yards = who->GetExactDist2d(x, y);
+            if (yards > CROSSING_BOARD_REACH_YARDS)
+                continue;
+            if (found && yards >= bestYards)
+                continue;
+            if (!MapSaysOnTransport(who, transport, x, y, z))
+                continue;
+            found = true;
+            bestX = x;
+            bestY = y;
+            bestZ = z;
+            bestYards = yards;
+        }
+        if (!found)
+            return false;
+
+        float const probeZ = std::max(bestZ, who->GetPositionZ());
+        int32 const steps =
+            std::clamp(static_cast<int32>(bestYards / 0.75f), int32(1), int32(64));
+        float const dx = (who->GetPositionX() - bestX) / static_cast<float>(steps);
+        float const dy = (who->GetPositionY() - bestY) / static_cast<float>(steps);
+        outX = bestX;
+        outY = bestY;
+        for (int32 i = 1; i <= steps; ++i)
+        {
+            float const px = bestX + dx * static_cast<float>(i);
+            float const py = bestY + dy * static_cast<float>(i);
+            if (!MapSaysOnTransport(who, transport, px, py, probeZ))
+                break;
+            outX = px;
+            outY = py;
+        }
+        outZ = bestZ;
+        return true;
     }
 
     struct CrossingRoute
@@ -31910,11 +32261,14 @@ private:
         std::vector<OverseerDecisions::CrossingMember> members;
         uint32 transportEntry{0};
         std::string transportName;
-        // Set ONLY when world.berthKnown, which today is never. Kept beside the
+        // Set ONLY when world.berthKnown / world.landingKnown. Kept beside the
         // flag rather than derived at the aim site so the two cannot disagree.
         float berthX{0.f};
         float berthY{0.f};
         float berthZ{0.f};
+        float landingX{0.f};
+        float landingY{0.f};
+        float landingZ{0.f};
         // The SHIP's mooring on each map. For the log line, never for an aim.
         float mooringX{0.f};
         float mooringY{0.f};
@@ -31922,107 +32276,94 @@ private:
         float landingMooringX{0.f};
         float landingMooringY{0.f};
         float landingMooringZ{0.f};
+        // Every candidate the price looked at, in one sentence, for the log.
+        std::string priced;
     };
 
-    // THE TRANSPORT IS FOUND, NOT NAMED. No boat entry, no taxi path id and no
-    // coordinate is written down anywhere in this module. The question asked of
-    // the world is "is there a transport on the map I am standing on whose own
-    // path also names the map I need", which is one lookup on data the core
-    // built at startup (TransportTemplate::mapsUsed) and which stays right if
-    // the world's transports ever change.
+    // WHICH TRANSPORT, PRICED (#389). Every catalogue transport whose own path
+    // names both maps is an offer; each is judged by whose crew it carries,
+    // whether both its ends have a berth level with its deck, and what it
+    // costs in yards from where the leader stands to the goal on the far side.
+    //
     // `originMap` IS PASSED, NOT TAKEN FROM THE LEADER. While a crossing is
-    // being supervised to its end the leader is already on the destination map,
-    // and a crossing whose two ends had collapsed into one map would read as a
-    // caller bug and log a refusal on top of a success. The map the crossing
-    // STARTED from is the crossing's origin for as long as it is running.
-    MotionTransport* FindCrossingTransport(Player* leader, uint32 originMap,
-                                           uint32 destinationMap, CrossingRoute& route,
-                                           bool& mooringKnown, bool& landingMooringKnown)
+    // supervised to its end the leader is already on the destination map, and
+    // the map the crossing STARTED from is its origin for as long as it runs.
+    int PriceCrossingTransports(Player* leader, uint32 originMap, uint32 destinationMap,
+                                float goalX, float goalY, uint32 incumbent,
+                                std::vector<CrossingTransportInfo const*>& serving,
+                                std::vector<std::pair<int, int>>& stops, std::string& said)
     {
-        mooringKnown = false;
-        landingMooringKnown = false;
-        if (!leader || !leader->GetMap())
-            return nullptr;
-        if (originMap == destinationMap)
-            return nullptr;
+        serving.clear();
+        stops.clear();
+        std::vector<OverseerDecisions::CrossingOffer> offers;
+        bool const leaderOnOrigin = leader->GetMapId() == originMap;
 
-        MotionTransport* best = nullptr;
-        for (Transport* candidate : leader->GetMap()->GetAllTransports())
+        for (CrossingTransportInfo const& info : ReadCrossingCatalogue())
         {
-            MotionTransport* transport = candidate ? candidate->ToMotionTransport() : nullptr;
-            if (!transport)
+            if (!info.mapsUsed.count(originMap) || !info.mapsUsed.count(destinationMap))
                 continue;
-            TransportTemplate const* tmpl = transport->GetTransportTemplate();
-            if (!tmpl || tmpl->inInstance)
+            int const from = StopOnMap(info, originMap, leader->GetPositionX(),
+                                       leader->GetPositionY());
+            int const to = StopOnMap(info, destinationMap, goalX, goalY);
+            if (from < 0 || to < 0)
                 continue;
-            if (!tmpl->mapsUsed.count(originMap) || !tmpl->mapsUsed.count(destinationMap))
-                continue;
+            CrossingStopInfo const& a = info.stops[from];
+            CrossingStopInfo const& b = info.stops[to];
 
-            float bx = 0.f, by = 0.f, bz = 0.f, lx = 0.f, ly = 0.f, lz = 0.f;
-            bool const here = TransportStopFrameOnMap(transport, originMap, bx, by, bz);
-            bool const there = TransportStopFrameOnMap(transport, destinationMap, lx, ly, lz);
+            std::size_t unwelcoming = 0;
+            for (CrossingCrewMember const& c : info.crew)
+                if (ReactionTowardCharacter(leader, c.faction) <=
+                    OverseerDecisions::Reaction::Unfriendly)
+                    ++unwelcoming;
 
-            // A LATER CANDIDATE WITH BOTH MOORINGS WINS, which is why this does
-            // not return on the first one it can name.
-            if (!best || (here && there && !(mooringKnown && landingMooringKnown)))
-            {
-                best = transport;
-                mooringKnown = here;
-                landingMooringKnown = there;
-                route.mooringX = bx;
-                route.mooringY = by;
-                route.mooringZ = bz;
-                route.landingMooringX = lx;
-                route.landingMooringY = ly;
-                route.landingMooringZ = lz;
-            }
+            OverseerDecisions::CrossingOffer offer;
+            offer.entry = info.entry;
+            offer.crew = OverseerDecisions::ReadCrewWelcome(info.crew.size(), unwelcoming);
+            offer.berthKnown = a.berthKnown;
+            offer.landingKnown = b.berthKnown;
+            // Zero once the leader has left the origin: he is past this walk.
+            offer.toBerthYards = leaderOnOrigin && a.berthKnown
+                                     ? leader->GetExactDist2d(a.berthX, a.berthY)
+                                     : 0.f;
+            offer.landingToGoalYards =
+                b.berthKnown ? std::hypot(b.berthX - goalX, b.berthY - goalY) : 0.f;
+            uint32 const period = info.pathTimeMs;
+            offer.rideSeconds =
+                period ? float((b.arriveMs + period - a.departMs % period) % period) / 1000.f
+                       : -1.f;
+            offer.periodSeconds = float(period) / 1000.f;
+            offers.push_back(offer);
+            serving.push_back(&info);
+            stops.emplace_back(from, to);
         }
-        return best;
-    }
 
-    // WHERE A BOARDABLE PLACE WOULD COME FROM, AND WHY THERE IS NOT ONE.
-    //
-    // This is the seam, kept as a named function with one job so that the day
-    // something can answer it, the change is here and the rest of the crossing
-    // is already written and tested around it. It returns false today, on
-    // purpose and not by omission.
-    //
-    // WHAT WOULD SATISFY IT: a position on `mapId`, near the mooring, that the
-    // WORLD agrees a character may stand on, and from which a bot can get onto
-    // the deck. Candidates that were considered and rejected, written down so
-    // they are not re-proposed:
-    //
-    //   * The stop frame itself. It is the ship's mooring over water. This is
-    //     the mistake this function exists to stop being made again.
-    //   * A point offset from the mooring toward land. That is #121 exactly:
-    //     a coordinate derived by pushing a known point in a direction nobody
-    //     checked, with a Z that belonged to something else.
-    //   * The nearest indexed creature spawn to the mooring. Data-backed, and
-    //     genuinely a place something stands - but it is a guess about which
-    //     side of the water it is on, and reaching it still leaves the deck
-    //     unreachable, so it buys a long dangerous walk and no crossing.
-    //   * A point on the deck confirmed by Map::GetTransportForPos. That IS a
-    //     real deck coordinate, and it is still not reachable: there is no
-    //     navmesh on a transport, so no `at:` aim resolves to it.
-    //
-    // The honest remaining answer is upstream's: a short straight-line move
-    // onto a confirmed deck point, taken from close range, which is what
-    // FollowAction already does for a follower whose master is aboard. Giving
-    // the LEADER that same move is the work this seam is waiting on, and it
-    // needs a watched run rather than a guess.
-    static bool BoardablePlaceNear(Player* /*leader*/, uint32 /*mapId*/,
-                                   float /*mooringX*/, float /*mooringY*/,
-                                   float /*mooringZ*/, float& /*outX*/,
-                                   float& /*outY*/, float& /*outZ*/)
-    {
-        return false;
+        OverseerDecisions::CrossingPriceLimits limits;
+        limits.yardsPerSecond = CROSSING_PRICE_YARDS_PER_SECOND;
+        limits.incumbentEntry = incumbent;
+        OverseerDecisions::CrossingPrice const price =
+            OverseerDecisions::PriceCrossings(offers, limits);
+
+        std::ostringstream line;
+        for (std::size_t i = 0; i < offers.size(); ++i)
+        {
+            if (i)
+                line << "; ";
+            line << '\'' << serving[i]->name << "' ";
+            if (price.verdicts[i] == OverseerDecisions::OfferVerdict::Priced)
+                line << std::fixed << std::setprecision(0) << price.yards[i] << " yards";
+            else
+                line << OverseerDecisions::OfferVerdictName(price.verdicts[i]);
+        }
+        if (offers.empty())
+            line << "no transport's path names both maps";
+        said = line.str();
+        return price.pick;
     }
 
     // ANSWERED ONCE PER BERTH, NOT ONCE PER POLL. The sweep is a pass over
     // every creature spawn on the map. Spawn data does not move, so the answer
-    // is kept against the point it was asked about. Unreached while
-    // BoardablePlaceNear refuses, and kept because it is the #267 gate the
-    // crossing must go through the moment it has somewhere to send anybody.
+    // is kept against the point it was asked about. It is the #267 gate every
+    // travel destination goes through, and a berth is one.
     bool BerthIsGuarded(DungeonRunCoordinatorState& coord, Player* leader, uint32 mapId,
                         float x, float y, uint32& outLevel)
     {
@@ -32051,8 +32392,8 @@ private:
         return coord.crossingBerthGuarded;
     }
 
-    // Read the whole crossing off the world: the route, its moorings, and one
-    // sighting per roster member.
+    // Read the whole crossing off the world: the route, its moorings, whether
+    // the boat is docked where the leader is, and one sighting per member.
     //
     // DRIVEN BY THE ROSTER AND NOT BY WHO HAPPENS TO BE ONLINE. A member this
     // cannot steer produces a reading that says so, and the decision refuses to
@@ -32060,79 +32401,80 @@ private:
     CrossingRoute ReadCrossingFromWorld(DungeonRunCoordinatorState& coord,
                                         std::vector<std::string> const& members,
                                         std::string const& leaderName, Player* leader,
-                                        uint32 originMap, uint32 destinationMap)
+                                        uint32 originMap, uint32 destinationMap,
+                                        float goalX, float goalY)
     {
         CrossingRoute route;
         route.world.originMap = originMap;
         route.world.destinationMap = destinationMap;
 
-        bool mooringKnown = false;
-        bool landingMooringKnown = false;
-        MotionTransport* seen =
-            FindCrossingTransport(leader, originMap, destinationMap, route,
-                                  mooringKnown, landingMooringKnown);
-
-        // A CROSSING IS THE SAME CROSSING WHILE BOTH ITS ENDS ARE. Anything else
-        // is a different route and inherits nothing.
+        // A CROSSING IS THE SAME CROSSING WHILE BOTH ITS ENDS ARE, and only
+        // then does it keep the transport it chose.
         bool const sameCrossing = coord.crossingRouteEntry != 0 &&
-                                  coord.crossingOriginMap == route.world.originMap &&
+                                  coord.crossingOriginMap == originMap &&
                                   coord.crossingDestinationMap == destinationMap;
+        std::vector<CrossingTransportInfo const*> serving;
+        std::vector<std::pair<int, int>> stops;
+        int const pick = leader && originMap != destinationMap
+                             ? PriceCrossingTransports(leader, originMap, destinationMap, goalX,
+                                                       goalY,
+                                                       sameCrossing ? coord.crossingRouteEntry : 0,
+                                                       serving, stops, route.priced)
+                             : -1;
 
-        if (seen)
+        coord.crossingOriginMap = originMap;
+        coord.crossingDestinationMap = destinationMap;
+        if (pick < 0)
         {
-            // THE ROUTE IS REMEMBERED BY IDENTITY, NOT BY COORDINATES. The first
-            // version remembered a berth and then treated those remembered
-            // numbers as proof a route existed, with no expiry and no identity,
-            // so a transport that was removed or rerouted would have left the
-            // leader walking at a place nothing sailed from any more.
-            coord.crossingRouteEntry = seen->GetEntry();
-            coord.crossingOriginMap = route.world.originMap;
-            coord.crossingDestinationMap = destinationMap;
-            coord.crossingRouteAgePolls = 0;
-            coord.crossingTransportName = seen->GetName();
-            coord.crossingMooringKnown = mooringKnown && landingMooringKnown;
-        }
-        else if (sameCrossing)
-        {
-            // The boat is at the far end of its run, which is half its period.
-            // The route still exists; the object is simply not on this Map,
-            // because DelayedTeleportTransport moves it between the two
-            // (Transport.cpp:716-721). It is only believed for a bounded number
-            // of polls, so a route that has genuinely gone away stops being
-            // claimed instead of being believed for ever.
-            if (coord.crossingRouteAgePolls < CROSSING_ROUTE_MEMORY_POLLS)
-                ++coord.crossingRouteAgePolls;
-            else
-                coord.crossingRouteEntry = 0;
+            coord.crossingRouteEntry = 0;
+            coord.crossingTransportName.clear();
         }
         else
         {
-            coord.crossingRouteEntry = 0;
-            coord.crossingRouteAgePolls = 0;
-            coord.crossingTransportName.clear();
-            coord.crossingMooringKnown = false;
-            coord.crossingOriginMap = route.world.originMap;
-            coord.crossingDestinationMap = destinationMap;
-        }
+            CrossingTransportInfo const& info = *serving[pick];
+            CrossingStopInfo const& from = info.stops[stops[pick].first];
+            CrossingStopInfo const& to = info.stops[stops[pick].second];
+            coord.crossingRouteEntry = info.entry;
+            coord.crossingTransportName = info.name;
+            route.world.transportFound = true;
+            route.world.mooringKnown = true;
+            route.mooringX = from.mooringX;
+            route.mooringY = from.mooringY;
+            route.mooringZ = from.mooringZ;
+            route.landingMooringX = to.mooringX;
+            route.landingMooringY = to.mooringY;
+            route.landingMooringZ = to.mooringZ;
+            // PriceCrossings only picks an offer with both ends known.
+            route.world.berthKnown = from.berthKnown;
+            route.berthX = from.berthX;
+            route.berthY = from.berthY;
+            route.berthZ = from.berthZ;
+            route.world.landingKnown = to.berthKnown;
+            route.landingX = to.berthX;
+            route.landingY = to.berthY;
+            route.landingZ = to.berthZ;
 
+            // DOCKED WHERE THE LEADER IS? Read off the live boat he can see,
+            // on the core's own stop test. Not established - false - while the
+            // boat is on the other map.
+            if (MotionTransport* live = LiveCrossingTransport(leader, info.entry))
+            {
+                OverseerDecisions::DockReading const dock = OverseerDecisions::ReadDock(
+                    live->GetPathProgress(), live->GetPeriod(), StopsOf(info));
+                if (dock.docked)
+                {
+                    int const at = static_cast<int>(dock.stop);
+                    route.world.dockedAtOrigin =
+                        at == stops[pick].first && leader->GetMapId() == originMap;
+                    route.world.dockedAtDestination =
+                        at == stops[pick].second && leader->GetMapId() == destinationMap;
+                    route.world.dwellLeftMs = dock.dwellLeftMs;
+                }
+            }
+        }
         route.transportEntry = coord.crossingRouteEntry;
         route.transportName = coord.crossingTransportName;
-        route.world.transportFound = route.transportEntry != 0;
-        route.world.mooringKnown = coord.crossingMooringKnown;
-
-        // THE SEAM. Both ends need a place the world agrees is standable, and
-        // nothing can supply one yet, so both read false and the decision
-        // refuses. See BoardablePlaceNear for what was rejected and why.
-        route.world.berthKnown =
-            route.world.transportFound && mooringKnown &&
-            BoardablePlaceNear(leader, route.world.originMap, route.mooringX,
-                               route.mooringY, route.mooringZ, route.berthX,
-                               route.berthY, route.berthZ);
-        float lx = 0.f, ly = 0.f, lz = 0.f;
-        route.world.landingKnown =
-            route.world.transportFound && landingMooringKnown &&
-            BoardablePlaceNear(leader, destinationMap, route.landingMooringX,
-                               route.landingMooringY, route.landingMooringZ, lx, ly, lz);
+        coord.crossingMooringKnown = route.world.mooringKnown;
 
         if (route.world.berthKnown)
         {
@@ -32161,13 +32503,8 @@ private:
             member.readable = true;
             member.mapId = p->GetMapId();
 
-            // ASKED OF THE MEMBER, NOT OF THE BOAT, AND MATCHED BY IDENTITY.
-            // The first version compared the member's transport pointer against
-            // one found by scanning the LEADER's map, so a follower genuinely
-            // riding a boat that was currently at the far dock read as NOT
-            // aboard and was counted ashore, then flipped back when the boat
-            // returned. Whether somebody is standing on a boat is a fact about
-            // them, not about where the boat is.
+            // ASKED OF THE MEMBER, NOT OF THE BOAT, AND MATCHED BY IDENTITY, so
+            // the answer does not depend on which map the boat is on.
             MotionTransport const* riding = nullptr;
             if (Transport* onBoard = p->GetTransport())
                 riding = onBoard->ToMotionTransport();
@@ -32182,17 +32519,23 @@ private:
                  member.mapId == route.world.originMap)
                     ? p->GetDistance2d(route.berthX, route.berthY)
                     : 0.f;
+            // How far behind its leader, on the same map and on foot. A
+            // member elsewhere reads a number no gather limit admits.
+            member.leaderDistance =
+                member.isLeader ? 0.f
+                : (leader && !member.aboard && p->GetMapId() == leader->GetMapId())
+                    ? p->GetExactDist2d(leader)
+                    : std::numeric_limits<float>::max();
             route.members.push_back(member);
         }
         return route;
     }
 
-    // ACT ON THE STEP. Five of the seven actions do nothing but say something,
-    // and today every reachable one of them is in that group: nothing can hand
-    // this a boardable place, so the crossing refuses and no character is aimed
-    // anywhere. Walk and Hold are written because the decision has them and
-    // because the seam they wait on is one function; they are unreachable while
-    // BoardablePlaceNear refuses, and that is stated rather than hidden.
+    // ACT ON THE STEP. Three actions move the leader: Walk aims him at the
+    // berth, Board steps him onto a docked deck, WalkOff steps him onto the far
+    // landing. The rest say something and, from the berth on, keep him HELD:
+    // a leader waiting at a pier or riding a deck with `new rpg` on is one that
+    // wanders off it, into the harbour or over the side (#279).
     //
     // SAID ON CHANGE, NOT ON EVERY POLL. A crossing is reached every
     // DUNGEON_RUN_POLL_MS for as long as it is unresolved, and a line repeated
@@ -32211,6 +32554,34 @@ private:
         std::string const why = OverseerDecisions::CrossingExplanation(step, route.world);
         std::string const boat =
             route.transportName.empty() ? std::string("a transport") : route.transportName;
+
+        // THE PRICE, ONCE PER CROSSING TRANSITION, so the choice of boat can
+        // be argued with: every transport that joins the two maps, and what
+        // each cost or why it was refused.
+        if (fresh && !route.priced.empty())
+            LOG_INFO("module.overseer",
+                     "overseer: crossing from map {} to map {} for '{}' priced - {}",
+                     route.world.originMap, route.world.destinationMap, leaderName,
+                     route.priced);
+
+        // THE HOLD THE CROSSING KEEPS ON ITS LEADER from the berth to the far
+        // landing, re-asserted every poll it stands. Bounded by the crossing's
+        // own backstop, so a crossing nothing comes back for lets go by itself.
+        // The stand state and the mount are left alone: nothing here casts.
+        auto const holdTheLeader = [&]() {
+            PlayerbotAI* ai = leader ? GET_PLAYERBOT_AI(leader) : nullptr;
+            if (ai)
+                HoldCharacterStill(leader, ai, leaderName, CROSSING_HOLD_VERB,
+                                   CROSSING_BACKSTOP_SECONDS, false);
+        };
+        // Only ever its OWN hold, and silent when there is none: a refusal
+        // reads every poll, and a staging hold on the same leader is not this
+        // one's to lift or to complain about.
+        auto const releaseTheLeader = [&](char const* reason) {
+            auto const hold = HoldsInForce().find(leaderName);
+            if (hold != HoldsInForce().end() && hold->second.verb == CROSSING_HOLD_VERB)
+                ReleaseHold(leaderName, leader, reason, CROSSING_HOLD_VERB);
+        };
 
         switch (step.action)
         {
@@ -32263,6 +32634,10 @@ private:
                 // wrong: a claim restarts the errand clock the death breaker
                 // measures its window from, and a release throws away an errand
                 // the travel drive has probably already given back on arrival.
+                // The leader is HELD on the pier, which is a different thing:
+                // it stops his own strategies walking him off it while the
+                // boat is away, and claims no errand.
+                holdTheLeader();
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is at the berth for '{}' on map {} - {}",
@@ -32270,10 +32645,12 @@ private:
                 break;
 
             case OverseerDecisions::CrossingAction::Ride:
-                // DELIBERATELY NOTHING. A travel aim now would walk a passenger
-                // off a moving deck. The berth errand is given back ONCE, on the
+                // NOTHING IS AIMED. A travel aim now would walk a passenger off
+                // a moving deck. The berth errand is given back ONCE, on the
                 // transition, so no backstop counts against an errand that is no
-                // longer the mechanism.
+                // longer the mechanism; the hold stays, so no strategy of his
+                // own walks him over the side either.
+                holdTheLeader();
                 if (fresh)
                 {
                     _travelAims.Release(leaderName, "the dungeon run coordinator");
@@ -32291,7 +32668,10 @@ private:
                 // on the destination map was counted as riding for ever; and the
                 // coordinator stopped consulting the crossing the moment the map
                 // comparison read walkable, so nothing watched this. Now it is
-                // watched. It still cannot walk anybody off, and says so.
+                // watched: the boat is still coming in, or the leader is already
+                // on the landing and HELD there while his followers follow him
+                // off.
+                holdTheLeader();
                 if (fresh)
                     LOG_WARN("module.overseer",
                              "overseer: {} member(s) are ashore on map {} but still "
@@ -32301,6 +32681,7 @@ private:
                 break;
 
             case OverseerDecisions::CrossingAction::Done:
+                releaseTheLeader("the family is ashore and off every transport");
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: the family is together on map {} and off every "
@@ -32311,7 +32692,6 @@ private:
                 // poll for as long as the job stayed set.
                 coord.crossingSince = 0;
                 coord.crossingRouteEntry = 0;
-                coord.crossingRouteAgePolls = 0;
                 coord.crossingMooringKnown = false;
                 coord.crossingTransportName.clear();
                 break;
@@ -32322,6 +32702,85 @@ private:
                              "overseer: the crossing for '{}' is not decided this poll - {}",
                              portal.keyword, why);
                 break;
+
+            case OverseerDecisions::CrossingAction::Board:
+            {
+                // THE STEP ABOARD (#279). The berth errand is given back once,
+                // on the transition, for Ride's reason: a travel aim at the pier
+                // would walk him back off the deck he is stepping onto.
+                if (fresh)
+                    _travelAims.Release(leaderName, "the dungeon run coordinator");
+                holdTheLeader();
+
+                CrossingTransportInfo const* info = CatalogueEntry(route.transportEntry);
+                MotionTransport* live = LiveCrossingTransport(leader, route.transportEntry);
+                float x = 0.f, y = 0.f, z = 0.f;
+                if (!info || !live || !DeckEdgeToward(leader, live, *info, x, y, z))
+                {
+                    // Said once per boarding, and not a refusal: the next poll
+                    // asks again, and the dock may simply have turned a few
+                    // degrees since the deck was last in reach.
+                    if (fresh)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is at the berth for '{}' and it is docked, "
+                                 "but no point on its deck within {:.0f} yards and level "
+                                 "with him is confirmed by the map, so he does not step - {}",
+                                 leaderName, boat, CROSSING_BOARD_REACH_YARDS, why);
+                    break;
+                }
+
+                // UPSTREAM'S OWN MOVE: a straight line, no path, because there
+                // is no navmesh on a deck. It is a few yards from surveyed
+                // ground to a point the map put on the planking, level with
+                // him; PlayerbotAI's once-a-second transport check boards him
+                // the moment the map says he is standing on it.
+                leader->GetMotionMaster()->MovePoint(CROSSING_STEP_POINT_ID, x, y, z,
+                                                     FORCED_MOVEMENT_NONE, 0.f, 0.f,
+                                                     /*generatePath*/ false,
+                                                     /*forceDestination*/ false);
+                LetHeldCharacterWalk(leaderName, CROSSING_STEP_WALK_SECONDS);
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' steps aboard '{}' at ({:.1f}, {:.1f}, {:.1f}) on "
+                             "map {}, {:.1f} yards from where he stands - {}",
+                             leaderName, boat, x, y, z, route.world.originMap,
+                             leader->GetExactDist2d(x, y), why);
+                break;
+            }
+
+            case OverseerDecisions::CrossingAction::WalkOff:
+            {
+                holdTheLeader();
+                float const yards = leader->GetExactDist2d(route.landingX, route.landingY);
+                if (yards > CROSSING_WALK_OFF_REACH_YARDS)
+                {
+                    if (fresh)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is aboard '{}' at its dock on map {} but "
+                                 "{:.0f} yards from the landing, beyond the {:.0f} a step off "
+                                 "a deck may be, so he stays aboard - {}",
+                                 leaderName, boat, route.world.destinationMap, yards,
+                                 CROSSING_WALK_OFF_REACH_YARDS, why);
+                    break;
+                }
+                // The same move in the other direction, onto ground the survey
+                // stood on and PickBerth found level with this deck. The bot
+                // AI's transport check takes him off the deck the moment the
+                // map no longer puts him on it; the followers follow him off.
+                leader->GetMotionMaster()->MovePoint(CROSSING_STEP_POINT_ID, route.landingX,
+                                                     route.landingY, route.landingZ,
+                                                     FORCED_MOVEMENT_NONE, 0.f, 0.f,
+                                                     /*generatePath*/ false,
+                                                     /*forceDestination*/ false);
+                LetHeldCharacterWalk(leaderName, CROSSING_STEP_WALK_SECONDS);
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' walks off '{}' onto the landing at ({:.1f}, "
+                             "{:.1f}, {:.1f}) on map {}, {:.1f} yards - {}",
+                             leaderName, boat, route.landingX, route.landingY,
+                             route.landingZ, route.world.destinationMap, yards, why);
+                break;
+            }
 
             case OverseerDecisions::CrossingAction::Refuse:
                 // THE STANDING REFUSAL, which is the behaviour that shipped
@@ -32339,6 +32798,7 @@ private:
                     _travelAims.Release(leaderName, "the dungeon run coordinator");
                     coord.crossingSince = 0;
                 }
+                releaseTheLeader("the crossing is refused");
                 if (!coord.loggedApproachRefused)
                 {
                     coord.loggedApproachRefused = true;
@@ -35732,9 +36192,13 @@ private:
             if (offOutsideMap ||
                 (coord.crossingPassengers && crossingOrigin != portal->outsideMapId))
             {
+                // THE GOAL ON THE FAR SIDE IS THE DOOR, by the portal's own
+                // trigger row, so the price of a crossing counts the walk from
+                // its landing to where the family is actually going.
+                AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal->entryTriggerId);
                 CrossingRoute route = ReadCrossingFromWorld(
                     coord, members, leaderName, leader, crossingOrigin,
-                    portal->outsideMapId);
+                    portal->outsideMapId, door ? door->x : 0.f, door ? door->y : 0.f);
 
                 // THE BACKSTOP IS APPLIED TO THE READING, not inside it: the
                 // clock is the caller's and the verdict is the decision's.
@@ -35745,6 +36209,8 @@ private:
 
                 OverseerDecisions::CrossingLimits limits;
                 limits.berthArrivedYards = CROSSING_BERTH_ARRIVED_YARDS;
+                limits.gatherYards = CROSSING_GATHER_YARDS;
+                limits.minBoardDwellMs = CROSSING_MIN_BOARD_DWELL_MS;
                 OverseerDecisions::CrossingStep const step =
                     OverseerDecisions::ReadCrossing(route.world, route.members, limits);
 

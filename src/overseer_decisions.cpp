@@ -751,6 +751,10 @@ std::vector<BuildFact> BuildReport(std::string const& coreVersion,
     facts.push_back(BuildFact{"pins",
                               PinsVerdict(coreVersion, Declared(env, ENV_PIN_CORE)),
                               SOURCE_DERIVED});
+    // WHAT THIS BUILD CAN DO ACROSS AN OCEAN (#279), for the bridge, which
+    // refuses a door on the other continent while nothing can cross to it and
+    // has no other way to learn that something now can.
+    facts.push_back(BuildFact{"crossing", CROSSING_CAPABILITY, SOURCE_COMPILED});
     return facts;
 }
 
@@ -5716,6 +5720,8 @@ char const* CrossingActionName(CrossingAction action)
         case CrossingAction::Ride:      return "ride";
         case CrossingAction::Disembark: return "disembark";
         case CrossingAction::Done:      return "done";
+        case CrossingAction::Board:     return "board";
+        case CrossingAction::WalkOff:   return "walk off";
     }
     return "wait";
 }
@@ -5740,8 +5746,14 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
             step.leaderReadable = true;
             step.leaderAboard = m.aboard;
             step.leaderOnOrigin = !m.aboard && m.mapId == world.originMap;
+            step.leaderOnDestination = m.mapId == world.destinationMap;
             step.leaderAtBerth = step.leaderOnOrigin &&
                                  m.berthDistance <= limits.berthArrivedYards;
+        }
+        else if (!m.aboard && m.mapId == world.originMap &&
+                 m.leaderDistance <= limits.gatherYards)
+        {
+            ++step.gathered;
         }
 
         // A PASSENGER IS COUNTED TWICE ON PURPOSE, ONCE AS A PASSENGER AND ONCE
@@ -5796,17 +5808,33 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 4. STILL ON THE DECK AT THE FAR END. Asked BEFORE Done, because a
+    // 4. THE LEADER ON THE DECK AT THE FAR END, WITH THE TRANSPORT DOCKED.
+    //    Walk him off onto the surveyed landing (#279); the followers follow
+    //    their leader off, the way they followed him on. Asked before the
+    //    general "still aboard" reading below because it is the one case of it
+    //    that has an order to give. Not docked is not this: stepping off a deck
+    //    that is still coming in is stepping into the harbour, and a landing
+    //    nothing established is not somewhere to step. Nor is a stop about to
+    //    end: a step off is a spline on the deck, and a deck that casts off
+    //    mid-step carries him out over the water with it.
+    if (step.leaderAboard && step.leaderOnDestination && world.dockedAtDestination &&
+        world.dwellLeftMs >= limits.minBoardDwellMs && world.landingKnown)
+    {
+        step.leg = CrossingLeg::Disembark;
+        step.action = CrossingAction::WalkOff;
+        return step;
+    }
+
+    // 5. STILL ON THE DECK AT THE FAR END. Asked BEFORE Done, because a
     //    passenger standing on the destination map has not arrived anywhere: it
     //    is on a boat that is about to sail back, and calling that Done ends the
     //    crossing at the exact moment it is most likely to be undone.
     //
-    //    THIS MODULE CANNOT WALK ANYBODY OFF, which is why the action is its own
-    //    kind of doing nothing rather than an order. Getting off a deck needs
-    //    the same thing getting on needs and does not have: a place the world
-    //    agrees is standable, next to a boat. Until one is supplied this
-    //    supervises and says so, which is strictly better than the previous
-    //    behaviour of never looking again.
+    //    NOTHING TO ORDER THIS POLL, which is why the action is its own kind of
+    //    doing nothing. Either the transport has not docked yet, or the leader
+    //    is already ashore and the followers are on their way off after him.
+    //    This supervises and says so, which is strictly better than the first
+    //    version's behaviour of never looking again.
     if (step.stillAboard)
     {
         step.leg = CrossingLeg::Disembark;
@@ -5814,7 +5842,7 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 5. EVERYBODY ASHORE, AND OFF EVERY TRANSPORT, ENDS IT. Both halves: the
+    // 6. EVERYBODY ASHORE, AND OFF EVERY TRANSPORT, ENDS IT. Both halves: the
     //    `aboard` test above has already taken every passenger out of `ashore`,
     //    so this cannot be reached by somebody standing on a deck.
     if (step.ashore == step.readable)
@@ -5824,7 +5852,7 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 6. THE LEADER IS ABOARD, so the transport owns the outcome and nothing is
+    // 7. THE LEADER IS ABOARD, so the transport owns the outcome and nothing is
     //    aimed. NOTE WHAT THIS IS NOT: it is not "somebody is aboard". A
     //    follower on the deck while the leader is still walking is an ordinary
     //    and expected state, and the previous version answered Ride to it, which
@@ -5836,15 +5864,15 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 7. THE FACTS THE WALK NEEDS. Each is a refusal rather than a wait, because
+    // 8. THE FACTS THE WALK NEEDS. Each is a refusal rather than a wait, because
     //    none of them arrives by waiting: a boat that does not serve both maps
     //    never will, and a berth nothing has validated is not made walkable by
     //    another poll.
     //
-    //    `berthKnown` IS NO LONGER "A STOP FRAME WAS FOUND". It is "the world
-    //    agreed a character may stand here", and while nothing can establish
-    //    that, this refuses. That refusal is the deliverable, not a gap in it:
-    //    the alternative is aiming a family at a ship's mooring.
+    //    `berthKnown` IS NOT "A STOP FRAME WAS FOUND". It is "the survey stood
+    //    on ground here, level with this transport's deck" (PickBerth), and
+    //    where nothing establishes that, this refuses rather than aiming a
+    //    family at a ship's mooring.
     if (!world.transportFound || !world.berthKnown || !world.landingKnown ||
         world.berthGuarded || world.overdue)
     {
@@ -5853,7 +5881,7 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 8. THE LEADER IS THE ONLY CHARACTER THIS EVER AIMS. A leader already on
+    // 9. THE LEADER IS THE ONLY CHARACTER THIS EVER AIMS. A leader already on
     //    the far side is therefore a crossing this cannot drive: the followers
     //    left behind need their leader's aim and it is not on their map to be
     //    given. Said rather than worked around, because aiming a follower on its
@@ -5865,7 +5893,7 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         return step;
     }
 
-    // 9. ALREADY THERE. Answered before Walk, and the difference between the
+    // 10. ALREADY THERE. Answered before Walk, and the difference between the
     //    two is the whole of the loop this closes: the travel drive releases an
     //    `at:` errand once the traveller is within five yards of it, and a
     //    reading that still said Walk made the caller claim it straight back.
@@ -5878,10 +5906,19 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
     //    berth" from further out than the travel drive reads "arrived", so the
     //    crossing has stopped asking for the walk before the drive finishes it.
     //    The other order would leave a gap in which neither is true.
+    //
+    //    AND THE STEP ABOARD IS TAKEN FROM HERE, only when all three hold: the
+    //    transport is standing at this end, enough of its stop is left for the
+    //    walk, and nobody on this side is out of the boarding assist's reach of
+    //    the leader. Any one missing is a Hold, and the next poll asks again.
     if (step.leaderAtBerth)
     {
         step.leg = CrossingLeg::WaitForTransport;
-        step.action = CrossingAction::Hold;
+        bool const everybodyHere = step.waiting == 0 || step.gathered + 1 >= step.waiting;
+        step.action = world.dockedAtOrigin && world.dwellLeftMs >= limits.minBoardDwellMs &&
+                              everybodyHere
+                          ? CrossingAction::Board
+                          : CrossingAction::Hold;
         return step;
     }
 
@@ -5913,9 +5950,33 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
             return std::to_string(step.stillAboard) +
                    " member(s) are on map " + destination +
                    " but still standing on the transport, which is not the same "
-                   "fact as being ashore and is not an arrival; this module has "
-                   "no validated landing to walk them to, so it watches and "
-                   "says so rather than ending the crossing on a deck";
+                   "fact as being ashore and is not an arrival; " +
+                   (step.leaderAboard
+                        ? std::string(!world.landingKnown
+                                          ? "no landing was established to walk "
+                                            "them onto"
+                                      : world.dockedAtDestination
+                                          ? "too little of the stop is left to "
+                                            "step off before it casts off"
+                                          : "the transport has not docked, so "
+                                            "nobody steps off yet")
+                        : std::string("the leader is ashore and they follow him "
+                                      "off")) +
+                   ", so it watches and says so rather than ending the crossing "
+                   "on a deck";
+
+        case CrossingAction::Board:
+            return "the transport is docked on map " + origin + " with " +
+                   std::to_string(world.dwellLeftMs / 1000) +
+                   "s of its stop left and every member on this side is with the "
+                   "leader, so he is walked the last yards onto a deck point the "
+                   "map confirmed and the bot AI boards him; the followers are "
+                   "pulled aboard after their master by the boarding assist";
+
+        case CrossingAction::WalkOff:
+            return "the leader is aboard on map " + destination +
+                   " and the transport is docked, so he is walked off onto the "
+                   "surveyed landing and the followers follow him off";
 
         case CrossingAction::Ride:
             return "the leader is aboard between maps " + origin + " and " +
@@ -5924,10 +5985,23 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
                    "passengers, so nothing is aimed until it has landed";
 
         case CrossingAction::Hold:
+        {
+            std::string const waitingFor =
+                !world.dockedAtOrigin
+                    ? "the transport to dock"
+                : step.gathered + 1 < step.waiting
+                    ? std::to_string(step.waiting - 1 - step.gathered) +
+                          " member(s) still too far from the leader to be pulled "
+                          "aboard with him"
+                    : "the next stop, because only " +
+                          std::to_string(world.dwellLeftMs / 1000) +
+                          "s of this one is left";
             return "the leader is at the berth on map " + origin +
-                   " with nothing to do but wait for the transport; no errand is "
-                   "claimed or released while it stands there, because a reclaim "
-                   "would restart the clock the death breaker measures from";
+                   " and waits for " + waitingFor +
+                   "; no errand is claimed or released while it stands there, "
+                   "because a reclaim would restart the clock the death breaker "
+                   "measures from";
+        }
 
         case CrossingAction::Walk:
             return "the leader is on map " + origin + " with " +
@@ -5956,13 +6030,11 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
                " (a crossing transport is one whose own path names both maps)";
     if (!world.berthKnown)
         return "no boardable place on map " + origin +
-               " has been established. A transport's stop frame is the SHIP's "
-               "mooring, over water beside a pier, not somewhere a character "
-               "may stand, and this module will not aim a family at one or "
-               "derive a pier from it. There is also no way here to step onto "
-               "a deck: upstream boards over the last sixty yards with a "
-               "straight-line move that needs a master already aboard, and the "
-               "leader has no master" +
+               " has been established: nothing the travel survey walked near "
+               "this transport's mooring is level with its deck. A transport's "
+               "stop frame is the SHIP's mooring, over water beside a pier, not "
+               "somewhere a character may stand, and this module will not aim "
+               "a family at one or derive a pier from it" +
                (world.mooringKnown ? " (the mooring itself is known, and is in "
                                      "the log line above this one)"
                                    : "");
@@ -5987,6 +6059,154 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
                " member(s) still waiting there, and this crossing only ever "
                "aims the leader, so there is nothing here to aim";
     return "the crossing is refused";
+}
+
+DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
+                     std::vector<TransportStop> const& stops)
+{
+    DockReading reading;
+    if (!periodMs)
+        return reading;
+    std::uint32_t const timer = pathProgressMs % periodMs;
+    for (std::size_t i = 0; i < stops.size(); ++i)
+    {
+        TransportStop const& stop = stops[i];
+        // THE CORE'S OWN TEST, both halves: arrived, and not yet departed. An
+        // empty interval - a frame whose departure is its arrival - is a
+        // waypoint the transport passes through, never a stop.
+        if (stop.arriveMs <= timer && timer < stop.departMs)
+        {
+            reading.docked = true;
+            reading.stop = i;
+            reading.dwellLeftMs = stop.departMs - timer;
+            return reading;
+        }
+    }
+    return reading;
+}
+
+int PickBerth(std::vector<BerthCandidate> const& candidates, float mooringX, float mooringY,
+              std::vector<float> const& deckLevels, BerthLimits const& limits)
+{
+    // A limit that is not a positive finite number admits nothing. A sign typo
+    // must not quietly become "anywhere at all".
+    if (!(limits.reachYards > 0.f) || !(limits.deckStepYards > 0.f) ||
+        !std::isfinite(limits.reachYards) || !std::isfinite(limits.deckStepYards))
+        return -1;
+
+    int best = -1;
+    float bestPlane = 0.f;
+    float bestStep = 0.f;
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        BerthCandidate const& c = candidates[i];
+        if (!std::isfinite(c.x) || !std::isfinite(c.y) || !std::isfinite(c.z))
+            continue;
+        float const plane = std::hypot(c.x - mooringX, c.y - mooringY);
+        if (!(plane <= limits.reachYards))
+            continue;
+
+        // THE NEAREST DECK LEVEL, and none at all is no berth: a transport
+        // whose crew was never read has no deck this can be level with.
+        bool level = false;
+        float step = 0.f;
+        for (float deck : deckLevels)
+        {
+            if (!std::isfinite(deck))
+                continue;
+            float const gap = std::fabs(c.z - deck);
+            if (!level || gap < step)
+            {
+                level = true;
+                step = gap;
+            }
+        }
+        if (!level || step > limits.deckStepYards)
+            continue;
+
+        if (best < 0 || plane < bestPlane || (plane == bestPlane && step < bestStep))
+        {
+            best = static_cast<int>(i);
+            bestPlane = plane;
+            bestStep = step;
+        }
+    }
+    return best;
+}
+
+CrewWelcome ReadCrewWelcome(std::size_t crewRead, std::size_t crewUnwelcoming)
+{
+    if (crewUnwelcoming)
+        return CrewWelcome::Unwelcome;
+    if (!crewRead)
+        return CrewWelcome::Unknown;
+    return CrewWelcome::Welcome;
+}
+
+char const* OfferVerdictName(OfferVerdict verdict)
+{
+    switch (verdict)
+    {
+        case OfferVerdict::Priced:     return "priced";
+        case OfferVerdict::WrongSide:  return "the other side's transport";
+        case OfferVerdict::CrewUnread: return "crew unread";
+        case OfferVerdict::NoBerth:    return "no berth level with the deck";
+        case OfferVerdict::NoLanding:  return "no landing level with the deck";
+        case OfferVerdict::BadFigures: return "unreadable distances";
+    }
+    return "unreadable distances";
+}
+
+CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
+                             CrossingPriceLimits const& limits)
+{
+    CrossingPrice price;
+    price.verdicts.reserve(offers.size());
+    price.yards.reserve(offers.size());
+
+    bool const rateUsable = limits.yardsPerSecond >= 0.f && std::isfinite(limits.yardsPerSecond);
+    int incumbent = -1;
+    for (std::size_t i = 0; i < offers.size(); ++i)
+    {
+        CrossingOffer const& o = offers[i];
+        OfferVerdict verdict = OfferVerdict::Priced;
+        // WHOSE BOAT IT IS COMES FIRST: a hostile crew is the worst fact about
+        // an offer, and naming a missing berth instead would send somebody to
+        // survey a dock the party must never use.
+        if (o.crew == CrewWelcome::Unwelcome)
+            verdict = OfferVerdict::WrongSide;
+        else if (o.crew == CrewWelcome::Unknown)
+            verdict = OfferVerdict::CrewUnread;
+        else if (!o.berthKnown)
+            verdict = OfferVerdict::NoBerth;
+        else if (!o.landingKnown)
+            verdict = OfferVerdict::NoLanding;
+        else if (!rateUsable || !(o.toBerthYards >= 0.f) || !(o.landingToGoalYards >= 0.f) ||
+                 !(o.rideSeconds >= 0.f) || !(o.periodSeconds >= 0.f) ||
+                 !std::isfinite(o.toBerthYards) || !std::isfinite(o.landingToGoalYards) ||
+                 !std::isfinite(o.rideSeconds) || !std::isfinite(o.periodSeconds))
+            verdict = OfferVerdict::BadFigures;
+
+        float yards = 0.f;
+        if (verdict == OfferVerdict::Priced)
+        {
+            yards = o.toBerthYards + o.landingToGoalYards +
+                    (o.rideSeconds + o.periodSeconds / 2.f) * limits.yardsPerSecond;
+            if (price.pick < 0 || yards < price.yards[static_cast<std::size_t>(price.pick)])
+                price.pick = static_cast<int>(i);
+            if (limits.incumbentEntry && o.entry == limits.incumbentEntry && incumbent < 0)
+                incumbent = static_cast<int>(i);
+        }
+        price.verdicts.push_back(verdict);
+        price.yards.push_back(yards);
+    }
+
+    if (incumbent >= 0)
+    {
+        price.keptIncumbent = incumbent != price.pick;
+        price.pick = incumbent;
+    }
+    return price;
 }
 
 namespace

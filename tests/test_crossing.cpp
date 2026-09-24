@@ -371,8 +371,8 @@ void AMooringIsNotABerthAndABerthlessCrossingRefuses()
               CrossingExplanation(step, w), "SHIP's");
     CheckSays("and says it will not derive a pier from one",
               CrossingExplanation(step, w), "derive a pier");
-    CheckSays("and says the deck cannot be stepped onto either",
-              CrossingExplanation(step, w), "sixty yards");
+    CheckSays("and says what a berth has to be instead",
+              CrossingExplanation(step, w), "level with its deck");
 }
 
 void ACrossingThatCannotEndIsNotStarted()
@@ -471,7 +471,7 @@ void EveryValueHasItsOwnName()
     std::vector<CrossingAction> const actions = {
         CrossingAction::Wait, CrossingAction::Refuse, CrossingAction::Walk,
         CrossingAction::Hold, CrossingAction::Ride, CrossingAction::Disembark,
-        CrossingAction::Done};
+        CrossingAction::Done, CrossingAction::Board, CrossingAction::WalkOff};
     for (std::size_t i = 0; i < actions.size(); ++i)
         for (std::size_t j = i + 1; j < actions.size(); ++j)
             if (std::string(CrossingActionName(actions[i])) ==
