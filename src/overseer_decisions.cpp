@@ -1895,6 +1895,24 @@ bool DungeonCampaignRecovers(unsigned trailingFailures)
     return trailingFailures > 0;
 }
 
+IdleCampaignPlan IdleCampaignRecovery(unsigned trailingFailures, bool recoveryAppliedForStreak,
+                                      CampaignRecoveryRow const& newest)
+{
+    IdleCampaignPlan plan;
+    if (newest.present && !newest.applied && !newest.attemptOpenedSince && newest.attempt > 0)
+    {
+        plan.step = IdleCampaignStep::ResumeRecovery;
+        plan.attempt = newest.attempt;
+        return plan;
+    }
+    if (DungeonCampaignRecovers(trailingFailures) && !recoveryAppliedForStreak)
+    {
+        plan.step = IdleCampaignStep::EnterRecovery;
+        plan.attempt = trailingFailures;
+    }
+    return plan;
+}
+
 char const* RunRecoveryWord(RunRecovery recovery)
 {
     switch (recovery)
@@ -13940,9 +13958,11 @@ HearthRegroupPlan PlanHearthRegroup(std::vector<HearthRegroupMember> const& fami
 }
 
 HearthRegroupStep HearthRegroupStepFor(bool inHearthSet, float yardsFromInn, bool leaderComing,
-                                       bool hearthImpossible, float innYards)
+                                       bool hearthImpossible, bool arrived, float innYards,
+                                       float leaveYards)
 {
-    if (yardsFromInn >= 0.f && yardsFromInn <= innYards)
+    float const within = arrived ? std::max(innYards, leaveYards) : innYards;
+    if (yardsFromInn >= 0.f && yardsFromInn <= within)
         return HearthRegroupStep::AtInn;
     if (inHearthSet && !hearthImpossible)
         return leaderComing ? HearthRegroupStep::Hearth : HearthRegroupStep::WaitForLeader;

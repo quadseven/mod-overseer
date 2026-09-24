@@ -2664,6 +2664,50 @@ unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewe
 // True for any streak of one or more attempts that never got inside.
 bool DungeonCampaignRecovers(unsigned trailingFailures);
 
+// A RECOVERY THE MODULE WROTE DOWN AND HAS NOT APPLIED OUTLIVES A RESTART
+// (2026-09-24). Measured on the dev realm: the Horde family's campaign 12
+// failed its seventh attempt in a row at 10:47:59 ("GATHERING was refused: the
+// party is above the staging point"), wrote overseer_run_recovery row 46
+// (attempt 7), and the bridge answered it hearth_regroup at 10:48:07 to apply
+// in 900s. The worldserver restarted at 10:53. The coordinator came back at
+// IDLE, and the IDLE gate asked the RUN rows how many attempts in a row had
+// failed: six, because a refusal before GATHERING or BARRIER opens a run row
+// writes none. Attempt 6's recovery read 'applied', so the gate opened a fresh
+// attempt at 11:11:07 and row 46 stayed 'answered' for ever.
+//
+// So the gate asks the recovery rows as well. The campaign's NEWEST
+// run_recovery row, when it is not applied, is a recovery this module was in
+// the middle of: it is resumed at that row's own attempt, with the backoff
+// counted from the row's own time and the bridge's answer on it still read.
+// Only the newest row: an older unapplied one was superseded by the failure
+// that wrote a newer row. And not a row an attempt has been opened after,
+// which is the state the bug above left behind: that attempt is the answer.
+struct CampaignRecoveryRow
+{
+    bool present{false};             // the campaign has a run_recovery row at all
+    unsigned attempt{0};             // the newest one's attempt
+    bool applied{false};             // its status reads 'applied'
+    bool attemptOpenedSince{false};  // a run of this campaign started after it
+};
+
+enum class IdleCampaignStep : std::uint8_t
+{
+    OpenAttempt,      // nothing to recover from: RESET the next attempt
+    EnterRecovery,    // the run rows end in failures nobody recovered from: a new request
+    ResumeRecovery,   // the newest request row is outstanding: resume it, write no new row
+};
+
+struct IdleCampaignPlan
+{
+    IdleCampaignStep step{IdleCampaignStep::OpenAttempt};
+    unsigned attempt{0};  // the recovery attempt, for the two recovering steps
+};
+
+// `trailingFailures` is TrailingUnenteredRuns; `recoveryAppliedForStreak` is
+// whether a run_recovery row for that attempt reads 'applied'.
+IdleCampaignPlan IdleCampaignRecovery(unsigned trailingFailures, bool recoveryAppliedForStreak,
+                                      CampaignRecoveryRow const& newest);
+
 // WHAT A FAILED ATTEMPT IS ANSWERED WITH. Each recovery is built from
 // machinery the coordinator already has; none of them moves a character by any
 // means but walking, and none is an admin shortcut.
@@ -16181,14 +16225,34 @@ enum class HearthRegroupStep : uint8_t
     Travel,         // walk or fly to the inn under the run's escort
 };
 
+// ARRIVAL IS STICKY, AND LEAVING TAKES MORE THAN ARRIVING (2026-09-24).
+// Measured on the dev realm, the Alliance family's campaign 13, recovery
+// hearth_regroup applied 11:09:42: all five hearthed and landed 0 to 3 yards
+// from the inn by 11:10:23, and the regroup never finished. The leader was
+// walked 100 yards off and then found 7,700 yards away in Winterspring, and
+// every member at the inn was released to `follow`, whose catch-up walked it
+// toward him. Each crossed out of HEARTH_REGROUP_INN_YARDS, was escorted
+// back, read "at the inn" at 93, 64, 70 or 76 yards, was let go again, and
+// crossed out again at 101 to 131 yards: for ten minutes, never all five at
+// once. A member that has reached the inn is now held there by the caller,
+// and still counts as there until it is past this wider radius, so one walk
+// that has not yet been stopped cannot undo an arrival. 150 is the town:
+// TOWN_STOP_NEAR_YARDS, the reading the module already uses for "in the town
+// the head stands in".
+constexpr float HEARTH_REGROUP_LEAVE_YARDS = TOWN_STOP_NEAR_YARDS;
+
 // `yardsFromInn` is below zero when the member is on another map or unseen.
 // `leaderComing` is true when the leader stands at the inn or is himself in
 // the hearth set; for the leader it is always true. `hearthImpossible` is the
 // executor's own gates read ahead (dead, no stone, stone on cooldown, casts
-// spent), and turns a hearth into a walk.
+// spent), and turns a hearth into a walk. `arrived` is whether this member
+// read AtInn on an earlier poll of this same regroup: an arrived member stays
+// AtInn out to `leaveYards`, one that has not arrived reaches it at
+// `innYards`.
 HearthRegroupStep HearthRegroupStepFor(bool inHearthSet, float yardsFromInn, bool leaderComing,
-                                       bool hearthImpossible,
-                                       float innYards = HEARTH_REGROUP_INN_YARDS);
+                                       bool hearthImpossible, bool arrived,
+                                       float innYards = HEARTH_REGROUP_INN_YARDS,
+                                       float leaveYards = HEARTH_REGROUP_LEAVE_YARDS);
 
 // "at the inn", "hearth", "wait for the leader", "travel".
 char const* HearthRegroupStepWord(HearthRegroupStep step);
