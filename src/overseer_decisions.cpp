@@ -4121,6 +4121,68 @@ std::string LootCandidatesJson(std::vector<LootCandidate> const& candidates)
     return out + "]";
 }
 
+// ------------------------------------------ a quest at its giver (kind='quest') --
+
+QuestErrand ParseQuestErrand(std::string const& command)
+{
+    QuestErrand out;
+    std::string::size_type const space = command.find(' ');
+    if (space == std::string::npos)
+        return out;
+    std::string const verb = command.substr(0, space);
+    std::string const spec = command.substr(space + 1);
+    static std::string const prefix = "quest:";
+    if (spec.rfind(prefix, 0) != 0)
+        return out;
+    std::string const digits = spec.substr(prefix.size());
+    if (digits.empty() || digits.size() > 9 ||
+        digits.find_first_not_of("0123456789") != std::string::npos)
+        return out;
+    std::uint32_t const id = static_cast<std::uint32_t>(std::stoul(digits));
+    if (!id)
+        return out;
+    if (verb == "take")
+        out.verb = QuestErrandVerb::Take;
+    else if (verb == "turnin")
+        out.verb = QuestErrandVerb::TurnIn;
+    else
+        return out;
+    out.questId = id;
+    return out;
+}
+
+std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const& facts)
+{
+    constexpr int STATUS_NONE = 0;
+    constexpr int STATUS_COMPLETE = 1;
+    if (errand.verb == QuestErrandVerb::None)
+        return "malformed request: want take quest:<id> or turnin quest:<id>";
+    if (!facts.questKnown)
+        return "no such quest";
+    if (facts.rewarded)
+        return "already turned in";
+    if (!facts.giverInReach)
+        return errand.verb == QuestErrandVerb::Take ? "no giver of that quest in reach"
+                                                    : "no taker of that quest in reach";
+    if (errand.verb == QuestErrandVerb::Take)
+    {
+        if (facts.status != STATUS_NONE)
+            return "already in the quest log";
+        if (!facts.logHasRoom)
+            return "the quest log is full";
+        if (!facts.eligible)
+            return "not eligible (level, race, class, prerequisite or exclusive group)";
+        return "";
+    }
+    if (facts.status != STATUS_COMPLETE)
+        return "not complete";
+    if (facts.rewardChoice)
+        return "it offers a choice of reward, and nobody here would choose";
+    if (!facts.rewardable)
+        return "the core will not reward it now";
+    return "";
+}
+
 // ------------------------------------------ what an equip displaced (#372) --
 
 void GearSlotCleared(GearSlotShadow& shadow, std::uint64_t stamp)
