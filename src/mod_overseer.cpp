@@ -4163,6 +4163,16 @@ void RememberAim(std::string const& name, std::string const& job, uint32 questAi
     }
 }
 
+// The job DriveQuests last saw on this character's row, "" before it has run
+// once. Read by the party poll, which has no job read of its own and needs one
+// only to tell a family waiting in town from one that is questing.
+std::string RememberedJob(std::string const& name)
+{
+    std::lock_guard<std::mutex> guard(g_aimMutex);
+    auto const it = g_aimSnapshot.find(LowerName(name));
+    return it == g_aimSnapshot.end() ? std::string() : it->second.job;
+}
+
 // Called from the two kill hooks below, whatever thread Unit::Kill happens to
 // be running the victim's death on - map-update, same as every other event
 // hook in this file (see the file header). Memory only, same discipline as
@@ -8945,7 +8955,34 @@ private:
             // on the dev realm 2026-09-08, the leader standing at the stone
             // carried `stay` AND `new rpg` and drifted anyway, which is what
             // that relevance means in practice.
-            if (!leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
+            //
+            // AND NOT WHILE THE FAMILY WAITS IN TOWN WITH NOTHING TO WALK TO
+            // (2026-09-24). See OverseerDecisions::LeaderCarriesNewRpg. The
+            // grant below is for a questing leader; one whose family waits on
+            // a campaign in town is taken off the strategy instead while it has
+            // no aim and no escort, and the next town errand hands it back
+            // through DriveTravel's own grant.
+            std::string const leaderName = leader->GetName();
+            bool const mayCarry = OverseerDecisions::LeaderCarriesNewRpg(
+                RememberedJob(leaderName),
+                !_travelAims.TargetFor(leaderName).empty() || IsEscorted(leaderName));
+            if (!mayCarry && leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
+                !HeldAfterRevival(leaderName) && !HeldStill(leaderName))
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' leads a family waiting in town and has no errand "
+                         "- taking `new rpg` off so it stays with the family instead of "
+                         "travelling on a status of its own; a town errand hands it back",
+                         leaderName);
+                leaderAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                if (leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' still carries `new rpg` after being told to "
+                              "drop it in town - it will keep travelling on its own",
+                              leaderName);
+            }
+
+            if (mayCarry && !leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 !HeldAfterRevival(leader->GetName()) &&
                 !HeldStill(leader->GetName()))
             {
@@ -9163,12 +9200,39 @@ private:
             // READ BACK, like every other grant on this path: a strategy that
             // silently failed to take is a character standing in a field, and
             // a confident log line about it is worse than no line at all.
-            if (!botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
+            //
+            // NOT FOR A FAMILY WAITING IN TOWN (2026-09-24). See
+            // OverseerDecisions::CutOffFollowerRoams: levelling where it stands
+            // is the questing answer, and a follower granted `new rpg` here
+            // is handed a random status on its next tick, which on the dev
+            // realm was a flight to the next zone within five minutes. Said
+            // once per split, like the split itself.
+            std::string const cutOffTarget = _travelAims.TargetFor(p->GetName());
+            bool const cutOffIdle =
+                !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 SplitFromLeader(p->GetName()) && !IsEscorted(p->GetName()) &&
                 !HeldAfterRevival(p->GetName()) && !HeldStill(p->GetName()) &&
-                OverseerDecisions::ReadSplitErrand(
-                    _travelAims.TargetFor(p->GetName())) ==
-                    OverseerDecisions::SplitErrand::Nothing)
+                OverseerDecisions::ReadSplitErrand(cutOffTarget) ==
+                    OverseerDecisions::SplitErrand::Nothing;
+            bool const cutOffRoams = cutOffIdle && OverseerDecisions::CutOffFollowerRoams(
+                                                       RememberedJob(p->GetName()), cutOffTarget);
+            if (cutOffIdle && !cutOffRoams)
+            {
+                auto const split = _partySplitSaid.find(p->GetName());
+                uint32 const there = split == _partySplitSaid.end() ? 0u : split->second;
+                auto const said = _cutOffInTownSaid.find(p->GetName());
+                if (said == _cutOffInTownSaid.end() || said->second != there)
+                {
+                    _cutOffInTownSaid[p->GetName()] = there;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is cut off from its leader and its family waits "
+                             "in town - not granting `new rpg`, so it stays where it is "
+                             "rather than travelling on a status of its own; a catch-up, a "
+                             "hearth or an errand of its own still moves it",
+                             p->GetName());
+                }
+            }
+            if (cutOffRoams)
             {
                 LOG_WARN("module.overseer",
                          "overseer: '{}' is cut off from its leader with no errand of its "
@@ -18262,12 +18326,16 @@ private:
     // false, and the backstop in KeepRosterFollowing takes the strategy back on
     // its next poll - so a family that reunites is a family whose followers
     // stop steering themselves, exactly as before.
+    //
+    // EXCEPT WITH AN EMPTY COLUMN WHILE THE FAMILY WAITS IN TOWN (2026-09-24).
+    // See OverseerDecisions::CutOffFollowerRoams: the grant is withheld there,
+    // and this is the half that takes back a strategy granted before the wait.
     bool MaySteerItself(std::string const& name) const
     {
         return IsEscorted(name) ||
                (SplitFromLeader(name) &&
-                OverseerDecisions::SplitFollowerDrivesItself(
-                    _travelAims.TargetFor(name)));
+                OverseerDecisions::CutOffFollowerRoams(RememberedJob(name),
+                                                       _travelAims.TargetFor(name)));
     }
 
     // DOES THIS CHARACTER LEAD, OR ANSWER TO NOBODY? Upstream's own test for who
@@ -52705,6 +52773,9 @@ private:
     // Erased by DriveCatchUp the moment the two are on one map again, so a
     // family that splits, reunites and splits again is announced twice.
     std::map<std::string, uint32> _partySplitSaid;
+    // Who was last told it stays put while cut off from a family waiting in
+    // town, keyed the same way, so the line is said once per split.
+    std::map<std::string, uint32> _cutOffInTownSaid;
 
     uint32 _travelTimer = 0;
     uint32 _professionTimer = 0;
