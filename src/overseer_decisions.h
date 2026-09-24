@@ -2959,6 +2959,70 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
 // single-wing run cannot be proved complete from the map-level mask.
 bool DungeonMapHasIndependentWings(uint32_t mapId);
 
+// CAN THIS PARTY GET THROUGH THE DOOR AT ALL (#578).
+//
+// The coordinator used to stage a party at any door with a portal row and never
+// ask whether the world would let it through. Two things the world enforces
+// were missed. The core refuses a member under the map's door minimum at the
+// knock (dungeon_access_template, read through ObjectMgr::GetAccessRequirement),
+// so a family whose levels straddle it splits at the door. And a locked door on
+// the approach does not open without its key, so a party without one stands at
+// a door that will not move until a backstop fires.
+//
+// NEITHER FACT IS WRITTEN HERE. The level is the core's own row. The key is
+// read from the door gameobject's lock in Lock.dbc (the LOCK_KEY_ITEM cases),
+// because lock_dbc is empty in this world database and a hand-kept item list
+// would drift from the lock the door really has. The portal row names only
+// which gameobject gates its approach.
+struct DoorPrerequisites
+{
+    // The map's door minimum, or 0 when the core has none.
+    std::uint32_t minLevel{0};
+    // The locked gameobject entry on the approach, or 0 for a door with none.
+    std::uint32_t keyDoorEntry{0};
+    // The items any one of which opens that door. Empty with a door named means
+    // its lock was not found or names no key, which is refused rather than
+    // guessed at: the row says a key is needed, and nothing here can say which.
+    std::vector<std::uint32_t> keyItems;
+};
+
+// One member as the check reads it. `carriesKey` is whether this member holds
+// any one of the door's key items, and is ignored when the door needs none.
+struct DoorCandidate
+{
+    std::string name;
+    std::uint32_t level{0};
+    bool carriesKey{false};
+};
+
+enum class DoorReadiness : std::uint8_t
+{
+    Ready,       // every member meets the minimum, and the key is carried if needed
+    UnderLevel,  // at least one member is under the door minimum
+    NoKey,       // the approach has a locked door and nobody carries its key
+    KeyUnknown,  // the approach has a locked door whose key could not be read
+};
+
+struct DoorReadinessReading
+{
+    DoorReadiness verdict{DoorReadiness::Ready};
+    // Who is under the minimum, in the order given. Filled for UnderLevel.
+    std::vector<std::string> underLevel;
+};
+
+// The level floor is asked first: the knock refuses an under-level member
+// whether or not the door is open, and a family that is not yet high enough is
+// the more common case. An empty party is Ready, because there is nobody to
+// refuse; whether a run can start with nobody is asked elsewhere.
+DoorReadinessReading ReadDoorReadiness(DoorPrerequisites const& door,
+                                       std::vector<DoorCandidate> const& party);
+
+// The refusal in words, naming who lacks what, for the line that says why a run
+// did not open. Empty for Ready.
+std::string DoorReadinessReason(DoorReadinessReading const& reading,
+                                DoorPrerequisites const& door,
+                                std::vector<DoorCandidate> const& party);
+
 // THE WORD THAT GOES ON THE ROW, in one place because the vocabulary is now
 // four wide at this one exit and picking it inline is how 'complete' would end
 // up written for a run that stalled.
