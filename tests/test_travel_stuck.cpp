@@ -4,6 +4,9 @@
 
 using OverseerDecisions::TravelStuckAction;
 using OverseerDecisions::TravelStuckDecision;
+using OverseerDecisions::TravelNoProgressBackoffAction;
+using OverseerDecisions::TravelNoProgressBackoffState;
+using OverseerDecisions::TravelNoProgressBackoffStep;
 
 int main()
 {
@@ -41,5 +44,22 @@ int main()
     for (unsigned poll = 0; poll < 25; ++poll)
         if (TravelStuckDecision(5, 5, false) != TravelStuckAction::Continue)
             return std::printf("the measured livelock is still reachable\n"), 1;
+
+    TravelNoProgressBackoffState backoff;
+    if (TravelNoProgressBackoffStep(backoff, 100, 3, 60) !=
+        TravelNoProgressBackoffAction::Continue)
+        return std::printf("backoff started too early\n"), 1;
+    if (TravelNoProgressBackoffStep(backoff, 101, 3, 60) !=
+        TravelNoProgressBackoffAction::Continue)
+        return std::printf("backoff did not count releases\n"), 1;
+    if (TravelNoProgressBackoffStep(backoff, 102, 3, 60) !=
+        TravelNoProgressBackoffAction::Backoff)
+        return std::printf("backoff did not bound repeated releases\n"), 1;
+    if (TravelNoProgressBackoffStep(backoff, 103, 3, 60) !=
+        TravelNoProgressBackoffAction::Backoff)
+        return std::printf("backoff expired early\n"), 1;
+    if (TravelNoProgressBackoffStep(backoff, 162, 3, 60) !=
+        TravelNoProgressBackoffAction::Continue)
+        return std::printf("backoff did not reset after cooldown\n"), 1;
     return 0;
 }

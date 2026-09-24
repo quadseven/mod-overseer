@@ -1532,6 +1532,13 @@ constexpr time_t TRAVEL_LANDED_CEILING_SECONDS = 15 * 60;
 // turned that sentence into code, is on OverseerDecisions::ErrandDeathLimits.
 constexpr OverseerDecisions::ErrandDeathLimits ERRAND_DEATH_LIMITS{};
 
+// How many live no-progress releases are allowed before the same aim is
+// refused for a bounded period. This is a backstop for an aim writer that
+// keeps re-arming a route the character cannot reach.
+constexpr uint32 TRAVEL_STUCK_BACKOFF_RELEASES = 3;
+constexpr time_t TRAVEL_STUCK_BACKOFF_SECONDS =
+    static_cast<time_t>(ERRAND_DEATH_LIMITS.cooloffSeconds);
+
 // WHAT ECONOMY ERRANDS ARE ALLOWED TO COST WHEN NOTHING IS GOING WRONG. The
 // breaker above answers an errand that kills; this answers one that simply
 // never stops. Measured on 2026-09-08, thirty minutes of one character's log:
@@ -5556,6 +5563,20 @@ public:
         return true;
     }
 
+    bool NoteNoProgressRelease(std::string const& name, std::string const& target)
+    {
+        NoProgressBackoff& backoff = _noProgressBackoff[name];
+        if (backoff.target != target)
+        {
+            backoff.target = target;
+            backoff.state = OverseerDecisions::TravelNoProgressBackoffState{};
+        }
+        return OverseerDecisions::TravelNoProgressBackoffStep(
+                   backoff.state, std::time(nullptr), TRAVEL_STUCK_BACKOFF_RELEASES,
+                   TRAVEL_STUCK_BACKOFF_SECONDS) ==
+               OverseerDecisions::TravelNoProgressBackoffAction::Backoff;
+    }
+
 private:
     // One errand a character was called off, why, and when.
     struct Refusal
@@ -5564,6 +5585,12 @@ private:
         std::string reason;
         time_t at{0};
         time_t said{0};  // when the re-issue was last reported, 0 = never
+    };
+
+    struct NoProgressBackoff
+    {
+        std::string target;
+        OverseerDecisions::TravelNoProgressBackoffState state;
     };
 
     std::map<std::string, TravelState> _state;
@@ -5590,6 +5617,7 @@ private:
     // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
     std::map<std::string, Refusal> _refused;
+    std::map<std::string, NoProgressBackoff> _noProgressBackoff;
     // The fence that refused each character's last claim, as said in the log,
     // so a refusal is said once per state rather than every poll (#560).
     // Erased when a claim writes. World thread only.
@@ -22216,6 +22244,19 @@ private:
                     botAI->rpgInfo.stuckAttempts, 5, countsForThisCharacter) ==
                 OverseerDecisions::TravelStuckAction::Release)
             {
+                bool const backoff =
+                    _travelAims.NoteNoProgressRelease(name, target);
+                if (backoff)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has been released {} times for no progress "
+                             "toward '{}' - bounded backoff for {} minutes before the aim "
+                             "may be re-issued",
+                             name, TRAVEL_STUCK_BACKOFF_RELEASES, target,
+                             static_cast<uint32>(TRAVEL_STUCK_BACKOFF_SECONDS / 60));
+                    _travelAims.Refuse(name, target,
+                                       "repeated no-progress releases; bounded backoff is active");
+                }
                 LOG_WARN("module.overseer",
                          "overseer: '{}' was sent to '{}' and made no progress in {} "
                          "attempts - releasing the errand before upstream can teleport it",
