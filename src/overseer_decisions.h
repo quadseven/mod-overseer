@@ -532,7 +532,11 @@ struct TerrainRecoveryLimits
     // which is what lets the bound be lifted inside it without lifting it
     // anywhere a scripted traversal happens. ZERO DISABLES IT.
     float voidCatchYards{0.f};
+    float maxLiftYards{0.f};
 };
+
+bool LiftDestinationIsValid(float currentZ, float destinationZ,
+                            bool destinationSurfaceValid, float maxLiftYards);
 
 // What one character's terrain recovery remembers between polls. Kept inside
 // the adapter's own per-character state, world-thread only and unguarded, like

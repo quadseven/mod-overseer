@@ -259,6 +259,15 @@ bool BelowTerrainNeedsRecovery(float currentZ, float surfaceAboveZ,
     return surfaceAboveZ - currentZ >= minimumGap;
 }
 
+bool LiftDestinationIsValid(float currentZ, float destinationZ,
+                            bool destinationSurfaceValid, float maxLiftYards)
+{
+    if (!destinationSurfaceValid || !std::isfinite(currentZ) ||
+        !std::isfinite(destinationZ) || destinationZ <= currentZ)
+        return false;
+    return maxLiftYards <= 0.f || destinationZ - currentZ <= maxLiftYards;
+}
+
 bool QuestIsStale(int playerLevel, int questLevel, bool objectiveProgress,
                  bool activeAim, int minimumLevelGap)
 {
@@ -476,6 +485,15 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
     }
 
+    float const ordinaryLiftZ = reading.surfaceAboveZ + limits.liftClearance;
+    if (!NearTheVoidPlane(reading.z, limits.voidCatchYards) &&
+        !LiftDestinationIsValid(reading.z, ordinaryLiftZ, reading.surfaceValid,
+                                limits.maxLiftYards))
+    {
+        state.lastAttempt = now;
+        return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
+    }
+
     // THE LAST STRETCH ABOVE THE KILL PLANE, WHERE THE BOUND STOPS APPLYING
     // (#188). Read this AFTER the on-the-ground branch above and not before
     // it: a character with a floor at its own feet at this depth is standing
@@ -512,7 +530,7 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         state.lastAttempt = now;
         return TerrainRecoveryVerdict{
             TerrainRemedy::LiftToSurface,
-            reading.surfaceAboveZ + limits.liftClearance};
+            ordinaryLiftZ};
     }
 
     // NO POLYGON. The ladder, and it is short on purpose: the failure this
@@ -538,7 +556,7 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
             state.lastAttempt = now;
             return TerrainRecoveryVerdict{
                 TerrainRemedy::LiftToSurface,
-                reading.surfaceAboveZ + limits.liftClearance};
+                ordinaryLiftZ};
         case 1:
             state.attempts = 2;
             state.lastAttempt = now;

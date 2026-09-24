@@ -29,6 +29,7 @@ using OverseerDecisions::TerrainReading;
 using OverseerDecisions::TerrainRecoveryState;
 using OverseerDecisions::TerrainRecoveryStep;
 using OverseerDecisions::TerrainRecoveryVerdict;
+using OverseerDecisions::LiftDestinationIsValid;
 using OverseerDecisions::TerrainRemedy;
 
 namespace
@@ -441,6 +442,20 @@ void TheOriginalCityIncidentStillRecovers()
     CheckRemedy("35 yards below a city floor with no polygon", v.remedy,
                 TerrainRemedy::LiftToSurface);
     CheckNear("lifted onto that floor", v.liftZ, 95.5f);
+}
+
+void AnUnsafeLiftGivesUpInsteadOfTeleportingTooHigh()
+{
+    OverseerDecisions::TerrainRecoveryLimits capped = LIVE_LIMITS;
+    capped.maxLiftYards = 30.f;
+    TerrainRecoveryState state;
+    TerrainRecoveryVerdict const verdict =
+        TerrainRecoveryStep(state, Here(60.f, 116.8f, false), capped, 1000);
+    CheckRemedy("a lift beyond the cap gives up", verdict.remedy, TerrainRemedy::GiveUp);
+    Check("the destination validator rejects an invalid surface", 
+          LiftDestinationIsValid(60.f, 116.8f, false, 30.f), false);
+    Check("the destination validator rejects a lift beyond the cap",
+          LiftDestinationIsValid(60.f, 90.1f, true, 30.f), false);
 }
 
 // A caller that passes no forget window gets the old unbounded behaviour, and
@@ -1358,6 +1373,7 @@ int main()
     AnUnknownSurfaceNeverProducesALift();
     AnOrdinaryCharacterIsLeftAloneAndForgotten();
     TheOriginalCityIncidentStillRecovers();
+    AnUnsafeLiftGivesUpInsteadOfTeleportingTooHigh();
     AWarningDoesNotSpendTheLiftARealFallWouldNeed();
     AZeroForgetWindowIsTheOldUnboundedBehaviourAndSaysSo();
 
