@@ -12154,6 +12154,8 @@ RespecStep JudgeRespec(RespecFacts const& facts)
         return RespecStep::CannotAfford;
     if (!facts.available)
         return RespecStep::NotNow;
+    if (facts.runOwnsTravel)
+        return RespecStep::RunOwnsTravel;
     if (!facts.columnFree)
         return RespecStep::ColumnBusy;
     if (facts.sinceLastMiss < RESPEC_RETRY_SECONDS)
@@ -12170,6 +12172,9 @@ char const* RespecStepWord(RespecStep step)
         case RespecStep::InTree: return "already in its tree";
         case RespecStep::CannotAfford: return "cannot afford the reset";
         case RespecStep::NotNow: return "not free to walk";
+        case RespecStep::RunOwnsTravel:
+            return "the family's dungeon run is staging or under way, and a talent reset "
+                   "walks only when the head is idle or in town";
         case RespecStep::ColumnBusy: return "another errand holds the travel column";
         case RespecStep::Resting: return "waiting out the retry after a missed reset";
         case RespecStep::Walk: return "walk to its class trainer";
@@ -12225,6 +12230,50 @@ GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield
 bool GearTankWeighsShieldPair(GearRole role, bool twoHanderInMainHand)
 {
     return role == GearRole::Tank && twoHanderInMainHand;
+}
+
+bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts)
+{
+    // Inside, nothing but the run moves the head: every counter is on another
+    // map, and a walk aimed at one is refused by the travel drive and then
+    // locked out for fifteen minutes.
+    if (facts.runInside)
+        return who == HeadErrand::ActiveRun;
+    // No bag room outranks the approach: the campaign hands the family to town
+    // and does not stage until there is room. Upkeep, a trainer trip and the
+    // rest may all go; the column decides between them (see the header).
+    if (facts.bagBlocked)
+        return who != HeadErrand::ActiveRun && who != HeadErrand::CampaignApproach;
+    // Staging: nothing below the approach may take or pin the head.
+    if (facts.runStaging)
+        return who == HeadErrand::ActiveRun || who == HeadErrand::CampaignApproach;
+    return true;
+}
+
+char const* HeadErrandWaitReason(HeadErrand who, HeadTravelFacts const& facts)
+{
+    if (HeadErrandMayTravel(who, facts))
+        return "";
+    if (facts.runInside)
+        return "the family is inside its dungeon run, and the run walks it out before "
+               "anything else may move the head";
+    if (facts.bagBlocked)
+        return "the family has no bag room, so the campaign waits for town upkeep to "
+               "make some";
+    return "a dungeon run is staging and walks the head to its door; BARRIER gathers "
+           "the family there, so nothing lower may take or pin the head";
+}
+
+EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool insideMapHasPortal)
+{
+    if (coordinatorKnowsItsDoor)
+        return EvacuationStart::WalkOut;
+    return insideMapHasPortal ? EvacuationStart::AdoptThenWalkOut : EvacuationStart::NoWayOut;
+}
+
+bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered)
+{
+    return familyBagHeld && enteringDungeonMap && alive && steered;
 }
 
 }  // namespace OverseerDecisions

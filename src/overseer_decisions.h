@@ -14505,6 +14505,7 @@ enum class RespecStep : uint8_t
     InTree,        // every spent point is already in the roster's tree
     CannotAfford,  // the purse is short of the trainer's price
     NotNow,        // dead, fighting, flying or inside an instance
+    RunOwnsTravel, // the family's dungeon run is staging or under way (#631)
     ColumnBusy,    // the travel column holds another errand; it goes first
     Resting,       // a recent walk ended without a reset; waiting out the retry
     Walk,          // claim the class-trainer aim, or keep the one already claimed
@@ -14524,6 +14525,9 @@ struct RespecFacts
     bool available{false};
     // `travel_npc` is empty, or already holds RESPEC_AIM.
     bool columnFree{false};
+    // HeadErrandMayTravel(HeadErrand::TrainerTrip, ...) said no: the family's
+    // run is staging or inside, and a trainer trip waits for it (#631).
+    bool runOwnsTravel{false};
     // Seconds since the last walk that ended without a reset; UINT32_MAX when
     // there has been none.
     uint32_t sinceLastMiss{UINT32_MAX};
@@ -14579,6 +14583,97 @@ GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield
 // Is the pair even the question? Only for a tank, and only when what is worn
 // in the main hand is a two-hander.
 bool GearTankWeighsShieldPair(GearRole role, bool twoHanderInMainHand);
+
+
+// --------------------- who owns a head's travel column, in order (#631) ----
+//
+// MEASURED ON THE DEV REALM, 2026-09-23. The Horde head was staging Ragefire
+// Chasm from about six thousand yards out. The regroup wait placed a hold on
+// him one second before the run started (a member was 5766 yards behind), and
+// that hold took `new rpg` off him for its full twenty minutes. The staging
+// aim moved nobody, GATHERING's twelve-minute backstop closed the attempt as
+// staging_failed, and the next attempt opened under the same hold. Three
+// attempts in a row ended that way. Nothing was wrong with any one drive: each
+// claimed the head for a good reason, and nothing said which reason wins.
+//
+// THE ORDER A GROUP OF PEOPLE PLAYS IN, and the one this answers with:
+//
+//   1. ActiveRun         - the family is inside its run. Everything waits.
+//   2. CampaignApproach  - the run is staging: reset, gather, barrier, door.
+//   3. BagUpkeep         - the family has no bag room. The campaign yields to
+//                          town (sell, bank, destroy, mail) until there is.
+//   4. TrainerTrip       - a talent reset or a trainer visit. Only when the
+//                          head is idle or already in town.
+//   5. Other             - the regroup wait and anything else.
+//
+// Within the town window the column itself decides between upkeep and a
+// trainer trip: an errand already walking is never taken off the head, and a
+// trainer trip only starts on a free column. So upkeep that is under way keeps
+// the head, and a trainer trip rides along when the column is free, which is
+// "in town" in the sense a player means it.
+enum class HeadErrand : uint8_t
+{
+    ActiveRun,
+    CampaignApproach,
+    BagUpkeep,
+    TrainerTrip,
+    Other,
+};
+
+struct HeadTravelFacts
+{
+    bool runInside{false};   // the coordinator is STAGED_INSIDE, CLEARING or EXIT
+    bool runStaging{false};  // the coordinator is RESET, GATHERING, BARRIER or ENTER
+    bool bagBlocked{false};  // a member is at or below the town trip's bag floor
+};
+
+// May `who` put its aim on the head right now?
+bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts);
+
+// Why it may not, for the log line; "" when it may.
+char const* HeadErrandWaitReason(HeadErrand who, HeadTravelFacts const& facts);
+
+// ------------------ a run the family cannot loot and nobody owns (#631) -----
+//
+// MEASURED ON THE DEV REALM, 2026-09-23. The Alliance family was standing in
+// Zul'Farrak with its bags full, on a run row the coordinator had not adopted
+// (the row had been opened by the arming drive when the family walked back in
+// through the door it had just been evacuated by). The bag check runs before
+// adoption, so it answered Evacuate on an IDLE coordinator: EXIT was set with
+// no portal, the next poll found no portal and fell back to IDLE, and the one
+// after that evacuated again. Two phase rows and an 'evacuated' row every ten
+// seconds for over ninety minutes, nobody walked out, and every town errand
+// sent the head to a counter on the instance map, where there is none.
+//
+// So an evacuation first asks whether the coordinator knows the door.
+enum class EvacuationStart : uint8_t
+{
+    // The coordinator is driving this run and knows its portal: walk out.
+    WalkOut,
+    // Idle, or its portal is gone, but the map the family is standing in has a
+    // portal row: adopt the run (its row, its door, its campaign) and walk out.
+    AdoptThenWalkOut,
+    // Nobody knows a door out of this map. Hold where it is and say so once,
+    // rather than set EXIT with no door and fall back to IDLE every poll.
+    NoWayOut,
+};
+
+EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool insideMapHasPortal);
+
+// ------------------- the door stays shut while the bags are full (#631) -----
+//
+// ALSO MEASURED, AND IT IS HOW THE FAMILY GOT BACK IN. Run 160057 was walked
+// out through areatrigger 922 at 21:52:29 and all five were on map 1. The town
+// trip aimed the head at a vendor 896 yards off, his client stepped through
+// the entrance trigger on the way, and at 21:52:35 he and a follower were on
+// map 209 again with a fresh run row opened under another member's name.
+// A family held for bag room is refused the teleport onto a dungeon map, the
+// way a group that has agreed to go to town first does not walk back in.
+//
+// Only an alive character this module steers, only onto a map with a portal
+// row, and only from another map (a teleport inside the instance is not a
+// crossing). A ghost is never refused: its corpse may be inside.
+bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered);
 
 }  // namespace OverseerDecisions
 

@@ -18015,6 +18015,23 @@ private:
             return;
         }
 
+        // ...OR THE FAMILY'S RUN IS STAGING (#631). The regroup wait is the
+        // lowest claimant on a head: it took `new rpg` off the Horde head for
+        // twenty minutes while his run's staging aim was the thing that should
+        // have been walking him, and GATHERING's backstop closed three
+        // attempts in a row as staging_failed. BARRIER gathers the family at
+        // the door, which is the regroup this wait was standing in for.
+        {
+            OverseerDecisions::HeadTravelFacts const head = HeadTravelFactsFor(leaderName);
+            if (!OverseerDecisions::HeadErrandMayTravel(OverseerDecisions::HeadErrand::Other,
+                                                        head))
+            {
+                EndTheRegroupWait(OverseerDecisions::HeadErrandWaitReason(
+                    OverseerDecisions::HeadErrand::Other, head));
+                return;
+            }
+        }
+
         // ANOTHER VERB IS ALREADY HOLDING THIS LEADER STILL, AND ITS HOLD IS
         // ITS OWN TO LIFT. A cast, a bind, a barrier: each takes the leader off
         // its movers for its own reasons and hands them back on its own terms,
@@ -25491,6 +25508,11 @@ private:
         // full bags are true on every poll until a town trip clears them, and
         // that is minutes of them.
         bool loggedBagHold{false};
+        // Said once per hold, for the same reason: a family with no bag room
+        // standing in a map this module has no portal row for is a hold that
+        // is true on every poll, and it used to be an EXIT set with no door
+        // and an IDLE one poll later, written to the timeline every time (#631).
+        bool loggedBagNoDoor{false};
         // Said once per run rather than once per poll, the same log-once
         // discipline every other flag on this struct follows: a map with no
         // encounter rows answers Unknowable on every poll for the whole run.
@@ -25675,6 +25697,98 @@ private:
     // row, staging point, members, clocks and evacuation here, and nothing in
     // one entry is read or written on behalf of another family.
     std::map<std::string, DungeonRunCoordinatorState> _dungeonRunCoordinators;
+
+    // WHERE EACH ROSTER MEMBER'S FAMILY RUN STANDS, for the drives that must
+    // yield to it (#631). Rebuilt on every DriveDungeonRun from the
+    // coordinators, on the world thread, and read only there: its one reader,
+    // HeadTravelFactsFor, is called by KeepTheFamilyTogether (through
+    // KeepRosterFollowing) and DriveRespec, both from OnUpdate. The teleport
+    // hook, which a map thread can call, never reads it; DoorShutFor reads only
+    // BagHeldMembers, under BagHeldLock.
+    std::map<std::string, DungeonRunPhase> _familyRunPhaseByMember;
+
+    // WHICH ROSTER MEMBERS BELONG TO A FAMILY WITH NO BAG ROOM, member ->
+    // family (#631). Written by DriveDungeonRunFor on the world thread and
+    // read by the teleport hook, which the core can call from a map thread,
+    // so both go through the lock.
+    static std::mutex& BagHeldLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+    static std::map<std::string, std::string>& BagHeldMembers()
+    {
+        static std::map<std::string, std::string> members;
+        return members;
+    }
+
+public:
+    // The family `name` belongs to when that family is held for bag room, or
+    // "" when it is not.
+    static std::string BagHeldFamilyOf(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(BagHeldLock());
+        auto const it = BagHeldMembers().find(name);
+        return it == BagHeldMembers().end() ? std::string() : it->second;
+    }
+
+    // IS THIS TELEPORT A HELD FAMILY WALKING BACK INTO A DUNGEON (#631)? Asked
+    // by the teleport hook for every teleport on the world, so the roster
+    // lookup comes first and every character outside a held family leaves on
+    // it. A teleport within the map it is already on is never a crossing.
+    static bool DoorShutFor(Player* player, uint32 targetMapId)
+    {
+        if (!player || player->GetMapId() == targetMapId)
+            return false;
+        if (BagHeldFamilyOf(player->GetName()).empty())
+            return false;
+        return OverseerDecisions::DungeonDoorShut(
+            true, FindDungeonPortalByInsideMap(targetMapId, std::string()) != nullptr,
+            player->IsAlive(), SteerableAI(player) != nullptr);
+    }
+
+private:
+    static void MarkFamilyBagHeld(std::string const& family,
+                                  std::vector<std::string> const& members, bool held)
+    {
+        std::lock_guard<std::mutex> guard(BagHeldLock());
+        auto& map = BagHeldMembers();
+        for (auto it = map.begin(); it != map.end();)
+            it = it->second == family ? map.erase(it) : std::next(it);
+        if (held)
+            for (std::string const& name : members)
+                map[name] = family;
+    }
+
+    // THE FACTS HeadErrandMayTravel ORDERS A HEAD'S TRAVEL COLUMN BY (#631),
+    // for any roster member: where its family's run stands and whether the
+    // family has bag room.
+    OverseerDecisions::HeadTravelFacts HeadTravelFactsFor(std::string const& name) const
+    {
+        OverseerDecisions::HeadTravelFacts facts;
+        auto const phase = _familyRunPhaseByMember.find(name);
+        if (phase != _familyRunPhaseByMember.end())
+        {
+            switch (phase->second)
+            {
+                case DungeonRunPhase::Resetting:
+                case DungeonRunPhase::Gathering:
+                case DungeonRunPhase::Barrier:
+                case DungeonRunPhase::Enter:
+                    facts.runStaging = true;
+                    break;
+                case DungeonRunPhase::StagedInside:
+                case DungeonRunPhase::Clearing:
+                case DungeonRunPhase::Exiting:
+                    facts.runInside = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+        facts.bagBlocked = !BagHeldFamilyOf(name).empty();
+        return facts;
+    }
 
     // THE RUN TIMELINE (overseer_dungeon_run_event). The coordinator's state is
     // snapshotted before and after each family's poll and the difference is
@@ -29571,7 +29685,17 @@ private:
         ReadRepairNeed(bot, damaged, broken);
         need.damagedItems = damaged;
         need.brokenItems = broken;
-        need.freeBagSlots = CountFreeBagSlots(bot);
+        // FREE INVENTORY SLOTS, NOT EMPTY BAG POSITIONS (#631). This read
+        // CountFreeBagSlots, which counts how many of the four bag positions
+        // hold no bag - zero for anybody wearing four bags - so every such
+        // member read "bags" at a floor of three whatever its bags held. On
+        // the dev realm the Horde family, with seven to nineteen free slots
+        // each, was walked to a vendor as "5 of 5 cannot carry on without it
+        // (bags)" and came back "NOTHING CHANGED - 0 free bag slot(s)", and
+        // the campaign held its run for each trip. GetFreeInventorySpace is
+        // the count DungeonRunBagPressure reads through ReadRunBags, so the
+        // trip and the run now agree about who is full.
+        need.freeBagSlots = bot->GetFreeInventorySpace();
         return need;
     }
 
@@ -30303,6 +30427,57 @@ private:
         return reading;
     }
 
+    // The first roster member standing inside an open run, or null.
+    static Player* FirstMemberInsideARun(std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (member && InDungeonRun(member))
+                return member;
+        }
+        return nullptr;
+    }
+
+    // ADOPT THE RUN THE FAMILY IS STANDING IN, SO THAT EXIT HAS A DOOR (#631).
+    // The same facts the IDLE adoption below reads, for the one case that
+    // cannot reach it: the bag check runs first, and a family with no room is
+    // walked out rather than handed to CLEARING. The row is put in order on
+    // the way in - its leader named as the family head, its campaign and run
+    // number read back or taken from the counter - so the row EXIT closes is
+    // one an operator can read, not a row a member's re-entry opened under
+    // somebody else's name with run 0 of campaign 0.
+    void AdoptRunToEvacuate(DungeonRunCoordinatorState& coord, DungeonPortal const& portal,
+                            std::vector<std::string> const& members,
+                            std::string const& leaderName)
+    {
+        coord = DungeonRunCoordinatorState();
+        coord.portalKeyword = portal.keyword;
+        coord.runId = ActiveRunIdOnMap(portal.insideMapId);
+        AlignRunLeader(coord.runId, leaderName);
+        ReadRunCampaign(coord.runId, coord.campaignId, coord.runNumber);
+        DungeonCampaignCap const cap = LoadCampaignCap(leaderName);
+        coord.capKnown = cap.known;
+        coord.runsWanted = cap.wanted;
+        if (!coord.runNumber)
+            coord.runNumber = cap.done + 1;
+        // THE CAMPAIGN IN PROGRESS ON THIS MAP, AND NEVER A NEW ONE. A run the
+        // family is only being walked out of is not the start of a series.
+        if (RunAccountingPresent())
+        {
+            if (!coord.campaignId)
+                coord.campaignId = CampaignInProgress(leaderName, portal.insideMapId);
+            StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
+                                 JoinNames(members));
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: family of '{}' has no bag room and stands in run {} on map {}, "
+                 "which no coordinator owned - adopted as run {} of campaign {} under its "
+                 "head, so EXIT has a door to walk them out by and a row to close (#631)",
+                 leaderName, coord.runId, portal.insideMapId, coord.runNumber,
+                 coord.campaignId);
+    }
+
     void DriveDungeonRun()
     {
         // WHAT RELEASES A STAGING HOLD, AND IT IS THE PHASE RATHER THAN A LIST
@@ -30366,6 +30541,9 @@ private:
         // no leader is not driven: every step below needs one to aim, and that
         // is a roster-shape problem this drive cannot fix.
         std::vector<OverseerDecisions::FamilyRoster> const rosters = LoadFamilyRosters();
+        // Rebuilt below from this poll's coordinators, and empty when nothing
+        // is driven, so a stale phase can never keep a drive yielding (#631).
+        _familyRunPhaseByMember.clear();
         if (rosters.empty())
             return;   // no roster, or the read failed: nothing is decided on no evidence
         std::vector<OverseerDecisions::FamilyRoster const*> const driven =
@@ -30414,6 +30592,8 @@ private:
             for (OverseerDecisions::FamilyMember const& member : roster->members)
                 members.push_back(member.name);
             DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
+            for (std::string const& name : members)
+                _familyRunPhaseByMember[name] = _dungeonRunCoordinators[roster->family].phase;
             // Compared with what was last WRITTEN rather than with the state at
             // the top of this poll, so a change made anywhere between two polls
             // is still caught here.
@@ -30462,6 +30642,15 @@ private:
         // the town drive does not think is owed.
         {
             RunBagReading const bags = ReadRunBags(members);
+
+            // THE DOOR IS SHUT FOR AS LONG AS ANYBODY HAS NO ROOM (#631), asked
+            // without the EXIT exemption below: a family walking out for bag
+            // room is exactly the family that must not be let back in.
+            MarkFamilyBagHeld(family, members,
+                              OverseerDecisions::DungeonRunBagPressure(
+                                  bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo, false,
+                                  false) != OverseerDecisions::DungeonBagPressure::None);
+
             switch (OverseerDecisions::DungeonRunBagPressure(
                 bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
                 bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting))
@@ -30471,9 +30660,47 @@ private:
                     // later episode says so too rather than holding silently -
                     // the same discipline loggedCampaignOver follows.
                     coord.loggedBagHold = false;
+                    coord.loggedBagNoDoor = false;
                     break;
 
                 case OverseerDecisions::DungeonBagPressure::Evacuate:
+                {
+                    // WHO KNOWS THE DOOR, ASKED BEFORE EXIT IS SET (#631). An
+                    // IDLE coordinator has no portal: EXIT set here used to fall
+                    // back to IDLE on the next poll ("lost its portal ('')") and
+                    // be set again on the one after, every ten seconds, with
+                    // nobody walked anywhere. The run the family is standing in
+                    // is adopted first, so EXIT has a door and a row to close.
+                    Player* const inside = FirstMemberInsideARun(members);
+                    DungeonPortal const* const insidePortal =
+                        inside ? FindDungeonPortalByInsideMap(inside->GetMapId(),
+                                                              DungeonKeywordForJob(leaderJob))
+                               : nullptr;
+                    bool const knowsItsDoor = coord.phase != DungeonRunPhase::Idle &&
+                                              FindDungeonPortal(coord.portalKeyword) != nullptr;
+                    switch (OverseerDecisions::DungeonEvacuationStart(knowsItsDoor,
+                                                                       insidePortal != nullptr))
+                    {
+                        case OverseerDecisions::EvacuationStart::NoWayOut:
+                            if (!coord.loggedBagNoDoor)
+                            {
+                                coord.loggedBagNoDoor = true;
+                                LOG_WARN("module.overseer",
+                                         "overseer: family '{}' has no bag room and is inside "
+                                         "map {}, which has no portal row - there is no known "
+                                         "door to walk them out by, so the coordinator holds "
+                                         "at IDLE rather than setting EXIT with no door and "
+                                         "falling back every poll (#631)",
+                                         family,
+                                         inside ? inside->GetMapId() : 0u);
+                            }
+                            return;
+                        case OverseerDecisions::EvacuationStart::AdoptThenWalkOut:
+                            AdoptRunToEvacuate(coord, *insidePortal, members, leaderName);
+                            break;
+                        case OverseerDecisions::EvacuationStart::WalkOut:
+                            break;
+                    }
                     coord.evacuated = true;
                     coord.phase = DungeonRunPhase::Exiting;
                     coord.crossing.best = 0.f;
@@ -30488,6 +30715,7 @@ private:
                              "NOT spend a slot of the campaign, because it cleared nothing",
                              TOWN_TRIP_LIMITS.freeBagSlotsToGo);
                     return;
+                }
 
                 case OverseerDecisions::DungeonBagPressure::HoldOut:
                     // BACK TO IDLE, WHICH IS THE FIX AND NOT A TIDY-UP.
@@ -30666,6 +30894,10 @@ private:
                 // putting a number on a run nobody drove would be a claim about
                 // a series that never happened.
                 coord.runId = ActiveRunIdOnMap(inside->insideMapId);
+                // THE ROW NAMES THE HEAD FROM THE MOMENT IT IS ADOPTED (#631),
+                // not only when EXIT closes it: the arming drive opens a row
+                // under whichever member crossed first.
+                AlignRunLeader(coord.runId, leaderName);
                 ReadRunCampaign(coord.runId, coord.campaignId, coord.runNumber);
 
                 // The cap is re-read rather than inherited: the operator may
@@ -33456,6 +33688,11 @@ private:
             facts.available = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
                               bot->GetMap() && !bot->GetMap()->Instanceable();
             facts.columnFree = column.empty() || column == OverseerDecisions::RESPEC_AIM;
+            // A TALENT RESET IS A TRAINER TRIP, BELOW THE RUN AND ITS APPROACH
+            // (#631). It walks when the head is idle or in town, never over a
+            // run that is staging or inside.
+            facts.runOwnsTravel = !OverseerDecisions::HeadErrandMayTravel(
+                OverseerDecisions::HeadErrand::TrainerTrip, HeadTravelFactsFor(name));
             auto const missed = _respecMissedAt.find(name);
             if (missed != _respecMissedAt.end())
                 facts.sinceLastMiss = static_cast<uint32>(std::max<time_t>(0, now - missed->second));
@@ -48600,9 +48837,70 @@ private:
     bool _watchLoaded = false;
 };
 
+// THE DOOR STAYS SHUT WHILE THE FAMILY HAS NO BAG ROOM (#631).
+//
+// Measured on the dev realm: a family walked out of Zul'Farrak for bag room at
+// 21:52:29 was back inside at 21:52:35. The town trip aimed the head at a
+// vendor past the entrance, his client crossed the entrance trigger, and the
+// followers were taken to him on the instance map. A new run row opened under a
+// follower's name, the dungeon brain was armed, and the family was stuck inside
+// with every counter on another map.
+//
+// OnPlayerBeforeTeleport is the core's one gate in front of Player::TeleportTo,
+// which is where an areatrigger crossing and a bot's move to its master's map
+// both land. Refusing it is what a group that agreed to go to town first does
+// at the door: it does not go in. Only a held family, only onto a map with a
+// portal row, only an alive character this module steers.
+class OverseerDoorScript : public PlayerScript
+{
+public:
+    OverseerDoorScript() : PlayerScript("OverseerDoorScript", {
+        PLAYERHOOK_ON_BEFORE_TELEPORT,
+    }) {}
+
+    bool OnPlayerBeforeTeleport(Player* player, uint32 mapid, float /*x*/, float /*y*/,
+                                float /*z*/, float /*orientation*/, uint32 /*options*/,
+                                Unit* /*target*/) override
+    {
+        if (!OverseerWorldScript::DoorShutFor(player, mapid))
+            return true;
+        std::string const name = player->GetName();
+        bool sayIt = false;
+        {
+            // ONE ENTRY PER CHARACTER, holding the last map it was refused
+            // onto, so the record is bounded by the roster and a refusal onto
+            // a different map is still said.
+            std::lock_guard<std::mutex> guard(SaidLock());
+            auto const [it, fresh] = Said().try_emplace(name, mapid);
+            sayIt = fresh || it->second != mapid;
+            it->second = mapid;
+        }
+        if (sayIt)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was about to cross into dungeon map {} while its family "
+                     "'{}' has no bag room - the teleport is refused and the family goes to "
+                     "town first (#631). Said again only when it is refused onto another map",
+                     name, mapid, OverseerWorldScript::BagHeldFamilyOf(name));
+        return false;
+    }
+
+private:
+    static std::mutex& SaidLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+    static std::map<std::string, uint32>& Said()
+    {
+        static std::map<std::string, uint32> said;
+        return said;
+    }
+};
+
 void Addmod_overseerScripts()
 {
     new OverseerWorldScript();
     new OverseerChatScript();
     new OverseerEventScript();
+    new OverseerDoorScript();
 }
