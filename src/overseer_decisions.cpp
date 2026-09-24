@@ -2431,6 +2431,33 @@ std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing)
     return said;
 }
 
+LeftoverAim ReadLeftoverAim(LeftoverAimFacts const& facts)
+{
+    if (facts.target.rfind("at:", 0) != 0)
+        return LeftoverAim::NotAPoint;
+    if (facts.writtenHere)
+        return LeftoverAim::WrittenHere;
+    if (facts.leadsFamily)
+        return LeftoverAim::TheLeadersOwn;
+    return LeftoverAim::Release;
+}
+
+char const* LeftoverAimName(LeftoverAim verdict)
+{
+    switch (verdict)
+    {
+        case LeftoverAim::NotAPoint:
+            return "not a point aim";
+        case LeftoverAim::WrittenHere:
+            return "written by this process";
+        case LeftoverAim::TheLeadersOwn:
+            return "the leader's own walk";
+        case LeftoverAim::Release:
+            return "a follower's point nobody running wrote";
+    }
+    return "unknown";
+}
+
 MaintenanceHold DungeonRunMaintenanceHold(std::string const& leaderAim,
                                           unsigned outstandingErrands,
                                           time_t heldForSeconds,

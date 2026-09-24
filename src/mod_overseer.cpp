@@ -5201,6 +5201,24 @@ public:
         return it != _claimed.end() && it->second == target;
     }
 
+    // A POINT AIM THE PROCESS THAT WROTE IT TOOK WITH IT (#658). Cleared with a
+    // compare-and-swap on the aim itself, so a column somebody rewrote since
+    // the read is left alone, and synchronously, so the travel poll that asked
+    // reads the blank. `learn_skill` is not touched: a trainer trip it names
+    // is still walked, by its own writer. Everything this book held for the
+    // character goes with it, as in Release.
+    void ForgetLeftover(std::string const& name, std::string const& target)
+    {
+        CharacterDatabase.DirectExecute(
+            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND travel_npc = '{}'",
+            Esc(name), Esc(target));
+        _lastEnd[name] = ErrandEnd{"a point aim left from before this worldserver started (#658)",
+                                   false};
+        _landed.erase(name);
+        _claimed.erase(name);
+        _state.erase(name);
+    }
+
     // THIS TARGET KILLED THIS CHARACTER AND THE ERRAND WAS CALLED OFF FOR IT.
     // Recorded rather than merely released because this module is not the only
     // writer of the column: a release with no memory is undone by the next
@@ -20589,8 +20607,54 @@ private:
     // one of the three has done none of the job. The dungeon run coordinator
     // used to do exactly that in eight places; see that class for what it cost.
 
+    // THE FIRST TRAVEL POLL CLEARS WHAT A GONE PROCESS LEFT BEHIND (#658). See
+    // OverseerDecisions::ReadLeftoverAim. Once per process, before the first
+    // Load, because the only aims it can be wrong about are the ones written
+    // before this process started; every later aim this book writes it also
+    // remembers. Each point aim found is said once, whichever way it goes.
+    void SweepLeftoverAims()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, travel_npc, `lead` FROM overseer_roster "
+            "WHERE enabled = 1 AND travel_npc LIKE 'at:%'");
+        if (!result)
+            return;  // no point aims, or a schema without the columns
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            std::string const target = fields[1].Get<std::string>();
+            OverseerDecisions::LeftoverAimFacts facts;
+            facts.target = target;
+            facts.writtenHere = _travelAims.RunOwns(name, target);
+            facts.leadsFamily = fields[2].Get<uint8>() != 0;
+            OverseerDecisions::LeftoverAim const verdict = OverseerDecisions::ReadLeftoverAim(facts);
+            if (verdict == OverseerDecisions::LeftoverAim::Release)
+            {
+                _travelAims.ForgetLeftover(name, target);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' carried '{}' from before this worldserver started - "
+                         "{}. Cleared, so it is not walked to a place the family may have "
+                         "left hours ago; a catch-up aims it afresh at where its leader "
+                         "stands if it is still behind, and any trainer trip stays pending "
+                         "(#658)",
+                         name, target, OverseerDecisions::LeftoverAimName(verdict));
+            }
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' carried '{}' from before this worldserver started "
+                         "and it is kept - {} (#658)",
+                         name, target, OverseerDecisions::LeftoverAimName(verdict));
+        } while (result->NextRow());
+    }
+
     void DriveTravel()
     {
+        if (!_leftoverAimsSwept)
+        {
+            _leftoverAimsSwept = true;
+            SweepLeftoverAims();
+        }
         // THE SAME READ THE QUEST DRIVE'S ARBITRATION USES (infra#2846), so the
         // two can never be looking at different answers to "who is on an
         // errand". The WHERE clause that used to live here lives in the loader:
@@ -52870,6 +52934,9 @@ private:
     // style. Both drives reach the column through this and nothing else. World
     // thread only, like everything else on these loops.
     TravelAimBook _travelAims;
+    // Whether the first travel poll has cleared the point aims a previous
+    // process left in the roster (#658).
+    bool _leftoverAimsSwept = false;
     // The talent reset errand (#626). Who is walking to a class trainer for
     // one, and the tree the reset is for; when the last walk ended without a
     // reset; which reason not to walk was last said; and how many arrival polls
