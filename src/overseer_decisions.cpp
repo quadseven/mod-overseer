@@ -11681,8 +11681,10 @@ MailWalkRequest ParseMailWalkRequest(std::string const& command)
     {
         std::string const& word = words[1];
         float yards = 0.f;
+        // UP TO THE FAR CAP (#633). A cap past MAIL_WALK_MAX_YARDS is a row that
+        // lets the walk go far; whether it does is decided on the destination.
         if (word.compare(0, 4, "max:") != 0 || !MailWalkYards(word.substr(4), yards)
-            || yards <= 0.f || yards > MAIL_WALK_MAX_YARDS)
+            || yards <= 0.f || yards > FAR_WALK_MAX_YARDS)
         {
             request.error = MailWalkRefusal::Malformed;
             return request;
@@ -11828,17 +11830,21 @@ MailWalkState JudgeMailWalk(MailWalkFacts const& facts)
         return MailWalkState::LeftWorld;
     if (!facts.alive)
         return MailWalkState::Died;
-    if (facts.inFlight)
+    if (facts.inFlight && !facts.onFlightLeg)
         return MailWalkState::TookFlight;
     if (!facts.sameMap)
         return MailWalkState::LeftMap;
     if (facts.inCombat)
-        return MailWalkState::EnteredCombat;
+        return facts.combatMs < facts.combatAllowanceMs ? MailWalkState::Paused
+                                                        : MailWalkState::EnteredCombat;
+    if (facts.onFlightLeg)
+        return facts.waitedMs >= facts.timeoutMs ? MailWalkState::TimedOut
+                                                 : MailWalkState::Flying;
     if (facts.mailboxInReach)
         return MailWalkState::Arrived;
     if (facts.waitedMs >= facts.timeoutMs)
         return MailWalkState::TimedOut;
-    if (facts.sinceProgressMs >= MAIL_WALK_STALL_SECONDS * 1000u)
+    if (facts.sinceProgressMs >= facts.stallMs)
         return MailWalkState::Stalled;
     if (facts.groundRefusals >= MAIL_WALK_GROUND_REFUSALS_MAX)
         return MailWalkState::GroundRefused;
@@ -11859,6 +11865,8 @@ char const* MailWalkStateWord(MailWalkState state)
         case MailWalkState::TimedOut:      return "timed_out";
         case MailWalkState::Stalled:       return "stalled";
         case MailWalkState::GroundRefused: return "ground_refused";
+        case MailWalkState::Paused:        return "paused";
+        case MailWalkState::Flying:        return "flying";
     }
     return "walking";
 }
@@ -11878,6 +11886,8 @@ char const* MailWalkEndReason(MailWalkState state)
         case MailWalkState::TimedOut:      return R::TimedOut;
         case MailWalkState::Stalled:       return R::Stalled;
         case MailWalkState::GroundRefused: return R::GroundRefused;
+        case MailWalkState::Paused:        return "";
+        case MailWalkState::Flying:        return "";
     }
     return "";
 }
@@ -11912,7 +11922,7 @@ bool ErrandWalkId(std::string const& text, uint32_t& out)
 bool ErrandWalkCap(std::string const& text, float& out)
 {
     float yards = 0.f;
-    if (!MailWalkYards(text, yards) || yards <= 0.f || yards > ERRAND_WALK_MAX_YARDS)
+    if (!MailWalkYards(text, yards) || yards <= 0.f || yards > FAR_WALK_MAX_YARDS)
         return false;
     out = yards;
     return true;
@@ -12098,6 +12108,8 @@ char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state)
         case MailWalkState::TimedOut:      return trainer ? E::TrainerTimedOut : E::VendorTimedOut;
         case MailWalkState::Stalled:       return trainer ? E::TrainerStalled : E::VendorStalled;
         case MailWalkState::GroundRefused: return trainer ? E::TrainerGround : E::VendorGround;
+        case MailWalkState::Paused:        return "";
+        case MailWalkState::Flying:        return "";
     }
     return "";
 }
@@ -12136,6 +12148,86 @@ char const* TrainerVisitWord(TrainerVisitOutcome outcome)
         case TrainerVisitOutcome::TaughtNothing:  return "taught_nothing";
     }
     return "taught_nothing";
+}
+
+// ------------------------------------------ far walks for guild bots (#633) --
+
+float NearWalkCapYards(WalkGoal goal)
+{
+    return goal == WalkGoal::Mailbox ? MAIL_WALK_MAX_YARDS : ERRAND_WALK_MAX_YARDS;
+}
+
+bool IsFarWalk(WalkGoal goal, float yards)
+{
+    return yards > NearWalkCapYards(goal);
+}
+
+bool FarWalkMapAllowed(uint32_t mapId)
+{
+    return mapId == FAR_WALK_MAP_EASTERN_KINGDOMS || mapId == FAR_WALK_MAP_KALIMDOR;
+}
+
+uint32_t FarWalkTimeoutSeconds(float yards)
+{
+    if (!(yards > 0.f))
+        return MAIL_WALK_TIMEOUT_FLOOR_SECONDS;
+    float const seconds = static_cast<float>(MAIL_WALK_TIMEOUT_FLOOR_SECONDS)
+        + yards / MAIL_WALK_PACE_YARDS_PER_SECOND;
+    if (seconds >= static_cast<float>(FAR_WALK_TIMEOUT_CEILING_SECONDS))
+        return FAR_WALK_TIMEOUT_CEILING_SECONDS;
+    return static_cast<uint32_t>(seconds);
+}
+
+bool FarWalkRefusalRetryable(std::string const& reason)
+{
+    namespace F = FarWalkRefusal;
+    return reason == F::BotBudgetSpent || reason == F::RealmFull;
+}
+
+void PruneFarWalkStarts(std::vector<int64_t>& starts, int64_t now)
+{
+    std::vector<int64_t> kept;
+    kept.reserve(starts.size());
+    for (int64_t at : starts)
+        if (now - at < static_cast<int64_t>(FAR_WALK_BUDGET_WINDOW_SECONDS))
+            kept.push_back(at);
+    starts.swap(kept);
+}
+
+char const* FarWalkBudgetGate(std::vector<int64_t> const& startsForBot, int64_t now,
+                              uint32_t underWay)
+{
+    if (underWay >= FAR_WALKS_AT_ONCE)
+        return FarWalkRefusal::RealmFull;
+    uint32_t inWindow = 0;
+    for (int64_t at : startsForBot)
+        if (now - at < static_cast<int64_t>(FAR_WALK_BUDGET_WINDOW_SECONDS))
+            ++inWindow;
+    if (inWindow >= FAR_WALK_STARTS_PER_BOT)
+        return FarWalkRefusal::BotBudgetSpent;
+    return "";
+}
+
+bool FarWalkShouldMount(FarWalkMountFacts const& facts)
+{
+    if (!facts.far || facts.mounted || facts.casting || !facts.outdoors || facts.inCombat)
+        return false;
+    if (!(facts.yardsToGo > FAR_WALK_MOUNT_YARDS))
+        return false;
+    if (facts.tries >= FAR_WALK_MOUNT_TRIES)
+        return false;
+    // The first try waits for nothing; a later one waits out the retry clock,
+    // so a mount cast that failed is not asked again on every poll.
+    return facts.tries == 0 || facts.sinceLastTrySeconds >= FAR_WALK_MOUNT_RETRY_SECONDS;
+}
+
+bool FarWalkMayAskFlight(FarWalkFlightFacts const& facts)
+{
+    if (!facts.far || facts.askedThisStretch || !facts.carriesNewRpg || facts.grouped)
+        return false;
+    if (facts.flights >= FAR_WALK_FLIGHTS_MAX)
+        return false;
+    return facts.yardsToGo >= FAR_WALK_FLIGHT_MIN_YARDS;
 }
 
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,

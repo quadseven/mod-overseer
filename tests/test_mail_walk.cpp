@@ -101,7 +101,7 @@ void TheGrammarTakesOneOptionalCap()
     CheckText("the cap itself is allowed", atCap.error, "");
 
     char const* const bad[] = {
-        "walk-to-mailbox max:601",       // a row cannot raise the cap
+        "walk-to-mailbox max:20001",     // a row cannot raise the far cap (#633)
         "walk-to-mailbox max:0",
         "walk-to-mailbox max:-5",
         "walk-to-mailbox max:",
@@ -344,11 +344,16 @@ void AWalkEndsForTheRightReason()
     CheckText("a map change ends the walk", MailWalkEndReason(JudgeMailWalk(f)), R::LeftMap);
 
     // COMBAT OUTRANKS ARRIVAL. A character held at a mailbox through a fight is
-    // a character killed by the hold, so the hold comes off.
+    // a character killed by the hold, so the hold comes off; since #633 the walk
+    // pauses for the fight rather than ending, and ends only when the fighting
+    // outlasts its allowance.
     f = OnTheWay();
     f.inCombat = true;
     f.mailboxInReach = true;
-    CheckText("combat at the box ends the walk", MailWalkEndReason(JudgeMailWalk(f)),
+    CheckText("combat at the box pauses the walk", MailWalkStateWord(JudgeMailWalk(f)),
+              "paused");
+    f.combatMs = MAIL_WALK_COMBAT_PAUSE_SECONDS * 1000u;
+    CheckText("a fight past the allowance ends the walk", MailWalkEndReason(JudgeMailWalk(f)),
               R::EnteredCombat);
 
     // ARRIVAL OUTRANKS THE CLOCKS.

@@ -114,7 +114,7 @@ void TheTrainerGrammar()
         "walk-to-trainer skill:197 learn:1,,2",
         "walk-to-trainer skill:197 learn:5,5",        // a repeat is a planner bug
         "walk-to-trainer skill:197 learn:1,2,3,4,5,6,7,8,9",
-        "walk-to-trainer skill:197 max:1001",         // a row cannot raise the cap
+        "walk-to-trainer skill:197 max:20001",        // a row cannot raise the far cap
         "walk-to-trainer skill:197 max:0",
         "walk-to-trainer skill:197 at:1:2,3,4",
         "walk-to-trainer skill:4294967296",
@@ -153,7 +153,7 @@ void TheVendorGrammar()
         "walk-to-vendor item:thread",
         "walk-to-vendor entry:14341",
         "walk-to-vendor item:1 item:2",
-        "walk-to-vendor item:1 max:2000",
+        "walk-to-vendor item:1 max:20001",
         "walk-to-vendor item:1 count:3",
     };
     for (char const* row : bad)
