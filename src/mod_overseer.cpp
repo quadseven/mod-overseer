@@ -28090,6 +28090,13 @@ private:
         std::time_t summonRowSince{0};
         bool summonWalkedIn{false};
         std::string summonSaid;
+        // A guild warlock may be outside the five-character family. When the
+        // party is full, one family member already at the door is swapped out
+        // for the ritual and restored after the existing summon row finishes.
+        std::string ritualSummoner;
+        std::string ritualSwapOut;
+        bool ritualSwapActive{false};
+        bool ritualSummonerAdded{false};
         // THE DUNGEON FINDER RUNG (RunRecovery::DungeonFinder): whether the
         // family was queued, when, for which finder dungeon, and which proposal
         // each member has already been answered for.
@@ -32524,6 +32531,10 @@ private:
             coord.summonRowSince = 0;
             coord.summonWalkedIn = false;
             coord.summonSaid.clear();
+            coord.ritualSummoner.clear();
+            coord.ritualSwapOut.clear();
+            coord.ritualSwapActive = false;
+            coord.ritualSummonerAdded = false;
             coord.finderJoined = false;
             coord.finderSince = 0;
             coord.finderDungeonId = 0;
@@ -32736,6 +32747,8 @@ private:
             return;
         }
 
+        if (coord.recovery == OverseerDecisions::RunRecovery::Summon)
+            RestoreRitualSummoner(coord, ObjectAccessor::FindPlayerByName(leaderName));
         LOG_INFO("module.overseer",
                  "overseer: RECOVERING ends for '{}' - '{}' {} after {}s; run {} of campaign "
                  "{} is attempted again from REPAIRING",
@@ -32862,6 +32875,141 @@ private:
     // first (the town, then the approach, with no staging clock), then an `at:`
     // aim at the stone's own spawn. The family follows him as it always does,
     // and the summon is for whoever does not arrive with him.
+    static bool RecoverySummonerPoolAllows()
+    {
+        return sConfigMgr->GetOption<std::string>("Overseer.Recovery.SummonerPool",
+                                                   "any guild warlock") ==
+               "any guild warlock";
+    }
+
+    static OverseerDecisions::RitualSummonerChoice ChooseRecoverySummoner(
+        Player* leader, std::vector<std::string> const& members)
+    {
+        OverseerDecisions::RitualSummonerChoice none;
+        none.why = "Overseer.Recovery.SummonerPool does not allow the default guild-warlock pool";
+        if (!leader || !RecoverySummonerPoolAllows() || !leader->GetGuildId())
+            return none;
+
+        std::set<std::string> family(members.begin(), members.end());
+        family.insert(leader->GetName());
+        std::vector<OverseerDecisions::RitualSummonerCandidate> candidates;
+        QueryResult rows = CharacterDatabase.Query(
+            "SELECT c.name FROM guild_member gm JOIN characters c ON c.guid = gm.guid "
+            "WHERE gm.guildid = {} AND c.class = 9 ORDER BY c.name",
+            leader->GetGuildId());
+        if (!rows)
+            return none;
+        do
+        {
+            std::string const name = rows->Fetch()[0].Get<std::string>();
+            OverseerDecisions::RitualSummonerCandidate candidate;
+            candidate.name = name;
+            candidate.guildMember = true;
+            candidate.warlock = true;
+            candidate.inFamily = family.count(name) != 0;
+            Player* const warlock = ObjectAccessor::FindPlayerByName(name);
+            if (warlock && warlock->IsInWorld())
+            {
+                candidate.inWorld = true;
+                candidate.alive = warlock->IsAlive();
+                candidate.inCombat = warlock->IsInCombat();
+                candidate.knowsRitual = warlock->HasSpell(698);
+                candidate.carriesSoulShard = warlock->GetItemCount(6265, false) > 0;
+            }
+            candidates.push_back(candidate);
+        } while (rows->NextRow());
+        return OverseerDecisions::ChooseRitualSummoner(candidates);
+    }
+
+    // Keep a five-person run a party. The core has no reversible
+    // ConvertToParty, so a sixth ritual participant is admitted by swapping
+    // out a family member already at the door, then restoring that member when
+    // the existing kind='summon' row reaches a verdict.
+    static bool PrepareRitualSummoner(DungeonRunCoordinatorState& coord,
+                                      Player* leader, std::vector<std::string> const& members,
+                                      GameObjectData const* stone,
+                                      std::string const& summoner)
+    {
+        Player* const warlock = ObjectAccessor::FindPlayerByName(summoner);
+        Group* const group = leader ? leader->GetGroup() : nullptr;
+        if (!warlock || !group || group->isRaidGroup())
+            return false;
+        if (warlock->GetGroup() == group)
+        {
+            coord.ritualSummoner = summoner;
+            coord.ritualSummonerAdded = false;
+            return true;
+        }
+        if (warlock->GetGroup())
+            return false;
+
+        Player* swapOut = nullptr;
+        if (group->IsFull())
+        {
+            for (std::string const& name : members)
+            {
+                if (name == leader->GetName())
+                    continue;
+                Player* const member = ObjectAccessor::FindPlayerByName(name);
+                if (member && member->GetGroup() == group && member->IsInWorld() && stone &&
+                    member->GetMapId() == stone->mapid && member->GetInstanceId() == 0 &&
+                    member->GetExactDist2d(stone->posX, stone->posY) <=
+                        OverseerDecisions::SUMMON_RUNG_AT_STONE_YARDS)
+                {
+                    swapOut = member;
+                    break;
+                }
+            }
+            if (!swapOut)
+                return false;
+            swapOut->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+            if (swapOut->GetGroup())
+                return false;
+            coord.ritualSwapOut = swapOut->GetName();
+            coord.ritualSwapActive = true;
+        }
+        if (!group->AddMember(warlock))
+        {
+            if (swapOut)
+                group->AddMember(swapOut);
+            coord.ritualSwapOut.clear();
+            coord.ritualSwapActive = false;
+            return false;
+        }
+        coord.ritualSummoner = summoner;
+        coord.ritualSummonerAdded = true;
+        LOG_INFO("module.overseer",
+                 "overseer: ritual recovery temporarily swaps '{}' out of the party for guild "
+                 "warlock '{}' instead of converting the five-person run to a raid",
+                 swapOut ? swapOut->GetName() : "nobody", summoner);
+        return true;
+    }
+
+    static void RestoreRitualSummoner(DungeonRunCoordinatorState& coord, Player* leader)
+    {
+        if (!leader || coord.ritualSummoner.empty())
+            return;
+        Group* const group = leader->GetGroup();
+        Player* const warlock = ObjectAccessor::FindPlayerByName(coord.ritualSummoner);
+        if (group && warlock && coord.ritualSummonerAdded && warlock->GetGroup() == group)
+            warlock->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+        if (group && coord.ritualSwapActive)
+        {
+            Player* const swapOut = ObjectAccessor::FindPlayerByName(coord.ritualSwapOut);
+            if (swapOut && !swapOut->GetGroup())
+                group->AddMember(swapOut);
+        }
+        if (group)
+            group->SendUpdate();
+        LOG_INFO("module.overseer", "overseer: ritual recovery restored the dungeon party after "
+                                    "guild warlock '{}' finished summoning",
+                 coord.ritualSummoner);
+        coord.ritualSummoner.clear();
+        coord.ritualSwapOut.clear();
+        coord.ritualSwapActive = false;
+        coord.ritualSummonerAdded = false;
+    }
+
     bool DriveSummonRung(DungeonRunCoordinatorState& coord, std::string const& leaderName,
                          Player* leader, bool leaderSteerable,
                          std::vector<std::string> const& members, DungeonPortal const& portal,
@@ -32904,6 +33052,7 @@ private:
                                             OverseerDecisions::SUMMON_RUNG_ROW_CEILING_SECONDS) +
                                         "s",
                          tries, OverseerDecisions::SUMMON_RUNG_TRIES_PER_MEMBER);
+            RestoreRitualSummoner(coord, leader);
             coord.summonRowSource.clear();
             coord.summonRowTarget.clear();
             coord.summonRowSince = 0;
@@ -32935,7 +33084,59 @@ private:
             }
             family.push_back(m);
         }
-        OverseerDecisions::SummonRungPlan const plan = OverseerDecisions::PlanSummonRung(family);
+        std::string ritualSummoner;
+        if (leader && leader->GetMapId() == stone->mapid && leader->GetInstanceId() == 0 &&
+            leader->GetExactDist2d(stone->posX, stone->posY) <=
+                OverseerDecisions::SUMMON_RUNG_AT_STONE_YARDS)
+        {
+            OverseerDecisions::RitualSummonerChoice const choice =
+                ChooseRecoverySummoner(leader, members);
+            if (choice.name.empty())
+            {
+                doneWhy = "no natural guild warlock is online with Ritual of Summoning and a Soul "
+                          "Shard (" + choice.why + ")";
+                if (coord.summonSaid != "ritual unavailable: " + choice.why)
+                {
+                    coord.summonSaid = "ritual unavailable: " + choice.why;
+                    LOG_WARN("module.overseer", "overseer: summon rung for '{}' cannot use a "
+                                               "ritual - {}", leaderName, choice.why);
+                }
+                return true;
+            }
+            if (!PrepareRitualSummoner(coord, leader, members, stone, choice.name))
+            {
+                doneWhy = "the selected guild warlock cannot join the party without a raid conversion";
+                return false;
+            }
+            ritualSummoner = coord.ritualSummoner;
+            for (OverseerDecisions::SummonRungMember& m : family)
+                if (m.name == coord.ritualSwapOut)
+                {
+                    m.inWorld = false;
+                    m.atStone = false;
+                }
+            if (ritualSummoner != leaderName)
+            {
+                OverseerDecisions::SummonRungMember m;
+                m.name = ritualSummoner;
+                m.inWorld = true;
+                m.alive = true;
+                m.summonable = false;
+                Player* const warlock = ObjectAccessor::FindPlayerByName(ritualSummoner);
+                if (warlock)
+                {
+                    m.atStone = warlock->GetMapId() == stone->mapid &&
+                                warlock->GetInstanceId() == 0 &&
+                                warlock->GetExactDist2d(stone->posX, stone->posY) <=
+                                    OverseerDecisions::SUMMON_RUNG_AT_STONE_YARDS;
+                    m.inCombat = warlock->IsInCombat();
+                }
+                family.push_back(m);
+            }
+        }
+        OverseerDecisions::SummonRungPlan const plan =
+            OverseerDecisions::PlanSummonRung(family, OverseerDecisions::SUMMON_RUNG_TRIES_PER_MEMBER,
+                                               ritualSummoner);
         std::string const said =
             std::string(OverseerDecisions::SummonRungStepWord(plan.step)) + ": " + plan.why;
         bool const changed = said != coord.summonSaid;
@@ -32953,9 +33154,11 @@ private:
         switch (plan.step)
         {
             case OverseerDecisions::SummonRungStep::Done:
+                RestoreRitualSummoner(coord, leader);
                 doneWhy = "every member stands at the meeting stone";
                 return true;
             case OverseerDecisions::SummonRungStep::NobodyLeft:
+                RestoreRitualSummoner(coord, leader);
                 doneWhy = "nobody left away from the meeting stone can be summoned";
                 return true;
             case OverseerDecisions::SummonRungStep::WaitForClickers:

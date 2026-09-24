@@ -321,6 +321,17 @@
 #        Default:     3
 #
 #Overseer.Recovery.SummonAfterFailures = 3
+
+#    Overseer.Recovery.SummonerPool
+#        Description: The naturally earned guild characters eligible to drive a
+#                     Ritual of Summoning recovery. The default accepts any
+#                     guild warlock, but still requires the live character to
+#                     know Ritual of Summoning and carry a real Soul Shard.
+#                     No spell, item, or character is granted by this rung.
+#
+#        Default:     any guild warlock
+#
+#Overseer.Recovery.SummonerPool = any guild warlock
 #
 #    Overseer.Recovery.DungeonFinder
 #        Description: May the LAST rung queue the family in the dungeon finder.
