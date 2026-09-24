@@ -16586,6 +16586,32 @@ char const* GhostRecoveryWord(GhostRecovery choice);
 // A sentence fragment saying why, for the log line.
 char const* GhostRecoveryReasonText(GhostRecoveryReason reason);
 
+// ----------------------------- a seasonal spawn is not a destination (#686) --
+//
+// THE CORE PUTS AN EVENT'S SPAWNS IN THE WORLD ONLY WHILE THE EVENT RUNS.
+// ObjectMgr::LoadCreatures adds a spawn to its grid only when no game event
+// manages it, and GameEventMgr spawns and despawns the rest as their events
+// start and stop. The travel index read every spawn in the table, so a walk
+// could be aimed at a spot where nothing stands. Measured on the dev realm on
+// 2026-09-24: the Horde head walked three times for his talent reset to
+// creature 26332, an Arena Tournament "Warrior Trainer" (event 31, never
+// running here), and found nobody each time; 1,310 service spawns on the realm
+// belong to events.
+//
+// THE SLOT LAYOUT IS THE CORE'S (GameEventMgr.cpp, LoadEventCreatureData):
+// GameEventCreatureGuids has `2 * eventCount - 1` lists, and event `e` (a
+// signed game_event_creature.eventEntry) is kept in list `eventCount + e - 1`,
+// where `eventCount` is the size of the event map. A positive event's spawns
+// stand only while it runs; a negative event's are taken out while it runs.
+
+// The signed event a slot of GameEventCreatureGuids holds, or 0 for the one
+// slot no event uses (and for a slot past the end).
+int32_t GameEventOfSlot(uint32_t slot, uint32_t eventCount);
+
+// Is a spawn of `gameEvent` (0 for none) in the world while that event's
+// running state is `eventActive`?
+bool SpawnStandsNow(int32_t gameEvent, bool eventActive);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

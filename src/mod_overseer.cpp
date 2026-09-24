@@ -209,6 +209,7 @@
 #include "Corpse.h"
 #include "Log.h"
 #include "DatabaseEnv.h"
+#include "GameEventMgr.h"
 #include "GameGraveyard.h"
 // GameTime::GetGameTime, for the one number the core wants alongside a fall
 // baseline. Every call site in the core that sets one passes this; the single
@@ -11548,6 +11549,41 @@ private:
         return mask;
     }
 
+    // THE GAME EVENT A CREATURE SPAWN BELONGS TO (#686), signed as
+    // game_event_creature writes it, or 0 for none. Read once from the core's
+    // own lists (GameEventMgr::GameEventCreatureGuids), whose slot layout
+    // OverseerDecisions::GameEventOfSlot states.
+    static int32 GameEventOfSpawn(ObjectGuid::LowType spawnId)
+    {
+        static std::unordered_map<ObjectGuid::LowType, int32> const bySpawn = [] {
+            std::unordered_map<ObjectGuid::LowType, int32> out;
+            auto const& lists = sGameEventMgr->GameEventCreatureGuids;
+            uint32 const eventCount = static_cast<uint32>(sGameEventMgr->GetEventMap().size());
+            for (uint32 slot = 0; slot < lists.size(); ++slot)
+            {
+                int32 const gameEvent = OverseerDecisions::GameEventOfSlot(slot, eventCount);
+                if (!gameEvent)
+                    continue;
+                for (ObjectGuid::LowType const spawnId : lists[slot])
+                    out.emplace(spawnId, gameEvent);
+            }
+            return out;
+        }();
+        auto const found = bySpawn.find(spawnId);
+        return found == bySpawn.end() ? 0 : found->second;
+    }
+
+    // IS A SPAWN OF THIS EVENT IN THE WORLD RIGHT NOW (#686)? Asked at every
+    // resolve rather than once at index time, because an event starts and
+    // stops while the worldserver runs.
+    static bool SpawnInWorldNow(int32 gameEvent)
+    {
+        if (!gameEvent)
+            return true;
+        uint16 const id = static_cast<uint16>(gameEvent < 0 ? -gameEvent : gameEvent);
+        return OverseerDecisions::SpawnStandsNow(gameEvent, sGameEventMgr->IsActiveEvent(id));
+    }
+
     // WHY AN INDEX AND NOT A QUERY, and why it is built here rather than in
     // Python. Three reasons, in order of how much they matter:
     //
@@ -11571,6 +11607,8 @@ private:
         if (_travelIndexBuilt)
             return;
         _travelIndexBuilt = true;
+
+        uint32 seasonal = 0;
 
         uint32 const wanted = TravelAnyFlag();
         for (auto const& itr : sObjectMgr->GetAllCreatureData())
@@ -11618,12 +11656,17 @@ private:
             spawn.z = data.posZ;
             spawn.npcFlags = npcFlags;
             spawn.faction = creatureTemplate->faction;
+            spawn.gameEvent = GameEventOfSpawn(itr.first);
+            if (spawn.gameEvent)
+                ++seasonal;
             _travelSpawns.push_back(spawn);
         }
 
         LOG_INFO("module.overseer",
-                 "overseer: travel index built - {} spawns the family can be sent to",
-                 static_cast<uint32>(_travelSpawns.size()));
+                 "overseer: travel index built - {} spawns the family can be sent to, {} "
+                 "of them standing only while a game event runs (or only while it does "
+                 "not), which are skipped whenever they are out of the world (#686)",
+                 static_cast<uint32>(_travelSpawns.size()), seasonal);
     }
 
     // Turn a roster value into a specific spawn near this character.
@@ -11810,6 +11853,8 @@ private:
                 {
                     if (spawn.mapId != node->map_id)
                         continue;
+                    if (!SpawnInWorldNow(spawn.gameEvent))
+                        continue;
                     if (!(spawn.npcFlags & UNIT_NPC_FLAG_FLIGHTMASTER))
                         continue;
                     if (!OverseerDecisions::FlightMasterAnswersForNode(
@@ -11910,6 +11955,10 @@ private:
         for (TravelSpawn const& spawn : _travelSpawns)
         {
             if (spawn.mapId != mapId)
+                continue;
+            // A SEASONAL SPAWN OUT OF SEASON IS NOBODY (#686): the walk would
+            // end on an empty spot and give the errand up.
+            if (!SpawnInWorldNow(spawn.gameEvent))
                 continue;
             if (wantedEntry)
             {
@@ -53252,6 +53301,9 @@ private:
             CreatureData const& data = itr.second;
             if (data.mapid != mapId || !(data.phaseMask & phase))
                 continue;
+            // Out of season, out of the world (#686).
+            if (!SpawnInWorldNow(GameEventOfSpawn(itr.first)))
+                continue;
             auto const found = serves.find(data.id);
             bool ok = false;
             if (found == serves.end())
@@ -54737,6 +54789,9 @@ private:
         // `creature` table carries no faction column - so the template is the
         // whole of the answer (#234).
         uint32 faction{0};
+        // The game event this spawn belongs to, signed as the world database
+        // writes it, or 0 (#686). See SpawnInWorldNow.
+        int32 gameEvent{0};
     };
     std::vector<TravelSpawn> _travelSpawns;
     bool _travelIndexBuilt = false;

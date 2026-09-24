@@ -14321,4 +14321,20 @@ char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
     return "unknown";
 }
 
+int32_t GameEventOfSlot(uint32_t slot, uint32_t eventCount)
+{
+    if (eventCount == 0 || slot >= 2 * eventCount - 1)
+        return 0;
+    return static_cast<int32_t>(slot) - static_cast<int32_t>(eventCount) + 1;
+}
+
+bool SpawnStandsNow(int32_t gameEvent, bool eventActive)
+{
+    if (gameEvent > 0)
+        return eventActive;
+    if (gameEvent < 0)
+        return !eventActive;
+    return true;
+}
+
 }  // namespace OverseerDecisions
