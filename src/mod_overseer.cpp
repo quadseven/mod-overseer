@@ -6105,6 +6105,9 @@ public:
             // its points spent before the strategies are asked about (#626).
             KeepTankStrategies();
             DriveRespec();
+            // After the respec, which claims the same column for its own
+            // trainer walk and is asked first (#688).
+            DriveTrainingStop();
         }
         if (_questTimer >= QUEST_POLL_MS)
         {
@@ -21894,6 +21897,23 @@ private:
                             ReleaseInnHold(name,
                                            "the bind was refused where it stands, so "
                                            "standing there is not what gets it bound");
+                    }
+                }
+                // A TRAINING STOP'S LEG ENDS AT ITS TRAINER (#688), asked
+                // before the talent reset and the learn branch below: the head
+                // was walked here for a member's learn, and running the head's
+                // own learn plan against this trainer would drop it when the
+                // trainer does not teach it.
+                else if (auto const stopLeg = _trainingStopLegs.find(name);
+                         stopLeg != _trainingStopLegs.end() &&
+                         target == std::to_string(stopLeg->second.entry))
+                {
+                    if (TeachAtTrainingStop(stopLeg->second))
+                    {
+                        _trainingStopLegs.erase(stopLeg);
+                        _travelAims.Release(name,
+                                            "the travel drive (training stop leg done on arrival)");
+                        continue;
                     }
                 }
                 // A LEARN AIM IS NOT ANSWERED BY AN ARRIVAL IT WAS NOT ABOUT
@@ -39371,6 +39391,284 @@ private:
         return true;
     }
 
+    // ------------------------------------- a training stop in town (#688) --
+    //
+    // A FAMILY WHOSE CAMPAIGN IS ARMED NEVER REACHED A TRAINER. The bridge
+    // walks a learn by handing the trainee the lead (tradechoice.next_lead),
+    // and while a campaign is armed the lead is the campaign's leader, so the
+    // learn trips wait for the campaign (quadseven/wow-overseer#44). On the dev
+    // realm on 2026-09-24 the Horde family's ten learns had waited 32 hours in
+    // Orgrimmar, every trainer they needed within 640 yards.
+    //
+    // THE HEAD KEEPS THE LEAD AND WALKS THE FAMILY TO EACH TRAINER IN TURN.
+    // The members follow him, and at each trainer every member standing there
+    // with a learn it teaches buys it through TrainOnArrival, the purchase a
+    // learn trip ends in. OverseerDecisions::PickTrainingStopLeg decides the
+    // next leg and when the stop ends; this reads the world for it and walks.
+
+    struct TrainingStopLegState
+    {
+        uint32 entry{0};                   // the trainer the head was aimed at
+        std::string forMember;             // whose learn the leg was walked for
+        std::vector<std::string> members;  // who was with the head when it set off
+        uint32 reachPolls{0};              // polls spent waiting at the trainer
+    };
+    struct TrainingStopState
+    {
+        time_t openedAt{0};                // the stop's first leg; 0 when none is open
+        time_t endedAt{0};                 // when the last stop ended; 0 when none has
+        std::set<std::string> walked;      // members already walked for in this stop
+        std::set<std::string> retried;     // members whose leg was cut short once already
+        OverseerDecisions::TrainingStopStep said{OverseerDecisions::TrainingStopStep::Walk};
+        bool saidAny{false};
+    };
+
+    // Read on the train poll after DriveRespec.
+    void DriveTrainingStop()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, family, lead, job, learn_skill FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        struct Row
+        {
+            std::string name;
+            bool lead{false};
+            std::string job;
+            uint32 learnSkill{0};
+        };
+        std::map<std::string, std::vector<Row>> families;
+        do
+        {
+            Field* fields = result->Fetch();
+            Row row;
+            row.name = fields[0].Get<std::string>();
+            row.lead = fields[2].Get<uint8>() != 0;
+            row.job = fields[3].Get<std::string>();
+            row.learnSkill = fields[4].Get<uint16>();
+            families[fields[1].Get<std::string>()].push_back(row);
+        } while (result->NextRow());
+
+        time_t const now = std::time(nullptr);
+        for (auto& [family, rows] : families)
+        {
+            auto const headRow = std::find_if(rows.begin(), rows.end(),
+                                              [](Row const& row) { return row.lead; });
+            if (headRow == rows.end())
+                continue;
+            std::string const headName = headRow->name;
+            std::string const headJob = headRow->job;
+            Player* head = ObjectAccessor::FindPlayerByName(headName);
+            if (!SteerableAI(head))
+                continue;
+
+            TrainingStopState& stop = _trainingStops[headName];
+            std::string const column = TravelAimBook::CurrentTravelNpc(headName);
+
+            // A LEG STILL WALKING IS THE TRAVEL DRIVE'S, which answers the
+            // arrival. A leg whose aim has left the column without that answer
+            // was ended by something else (the backstop, a death, a run's
+            // claim), and the stop goes on to the next member.
+            auto const walking = _trainingStopLegs.find(headName);
+            if (walking != _trainingStopLegs.end())
+            {
+                if (column == std::to_string(walking->second.entry))
+                    continue;
+                LOG_INFO("module.overseer",
+                         "overseer: {}'s training stop walk to creature {} for '{}' ended "
+                         "before the trainer ({}) - the stop goes on to its next leg",
+                         family, walking->second.entry, walking->second.forMember,
+                         column.empty() ? std::string("the column was cleared")
+                                        : "the column now holds '" + column + "'");
+                // A LEG CUT SHORT IS NOT A LEG WALKED, once. A takeover, a
+                // death or the backstop gives the member one more leg in this
+                // stop; a second cut ends its turn, so one trainer the world
+                // keeps refusing cannot hold the stop.
+                if (stop.retried.insert(walking->second.forMember).second)
+                    stop.walked.erase(walking->second.forMember);
+                _trainingStopLegs.erase(walking);
+            }
+
+            OverseerDecisions::TrainingStopFacts facts;
+            facts.campaignArmed = IsDungeonJob(headJob) || OverseerDecisions::HoldsInTown(headJob);
+            facts.head = HeadTravelFactsFor(headName);
+            facts.columnFree = column.empty();
+            if (stop.openedAt)
+                facts.stopSeconds =
+                    static_cast<uint32>(std::max<time_t>(1, now - stop.openedAt));
+            if (stop.endedAt)
+                facts.sinceLastStop =
+                    static_cast<uint32>(std::max<time_t>(0, now - stop.endedAt));
+
+            // THE HEAD FIRST when he has a learn of his own, then the others by
+            // name, which is the order PickTrainingStopLeg walks them in.
+            std::stable_sort(rows.begin(), rows.end(), [](Row const& a, Row const& b) {
+                return a.lead != b.lead ? a.lead : a.name < b.name;
+            });
+            std::vector<OverseerDecisions::TrainingStopMember> members;
+            std::vector<uint32> trainers;
+            for (Row const& row : rows)
+            {
+                if (!row.learnSkill)
+                    continue;
+                OverseerDecisions::TrainingStopMember member;
+                member.name = row.name;
+                member.learnSkill = row.learnSkill;
+                member.walkedThisStop = stop.walked.count(row.name) != 0;
+                Player* bot = row.name == headName ? head : ObjectAccessor::FindPlayerByName(row.name);
+                member.withTheHead = SteerableAI(bot) && bot->IsAlive() &&
+                                     bot->GetMapId() == head->GetMapId() &&
+                                     (bot == head || bot->GetExactDist2d(head) <=
+                                                         OverseerDecisions::TRAINING_STOP_WITH_HEAD_YARDS);
+                uint32 trainer = 0;
+                // The spawn search only for a member the pick could walk for.
+                if (facts.campaignArmed && member.withTheHead && !member.walkedThisStop)
+                {
+                    WorldPosition where;
+                    if (ResolveTravelTarget(bot, "profession trainer", trainer, where, row.learnSkill))
+                        member.trainerYards =
+                            head->GetExactDist2d(where.GetPositionX(), where.GetPositionY());
+                    else
+                        trainer = 0;
+                }
+                members.push_back(member);
+                trainers.push_back(trainer);
+            }
+
+            OverseerDecisions::TrainingStopLeg const pick =
+                OverseerDecisions::PickTrainingStopLeg(facts, members);
+            if (OverseerDecisions::TrainingStopEnds(pick.step, stop.openedAt != 0))
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: {}'s training stop ends after {}s with {} leg(s) walked - "
+                         "{}. The next may start in {} minutes",
+                         family, facts.stopSeconds, static_cast<uint32>(stop.walked.size()),
+                         OverseerDecisions::TrainingStopStepWord(pick.step),
+                         OverseerDecisions::TRAINING_STOP_REST_SECONDS / 60);
+                stop.openedAt = 0;
+                stop.endedAt = now;
+                stop.walked.clear();
+                stop.retried.clear();
+                stop.saidAny = false;
+                continue;
+            }
+
+            if (pick.step == OverseerDecisions::TrainingStopStep::Walk)
+            {
+                OverseerDecisions::TrainingStopMember const& member = members[pick.member];
+                uint32 const entry = trainers[pick.member];
+                if (!_travelAims.Claim(headName, std::to_string(entry),
+                                       OverseerDecisions::TravelOwner::TrainingStop))
+                    continue;   // Claim has said why, once
+                bool const opening = stop.openedAt == 0;
+                if (opening)
+                    stop.openedAt = now;
+                stop.walked.insert(member.name);
+                stop.saidAny = false;
+                TrainingStopLegState leg;
+                leg.entry = entry;
+                leg.forMember = member.name;
+                for (OverseerDecisions::TrainingStopMember const& other : members)
+                    if (other.withTheHead)
+                        leg.members.push_back(other.name);
+                _trainingStopLegs[headName] = leg;
+                CreatureTemplate const* trainerTemplate = sObjectMgr->GetCreatureTemplate(entry);
+                LOG_INFO("module.overseer",
+                         "overseer: TRAINING STOP for {} {} - '{}' walks the family {:.0f} "
+                         "yards to '{}' (creature {}) so '{}' can learn {} ({}). {}, and "
+                         "'{}' keeps the lead",
+                         family, opening ? "opens" : "goes on", headName, member.trainerYards,
+                         trainerTemplate ? trainerTemplate->Name : std::string("a trainer"),
+                         entry, member.name, SkillName(member.learnSkill), member.learnSkill,
+                         facts.head.bagBlocked
+                             ? "The campaign holds the family in town for bag room"
+                             : facts.head.campaignBetweenAttempts
+                                   ? "The campaign is between attempts"
+                                   : "The campaign is armed and not staging",
+                         headName);
+                continue;
+            }
+
+            // SAID ONCE PER REASON, and not at all for the two ordinary states:
+            // no campaign (the bridge's learn trips walk) and nothing to learn.
+            if (pick.step == OverseerDecisions::TrainingStopStep::NotACampaign ||
+                pick.step == OverseerDecisions::TrainingStopStep::NothingToLearn)
+                continue;
+            if (stop.saidAny && stop.said == pick.step)
+                continue;
+            stop.saidAny = true;
+            stop.said = pick.step;
+            LOG_INFO("module.overseer",
+                     "overseer: {} has learns outstanding and no training stop leg walks yet "
+                     "- {}", family, OverseerDecisions::TrainingStopStepWord(pick.step));
+        }
+    }
+
+    // The head has reached the trainer of a training stop leg: every member
+    // who set off with him and whose learn this trainer teaches buys it here.
+    //
+    // THE MEMBERS ARRIVE BY FOLLOWING, a few yards behind, so a member not yet
+    // within TRAVEL_ARRIVED_YARDS of the trainer is waited for up to
+    // TRAINING_STOP_REACH_POLLS polls before the others buy without it.
+    // TrainOnArrival is asked only of a member this trainer can teach, so its
+    // "cannot teach" branch, which drops the learn, is never reached from here.
+    //
+    // Returns true when the leg is over and false while it waits.
+    bool TeachAtTrainingStop(TrainingStopLegState& leg)
+    {
+        Trainer::Trainer* trainer = sObjectMgr->GetTrainer(leg.entry);
+        std::map<std::string, ProfessionPlan> const plans = LoadProfessionPlans();
+        std::vector<std::pair<std::string, Player*>> learners;
+        std::vector<std::string> away;
+        for (std::string const& name : leg.members)
+        {
+            auto const plan = plans.find(name);
+            if (plan == plans.end() || !plan->second.learnSkill)
+                continue;
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(bot) || !bot->IsAlive())
+                continue;
+            if (!trainer || !trainer->IsTrainerValidForPlayer(bot) ||
+                !TrainerSpellForSkill(trainer, bot, plan->second.learnSkill))
+                continue;
+            if (!bot->FindNearestCreature(leg.entry, TRAVEL_ARRIVED_YARDS))
+            {
+                away.push_back(name);
+                continue;
+            }
+            learners.emplace_back(name, bot);
+        }
+        if (!away.empty() && ++leg.reachPolls < OverseerDecisions::TRAINING_STOP_REACH_POLLS)
+            return false;
+
+        uint32 learned = 0;
+        for (auto const& [name, bot] : learners)
+        {
+            bool const held = bot->HasSkill(plans.at(name).learnSkill);
+            uint32 const before = static_cast<uint32>(bot->GetPureMaxSkillValue(plans.at(name).learnSkill));
+            TrainOnArrival(name, bot, leg.entry, plans.at(name));
+            uint32 const skill = plans.at(name).learnSkill;
+            if (held ? static_cast<uint32>(bot->GetPureMaxSkillValue(skill)) > before
+                     : bot->HasSkill(skill))
+                ++learned;
+        }
+        std::string awayList;
+        for (std::string const& name : away)
+            awayList += (awayList.empty() ? "" : ", ") + name;
+        LOG_INFO("module.overseer",
+                 "overseer: training stop leg at creature {} for '{}' is over - {} of {} "
+                 "member(s) this trainer could teach learned here{}",
+                 leg.entry, leg.forMember, learned,
+                 static_cast<uint32>(learners.size() + away.size()),
+                 away.empty() ? std::string()
+                              : "; not within " + std::to_string(static_cast<uint32>(TRAVEL_ARRIVED_YARDS)) +
+                                    " yards of the trainer after " +
+                                    std::to_string(OverseerDecisions::TRAINING_STOP_REACH_POLLS) +
+                                    " polls: " + awayList);
+        return true;
+    }
+
     // Put the tank strategies on a character whose talents are in a tank tree.
     //
     // WHY THIS IS NEEDED AFTER A RESET. mod-playerbots chooses a bot's combat
@@ -54828,6 +55126,10 @@ private:
     std::map<std::string, time_t> _respecMissedAt;
     std::map<std::string, OverseerDecisions::RespecStep> _respecSaid;
     std::map<std::string, uint32> _respecReachTries;
+    // The training stop (#688), keyed by the family head's name: the stop
+    // itself, and the one leg it is walking.
+    std::map<std::string, TrainingStopState> _trainingStops;
+    std::map<std::string, TrainingStopLegState> _trainingStopLegs;
     // Who has been told once that the tank strategies would not take.
     std::set<std::string> _tankStrategyRefused;
 

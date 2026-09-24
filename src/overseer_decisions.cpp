@@ -2527,6 +2527,7 @@ bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner)
         case TravelOwner::Run:
         case TravelOwner::WalkBackIn:
         case TravelOwner::Respec:
+        case TravelOwner::TrainingStop:
             return true;
         case TravelOwner::HomeErrand:
             return false;
@@ -2544,6 +2545,7 @@ bool TravelOwnerIsALiveRun(TravelOwner owner)
         case TravelOwner::HomeErrand:
         case TravelOwner::CatchUp:
         case TravelOwner::Respec:
+        case TravelOwner::TrainingStop:
             return false;
     }
     return false;
@@ -14012,9 +14014,9 @@ bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts)
         return who == HeadErrand::ActiveRun || who == HeadErrand::CampaignApproach;
     }
     // Between attempts of an armed campaign, a trainer trip goes only to a
-    // trainer in the town the head stands in. Unmeasured is not near.
+    // trainer in the town the head stands in (#688). Unmeasured is not near.
     if (facts.campaignBetweenAttempts && who == HeadErrand::TrainerTrip)
-        return facts.trainerYards >= 0.f && facts.trainerYards <= TOWN_STOP_NEAR_YARDS;
+        return facts.trainerYards >= 0.f && facts.trainerYards <= TRAINING_STOP_YARDS;
     if (facts.hearthRegroup && who == HeadErrand::Other)
         return false;
     return true;
@@ -14335,6 +14337,103 @@ bool SpawnStandsNow(int32_t gameEvent, bool eventActive)
     if (gameEvent < 0)
         return !eventActive;
     return true;
+}
+
+TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
+                                    std::vector<TrainingStopMember> const& members)
+{
+    TrainingStopLeg leg;
+    if (!facts.campaignArmed)
+    {
+        leg.step = TrainingStopStep::NotACampaign;
+        return leg;
+    }
+    bool anyLearn = false;
+    for (TrainingStopMember const& member : members)
+        anyLearn = anyLearn || (member.learnSkill != 0 && !member.walkedThisStop);
+    if (!anyLearn)
+    {
+        leg.step = TrainingStopStep::NothingToLearn;
+        return leg;
+    }
+    // The trainer distance is each member's own; the run's state is the
+    // family's, so it is asked once with the town radius standing in.
+    HeadTravelFacts head = facts.head;
+    head.trainerYards = 0.f;
+    if (!HeadErrandMayTravel(HeadErrand::TrainerTrip, head))
+    {
+        leg.step = TrainingStopStep::RunOwnsTravel;
+        return leg;
+    }
+    if (facts.stopSeconds == 0 && facts.sinceLastStop < TRAINING_STOP_REST_SECONDS)
+    {
+        leg.step = TrainingStopStep::Resting;
+        return leg;
+    }
+    if (facts.stopSeconds >= TRAINING_STOP_MAX_SECONDS)
+    {
+        leg.step = TrainingStopStep::SpentItsTime;
+        return leg;
+    }
+    bool anyWithTheHead = false;
+    bool found = false;
+    for (std::size_t i = 0; i < members.size(); ++i)
+    {
+        TrainingStopMember const& member = members[i];
+        if (member.learnSkill == 0 || member.walkedThisStop || !member.withTheHead)
+            continue;
+        anyWithTheHead = true;
+        if (member.trainerYards < 0.f || member.trainerYards > TRAINING_STOP_YARDS)
+            continue;
+        leg.member = i;
+        found = true;
+        break;
+    }
+    if (!anyWithTheHead)
+    {
+        leg.step = TrainingStopStep::NobodyWithTheHead;
+        return leg;
+    }
+    if (!found)
+    {
+        leg.step = TrainingStopStep::NoTrainerInTown;
+        return leg;
+    }
+    leg.step = facts.columnFree ? TrainingStopStep::Walk : TrainingStopStep::ColumnTaken;
+    return leg;
+}
+
+char const* TrainingStopStepWord(TrainingStopStep step)
+{
+    switch (step)
+    {
+        case TrainingStopStep::NotACampaign:
+            return "no campaign is armed, so the bridge's learn trips walk";
+        case TrainingStopStep::NothingToLearn:
+            return "nobody in the family has a learn left for this stop";
+        case TrainingStopStep::RunOwnsTravel:
+            return "the family's dungeon run is staging or under way";
+        case TrainingStopStep::Resting:
+            return "the last training stop ended less than 30 minutes ago";
+        case TrainingStopStep::SpentItsTime:
+            return "this training stop has had its 15 minutes";
+        case TrainingStopStep::NobodyWithTheHead:
+            return "every member with a learn is more than 40 yards from the head";
+        case TrainingStopStep::NoTrainerInTown:
+            return "no trainer for the learns left is within 700 yards of the head";
+        case TrainingStopStep::ColumnTaken:
+            return "another errand holds the head's travel column";
+        case TrainingStopStep::Walk:
+            return "walk";
+    }
+    return "unknown";
+}
+
+bool TrainingStopEnds(TrainingStopStep step, bool stopOpen)
+{
+    if (!stopOpen)
+        return false;
+    return step != TrainingStopStep::Walk && step != TrainingStopStep::ColumnTaken;
 }
 
 }  // namespace OverseerDecisions

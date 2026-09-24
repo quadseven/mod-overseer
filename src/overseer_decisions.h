@@ -3494,6 +3494,7 @@ enum class TravelOwner : uint8_t
                  // crossing, town, repair or reset exit (wow-overseer#227)
     WalkBackIn,  // a member walked back into the instance its run is in (#393)
     Respec,      // a walk to a class trainer of its own class for a talent reset (#626)
+    TrainingStop,  // the head walking the family to a member's trainer in town (#688)
 };
 
 // DOES THIS OWNER'S AIM PASS A PROFESSION ERRAND WHOSE COLUMN IS EMPTY? The
@@ -3502,7 +3503,9 @@ enum class TravelOwner : uint8_t
 // keeps the #435 fence. The talent reset (#626) passes as well: over an empty
 // column there is no trainer walk to overwrite, the bridge holds its learn
 // trips while the column is taken, and a tank who cannot tank is what keeps the
-// family's runs from starting at all.
+// family's runs from starting at all. The training stop (#688) passes for the
+// same reason, and because the learn it would be fenced for is the one it is
+// walking to.
 bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner);
 
 // IS THIS OWNER A LIVE DUNGEON RUN (#656)? `Run` and `WalkBackIn`, the walks a
@@ -16166,9 +16169,9 @@ struct HeadTravelFacts
     // or REPAIRING. Nobody is walking to a door, but the run has not ended
     // either, and the leader is the one it will stage with (2026-09-24).
     bool campaignBetweenAttempts{false};
-    // How far the head stands from the class trainer a talent reset would
-    // walk to, or below zero when nobody has measured it. Read only for
-    // HeadErrand::TrainerTrip while `campaignBetweenAttempts`.
+    // How far the head stands from the trainer a talent reset or a training
+    // stop would walk to, or below zero when nobody has measured it. Read only
+    // for HeadErrand::TrainerTrip while `campaignBetweenAttempts`.
     float trainerYards{-1.f};
     // The campaign's hearth regroup has the family (RunRecovery::
     // HearthRegroup): meeting at the inn IS the regroup, so the regroup wait
@@ -16187,11 +16190,21 @@ constexpr float TOWN_STOP_NEAR_YARDS = 150.f;
 // run stops waiting quietly and says so.
 constexpr uint32_t TOWN_STOP_MAX_SECONDS = 300;
 
+// THE TOWN A CAMPAIGN WAITS IN, FOR A TRAINER (#688). A counter stop is short
+// and 150 yards is the street it stands on; a trainer is somewhere else in the
+// same city. Measured on the dev realm on 2026-09-24 from where the Horde
+// family waits in Orgrimmar for Ragefire Chasm: the warrior trainer is 564
+// yards away and the nine profession trainers its learns need are 265 to 639.
+// 700 is the city and not the road out of it: #663's 2,375-yard walk still
+// waits, and at the 112 yards a minute the travel backstop measures, the
+// farthest trainer in the city is under six minutes' walk.
+constexpr float TRAINING_STOP_YARDS = 700.f;
+
 // May `who` put its aim on the head right now?
 //
 // A TRAINER TRIP WAITS FOR AN ARMED CAMPAIGN BETWEEN ATTEMPTS TOO
 // (2026-09-24), unless the trainer is in the town the head stands in
-// (`trainerYards` within TOWN_STOP_NEAR_YARDS). Measured on the dev realm: the
+// (`trainerYards` within TRAINING_STOP_YARDS, #688). Measured on the dev realm: the
 // Horde head, leading a Ragefire campaign that was RECOVERING, was "sent to
 // 'class trainer' - creature 26332 at 2375 yards" for a talent reset, twice in
 // six minutes, while the run needed him to regroup the family and stage. A
@@ -16611,6 +16624,103 @@ int32_t GameEventOfSlot(uint32_t slot, uint32_t eventCount);
 // Is a spawn of `gameEvent` (0 for none) in the world while that event's
 // running state is `eventActive`?
 bool SpawnStandsNow(int32_t gameEvent, bool eventActive);
+
+// ------------------------------- a training stop in town (#688) --------------
+//
+// MEASURED ON THE DEV REALM, 2026-09-24. The Horde family's ten profession
+// learns had been planned for 32 hours and none was learned, because its
+// Ragefire campaign had been armed the whole time. The bridge walks a learn by
+// handing the trainee the lead, and the campaign's leader is the roster lead,
+// so it waits while a campaign is armed (quadseven/wow-overseer#44). Between
+// attempts, and while the campaign held the family in Orgrimmar for bag room,
+// every trainer the learns needed was within 640 yards.
+//
+// A GROUP OF PLAYERS WAITING IN A CITY WALKS TO THE TRAINERS TOGETHER. The
+// head keeps the lead and walks the family to one member's trainer at a time;
+// the members follow, and whoever stands there with a learn that trainer
+// teaches buys it (TrainOnArrival, the same purchase a learn trip ends in).
+//
+// BOUNDED, NEVER A CANCELLATION. A stop runs only while the campaign is
+// between attempts or holding the family in town, never while a run stages or
+// is inside (HeadErrandMayTravel, HeadErrand::TrainerTrip). It lasts at most
+// TRAINING_STOP_MAX_SECONDS and then rests TRAINING_STOP_REST_SECONDS, and a
+// leg that is walking when the campaign stages again is waited for by the
+// run's own RESET deferral, which the travel drive's backstop bounds.
+
+// How long one stop may keep the head, from its first leg.
+constexpr uint32_t TRAINING_STOP_MAX_SECONDS = 15 * 60;
+// How long after a stop ends before the next may start.
+constexpr uint32_t TRAINING_STOP_REST_SECONDS = 30 * 60;
+// A member this near the head when a leg starts is with the family and
+// arrives by following. Farther out it is somewhere else, and a leg walked
+// for it would teach nobody.
+constexpr float TRAINING_STOP_WITH_HEAD_YARDS = 40.f;
+// How many travel polls the head stands at the trainer waiting for the
+// members it walked for to close in before the purchase is made without them.
+constexpr uint32_t TRAINING_STOP_REACH_POLLS = 4;
+
+struct TrainingStopMember
+{
+    std::string name;
+    uint32_t learnSkill{0};    // overseer_roster.learn_skill; 0 is nothing to learn
+    bool withTheHead{false};   // alive, on the head's map, within TRAINING_STOP_WITH_HEAD_YARDS
+    // How far the head stands from the nearest trainer that teaches this
+    // member its learn, or below zero when no trainer on the map does.
+    float trainerYards{-1.f};
+    bool walkedThisStop{false};  // a leg for this member already ran in this stop
+};
+
+struct TrainingStopFacts
+{
+    // The head's job is a dungeon campaign, or the town hold the bridge puts
+    // a campaign's family on while it waits in town (TOWN_HOLD_JOB). Anything
+    // else is the bridge's own learn trip to walk.
+    bool campaignArmed{false};
+    // Where the family's run stands and whether it is held for bag room; the
+    // `trainerYards` in it is ignored, since each member has its own.
+    HeadTravelFacts head;
+    // The head's travel column is empty, or holds this stop's own aim.
+    bool columnFree{false};
+    // Seconds since this stop's first leg, or 0 when no stop is open.
+    uint32_t stopSeconds{0};
+    // Seconds since the last stop ended; UINT32_MAX when there has been none.
+    uint32_t sinceLastStop{UINT32_MAX};
+};
+
+enum class TrainingStopStep : uint8_t
+{
+    NotACampaign,     // no armed campaign: the bridge's learn trips walk
+    NothingToLearn,   // nobody in the family carries a learn
+    RunOwnsTravel,    // the run is staging or inside
+    Resting,          // the last stop ended less than TRAINING_STOP_REST_SECONDS ago
+    SpentItsTime,     // this stop has run TRAINING_STOP_MAX_SECONDS
+    NobodyWithTheHead,  // every member with a learn is away from the family
+    NoTrainerInTown,  // every learn's trainer is past TRAINING_STOP_YARDS, or on no spawn
+    ColumnTaken,      // another errand holds the head's travel column
+    Walk,             // walk the head to `member`'s trainer
+};
+
+struct TrainingStopLeg
+{
+    TrainingStopStep step{TrainingStopStep::NothingToLearn};
+    // Index into the members for Walk; the members' order is the order they
+    // are walked in, head first when the head has a learn of its own.
+    std::size_t member{0};
+};
+
+// The first reason in the enum's order wins. A member already walked for this
+// stop is not walked again in it, so one trainer the world will not let a
+// member use cannot hold the stop.
+TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
+                                    std::vector<TrainingStopMember> const& members);
+
+// "walk", "resting" ... for the log line.
+char const* TrainingStopStepWord(TrainingStopStep step);
+
+// Does a stop that is open end now? When its time is spent, or when the pick
+// has nothing left to walk for any reason other than a taken column, which
+// only means the next leg waits.
+bool TrainingStopEnds(TrainingStopStep step, bool stopOpen);
 
 }  // namespace OverseerDecisions
 
