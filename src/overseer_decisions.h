@@ -15233,6 +15233,22 @@ enum class TravelStuckAction
 TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
                                       bool carriesStrategy);
 
+struct TravelNoProgressBackoffState
+{
+    uint32_t releases{0};
+    time_t until{0};
+};
+
+enum class TravelNoProgressBackoffAction
+{
+    Continue,
+    Backoff,
+};
+
+TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
+    TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
+    time_t cooldownSeconds);
+
 // ------------- holding a character on the ground, when the ground is water --
 //
 // WHAT THE GUARD ABOVE SAYS, AND WHY IT IS THE WRONG SENTENCE HERE (#503).

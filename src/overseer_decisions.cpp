@@ -12930,6 +12930,26 @@ TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
                              : TravelStuckAction::Continue;
 }
 
+TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
+    TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
+    time_t cooldownSeconds)
+{
+    if (releaseLimit == 0 || cooldownSeconds <= 0)
+        return TravelNoProgressBackoffAction::Continue;
+    if (state.until > now)
+        return TravelNoProgressBackoffAction::Backoff;
+    if (state.until != 0 && state.until <= now)
+    {
+        state.releases = 0;
+        state.until = 0;
+    }
+    ++state.releases;
+    if (state.releases < releaseLimit)
+        return TravelNoProgressBackoffAction::Continue;
+    state.until = now + cooldownSeconds;
+    return TravelNoProgressBackoffAction::Backoff;
+}
+
 DrowningHoldAction DrowningHoldDecision(DrowningHoldFacts const& facts,
                                         DrowningHoldLimits const& limits)
 {
