@@ -23,7 +23,18 @@ int main()
     std::string const text((std::istreambuf_iterator<char>(source)),
                            std::istreambuf_iterator<char>());
     std::size_t const snapshot = text.find("travelTarget = it->second.travelTarget;");
-    std::size_t const release = text.find("_travelAims.Release(name);", snapshot);
+    // THE RELEASE IS GATED ON THE VERDICT (2026-09-24): a give-up for a
+    // character standing on the ground moves nothing and must not end its
+    // errand, so the release sits behind TerrainRemedyEndsTheErrand.
+    std::size_t const gate = text.find("if (endsTheErrand)", snapshot);
+    std::size_t const release = text.find("_travelAims.Release(name, ", gate);
+    if (gate == std::string::npos || release == std::string::npos || !(gate < release) ||
+        text.find("OverseerDecisions::TerrainRemedyEndsTheErrand(verdict.remedy, onTheGround)") ==
+            std::string::npos)
+    {
+        std::cerr << "the terrain release must be gated on TerrainRemedyEndsTheErrand\n";
+        return EXIT_FAILURE;
+    }
     std::size_t const teleport = text.find("bot->TeleportTo(bot->GetMapId()", release);
     if (snapshot == std::string::npos || release == std::string::npos ||
         teleport == std::string::npos || !(snapshot < release && release < teleport))

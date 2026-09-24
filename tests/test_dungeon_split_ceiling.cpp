@@ -9,7 +9,7 @@
  * an hour. What is pinned here is the accounting consequence of that word,
  * which is the half a wrong answer would hide: whether the attempt fills a slot
  * in a campaign of a hundred, and whether a party that keeps splitting on the
- * same door is ever stopped.
+ * same door is recovered rather than stopped.
  *
  * The measurement it exists for: a run adopted at STAGED_INSIDE with one of five
  * members inside sat 'active' for over 36 minutes. Four members were inside and
@@ -35,7 +35,10 @@
 
 using OverseerDecisions::DungeonCampaignAfterRun;
 using OverseerDecisions::DungeonCampaignProgress;
-using OverseerDecisions::DungeonCampaignStopsOnFailures;
+using OverseerDecisions::DungeonCampaignRecovers;
+using OverseerDecisions::RunFailureFacts;
+using OverseerDecisions::RunRecovery;
+using OverseerDecisions::RunRecoveryHeuristic;
 using OverseerDecisions::DungeonRunEnteredTheInstance;
 using OverseerDecisions::DungeonRunTrailingFailures;
 
@@ -44,11 +47,6 @@ namespace
 
 int failures = 0;
 
-// The adapter's own DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES. Written here rather
-// than imported, for the reason the sibling ceiling test gives: this is about
-// the shape of the rule and must keep meaning the same thing if the adapter
-// retunes its number.
-constexpr unsigned STOP_AFTER = 3;
 
 void CheckBool(char const* what, bool got, bool want)
 {
@@ -133,53 +131,46 @@ void ASplitRunDoesNotFillTheSlotItWasAimingAt()
     CheckUnsigned("and it tries that slot again", lastSlot.nextRunNumber, 30);
 }
 
-void APartyThatKeepsSplittingIsStopped()
+void APartyThatKeepsSplittingIsRecoveredNotStopped()
 {
     // The rows come back newest first, exactly as the adapter's
     // `ORDER BY id DESC LIMIT n` returns them.
     std::vector<std::string> const three{"split_failed", "split_failed",
                                          "split_failed"};
     CheckUnsigned("three splits in a row", DungeonRunTrailingFailures(three), 3);
-    CheckBool("and the campaign stops",
-              DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures(three),
-                                             STOP_AFTER),
+    // THE CAMPAIGN NO LONGER STOPS HERE. Three in a row used to end it with an
+    // ERROR asking the operator to take the rows out of the campaign by hand;
+    // now the coordinator recovers, and the recovery for a split party is to
+    // walk everybody out and in through one copy.
+    CheckBool("and the campaign recovers", DungeonCampaignRecovers(DungeonRunTrailingFailures(three)),
               true);
+    RunFailureFacts split;
+    split.outcome = "split_failed";
+    CheckBool("a split is walked into one copy",
+              RunRecoveryHeuristic(split) == RunRecovery::OneCopy, true);
 
     // MIXED WITH THE OLDER TWO, because the streak is about "never got inside
-    // together" and not about one particular way of failing at it. A door that
-    // strands a member on every attempt can perfectly well fail a reset once in
-    // the middle of doing it.
+    // together" and not about one particular way of failing at it.
     std::vector<std::string> const mixed{"split_failed", "staging_failed",
                                          "reset_failed"};
     CheckUnsigned("a mixed streak still counts three",
                   DungeonRunTrailingFailures(mixed), 3);
-    CheckBool("and still stops",
-              DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures(mixed),
-                                             STOP_AFTER),
-              true);
+    CheckBool("and still recovers",
+              DungeonCampaignRecovers(DungeonRunTrailingFailures(mixed)), true);
 
-    // ONE GOOD RUN BREAKS THE STREAK, which is the property that keeps this
-    // from stopping a campaign that is mostly working. The newest row is a run
-    // that entered, so the count is zero however bad the two behind it were.
+    // ONE GOOD RUN BREAKS THE STREAK: nothing to recover from.
     std::vector<std::string> const recovered{"left", "split_failed",
                                              "split_failed"};
     CheckUnsigned("a run that entered ends the streak",
                   DungeonRunTrailingFailures(recovered), 0);
-    CheckBool("so nothing is stopped",
-              DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures(recovered),
-                                             STOP_AFTER),
-              false);
+    CheckBool("so there is nothing to recover",
+              DungeonCampaignRecovers(DungeonRunTrailingFailures(recovered)), false);
 
-    // TWO IS NOT THREE. The bound is the third failure, not the fourth and not
-    // the second, and a campaign that has split twice is still allowed the
-    // attempt that might work.
     std::vector<std::string> const two{"split_failed", "split_failed", "wipe"};
     CheckUnsigned("two splits behind a real run",
                   DungeonRunTrailingFailures(two), 2);
-    CheckBool("two does not stop a campaign",
-              DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures(two),
-                                             STOP_AFTER),
-              false);
+    CheckBool("two recovers too", DungeonCampaignRecovers(DungeonRunTrailingFailures(two)),
+              true);
 }
 
 } // namespace
@@ -188,6 +179,6 @@ int main()
 {
     ASplitRunIsNotARun();
     ASplitRunDoesNotFillTheSlotItWasAimingAt();
-    APartyThatKeepsSplittingIsStopped();
+    APartyThatKeepsSplittingIsRecoveredNotStopped();
     return failures ? 1 : 0;
 }

@@ -2649,7 +2649,30 @@ constexpr time_t DUNGEON_RESET_BACKSTOP_SECONDS = 5 * 60;
 // instance still has every boss dead in it, so the fourth attempt would walk
 // into the same empty mine as the first three. Counted from the run rows rather
 // than from memory so it survives a worldserver bounce.
-constexpr uint32 DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES = 3;
+// RECOVERING (the campaign never stops on failures). How far back the streak
+// of attempts that never got inside is counted: far enough that the backoff,
+// which caps long before this, never reads a short count.
+constexpr uint32 DUNGEON_RECOVERY_STREAK_WINDOW = 50;
+// The backoff before a recovery: doubled per failure in the streak, capped.
+constexpr unsigned DUNGEON_RECOVERY_BACKOFF_BASE_SECONDS = 60;
+constexpr unsigned DUNGEON_RECOVERY_BACKOFF_CAP_SECONDS = 900;
+// A restage walk ends at this ceiling, or when the leader has got no nearer
+// for the stall window, and the next attempt opens either way.
+constexpr unsigned DUNGEON_RECOVERY_WALK_CEILING_SECONDS = 2400;
+constexpr unsigned DUNGEON_RECOVERY_WALK_STALL_SECONDS = 300;
+constexpr float DUNGEON_RECOVERY_WALK_PROGRESS_YARDS = 20.f;
+// Where a restage walk hands over to the next attempt's own staging.
+constexpr float DUNGEON_RECOVERY_NEAR_YARDS = 150.f;
+// A regroup or a wait for a client ends at this ceiling.
+constexpr unsigned DUNGEON_RECOVERY_WAIT_CEILING_SECONDS = 600;
+constexpr float DUNGEON_RECOVERY_REGROUP_YARDS = 60.f;
+// How long a staging stall waits for the bridge's answer before the
+// heuristic's is used, and how long the run yields when that is the answer.
+constexpr unsigned STAGING_STALL_ANSWER_SECONDS = 30;
+constexpr unsigned STAGING_STALL_YIELD_SECONDS = 120;
+// How far from a member with no bag room a corpse is searched for an upgrade
+// that would be lost (the one bag state that still walks a run out).
+constexpr float DUNGEON_ROOM_LOOT_YARDS = 40.f;
 
 // HOW LONG THE NEXT RUN WAITS FOR A MAINTENANCE ERRAND SOMEBODY ELSE IS
 // RUNNING (#168), before it opens anyway and says so.
@@ -4714,8 +4737,16 @@ public:
 
     // GIVE THE ERRAND BACK. THE ONE TERMINAL PATH - every release, in either
     // drive, goes through here, which is why it does three things and not one.
-    void Release(std::string const& name)
+    void Release(std::string const& name, std::string const& why = std::string())
     {
+        // WHO ENDED IT, REMEMBERED FOR THE ONE READER THAT NEEDS IT (#632
+        // follow-up). A staging run that has to take its leader's errand back
+        // reports how often; without this it could not say who took it, and a
+        // run that re-arms seven times in ten minutes needs the second fact
+        // more than the first. See LastEnd.
+        _lastEnd[name] = ErrandEnd{why.empty() ? std::string("a release that did not name itself")
+                                               : why,
+                                   false};
         // THE COLUMN WRITE IS THE ONE PART OF THIS THAT IS NOW CONDITIONAL
         // (mod-overseer#435). `_claimed` already answers "did this book put
         // the walker at its CURRENT aim" - so when it says no, this Release
@@ -4864,6 +4895,9 @@ public:
             // The character may be mid-walk under an aim nobody is renewing any
             // more, so this is a release like any other and takes the same grace.
             _handback[it->first] = std::time(nullptr);
+            _lastEnd[it->first] = ErrandEnd{
+                "the column being emptied outside this module (another owner cleared it)",
+                true};
             _claimed.erase(it->first);
             it = _state.erase(it);
         }
@@ -4877,6 +4911,19 @@ public:
             else
                 it = _landed.erase(it);
         }
+    }
+
+    // What ended this character's errand the last time one ended, and whether
+    // that was a writer outside this module. Empty when none has ended.
+    struct ErrandEnd
+    {
+        std::string why;
+        bool outside{false};
+    };
+    ErrandEnd LastEnd(std::string const& name) const
+    {
+        auto const it = _lastEnd.find(name);
+        return it == _lastEnd.end() ? ErrandEnd{} : it->second;
     }
 
     // HAS TRAVEL LET GO OF THIS CHARACTER TOO RECENTLY FOR THE QUEST DRIVE TO
@@ -5064,6 +5111,9 @@ private:
     // by Claim, which is its only door into the column, and erased by Release
     // and PruneVanished - every way an errand can end.
     std::map<std::string, std::string> _claimed;
+    // What ended each character's last errand; see LastEnd. Never erased: one
+    // short string per roster character, overwritten by the next ending.
+    std::map<std::string, ErrandEnd> _lastEnd;
     // An aim this book was driving, let go of, and left standing in the column
     // because it was not this book's to erase (#558). Written by Release and
     // MarkCounterLanding, erased by Claim, Release, PruneVanished and
@@ -9816,7 +9866,7 @@ private:
         QueryResult result = CharacterDatabase.Query(
             "SELECT outcome FROM overseer_dungeon_run WHERE campaign_id = {} "
             "ORDER BY id DESC LIMIT {}", campaignId,
-            DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES);
+            DUNGEON_RECOVERY_STREAK_WINDOW);
         if (!result)
             return 0;
 
@@ -9828,56 +9878,28 @@ private:
         return OverseerDecisions::DungeonRunTrailingFailures(outcomes);
     }
 
-    // ----------------------------- the stop, at every gate that opens a run (#306) --
-    //
-    // WHAT WENT WRONG, WRITTEN DOWN SO THE SHAPE IS NOT UNDONE. This test used to
-    // be inline in DriveDungeonRun's IDLE branch, and that branch decides only a
-    // campaign's FIRST attempt. EndRunAndDecide re-arms the coordinator straight
-    // into RESETTING for every attempt after it, so a campaign passes through
-    // IDLE exactly once - at the one moment in its life when it has no failures
-    // to count - and the stop was unreachable from then on.
-    //
-    // Measured 2026-09-07 on the live realm, and the numbers are worth keeping
-    // because the arithmetic all looked right while this was happening: seven
-    // consecutive `staging_failed` rows in one campaign against a threshold of
-    // three, ONE "dungeon run requested" line in the 102 minutes that covered
-    // eight attempts, and zero occurrences of the ERROR below in the whole log.
-    //
-    // So it is a function, and every path that is about to open a run calls it.
-    // There are two of those today and both do; a third that forgets is this
-    // defect coming back.
-    //
-    // `sayIt` IS THE CALLER'S LATCH AND NOT A SECOND POLICY. The IDLE branch is
-    // polled every few seconds and must say this once rather than forever, and it
-    // already owns the flag that remembers (see loggedCampaignOver's own comment
-    // for why nothing clears it). The go-again gate is reached once per attempt
-    // and always speaks. Neither is a different rule about when to stop.
-    static bool CampaignStoppedByFailures(uint32 campaignId,
-                                          std::string const& leaderName, bool sayIt)
+    // THE NEWEST ATTEMPT OF A CAMPAIGN, for the IDLE gate that puts a campaign
+    // whose last attempt failed into RECOVERING rather than straight into the
+    // next attempt: its outcome, its reason, and how long ago it ended, so a
+    // backoff that a worldserver bounce interrupted is resumed rather than
+    // started again. False when there is no row.
+    static bool LastAttemptOfCampaign(uint32 campaignId, std::string& outcome,
+                                      std::string& reason, uint32& endedSecondsAgo)
     {
-        uint32 const failures = TrailingUnenteredRuns(campaignId);
-        if (!OverseerDecisions::DungeonCampaignStopsOnFailures(
-                failures, DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES))
+        if (!campaignId)
             return false;
-
-        if (sayIt)
-            // THE ESCAPE HAD TO CHANGE WITH THE RULE ABOVE (#225). "Set
-            // dungeon_runs_done to 0" used to clear this stop as a side effect:
-            // it made the next run allocate a fresh campaign, which orphaned the
-            // failing rows. That is exactly the behaviour #225 removed, so the
-            // gesture is named directly instead. Taking the attempts out of the
-            // campaign is what the module reads, and campaign_id 0 already means
-            // "a run this coordinator did not drive".
-            LOG_ERROR("module.overseer",
-                      "overseer: the dungeon campaign for '{}' is stopped - the "
-                      "last {} attempts of campaign {} all ended without the "
-                      "party ever being inside together, so a further one would "
-                      "fail the same way. The reasons are on those rows. Once "
-                      "the cause is fixed, take them out of the campaign to "
-                      "start again: UPDATE overseer_dungeon_run SET campaign_id "
-                      "= 0 WHERE campaign_id = {} AND outcome IN "
-                      "('reset_failed','staging_failed','split_failed')",
-                      leaderName, failures, campaignId, campaignId);
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT outcome, ended_reason, "
+            "COALESCE(TIMESTAMPDIFF(SECOND, ended_at, NOW()), 0) "
+            "FROM overseer_dungeon_run WHERE campaign_id = {} "
+            "ORDER BY id DESC LIMIT 1", campaignId);
+        if (!result)
+            return false;
+        outcome = result->Fetch()[0].Get<std::string>();
+        reason = result->Fetch()[1].Get<std::string>();
+        // An expression comes back as a BIGINT; see CampaignIdAfterTable.
+        int64 const ago = result->Fetch()[2].Get<int64>();
+        endedSecondsAgo = ago > 0 ? static_cast<uint32>(ago) : 0;
         return true;
     }
 
@@ -18588,7 +18610,7 @@ private:
 
     void EndOneEscort(std::string const& name, bool granted)
     {
-        _travelAims.Release(name);
+        _travelAims.Release(name, "an escort ending (EndOneEscort)");
         // THE INN HOLD DIES WITH THE WALK THAT TOOK IT (#369), and it is
         // released HERE rather than in the home drive because this is the one
         // statement every end of every escort passes through: the bind
@@ -19751,7 +19773,7 @@ private:
                                  static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60));
                         _travelAims.Refuse(name, target,
                                            "it was killing this character");
-                        _travelAims.Release(name);
+                        _travelAims.Release(name, "the travel drive (deaths on the errand)");
                         continue;
                     }
 
@@ -19779,7 +19801,7 @@ private:
                                      "writing this column",
                                      name, target, _travelAims.RefusedReason(name),
                                      verdict.coolOffRemaining);
-                        _travelAims.Release(name);
+                        _travelAims.Release(name, "the travel drive (an errand refused earlier was written again)");
                         continue;
 
                     case OverseerDecisions::ErrandDeathRemedy::DeclineRunOwned:
@@ -19905,7 +19927,7 @@ private:
                             _dungeonEscorts.erase(walk);
                         }
                         else
-                            _travelAims.Release(name);
+                            _travelAims.Release(name, "the travel drive (deaths on a catch-up or home walk)");
                         continue;
                     }
                 }
@@ -20140,7 +20162,7 @@ private:
                 _travelAims.Refuse(name, target,
                                    "it was standing still in water on it, which is how "
                                    "this roster drowns");
-                _travelAims.Release(name);
+                _travelAims.Release(name, "the travel drive (standing still in water)");
                 continue;
             }
 
@@ -20229,7 +20251,7 @@ private:
                          "overseer: '{}' was sent to '{}' and made no progress in {} "
                          "attempts - releasing the errand before upstream can teleport it",
                          name, target, botAI->rpgInfo.stuckAttempts);
-                _travelAims.Release(name);
+                _travelAims.Release(name, "the travel drive (no progress in five stuck attempts)");
                 continue;
             }
             // MoveFarTo owns these counters. It resets them when the bot makes
@@ -20278,7 +20300,7 @@ private:
                          "the errand", name, target,
                          said.empty() ? std::string("there is no such spawn") : said,
                          static_cast<uint32>(bot->GetMapId()));
-                _travelAims.Release(name);
+                _travelAims.Release(name, "the travel drive (no such spawn on this map)");
                 continue;
             }
 
@@ -20332,7 +20354,7 @@ private:
 
                 if (doorway && StepThroughAreaTrigger(name, bot, target))
                 {
-                    _travelAims.Release(name);
+                    _travelAims.Release(name, "the travel drive (stepped through the doorway it was sent to)");
                     continue;
                 }
 
@@ -20473,7 +20495,7 @@ private:
                     {
                         _respecErrands.erase(name);
                         _respecReachTries.erase(name);
-                        _travelAims.Release(name);
+                        _travelAims.Release(name, "the travel drive (respec done on arrival)");
                         continue;
                     }
                 }
@@ -20561,7 +20583,7 @@ private:
                                  name, nearestYards,
                                  uint32(FLIGHT_DISCOVERY_HOLD_CEILING_SECONDS), requestedNode,
                                  learned ? "learned" : "not learned - see the line above");
-                        _travelAims.Release(name);
+                        _travelAims.Release(name, "the travel drive (flight master reached)");
                         continue;
                     }
                     else
@@ -20577,7 +20599,7 @@ private:
                                  "near enough to learn from - releasing, the aim is what to "
                                  "look at",
                                  name, requestedNode, entry);
-                        _travelAims.Release(name);
+                        _travelAims.Release(name, "the travel drive (flight master spot reached, nobody there)");
                         continue;
                     }
                 }
@@ -20724,7 +20746,7 @@ private:
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' reached '{}' (creature {}) - errand done, "
                                  "releasing", name, target, entry);
-                        _travelAims.Release(name);
+                        _travelAims.Release(name, "the travel drive (arrived)");
                         if (arrival == OverseerDecisions::CounterArrival::StandAndTrade)
                             _travelAims.MarkCounterLanding(name, target);
                         continue;
@@ -20879,7 +20901,7 @@ private:
                          "{} yards for {} minutes - releasing the errand as unreachable",
                          name, target, static_cast<uint32>(state.progress.best),
                          static_cast<uint32>(backstop / 60));
-                _travelAims.Release(name);
+                _travelAims.Release(name, "the travel drive (travel backstop: no nearer for minutes)");
                 continue;
             }
 
@@ -21008,7 +21030,7 @@ private:
                              "overseer: '{}' was sent to '{}' and has been refused every "
                              "bearing for {} polls running without getting any nearer - releasing the errand as unreachable",
                              name, target, refusal.consecutive);
-                    _travelAims.Release(name);
+                    _travelAims.Release(name, "the travel drive (every bearing refused, ground give-up)");
                 }
                 continue;
             }
@@ -22457,7 +22479,15 @@ private:
             // Recovery is terminal for the unsafe travel aim. Clear it before
             // teleporting, otherwise the next travel poll re-issues the same
             // coordinate and sends the character back onto the bad plane.
-            _travelAims.Release(name);
+            //
+            // BUT ONLY FOR A VERDICT THAT SAYS THE AIM MAY BE WHAT IS WRONG.
+            // The on-the-ground give-up below moves nothing and says so; it
+            // used to end the errand anyway, which is what took a Horde
+            // leader's staging walk off him six times in ten minutes through
+            // Orgrimmar (one release per overhang). See
+            // OverseerDecisions::TerrainRemedyEndsTheErrand.
+            bool const endsTheErrand =
+                OverseerDecisions::TerrainRemedyEndsTheErrand(verdict.remedy, onTheGround);
             std::string travelTarget;
             std::string job;
             uint32 questAim = 0;
@@ -22480,8 +22510,11 @@ private:
             // Recovery is terminal for the unsafe travel aim. Capture the
             // snapshot first so the recovery log preserves the cause, then
             // clear it before any rescue teleport so the next travel poll
-            // cannot re-issue the same coordinate onto the bad plane.
-            _travelAims.Release(name);
+            // cannot re-issue the same coordinate onto the bad plane. Once, and
+            // only where the verdict can have been caused by the aim.
+            if (endsTheErrand)
+                _travelAims.Release(name, "the terrain drive (a lift, or a give-up "
+                                          "under the world)");
 
             // A LIFT IS NOT A DISPLACEMENT, so it takes nothing away. Same map,
             // same x and y, on top of the surface the probe just read - and the
@@ -22632,7 +22665,9 @@ private:
                               "STANDING ON THE GROUND and what the "
                               "probe found overhead is a roof, a bridge or a tower floor. "
                               "NOTHING IS BEING MOVED: this is the detector being wrong "
-                              "about this place, not a character below the world (#188). "
+                              "about this place, not a character below the world (#188), "
+                              "and the terrain drive keeps its errand: nothing here ends "
+                              "a walk. "
                               "Aim job='{}' quest={} travel='{}'. Staying quiet about this "
                               "character for {}s",
                               name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
@@ -23587,8 +23622,8 @@ private:
     //
     // WHAT BOUNDS THE LOOP, AND WHAT DOES NOT. Two numbers on the leader's
     // roster row - `dungeon_runs_wanted` (30 by default, the operator's own
-    // figure) and `dungeon_runs_done` - plus a stop after
-    // DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES resets that would not take. What
+    // figure) and `dungeon_runs_done`. A reset that would not take is
+    // recovered from (RECOVERING, with a capped backoff), never stopped on. What
     // does NOT bound it is any notion of the run's GOAL being met: a run's real
     // goal is #143 and is not built, gear as a goal is #145, "until item X
     // drops" is #150. #144's own wording for the stand-in is used instead - the
@@ -25386,7 +25421,15 @@ private:
         // characters - and because the coordinator claiming the leader's aim
         // for a staging point is exactly what has always taken a repair
         // errand away from whoever was in the middle of it.
-        Repairing      // the party is repaired before the next run opens
+        Repairing,     // the party is repaired before the next run opens
+        // A CAMPAIGN NEVER STOPS ON FAILURES; IT RECOVERS (the operator's
+        // standing order, 2026-09-24). An attempt that never got the party
+        // inside used to count toward a stop after three in a row, which the
+        // operator then undid by hand. Now it lands here: a backoff that grows
+        // with the streak and is capped, then one recovery chosen from the
+        // failure's own facts (by the heuristic, or by Jev through the bridge),
+        // then REPAIRING and the next attempt. See OverseerDecisions::RunRecovery.
+        Recovering
     };
 
     // World-thread-only, unguarded, lost on restart - same discipline as
@@ -25451,6 +25494,45 @@ private:
         // not be staged says which of the two failures it was: a leader that
         // walked and did not arrive, or a leader that kept being stopped.
         unsigned stagingRearms{0};
+        // WHAT ENDED IT THE LAST TIME, as TravelAimBook::LastEnd recorded it,
+        // and whether that was a writer outside this module. Carried onto the
+        // timeline row and into the staging stall question.
+        std::string stagingRearmWhy;
+        bool stagingRearmOutside{false};
+        // THE STAGING STALL QUESTION (see OverseerDecisions::StagingStall).
+        // Asked every STAGING_STALL_ASK_EVERY re-arms; the answer is read from
+        // overseer_run_recovery until STAGING_STALL_ANSWER_SECONDS, then the
+        // heuristic's is used.
+        std::time_t stallAskedAt{0};
+        unsigned stallAskRearms{0};
+        OverseerDecisions::StagingStall stallHeuristic{
+            OverseerDecisions::StagingStall::KeepRearming};
+        std::time_t stallYieldUntil{0};
+        std::string stallNote;
+        // RECOVERING. `recoveryStreak` is the only field carried across a
+        // re-armed attempt: how many attempts in a row have failed before
+        // entry, which is what the backoff grows with. Zeroed by any run that
+        // got inside, because that run re-arms through a fresh state.
+        unsigned recoveryStreak{0};
+        unsigned recoveryAttempt{0};
+        std::time_t recoverySince{0};
+        unsigned recoveryWaitSeconds{0};
+        OverseerDecisions::RunFailureFacts recoveryFacts;
+        OverseerDecisions::RunRecovery recoveryHeuristic{
+            OverseerDecisions::RunRecovery::ResetInstance};
+        std::string recoveryHeuristicWhy;
+        bool recoveryChosen{false};
+        OverseerDecisions::RunRecovery recovery{OverseerDecisions::RunRecovery::ResetInstance};
+        std::string recoveryBy;
+        std::time_t recoveryActSince{0};
+        float recoveryBest{-1.f};
+        std::time_t recoveryBestAt{0};
+        bool recoveryTownReached{false};
+        std::string recoveryNote;
+        // MAKING ROOM INSIDE (see MakeRoomInside): who has had the loot rule
+        // set this run, and who was told once that no grey was left.
+        std::set<std::string> roomLootRuleSet;
+        std::set<std::string> roomNoGreySaid;
         bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
@@ -25937,6 +26019,7 @@ private:
             case DungeonRunPhase::Clearing:     return "CLEARING";
             case DungeonRunPhase::Exiting:      return "EXIT";
             case DungeonRunPhase::Repairing:    return "REPAIRING";
+            case DungeonRunPhase::Recovering:   return "RECOVERING";
         }
         return "UNKNOWN";
     }
@@ -25959,6 +26042,9 @@ private:
         snap.brainNotMoving = coord.loggedNotMoved;
         snap.busyCeiling = coord.loggedBusyCeiling;
         snap.stagingRearms = coord.stagingRearms;
+        snap.stagingRearmWhy = coord.stagingRearmWhy;
+        snap.recoveryNote = coord.recoveryNote;
+        snap.stallNote = coord.stallNote;
         snap.resetAttempts = coord.resetAttempts;
         return snap;
     }
@@ -26100,6 +26186,10 @@ private:
             case DungeonRunPhase::Resetting: return OverseerDecisions::FetchRunPhase::Resetting;
             case DungeonRunPhase::Gathering: return OverseerDecisions::FetchRunPhase::Gathering;
             case DungeonRunPhase::Barrier:   return OverseerDecisions::FetchRunPhase::Barrier;
+            // A run between attempts has nobody walking to a door, so a fetch
+            // is as free as it is with no run at all - and a regroup recovery
+            // is exactly when the leader should be going back for somebody.
+            case DungeonRunPhase::Recovering: return OverseerDecisions::FetchRunPhase::NoRun;
             default:                         return OverseerDecisions::FetchRunPhase::Committed;
         }
     }
@@ -28304,9 +28394,12 @@ private:
 
         RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
                            coord.runNumber, "reset_failed", reason, JoinNames(members));
-        WriteRunEnded(coord, leaderName, 0, "reset_failed", reason);
-        _travelAims.Release(leaderName);
-        coord = DungeonRunCoordinatorState();
+        // THROUGH EndRunAndDecide LIKE EVERY OTHER FAILED ATTEMPT, so a reset
+        // that would not take is recovered from rather than dropped to IDLE,
+        // where the campaign used to be stopped after three of them. There is
+        // no run row to close (runId 0), which CloseRun already treats as
+        // nothing to do; the row was written just above.
+        EndRunAndDecide(coord, leaderName, portal, 0, "reset_failed", reason, true, &members);
     }
 
     // A SHORT TOWN STOP ON THE APPROACH (#639). The bridge makes one between
@@ -28427,7 +28520,8 @@ private:
     // it exists to fix. What answers it now is TrailingUnenteredRuns, widened in
     // the same change to count 'staging_failed' beside 'reset_failed': three
     // attempts in a row that never got inside stop the campaign with the ERROR
-    // that already exists for it, whichever of the two ways they failed.
+    // that already exists for it, whichever of the two ways they failed. (That
+    // stop is gone: a streak now paces RECOVERING's backoff instead.)
     //
     // WHY THAT IS A BETTER BOUND AND NOT JUST A DIFFERENT ONE. It stops after
     // three attempts rather than after a hundred, it says what is wrong instead
@@ -28481,7 +28575,7 @@ private:
                                JoinNames(members));
 
         EndRunAndDecide(coord, leaderName, portal, runId, "staging_failed", reason,
-                        stillWanted);
+                        stillWanted, &members);
     }
 
     // THE SAME CLOSING, FOR A RUN THAT DOES NOT NEED THE REST OF ITS CLOCK
@@ -28507,6 +28601,7 @@ private:
     // door. The campaign's own cap bounds the repeat, exactly as it does for
     // every other closing reason.
     void FailApproach(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                      std::vector<std::string> const& members,
                       DungeonPortal const& portal, char const* phase,
                       std::string const& blockers, bool stillWanted)
     {
@@ -28526,7 +28621,7 @@ private:
                         std::string(phase) +
                             " was refused: the party is above the staging point, not "
                             "near it, and has stopped descending - " + blockers,
-                        stillWanted);
+                        stillWanted, &members);
     }
 
     // THE SAME CLOSING AGAIN, FOR A RUN THAT GOT INSIDE AND NEVER GOT INSIDE
@@ -28565,10 +28660,9 @@ private:
     //
     // WHICH IS ALSO WHAT PUTS A CEILING ON THE REPEAT. A split run spends no
     // slot in the campaign, so nothing about the cap bounds a party that keeps
-    // splitting on the same door; what bounds it is TrailingUnenteredRuns, which
-    // counts `split_failed` beside the other two, and stops the campaign with
-    // the ERROR that already exists after DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES
-    // of them.
+    // splitting on the same door; what paces it is TrailingUnenteredRuns, which
+    // counts `split_failed` beside the other two and grows the RECOVERING
+    // backoff with the streak. The campaign is never stopped on it.
     //
     // WHY CLOSING RECOVERS THE PARTY RATHER THAN ABANDONING IT. Everything
     // FailStaging's own comment says about a closed run being recoverable
@@ -28629,7 +28723,552 @@ private:
                                JoinNames(members));
 
         EndRunAndDecide(coord, leaderName, portal, runId, "split_failed", reason,
-                        stillWanted);
+                        stillWanted, &members);
+    }
+
+    // ------------------------------------------- RECOVERING: a campaign never stops --
+    //
+    // THE OPERATOR'S STANDING ORDER, 2026-09-24: do not ever cancel a campaign.
+    // Three attempts in a row that never got the party inside used to stop it
+    // with an ERROR naming the UPDATE that would restart it, and that UPDATE
+    // was run by hand several times in one evening for failures this module
+    // could answer on its own. So a failed attempt now enters RECOVERING:
+    //
+    //   1. a backoff that doubles with the streak and is capped
+    //      (OverseerDecisions::RunRecoveryBackoffSeconds), so nothing loops hot;
+    //   2. one recovery, chosen by OverseerDecisions::RunRecoveryHeuristic from
+    //      the failure's own facts, or by Jev through the bridge when it answers
+    //      the request row in overseer_run_recovery in time and confidently;
+    //   3. REPAIRING and the next attempt, exactly as before.
+    //
+    // Every safety bound the phases carry is untouched: the staging backstop,
+    // the death breakers and the fall guard all still run, because every
+    // recovery is made of the phases and walks that already exist.
+
+    SchemaColumns _runRecoveryColumns{SchemaColumns::Unknown};
+    bool RunRecoveryPresent()
+    {
+        if (_runRecoveryColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_run_recovery", "'kind','attempt','answer','status'", 4);
+            _runRecoveryColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (present)
+                LOG_INFO("module.overseer",
+                         "overseer: run recovery requests on - each failed attempt and "
+                         "each staging stall is written to overseer_run_recovery for the "
+                         "bridge to answer");
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_run_recovery is missing "
+                         "(2026_09_24_00_overseer_run_recovery.sql has not been applied), "
+                         "so every recovery and staging stall is decided by the module's "
+                         "own heuristic and nothing asks the bridge");
+        }
+        return _runRecoveryColumns == SchemaColumns::Present;
+    }
+
+    void WriteRecoveryRequest(std::string const& family, std::string const& leaderName,
+                              uint32 campaignId, uint32 runNumber, char const* kind,
+                              unsigned attempt, std::string const& failure,
+                              std::string const& facts, std::string const& options,
+                              std::string const& heuristic, std::string const& heuristicWhy)
+    {
+        if (!RunRecoveryPresent())
+            return;
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_run_recovery "
+            "(family, leader_name, campaign_id, run_number, kind, attempt, failure, facts, "
+            " options, heuristic, heuristic_why) "
+            "VALUES ('{}', '{}', {}, {}, '{}', {}, '{}', '{}', '{}', '{}', '{}')",
+            Esc(family), Esc(leaderName), campaignId, runNumber, kind, attempt,
+            Esc(OverseerDecisions::RunTimelineDetail(failure, 500)),
+            Esc(OverseerDecisions::RunTimelineDetail(facts, 1000)), Esc(options),
+            Esc(heuristic), Esc(OverseerDecisions::RunTimelineDetail(heuristicWhy, 300)));
+    }
+
+    // The bridge's answer to one request, when it has written one. `by` is who
+    // chose it ("jev" or "heuristic"); the word is parsed by the caller, so a
+    // word this module did not offer is never executed.
+    bool ReadRecoveryAnswer(std::string const& leaderName, char const* kind,
+                            uint32 campaignId, unsigned attempt, std::string& answer,
+                            std::string& by)
+    {
+        if (!RunRecoveryPresent())
+            return false;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT answer, answered_by FROM overseer_run_recovery "
+            "WHERE leader_name = '{}' AND kind = '{}' AND campaign_id = {} AND attempt = {} "
+            "AND status = 'answered' ORDER BY id DESC LIMIT 1",
+            Esc(leaderName), kind, campaignId, attempt);
+        if (!result)
+            return false;
+        Field* row = result->Fetch();
+        answer = row[0].Get<std::string>();
+        by = row[1].Get<std::string>();
+        return !answer.empty();
+    }
+
+    void MarkRecoveryApplied(std::string const& leaderName, char const* kind,
+                             uint32 campaignId, unsigned attempt, std::string const& applied,
+                             std::string const& by)
+    {
+        if (!RunRecoveryPresent())
+            return;
+        CharacterDatabase.Execute(
+            "UPDATE overseer_run_recovery SET status = 'applied', applied = '{}', "
+            "applied_by = '{}', applied_at = NOW() "
+            "WHERE leader_name = '{}' AND kind = '{}' AND campaign_id = {} AND attempt = {} "
+            "AND status IN ('pending', 'answered')",
+            Esc(applied), Esc(by), Esc(leaderName), kind, campaignId, attempt);
+    }
+
+    // The recoveries this campaign has already applied, oldest first, read
+    // back from the rows so a worldserver bounce does not forget them.
+    std::vector<OverseerDecisions::RunRecovery> RecoveriesTried(std::string const& leaderName,
+                                                                uint32 campaignId,
+                                                                unsigned limit)
+    {
+        std::vector<OverseerDecisions::RunRecovery> tried;
+        if (!RunRecoveryPresent() || !campaignId || !limit)
+            return tried;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT applied FROM overseer_run_recovery "
+            "WHERE leader_name = '{}' AND campaign_id = {} AND kind = 'run_recovery' "
+            "AND status = 'applied' ORDER BY id DESC LIMIT {}",
+            Esc(leaderName), campaignId, limit);
+        if (!result)
+            return tried;
+        do
+        {
+            OverseerDecisions::RunRecovery r;
+            if (OverseerDecisions::ParseRunRecovery(result->Fetch()[0].Get<std::string>(), r))
+                tried.insert(tried.begin(), r);
+        } while (result->NextRow());
+        return tried;
+    }
+
+    // Has this attempt's recovery already been applied? Asked by the IDLE gate,
+    // so the attempt that follows a town trip for bags is opened rather than
+    // recovered from a second time.
+    bool RecoveryAppliedFor(std::string const& leaderName, uint32 campaignId, unsigned attempt)
+    {
+        if (!RunRecoveryPresent())
+            return false;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_run_recovery "
+            "WHERE leader_name = '{}' AND campaign_id = {} AND kind = 'run_recovery' "
+            "AND attempt = {} AND status = 'applied'",
+            Esc(leaderName), campaignId, attempt);
+        return result && result->Fetch()[0].Get<uint64>() > 0;
+    }
+
+    // THE FACTS A RECOVERY IS CHOSEN FROM, read off the live world at the
+    // moment the attempt fails.
+    OverseerDecisions::RunFailureFacts ReadRunFailureFacts(
+        DungeonRunCoordinatorState const& coord, std::string const& leaderName,
+        std::vector<std::string> const& members, DungeonPortal const& portal,
+        std::string const& outcome, std::string const& reason)
+    {
+        OverseerDecisions::RunFailureFacts facts;
+        facts.outcome = outcome;
+        facts.reason = reason;
+        facts.stagingRearms = coord.stagingRearms;
+        facts.bagsFull = OverseerDecisions::DungeonRunBagPressure(
+                             ReadRunBags(members).freeSlots,
+                             TOWN_TRIP_LIMITS.freeBagSlotsToGo, false, false) !=
+                         OverseerDecisions::DungeonBagPressure::None;
+
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+        if (!SteerableAI(leader))
+            facts.everyoneSteerable = false;
+        if (leader && leader->GetMapId() == portal.outsideMapId &&
+            OverseerDecisions::StagingPointUsable(coord.stageX, coord.stageY, coord.stageZ))
+            facts.leaderYardsFromStaging = leader->GetExactDist2d(coord.stageX, coord.stageY);
+
+        float farthest = -1.f;
+        for (std::string const& name : members)
+        {
+            if (name == leaderName)
+                continue;
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            if (!SteerableAI(bot))
+            {
+                facts.everyoneSteerable = false;
+                continue;
+            }
+            if (!leader)
+                continue;
+            if (bot->GetMapId() != leader->GetMapId() ||
+                bot->GetInstanceId() != leader->GetInstanceId())
+            {
+                ++facts.membersApart;
+                continue;
+            }
+            farthest = std::max(farthest, bot->GetExactDist2d(leader));
+        }
+        facts.farthestMemberYards = farthest;
+        facts.tried = RecoveriesTried(leaderName, coord.campaignId, 8);
+        return facts;
+    }
+
+    static std::string RecoveryFactsLine(OverseerDecisions::RunFailureFacts const& facts)
+    {
+        std::ostringstream line;
+        line << "leader ";
+        if (facts.leaderYardsFromStaging >= 0.f)
+            line << static_cast<uint32>(facts.leaderYardsFromStaging) << "y from the staging point";
+        else
+            line << "not measured against the staging point";
+        line << "; farthest member ";
+        if (facts.farthestMemberYards >= 0.f)
+            line << static_cast<uint32>(facts.farthestMemberYards) << "y from the leader";
+        else
+            line << "not measured";
+        line << "; " << facts.membersApart << " on another map or copy";
+        line << "; bags " << (facts.bagsFull ? "full" : "ok");
+        line << "; clients " << (facts.everyoneSteerable ? "all steerable" : "one or more missing");
+        line << "; staging errand taken back " << facts.stagingRearms << " times";
+        line << "; tried";
+        if (facts.tried.empty())
+            line << " nothing yet";
+        for (OverseerDecisions::RunRecovery r : facts.tried)
+            line << ' ' << OverseerDecisions::RunRecoveryWord(r);
+        return line.str();
+    }
+
+    // INTO RECOVERING. `coord` already carries the next attempt's identity
+    // (portal, staging point, campaign, run number, cap); this adds the
+    // recovery and writes the request the bridge answers.
+    void EnterRecovering(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                         OverseerDecisions::RunFailureFacts const& facts, unsigned attempt,
+                         uint32 alreadyWaited)
+    {
+        std::time_t const now = std::time(nullptr);
+        coord.phase = DungeonRunPhase::Recovering;
+        coord.recoveryStreak = attempt;
+        coord.recoveryAttempt = attempt;
+        coord.recoverySince = now;
+        unsigned const backoff = OverseerDecisions::RunRecoveryBackoffSeconds(
+            attempt, DUNGEON_RECOVERY_BACKOFF_BASE_SECONDS, DUNGEON_RECOVERY_BACKOFF_CAP_SECONDS);
+        // Never zero: a failure never re-opens a run in the poll it failed in.
+        coord.recoveryWaitSeconds = backoff > alreadyWaited ? backoff - alreadyWaited : 1;
+        coord.recoveryFacts = facts;
+        coord.recoveryHeuristic = OverseerDecisions::RunRecoveryHeuristic(facts);
+        coord.recoveryHeuristicWhy =
+            OverseerDecisions::RunRecoveryHeuristicWhy(facts, coord.recoveryHeuristic);
+        coord.recoveryChosen = false;
+        coord.recoveryNote = "attempt " + std::to_string(attempt) + " in a row failed (" +
+                             facts.outcome + "); " +
+                             OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic) +
+                             " in " + std::to_string(coord.recoveryWaitSeconds) +
+                             "s unless Jev chooses another";
+
+        std::string const factsLine = RecoveryFactsLine(facts);
+        WriteRecoveryRequest(FamilyOfCoordinator(coord), leaderName, coord.campaignId,
+                             coord.runNumber, "run_recovery", attempt,
+                             facts.outcome + ": " + facts.reason, factsLine,
+                             OverseerDecisions::RunRecoveryOptions(),
+                             OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic),
+                             coord.recoveryHeuristicWhy);
+
+        // STILL AN ERROR, BECAUSE AN ATTEMPT FAILED, AND IT SAYS WHAT HAPPENS
+        // NEXT. The old line ended with an UPDATE for the operator to run;
+        // this one ends with what the module is doing about it.
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon campaign {} for '{}' is RECOVERING, not stopped - "
+                  "attempt {} in a row never got the party inside ('{}': {}). Facts: {}. "
+                  "Recovery '{}' ({}) is applied in {}s, unless the bridge's Jev "
+                  "judgment chooses another first, and then run {} is attempted again. "
+                  "Nothing needs the operator",
+                  coord.campaignId, leaderName, attempt, facts.outcome, facts.reason,
+                  factsLine, OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic),
+                  coord.recoveryHeuristicWhy, coord.recoveryWaitSeconds, coord.runNumber);
+    }
+
+    // OUT OF RECOVERING INTO THE NEXT ATTEMPT, through REPAIRING exactly as a
+    // re-armed campaign has always gone. `replan` throws away the carried
+    // staging point and approach, so RESETTING derives a fresh one (see
+    // StagingPointUsable at RESETTING) and GATHERING plans its legs again.
+    void RearmAfterRecovery(DungeonRunCoordinatorState& coord, bool replan)
+    {
+        DungeonRunCoordinatorState next;
+        next.phase = DungeonRunPhase::Repairing;
+        next.repairSince = std::time(nullptr);
+        next.portalKeyword = coord.portalKeyword;
+        next.stageX = replan ? 0.f : coord.stageX;
+        next.stageY = replan ? 0.f : coord.stageY;
+        next.stageZ = replan ? 0.f : coord.stageZ;
+        next.campaignId = coord.campaignId;
+        next.runNumber = coord.runNumber;
+        next.runsWanted = coord.runsWanted;
+        next.capKnown = coord.capKnown;
+        next.resetSince = std::time(nullptr);
+        next.recoveryStreak = coord.recoveryStreak;
+        coord = next;
+    }
+
+    // One poll of RECOVERING: wait out the backoff, choose, and then either
+    // hand straight to the next attempt or walk or wait until the recovery has
+    // done its work (or reached its ceiling).
+    void DriveRecovering(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                         std::vector<std::string> const& members, DungeonPortal const& portal)
+    {
+        std::time_t const now = std::time(nullptr);
+        if (!coord.recoveryChosen)
+        {
+            if (now - coord.recoverySince < static_cast<std::time_t>(coord.recoveryWaitSeconds))
+                return;   // the backoff: nothing is attempted, nothing loops
+
+            OverseerDecisions::RunRecovery chosen = coord.recoveryHeuristic;
+            std::string chosenBy = "heuristic";
+            std::string answer;
+            std::string by;
+            if (ReadRecoveryAnswer(leaderName, "run_recovery", coord.campaignId,
+                                   coord.recoveryAttempt, answer, by))
+            {
+                OverseerDecisions::RunRecovery parsed;
+                if (OverseerDecisions::ParseRunRecovery(answer, parsed))
+                {
+                    chosen = parsed;
+                    chosenBy = by.empty() ? std::string("bridge") : by;
+                }
+                else
+                    LOG_WARN("module.overseer",
+                             "overseer: the bridge answered recovery '{}' for '{}', which "
+                             "is not one this module offered ({}) - the heuristic's '{}' "
+                             "is applied instead",
+                             answer, leaderName, OverseerDecisions::RunRecoveryOptions(),
+                             OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic));
+            }
+
+            coord.recoveryChosen = true;
+            coord.recovery = chosen;
+            coord.recoveryBy = chosenBy;
+            coord.recoveryActSince = now;
+            coord.recoveryBest = -1.f;
+            coord.recoveryBestAt = now;
+            coord.recoveryTownReached = false;
+            MarkRecoveryApplied(leaderName, "run_recovery", coord.campaignId,
+                                coord.recoveryAttempt, OverseerDecisions::RunRecoveryWord(chosen),
+                                chosenBy);
+            coord.recoveryNote = "attempt " + std::to_string(coord.recoveryAttempt) + ": " +
+                                 OverseerDecisions::RunRecoveryWord(chosen) + " (chosen by " +
+                                 chosenBy + ")";
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon campaign {} for '{}' recovery '{}' chosen by {} "
+                     "after a {}s backoff (the heuristic said '{}': {})",
+                     coord.campaignId, leaderName, OverseerDecisions::RunRecoveryWord(chosen),
+                     chosenBy, coord.recoveryWaitSeconds,
+                     OverseerDecisions::RunRecoveryWord(coord.recoveryHeuristic),
+                     coord.recoveryHeuristicWhy);
+
+            switch (chosen)
+            {
+                case OverseerDecisions::RunRecovery::TownForBags:
+                    // IDLE is the one phase the town trip runs in, and the
+                    // IDLE gate opens the next attempt of this same campaign
+                    // once the bags allow it: this attempt's recovery row now
+                    // reads 'applied', so it is not recovered from twice.
+                    _travelAims.Release(leaderName, "the run's town_for_bags recovery");
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon campaign {} for '{}' stands down to IDLE for "
+                             "the town trip; it opens run {} again from there, it is not "
+                             "cancelled",
+                             coord.campaignId, leaderName, coord.runNumber);
+                    coord = DungeonRunCoordinatorState();
+                    return;
+                case OverseerDecisions::RunRecovery::OneCopy:
+                case OverseerDecisions::RunRecovery::ResetInstance:
+                    RearmAfterRecovery(coord, false);
+                    return;
+                case OverseerDecisions::RunRecovery::Replan:
+                    RearmAfterRecovery(coord, true);
+                    return;
+                case OverseerDecisions::RunRecovery::Regroup:
+                    // The leader stands still; the catch-up walks bring the
+                    // family to him.
+                    _travelAims.Release(leaderName, "the run's regroup recovery");
+                    return;
+                case OverseerDecisions::RunRecovery::RestageNearer:
+                case OverseerDecisions::RunRecovery::WaitForClient:
+                    return;
+            }
+            return;
+        }
+
+        OverseerDecisions::RecoveryWaitFacts wait;
+        wait.since = coord.recoveryActSince;
+        wait.now = now;
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+        bool const leaderSteerable = SteerableAI(leader) != nullptr;
+        char const* doneWhy = "";
+
+        switch (coord.recovery)
+        {
+            case OverseerDecisions::RunRecovery::WaitForClient:
+            {
+                wait.ceilingSeconds = DUNGEON_RECOVERY_WAIT_CEILING_SECONDS;
+                bool all = leaderSteerable;
+                for (std::string const& name : members)
+                    all = all && SteerableAI(ObjectAccessor::FindPlayerByName(name)) != nullptr;
+                wait.satisfied = all;
+                doneWhy = "every member is steerable again";
+                break;
+            }
+            case OverseerDecisions::RunRecovery::Regroup:
+            {
+                wait.ceilingSeconds = DUNGEON_RECOVERY_WAIT_CEILING_SECONDS;
+                bool all = leaderSteerable;
+                for (std::string const& name : members)
+                {
+                    if (!all || name == leaderName)
+                        continue;
+                    Player* const bot = ObjectAccessor::FindPlayerByName(name);
+                    all = SteerableAI(bot) && bot->GetMapId() == leader->GetMapId() &&
+                          bot->GetInstanceId() == leader->GetInstanceId() &&
+                          bot->GetExactDist2d(leader) <= DUNGEON_RECOVERY_REGROUP_YARDS;
+                }
+                wait.satisfied = all;
+                doneWhy = "every member is back beside the leader";
+                break;
+            }
+            case OverseerDecisions::RunRecovery::RestageNearer:
+            {
+                wait.ceilingSeconds = DUNGEON_RECOVERY_WALK_CEILING_SECONDS;
+                doneWhy = "the leader is near the staging point";
+                if (!leaderSteerable)
+                    break;   // wait for him; the ceiling still runs
+                if (leader->GetMapId() != portal.outsideMapId ||
+                    !OverseerDecisions::StagingPointUsable(coord.stageX, coord.stageY,
+                                                           coord.stageZ))
+                {
+                    // Nothing this walk can do from another map, or toward a
+                    // point that is not a place: the attempt's own travel and
+                    // RESETTING's derivation are what answer those.
+                    wait.satisfied = true;
+                    doneWhy = "the leader is not on the door's map, so the next attempt "
+                              "walks him";
+                    break;
+                }
+
+                // THE TOWN FIRST, WHERE THE PORTAL ROW NAMES ONE, then the
+                // approach the staging walk would take - with no staging clock.
+                OverseerDecisions::CampaignHomeAnchor const town = DungeonHomeAnchor(portal);
+                std::string aim;
+                float yards = 0.f;
+                if (town.known && !coord.recoveryTownReached)
+                {
+                    yards = leader->GetExactDist2d(town.x, town.y);
+                    if (yards <= DUNGEON_RECOVERY_NEAR_YARDS)
+                    {
+                        coord.recoveryTownReached = true;
+                        coord.recoveryBest = -1.f;
+                        coord.recoveryBestAt = now;
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' reached the '{}' town on its restage walk "
+                                 "and goes on toward the door",
+                                 leaderName, portal.keyword);
+                    }
+                    else
+                    {
+                        std::ostringstream at;
+                        at << "at:" << portal.outsideMapId << ':' << town.x << ',' << town.y
+                           << ',' << town.z;
+                        aim = at.str();
+                    }
+                }
+                if (aim.empty())
+                {
+                    DungeonApproachAim const legAim = DungeonApproachAimFor(
+                        portal, coord.approach[leaderName], leader, coord.stageX,
+                        coord.stageY, coord.stageZ);
+                    if (!legAim.usable)
+                    {
+                        wait.satisfied = true;
+                        doneWhy = "no usable aim toward the door, so the next attempt plans it";
+                        break;
+                    }
+                    aim = legAim.aim;
+                    yards = leader->GetExactDist2d(coord.stageX, coord.stageY);
+                    wait.satisfied = yards <= DUNGEON_RECOVERY_NEAR_YARDS;
+                }
+                if (wait.satisfied)
+                    break;
+
+                // CLAIMED EVERY POLL, the way BARRIER and GATHERING claim:
+                // Claim returns at once while the errand is live, and renews
+                // it when something else ended it.
+                _travelAims.Claim(leaderName, aim, OverseerDecisions::TravelOwner::Run);
+                if (coord.recoveryBest < 0.f ||
+                    yards < coord.recoveryBest - DUNGEON_RECOVERY_WALK_PROGRESS_YARDS)
+                {
+                    coord.recoveryBest = yards;
+                    coord.recoveryBestAt = now;
+                }
+                else if (now - coord.recoveryBestAt >=
+                         static_cast<std::time_t>(DUNGEON_RECOVERY_WALK_STALL_SECONDS))
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has got no nearer than {:.0f}y on its restage "
+                             "walk for {}s; the walk ends and the next attempt opens from "
+                             "where he stands",
+                             leaderName, coord.recoveryBest,
+                             DUNGEON_RECOVERY_WALK_STALL_SECONDS);
+                    wait.satisfied = true;
+                    doneWhy = "the walk stopped making progress";
+                }
+                break;
+            }
+            default:
+                // Every other recovery re-armed the moment it was chosen.
+                wait.satisfied = true;
+                break;
+        }
+
+        OverseerDecisions::RecoveryWaitStep const step = OverseerDecisions::RecoveryWaitNext(wait);
+        if (step == OverseerDecisions::RecoveryWaitStep::Wait)
+            return;
+
+        LOG_INFO("module.overseer",
+                 "overseer: RECOVERING ends for '{}' - '{}' {} after {}s; run {} of campaign "
+                 "{} is attempted again from REPAIRING",
+                 leaderName, OverseerDecisions::RunRecoveryWord(coord.recovery),
+                 step == OverseerDecisions::RecoveryWaitStep::Done
+                     ? std::string("done: ") + doneWhy
+                     : std::string("reached its ceiling"),
+                 static_cast<uint32>(now - coord.recoveryActSince), coord.runNumber,
+                 coord.campaignId);
+        if (coord.recovery == OverseerDecisions::RunRecovery::RestageNearer)
+            _travelAims.Release(leaderName, "the run's restage walk ending");
+        RearmAfterRecovery(coord, false);
+    }
+
+    // THE STAGING STALL, CLOSED EARLY. The same accounting as FailStaging (a
+    // row for an attempt that never opened one), for a run whose answer to
+    // repeated take-backs is to recover now rather than at the backstop.
+    void FailStagingStall(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                          std::vector<std::string> const& members, DungeonPortal const& portal,
+                          bool stillWanted)
+    {
+        std::string const reason =
+            "GATHERING was closed early: the leader's staging errand was taken back " +
+            std::to_string(coord.stagingRearms) + " times (last ended by " +
+            (coord.stagingRearmWhy.empty() ? std::string("nothing recorded")
+                                           : coord.stagingRearmWhy) +
+            "), and the staging stall answer was to recover now";
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} staging stall - {}. The attempt "
+                  "is closed and the campaign RECOVERS; it is not stopped",
+                  coord.runNumber, coord.campaignId, reason);
+        uint32 const runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+        if (runId)
+            StampRunIntoCampaign(runId, coord.campaignId, coord.runNumber, JoinNames(members));
+        else
+            RecordUnenteredRun(leaderName, portal.insideMapId, coord.campaignId,
+                               coord.runNumber, "staging_failed", reason, JoinNames(members));
+        EndRunAndDecide(coord, leaderName, portal, runId, "staging_failed", reason, stillWanted,
+                        &members);
     }
 
     // THE END OF A RUN, AND THE DECISION TO GO AGAIN.
@@ -28655,8 +29294,18 @@ private:
                          DungeonPortal const& portal,
                          uint32 runId, char const* outcome,
                          std::string const& reason,
-                         bool stillWanted)
+                         bool stillWanted,
+                         std::vector<std::string> const* members = nullptr)
     {
+        // READ BEFORE ANYTHING IS RESET: the facts a recovery is chosen from
+        // are about the attempt that just failed, and the streak is carried.
+        bool const unentered = !OverseerDecisions::DungeonRunEnteredTheInstance(outcome);
+        unsigned const streakBefore = coord.recoveryStreak;
+        OverseerDecisions::RunFailureFacts const failureFacts =
+            unentered ? ReadRunFailureFacts(coord, leaderName,
+                                            members ? *members : std::vector<std::string>(),
+                                            portal, outcome, reason)
+                      : OverseerDecisions::RunFailureFacts();
         AlignRunLeader(runId, leaderName);
         CloseRun(runId, outcome, reason);
         WriteRunEnded(coord, leaderName, runId, outcome, reason);
@@ -28674,7 +29323,7 @@ private:
                                                        coord.runsWanted, coord.capKnown);
         if (progress.counted)
             CountRunDone(leaderName);
-        _travelAims.Release(leaderName);
+        _travelAims.Release(leaderName, "the dungeon run coordinator");
 
         uint32 const finished = progress.runsDone;
         uint32 const wanted = coord.runsWanted;
@@ -28758,32 +29407,6 @@ private:
             return;
         }
 
-        // THE SECOND GATE, AND THE HALF THAT WAS MISSING (#306). Everything
-        // below opens another attempt, and until now nothing here asked whether
-        // the campaign should be opening one. The IDLE branch asks before a
-        // campaign's FIRST run; a campaign's second, third and eighth runs are
-        // opened from exactly here and never go back through IDLE, so the stop
-        // that bounds them was unreachable by construction. Seven consecutive
-        // attempts that never reached the instance, against a threshold of
-        // three, is what that cost on 2026-09-07.
-        //
-        // IT IS ASKED AFTER CloseRun AND NOT BEFORE, so that this attempt's own
-        // row is one of the rows counted. Every path into this function has
-        // written the attempt down by the time it arrives: FailStaging inserts a
-        // row for an attempt that never opened one, and CloseRun above stamps
-        // the outcome onto one that did.
-        //
-        // AND IT RETURNS TO IDLE RATHER THAN RE-ARMING, with the flag already
-        // latched, so the gate above reaches the same verdict on every poll from
-        // now on and says nothing further. One ERROR per campaign, which is the
-        // whole point of saying it at all.
-        if (CampaignStoppedByFailures(campaignId, leaderName, true))
-        {
-            coord = DungeonRunCoordinatorState();
-            coord.loggedCampaignOver = true;
-            return;
-        }
-
         coord = DungeonRunCoordinatorState();
         // THE NEXT RUN DOES NOT OPEN ON BROKEN GEAR (#391). This used to set
         // RESETTING directly, and that one assignment is why a hundred-run
@@ -28836,6 +29459,22 @@ private:
         coord.capKnown = known;
         coord.resetSince = std::time(nullptr);
 
+        // AN ATTEMPT THAT NEVER GOT INSIDE IS RECOVERED FROM, NEVER STOPPED ON.
+        // This is where three in a row used to end the campaign (#306). The
+        // coordinator keeps everything the next attempt needs (set just above)
+        // and goes to RECOVERING instead of REPAIRING; RECOVERING hands to
+        // REPAIRING itself once its recovery has run. The streak is the larger
+        // of the carried count and the rows: the carried count is exact within
+        // one process, and the rows cover a worldserver bounce (and may not yet
+        // hold this attempt's own row, whose write is queued).
+        if (unentered)
+        {
+            unsigned const attempt = std::max<unsigned>(
+                streakBefore + 1, TrailingUnenteredRuns(campaignId));
+            EnterRecovering(coord, leaderName, failureFacts, attempt, 0);
+            return;
+        }
+
         if (progress.counted)
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} ended '{}' - {}. That was run {} of {} in "
@@ -28845,13 +29484,11 @@ private:
                      runId, outcome, reason, finished, wanted, campaignId,
                      portal.insideMapId);
         else
-            LOG_WARN("module.overseer",
-                     "overseer: dungeon attempt ended '{}' - {}. Nobody reached the "
-                     "instance, so it is written down as a failed attempt and run {} of {} "
-                     "in campaign {} is still to be made: RESET on map {} first, and the "
-                     "campaign stops if {} attempts in a row fail this way",
-                     outcome, reason, coord.runNumber, wanted, campaignId,
-                     portal.insideMapId, DUNGEON_CAMPAIGN_CONSECUTIVE_FAILURES);
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. The party was inside, so "
+                     "run {} of {} in campaign {} goes again: RESET on map {} first",
+                     runId, outcome, reason, coord.runNumber, wanted, campaignId,
+                     portal.insideMapId);
     }
 
     // ------------------------------------------- crossing a continent (#241) --
@@ -29282,7 +29919,7 @@ private:
                 // longer the mechanism.
                 if (fresh)
                 {
-                    _travelAims.Release(leaderName);
+                    _travelAims.Release(leaderName, "the dungeon run coordinator");
                     LOG_INFO("module.overseer",
                              "overseer: the leader '{}' is aboard '{}' between maps {} "
                              "and {} - {}",
@@ -29342,7 +29979,7 @@ private:
                 // this has just stopped believing in.
                 if (coord.crossingSince)
                 {
-                    _travelAims.Release(leaderName);
+                    _travelAims.Release(leaderName, "the dungeon run coordinator");
                     coord.crossingSince = 0;
                 }
                 if (!coord.loggedApproachRefused)
@@ -29467,7 +30104,7 @@ private:
         coord.repairSettled.insert(name);
         if (HasCounterHold(name))
             ReleaseCounterHold(name, "the repair leg is finished with it");
-        _travelAims.Release(name);
+        _travelAims.Release(name, "the repair leg settling a member");
     }
 
     // REPAIR THIS MEMBER WHERE IT IS STANDING, AND READ THE WORLD BACK.
@@ -29586,7 +30223,7 @@ private:
         {
             if (HasCounterHold(name))
                 ReleaseCounterHold(name, "the repair leg is over");
-            _travelAims.Release(name);
+            _travelAims.Release(name, "the repair leg ending");
         }
         coord.repairSince = 0;
         coord.repairSettled.clear();
@@ -29965,7 +30602,7 @@ private:
         trip.settled.insert(name);
         if (HasCounterHold(name))
             ReleaseCounterHold(name, "the town trip is finished with it");
-        _travelAims.Release(name);
+        _travelAims.Release(name, "the town trip settling a member");
     }
 
     // Everything the trip claimed, handed back in one place so that every way out
@@ -29988,7 +30625,7 @@ private:
                 ProveAndRecordTownTrip(trip, name, ObjectAccessor::FindPlayerByName(name));
             if (HasCounterHold(name))
                 ReleaseCounterHold(name, why);
-            _travelAims.Release(name);
+            _travelAims.Release(name, "the town trip ending");
         }
         LOG_INFO("module.overseer",
                  "overseer: the town trip to a '{}' is over after {}s - {}",
@@ -30643,6 +31280,120 @@ private:
     }
 
     // The first roster member standing inside an open run, or null.
+    // IS AN UPGRADE BEING LEFT ON THE FLOOR FOR WANT OF ROOM? The one bag state
+    // that still walks a run out (OverseerDecisions::DungeonRunBagAnswer): a
+    // member inside with ZERO free slots, and a corpse near them still holding
+    // an Uncommon or better item they are allowed to loot.
+    static bool UpgradeStrandedOnTheFloor(std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !InDungeonRun(bot) || bot->GetFreeInventorySpace() > 0)
+                continue;
+            std::list<Creature*> corpses;
+            bot->GetDeadCreatureListInGrid(corpses, DUNGEON_ROOM_LOOT_YARDS);
+            for (Creature* corpse : corpses)
+            {
+                if (!corpse || corpse->loot.isLooted())
+                    continue;
+                for (LootItem const& item : corpse->loot.items)
+                {
+                    if (item.is_looted || !item.AllowedForPlayer(bot, corpse->GetGUID()))
+                        continue;
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item.itemid);
+                    if (proto && proto->Quality >= ITEM_QUALITY_UNCOMMON)
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' has no bag room and '{}' (entry {}, "
+                                 "quality {}) is on a corpse {:.0f}y away - an upgrade "
+                                 "would be lost, so this run walks out for bags",
+                                 name, proto->Name1, item.itemid, proto->Quality,
+                                 bot->GetExactDist2d(corpse));
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // MAKE ROOM WHERE THE PARTY STANDS (2026-09-24). What a group of people
+    // does when bags fill mid-clear: destroy the greys (through the #614
+    // destroy verb, with allow:grey lifting its sell-price and quest walls for
+    // a Poor item only) and stop picking up vendor trash (playerbots' `ll
+    // normal` loot rule: only items with a use). The run keeps clearing.
+    void MakeRoomInside(DungeonRunCoordinatorState& coord,
+                        std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const botAI = SteerableAI(bot);
+            if (!botAI || !InDungeonRun(bot) ||
+                bot->GetFreeInventorySpace() > TOWN_TRIP_LIMITS.freeBagSlotsToGo)
+                continue;
+
+            if (!coord.roomLootRuleSet.count(name))
+            {
+                coord.roomLootRuleSet.insert(name);
+                bool const set = botAI->DoSpecificAction("ll", Event("ll", "normal", bot), true);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is low on bag room inside the run - loot rule "
+                         "'normal' {} (vendor trash is left on the corpse)",
+                         name, set ? "set" : "NOT accepted");
+            }
+
+            std::vector<std::pair<uint32, uint32>> greys;   // guid counter, count
+            auto consider = [&](Item* item) {
+                if (!item)
+                    return;
+                ItemTemplate const* proto = item->GetTemplate();
+                if (proto && proto->Quality == ITEM_QUALITY_POOR)
+                    greys.emplace_back(item->GetGUID().GetCounter(), item->GetCount());
+            };
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                consider(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END;
+                 ++bagSlot)
+                if (Bag* bag = bot->GetBagByPos(bagSlot))
+                    for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                        consider(bag->GetItemByPos(static_cast<uint8>(slot)));
+
+            uint32 destroyed = 0;
+            for (auto const& [guid, count] : greys)
+            {
+                if (bot->GetFreeInventorySpace() > TOWN_TRIP_LIMITS.freeBagSlotsToGo)
+                    break;
+                char const* status = "error";
+                std::string out;
+                std::string const command = "destroy guid:" + std::to_string(guid) +
+                                            " count:" + std::to_string(count) +
+                                            " allow:grey";
+                if (!*DoDestroy(bot, command, status, out))
+                    ++destroyed;
+            }
+
+            uint32 const freeNow = bot->GetFreeInventorySpace();
+            if (destroyed)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' makes bag room inside the run - destroyed {} grey "
+                         "stack(s), {} free slot(s) now; the run keeps clearing and is not "
+                         "evacuated for bags",
+                         name, destroyed, freeNow);
+            else if (!coord.roomNoGreySaid.count(name))
+            {
+                coord.roomNoGreySaid.insert(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has {} free slot(s) inside the run and no grey "
+                         "left to destroy - the run keeps clearing, and walks out only if "
+                         "an Uncommon or better item is left on the floor for a member "
+                         "with no room",
+                         name, freeNow);
+            }
+        }
+    }
+
     static Player* FirstMemberInsideARun(std::vector<std::string> const& members)
     {
         for (std::string const& name : members)
@@ -31338,10 +32089,21 @@ private:
                                   bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo, false,
                                   false) != OverseerDecisions::DungeonBagPressure::None);
 
-            switch (OverseerDecisions::DungeonRunBagPressure(
-                bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
-                bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting))
+            // A RUN INSIDE MAKES ROOM RATHER THAN LEAVING (2026-09-24), unless a
+            // member with no room at all has an Uncommon or better item on the
+            // floor. See OverseerDecisions::DungeonRunBagAnswer.
+            OverseerDecisions::DungeonBagPressure const pressure =
+                OverseerDecisions::DungeonRunBagPressure(
+                    bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
+                    bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting);
+            switch (OverseerDecisions::DungeonRunBagAnswer(
+                pressure, pressure == OverseerDecisions::DungeonBagPressure::Evacuate &&
+                              UpgradeStrandedOnTheFloor(members)))
             {
+                case OverseerDecisions::DungeonBagPressure::MakeRoom:
+                    MakeRoomInside(coord, members);
+                    break;
+
                 case OverseerDecisions::DungeonBagPressure::None:
                     // The latch is cleared the moment there is room again, so a
                     // later episode says so too rather than holding silently -
@@ -31394,13 +32156,14 @@ private:
                     coord.crossing.since = std::time(nullptr);
                     coord.loggedCrossingAim = false;
                     coord.loggedCrossingWaiting = false;
-                    _travelAims.Release(leaderName);
+                    _travelAims.Release(leaderName, "the dungeon run coordinator");
                     LOG_WARN("module.overseer",
                              "overseer: an active dungeon run is being evacuated because a "
-                             "family member inside has {} or fewer free inventory slots. The "
-                             "row will read 'evacuated' rather than 'left', and the run does "
-                             "NOT spend a slot of the campaign, because it cleared nothing",
-                             TOWN_TRIP_LIMITS.freeBagSlotsToGo);
+                             "family member inside has no free inventory slot and an "
+                             "Uncommon or better item is on the floor for them - the one "
+                             "bag state making room inside cannot answer. The row will read "
+                             "'evacuated' rather than 'left', and the run does NOT spend a "
+                             "slot of the campaign");
                     return;
                 }
 
@@ -31415,7 +32178,7 @@ private:
                     // against a cure that is not allowed to run.
                     if (coord.phase != DungeonRunPhase::Idle)
                     {
-                        _travelAims.Release(leaderName);
+                        _travelAims.Release(leaderName, "the dungeon run coordinator");
                         coord = DungeonRunCoordinatorState();
                     }
                     // SAID ONLY WHEN THERE IS A RUN BEING HELD BACK. A family
@@ -32126,8 +32889,7 @@ private:
             // attempts all died at the barrier still reads zero, and taking that
             // zero as the operator's gesture would hand every one of those
             // failures a brand new campaign id - which is to say it would hide
-            // them from the consecutive-failure stop that is now the only thing
-            // bounding them. UnstartedCampaignOnMap asks the rows instead: if
+            // them from the recovery streak that grows the backoff. UnstartedCampaignOnMap asks the rows instead: if
             // the last thing that happened on this map never got inside, this
             // campaign is still trying to start and the attempt belongs to it.
             uint32 campaignId = 0;
@@ -32140,19 +32902,38 @@ private:
                         : CampaignInProgress(leaderName, portal->insideMapId);
                 if (!campaignId)
                     campaignId = AllocateCampaignId();
+            }
 
-                // THE FIRST OF THE TWO GATES (#306). This one is reached only
-                // for a campaign's FIRST attempt - see the other, at the end of
-                // EndRunAndDecide, which is reached for all the rest.
-                if (CampaignStoppedByFailures(campaignId, leaderName,
-                                              !coord.loggedCampaignOver))
-                {
-                    // Latched whether or not this poll was the one that spoke:
-                    // the question is asked again in a few seconds and the
-                    // answer will not have changed.
-                    coord.loggedCampaignOver = true;
-                    return;
-                }
+            // A CAMPAIGN WHOSE LAST ATTEMPT FAILED BEFORE ENTRY RECOVERS FIRST.
+            // This was the first of the two stop gates (#306); a campaign is
+            // never stopped now. Reached for a campaign re-entering IDLE after a
+            // worldserver bounce mid-recovery (the backoff resumes from the
+            // row's own end time rather than starting again) and after a
+            // town_for_bags recovery, whose row already reads 'applied', so the
+            // attempt it was for is opened now rather than recovered twice.
+            uint32 const streak = TrailingUnenteredRuns(campaignId);
+            std::string lastOutcome;
+            std::string lastReason;
+            uint32 endedAgo = 0;
+            if (OverseerDecisions::DungeonCampaignRecovers(streak) &&
+                !RecoveryAppliedFor(leaderName, campaignId, streak) &&
+                LastAttemptOfCampaign(campaignId, lastOutcome, lastReason, endedAgo))
+            {
+                coord = DungeonRunCoordinatorState();
+                coord.portalKeyword = dungeonKeyword;
+                coord.stageX = stageX;
+                coord.stageY = stageY;
+                coord.stageZ = stageZ;
+                coord.campaignId = campaignId;
+                coord.runNumber = runNumber;
+                coord.runsWanted = cap.wanted;
+                coord.capKnown = cap.known;
+                coord.resetSince = std::time(nullptr);
+                EnterRecovering(coord, leaderName,
+                                ReadRunFailureFacts(coord, leaderName, members, *portal,
+                                                    lastOutcome, lastReason),
+                                streak, endedAgo);
+                return;
             }
 
             coord = DungeonRunCoordinatorState();
@@ -32258,7 +33039,7 @@ private:
                 // pointing at the entrance is one DriveTravel would refuse from
                 // inside anyway (ResolveTravelTarget checks the map), releasing
                 // it on a line that says "no such spawn" and reads as a fault.
-                _travelAims.Release(leaderName);
+                _travelAims.Release(leaderName, "the dungeon run coordinator");
                 LOG_INFO("module.overseer",
                          "overseer: '{}' job left 'dungeon' while the party was inside - "
                          "the run is over, so EXIT walks them back out through the door "
@@ -32289,8 +33070,17 @@ private:
             // 'dungeon' kept a live aim at a dungeon portal with no coordinator
             // left to own it. That is the "outlived its purpose" shape this
             // whole change is about.
-            _travelAims.Release(leaderName);
+            _travelAims.Release(leaderName, "the dungeon run coordinator");
             coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        // RECOVERING IS DRIVEN BEFORE THE CLIENT CHECK, because one of its
+        // recoveries is waiting for that client; everything it does to the
+        // leader it asks SteerableAI for itself.
+        if (coord.phase == DungeonRunPhase::Recovering)
+        {
+            DriveRecovering(coord, leaderName, members, *portal);
             return;
         }
 
@@ -32322,7 +33112,7 @@ private:
             // map before that poll (a wipe releases to a graveyard out there)
             // finds a live aim walking it to the dungeon door. Released where
             // the reason is known. Same argument as the ENTER success path.
-            _travelAims.Release(leaderName);
+            _travelAims.Release(leaderName, "the dungeon run coordinator");
             coord = DungeonRunCoordinatorState();
             return;
         }
@@ -32700,6 +33490,65 @@ private:
             // GetPositionZ  Position.h:120  float GetPositionZ() const
             bool const onTheOutsideMap = leader->GetMapId() == portal->outsideMapId;
 
+            // THE STAGING STALL ANSWER. Read while one is outstanding, until the
+            // bridge answers or STAGING_STALL_ANSWER_SECONDS pass; then applied
+            // once.
+            if (coord.stallAskedAt)
+            {
+                std::time_t const now = std::time(nullptr);
+                std::string answer;
+                std::string by;
+                OverseerDecisions::StagingStall chosen = coord.stallHeuristic;
+                bool decided = false;
+                if (ReadRecoveryAnswer(leaderName, "staging_stall", coord.campaignId,
+                                       coord.stallAskRearms, answer, by))
+                {
+                    OverseerDecisions::StagingStall parsed;
+                    if (OverseerDecisions::ParseStagingStall(answer, parsed))
+                        chosen = parsed;
+                    else
+                        by = "heuristic";
+                    decided = true;
+                }
+                else if (now - coord.stallAskedAt >=
+                         static_cast<std::time_t>(STAGING_STALL_ANSWER_SECONDS))
+                {
+                    by = "heuristic";
+                    decided = true;
+                }
+                if (decided)
+                {
+                    if (by.empty())
+                        by = "bridge";
+                    coord.stallAskedAt = 0;
+                    MarkRecoveryApplied(leaderName, "staging_stall", coord.campaignId,
+                                        coord.stallAskRearms,
+                                        OverseerDecisions::StagingStallWord(chosen), by);
+                    coord.stallNote = "after " + std::to_string(coord.stallAskRearms) +
+                                      " take-backs: " +
+                                      OverseerDecisions::StagingStallWord(chosen) + " (" + by +
+                                      ")";
+                    LOG_WARN("module.overseer",
+                             "overseer: dungeon run {} staging stall decided - '{}' after {} "
+                             "take-backs, chosen by {}",
+                             coord.runNumber, OverseerDecisions::StagingStallWord(chosen),
+                             coord.stallAskRearms, by);
+                    if (chosen == OverseerDecisions::StagingStall::RunYields)
+                    {
+                        coord.stallYieldUntil = now + STAGING_STALL_YIELD_SECONDS;
+                        // THE CLOCK DOES NOT RUN WHILE THE RUN YIELDS.
+                        if (coord.stagingSince)
+                            coord.stagingSince += STAGING_STALL_YIELD_SECONDS;
+                    }
+                    else if (chosen == OverseerDecisions::StagingStall::RecoverNow)
+                    {
+                        FailStagingStall(coord, leaderName, members, *portal,
+                                         IsDungeonJob(leaderJob));
+                        return;
+                    }
+                }
+            }
+
             // WHICH LEG IS BEING WALKED, AND THE GAP TO THE POINT IT ENDS AT
             // (#242). This used to be the gap to the staging point and nothing
             // else, which is right for a door you can walk straight at and
@@ -32771,7 +33620,10 @@ private:
             // last saw already holds this string, so the steady state is one map
             // lookup and no write - which is exactly why BARRIER has been able
             // to call it on every poll since #122.
-            if (onTheOutsideMap && legAim.usable)
+            // A RUN THAT YIELDS DOES NOT RE-CLAIM, and its staging clock does
+            // not run meanwhile (see the staging stall answer above).
+            bool const yielding = std::time(nullptr) < coord.stallYieldUntil;
+            if (onTheOutsideMap && legAim.usable && !yielding)
             {
                 // WHOSE AIM THIS STILL IS, ASKED BEFORE IT IS RE-ASSERTED, AND
                 // ASKED OF BOTH REGISTERS BECAUSE NEITHER ANSWERS IT ALONE.
@@ -32813,6 +33665,11 @@ private:
                 if (step == OverseerDecisions::StagingAim::Rearm)
                 {
                     ++coord.stagingRearms;
+                    // WHO TOOK IT. Read before anything is claimed; Claim does
+                    // not touch this record.
+                    TravelAimBook::ErrandEnd const ended = _travelAims.LastEnd(leaderName);
+                    coord.stagingRearmWhy = ended.why;
+                    coord.stagingRearmOutside = ended.outside;
                     LOG_WARN("module.overseer",
                              "overseer: dungeon run staging - the errand walking '{}' to "
                              "{} ({}) had ended or been written over, and this run is "
@@ -32821,14 +33678,59 @@ private:
                              "is aimed rather than escorted, so no sweep renews it. "
                              "Re-armed ({} so far this run) and the stall ladder starts "
                              "again, because the yards it measured were measured on a "
-                             "character nothing was walking toward this point. He is {}",
+                             "character nothing was walking toward this point. He is {}. "
+                             "It was last ended by {}",
                              leaderName,
                              onTheCorridor ? "the start of the approach corridor"
                                            : "the staging point",
                              legAim.aim,
                              inFlight.empty() ? "nothing" : inFlight.c_str(),
                              coord.stagingRearms,
-                             OverseerDecisions::ApproachWhere(gap));
+                             OverseerDecisions::ApproachWhere(gap),
+                             ended.why.empty() ? std::string("nothing on record") : ended.why);
+
+                    // THE STAGING STALL QUESTION, every few re-arms: the
+                    // bridge asks Jev what should yield, and the answer (or the
+                    // heuristic's, when none arrives) is applied above on a
+                    // later poll.
+                    // ONE QUESTION AT A TIME: an ask still waiting for its
+                    // answer is not overwritten by the next, or its row would
+                    // never be marked applied.
+                    if (OverseerDecisions::StagingStallAskAt(coord.stagingRearms) &&
+                        !coord.stallAskedAt)
+                    {
+                        OverseerDecisions::StagingStallFacts stall;
+                        stall.rearms = coord.stagingRearms;
+                        stall.lastEndedBy = ended.why;
+                        stall.endedFromOutside = ended.outside;
+                        stall.leaderYards = gap.measured ? gap.horizontalYards : -1.f;
+                        coord.stallHeuristic = OverseerDecisions::StagingStallHeuristic(stall);
+                        coord.stallAskedAt = std::time(nullptr);
+                        coord.stallAskRearms = coord.stagingRearms;
+                        std::ostringstream facts;
+                        facts << "rearms " << stall.rearms << "; last ended by "
+                              << (ended.why.empty() ? std::string("nothing on record") : ended.why)
+                              << (ended.outside ? " (outside this module)" : "")
+                              << "; leader " << OverseerDecisions::ApproachWhere(gap)
+                              << "; staging clock "
+                              << (coord.stagingSince ? std::time(nullptr) - coord.stagingSince : 0)
+                              << "s of " << DUNGEON_STAGING_BACKSTOP_SECONDS << "s";
+                        WriteRecoveryRequest(
+                            FamilyOfCoordinator(coord), leaderName, coord.campaignId,
+                            coord.runNumber, "staging_stall", coord.stagingRearms,
+                            "the leader's staging errand was taken back " +
+                                std::to_string(coord.stagingRearms) + " times",
+                            facts.str(), OverseerDecisions::StagingStallOptions(),
+                            OverseerDecisions::StagingStallWord(coord.stallHeuristic),
+                            "the heuristic reads who ended the errand and how far out he is");
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run {} staging stall asked - '{}' has had "
+                                 "his errand taken back {} times; the heuristic says '{}', "
+                                 "and the bridge has {}s to answer otherwise",
+                                 coord.runNumber, leaderName, coord.stagingRearms,
+                                 OverseerDecisions::StagingStallWord(coord.stallHeuristic),
+                                 STAGING_STALL_ANSWER_SECONDS);
+                    }
                 }
 
                 if (OverseerDecisions::StagingAimRestartsMeasurement(step))
@@ -32982,7 +33884,7 @@ private:
                 // fixes, and a line that said only "the staging point" for both
                 // would send the next reader to the wrong one.
                 if (RunStagingWatchdog(coord, leaderName, leader, gap))
-                    FailApproach(coord, leaderName, *portal, "GATHERING",
+                    FailApproach(coord, leaderName, members, *portal, "GATHERING",
                                  leaderName + " (" +
                                      OverseerDecisions::ApproachWhere(gap) +
                                      (onTheCorridor
@@ -33067,7 +33969,7 @@ private:
                           "overseer: dungeon run wanted areatrigger {} and this world's "
                           "tables do not have it - there is no door to walk through, so the "
                           "run is given up rather than held forever", triggerId);
-                _travelAims.Release(leaderName);
+                _travelAims.Release(leaderName, "the dungeon run coordinator");
                 coord = DungeonRunCoordinatorState();
                 return;
             }
@@ -33092,7 +33994,7 @@ private:
                                  "head - {}. Back to IDLE",
                                  static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60),
                                  leaderName, coord.loggedGroupBreach);
-                        _travelAims.Release(leaderName);
+                        _travelAims.Release(leaderName, "the dungeon run coordinator");
                         coord = DungeonRunCoordinatorState();
                     }
                     return;
@@ -33117,7 +34019,7 @@ private:
                         // walking it back to the dungeon door. That is the
                         // staging aim outliving its purpose, which is what this
                         // column's two writers used to do to each other.
-                        _travelAims.Release(leaderName);
+                        _travelAims.Release(leaderName, "the dungeon run coordinator");
                         LOG_INFO("module.overseer",
                                  "overseer: all {} roster members went through areatrigger "
                                  "{} and are on map {} - ENTER done, STAGED_INSIDE holds",
@@ -33132,7 +34034,7 @@ private:
                         // will adopt that run on its next poll rather than
                         // trying to re-gather a party that is no longer in one
                         // place. The crossing itself already said who was left.
-                        _travelAims.Release(leaderName);
+                        _travelAims.Release(leaderName, "the dungeon run coordinator");
                         coord = DungeonRunCoordinatorState();
                         return;
 
@@ -33248,7 +34150,7 @@ private:
                                   "whoever is left inside out through that same door, and "
                                   "if this repeats, the party cannot reach its own exit",
                                   triggerId, portal->insideMapId);
-                        _travelAims.Release(leaderName);
+                        _travelAims.Release(leaderName, "the dungeon run coordinator");
                         coord = DungeonRunCoordinatorState();
                         return;
 
@@ -34029,7 +34931,7 @@ private:
                 // achieve, and every minute of it is a minute the party spends
                 // standing beside a drop. The watchdog has already said which
                 // character and how far above.
-                FailApproach(coord, leaderName, *portal, "BARRIER",
+                FailApproach(coord, leaderName, members, *portal, "BARRIER",
                              name + " (" + OverseerDecisions::ApproachWhere(legGap) +
                                  (onTheCorridor
                                       ? ", walking to the start of the approach corridor"
@@ -34420,7 +35322,7 @@ private:
                  step == OverseerDecisions::RespecStep::NoTree))
             {
                 _respecErrands.erase(walking);
-                _travelAims.Release(name);
+                _travelAims.Release(name, "the talent reset walk ending");
                 LOG_INFO("module.overseer",
                          "overseer: '{}' no longer needs a talent reset ({}) - the walk to a "
                          "class trainer is released", name,

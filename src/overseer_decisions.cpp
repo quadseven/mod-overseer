@@ -1890,15 +1890,251 @@ unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewe
     return failures;
 }
 
-bool DungeonCampaignStopsOnFailures(unsigned trailingFailures, unsigned failureLimit)
+bool DungeonCampaignRecovers(unsigned trailingFailures)
 {
-    // Said first and on its own, because it is the branch a reader doubts: a
-    // limit of zero is a bound that could not be read, and no campaign is
-    // stopped on one.
-    if (!failureLimit)
-        return false;
+    return trailingFailures > 0;
+}
 
-    return trailingFailures >= failureLimit;
+char const* RunRecoveryWord(RunRecovery recovery)
+{
+    switch (recovery)
+    {
+        case RunRecovery::RestageNearer: return "restage_nearer";
+        case RunRecovery::Regroup:       return "regroup";
+        case RunRecovery::TownForBags:   return "town_for_bags";
+        case RunRecovery::WaitForClient: return "wait_for_client";
+        case RunRecovery::OneCopy:       return "one_copy";
+        case RunRecovery::Replan:        return "replan";
+        case RunRecovery::ResetInstance: return "reset_instance";
+    }
+    return "reset_instance";
+}
+
+namespace
+{
+// Ladder order: the order the heuristic walks when the failure's own facts
+// point at nothing, and the order the options are offered in.
+RunRecovery const RUN_RECOVERY_LADDER[] = {
+    RunRecovery::RestageNearer, RunRecovery::Regroup,  RunRecovery::Replan,
+    RunRecovery::OneCopy,       RunRecovery::ResetInstance, RunRecovery::WaitForClient,
+    RunRecovery::TownForBags,
+};
+
+bool TriedTwiceRunning(std::vector<RunRecovery> const& tried, RunRecovery r)
+{
+    std::size_t const n = tried.size();
+    return n >= 2 && tried[n - 1] == r && tried[n - 2] == r;
+}
+
+unsigned TimesTried(std::vector<RunRecovery> const& tried, RunRecovery r)
+{
+    unsigned count = 0;
+    for (RunRecovery t : tried)
+        if (t == r)
+            ++count;
+    return count;
+}
+
+bool Mentions(std::string const& text, char const* needle)
+{
+    return text.find(needle) != std::string::npos;
+}
+}  // namespace
+
+bool ParseRunRecovery(std::string const& word, RunRecovery& out)
+{
+    for (RunRecovery r : RUN_RECOVERY_LADDER)
+        if (word == RunRecoveryWord(r))
+        {
+            out = r;
+            return true;
+        }
+    return false;
+}
+
+std::string RunRecoveryOptions()
+{
+    std::string out;
+    for (RunRecovery r : RUN_RECOVERY_LADDER)
+    {
+        if (!out.empty())
+            out += ',';
+        out += RunRecoveryWord(r);
+    }
+    return out;
+}
+
+RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
+{
+    // A candidate the facts point at, unless it has already failed twice
+    // running; then the ladder picks the least-tried recovery instead.
+    auto pick = [&](RunRecovery wanted) -> RunRecovery {
+        if (!TriedTwiceRunning(facts.tried, wanted))
+            return wanted;
+        RunRecovery best = RunRecovery::ResetInstance;
+        unsigned fewest = ~0u;
+        for (RunRecovery r : RUN_RECOVERY_LADDER)
+        {
+            if (r == wanted || r == RunRecovery::TownForBags ||
+                r == RunRecovery::WaitForClient)
+                continue;
+            unsigned const times = TimesTried(facts.tried, r);
+            if (times < fewest)
+            {
+                fewest = times;
+                best = r;
+            }
+        }
+        return best;
+    };
+
+    // What cannot be walked around comes first. Full bags keep the door shut
+    // whatever else is done, and a character without a steerable client
+    // cannot be walked anywhere.
+    if (facts.bagsFull || facts.outcome == "evacuated")
+        return RunRecovery::TownForBags;
+    if (!facts.everyoneSteerable)
+        return pick(RunRecovery::WaitForClient);
+
+    // A party on both sides of the door, or in two copies of it, is collected
+    // by RESET's walk out and then enters together.
+    if (facts.outcome == "split_failed" || facts.membersApart > 0)
+        return pick(RunRecovery::OneCopy);
+
+    // A reset the core refused is answered by resetting again (RESET walks
+    // whoever is still inside out first); the ladder takes over if it keeps
+    // failing.
+    if (facts.outcome == "reset_failed")
+        return pick(RunRecovery::ResetInstance);
+
+    // A staging that timed out with the leader far from the door never had a
+    // chance: the walk does not fit in the clock.
+    if (facts.leaderYardsFromStaging > RUN_RECOVERY_FAR_YARDS ||
+        (facts.leaderYardsFromStaging < 0.f && Mentions(facts.reason, "never opened")))
+        return pick(RunRecovery::RestageNearer);
+
+    // Stragglers are regrouped before anything else is tried.
+    if (facts.farthestMemberYards > RUN_RECOVERY_STRAGGLER_YARDS)
+        return pick(RunRecovery::Regroup);
+
+    // A leader above the door that stopped descending, or one whose errand
+    // kept being taken back, walks a fresh plan.
+    if (Mentions(facts.reason, "above the staging point") || facts.stagingRearms > 0)
+        return pick(RunRecovery::Replan);
+
+    // Nothing in the facts: the ladder, by how often each has been tried.
+    return pick(facts.tried.empty() ? RunRecovery::RestageNearer
+                                    : RUN_RECOVERY_LADDER[facts.tried.size() % 4]);
+}
+
+std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery chosen)
+{
+    std::string why;
+    switch (chosen)
+    {
+        case RunRecovery::TownForBags:
+            why = "a member has no bag room, and the town trip runs only from IDLE";
+            break;
+        case RunRecovery::WaitForClient:
+            why = "a member has no steerable client";
+            break;
+        case RunRecovery::OneCopy:
+            why = "the party was apart (another map or another copy)";
+            break;
+        case RunRecovery::ResetInstance:
+            why = "the instance reset did not take";
+            break;
+        case RunRecovery::RestageNearer:
+            why = "the leader was far from the door when the staging clock ran";
+            break;
+        case RunRecovery::Regroup:
+            why = "a member was far from the leader";
+            break;
+        case RunRecovery::Replan:
+            why = "the approach itself failed (a ledge or a leader whose errand kept "
+                  "being taken back)";
+            break;
+    }
+    if (TimesTried(facts.tried, chosen) > 0)
+        why += "; tried " + std::to_string(TimesTried(facts.tried, chosen)) +
+               " time(s) already this streak";
+    return why;
+}
+
+unsigned RunRecoveryBackoffSeconds(unsigned attempt, unsigned base, unsigned cap)
+{
+    unsigned const floor = base ? base : 1u;
+    unsigned const ceiling = cap < floor ? floor : cap;
+    unsigned wait = floor;
+    for (unsigned i = 1; i < attempt && wait < ceiling; ++i)
+        wait = wait > ceiling / 2 ? ceiling : wait * 2;
+    return wait < ceiling ? wait : ceiling;
+}
+
+RecoveryWaitStep RecoveryWaitNext(RecoveryWaitFacts const& facts)
+{
+    if (facts.satisfied)
+        return RecoveryWaitStep::Done;
+    if (facts.since && facts.now - facts.since >= static_cast<std::time_t>(facts.ceilingSeconds))
+        return RecoveryWaitStep::Ceiling;
+    return RecoveryWaitStep::Wait;
+}
+
+char const* StagingStallWord(StagingStall stall)
+{
+    switch (stall)
+    {
+        case StagingStall::KeepRearming: return "keep_rearming";
+        case StagingStall::RunYields:    return "run_yields";
+        case StagingStall::RecoverNow:   return "recover_now";
+    }
+    return "keep_rearming";
+}
+
+bool ParseStagingStall(std::string const& word, StagingStall& out)
+{
+    for (StagingStall s : {StagingStall::KeepRearming, StagingStall::RunYields,
+                           StagingStall::RecoverNow})
+        if (word == StagingStallWord(s))
+        {
+            out = s;
+            return true;
+        }
+    return false;
+}
+
+std::string StagingStallOptions()
+{
+    return "keep_rearming,run_yields,recover_now";
+}
+
+bool StagingStallAskAt(unsigned rearms)
+{
+    return rearms > 0 && rearms % STAGING_STALL_ASK_EVERY == 0;
+}
+
+StagingStall StagingStallHeuristic(StagingStallFacts const& facts)
+{
+    // Far out and still being stopped: the rest of the clock will be spent
+    // re-arming, so recover now and restage from nearer.
+    if (facts.leaderYards > RUN_RECOVERY_FAR_YARDS && facts.rearms >= 2 * STAGING_STALL_ASK_EVERY)
+        return StagingStall::RecoverNow;
+    // Another owner keeps writing the column: let it finish, with the clock
+    // stopped, rather than fight it every poll.
+    if (facts.endedFromOutside)
+        return StagingStall::RunYields;
+    return StagingStall::KeepRearming;
+}
+
+bool TerrainRemedyEndsTheErrand(TerrainRemedy remedy, bool onTheGround)
+{
+    switch (remedy)
+    {
+        case TerrainRemedy::Nothing:       return false;
+        case TerrainRemedy::LiftToSurface: return true;
+        case TerrainRemedy::GiveUp:        return !onTheGround;
+    }
+    return true;
 }
 
 DungeonCampaignProgress DungeonCampaignAfterRun(std::string const& outcome,
@@ -2000,6 +2236,13 @@ DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlo
     // open - and that is the new half, because the old check could only ever be
     // reached from inside and so could only ever answer with a walk back out.
     return anyMemberInside ? DungeonBagPressure::Evacuate : DungeonBagPressure::HoldOut;
+}
+
+DungeonBagPressure DungeonRunBagAnswer(DungeonBagPressure pressure, bool upgradeStranded)
+{
+    if (pressure != DungeonBagPressure::Evacuate)
+        return pressure;
+    return upgradeStranded ? DungeonBagPressure::Evacuate : DungeonBagPressure::MakeRoom;
 }
 
 CounterRole CounterRoleForAim(std::string const& aim)
@@ -3680,12 +3923,15 @@ DestroySpec ParseDestroySpec(std::string const& command)
 
     bool allowBound = false;
     bool allowQuality = false;
+    bool allowGrey = false;
     for (size_t i = 3; i < words.size(); ++i)
     {
         if (words[i] == "allow:bound" && !allowBound)
             allowBound = true;
         else if (words[i] == "allow:quality" && !allowQuality)
             allowQuality = true;
+        else if (words[i] == "allow:grey" && !allowGrey)
+            allowGrey = true;
         else
             return spec;
     }
@@ -3695,6 +3941,7 @@ DestroySpec ParseDestroySpec(std::string const& command)
     spec.count = count;
     spec.allowBound = allowBound;
     spec.allowQuality = allowQuality;
+    spec.allowGrey = allowGrey;
     return spec;
 }
 
@@ -3709,9 +3956,14 @@ char const* DestroyRefusal(DestroySpec const& spec, DestroyFacts const& facts)
         return R::Malformed;
     if (facts.equipped)
         return R::Equipped;
-    if (facts.questHold != QuestItemHold::Released)
+    // A GREY MADE ROOM FOR INSIDE A RUN (allow:grey) is destroyed despite its
+    // sell price, because no vendor is reachable from inside and a party that
+    // walks out for bag room loses the run. The quest check does not block it
+    // either: a Poor item is never a quest objective. Every other wall stands.
+    bool const greyRoom = spec.allowGrey && facts.quality == 0;
+    if (!greyRoom && facts.questHold != QuestItemHold::Released)
         return R::Quest;
-    if (facts.sellPrice > 0)
+    if (!greyRoom && facts.sellPrice > 0)
         return R::HasPrice;
     if (facts.noUserDestroy)
         return R::NoDestroy;
@@ -12312,7 +12564,12 @@ std::vector<RunTimelineEvent> RunTimelineEvents(RunTimelineSnapshot const& befor
             add("reset_retry", "reset attempt " + std::to_string(after.resetAttempts));
         if (after.stagingRearms > before.stagingRearms)
             add("staging_rearm", "the leader's staging errand was taken back (" +
-                                     std::to_string(after.stagingRearms) + " so far)");
+                                     std::to_string(after.stagingRearms) + " so far)" +
+                                     (after.stagingRearmWhy.empty()
+                                          ? std::string()
+                                          : "; it was ended by " + after.stagingRearmWhy));
+        if (!after.stallNote.empty() && after.stallNote != before.stallNote)
+            add("staging_stall", after.stallNote);
         if (after.dcAcceptedAll && !before.dcAcceptedAll)
             add("dc_on_all", "'dc on' accepted for everyone inside");
         if (after.dcNotAccepted && !before.dcNotAccepted)
@@ -12329,6 +12586,13 @@ std::vector<RunTimelineEvent> RunTimelineEvents(RunTimelineSnapshot const& befor
         if (after.evacuated && !before.evacuated)
             add("evacuated", "the family has no bag room; the run is walked out");
     }
+
+    // THE RECOVERY IS WRITTEN WHATEVER THE RUN IDENTITY DID. Entering
+    // RECOVERING re-arms the coordinator, so the snapshot before it belongs to
+    // the attempt that failed and the one after to the attempt being recovered
+    // for; the sentence is about the second.
+    if (!after.recoveryNote.empty() && after.recoveryNote != before.recoveryNote)
+        add("recovery", after.recoveryNote);
 
     if (after.phase != before.phase)
     {

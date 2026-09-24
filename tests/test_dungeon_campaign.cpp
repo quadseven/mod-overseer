@@ -16,7 +16,7 @@
 
 using OverseerDecisions::DungeonCampaignAfterRun;
 using OverseerDecisions::DungeonCampaignProgress;
-using OverseerDecisions::DungeonCampaignStopsOnFailures;
+using OverseerDecisions::DungeonCampaignRecovers;
 using OverseerDecisions::DungeonRunCountsAsDone;
 using OverseerDecisions::DungeonRunEnteredTheInstance;
 using OverseerDecisions::DungeonRunTrailingFailures;
@@ -108,65 +108,39 @@ void TheStreakStopsAtTheFirstRunThatHappened()
                DungeonRunTrailingFailures({"staging_failed", "wipe", "staging_failed"}), 1u);
 }
 
-// The stop the streak above is counted FOR (#306). The count was never the
-// defect: it was right, and it was asked in one of the two places that open a
-// run. These pin the rule itself, so a caller cannot get the comparison a
-// little bit wrong on its way to a second copy of it.
-void ThreeInARowStopsTheCampaign()
+// What the streak above is counted FOR. It used to be a stop: three in a row
+// ended the campaign and asked the operator to restart it by hand. The operator
+// restarted campaigns that way several times on 2026-09-23 and ordered that it
+// never be needed again, so any streak now recovers and no streak stops.
+void NoStreakStopsTheCampaign()
 {
-    // The boundary, said in both directions. Three consecutive failures is the
-    // THIRD failure, not the fourth.
-    Check("two of three", DungeonCampaignStopsOnFailures(2, 3), false);
-    Check("three of three", DungeonCampaignStopsOnFailures(3, 3), true);
-    Check("four of three", DungeonCampaignStopsOnFailures(4, 3), true);
-    Check("none at all", DungeonCampaignStopsOnFailures(0, 3), false);
+    Check("one failure recovers", DungeonCampaignRecovers(1), true);
+    Check("three in a row recovers", DungeonCampaignRecovers(3), true);
+    // MEASURED 2026-09-07: seven consecutive staging failures. That campaign
+    // now recovers seven times rather than stopping at the third.
+    std::vector<std::string> const seven(7, "staging_failed");
+    Check("seven in a row still recovers",
+          DungeonCampaignRecovers(DungeonRunTrailingFailures(seven)), true);
+    // The one boundary, in both directions and in the caller's own shape.
+    Check("no failures, nothing to recover",
+          DungeonCampaignRecovers(DungeonRunTrailingFailures({"complete"})), false);
+    Check("the first failure recovers",
+          DungeonCampaignRecovers(DungeonRunTrailingFailures({"staging_failed", "complete"})),
+          true);
 }
 
-void ALimitThatCouldNotBeReadStopsNothing()
+void TheStreakReadsRealRowsTheWayTheCallerHandsThemOver()
 {
-    // Zero is a bound this database could not answer for, and reading it as
-    // "the campaign is already over" would end every campaign on such a
-    // database - the same direction the run cap already refuses to guess in.
-    Check("zero limit, no failures", DungeonCampaignStopsOnFailures(0, 0), false);
-    Check("zero limit, many failures", DungeonCampaignStopsOnFailures(99, 0), false);
-}
-
-void TheStopReadsRealRowsTheWayTheCallerHandsThemOver()
-{
-    // The two halves composed exactly as the adapter composes them: the rows
-    // come back newest first from `ORDER BY id DESC LIMIT 3`, the streak is
-    // counted, and the count is put to the stop.
-    //
-    // MEASURED 2026-09-07. Seven consecutive `staging_failed` rows in one
-    // campaign, against a threshold of three, and the campaign opened an eighth
-    // attempt anyway - because nothing on the go-again path ever asked this.
-    // The three newest of those rows are what the query returns.
-    std::vector<std::string> const tonight = {"staging_failed", "staging_failed",
-                                              "staging_failed"};
-    CheckCount("tonight's streak", DungeonRunTrailingFailures(tonight), 3u);
-    Check("tonight's campaign stops",
-          DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures(tonight), 3), true);
-
-    // A campaign that has had one good run since its last failure is not stuck,
-    // however bad that run was. A wipe happened; a staging failure did not.
     std::vector<std::string> const recovered = {"staging_failed", "wipe",
                                                 "staging_failed"};
-    Check("a run that happened clears the streak",
-          DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures(recovered), 3),
-          false);
-
-    // Both ways of failing before entry are one streak, which is what #225
-    // widened the count for. The stop must not need to know which is which.
+    CheckCount("a run that happened clears the streak to the newest failure",
+               DungeonRunTrailingFailures(recovered), 1u);
     std::vector<std::string> const mixed = {"reset_failed", "staging_failed",
                                             "reset_failed"};
-    Check("a mixed streak still stops it",
-          DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures(mixed), 3), true);
-
-    // A campaign with no rows at all is a campaign about to make its first
-    // attempt. This is the state the IDLE gate is in every time it asks, and
-    // reading it as "stopped" would mean no campaign could ever start.
-    Check("an empty table starts a campaign",
-          DungeonCampaignStopsOnFailures(DungeonRunTrailingFailures({}), 3), false);
+    Check("a mixed streak recovers",
+          DungeonCampaignRecovers(DungeonRunTrailingFailures(mixed)), true);
+    Check("an empty table starts a campaign with nothing to recover",
+          DungeonCampaignRecovers(DungeonRunTrailingFailures({})), false);
 }
 
 void ARunThatEnteredFillsItsSlot()
@@ -255,9 +229,8 @@ int main()
     EveryOutcomeWrittenAboutAPartyInsideIsARun();
     OnlyAnExplicitClearCountsAsCampaignProgress();
     TheStreakStopsAtTheFirstRunThatHappened();
-    ThreeInARowStopsTheCampaign();
-    ALimitThatCouldNotBeReadStopsNothing();
-    TheStopReadsRealRowsTheWayTheCallerHandsThemOver();
+    NoStreakStopsTheCampaign();
+    TheStreakReadsRealRowsTheWayTheCallerHandsThemOver();
     ARunThatEnteredFillsItsSlot();
     ARunThatNeverGotInsideLeavesItsSlotEmpty();
     TheLastSlotIsWhereTheCountUsedToLie();

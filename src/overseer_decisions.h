@@ -2643,28 +2643,193 @@ bool DungeonRunCountsAsDone(std::string const& outcome);
 // again from zero.
 unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewestFirst);
 
-// DOES THE CAMPAIGN STOP RATHER THAN OPEN ANOTHER ATTEMPT (#306)?
+// A CAMPAIGN NEVER STOPS ON FAILURES. IT RECOVERS.
 //
-// WHY THIS IS A NAMED DECISION AND NOT A `>=` AT THE CALL SITE, WHICH IS THE
-// WHOLE POINT. The comparison was written once, inline, in the branch that
-// decides a campaign's FIRST attempt - and every attempt after the first is
-// decided somewhere else entirely, which never asked. Measured 2026-09-07 on a
-// live realm: seven consecutive attempts that never reached the instance,
-// against a threshold of three, and the stop's own log line absent from the
-// whole of that worldserver's history. The counting above was right and the
-// vocabulary beside it was right; nothing ever put the question. So the rule
-// gets a name and one home, and every gate that opens a run calls it.
+// This used to be DungeonCampaignStopsOnFailures: three attempts in a row that
+// never got the party inside stopped the campaign with an ERROR asking the
+// operator to take those rows out of it by hand. On 2026-09-23 the operator did
+// exactly that several times in one evening, for failures the module could have
+// answered itself: a leader thousands of yards from the door when the staging
+// clock started, a family split across two instance copies, full bags, and a
+// leader whose errand kept being taken off him. A stop that is always followed
+// by the same manual restart is not a bound, it is a chore.
 //
-// A ZERO LIMIT IS "DO NOT STOP", NOT "STOP IMMEDIATELY". Zero reaches here only
-// from a caller whose threshold could not be read, and reading an unreadable
-// bound as "every campaign is already over" would end every campaign on a
-// database that cannot answer - the opposite of the direction the run cap
-// already refuses to guess in.
+// So a failed attempt now puts the coordinator into RECOVERING. What bounds a
+// campaign that keeps failing is the backoff below (a growing wait, capped, so
+// nothing loops hot), every safety bound the phases themselves carry (deaths,
+// the fall guard, the staging backstop), and the operator's own `job` switch,
+// which still ends a campaign at once.
 //
-// `>=` AND NOT `>`: three consecutive failures is the third failure, not the
-// fourth. The count comes from DungeonRunTrailingFailures above, so a streak
-// broken by any run that got inside is already zero by the time it arrives.
-bool DungeonCampaignStopsOnFailures(unsigned trailingFailures, unsigned failureLimit);
+// True for any streak of one or more attempts that never got inside.
+bool DungeonCampaignRecovers(unsigned trailingFailures);
+
+// WHAT A FAILED ATTEMPT IS ANSWERED WITH. Each recovery is built from
+// machinery the coordinator already has; none of them moves a character by any
+// means but walking, and none is an admin shortcut.
+enum class RunRecovery : std::uint8_t
+{
+    // Walk the leader toward the dungeon (its town first, where the portal row
+    // names one) with no staging clock running, and open the next attempt only
+    // once he is near. The answer to a staging timeout that started thousands
+    // of yards out.
+    RestageNearer,
+    // Hold the leader still until every member is close to him again, so the
+    // catch-up walks can bring stragglers in. The answer to a split family.
+    Regroup,
+    // Stand the run down to IDLE, the one phase the town trip runs in, so the
+    // family empties its bags; the campaign opens its next attempt from IDLE.
+    TownForBags,
+    // Wait for the head (and every member) to be steerable again.
+    WaitForClient,
+    // Walk everybody out through RESET, which collects a member left in
+    // another copy of the dungeon, then enter together.
+    OneCopy,
+    // Throw away the carried staging point and approach, so RESET derives a
+    // fresh one and GATHERING plans the route again.
+    Replan,
+    // Go straight to REPAIRING and RESET, the pre-recovery behaviour.
+    ResetInstance,
+};
+
+// "restage_nearer", "regroup", "town_for_bags", "wait_for_client",
+// "one_copy", "replan", "reset_instance". The word a log line, a table row and
+// the bridge all use.
+char const* RunRecoveryWord(RunRecovery recovery);
+
+// The recovery a word names, or false when it names none. The bridge's answer
+// is parsed through this and nothing else, so a word the module did not offer
+// can never be executed.
+bool ParseRunRecovery(std::string const& word, RunRecovery& out);
+
+// Every recovery word, comma separated, in ladder order: what the module
+// offers the bridge.
+std::string RunRecoveryOptions();
+
+// What the module knows about a failed attempt when it chooses a recovery.
+struct RunFailureFacts
+{
+    // The outcome word of the attempt: staging_failed, reset_failed,
+    // split_failed, evacuated.
+    std::string outcome;
+    // The reason written on the run row.
+    std::string reason;
+    // Some member has no bag room the town trip would not clear first.
+    bool bagsFull{false};
+    // The leader and every member resolve to a steerable character.
+    bool everyoneSteerable{true};
+    // The leader's 2D distance to the staging point, or negative when it
+    // could not be measured (another map, offline).
+    float leaderYardsFromStaging{-1.f};
+    // The farthest member from the leader, or negative when unmeasured.
+    float farthestMemberYards{-1.f};
+    // Members on another map than the leader, or in another copy.
+    unsigned membersApart{0};
+    // How often the staging run had to take its leader's errand back.
+    unsigned stagingRearms{0};
+    // The recoveries already applied in this streak, oldest first.
+    std::vector<RunRecovery> tried;
+};
+
+// Yards past which a leader is "far" from the staging point: a walk that long
+// does not fit inside the staging clock, so the next attempt starts nearer.
+constexpr float RUN_RECOVERY_FAR_YARDS = 1000.f;
+// Yards past which a member is a straggler worth regrouping for.
+constexpr float RUN_RECOVERY_STRAGGLER_YARDS = 150.f;
+
+// THE HEURISTIC, and the fallback whenever Jev does not answer or is not
+// confident. Reads the failure's own facts first (bags, clients, copies,
+// distance, stragglers) and only then the ladder, and never chooses the same
+// recovery a third time running: a recovery that has not worked twice is not
+// going to work because it was asked again.
+RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts);
+
+// Why the heuristic chose what it chose, in one clause, for the log and the
+// request row.
+std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery chosen);
+
+// THE BACKOFF. The wait before attempt `attempt` (1-based: the first failure
+// in a row is attempt 1) is `base` doubled per earlier failure, capped at
+// `cap`. Never zero, so a failure can never re-open a run in the same poll.
+unsigned RunRecoveryBackoffSeconds(unsigned attempt, unsigned base, unsigned cap);
+
+// Every recovery that walks or waits has a ceiling, after which the next
+// attempt opens anyway: a recovery is a chance to do better, not a new way to
+// stand still. These are the rules that end one.
+struct RecoveryWaitFacts
+{
+    std::time_t since{0};
+    std::time_t now{0};
+    unsigned ceilingSeconds{0};
+    // The condition the wait is for now holds.
+    bool satisfied{false};
+};
+
+enum class RecoveryWaitStep : std::uint8_t
+{
+    Wait,       // keep waiting
+    Done,       // the condition holds; open the next attempt
+    Ceiling,    // the ceiling passed; open the next attempt anyway
+};
+
+RecoveryWaitStep RecoveryWaitNext(RecoveryWaitFacts const& facts);
+
+// WHEN A STAGING ERRAND KEEPS BEING TAKEN BACK. Asked every
+// STAGING_STALL_ASK_EVERY re-arms of one attempt.
+enum class StagingStall : std::uint8_t
+{
+    // The run holds its errand and takes it back again at once, which is what
+    // it already does. The other claimant yields.
+    KeepRearming,
+    // The run yields: it stops re-claiming for a while and its staging clock
+    // does not run meanwhile, so whatever else owns the column can finish.
+    RunYields,
+    // The attempt is closed now and the coordinator recovers (restaging from
+    // nearer) rather than spending the rest of the staging clock re-arming.
+    RecoverNow,
+};
+
+constexpr unsigned STAGING_STALL_ASK_EVERY = 3;
+
+char const* StagingStallWord(StagingStall stall);
+bool ParseStagingStall(std::string const& word, StagingStall& out);
+std::string StagingStallOptions();
+
+// Is this re-arm count one the stall question is asked at? Every
+// STAGING_STALL_ASK_EVERY re-arms, never at zero.
+bool StagingStallAskAt(unsigned rearms);
+
+struct StagingStallFacts
+{
+    unsigned rearms{0};
+    // Why the leader's errand was ended the last time, as the travel book
+    // recorded it ("" when nothing recorded a reason).
+    std::string lastEndedBy;
+    // True when that ending was a claim from outside this module (the column
+    // was emptied or rewritten by another owner).
+    bool endedFromOutside{false};
+    // The leader's distance to the point being walked at, or negative.
+    float leaderYards{-1.f};
+};
+
+StagingStall StagingStallHeuristic(StagingStallFacts const& facts);
+
+// DOES A TERRAIN RECOVERY VERDICT END THE CHARACTER'S TRAVEL ERRAND?
+//
+// Measured 2026-09-24 on the dev realm, campaign 11: the Horde leader walking
+// through Orgrimmar to Ragefire Chasm had his staging errand taken back seven
+// times in ten minutes, and six of the seven came one to three seconds after
+// the terrain drive's "STANDING ON THE GROUND ... NOTHING IS BEING MOVED" line
+// for him. That line is the give-up for a character under a roof, a bridge or
+// the canyon walls of a layered city: nothing is done to it. But the drive
+// released the travel errand for every remedy but Nothing, so the one verdict
+// that promises to leave a character alone ended the walk it was on, and each
+// fresh episode (a new overhang a few dozen yards on) ended it again.
+//
+// A LIFT ends the errand, because the aim may be what put the character under
+// the world. A give-up for a character that is NOT on the ground ends it for the
+// same reason. A give-up for a character standing on the ground does not: the
+// errand is not what is wrong.
+bool TerrainRemedyEndsTheErrand(TerrainRemedy remedy, bool onTheGround);
 
 // WHERE A CAMPAIGN STANDS ONCE A RUN HAS ENDED.
 //
@@ -2833,8 +2998,15 @@ enum class DungeonBagPressure : std::uint8_t
     // The family cannot loot and somebody is already on the instance map. The
     // party is walked out, which is what this check has always done and is
     // still right: bags can fill DURING a run, and that is the case this answer
-    // was actually built for.
+    // was actually built for. SINCE 2026-09-24 ONLY WHEN AN UPGRADE WOULD BE
+    // LOST: see DungeonRunBagAnswer, which turns an Evacuate the run can make
+    // room for into MakeRoom.
     Evacuate,
+    // The family cannot loot and is inside, and nothing better than common is
+    // lying on the floor for a member with no room. The run keeps clearing and
+    // makes room where it stands: greys are destroyed and the loot rule skips
+    // vendor trash. What a human group does.
+    MakeRoom,
 };
 
 // `freeBagSlots` is one reading per member the caller could actually read this
@@ -2866,6 +3038,16 @@ DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlo
                                          unsigned freeSlotsFloor,
                                          bool anyMemberInside,
                                          bool alreadyLeaving);
+
+// WHAT A RUN INSIDE DOES ABOUT IT (2026-09-24). Measured on the dev realm: a
+// Horde Ragefire run credited two bosses and was then walked out mid-clear
+// because a member's bags were low. A group of people keeps clearing and makes
+// room: it destroys greys and stops picking up vendor trash, and it leaves only
+// when an actual upgrade cannot be picked up. So an Evacuate becomes MakeRoom
+// unless `upgradeStranded`: a member with ZERO free slots has an Uncommon or
+// better item on the floor that they may loot. Every other answer passes
+// through unchanged, so the pre-run town-first gate (HoldOut) is untouched.
+DungeonBagPressure DungeonRunBagAnswer(DungeonBagPressure pressure, bool upgradeStranded);
 
 // --------------------------- the run yields to an errand it would trample --
 //
@@ -4690,6 +4872,9 @@ struct DestroySpec
     uint32_t count{0};  // never 0 when valid
     bool allowBound{false};
     bool allowQuality{false};
+    // `allow:grey`: a Poor (grey) item destroyed to make bag room inside a
+    // run. It lifts the sell-price and quest walls for a grey only.
+    bool allowGrey{false};
 };
 
 DestroySpec ParseDestroySpec(std::string const& command);
@@ -14731,7 +14916,15 @@ struct RunTimelineSnapshot
     bool brainNotMoving{false};   // accepted, and the leader has not moved since
     bool busyCeiling{false};      // the clearing watchdog stopped trusting "busy"
     unsigned stagingRearms{0};
+    // What ended the leader's staging errand the last time it was taken back,
+    // as the travel book recorded it. Empty when nothing named itself.
+    std::string stagingRearmWhy;
     uint32_t resetAttempts{0};
+    // The recovery the coordinator is in, in one sentence, while it is
+    // RECOVERING; a new sentence is a new timeline row.
+    std::string recoveryNote;
+    // The last staging stall decision, in one sentence.
+    std::string stallNote;
 };
 
 // One row of the timeline, before the adapter adds who and when.
