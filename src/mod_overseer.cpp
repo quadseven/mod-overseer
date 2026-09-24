@@ -40477,7 +40477,7 @@ private:
     void DriveTrainingStop()
     {
         QueryResult result = CharacterDatabase.Query(
-            "SELECT name, family, lead, job, learn_skill FROM overseer_roster WHERE enabled = 1");
+            "SELECT name, family, `lead`, job, learn_skill FROM overseer_roster WHERE enabled = 1");
         if (!result)
             return;
 
