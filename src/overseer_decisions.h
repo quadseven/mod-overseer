@@ -15696,7 +15696,9 @@ bool MailWalkMadeProgress(float bestYards, float nowYards);
 //
 // `any` walks to the nearest vendor that buys at all (one not flagged to refuse
 // sales), for the `sell` rows a guild member writes next to sell what nobody in
-// its guild needs.
+// its guild needs. As with `item:` and its `buy`, the site writes those rows
+// only after this walk's row reads `applied`: a `sell` row claimed while the
+// walk is still under way answers `vendor not in range`, which is the truth.
 //
 // A trainer walk ends AT the trainer: on arrival the adapter buys the next rank
 // of `skill` (when this trainer sells one this character may take) and each
