@@ -17038,6 +17038,35 @@ constexpr unsigned FINDER_GROUP_SIZE = 5;
 // (LFG_TIME_ROLECHECK, LFG_TIME_PROPOSAL); this bounds the whole.
 constexpr unsigned FINDER_CEILING_SECONDS = 180;
 
+// WHICH FINDER DUNGEON IS THIS DOOR? LFGDungeons.dbc can hold several rows on
+// one map: Scarlet Monastery, Maraudon, Dire Maul, Blackrock Depths and
+// Stratholme are each several wings of one map, and the core's
+// GetLFGDungeon(map, difficulty) returns whichever comes first. So a door with
+// more than one candidate is matched by where the finder would land the group
+// (lfg_dungeon_template) against where the door itself lands it; a candidate
+// with no row there lands on the map's shared entrance and cannot be told
+// apart. The finder is never pointed at a wing the campaign did not ask for.
+constexpr float FINDER_WING_MATCH_YARDS = 60.f;
+
+struct FinderDungeonCandidate
+{
+    std::uint32_t id{0};
+    bool hasEntrance{false};
+    float x{0.f};
+    float y{0.f};
+};
+
+// The finder dungeon for a door whose areatrigger lands at (landingX,
+// landingY), or 0 with `why` saying which of the two reasons it is.
+std::uint32_t ChooseFinderDungeon(std::vector<FinderDungeonCandidate> const& candidates,
+                                  float landingX, float landingY, std::string& why);
+
+// CAN THESE CLASSES MAKE THE GROUP THE FINDER INSISTS ON: one tank, one healer
+// and the rest damage (LFGMgr::CheckGroupRoles)? Asked of the role masks
+// FinderRoleMask gives, so a family with no healer class is told so before
+// the last rung is spent on a role check the core would fail.
+bool FinderRolesFit(std::vector<std::uint8_t> const& masks);
+
 // Every role a class could be asked to fill, as the finder's bits, with the
 // leader bit on the leader. The core's CheckGroupRoles then finds the one
 // tank, one healer and three damage the group can make.
@@ -17067,6 +17096,8 @@ struct FinderFacts
     // The finder's id for the campaign's dungeon (LFGDungeons.dbc, normal
     // difficulty), zero when the dungeon has none.
     std::uint32_t dungeonId{0};
+    // Why there is no dungeon id, when there is none (ChooseFinderDungeon).
+    std::string dungeonWhy;
     // Its level range in the DBC, for the words when a member is locked.
     unsigned dbcMinLevel{0};
     unsigned dbcMaxLevel{0};
@@ -17131,12 +17162,17 @@ enum class FinderStep : std::uint8_t
     Join,     // queue the family
     Wait,     // the core is working (role check, queue, a member in combat)
     Accept,   // accept the proposal for every member
+    Teleport, // the finder group is made and a member is still outside: press
+              // the finder's own "teleport in" for it (a refused teleport -
+              // falling, combat - is not retried by the core)
     Inside,   // the whole family is in: the run is staged inside
     GiveUp,   // out of time, or the core let the family go
 };
 
 // ONE POLL. Inside is asked first: a family that is in is in, whatever the
-// clock says. Nothing is joined or accepted while a member is not ready. A
+// clock says; and at the ceiling a finder group with anybody inside is inside,
+// because STAGED_INSIDE walks the rest in through the door, which a finder
+// group may use for its own dungeon. Nothing is joined or accepted while a member is not ready. A
 // joined family the core has put back to None was refused (a failed role
 // check or a declined proposal) and the rung gives up rather than queueing
 // again inside one recovery.

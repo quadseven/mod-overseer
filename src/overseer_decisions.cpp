@@ -14747,6 +14747,63 @@ bool SummonRowFinished(std::string const& status)
     return status != "pending" && status != "claimed" && status != "verifying";
 }
 
+std::uint32_t ChooseFinderDungeon(std::vector<FinderDungeonCandidate> const& candidates,
+                                  float landingX, float landingY, std::string& why)
+{
+    why.clear();
+    if (candidates.empty())
+    {
+        why = "the campaign's dungeon has no dungeon finder entry";
+        return 0;
+    }
+    if (candidates.size() == 1)
+        return candidates.front().id;
+    std::uint32_t best = 0;
+    float bestYards = FINDER_WING_MATCH_YARDS;
+    for (FinderDungeonCandidate const& c : candidates)
+    {
+        if (!c.hasEntrance)
+            continue;
+        float const dx = c.x - landingX;
+        float const dy = c.y - landingY;
+        float const yards = std::sqrt(dx * dx + dy * dy);
+        if (yards <= bestYards)
+        {
+            best = c.id;
+            bestYards = yards;
+        }
+    }
+    if (!best)
+        why = std::to_string(candidates.size()) +
+              " dungeon finder wings share this map and none starts where this door lands, "
+              "so the finder could send the family to the wrong one";
+    return best;
+}
+
+bool FinderRolesFit(std::vector<std::uint8_t> const& masks)
+{
+    std::size_t const n = masks.size();
+    if (n != FINDER_GROUP_SIZE)
+        return false;
+    for (std::size_t tank = 0; tank < n; ++tank)
+    {
+        if (!(masks[tank] & FINDER_ROLE_TANK))
+            continue;
+        for (std::size_t healer = 0; healer < n; ++healer)
+        {
+            if (healer == tank || !(masks[healer] & FINDER_ROLE_HEALER))
+                continue;
+            bool rest = true;
+            for (std::size_t i = 0; i < n; ++i)
+                if (i != tank && i != healer && !(masks[i] & FINDER_ROLE_DAMAGE))
+                    rest = false;
+            if (rest)
+                return true;
+        }
+    }
+    return false;
+}
+
 std::uint8_t FinderRoleMask(unsigned classId, bool leader)
 {
     std::uint8_t mask = leader ? FINDER_ROLE_LEADER : 0;
@@ -14818,7 +14875,8 @@ FinderReadiness ReadFinderReadiness(FinderFacts const& facts, bool now)
     if (!facts.finderOn)
         return no("the realm's DungeonFinder.OptionsMask does not carry the dungeon finder");
     if (!facts.dungeonId)
-        return no("the campaign's dungeon has no dungeon finder entry");
+        return no(facts.dungeonWhy.empty() ? "the campaign's dungeon has no dungeon finder entry"
+                                           : facts.dungeonWhy);
     if (!facts.groupExists)
         return no("the head is in no group");
     if (facts.groupIsFinders)
@@ -14858,6 +14916,12 @@ FinderReadiness ReadFinderReadiness(FinderFacts const& facts, bool now)
     }
     if (!why.empty())
         return no(why);
+    std::vector<std::uint8_t> masks;
+    for (FinderMember const& m : facts.family)
+        masks.push_back(FinderRoleMask(m.classId, m.leader));
+    if (!FinderRolesFit(masks))
+        return no("the family's classes cannot make the one tank, one healer and three damage "
+                  "the dungeon finder insists on");
     out.ready = true;
     return out;
 }
@@ -14867,7 +14931,10 @@ FinderStep FinderNext(FinderPollFacts const& facts)
     if (facts.familySize && facts.inside >= facts.familySize)
         return FinderStep::Inside;
     if (facts.waitedSeconds >= facts.ceilingSeconds)
-        return FinderStep::GiveUp;
+        return facts.state == FinderState::Dungeon && facts.inside > 0 ? FinderStep::Inside
+                                                                        : FinderStep::GiveUp;
+    if (facts.joined && facts.state == FinderState::Dungeon)
+        return facts.anyoneNotReady ? FinderStep::Wait : FinderStep::Teleport;
     if (facts.anyoneNotReady)
         return FinderStep::Wait;
     if (!facts.joined)
@@ -14887,6 +14954,7 @@ char const* FinderStepWord(FinderStep step)
         case FinderStep::Join:   return "join";
         case FinderStep::Wait:   return "wait";
         case FinderStep::Accept: return "accept";
+        case FinderStep::Teleport: return "teleport";
         case FinderStep::Inside: return "inside";
         case FinderStep::GiveUp: return "give up";
     }

@@ -31366,6 +31366,61 @@ private:
         return best;
     }
 
+    // THE FINDER'S OWN ENTRY FOR THIS DOOR (OverseerDecisions::
+    // ChooseFinderDungeon): every normal-difficulty dungeon row of
+    // LFGDungeons.dbc on the door's inside map, matched by where
+    // lfg_dungeon_template lands the group against where the door's own
+    // areatrigger does. The core's GetLFGDungeon(map, difficulty) returns
+    // the first row for a map, which is the wrong wing of Scarlet Monastery,
+    // Maraudon, Dire Maul, Blackrock Depths and Stratholme. Kept per door;
+    // the tables are loaded once at start-up.
+    static LFGDungeonEntry const* FinderDungeonForDoor(DungeonPortal const& portal,
+                                                       std::string& why)
+    {
+        static std::map<uint32, std::pair<LFGDungeonEntry const*, std::string>> s_chosen;
+        auto const known = s_chosen.find(portal.entryTriggerId);
+        if (known != s_chosen.end())
+        {
+            why = known->second.second;
+            return known->second.first;
+        }
+        std::vector<OverseerDecisions::FinderDungeonCandidate> candidates;
+        std::map<uint32, LFGDungeonEntry const*> byId;
+        for (uint32 i = 0; i < sLFGDungeonStore.GetNumRows(); ++i)
+        {
+            LFGDungeonEntry const* row = sLFGDungeonStore.LookupEntry(i);
+            if (!row || row->MapID != portal.insideMapId ||
+                row->TypeID != lfg::LFG_TYPE_DUNGEON ||
+                Difficulty(row->Difficulty) != DUNGEON_DIFFICULTY_NORMAL)
+                continue;
+            OverseerDecisions::FinderDungeonCandidate c;
+            c.id = row->ID;
+            if (QueryResult at = WorldDatabase.Query(
+                    "SELECT position_x, position_y FROM lfg_dungeon_template WHERE dungeonId = {}",
+                    row->ID))
+            {
+                c.hasEntrance = true;
+                c.x = at->Fetch()[0].Get<float>();
+                c.y = at->Fetch()[1].Get<float>();
+            }
+            candidates.push_back(c);
+            byId[row->ID] = row;
+        }
+        float landingX = 0.f;
+        float landingY = 0.f;
+        if (AreaTriggerTeleport const* landing =
+                sObjectMgr->GetAreaTriggerTeleport(portal.entryTriggerId))
+        {
+            landingX = landing->target_X;
+            landingY = landing->target_Y;
+        }
+        uint32 const id =
+            OverseerDecisions::ChooseFinderDungeon(candidates, landingX, landingY, why);
+        LFGDungeonEntry const* const chosen = id ? byId[id] : nullptr;
+        s_chosen[portal.entryTriggerId] = {chosen, why};
+        return chosen;
+    }
+
     // WHAT THE DUNGEON FINDER WOULD SAY ABOUT THIS FAMILY NOW. The locks are
     // the core's own (LFGMgr::InitializeLockedDungeons, the call the client's
     // lock-info request makes), read for the campaign's dungeon at normal
@@ -31377,9 +31432,8 @@ private:
         OverseerDecisions::FinderFacts facts;
         facts.enabled = RecoveryFinderEnabled();
         facts.finderOn = sLFGMgr->isOptionEnabled(lfg::LFG_OPTION_ENABLE_DUNGEON_FINDER);
-        LFGDungeonEntry const* dungeon =
-            GetLFGDungeon(portal.insideMapId, DUNGEON_DIFFICULTY_NORMAL);
-        if (dungeon && dungeon->TypeID == lfg::LFG_TYPE_DUNGEON)
+        LFGDungeonEntry const* const dungeon = FinderDungeonForDoor(portal, facts.dungeonWhy);
+        if (dungeon)
         {
             facts.dungeonId = dungeon->ID;
             facts.dbcMinLevel = dungeon->MinLevel;
@@ -32538,6 +32592,14 @@ private:
         poll.waitedSeconds =
             coord.finderSince ? static_cast<unsigned>(now - coord.finderSince) : 0;
 
+        // THE FALL HEIGHT IS KEPT UNDER THEIR FEET WHILE THE FAMILY IS QUEUED.
+        // The bots' own LFG accept action (mod-playerbots LfgAcceptAction)
+        // answers a proposal the moment it arrives, often before this poll,
+        // so the re-anchor cannot wait for this rung's own accept.
+        if (coord.finderJoined)
+            for (std::string const& name : names)
+                ReanchorFallForTheFinder(ObjectAccessor::FindPlayerByName(name));
+
         OverseerDecisions::FinderStep const step = OverseerDecisions::FinderNext(poll);
         std::string const said = std::string(OverseerDecisions::FinderStepWord(step)) + " " +
                                  std::to_string(static_cast<unsigned>(poll.state)) + " " +
@@ -32660,6 +32722,36 @@ private:
                     answer << uint8(1);
                     answer.rpos(0);
                     p->GetSession()->HandleLfgProposalResultOpcode(answer);
+                }
+                return FinderRungOutcome::Waiting;
+            }
+
+            case OverseerDecisions::FinderStep::Teleport:
+            {
+                // THE FINDER GROUP IS MADE AND SOMEBODY IS STILL OUTSIDE: the
+                // core refused that member's teleport (falling, combat) and
+                // does not try again. A player presses the finder's own
+                // "teleport in" (CMSG_LFG_TELEPORT, false), handed here to
+                // WorldSession::HandleLfgTeleportOpcode for each member not
+                // yet in the head's copy.
+                for (std::string const& name : names)
+                {
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    if (!p || !p->IsInWorld() || !p->GetSession() || p->IsBeingTeleported())
+                        continue;
+                    if (headInstance && p->GetMapId() == portal.insideMapId &&
+                        p->GetInstanceId() == headInstance)
+                        continue;
+                    if (sayIt)
+                        LOG_INFO("module.overseer",
+                                 "overseer: DUNGEON FINDER - '{}' is still outside map {} after "
+                                 "the finder made the group, so it uses the finder's own "
+                                 "teleport in",
+                                 name, portal.insideMapId);
+                    WorldPacket in(CMSG_LFG_TELEPORT, 1);
+                    in << uint8(0);  // false: in, not out
+                    in.rpos(0);
+                    p->GetSession()->HandleLfgTeleportOpcode(in);
                 }
                 return FinderRungOutcome::Waiting;
             }

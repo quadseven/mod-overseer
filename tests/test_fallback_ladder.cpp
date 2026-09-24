@@ -370,6 +370,52 @@ void TheFinderReadsTheGroupAndTheCoresLocks()
           false);
 }
 
+void TheFinderPicksTheDoorsOwnWing()
+{
+    std::string why;
+    // Ragefire Chasm: one row, whatever its entrance.
+    Check("one candidate is the dungeon",
+          ChooseFinderDungeon({{4, false, 0.f, 0.f}}, 3.f, -11.f, why) == 4);
+    Check("none is no dungeon", ChooseFinderDungeon({}, 0.f, 0.f, why) == 0);
+    // Maraudon, read from lfg_dungeon_template: Orange 26 at (1019.69,
+    // -458.31), Purple 272 at (752.91, -616.53), Pristine 273 at (495.702,
+    // 17.3372). A door landing beside the purple start is the purple wing.
+    std::vector<FinderDungeonCandidate> const maraudon = {
+        {26, true, 1019.69f, -458.31f}, {272, true, 752.91f, -616.53f},
+        {273, true, 495.702f, 17.3372f}};
+    Check("a door landing at the purple start is Purple Crystals",
+          ChooseFinderDungeon(maraudon, 750.f, -620.f, why) == 272);
+    Check("a door landing nowhere near any start is refused",
+          ChooseFinderDungeon(maraudon, 0.f, 0.f, why) == 0);
+    Check("and says the wing cannot be told", why.find("wrong one") != std::string::npos);
+    // Scarlet Monastery: only the Graveyard has a row there; the Library,
+    // Armory and Cathedral land on the map's shared entrance.
+    std::vector<FinderDungeonCandidate> const scarlet = {
+        {18, true, 1688.99f, 1053.48f}, {165, false, 0.f, 0.f}, {163, false, 0.f, 0.f}};
+    Check("a Library door is not sent to the Graveyard",
+          ChooseFinderDungeon(scarlet, 255.f, -209.f, why) == 0);
+}
+
+void TheFamilyMustMakeAFinderGroup()
+{
+    std::vector<std::uint8_t> alliance = {FinderRoleMask(1, true), FinderRoleMask(2, false),
+                                          FinderRoleMask(4, false), FinderRoleMask(8, false),
+                                          FinderRoleMask(5, false)};
+    Check("warrior, paladin, rogue, mage, priest fit", FinderRolesFit(alliance));
+    std::vector<std::uint8_t> horde = {FinderRoleMask(1, true), FinderRoleMask(8, false),
+                                       FinderRoleMask(5, false), FinderRoleMask(11, false),
+                                       FinderRoleMask(7, false)};
+    Check("warrior, mage, priest, druid, shaman fit", FinderRolesFit(horde));
+    std::vector<std::uint8_t> noHealer = {FinderRoleMask(1, true), FinderRoleMask(4, false),
+                                          FinderRoleMask(4, false), FinderRoleMask(8, false),
+                                          FinderRoleMask(9, false)};
+    Check("no healer class: no fit", FinderRolesFit(noHealer), false);
+    FinderFacts f = AllianceAtZulFarrak();
+    f.family = {FM("Grug", 1, true), FM("A", 4), FM("B", 4), FM("C", 8), FM("D", 9)};
+    Check("and readiness says so before the rung is spent",
+          ReadFinderReadiness(f, false).whyNot.find("one healer") != std::string::npos);
+}
+
 void TheFinderPollSteps()
 {
     FinderPollFacts p;
@@ -396,7 +442,21 @@ void TheFinderPollSteps()
     p.waitedSeconds = 10000;
     Check("inside beats the clock", FinderNext(p) == FinderStep::Inside);
     p.inside = 4;
-    Check("four inside at the ceiling: give up", FinderNext(p) == FinderStep::GiveUp);
+    Check("a finder group with four inside at the ceiling is staged inside: the door "
+          "brings the fifth",
+          FinderNext(p) == FinderStep::Inside);
+    p.inside = 0;
+    Check("nobody inside at the ceiling: give up", FinderNext(p) == FinderStep::GiveUp);
+    p.state = FinderState::Queued;
+    p.inside = 0;
+    Check("still queued at the ceiling: give up", FinderNext(p) == FinderStep::GiveUp);
+    p.waitedSeconds = 30;
+    p.state = FinderState::Dungeon;
+    p.inside = 3;
+    Check("the group is made and two are outside: the finder's own teleport in",
+          FinderNext(p) == FinderStep::Teleport);
+    p.anyoneNotReady = true;
+    Check("but not while one is in a fight", FinderNext(p) == FinderStep::Wait);
     Check("the refusal words are the core's",
           std::string(FinderJoinResultWord(6)).find("party member") != std::string::npos);
 }
@@ -453,6 +513,10 @@ void TheAdapterIsWired()
         "p->GetSession()->HandleLfgProposalResultOpcode(answer);");
     has("the fall height is re-anchored the way upstream #2754 does",
         "if (p && p->IsInWorld() && !p->Unit::IsFalling())");
+    has("a member the core did not teleport presses the finder's own teleport in",
+        "p->GetSession()->HandleLfgTeleportOpcode(in);");
+    has("the door's own wing, not the map's first",
+        "OverseerDecisions::ChooseFinderDungeon(candidates, landingX, landingY, why);");
     has("the proposal id is read off the core's packet",
         "OverseerWorldScript::NoteFinderProposal(name, packet->read<uint32>(5),");
     has("a finder group is let go before the reset", "group->Disband();");
@@ -493,6 +557,8 @@ int main()
     TheRowIsFoundAgainByItsSource();
     TheFamilyOffersTheRolesItsClassesCanFill();
     TheFinderReadsTheGroupAndTheCoresLocks();
+    TheFinderPicksTheDoorsOwnWing();
+    TheFamilyMustMakeAFinderGroup();
     TheFinderPollSteps();
     TheRungsHoldTheLeader();
     TheAdapterIsWired();
