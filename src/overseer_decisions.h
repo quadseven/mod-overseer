@@ -14157,13 +14157,17 @@ std::uint32_t TakeLootedItemGuid(LootStoreNote& note, std::uint64_t looter, std:
 // here uses (the summon's approach is the precedent), and it ends at a box the
 // core's own CanOpenMailBox accepts. The letter is a separate `send` row.
 //
-// SHAPE. `walk-to-mailbox` alone, or `walk-to-mailbox max:<yards>` to cap the
-// walk below MAIL_WALK_MAX_YARDS. Nothing else is accepted.
+// SHAPE. `walk-to-mailbox` alone, or `walk-to-mailbox max:<yards>` to set the
+// cap. A cap up to MAIL_WALK_MAX_YARDS keeps the walk the short walk it always
+// was; a larger one, up to FAR_WALK_MAX_YARDS, lets the walk become a far walk
+// (#633, see below). Nothing else is accepted.
 
 constexpr char const* MAIL_WALK_VERB = "walk-to-mailbox";
 
 // THE CAP, and the site's own: wow-overseer's plan_mail_runs walks a holder only
-// to a mailbox within 600 yards. A row cannot raise it.
+// to a mailbox within 600 yards. It is the cap of a row that names none, and
+// the line past which a destination makes the walk a far walk (#633). A row may
+// ask for more, up to FAR_WALK_MAX_YARDS, and only a far walk goes past this.
 constexpr float MAIL_WALK_MAX_YARDS = 600.0f;
 
 // HOW FAR ONE LEG AIMS. PathGenerator smooths at most 74 points of 4 yards,
@@ -14186,6 +14190,15 @@ constexpr float MAIL_WALK_PROGRESS_YARDS = 10.0f;
 
 // THIS MANY POLLS IN A ROW WITH NO STEP THE GROUND WILL TAKE ENDS THE WALK.
 constexpr uint32_t MAIL_WALK_GROUND_REFUSALS_MAX = 5;
+
+// A FIGHT PAUSES A WALK RATHER THAN ENDING IT (#633), up to this many seconds of
+// fighting over the whole walk. Measured on the dev realm: a dues walk that met
+// one mob 341 yards from the box ended "entered combat on the way to the
+// mailbox" and posted nothing, when a player would have killed the mob and
+// walked on. Three minutes covers a level 60 bot's ordinary fight several times
+// over; a walk that spends longer than that fighting is walking through
+// something it should not, and ends the way it always did.
+constexpr uint32_t MAIL_WALK_COMBAT_PAUSE_SECONDS = 180;
 
 // ON ARRIVAL THE HOLD STAYS THIS LONG, so the bot's own wander does not walk it
 // off the box before the site's `send` row lands. A successful `send` lifts it
@@ -14326,6 +14339,13 @@ enum class MailWalkState
     TimedOut,
     Stalled,
     GroundRefused,
+    // THE WALK IS NOT OVER, AND NOT MOVING EITHER (#633). Paused: a fight is on
+    // and the combat allowance is not spent, so the hold comes off for the fight
+    // and the walk picks up where it stands afterwards. Flying: a far walk's own
+    // flight leg is under way, walking to a flight master or in the air, and
+    // arrival and the ground clocks wait for the landing.
+    Paused,
+    Flying,
 };
 
 // What one poll of a walk read. `mailboxInReach` is the core's own gate: a
@@ -14342,11 +14362,25 @@ struct MailWalkFacts
     uint32_t timeoutMs{0};
     uint32_t sinceProgressMs{0};
     uint32_t groundRefusals{0};
+    // THE FIGHTING SO FAR, this one included, and how much of it the walk will
+    // sit out (#633). A fight inside the allowance pauses the walk; one that
+    // outlasts it ends the walk as it always did.
+    uint32_t combatMs{0};
+    uint32_t combatAllowanceMs{MAIL_WALK_COMBAT_PAUSE_SECONDS * 1000u};
+    // A far walk's own flight leg is running (#633): a taxi is then the walk
+    // going well rather than the walk being taken somewhere else.
+    bool onFlightLeg{false};
+    // How long without progress is a stall. A far walk follows the survey round
+    // hills and rivers and is given longer (FAR_WALK_STALL_SECONDS).
+    uint32_t stallMs{MAIL_WALK_STALL_SECONDS * 1000u};
 };
 
-// THE VERDICT FOR ONE POLL. Leaving the world, dying, flying and changing map
-// end it first; then combat, because a character held through a fight is a
-// character killed by the hold; then arrival; then the clocks.
+// THE VERDICT FOR ONE POLL. Leaving the world, dying, a taxi the walk did not
+// board and changing map end it first. Then combat: a character held through a
+// fight is a character killed by the hold, so the hold comes off, and since
+// #633 the walk PAUSES rather than ends while the fighting stays inside its
+// allowance. Then a far walk's own flight leg, which waits for the landing and
+// answers only to the timeout. Then arrival; then the clocks.
 MailWalkState JudgeMailWalk(MailWalkFacts const& facts);
 
 // "walking", "arrived", ... for the result JSON.
@@ -14393,7 +14427,8 @@ constexpr char const* VENDOR_WALK_VERB = "walk-to-vendor";
 // THE CAP. A trainer or a vendor stands in a town, and a bot on the road is
 // often past a mailbox's 600 yards from the nearest one. 1,000 yards is still
 // inside MAIL_WALK_TIMEOUT_CEILING_SECONDS at a bot's 7 yards a second with the
-// same allowance for bends, and a row cannot raise it.
+// same allowance for bends. It is the cap of a row that names none; a row may
+// ask for up to FAR_WALK_MAX_YARDS, and only a far walk goes past this (#633).
 constexpr float ERRAND_WALK_MAX_YARDS = 1000.0f;
 
 // At most this many named spells in one trainer walk. A trainer visit buys a
@@ -14426,7 +14461,7 @@ struct TrainerWalkRequest
 
 // `skill:` is required and must be a non-zero id. `learn:` is optional, a comma
 // list of non-zero ids with no repeats and at most TRAINER_WALK_MAX_LEARN of
-// them. `max:` is optional and no larger than ERRAND_WALK_MAX_YARDS. Each key at
+// them. `max:` is optional and no larger than FAR_WALK_MAX_YARDS (#633). Each key at
 // most once, in any order; anything else is Malformed.
 TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command);
 
@@ -14521,6 +14556,137 @@ TrainerVisitOutcome JudgeTrainerVisit(TrainerVisitFacts const& facts);
 
 // "learned", "nothing_to_learn", "taught_nothing".
 char const* TrainerVisitWord(TrainerVisitOutcome outcome);
+
+// ------------------------------------------ far walks for guild bots (#633) --
+//
+// A GUILD BOT OFF THE ROSTER, TRAVELLING THE WAY A PLAYER WOULD. The three walks
+// above end at a destination within 600 or 1,000 yards, on foot and in a
+// straight line. Read on the dev realm, most of the site's corps and dues walks
+// ended "nearest mailbox is beyond the cap" at 1,000 to 2,300 yards, and the one
+// vendor that sells the Runecloth Bag pattern stands in Everlook, a continent
+// away from most of the guild. The roster has had everything that would carry
+// them for a long time: the travel survey and RouteLeg, GroundedStep and its
+// retreat along the route, ConsiderFlight over the taxi nodes a character
+// knows, and upstream's own mount and flight actions. A FAR walk is a walk that
+// uses those, rather than a second drive written beside them.
+//
+// WHAT MAKES A WALK FAR. The row asked for a cap past the verb's near cap (its
+// `max:`), AND the destination actually chosen lies past the near cap. A row
+// that could go far and finds its destination round the corner stays a near
+// walk in every respect, budget included.
+//
+// WHERE. The classic continents only, Eastern Kingdoms and Kalimdor: this realm
+// is a level 60 realm by the operator's decision, and a far walk never starts on
+// Outland or Northrend.
+//
+// BOUNDED THREE WAYS. A far walk may be FAR_WALK_MAX_YARDS away at most, which
+// is any destination on one continent; it is given FAR_WALK_TIMEOUT_CEILING_
+// SECONDS; and one bot may start FAR_WALK_STARTS_PER_BOT of them in any
+// FAR_WALK_BUDGET_WINDOW_SECONDS while the realm has at most FAR_WALKS_AT_ONCE
+// under way.
+
+constexpr float FAR_WALK_MAX_YARDS = 20000.0f;
+
+// The continents a far walk may start on: Eastern Kingdoms and Kalimdor.
+constexpr uint32_t FAR_WALK_MAP_EASTERN_KINGDOMS = 0;
+constexpr uint32_t FAR_WALK_MAP_KALIMDOR = 1;
+
+// THE CLOCK. The pace is the near walk's own; only the ceiling is longer, and it
+// is long enough for a mounted crossing of a continent or a flight and the walk
+// either side of it. A far walk makes progress round a hill more slowly than a
+// straight one does, so its stall is longer too.
+constexpr uint32_t FAR_WALK_TIMEOUT_CEILING_SECONDS = 1800;
+constexpr uint32_t FAR_WALK_STALL_SECONDS = 120;
+
+// THE BUDGET. Two far walks per bot per hour, four under way on the realm.
+constexpr uint32_t FAR_WALK_STARTS_PER_BOT = 2;
+constexpr uint32_t FAR_WALK_BUDGET_WINDOW_SECONDS = 3600;
+constexpr uint32_t FAR_WALKS_AT_ONCE = 4;
+
+// MOUNTING. A far walker with more than this still to go is put on its mount by
+// upstream's own `check mount state` action, at most FAR_WALK_MOUNT_TRIES times
+// per walk and never more often than every FAR_WALK_MOUNT_RETRY_SECONDS.
+constexpr float FAR_WALK_MOUNT_YARDS = 100.0f;
+constexpr uint32_t FAR_WALK_MOUNT_TRIES = 3;
+constexpr uint32_t FAR_WALK_MOUNT_RETRY_SECONDS = 10;
+
+// FLYING. A far walk asks for a flight at most this many times over its life:
+// once when it sets off and once more after it lands, like one roster errand
+// (TRAVEL_FLIGHT_MAX_PER_ERRAND in the adapter).
+constexpr uint32_t FAR_WALK_FLIGHTS_MAX = 2;
+// ...and only while this much is still to go, the roster's own line below which
+// a flight is never worth it (TRAVEL_FLIGHT_MIN_YARDS in the adapter).
+constexpr float FAR_WALK_FLIGHT_MIN_YARDS = 1500.0f;
+
+// The near cap of a walk to `goal`: MAIL_WALK_MAX_YARDS for a mailbox,
+// ERRAND_WALK_MAX_YARDS for a trainer or a vendor.
+float NearWalkCapYards(WalkGoal goal);
+
+// Is a walk to `goal` whose chosen destination is `yards` away a far walk?
+// True only past the goal's near cap.
+bool IsFarWalk(WalkGoal goal, float yards);
+
+// May a far walk start on this map? Eastern Kingdoms and Kalimdor only.
+bool FarWalkMapAllowed(uint32_t mapId);
+
+// A far walk's timeout for a destination this far away: the near walk's pace
+// and floor under FAR_WALK_TIMEOUT_CEILING_SECONDS.
+uint32_t FarWalkTimeoutSeconds(float yards);
+
+namespace FarWalkRefusal
+{
+constexpr char const* NotOnAContinent = "a far walk starts only on the Eastern Kingdoms or Kalimdor";
+constexpr char const* BotBudgetSpent  = "this character has started as many far walks this hour as one may";
+constexpr char const* RealmFull       = "the realm has as many far walks under way as it allows";
+}  // namespace FarWalkRefusal
+
+// Worth asking again later: the budget and the realm ceiling move with the
+// clock; the map does not.
+bool FarWalkRefusalRetryable(std::string const& reason);
+
+// THE BUDGET GATE. `startsForBot` are the times (seconds) this bot started a far
+// walk, `now` the time now, `underWay` the far walks the realm has running.
+// "" when a far walk may start; otherwise the FarWalkRefusal literal. The realm
+// ceiling is named first: it is the wall that moves soonest.
+char const* FarWalkBudgetGate(std::vector<int64_t> const& startsForBot, int64_t now,
+                              uint32_t underWay);
+
+// Drop the starts that have left the window, so the memory stays one hour deep.
+void PruneFarWalkStarts(std::vector<int64_t>& starts, int64_t now);
+
+// SHOULD THE WALK ASK UPSTREAM TO MOUNT THIS POLL? Only a far walk, only with
+// more than FAR_WALK_MOUNT_YARDS to go, only when the walker is not mounted,
+// not casting, out of doors and out of a fight, and only while the tries and
+// the retry clock allow.
+struct FarWalkMountFacts
+{
+    bool far{false};
+    bool mounted{false};
+    bool casting{false};
+    bool outdoors{false};
+    bool inCombat{false};
+    float yardsToGo{0.f};
+    uint32_t tries{0};
+    uint32_t sinceLastTrySeconds{0};
+};
+bool FarWalkShouldMount(FarWalkMountFacts const& facts);
+
+// SHOULD THE WALK OFFER THE ROSTER'S FLIGHT LOGIC A TURN THIS POLL? Only a far
+// walk, only once per stretch on the ground (set off, or landed), only while
+// FAR_WALK_FLIGHT_MIN_YARDS or more is still to go and FAR_WALK_FLIGHTS_MAX is
+// not spent, and only for a walker upstream's flight action can carry: one that
+// carries `new rpg` once its hold is lifted, and is in no group (a party flight
+// is the roster's, and boards everybody in the group).
+struct FarWalkFlightFacts
+{
+    bool far{false};
+    bool askedThisStretch{false};
+    bool carriesNewRpg{false};
+    bool grouped{false};
+    float yardsToGo{0.f};
+    uint32_t flights{0};
+};
+bool FarWalkMayAskFlight(FarWalkFlightFacts const& facts);
 
 // ---------------------------------------------------------------------------
 // THE DUNGEON RUN TIMELINE (overseer_dungeon_run_event).

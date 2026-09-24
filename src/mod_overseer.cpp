@@ -22080,14 +22080,33 @@ private:
 
     void DriveBelowTerrainRecovery()
     {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT name FROM overseer_roster WHERE enabled = 1");
-        if (!result)
+        // THE ROSTER, AND SINCE #633 EVERY GUILD BOT ON A FAR WALK. A far walk
+        // moves a bot off the roster by the same server-side splines this
+        // guard exists for, across the same hills, so the fall baseline is put
+        // back under its feet on the same poll the roster's is. Only the
+        // baseline guard: the below-terrain lift and its ladder stay the
+        // roster's, and a far walker that cannot find its footing ends its walk
+        // on the stall clock instead.
+        std::vector<std::string> names;
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT name FROM overseer_roster WHERE enabled = 1"))
+        {
+            do
+                names.push_back(result->Fetch()[0].Get<std::string>());
+            while (result->NextRow());
+        }
+        std::size_t const rosterCount = names.size();
+        for (MailWalkCheck const& check : _pendingMailWalks)
+            if (check.ev.far &&
+                std::find(names.begin(), names.end(), check.targetName) == names.end())
+                names.push_back(check.targetName);
+        if (names.empty())
             return;
 
-        do
+        for (std::size_t index = 0; index < names.size(); ++index)
         {
-            std::string const name = result->Fetch()[0].Get<std::string>();
+            std::string const& name = names[index];
+            bool const onRoster = index < rosterCount;
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot)
                 continue;
@@ -22263,6 +22282,10 @@ private:
                     standDown |= OverseerDecisions::FALL_GUARD_DESCENDING;
                 RememberStandDown(name, standDown);
             }
+
+            // A FAR WALKER GETS THE BASELINE GUARD ABOVE AND NOTHING BELOW (#633).
+            if (!onRoster)
+                continue;
 
             // IS THIS CHARACTER IN THE LAST STRETCH ABOVE THE KILL PLANE
             // (#188)? Asked here, before the stand-down, because it is the one
@@ -22659,7 +22682,7 @@ private:
                           questAim, travelTarget, static_cast<uint32>(aimedMap),
                           aimedX, aimedY, aimedZ);
             }
-        } while (result->NextRow());
+        }
     }
 
     void DriveStuckRevival()
@@ -47961,9 +47984,16 @@ private:
     //     PathGenerator will smooth, and every point handed to the mover has
     //     been through GroundedStep: the navmesh when it routes, a short step
     //     over proved ground when it does not, nothing at all otherwise.
-    //   * The walk ends, and the hold comes off, on combat, death, logout, a
-    //     taxi, a map change, its own timeout, thirty seconds without getting
-    //     nearer, or the ground refusing five polls running.
+    //   * The walk ends, and the hold comes off, on death, logout, a taxi it
+    //     did not board, a map change, its own timeout, thirty seconds without
+    //     getting nearer, or the ground refusing five polls running. A fight
+    //     takes the hold off and PAUSES the walk (#633), which walks on after
+    //     it, until MAIL_WALK_COMBAT_PAUSE_SECONDS of fighting ends it.
+    //   * A destination past the near cap makes a FAR walk (#633): mounted by
+    //     upstream's own action, flown by the roster's ConsiderFlight over the
+    //     nodes the bot knows, and walked along the travel survey by the
+    //     roster's RouteLeg, on the classic continents only and inside a
+    //     per-bot budget and a realm ceiling.
     //
     // ON ARRIVAL THE HOLD STAYS FOR MAIL_WALK_LINGER_SECONDS, so the bot's own
     // wander does not walk it off the box before the site's `send` row lands.
@@ -48041,7 +48071,33 @@ private:
 
         // A vendor walk's request.
         uint32 item{0};
+
+        // A FAR WALK (#633): the destination lies past the goal's near cap, so
+        // the walk mounts, may fly and follows the travel survey. `travel` is
+        // the roster drive's own per-errand record, used here for what it is
+        // used for there and nothing else: the surveyed route and its cursor
+        // for RouteLeg, and the flight budget and leg clock for ConsiderFlight.
+        bool far{false};
+        TravelAimBook::TravelState travel;
+        bool flightAskedThisStretch{false};
+        uint32 flightLegs{0};
+        uint32 mountTries{0};
+        time_t lastMountTry{0};
+        // THE COMBAT PAUSE (#633): the fighting so far, how many fights, and
+        // whether the walk is paused for one now, its hold lifted for it.
+        uint32 combatMs{0};
+        uint32 pauses{0};
+        bool paused{false};
     };
+
+    // FAR WALKS STARTED, per bot, for the budget (#633). World thread only,
+    // like the pending list; pruned to one hour on every ask, and a name whose
+    // starts have all left the window is dropped.
+    static std::map<std::string, std::vector<int64_t>>& FarWalkStarts()
+    {
+        static std::map<std::string, std::vector<int64_t>> starts;
+        return starts;
+    }
 
     struct MailWalkCheck
     {
@@ -48075,6 +48131,7 @@ private:
             o << ",\"retryable\":"
               << ((mailbox ? D::MailWalkRefusalRetryable(reason)
                            : D::ErrandWalkRefusalRetryable(reason))
+                          || D::FarWalkRefusalRetryable(reason)
                       ? "true"
                       : "false");
         o << ",\"goal\":" << J(D::WalkGoalWord(ev.goal))
@@ -48135,6 +48192,12 @@ private:
         }
         if (ev.goal == D::WalkGoal::Vendor)
             o << ",\"item\":" << ev.item;
+        o << ",\"far\":" << (ev.far ? "true" : "false");
+        if (ev.far)
+            o << ",\"flights\":" << ev.flightLegs
+              << ",\"mount_tries\":" << ev.mountTries
+              << ",\"route_points\":" << ev.travel.route.size();
+        o << ",\"combat_ms\":" << ev.combatMs << ",\"pauses\":" << ev.pauses;
         o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
           << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
           << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
@@ -48310,21 +48373,48 @@ private:
         }
 
         bool final = false;
-        OverseerDecisions::MailWalkPoint const aim = OverseerDecisions::MailWalkLegAim(
+        OverseerDecisions::MailWalkPoint aim = OverseerDecisions::MailWalkLegAim(
             who->GetPositionX(), who->GetPositionY(), who->GetPositionZ(), ev.boxX, ev.boxY,
             ev.boxZ, OverseerDecisions::MAIL_WALK_LEG_YARDS, final);
         float aimZ = aim.z;
+
+        // A FAR WALK FOLLOWS THE TRAVEL SURVEY (#633), through the roster
+        // drive's own RouteLeg and the route record the walk carries. RouteLeg
+        // answers the destination itself when there is no route to follow (no
+        // survey, nothing the survey improves on, or the last yards), and the
+        // straight leg above is walked then, exactly as a near walk walks it.
+        WorldPosition const destination(ev.mapId, ev.boxX, ev.boxY, ev.boxZ);
+        bool onRoute = false;
+        if (ev.far)
+        {
+            WorldPosition const leg =
+                RouteLeg(who, destination, ev.travel, ev.character, ev.travel.target);
+            if (leg.GetPositionX() != destination.GetPositionX() ||
+                leg.GetPositionY() != destination.GetPositionY())
+            {
+                aim.x = leg.GetPositionX();
+                aim.y = leg.GetPositionY();
+                aim.z = leg.GetPositionZ();
+                aimZ = aim.z;
+                onRoute = true;
+            }
+        }
+
         // A leg that stops short of the box ends on the ground under the line,
-        // not at a height interpolated through a hill.
-        if (!final)
+        // not at a height interpolated through a hill. A survey point is
+        // already a place on the ground.
+        if (!final && !onRoute)
         {
             float surface = 0.f;
             if (SurfaceAt(who, aim.x, aim.y, aim.z + TRAVEL_GROUND_UPHILL_YARDS, surface))
                 aimZ = surface;
         }
 
+        // THE GROUND GUARD, AND FOR A FAR WALK THE ROSTER'S RETREAT ALONG THE
+        // ROUTE when the point it aimed at is refused (#592).
         WorldPosition step;
-        if (!GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aimZ), step))
+        if (!GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aimZ), step) &&
+            !(ev.far && RetreatAlongRoute(who, destination, ev.travel, step)))
             return false;
 
         if (!who->IsStandState())
@@ -48627,11 +48717,65 @@ private:
         ev.bestYards = choice.yards;
         ev.nowYards = choice.yards;
 
+        // ---- near or far (#633) ----------------------------------------------
+        //
+        // FAR ONLY WHEN THE DESTINATION IS, and only where a far walk may go:
+        // the classic continents, inside the bot's own budget and the realm's
+        // ceiling. A row that asked for a far cap and found its destination
+        // round the corner is a near walk in every respect.
+        ev.far = D::IsFarWalk(goal, choice.yards);
+        int64_t const nowSeconds = static_cast<int64_t>(std::time(nullptr));
+        if (ev.far)
+        {
+            if (!D::FarWalkMapAllowed(ev.mapId))
+                return refuse(D::FarWalkRefusal::NotOnAContinent);
+            auto& budget = FarWalkStarts();
+            for (auto it = budget.begin(); it != budget.end();)
+            {
+                D::PruneFarWalkStarts(it->second, nowSeconds);
+                it = it->second.empty() ? budget.erase(it) : std::next(it);
+            }
+            uint32 underWay = 0;
+            for (MailWalkCheck const& check : walking)
+                if (check.ev.far)
+                    ++underWay;
+            auto const mine = budget.find(ev.character);
+            std::vector<int64_t> const none;
+            if (char const* wall = D::FarWalkBudgetGate(
+                    mine == budget.end() ? none : mine->second, nowSeconds, underWay);
+                *wall)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: guild far walk {} for '{}' refused by the budget: {} "
+                         "({} far walk(s) under way on the realm, {} allowed; {} per bot per "
+                         "{}s) (#633)",
+                         id, ev.character, wall, underWay, D::FAR_WALKS_AT_ONCE,
+                         D::FAR_WALK_STARTS_PER_BOT, D::FAR_WALK_BUDGET_WINDOW_SECONDS);
+                return refuse(wall);
+            }
+            // The name the roster drive's log lines and the survey planner call
+            // the errand by.
+            ev.travel.target = std::string("the ") + noun + " '" + ev.mailboxName + "'";
+            ev.travel.mapId = ev.mapId;
+            ev.travel.x = ev.boxX;
+            ev.travel.y = ev.boxY;
+            ev.travel.z = ev.boxZ;
+            ev.travel.errandSince = std::time(nullptr);
+            ev.travel.progress.since = std::time(nullptr);
+        }
+
         // ---- the way there ---------------------------------------------------
         //
         // The straight line is swept for the other side's people at the route
         // planner's own spacing. The walk bends round buildings, but inside a
         // 1,000 yard cap and a 60 yard threat radius the line is where it goes.
+        //
+        // A FAR WALK DOES NOT GO WHERE THE LINE GOES (#633): it flies, or follows
+        // the travel survey, whose own reading of the other side's ground (#326)
+        // prices the road round it the way it does for the roster. So the line
+        // across a continent is not swept, and the destination's own ground was
+        // already read when it was chosen.
+        if (!ev.far)
         {
             std::vector<D::MailWalkPoint> const line = D::MailWalkLineSamples(
                 ev.fromX, ev.fromY, ev.boxX, ev.boxY, TRAVEL_ROUTE_GUARDED_SPACING_YARDS);
@@ -48652,7 +48796,8 @@ private:
                 }
         }
 
-        ev.timeoutMs = D::MailWalkTimeoutSeconds(ev.startYards) * 1000u;
+        ev.timeoutMs = (ev.far ? D::FarWalkTimeoutSeconds(ev.startYards)
+                               : D::MailWalkTimeoutSeconds(ev.startYards)) * 1000u;
 
         // ---- hold, then walk ------------------------------------------------
         //
@@ -48674,6 +48819,17 @@ private:
             return refuse(R::GroundRefused);
         }
 
+        if (ev.far)
+        {
+            FarWalkStarts()[ev.character].push_back(nowSeconds);
+            LOG_INFO("module.overseer",
+                     "overseer: guild far walk {} - '{}' sets off for {} (spawn {}) {:.0f} "
+                     "yards away on map {}, past the {:.0f} yard near cap: mounted, by a "
+                     "flight path it knows where one beats the road, and along the travel "
+                     "survey; given {}s (#633)",
+                     id, ev.character, ev.travel.target, ev.mailboxSpawn, ev.startYards,
+                     ev.mapId, D::NearWalkCapYards(goal), ev.timeoutMs / 1000u);
+        }
         if (goal == D::WalkGoal::Mailbox)
             LOG_INFO("module.overseer",
                      "overseer: mailbox walk {} - '{}' walks to '{}' (spawn {}) {:.0f} yards away "
@@ -48699,8 +48855,40 @@ private:
         return "";
     }
 
+    // TAKE A WALKER BACK AFTER A FIGHT OR A FLIGHT (#633). The hold comes off
+    // for both - a character held through a fight is a character killed by the
+    // hold, and upstream's flight action needs the `new rpg` the hold takes -
+    // and the walk puts it back on, with the time the walk has left, before it
+    // hands out another leg. False when another verb holds the character now:
+    // the walk does not take a character off somebody else.
+    static bool RetakeWalkHold(Player* bot, MailWalkEvidence& ev)
+    {
+        auto const& holds = HoldsInForce();
+        auto const hold = holds.find(ev.character);
+        if (HeldStill(ev.character) && hold != holds.end() &&
+            hold->second.verb != MAIL_WALK_HOLD_VERB)
+            return false;
+        uint32 const left =
+            ev.timeoutMs > ev.waitedMs ? (ev.timeoutMs - ev.waitedMs) / 1000u : 0u;
+        CastHoldReport again;
+        HoldStillAndReport(bot, ev.character, MAIL_WALK_HOLD_VERB, again,
+                           left + MAIL_WALK_HOLD_MARGIN_SECONDS, false);
+        if (!again.applied)
+            return false;
+        // What the hold took is read again: the flight logic's turn needs to
+        // know whether a release would hand `new rpg` back.
+        ev.hold = again;
+        return true;
+    }
+
     // WHERE A WALK IS DRIVEN AND ANSWERED. Every poll: read where the walker
     // is, judge it, and either hand it its next leg or end the row.
+    //
+    // SINCE #633 A WALK ALSO WAITS. A fight pauses it (the hold comes off for
+    // the fight and goes back on after), and a far walk's flight leg holds it
+    // open while upstream's flight action carries the walker to the flight
+    // master, aboard and down again. Neither is an ending, and neither spends
+    // the ground clocks.
     void ResolveMailWalks(uint32 elapsedMs)
     {
         namespace D = OverseerDecisions;
@@ -48709,11 +48897,11 @@ private:
 
         std::vector<MailWalkCheck> still;
         still.reserve(_pendingMailWalks.size());
+        time_t const now = std::time(nullptr);
 
         for (MailWalkCheck& check : _pendingMailWalks)
         {
             MailWalkEvidence& ev = check.ev;
-            ev.waitedMs += elapsedMs;
             char const* const noun = D::WalkGoalWord(ev.goal);
 
             Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
@@ -48723,6 +48911,18 @@ private:
             facts.inFlight = facts.present && bot->IsInFlight();
             facts.sameMap = facts.present && bot->GetMapId() == ev.mapId;
             facts.inCombat = facts.present && bot->IsInCombat();
+            facts.onFlightLeg = ev.travel.flightSince != 0;
+            if (ev.far)
+                facts.stallMs = D::FAR_WALK_STALL_SECONDS * 1000u;
+
+            // THE CLOCKS (#633). Fighting is counted against its own allowance
+            // and against nothing else; a flight leg runs the walk's timeout but
+            // not its stall, since walking to a flight master is walking away.
+            bool const fighting = facts.present && facts.alive && facts.inCombat;
+            if (fighting)
+                ev.combatMs += elapsedMs;
+            else
+                ev.waitedMs += elapsedMs;
             if (facts.present && facts.sameMap)
             {
                 ev.nowYards = bot->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
@@ -48731,9 +48931,9 @@ private:
                     ev.bestYards = ev.nowYards;
                     ev.sinceProgressMs = 0;
                 }
-                else
+                else if (!fighting && !facts.onFlightLeg)
                     ev.sinceProgressMs += elapsedMs;
-                if (facts.alive)
+                if (facts.alive && !facts.onFlightLeg)
                     facts.mailboxInReach =
                         DestinationInReach(bot, ev, ev.reachedName, ev.reachedYards);
             }
@@ -48741,8 +48941,134 @@ private:
             facts.timeoutMs = ev.timeoutMs;
             facts.sinceProgressMs = ev.sinceProgressMs;
             facts.groundRefusals = ev.groundRefusals;
+            facts.combatMs = ev.combatMs;
 
-            D::MailWalkState const state = D::JudgeMailWalk(facts);
+            D::MailWalkState state = D::JudgeMailWalk(facts);
+
+            // Write the row's ending, whatever it is.
+            auto finish = [&](char const* status, char const* reason, char const* word)
+            {
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    status, reason, EscLong(MailWalkJson(ev, word, reason)), check.id,
+                    g_runToken);
+            };
+
+            // ---- a fight: pause ------------------------------------------------
+            if (state == D::MailWalkState::Paused)
+            {
+                if (!ev.paused)
+                {
+                    ev.paused = true;
+                    ++ev.pauses;
+                    ReleaseHold(check.targetName, bot,
+                                "a fight started on the way; the walk pauses for it",
+                                MAIL_WALK_HOLD_VERB);
+                    LOG_INFO("module.overseer",
+                             "overseer: {} walk {} - '{}' is in a fight {:.0f} yards from "
+                             "'{}'; the walk pauses and its hold comes off for the fight, and "
+                             "it walks on afterwards ({}s of fighting allowed per walk, {}s "
+                             "spent) (#633)",
+                             noun, check.id, check.targetName, ev.nowYards, ev.mailboxName,
+                             D::MAIL_WALK_COMBAT_PAUSE_SECONDS, ev.combatMs / 1000u);
+                }
+                still.push_back(check);
+                continue;
+            }
+
+            // ---- the fight is over: resume --------------------------------------
+            bool const ending = state != D::MailWalkState::Walking &&
+                                state != D::MailWalkState::Arrived &&
+                                state != D::MailWalkState::Flying;
+            if (ev.paused && !ending)
+            {
+                ev.paused = false;
+                if (!facts.onFlightLeg)
+                {
+                    if (!RetakeWalkHold(bot, ev))
+                    {
+                        char const* const reason =
+                            D::WalkRefusalFor(ev.goal, D::MailWalkRefusal::HeldByAnother);
+                        LOG_WARN("module.overseer",
+                                 "overseer: {} walk {} - '{}' came out of its fight held by "
+                                 "another verb; the walk ends there (#633)",
+                                 noun, check.id, check.targetName);
+                        ev.reachedName.clear();
+                        finish("error", reason, "abandoned");
+                        continue;
+                    }
+                    // A fight moves a character; the walk measures afresh.
+                    ev.bestYards = ev.nowYards;
+                    ev.sinceProgressMs = 0;
+                    ev.groundRefusals = 0;
+                }
+                LOG_INFO("module.overseer",
+                         "overseer: {} walk {} - '{}' is out of its fight and walks on to "
+                         "'{}', {:.0f} yards off, after {}s of fighting over {} fight(s) (#633)",
+                         noun, check.id, check.targetName, ev.mailboxName, ev.nowYards,
+                         ev.combatMs / 1000u, ev.pauses);
+            }
+
+            // ---- a far walk's flight leg ---------------------------------------
+            //
+            // THE ROSTER DRIVE'S LEG, READ THE SAME WAY (#68): upstream holds the
+            // walker in RPG_TRAVEL_FLIGHT while it walks to the flight master and
+            // flies, and returns it to RPG_IDLE when it lands or the activation is
+            // refused. A leg that has not left the ground in the roster's own
+            // backstop is given up and the walk goes on by road.
+            if (state == D::MailWalkState::Flying)
+            {
+                PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+                bool const onLeg = bot->IsInFlight() ||
+                                   (botAI && botAI->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT);
+                if (onLeg)
+                {
+                    if (bot->IsInFlight() ||
+                        now - ev.travel.flightSince <= TRAVEL_FLIGHT_BACKSTOP_SECONDS)
+                    {
+                        still.push_back(check);
+                        continue;
+                    }
+                    LOG_WARN("module.overseer",
+                             "overseer: {} walk {} - '{}' set off for a flight master on its "
+                             "way to '{}' and has not left the ground in {} minutes; giving up "
+                             "the flight and going on by road (#633)",
+                             noun, check.id, check.targetName, ev.mailboxName,
+                             static_cast<uint32>(TRAVEL_FLIGHT_BACKSTOP_SECONDS / 60));
+                    if (botAI)
+                        botAI->rpgInfo.ChangeToIdle();
+                }
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: {} walk {} - '{}' is off its flight leg and goes on to "
+                             "'{}' from {:.0f} yards (#633)",
+                             noun, check.id, check.targetName, ev.mailboxName, ev.nowYards);
+                ev.travel.flightSince = 0;
+                // A new stretch on the ground: a new route from where it stands,
+                // fresh progress, and one more chance to fly if that still pays.
+                ev.flightAskedThisStretch = false;
+                ev.travel.routePlanned = false;
+                ev.travel.route.clear();
+                ev.travel.routeCursor = D::RouteCursor{};
+                ev.bestYards = ev.nowYards;
+                ev.sinceProgressMs = 0;
+                ev.groundRefusals = 0;
+                if (!RetakeWalkHold(bot, ev))
+                {
+                    char const* const reason =
+                        D::WalkRefusalFor(ev.goal, D::MailWalkRefusal::HeldByAnother);
+                    LOG_WARN("module.overseer",
+                             "overseer: {} walk {} - '{}' came off its flight leg held by "
+                             "another verb; the walk ends there (#633)",
+                             noun, check.id, check.targetName);
+                    ev.reachedName.clear();
+                    finish("error", reason, "abandoned");
+                    continue;
+                }
+                still.push_back(check);
+                continue;
+            }
 
             if (state == D::MailWalkState::Walking)
             {
@@ -48758,16 +49084,104 @@ private:
                              "ending it where it stands",
                              noun, check.id, check.targetName);
                     ev.reachedName.clear();
-                    CharacterDatabase.Execute(
-                        "UPDATE overseer_command SET status = 'error', detail = '{}', "
-                        "result = '{}' WHERE id = {} AND status = 'verifying' "
-                        "AND claimed_by = '{}'",
-                        "the walk's hold was lifted by something else",
-                        EscLong(MailWalkJson(ev, "abandoned",
-                                             "the walk's hold was lifted by something else")),
-                        check.id, g_runToken);
+                    finish("error", "the walk's hold was lifted by something else",
+                           "abandoned");
                     continue;
                 }
+
+                if (ev.far)
+                {
+                    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+
+                    // THE FLIGHT LOGIC'S TURN, the roster's ConsiderFlight and
+                    // nothing else: known taxi nodes only, every hop of the route
+                    // known, the fare in the purse, and a flight only where it
+                    // beats the road. Upstream's flight action needs `new rpg`,
+                    // which the hold took, so the hold comes off for the ask and
+                    // goes back on if nothing is boarded.
+                    D::FarWalkFlightFacts flight;
+                    flight.far = true;
+                    flight.askedThisStretch = ev.flightAskedThisStretch;
+                    flight.carriesNewRpg = ev.hold.tookNewRpg;
+                    flight.grouped = bot->GetGroup() != nullptr;
+                    flight.yardsToGo = ev.nowYards;
+                    flight.flights = ev.travel.flights;
+                    if (botAI && D::FarWalkMayAskFlight(flight))
+                    {
+                        ev.flightAskedThisStretch = true;
+                        ReleaseHold(check.targetName, bot,
+                                    "the far walk offers the flight logic its turn",
+                                    MAIL_WALK_HOLD_VERB);
+                        WorldPosition const destination(ev.mapId, ev.boxX, ev.boxY, ev.boxZ);
+                        if (ConsiderFlight(check.targetName, bot, botAI, destination,
+                                           ev.nowYards, ev.travel))
+                        {
+                            ++ev.flightLegs;
+                            LOG_INFO("module.overseer",
+                                     "overseer: guild far walk {} - '{}' flies toward '{}', "
+                                     "{:.0f} yards off: upstream's flight action carries it to "
+                                     "the flight master and aboard, and the walk takes it back "
+                                     "when it lands (#633)",
+                                     check.id, check.targetName, ev.mailboxName, ev.nowYards);
+                            still.push_back(check);
+                            continue;
+                        }
+                        if (!RetakeWalkHold(bot, ev))
+                        {
+                            char const* const reason =
+                                D::WalkRefusalFor(ev.goal, D::MailWalkRefusal::HeldByAnother);
+                            ev.reachedName.clear();
+                            finish("error", reason, "abandoned");
+                            continue;
+                        }
+                        LOG_INFO("module.overseer",
+                                 "overseer: guild far walk {} - '{}' has no flight that beats "
+                                 "the road to '{}', {:.0f} yards off; it goes on by road (#633)",
+                                 check.id, check.targetName, ev.mailboxName, ev.nowYards);
+                    }
+
+                    // THE MOUNT, by upstream's own `check mount state` action:
+                    // the bot's own fastest mount, cast the way a player casts
+                    // it. The leg waits for the cast.
+                    D::FarWalkMountFacts mount;
+                    mount.far = true;
+                    mount.mounted = bot->IsMounted();
+                    mount.casting = bot->IsNonMeleeSpellCast(false);
+                    mount.outdoors = bot->IsOutdoors();
+                    mount.inCombat = bot->IsInCombat();
+                    mount.yardsToGo = ev.nowYards;
+                    mount.tries = ev.mountTries;
+                    mount.sinceLastTrySeconds =
+                        ev.lastMountTry ? static_cast<uint32>(now - ev.lastMountTry) : 0u;
+                    if (botAI && D::FarWalkShouldMount(mount))
+                    {
+                        ++ev.mountTries;
+                        ev.lastMountTry = now;
+                        bool const casting =
+                            botAI->DoSpecificAction("check mount state", Event(), true);
+                        LOG_INFO("module.overseer",
+                                 "overseer: guild far walk {} - '{}' is asked onto its mount by "
+                                 "upstream's check mount state action, {:.0f} yards from '{}': "
+                                 "{} (try {} of {}) (#633)",
+                                 check.id, check.targetName, ev.nowYards, ev.mailboxName,
+                                 casting ? "it mounts" : "upstream declined, it goes on foot",
+                                 ev.mountTries, D::FAR_WALK_MOUNT_TRIES);
+                        if (casting)
+                        {
+                            LetHeldCharacterWalk(check.targetName, MAIL_WALK_SWEEP_QUIET_SECONDS);
+                            still.push_back(check);
+                            continue;
+                        }
+                    }
+                    // A mount cast in flight: a leg now would interrupt it.
+                    if (bot->IsNonMeleeSpellCast(false))
+                    {
+                        LetHeldCharacterWalk(check.targetName, MAIL_WALK_SWEEP_QUIET_SECONDS);
+                        still.push_back(check);
+                        continue;
+                    }
+                }
+
                 if (IssueMailWalkLeg(bot, ev, false))
                     ev.groundRefusals = 0;
                 else
@@ -48830,11 +49244,15 @@ private:
                          noun, check.id, check.targetName, reason, ev.waitedMs, ev.legs,
                          ev.nowYards, ev.startYards);
             }
+            if (ev.far && state == D::MailWalkState::Arrived)
+                LOG_INFO("module.overseer",
+                         "overseer: guild far walk {} - '{}' arrived at '{}' from {:.0f} yards "
+                         "after {}s, {} flight(s), {} mount tries and {}s of fighting (#633)",
+                         check.id, check.targetName, ev.mailboxName, ev.startYards,
+                         ev.waitedMs / 1000u, ev.flightLegs, ev.mountTries,
+                         ev.combatMs / 1000u);
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, reason, EscLong(MailWalkJson(ev, word, reason)), check.id, g_runToken);
+            finish(status, reason, word);
         }
 
         _pendingMailWalks.swap(still);
