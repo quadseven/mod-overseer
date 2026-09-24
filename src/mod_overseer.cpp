@@ -38874,7 +38874,7 @@ private:
     // WHY FIVE POINTS PER ROW. That is the tier requirement, so it is also the
     // least that opens the next row. Without the cap a five-rank talent on row
     // 0 can eat every point a low-level character has and the tree never opens.
-    void SpendTalents(Player* bot, uint32 tabpage)
+    static void SpendTalents(Player* bot, uint32 tabpage)
     {
         uint32 const classMask = bot->getClassMask();
 
@@ -39107,6 +39107,18 @@ private:
     // Returns true when the errand is over, reset or not, and false while the
     // trainer is still outside the interact gate and the walk should close the
     // last few yards.
+    // THE ONE DOOR A TALENT RESET IS BOUGHT THROUGH, for the roster (#626) and
+    // for a guild raider (#692): the client's "yes" to the trainer's price,
+    // MSG_TALENT_WIPE_CONFIRM with the trainer's guid, handed to the core's own
+    // handler, which checks the interact gate and CanResetTalents and takes the
+    // money inside Player::resetTalents.
+    static void AskForTalentWipe(Player* bot, Creature* npc)
+    {
+        WorldPacket packet(MSG_TALENT_WIPE_CONFIRM, 8);
+        packet << npc->GetGUID();
+        bot->GetSession()->HandleTalentWipeConfirmOpcode(packet);
+    }
+
     bool RespecOnArrival(std::string const& name, Player* bot, uint32 entry, uint8 tree)
     {
         Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
@@ -39142,9 +39154,7 @@ private:
         uint32 const moneyBefore = bot->GetMoney();
         uint32 const price = bot->resetTalentsCost();
 
-        WorldPacket packet(MSG_TALENT_WIPE_CONFIRM, 8);
-        packet << npc->GetGUID();
-        bot->GetSession()->HandleTalentWipeConfirmOpcode(packet);
+        AskForTalentWipe(bot, npc);
 
         // THE READ-BACK. The handler answers a client, and there is none: the
         // character is the only witness to whether anything happened.
@@ -52827,6 +52837,12 @@ private:
         int64 moneyBefore{-1};
         int64 moneyAfter{-1};
         char const* visit{""};
+        // A talents walk (#692): the tree, the premade spec it was spent with,
+        // and the points in each tree either side of the reset.
+        int32 talentTab{-1};
+        uint32 specIndex{0};
+        uint32 pointsBefore[3]{0, 0, 0};
+        uint32 pointsAfter[3]{0, 0, 0};
 
         // A vendor walk's request.
         uint32 item{0};
@@ -52960,6 +52976,11 @@ private:
             WalkIdList(o, ev.notTaught);
             o << ",\"money_before\":" << ev.moneyBefore
               << ",\"money_after\":" << ev.moneyAfter;
+            if (ev.talentTab >= 0)
+                o << ",\"talents\":" << ev.talentTab << ",\"spec_index\":" << ev.specIndex
+                  << ",\"points_before\":[" << ev.pointsBefore[0] << "," << ev.pointsBefore[1]
+                  << "," << ev.pointsBefore[2] << "],\"points_after\":[" << ev.pointsAfter[0]
+                  << "," << ev.pointsAfter[1] << "," << ev.pointsAfter[2] << "]";
         }
         if (ev.goal == D::WalkGoal::Vendor)
             o << ",\"item\":" << ev.item;
@@ -53058,6 +53079,10 @@ private:
         Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
         if (!trainer || !trainer->IsTrainerValidForPlayer(who))
             return false;
+        // A TALENT RESET IS SOLD BY A TRAINER OF THE WALKER'S OWN CLASS (#692),
+        // which is Creature::CanResetTalents' own question.
+        if (ev.talentTab >= 0)
+            return TrainerServesClassOf(entry, who);
         uint32 rankSpell = 0;
         std::vector<uint32> spells;
         TrainerOffers(trainer, who, ev, rankSpell, spells);
@@ -53214,6 +53239,59 @@ private:
         AnchorHoldWhereItStands(hold->second, who);
     }
 
+    // A GUILD RAIDER'S TALENT RESET, AT THE CLASS TRAINER THE WALK REACHED
+    // (#692). The reset is bought through the same door as RespecOnArrival
+    // (AskForTalentWipe), and the points are spent with mod-playerbots' premade
+    // build for the tree: InitTalentsBySpecNo with the spec index the playerbot
+    // config maps the tree to, which is the build a random bot of that tree
+    // plays. Whatever the premade leaves unspent goes into the tree row by row
+    // (SpendTalents, the family's own spender), so a free point never stays
+    // free. The bot's strategies are then reset, because the playerbot chooses
+    // them from the talents only when it is set up. The row is judged on the
+    // read-back alone.
+    static char const* RespecAtTheTrainer(Player* bot, MailWalkEvidence& ev, char const*& reason)
+    {
+        namespace D = OverseerDecisions;
+        namespace E = OverseerDecisions::ErrandWalkRefusal;
+        uint8 const tree = static_cast<uint8>(ev.talentTab);
+        ev.moneyBefore = int64(bot->GetMoney());
+        TalentPointsByTree(bot, ev.pointsBefore);
+        uint32 const outsideBefore = D::PointsOutsideTree(ev.pointsBefore, tree);
+        uint32 const freeBefore = bot->GetFreeTalentPoints();
+
+        bool took = false;
+        if (Creature* npc = WalkCreatureInReach(bot, ev))
+        {
+            AskForTalentWipe(bot, npc);
+            uint32 wiped[3] = {0, 0, 0};
+            TalentPointsByTree(bot, wiped);
+            took = D::RespecTook(outsideBefore, D::PointsOutsideTree(wiped, tree), freeBefore,
+                                 bot->GetFreeTalentPoints());
+        }
+        if (took)
+        {
+            ev.specIndex = sPlayerbotAIConfig.randomClassSpecIndex[bot->getClass()][tree];
+            PlayerbotFactory::InitTalentsBySpecNo(bot, static_cast<int>(ev.specIndex), false);
+            if (bot->GetFreeTalentPoints())
+                SpendTalents(bot, tree);
+            bot->SendTalentsInfoData(false);
+            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+                botAI->ResetStrategies(false);
+        }
+        TalentPointsByTree(bot, ev.pointsAfter);
+        ev.moneyAfter = int64(bot->GetMoney());
+
+        D::TrainerVisitOutcome const outcome = D::JudgeTalentVisit(took, ev.pointsAfter, tree);
+        ev.visit = D::TrainerVisitWord(outcome);
+        if (outcome == D::TrainerVisitOutcome::Learned)
+        {
+            reason = "";
+            return "applied";
+        }
+        reason = E::TaughtNothing;
+        return "unchanged";
+    }
+
     // BUY WHAT THE ROW ASKED FOR, AT THE TRAINER THE WALK REACHED, the way a
     // player does at the trainer window: Trainer::TeachSpell, which takes the
     // money (with the reputation discount) and enforces every requirement, one
@@ -53224,6 +53302,8 @@ private:
     {
         namespace D = OverseerDecisions;
         namespace E = OverseerDecisions::ErrandWalkRefusal;
+        if (ev.talentTab >= 0)
+            return RespecAtTheTrainer(bot, ev, reason);
         D::TrainerVisitFacts facts;
         facts.asked = static_cast<uint32_t>(ev.learnAsked.size());
         ev.moneyBefore = int64(bot->GetMoney());
@@ -53307,7 +53387,12 @@ private:
 
         auto refuse = [&](char const* wall) -> char const*
         {
-            char const* const reason = D::WalkRefusalFor(goal, wall);
+            char const* reason = D::WalkRefusalFor(goal, wall);
+            // A talents walk wants a trainer of the walker's class, not a trade
+            // trainer, and says so (#692).
+            if (ev.talentTab >= 0 &&
+                std::string(reason) == D::ErrandWalkRefusal::NoTrainerOnMap)
+                reason = D::ErrandWalkRefusal::NoClassTrainerOnMap;
             out = MailWalkJson(ev, "refused", reason);
             if (goal == D::WalkGoal::Mailbox)
                 LOG_INFO("module.overseer",
@@ -53335,6 +53420,7 @@ private:
             ev.capYards = req.maxYards;
             ev.skill = req.skill;
             ev.learnAsked.assign(req.learn.begin(), req.learn.end());
+            ev.talentTab = req.talentTab;
         }
         else
         {
@@ -53378,6 +53464,22 @@ private:
         }
         if (char const* wall = D::MailWalkGate(gate); *wall)
             return refuse(wall);
+
+        // A TALENTS WALK IS JUDGED BY THE ROSTER RESET'S OWN RULES (#692)
+        // before anything is held: too low, already in the tree, or short of
+        // the core's price.
+        if (goal == D::WalkGoal::Trainer && ev.talentTab >= 0)
+        {
+            D::RespecFacts facts;
+            facts.specTab = static_cast<uint8>(ev.talentTab);
+            facts.level = who->GetLevel();
+            TalentPointsByTree(who, facts.pointsByTree);
+            facts.money = who->GetMoney();
+            facts.cost = who->resetTalentsCost();
+            facts.costWaived = sWorld->getBoolConfig(CONFIG_NO_RESET_TALENT_COST);
+            if (char const* wall = D::TalentWalkRefusal(facts); *wall)
+                return refuse(wall);
+        }
 
         // A linger left by an earlier walk is this verb's own and is replaced
         // rather than re-asserted, so the new walk gets its own ceiling.
@@ -53971,14 +54073,25 @@ private:
                 word = ev.visit;
                 ReleaseHold(check.targetName, bot, "the trainer visit is over",
                             MAIL_WALK_HOLD_VERB);
-                LOG_INFO("module.overseer",
-                         "overseer: trainer walk {} - '{}' reached '{}' after {}ms and {} "
-                         "leg(s): {} (rank spell {}, skill {} cap {} -> {}, {} recipe(s) "
-                         "taught, {} already known, {} not taught), money {} -> {}",
-                         check.id, check.targetName, ev.reachedName, ev.waitedMs, ev.legs,
-                         ev.visit, ev.rankSpell, ev.skill, ev.maxBefore, ev.maxAfter,
-                         ev.taught.size(), ev.alreadyKnown.size(), ev.notTaught.size(),
-                         ev.moneyBefore, ev.moneyAfter);
+                if (ev.talentTab >= 0)
+                    LOG_INFO("module.overseer",
+                             "overseer: talent walk {} - '{}' reached '{}' after {}ms and {} "
+                             "leg(s): {} - tree {} with premade spec {}, points {}/{}/{} -> "
+                             "{}/{}/{}, money {} -> {}",
+                             check.id, check.targetName, ev.reachedName, ev.waitedMs, ev.legs,
+                             ev.visit, ev.talentTab, ev.specIndex, ev.pointsBefore[0],
+                             ev.pointsBefore[1], ev.pointsBefore[2], ev.pointsAfter[0],
+                             ev.pointsAfter[1], ev.pointsAfter[2], ev.moneyBefore,
+                             ev.moneyAfter);
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: trainer walk {} - '{}' reached '{}' after {}ms and {} "
+                             "leg(s): {} (rank spell {}, skill {} cap {} -> {}, {} recipe(s) "
+                             "taught, {} already known, {} not taught), money {} -> {}",
+                             check.id, check.targetName, ev.reachedName, ev.waitedMs, ev.legs,
+                             ev.visit, ev.rankSpell, ev.skill, ev.maxBefore, ev.maxAfter,
+                             ev.taught.size(), ev.alreadyKnown.size(), ev.notTaught.size(),
+                             ev.moneyBefore, ev.moneyAfter);
             }
             else if (state == D::MailWalkState::Arrived)
             {
