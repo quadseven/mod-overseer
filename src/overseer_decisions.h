@@ -1366,6 +1366,13 @@ constexpr char SOURCE_COMPILED[] = "compiled";  // read out of this binary
 constexpr char SOURCE_DECLARED[] = "declared";  // handed in by the deployment
 constexpr char SOURCE_DERIVED[]  = "derived";   // this module's own verdict
 
+// WHAT A CONTINENT CROSSING DOES IN THIS BUILD (#279), reported as the build
+// fact `crossing`. "boards": the family walks to a surveyed berth, steps onto a
+// docked transport together, rides it, and is walked off at the far landing. A
+// build without the fact is one that refuses every crossing, and a reader that
+// finds no row must read it that way.
+constexpr char CROSSING_CAPABILITY[] = "boards";
+
 // The environment variables a deployment may set for this module, named here so
 // the writer and its tests cannot disagree about them.
 //
@@ -6997,24 +7004,24 @@ bool AimedMoverTravels(AimedMover verdict);
 // says the character is standing on. This module must not board anybody, must
 // not teleport anybody, and must not simulate a packet.
 //
-// WHAT THIS MODULE STILL CANNOT DO, WRITTEN DOWN BECAUSE THE FIRST VERSION OF
-// THIS FILE CLAIMED OTHERWISE. It cannot get a character onto a deck. Upstream
-// boards a follower with a straight-line `MovePoint(generatePath = false)` over
-// the last sixty yards, and it only ever does so because the MASTER is already
-// aboard and supplies the point (FollowActions.cpp). There is no navmesh on a
-// moving transport, so an `at:` aim cannot path onto one, and the party leader
-// has no master to be pulled aboard by. A transport's stop frame is not a
-// substitute: it is the SHIP's own world-space origin at its mooring, which is
-// over water beside a pier rather than anywhere a character may stand.
+// THE LAST FEW YARDS, WHICH WERE MISSING UNTIL #279. Upstream boards a
+// follower with a straight-line `MovePoint(generatePath = false)` over the last
+// sixty yards, and only because the MASTER is already aboard and supplies the
+// point (FollowActions.cpp). The party leader has no master, and there is no
+// navmesh on a moving transport, so an `at:` aim cannot path onto one. What the
+// caller now does instead: walks the leader to a berth the travel survey stood
+// on, level with the deck (PickBerth); waits there until the transport is
+// DOCKED (ReadDock) and the family is around him; then takes upstream's own
+// straight-line step onto a deck point the MAP confirms. At the far end the
+// same step in reverse, onto the surveyed landing. A transport's stop frame is
+// still never an aim: it is the SHIP's own world-space origin at its mooring,
+// over water beside a pier.
 //
-// SO EVERY LEG THAT NEEDS A PLACE TO STAND IS FAIL-CLOSED UNTIL SOMETHING
-// SUPPLIES ONE. The first version of this decision took a stop frame as a
-// walkable berth and would have aimed the family at a mooring. It is now the
-// caller's job to hand in a berth that the WORLD has agreed is standable, and
-// a berth that was not handed in is a refusal that says so. That is the #121
-// discipline applied to the one place this file could still have broken it: a
-// coordinate nobody validated is not a destination, however exactly it was
-// read out of the right table.
+// EVERY LEG THAT NEEDS A PLACE TO STAND IS STILL FAIL-CLOSED. It is the
+// caller's job to hand in a berth the world has agreed is standable, and a
+// berth that was not handed in is a refusal that says so. That is the #121
+// discipline: a coordinate nobody validated is not a destination, however
+// exactly it was read out of the right table.
 //
 // THE UNITS OF THIS DECISION ARE MEMBERS, NOT THE PARTY. The party it was
 // written for was ALREADY split when the crossing became necessary: three
@@ -7040,7 +7047,8 @@ enum class CrossingLeg : std::uint8_t
     // releases an `at:` errand at five yards, this reading called it Walk all
     // the way in, so the aim was released and reclaimed forever, and every
     // reclaim restamped the errand clock that the death breaker measures its
-    // window from. A leader standing at the berth is not walking to it.
+    // window from. A leader standing at the berth is not walking to it. The
+    // step onto a docked deck (#279) is taken from this leg too: Board.
     WaitForTransport,
     // The LEADER is on the deck, or riding. The transport owns the crossing.
     Aboard,
@@ -7074,12 +7082,35 @@ enum class CrossingAction : std::uint8_t
     // Wait because "doing nothing because the boat is sailing" and "doing
     // nothing because the world did not answer" must not be one value.
     Ride,
-    // Somebody is on the destination map and still a passenger. This module has
-    // no way to walk them off, so this is a Wait that says something completely
-    // different and must be visible as its own thing.
+    // Somebody is on the destination map and still a passenger, and nothing
+    // can be done about it on this poll: the transport has not docked yet, or
+    // the leader is already ashore and the followers are following him off.
+    // A Wait that says something completely different, and must be visible as
+    // its own thing.
     Disembark,
     // Every member is on the destination map, off every transport. Over.
     Done,
+    // THE LAST STEP ONTO THE DECK (#279). The leader is at the berth, the
+    // transport is DOCKED at this end with enough of its stop left, and every
+    // member on this side is close enough to him to be pulled aboard after
+    // him by upstream's boarding assist. The caller walks the leader the last
+    // few yards onto a deck point the MAP confirmed, and the bot AI's own
+    // transport check boards him. Nobody is teleported and nothing is
+    // boarded by this module.
+    Board,
+    // THE LAST STEP OFF IT. The leader is still a passenger, on the
+    // destination map, and the transport is DOCKED at this end. The caller
+    // walks him onto the surveyed landing; the bot AI's transport check takes
+    // him off the deck the moment the map says he is no longer on it, and the
+    // followers follow their leader off. Appended rather than inserted so the
+    // values that already existed keep their numbers.
+    WalkOff,
+    // THE FAMILY DID NOT FOLLOW HIM ABOARD. The leader is on the deck at the
+    // ORIGIN, the transport is docked there, somebody on this side is still
+    // not aboard, and the stop is running out. Rather than sail and split the
+    // family across an ocean, he steps back onto the berth and the next stop
+    // is tried again. Same step as WalkOff, onto this end's berth.
+    StepBack,
 };
 
 char const* CrossingActionName(CrossingAction action);
@@ -7104,6 +7135,12 @@ struct CrossingMember
     bool aboard{false};       // the member's own transport IS this route's
     std::uint32_t mapId{0};
     float berthDistance{0.f}; // yards, two-dimensional; meaningless off-map
+    // Yards, two-dimensional, to the LEADER, read only for a member on the
+    // same map as him and not aboard. It is what "the party boards together"
+    // is measured with: upstream's boarding assist pulls a follower onto a
+    // deck its master stands on from sixty yards, and a follower further away
+    // than that is left on the pier. Zero for the leader himself.
+    float leaderDistance{0.f};
 };
 
 // What the adapter could establish about the crossing itself. Every field is a
@@ -7116,8 +7153,9 @@ struct CrossingWorld
     // A transport is known whose own path serves both maps.
     bool transportFound{false};
     // A place on the ORIGIN map that the world agreed a character may stand on
-    // and from which that transport can be boarded. NOT a stop frame. Until
-    // something can supply one, this is false and the crossing refuses.
+    // and from which that transport can be boarded: ground the travel survey
+    // walked, level with the deck (PickBerth). NOT a stop frame. Where nothing
+    // qualifies, this is false and the crossing refuses.
     bool berthKnown{false};
     // The same, on the destination map, for walking off at the far end.
     bool landingKnown{false};
@@ -7137,6 +7175,16 @@ struct CrossingWorld
     // actually is. Carried for the log line only: it says where the boat ties
     // up, so an operator reading a refusal can go and look. NEVER an aim.
     bool mooringKnown{false};
+    // THE TRANSPORT IS STANDING AT THIS END'S STOP RIGHT NOW (#303's docked
+    // test, ReadDock below). Read off the live object on the map the leader is
+    // on, so it is false - "not established" - whenever the transport is on
+    // the other map or the leader cannot see it. Nothing steps onto or off a
+    // deck that is moving.
+    bool dockedAtOrigin{false};
+    bool dockedAtDestination{false};
+    // How much of that stop is left, in milliseconds. Meaningless unless one of
+    // the two above is true.
+    std::uint32_t dwellLeftMs{0};
 };
 
 struct CrossingLimits
@@ -7144,6 +7192,15 @@ struct CrossingLimits
     // Inside this, the leader is AT the berth. An arrival tolerance, not a
     // boarding radius: this module never decides anybody is aboard.
     float berthArrivedYards{0.f};
+    // THE PARTY BOARDS TOGETHER OR NOT AT ALL. Every member on the origin map
+    // and not yet aboard must be within this of the leader before he is walked
+    // onto the deck. Zero, the default, lets nobody but a lone leader board,
+    // which is the fail-closed reading of a limit nobody set.
+    float gatherYards{0.f};
+    // How much of the stop must be left to start the step aboard, or the step
+    // off at the far end. A step started as the boat casts off is a character
+    // walked off the end of a pier into the harbour, or off a deck over it.
+    std::uint32_t minBoardDwellMs{0};
 };
 
 struct CrossingStep
@@ -7161,6 +7218,12 @@ struct CrossingStep
     bool leaderOnOrigin{false};
     bool leaderAboard{false};
     bool leaderAtBerth{false};
+    // The leader is on the destination map, aboard or not.
+    bool leaderOnDestination{false};
+    // Members on the origin map, not aboard and not the leader, within
+    // CrossingLimits::gatherYards of him. Board needs this to equal
+    // `waiting - 1`.
+    std::size_t gathered{0};
 };
 
 // THE ORDER OF THE TESTS IS THE FAIL-CLOSED RULE, WRITTEN OUT.
@@ -7187,6 +7250,154 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
 // The step as one sentence, including when the answer is "nothing". A refusal
 // that does not say which fact was missing trains an operator to ignore it.
 std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& world);
+
+// ------------------------------------------- is the transport docked (#303) --
+//
+// A MotionTransport stands still at a stop frame for exactly the interval
+// [ArriveTime, DepartureTime) of that frame, measured on the clock
+// `GetPathProgress() % GetPeriod()`. That is the core's own SetMoving(false)
+// condition (Transport.cpp MotionTransport::Update), and only a stop frame can
+// match it, because every other frame is built with DepartureTime equal to its
+// ArriveTime. `IsMoving()` itself is private, which is why this re-derives it
+// from the two public reads rather than asking.
+struct TransportStop
+{
+    std::uint32_t mapId{0};
+    std::uint32_t arriveMs{0};
+    std::uint32_t departMs{0};
+};
+
+struct DockReading
+{
+    bool docked{false};
+    // Index into the stops handed in. Meaningless unless `docked`.
+    std::size_t stop{0};
+    std::uint32_t dwellLeftMs{0};
+};
+
+// A zero period is "no clock", not "always docked", and reads not docked.
+DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
+                     std::vector<TransportStop> const& stops);
+
+// How long the ride is from leaving one stop to arriving at another, on the
+// same clock, in milliseconds. The arrival can be earlier in the period than
+// the departure - the path wraps round - so the difference is taken modulo
+// the period. Zero for a zero period.
+std::uint32_t TransportRideMs(std::uint32_t departMs, std::uint32_t arriveMs,
+                              std::uint32_t periodMs);
+
+// ------------------------------------- the berth, from the survey (#279) --
+//
+// THE PIER IS NOT DERIVED FROM THE MOORING. It is read out of the travel
+// survey mod-playerbots ships, which already walked to every dock: each walk
+// link into a transport's own node carries navmesh-walked points, and the last
+// ones before the mooring are ground somebody stood on at the water's edge.
+// Measured on the shipped survey for the six crossings between Kalimdor and the
+// Eastern Kingdoms: the Ratchet pier ends 15 yards from the Maiden's Fancy's
+// mooring at z 5.4 against a deck at 6.1; the Orgrimmar tower's platform is at
+// z 53.7 under a zeppelin deck at 54.2.
+//
+// AND IT IS STILL CHECKED AGAINST THE DECK, because the survey's last point is
+// wherever the navmesh stopped, which is not always the pier. At Grom'gol every
+// surveyed walk into the Iron Eagle's mooring ends on the ground at the foot of
+// the tower, 49 yards below the gondola. So a candidate is a berth only when it
+// is within `reachYards` of the mooring on the plane AND within
+// `deckStepYards` of a DECK LEVEL - the mooring's height plus the height a
+// member of the transport's own crew stands at (static passengers, read from
+// spawn data). Among those, the nearest the mooring wins; the smaller step
+// breaks a tie. Answers -1 when nothing qualifies, which refuses the crossing
+// at that end rather than aiming anybody at the foot of a tower.
+struct BerthCandidate
+{
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+struct BerthLimits
+{
+    float reachYards{0.f};
+    float deckStepYards{0.f};
+};
+
+int PickBerth(std::vector<BerthCandidate> const& candidates, float mooringX, float mooringY,
+              std::vector<float> const& deckLevels, BerthLimits const& limits);
+
+// --------------------------------- whose boat it is (faction-correct docks) --
+//
+// MEASURED, NOT ASSUMED: the dev realm offered an Alliance leader the Horde
+// zeppelin to Undercity on 2026-09-14, because the transport was chosen by
+// "which one is on this map right now". Nothing on a transport's own row says
+// whose it is - every `gameobject_template_addon.faction` for the twenty
+// transports is 0 - but its CREW does: the Thundercaller is crewed by faction
+// 1734, hostile to the Alliance; the Lady Mehley by 1733, hostile to the
+// Horde; the Maiden's Fancy by 120, Booty Bay, neutral to both. So a transport
+// serves a party when at least one crew member was read and none of them would
+// meet the leader at worse than neutral.
+enum class CrewWelcome : std::uint8_t
+{
+    Unknown,    // no crew read: not established, and never read as welcome
+    Welcome,
+    Unwelcome,  // at least one crew member unfriendly or worse to the leader
+};
+
+CrewWelcome ReadCrewWelcome(std::size_t crewRead, std::size_t crewUnwelcoming);
+
+// ---------------------------------------------- pricing a crossing (#389) --
+//
+// SEVERAL TRANSPORTS CAN JOIN THE SAME TWO MAPS, and the first version took
+// whichever happened to be on the leader's map that poll. An Alliance party in
+// Tanaris can sail from Theramore to Menethil or from Ratchet to Booty Bay;
+// which is better depends on where it is standing and where it is going. So
+// each candidate is priced in yards: the walk to its berth, the walk from its
+// landing to the goal, and the time on the water - the ride plus half a period
+// of waiting on average - at `yardsPerSecond`. The cheapest priced offer wins.
+//
+// A CROSSING UNDER WAY KEEPS ITS TRANSPORT. The walk to the berth shortens as
+// the leader walks it, and a price that re-chose every poll could turn him
+// round half way to one dock because another had become cheaper. The
+// incumbent, while it still prices at all, is kept.
+struct CrossingOffer
+{
+    std::uint32_t entry{0};
+    CrewWelcome crew{CrewWelcome::Unknown};
+    bool berthKnown{false};
+    bool landingKnown{false};
+    float toBerthYards{0.f};
+    float landingToGoalYards{0.f};
+    float rideSeconds{0.f};
+    float periodSeconds{0.f};
+};
+
+enum class OfferVerdict : std::uint8_t
+{
+    Priced,
+    WrongSide,   // the crew would not meet the party at neutral or better
+    CrewUnread,  // nobody aboard was read, so whose boat it is is unknown
+    NoBerth,     // nowhere surveyed at this end is level with the deck
+    NoLanding,   // the same, at the far end: a crossing that cannot end
+    BadFigures,  // a negative or non-finite distance or time
+};
+
+char const* OfferVerdictName(OfferVerdict verdict);
+
+struct CrossingPriceLimits
+{
+    float yardsPerSecond{0.f};
+    // The transport this crossing is already committed to, or 0.
+    std::uint32_t incumbentEntry{0};
+};
+
+struct CrossingPrice
+{
+    std::vector<OfferVerdict> verdicts;  // one per offer, in order
+    std::vector<float> yards;            // one per offer; 0 unless Priced
+    int pick{-1};                        // index of the chosen offer, or -1
+    bool keptIncumbent{false};
+};
+
+CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
+                             CrossingPriceLimits const& limits);
 
 // ----------------------------- who a character can actually be sent to (#234) --
 //
