@@ -8945,11 +8945,24 @@ char const* SelfDeathReadingName(SelfDeathReading reading);
 // kind='trade' and kind='share' name the other character, and is unused by the
 // other four verbs.
 //
-//   send [item:<item_instance.guid>] [money:<copper>] subject:<text> [body:<text>]
+//   send [item:<item_instance.guid> | entry:<item_template.entry>] [money:<copper>]
+//        subject:<text> [body:<text>]
 //   take-item mail:<mail.id> item:<item_instance.guid>
 //   take-money mail:<mail.id>
 //   return mail:<mail.id>
 //   delete mail:<mail.id>
+//
+// `entry:` NAMES THE ITEM BY KIND, for an item the sender made or bought a
+// moment ago. The character database learns a new item's guid only when the
+// character is next saved (PlayerSaveInterval, 15 minutes by default), so a
+// row written right after a craft or a purchase cannot name the guid yet. A
+// random bot does not keep what it has no use for that long: a guild tailor's
+// finished bag, or a pattern a guildmate bought for it, is a vendor item to
+// its own AI and is sold or destroyed before the next save (measured on the
+// dev realm 2026-09-24, one Runecloth Bag lost that way). `entry:` posts the
+// first stack of that entry in the backpack or the worn bags' contents, never
+// a worn bag or equipped gear, and the row's result names the guid it took.
+// `item:` and `entry:` together are refused: two names for one attachment.
 //
 // The `key:value` pairs come first, in any order, each at most once, and every
 // value is a decimal id or a copper amount - there is no gold/silver notation
@@ -8998,8 +9011,9 @@ struct MailRequest
     uint32_t mailId{0};      // take-item, take-money, return, delete
     uint32_t itemGuid{0};    // send: the carried item to attach
                              // take-item: the attachment to take
+    uint32_t itemEntry{0};   // send: attach a loose carried stack of this entry
     uint32_t money{0};       // send: copper to enclose, 0 for none
-    bool hasItem{false};     // send: an item: key was given
+    bool hasItem{false};     // send: an item: or entry: key was given
     bool hasMoney{false};    // send: a money: key was given
     std::string subject;     // send: required, already trimmed
     std::string body;        // send: may be empty

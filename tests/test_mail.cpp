@@ -155,6 +155,22 @@ void FieldsMayComeInAnyOrderButTheTextIsLast()
     CheckNumber("money", r.money, 7);
 }
 
+// A craft or a purchase the character database has not saved yet has no guid
+// for the row's writer to name, so a send may name the attachment by entry.
+void ASendCanNameItsItemByEntry()
+{
+    MailRequest const r = ParseMailRequest("send entry:14046 subject:Runecloth Bag");
+    CheckVerb("a send by entry parses", r.verb, MailVerb::Send);
+    CheckText("and carries no error", r.error, "");
+    CheckNumber("the entry lands", r.itemEntry, 14046);
+    CheckNumber("and no guid is invented", r.itemGuid, 0);
+    Check("an attachment was named", r.hasItem, true);
+    CheckText("subject", r.subject, "Runecloth Bag");
+
+    MailRequest const guid = ParseMailRequest("send item:44 subject:here");
+    CheckNumber("a send by guid names no entry", guid.itemEntry, 0);
+}
+
 void TheTakeVerbsTakeIdsOnly()
 {
     MailRequest const item = ParseMailRequest("take-item mail:9001 item:1303004");
@@ -200,6 +216,10 @@ void WhatDoesNotParse()
         {"delete mail:1 item:2", "a delete carrying an item"},
         {"return mail:1 money:5", "a return carrying money"},
         {"delete mail:1 subject:bye", "text on a verb that posts nothing"},
+        {"send entry:0 subject:a", "a zero entry"},
+        {"send entry:5 item:6 subject:a", "an attachment named twice"},
+        {"send entry:5 entry:6 subject:a", "a repeated entry"},
+        {"take-item mail:1 entry:5", "an entry on a verb that takes by guid"},
     };
     for (Case const& c : cases)
     {
@@ -423,6 +443,7 @@ int main()
     ASendCanBeTextOnly();
     ASendCanCarryBoth();
     FieldsMayComeInAnyOrderButTheTextIsLast();
+    ASendCanNameItsItemByEntry();
     TheTakeVerbsTakeIdsOnly();
     WhatDoesNotParse();
     TheFirstBodyMarkerSplits();

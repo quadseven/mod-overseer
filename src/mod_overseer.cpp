@@ -41280,6 +41280,30 @@ private:
         return nullptr;
     }
 
+    // A LOOSE STACK OF ONE ENTRY: the backpack and the worn bags' contents,
+    // never equipped gear and never a worn bag, for kind='mail' `send entry:`.
+    // FindCarriedItem by entry walks the equipment and bag slots first, so it
+    // would hand back a worn bag of the same entry, which cannot be posted.
+    static Item* FindLooseItemByEntry(Player* who, uint32 entry)
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (item->GetEntry() == entry)
+                    return item;
+
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (item->GetEntry() == entry)
+                        return item;
+        }
+        return nullptr;
+    }
+
     // ------------------------------------------- a bag goes in a bag slot --
     //
     // A CONTAINER DOES NOT NEED INVENTORY SPACE. It needs a BAG SLOT, and a
@@ -51962,7 +51986,7 @@ private:
     // for `send`, the way kind='give' and kind='trade' name the other
     // character, and is unused by the other four verbs:
     //
-    //     send [item:<item_instance.guid>] [money:<copper>] subject:<text> [body:<text>]
+    //     send [item:<item_instance.guid> | entry:<entry>] [money:<copper>] subject:<text> [body:<text>]
     //     take-item mail:<mail.id> item:<item_instance.guid>
     //     take-money mail:<mail.id>
     //     return mail:<mail.id>
@@ -52288,7 +52312,12 @@ private:
                 // owned item (:241, Player::GetItemByGuid includes the bank)
                 // but a player could not drag a banked item into the mail
                 // frame, and every other executor here addresses a bag.
-                Item* item = FindCarriedItem(who, true, req.itemGuid);
+                // `entry:` takes the first loose stack of that kind: an item
+                // made or bought since the last save has no guid in the
+                // database for the row's writer to name.
+                Item* item = req.itemEntry
+                    ? FindLooseItemByEntry(who, req.itemEntry)
+                    : FindCarriedItem(who, true, req.itemGuid);
                 if (!item)
                     return refuse(R::ItemNotCarried);
 

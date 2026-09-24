@@ -7543,7 +7543,7 @@ MailRequest ParseMailRequest(std::string const& command)
     // another verb: a `delete` carrying an item, or a `take-item` short of its
     // item, is a row whose author meant something this executor cannot guess
     // at, so it is refused rather than filled in.
-    bool sawMail = false, sawItem = false, sawMoney = false;
+    bool sawMail = false, sawItem = false, sawMoney = false, sawEntry = false;
     for (std::size_t i = 1; i < words.size(); ++i)
     {
         std::string const& word = words[i];
@@ -7587,6 +7587,11 @@ MailRequest ParseMailRequest(std::string const& command)
         {
             seen = &sawMoney;
             into = &request.money;
+        }
+        else if (key == "entry" && verb == MailVerb::Send)
+        {
+            seen = &sawEntry;
+            into = &request.itemEntry;
         }
         else
         {
@@ -7642,8 +7647,15 @@ MailRequest ParseMailRequest(std::string const& command)
         request.error = MailRefusal::Malformed;
         return request;
     }
+    // One attachment, named once: by its guid or by its entry, never both,
+    // and never entry 0, which no item template carries.
+    if (sawEntry && (sawItem || request.itemEntry == 0))
+    {
+        request.error = MailRefusal::Malformed;
+        return request;
+    }
 
-    request.hasItem = sawItem;
+    request.hasItem = sawItem || sawEntry;
     request.hasMoney = sawMoney;
 
     if (verb == MailVerb::Send)
