@@ -230,6 +230,7 @@
 // put values into an EmblemInfo - see the tabard branch in DoGuild.
 #include "GuildPackets.h"
 #include "InstanceSaveMgr.h"
+#include "InstanceScript.h"
 #include "ObjectAccessor.h"
 #include "Map.h"
 #include "MapMgr.h"
@@ -21855,17 +21856,26 @@ private:
             if (!bot->IsAlive())
                 continue;
 
-            // NOT ON A RAID MAP UNTIL CLEARING IS ORDERED (the raid run's first
-            // slice). See OverseerDecisions::DungeonClearMayArmHere. No order to
-            // clear a raid exists yet, so the answer on a raid map is always
-            // hold, and no run row is opened for it either.
-            if (!OverseerDecisions::DungeonClearMayArmHere(map->IsRaid(), false))
+            // NOT ON A RAID MAP UNTIL CLEARING IS ORDERED. See
+            // OverseerDecisions::DungeonClearMayArmHere. Ordered means this
+            // character's family raid run is in CLEAR (#640), which only the
+            // operator's raid order reaches and only through HOLD; in every
+            // other phase the answer on a raid map is hold, and no run row is
+            // opened for it either.
+            bool raidClearOrdered = false;
+            if (map->IsRaid())
+            {
+                auto const raidPhase = _raidRunPhaseByMember.find(name);
+                raidClearOrdered = raidPhase != _raidRunPhaseByMember.end() &&
+                                   raidPhase->second == OverseerDecisions::RaidRunPhase::Clear;
+            }
+            if (!OverseerDecisions::DungeonClearMayArmHere(map->IsRaid(), raidClearOrdered))
             {
                 if (_raidArmingHeldSaid.insert(name).second)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is inside raid map {} - the dungeon brain is "
-                             "held off because clearing a raid is not ordered; the raid "
-                             "stands at the entrance",
+                             "held off until the family's raid run is in CLEAR; the raid "
+                             "holds where it stands",
                              name, static_cast<uint32>(bot->GetMapId()));
                 continue;
             }
@@ -22797,6 +22807,24 @@ private:
             // it sits on a picture somebody is watching.
             if (bot->isResurrectRequested() && AnswerResurrectOffer(bot, botAI, name))
                 continue;
+
+            // A RAID CORPSE RUN IS NOT STUCK (#640). The raid run walks this
+            // ghost from the graveyard to the door, where the core raises it
+            // for entering the map its corpse is on, so a graveyard revive here
+            // would take it off the run-back and cost it resurrection
+            // sickness for nothing. Only while the run-back walks it: once that
+            // stops (RAID_RUNBACK_WAIT_SECONDS) the ordinary recovery below is
+            // the fallback, unchanged. Said once per run-back.
+            if (_raidRunBackGhosts.count(name))
+            {
+                if (_raidRunBackStoodDownSaid.insert(name).second)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is a ghost on the raid's run-back to the door - "
+                             "the stuck-revival drive stands down while the raid run walks it",
+                             name);
+                continue;
+            }
+            _raidRunBackStoodDownSaid.erase(name);
 
             // THE HEALER GETS THERE FIRST.
             //
@@ -25906,10 +25934,14 @@ private:
         // ASSEMBLE and ENTER walk him to the door, INSIDE holds him there, and
         // the family's lower claimants yield to it exactly as they yield to a
         // dungeon run in the same state.
+        //
+        // HOLD and CLEAR are a run inside (#640). RECOVER reads as staging: the
+        // head is walking back to the door, exactly as he did in ASSEMBLE.
         auto const raid = _raidRunPhaseByMember.find(name);
         if (raid != _raidRunPhaseByMember.end())
         {
-            if (raid->second == OverseerDecisions::RaidRunPhase::Inside)
+            if (raid->second == OverseerDecisions::RaidRunPhase::Hold ||
+                raid->second == OverseerDecisions::RaidRunPhase::Clear)
                 facts.runInside = true;
             else if (raid->second != OverseerDecisions::RaidRunPhase::Idle)
                 facts.runStaging = true;
@@ -26067,6 +26099,17 @@ private:
                 event.runNumber = coord->second.runNumber;
                 event.portal = coord->second.portalKeyword;
                 event.phase = DungeonRunPhaseName(coord->second.phase);
+            }
+            // A family on a raid order is stamped with the raid run (#640): the
+            // dungeon coordinator is idle for it, and "IDLE" on a `dc on` row
+            // written in the middle of Molten Core would say nothing.
+            auto const raid = _raidRuns.find(family);
+            if (raid != _raidRuns.end() &&
+                raid->second.phase != OverseerDecisions::RaidRunPhase::Idle)
+            {
+                event.portal = raid->second.keyword;
+                event.runNumber = raid->second.wipes + 1;
+                event.phase = OverseerDecisions::RaidRunPhaseName(raid->second.phase);
             }
             WriteRunTimeline(family, leader, dc.name, event);
         }
@@ -30723,8 +30766,41 @@ private:
         // that group and never one the family formed afterwards.
         uint64 groupId{0};
         std::string lastWhy;
+
+        // -- inside (#640) --
+        // What the timeline counts, for the whole order.
+        unsigned wipes{0};
+        unsigned released{0};
+        unsigned regroups{0};
+        unsigned skips{0};
+        bool mainTankMarked{false};
+        // The instance script's encounters, DONE and in all, as last read.
+        unsigned bossesDone{0};
+        unsigned bossesTotal{0};
+        // CLEAR's stall ladder: the head's position mark, the ratchet on it,
+        // when the raid last credited a boss or moved, and the regroups spent
+        // since that progress. Reset on every entry to CLEAR.
+        OverseerDecisions::RatchetState clearProgress;
+        bool clearMarked{false};
+        float clearX{0.f};
+        float clearY{0.f};
+        time_t clearAdvancedAt{0};
+        unsigned regroupsSinceProgress{0};
+        bool loggedBusyCeiling{false};
+        // HOLD's preparation is said once per stay in HOLD.
+        bool preparedSaid{false};
+        // How many ghosts the run-back walked on the last poll, so the line is
+        // said when the number changes rather than every five seconds.
+        unsigned runBackWalking{0};
     };
     std::map<std::string, RaidRunState> _raidRuns;
+    // What the raid timeline last wrote for each family (#640).
+    std::map<std::string, OverseerDecisions::RaidTimelineSnapshot> _raidTimelineSeen;
+    // Roster characters whose ghost the raid run-back is walking this poll, so
+    // the stuck-revival drive does not revive them at the graveyard instead.
+    std::set<std::string> _raidRunBackGhosts;
+    // Ghosts the stuck-revival drive has said it stands down for, once each.
+    std::set<std::string> _raidRunBackStoodDownSaid;
     // Each roster member of a family whose raid run is not idle, and its phase,
     // rebuilt on every DriveRaidRun, for HeadTravelFactsFor (#631's order of
     // claimants on a head's travel column). World thread only.
@@ -30952,12 +31028,418 @@ private:
         return true;
     }
 
+    // ------------------------------------------------ inside the door (#640) --
+    //
+    // HOLD, CLEAR and RECOVER. OverseerDecisions::StepRaidRun decides; what is
+    // below reads the raid into facts and carries one step out. Nothing here is a
+    // shortcut the game does not offer a player: the main tank is the raid
+    // leader's own assignment, the release is the release button, a ghost walks
+    // back on its own legs and is raised by the core for entering the map its
+    // corpse is on, and the brain is switched with its own `dc` verbs.
+
+    // A raid member walking back as a ghost: dead, released, and its corpse on
+    // the raid's inside map. Player::GetCorpseLocation is where the core keeps
+    // it across maps; GetCorpse() answers only for the current map.
+    static bool RaidGhostOf(Player* member, OverseerDecisions::RaidDoor const* door)
+    {
+        return member && door && !member->IsAlive() &&
+               member->HasPlayerFlag(PLAYER_FLAGS_GHOST) &&
+               member->GetCorpseLocation().GetMapId() == door->insideMapId;
+    }
+
+    // THE CORE'S OWN CREDIT, read off the instance script through any member
+    // standing inside. Molten Core keeps ten boss slots (molten_core.h,
+    // DATA_LUCIFRON 0 to DATA_RAGNAROS 9) and sets each through SetBossState,
+    // including the two the script summons, so DONE here is what the instance
+    // itself believes. Nobody inside to read it through is zero of zero.
+    static void RaidEncounters(Group* group, OverseerDecisions::RaidDoor const* door,
+                               unsigned& done, unsigned& total)
+    {
+        done = 0;
+        total = 0;
+        if (!group || !door)
+            return;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || !member->IsInWorld() || member->GetMapId() != door->insideMapId)
+                continue;
+            // GetInstanceScript  Object.h:527; GetEncounterCount and GetBossState
+            // InstanceScript.h:278 and :252.
+            InstanceScript* script = member->GetInstanceScript();
+            if (!script)
+                continue;
+            total = script->GetEncounterCount();
+            for (uint32 slot = 0; slot < total; ++slot)
+                if (script->GetBossState(slot) == DONE)
+                    ++done;
+            return;
+        }
+    }
+
+    // THE HEAD IS THE RAID'S MAIN TANK, set the way a raid leader sets it: the
+    // MSG_PARTY_ASSIGNMENT handler's own Group::SetGroupMemberFlag, which keeps
+    // the flag unique (Group.cpp, RemoveUniqueGroupMemberFlag). The dungeon
+    // brain's raid election takes the flagged tank bot first and otherwise the
+    // tank bot with the best gear (mod-dungeon-clear DcLeaderSignal.cpp,
+    // FindLeaderTank), which in a guild raid need not be the head. True when this
+    // call set it.
+    static bool MarkRaidMainTank(Group* group, Player* head)
+    {
+        if (!group || !head || !group->isRaidGroup())
+            return false;
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            if (slot.guid != head->GetGUID())
+                continue;
+            if (slot.flags & MEMBER_FLAG_MAINTANK)
+                return false;
+            group->SetGroupMemberFlag(head->GetGUID(), true, MEMBER_FLAG_MAINTANK);
+            group->SendUpdate();
+            return true;
+        }
+        return false;
+    }
+
+    // EVERY RAID MEMBER INSIDE CARRIES THE DOOR'S FIGHT STRATEGY. mod-playerbots
+    // installs it on map change itself when AiPlayerbot.ApplyInstanceStrategies
+    // is on, which is its default (PlayerbotAI::ApplyInstanceStrategies,
+    // "moltencore" for map 409); this checks that it did and makes the same call
+    // where it did not. Returns how many were given it.
+    static unsigned ApplyRaidFightStrategy(Group* group, OverseerDecisions::RaidDoor const* door)
+    {
+        unsigned applied = 0;
+        if (!group || !door || !door->fightStrategy || !*door->fightStrategy)
+            return applied;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || !member->IsInWorld() || !member->IsAlive() ||
+                member->GetMapId() != door->insideMapId)
+                continue;
+            PlayerbotAI* memberAI = GET_PLAYERBOT_AI(member);
+            if (!memberAI || memberAI->HasStrategy(door->fightStrategy, BOT_STATE_COMBAT))
+                continue;
+            memberAI->ApplyInstanceStrategies(door->insideMapId);
+            ++applied;
+        }
+        return applied;
+    }
+
+    // THE FLOOR OVER THE DOOR'S TRIGGER, read from the map. The trigger's own z
+    // is the sphere's centre, under the floor; an aim at it would ask the walker
+    // for a point inside rock. Falls back to the staging point's height.
+    static float RaidDoorFloor(Map* map, OverseerDecisions::RaidDoor const* door,
+                               AreaTrigger const* trigger)
+    {
+        float z = door->stageZ;
+        if (map && trigger && map->GetId() == door->outsideMapId &&
+            map->IsGridLoaded(trigger->x, trigger->y))
+        {
+            float const ground = map->GetHeight(trigger->x, trigger->y, door->stageZ + 5.f);
+            if (ground > INVALID_HEIGHT && std::fabs(ground - door->stageZ) < 6.f)
+                z = ground;
+        }
+        return z;
+    }
+
+    // TELL THE BRAIN TO LET GO, ONCE, as the module's own `dc off` (#640), and
+    // forget every `dc on` this process issued for the family so CLEAR arms it
+    // again from a clean state. `dc off` resets the run's whole state
+    // (DisableDungeonClear), including the pre-boss muster, so the next pull
+    // rests and rebuffs again. A head who is not steerable (a ghost on another
+    // map, a dropped client) needs nothing: leaving the map already disabled the
+    // run (DcStrategyGate, TeardownOnStrip).
+    void StandDownRaidBrain(OverseerDecisions::FamilyRoster const& roster, Player* head,
+                            char const* why)
+    {
+        for (OverseerDecisions::FamilyMember const& member : roster.members)
+            _dcOnIssued.erase(member.name);
+        PlayerbotAI* headAI = SteerableAI(head);
+        if (!headAI || !head->IsInWorld())
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: raid run for family '{}' lets go of the dungeon brain ({}) - "
+                     "'{}' is not steerable here, so no 'dc off' is sent; leaving the map "
+                     "already turned the brain off",
+                     roster.family, why, roster.leader);
+            return;
+        }
+        Player* issuer = AuthorizedDcIssuer(head);
+        // Event(source, param, owner)  Event.h:21-24; the owner is what
+        // IsAuthorized reads (DungeonClearChatActions.cpp:62).
+        bool const off =
+            issuer && headAI->DoSpecificAction("dc off", Event("dc", "", issuer), true);
+        LOG_INFO("module.overseer",
+                 "overseer: raid run for family '{}' lets go of the dungeon brain ({}) - "
+                 "'dc off' on '{}' as '{}': {}",
+                 roster.family, why, roster.leader, issuer ? issuer->GetName() : "nobody",
+                 off ? "accepted" : "REFUSED or unavailable; the dungeon module's log says "
+                                    "why under 'DC command refused'");
+    }
+
+    // RELEASE EVERY RAID MEMBER LYING DEAD INSIDE (#640), the release button's
+    // own two calls (MiscHandler.cpp, CMSG_REPOP_REQUEST: BuildPlayerRepop and
+    // RepopAtGraveyard). Only on a wipe: nobody standing can raise them, and
+    // the dungeon brain's StayDead keeps a bot from releasing on its own. The
+    // ghost lands at the instance's graveyard (for Molten Core, Blackrock
+    // Mountain's) with its corpse still inside. Returns how many.
+    unsigned ReleaseRaidDead(Group* group, OverseerDecisions::RaidDoor const* door)
+    {
+        unsigned released = 0;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || !member->IsInWorld() || member->IsAlive() ||
+                member->GetMapId() != door->insideMapId ||
+                member->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+                continue;
+            member->BuildPlayerRepop();
+            member->RepopAtGraveyard();
+            ++released;
+        }
+        return released;
+    }
+
+    // WALK EVERY GHOST OF THE RAID BACK TO THE DOOR (#640).
+    //
+    // A ghost has no travel drive: mod-playerbots runs a dead character on its
+    // dead engine, whose corpse search cannot see a corpse on another map
+    // (FindCorpseAction reads GetCorpse, which is map-scoped), so a raid that
+    // released at Blackrock Mountain's graveyard would stand there. So the
+    // ghost is walked here, a MovePoint at the floor over the door's trigger,
+    // with a path and WITHOUT forcing the destination: a leg the navmesh cannot
+    // find is not walked in a straight line through the mountain, it is left,
+    // and the next poll tries again from wherever the ghost stopped. A walk the
+    // path cut short is continued the same way.
+    //
+    // THE DEAD ENGINE'S `stay` IS LEASED OFF WHILE IT WALKS. Its default action
+    // stops any movement it finds (StayAction::isUseful is "am I moving"), which
+    // would end every leg the moment it started. It is handed back the moment
+    // the character is alive again or the run-back is over
+    // (ReturnRaidStayLeases). `follow` is left: a ghost following a ghost head
+    // walks the same way.
+    //
+    // Roster ghosts are named in _raidRunBackGhosts so the stuck-revival drive
+    // stands down for them instead of raising them at the graveyard. Returns how
+    // many ghosts are being walked.
+    unsigned WalkRaidGhostsBack(Group* group, OverseerDecisions::RaidDoor const* door,
+                                std::set<std::string> const& rosterNames,
+                                std::set<std::string>& walked)
+    {
+        AreaTrigger const* trigger = sObjectMgr->GetAreaTrigger(door->entryTriggerId);
+        if (!trigger)
+            return 0;
+        unsigned walking = 0;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || !member->IsInWorld() || member->GetMapId() != door->outsideMapId ||
+                !RaidGhostOf(member, door))
+                continue;
+            std::string const name = member->GetName();
+            // Past its window the ghost is the ordinary revival's again.
+            auto const since = _raidGhostSince.find(name);
+            if (since != _raidGhostSince.end() &&
+                !OverseerDecisions::RaidGhostMayBeWalked(long(std::time(nullptr) - since->second)))
+                continue;
+            ++walking;
+            walked.insert(name);
+            if (rosterNames.count(name))
+                _raidRunBackGhosts.insert(name);
+            // In the door: the knock takes it from here.
+            if (member->IsInAreaTriggerRadius(trigger))
+                continue;
+            if (PlayerbotAI* memberAI = GET_PLAYERBOT_AI(member))
+                if (memberAI->HasStrategy("stay", BOT_STATE_DEAD))
+                {
+                    memberAI->ChangeStrategy("-stay", BOT_STATE_DEAD);
+                    _raidRunBackStayLeased.insert(name);
+                }
+            MotionMaster* motion = member->GetMotionMaster();
+            if (member->isMoving() &&
+                motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+                continue;
+            motion->MovePoint(RAID_RUNBACK_POINT_ID, trigger->x, trigger->y,
+                              RaidDoorFloor(member->GetMap(), door, trigger),
+                              FORCED_MOVEMENT_NONE, 0.f, 0.f,
+                              /*generatePath*/ true, /*forceDestination*/ false);
+        }
+        return walking;
+    }
+    static constexpr uint32 RAID_RUNBACK_POINT_ID = 0;
+    // Characters whose dead engine had `stay` taken off for the run-back.
+    std::set<std::string> _raidRunBackStayLeased;
+    // When the run first saw each raid ghost, for its run-back window.
+    std::map<std::string, time_t> _raidGhostSince;
+
+    // Hand `stay` back to every ghost that is alive again, gone, or no longer
+    // being walked. `walking` is who the run-back still walks this poll.
+    void ReturnRaidStayLeases(std::set<std::string> const& walking)
+    {
+        for (auto it = _raidRunBackStayLeased.begin(); it != _raidRunBackStayLeased.end();)
+        {
+            Player* who = ObjectAccessor::FindPlayerByName(*it);
+            bool const stillWalking = who && !who->IsAlive() && walking.count(*it);
+            if (stillWalking)
+            {
+                ++it;
+                continue;
+            }
+            if (who)
+                if (PlayerbotAI* whoAI = GET_PLAYERBOT_AI(who))
+                    if (!whoAI->HasStrategy("stay", BOT_STATE_DEAD))
+                        whoAI->ChangeStrategy("+stay", BOT_STATE_DEAD);
+            it = _raidRunBackStayLeased.erase(it);
+        }
+    }
+
+    // CLEAR'S STALL LADDER, one poll (#640). The dungeon watchdog's own reading
+    // (DUNGEON_CLEAR_RATCHET: thirty yards from a mark in five minutes) and the
+    // same bounded busy hold (DungeonClearBusyStillHolds), on the head, with a
+    // boss credited counting as progress. Answers what the ladder does now;
+    // the regroup is carried out by StepRaidRun through `stallRegroup`, the
+    // skip here.
+    OverseerDecisions::RaidClearStallAction RaidClearStall(
+        std::string const& family, RaidRunState& run, Player* head,
+        OverseerDecisions::RaidDoor const* door, bool anyBusy, unsigned bossesDone)
+    {
+        time_t const now = std::time(nullptr);
+        if (bossesDone > run.bossesDone)
+        {
+            run.clearMarked = false;
+            run.clearAdvancedAt = now;
+            run.regroupsSinceProgress = 0;
+            run.loggedBusyCeiling = false;
+            return OverseerDecisions::RaidClearStallAction::Nothing;
+        }
+        if (!head || !head->IsInWorld() || head->GetMapId() != door->insideMapId)
+            return OverseerDecisions::RaidClearStallAction::Nothing;
+
+        float const moved =
+            run.clearMarked ? head->GetExactDist2d(run.clearX, run.clearY) : 0.f;
+        OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
+            run.clearProgress, moved, now, DUNGEON_CLEAR_RATCHET);
+        if (!run.clearMarked || progress.progressed)
+        {
+            run.clearMarked = true;
+            run.clearX = head->GetPositionX();
+            run.clearY = head->GetPositionY();
+            run.clearProgress.since = now;
+            run.clearAdvancedAt = now;
+            run.regroupsSinceProgress = 0;
+            run.loggedBusyCeiling = false;
+            return OverseerDecisions::RaidClearStallAction::Nothing;
+        }
+        if (!run.clearAdvancedAt)
+            run.clearAdvancedAt = now;
+
+        bool const busyHolds = OverseerDecisions::DungeonClearBusyStillHolds(
+            anyBusy, run.clearAdvancedAt, now, DUNGEON_CLEAR_BUSY_CEILING_SECONDS);
+        if (busyHolds)
+        {
+            run.clearProgress.since = now;
+            return OverseerDecisions::RaidClearStallAction::Nothing;
+        }
+        if (anyBusy && !run.loggedBusyCeiling)
+        {
+            run.loggedBusyCeiling = true;
+            LOG_WARN("module.overseer",
+                     "overseer: raid run for family '{}' has credited no boss and not moved "
+                     "'{}' {}y for {} minutes while the raid looks busy - that is longer than "
+                     "busy is believed for, so the stall clock runs",
+                     family, head->GetName(), static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS),
+                     static_cast<uint32>((now - run.clearAdvancedAt) / 60));
+        }
+
+        OverseerDecisions::RaidClearStallAction const action =
+            OverseerDecisions::RaidClearStallDecision(progress.stalled,
+                                                      run.regroupsSinceProgress,
+                                                      OverseerDecisions::RAID_CLEAR_REGROUPS);
+        if (action == OverseerDecisions::RaidClearStallAction::Nothing)
+            return action;
+        // Every rung gets a whole window to work in before the next one.
+        run.clearProgress.since = now;
+        if (action == OverseerDecisions::RaidClearStallAction::Regroup)
+        {
+            ++run.regroups;
+            ++run.regroupsSinceProgress;
+            LOG_WARN("module.overseer",
+                     "overseer: raid run for family '{}' CLEAR has credited no boss and not "
+                     "moved '{}' {}y in {} minutes - regroup {} of {} at HOLD: the brain lets "
+                     "go, the raid rests and rebuffs, and it is armed again",
+                     family, head->GetName(), static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS),
+                     static_cast<uint32>(DUNGEON_CLEAR_STALL_SECONDS / 60),
+                     run.regroupsSinceProgress, OverseerDecisions::RAID_CLEAR_REGROUPS);
+            return action;
+        }
+
+        ++run.skips;
+        run.regroupsSinceProgress = 0;
+        Player* issuer = AuthorizedDcIssuer(head);
+        PlayerbotAI* headAI = SteerableAI(head);
+        bool const skipped =
+            issuer && headAI && headAI->DoSpecificAction("dc skip", Event("dc", "", issuer), true);
+        LOG_WARN("module.overseer",
+                 "overseer: raid run for family '{}' CLEAR is still stuck after {} regroups - "
+                 "issuing 'dc skip' as '{}': {}. The order stands; the ladder starts again",
+                 family, OverseerDecisions::RAID_CLEAR_REGROUPS,
+                 issuer ? issuer->GetName() : "nobody",
+                 skipped ? "accepted" : "REFUSED or unavailable; the dungeon module's log "
+                                        "says why under 'DC command refused'");
+        return action;
+    }
+
+    // THE RAID TIMELINE (#640, in #617's table): what this run looks like to a
+    // reader of overseer_dungeon_run_event, diffed across one poll.
+    static OverseerDecisions::RaidTimelineSnapshot SnapshotRaid(RaidRunState const& run)
+    {
+        OverseerDecisions::RaidTimelineSnapshot snap;
+        snap.phase = OverseerDecisions::RaidRunPhaseName(run.phase);
+        snap.why = run.lastWhy;
+        snap.keyword = run.keyword;
+        snap.bossesDone = run.bossesDone;
+        snap.bossesTotal = run.bossesTotal;
+        snap.wipes = run.wipes;
+        snap.released = run.released;
+        snap.regroups = run.regroups;
+        snap.skips = run.skips;
+        snap.mainTankMarked = run.mainTankMarked;
+        snap.cleared = run.bossesTotal && run.bossesDone >= run.bossesTotal;
+        return snap;
+    }
+
+    void WriteRaidTimeline(OverseerDecisions::FamilyRoster const& roster,
+                           RaidRunState const& run, OverseerDecisions::RaidDoor const* door)
+    {
+        OverseerDecisions::RaidTimelineSnapshot now = SnapshotRaid(run);
+        OverseerDecisions::RaidTimelineSnapshot& seen = _raidTimelineSeen[roster.family];
+        if (now.keyword.empty())
+            now.keyword = seen.keyword;
+        std::vector<OverseerDecisions::RunTimelineEvent> events =
+            OverseerDecisions::RaidTimelineEvents(seen, now);
+        if (!events.empty())
+        {
+            // The dungeon run row the arming drive opened for the raid map, when
+            // there is one: CLEAR opens it, HOLD and RECOVER write 0.
+            uint32 const runId = door ? ActiveRunIdOnMap(door->insideMapId) : 0;
+            for (OverseerDecisions::RunTimelineEvent& event : events)
+            {
+                event.runId = runId;
+                WriteRunTimeline(roster.family, roster.leader, "", event);
+            }
+        }
+        seen = now;
+    }
+
     void DriveRaidRun()
     {
         using OverseerDecisions::RaidRunPhase;
 
         std::map<std::string, std::string> const jobs = LoadJobs();
         _raidRunPhaseByMember.clear();
+        _raidRunBackGhosts.clear();
+        std::set<std::string> ghostsWalked;
         for (OverseerDecisions::FamilyRoster const& roster : LoadFamilyRosters())
         {
             if (roster.leader.empty())
@@ -30988,6 +31470,7 @@ private:
             facts.ordered = !keyword.empty();
             Player* head = ObjectAccessor::FindPlayerByName(roster.leader);
             facts.headStreaming = head && head->IsInWorld() && ClientAttached(head);
+            facts.headAlive = head && head->IsInWorld() && head->IsAlive();
             Group* group = head ? head->GetGroup() : nullptr;
             facts.raidFormed = group && group->isRaidGroup();
             facts.heldSeconds = run.phaseSince ? long(std::time(nullptr) - run.phaseSince) : 0;
@@ -30996,6 +31479,9 @@ private:
             if (facts.ordered)
                 seats = LoadRaidSeats(roster.family, keyword);
 
+            // BUSY, FOR CLEAR'S STALL LADDER: somebody inside fighting, dead
+            // and waiting on a healer, or the head eating or drinking.
+            bool anyBusy = false;
             if (facts.raidFormed && door)
             {
                 for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
@@ -31004,8 +31490,42 @@ private:
                     if (!member || !member->IsInWorld())
                         continue;
                     ++facts.inWorld;
+                    // A GHOST WALKING BACK (#640), timed per ghost from when the
+                    // run first saw it released; the window is
+                    // RaidGhostMayBeWalked's.
+                    if (RaidGhostOf(member, door))
+                    {
+                        time_t const since =
+                            _raidGhostSince.emplace(member->GetName(), std::time(nullptr))
+                                .first->second;
+                        if (OverseerDecisions::RaidGhostMayBeWalked(
+                                long(std::time(nullptr) - since)))
+                            ++facts.ghosts;
+                    }
+                    else
+                        _raidGhostSince.erase(member->GetName());
                     if (member->GetMapId() == door->insideMapId)
+                    {
                         ++facts.inside;
+                        if (!member->IsAlive())
+                        {
+                            ++facts.insideDead;
+                            anyBusy = true;
+                            continue;
+                        }
+                        ++facts.insideAlive;
+                        if (member->IsInCombat())
+                        {
+                            facts.insideCombat = true;
+                            anyBusy = true;
+                        }
+                        else if (member->GetHealthPct() <
+                                     float(OverseerDecisions::RAID_HOLD_READY_PCT) ||
+                                 (member->GetMaxPower(POWER_MANA) > 0 &&
+                                  member->GetPowerPct(POWER_MANA) <
+                                      float(OverseerDecisions::RAID_HOLD_READY_PCT)))
+                            ++facts.insideResting;
+                    }
                     else if (member->GetMapId() == door->outsideMapId &&
                              member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
                                  OverseerDecisions::RAID_ASSEMBLE_YARDS)
@@ -31020,6 +31540,8 @@ private:
                             ++facts.othersAssembled;
                     }
                 }
+                if (head && head->IsInWorld() && head->IsAlive() && head->IsSitState())
+                    anyBusy = true;
             }
             if (head && door && head->IsInWorld())
                 facts.headInside = head->GetMapId() == door->insideMapId;
@@ -31028,6 +31550,29 @@ private:
             for (auto const& [name, subgroup] : seats)
                 if (RaidSeatCanJoin(ObjectAccessor::FindPlayerByName(name), group))
                     ++facts.addable;
+
+            // The instance's own credit, and CLEAR's stall ladder on it.
+            unsigned bossesDone = 0;
+            unsigned bossesTotal = 0;
+            if (facts.raidFormed && door)
+                RaidEncounters(group, door, bossesDone, bossesTotal);
+            facts.cleared = bossesTotal > 0 && bossesDone >= bossesTotal;
+            if (run.phase == RaidRunPhase::Clear && door && facts.ordered)
+            {
+                OverseerDecisions::RaidClearStallAction const stall =
+                    RaidClearStall(roster.family, run, head, door, anyBusy, bossesDone);
+                facts.stallRegroup = stall == OverseerDecisions::RaidClearStallAction::Regroup;
+            }
+            if (bossesTotal)
+            {
+                if (bossesDone > run.bossesDone)
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' - {} of {} encounters in {} "
+                             "are done",
+                             roster.family, bossesDone, bossesTotal, door ? door->name : "?");
+                run.bossesDone = bossesDone;
+                run.bossesTotal = bossesTotal;
+            }
 
             if (facts.ordered && seats.empty() && run.phase == RaidRunPhase::Idle)
             {
@@ -31053,6 +31598,8 @@ private:
                              roster.family, OverseerDecisions::RaidRunPhaseName(run.phase),
                              step.why);
                     run = RaidRunState();
+                    run.lastWhy = step.why;
+                    WriteRaidTimeline(roster, run, door);
                 }
                 continue;
             }
@@ -31066,19 +31613,39 @@ private:
                 run.keyword = keyword;
             run.head = roster.leader;
 
+            RaidRunPhase const was = run.phase;
             if (step.phase != run.phase)
             {
                 LOG_INFO("module.overseer",
                          "overseer: raid run for family '{}' ({}) {} -> {} - {} ({} in the "
-                         "world, {} at the door, {} inside, {} seats)",
+                         "world, {} at the door, {} inside of whom {} alive, {} seats)",
                          roster.family, door ? door->name : "?",
                          OverseerDecisions::RaidRunPhaseName(run.phase),
                          OverseerDecisions::RaidRunPhaseName(step.phase), step.why,
-                         facts.inWorld, facts.assembled, facts.inside,
+                         facts.inWorld, facts.assembled, facts.inside, facts.insideAlive,
                          uint32(seats.size()));
+                if (step.phase == RaidRunPhase::Recover && OverseerDecisions::RaidWiped(facts))
+                {
+                    ++run.wipes;
+                    LOG_WARN("module.overseer",
+                             "overseer: raid run for family '{}' WIPED in {} ({} dead and {} "
+                             "alive inside) - wipe {}; the dead are released and run back, "
+                             "and the order stands",
+                             roster.family, door ? door->name : "?", facts.insideDead,
+                             facts.insideAlive, run.wipes);
+                }
                 run.phase = step.phase;
                 run.phaseSince = std::time(nullptr);
                 run.lastWhy = step.why;
+                run.preparedSaid = false;
+                if (step.phase == RaidRunPhase::Clear)
+                {
+                    // A fresh ladder for every stay in CLEAR.
+                    run.clearProgress = OverseerDecisions::RatchetState();
+                    run.clearMarked = false;
+                    run.clearAdvancedAt = std::time(nullptr);
+                    run.loggedBusyCeiling = false;
+                }
             }
             else if (run.lastWhy != step.why)
             {
@@ -31089,8 +31656,81 @@ private:
                 run.lastWhy = step.why;
             }
 
-            if (!head || !door)
+            if (!door)
+            {
+                WriteRaidTimeline(roster, run, door);
                 continue;
+            }
+
+            if (step.standDown && was == RaidRunPhase::Clear)
+                StandDownRaidBrain(roster, head, step.why);
+
+            if (step.releaseDead && group && group->isRaidGroup())
+            {
+                unsigned const released = ReleaseRaidDead(group, door);
+                if (released)
+                {
+                    run.released += released;
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' released {} raid member(s) "
+                             "lying dead in {} - the release button's own repop, since nobody "
+                             "standing can raise them; the ghosts land at the graveyard and "
+                             "are walked back",
+                             roster.family, released, door->name);
+                }
+            }
+
+            if (step.prepare && group && group->isRaidGroup() && head)
+            {
+                if (MarkRaidMainTank(group, head))
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' marked '{}' main tank of the "
+                             "raid, so the dungeon brain elects him to lead the clear",
+                             roster.family, head->GetName());
+                run.mainTankMarked = true;
+                unsigned const applied = ApplyRaidFightStrategy(group, door);
+                if (applied || !run.preparedSaid)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' HOLD checked the '{}' fight "
+                             "strategy on the raid inside {} - {} member(s) were missing it "
+                             "and were given it",
+                             roster.family, door->fightStrategy, door->name, applied);
+                    run.preparedSaid = true;
+                }
+            }
+
+            if (step.runBack && group && group->isRaidGroup() && facts.headStreaming)
+            {
+                std::set<std::string> rosterNames;
+                for (OverseerDecisions::FamilyMember const& member : roster.members)
+                    rosterNames.insert(member.name);
+                unsigned const walking =
+                    WalkRaidGhostsBack(group, door, rosterNames, ghostsWalked);
+                if (walking != run.runBackWalking)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' is walking {} ghost(s) back "
+                             "from the graveyard to {}'s door, where the core raises each one "
+                             "for entering the map its corpse is on",
+                             roster.family, walking, door->name);
+                    run.runBackWalking = walking;
+                }
+            }
+            else if (run.runBackWalking)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' stopped walking the run-back "
+                         "({} ghost(s) were being walked) - {}",
+                         roster.family, run.runBackWalking, step.why);
+                run.runBackWalking = 0;
+            }
+
+            if (!head)
+            {
+                WriteRaidTimeline(roster, run, door);
+                continue;
+            }
 
             if (step.form)
                 FormRaidFromSeats(roster.family, head, seats, run);
@@ -31109,21 +31749,12 @@ private:
                                   "overseer: raid run for family '{}' - areatrigger {} is not "
                                   "in this world, so there is no door to walk onto",
                                   roster.family, door->entryTriggerId);
+                        WriteRaidTimeline(roster, run, door);
                         continue;
                     }
                     x = trigger->x;
                     y = trigger->y;
-                    // THE FLOOR OVER THE TRIGGER, READ FROM THE MAP. The trigger's
-                    // own z is the sphere's centre, under the floor; an aim at it
-                    // would ask the walker for a point inside rock.
-                    z = door->stageZ;
-                    Map* map = head->GetMap();
-                    if (map && map->GetId() == door->outsideMapId && map->IsGridLoaded(x, y))
-                    {
-                        float const ground = map->GetHeight(x, y, door->stageZ + 5.f);
-                        if (ground > INVALID_HEIGHT && std::fabs(ground - door->stageZ) < 6.f)
-                            z = ground;
-                    }
+                    z = RaidDoorFloor(head->GetMap(), door, trigger);
                 }
                 std::ostringstream aim;
                 aim << std::fixed << std::setprecision(1) << "at:" << door->outsideMapId
@@ -31135,34 +31766,42 @@ private:
             if (step.knockMembers || step.knockHead)
             {
                 AreaTrigger const* trigger = sObjectMgr->GetAreaTrigger(door->entryTriggerId);
-                if (!trigger || !group || !group->isRaidGroup())
-                    continue;
-                std::vector<std::string> inDoor;
-                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                if (trigger && group && group->isRaidGroup())
                 {
-                    Player* member = ref->GetSource();
-                    if (member && member->IsInWorld() && member->IsAlive() &&
-                        member->IsInAreaTriggerRadius(trigger))
-                        inDoor.push_back(member->GetName());
+                    // THE LIVING, AND A GHOST WHOSE CORPSE IS INSIDE (#640): the
+                    // core lets a ghost through to the map its corpse is on
+                    // (MapMgr::PlayerCannotEnter) and raises it on arrival.
+                    std::vector<std::string> inDoor;
+                    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                    {
+                        Player* member = ref->GetSource();
+                        if (member && member->IsInWorld() &&
+                            (member->IsAlive() || RaidGhostOf(member, door)) &&
+                            member->IsInAreaTriggerRadius(trigger))
+                            inDoor.push_back(member->GetName());
+                    }
+                    std::string const knock = "trigger:" + std::to_string(door->entryTriggerId);
+                    unsigned crossed = 0;
+                    for (std::string const& name :
+                         OverseerDecisions::RaidKnockOrder(inDoor, roster.leader, step.knockHead))
+                    {
+                        Player* member = ObjectAccessor::FindPlayerByName(name);
+                        if (member && StepThroughAreaTrigger(name, member, knock))
+                            ++crossed;
+                    }
+                    if (crossed)
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' knocked {} of {} standing "
+                                 "in areatrigger {} through into {}{}",
+                                 roster.family, crossed, uint32(inDoor.size()),
+                                 door->entryTriggerId, door->name,
+                                 step.knockHead ? " (the head may cross)" : "");
                 }
-                std::string const knock = "trigger:" + std::to_string(door->entryTriggerId);
-                unsigned crossed = 0;
-                for (std::string const& name :
-                     OverseerDecisions::RaidKnockOrder(inDoor, roster.leader, step.knockHead))
-                {
-                    Player* member = ObjectAccessor::FindPlayerByName(name);
-                    if (member && StepThroughAreaTrigger(name, member, knock))
-                        ++crossed;
-                }
-                if (crossed)
-                    LOG_INFO("module.overseer",
-                             "overseer: raid run for family '{}' knocked {} of {} standing "
-                             "in areatrigger {} through into {}{}",
-                             roster.family, crossed, uint32(inDoor.size()),
-                             door->entryTriggerId, door->name,
-                             step.knockHead ? " (the head may cross)" : "");
             }
+
+            WriteRaidTimeline(roster, run, door);
         }
+        ReturnRaidStayLeases(ghostsWalked);
     }
 
     void DriveDungeonRun()

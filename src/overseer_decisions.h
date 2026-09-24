@@ -13299,14 +13299,14 @@ std::vector<RaidMove> RaidSeatingMoves(std::vector<RaidSeatNow> const& seats);
 
 // -- the raid run: a forty-player raid formed, assembled and walked in ---------
 //
-// WHAT THIS IS, AND WHAT IT IS NOT YET. The five-player dungeon coordinator
-// owns a family's party from RESET to EXIT. Nothing owned a raid: `guild raid
-// form` could convert a group, but nobody decided when, nobody brought forty
-// characters to a door, and nobody walked them through it. This is that owner,
-// FIRST SLICE: FORM the raid from the seats the bridge wrote, ASSEMBLE it at
-// the door, ENTER together, and HOLD inside. Clearing is a later slice and this
-// machine never starts it: DungeonClearMayArmHere below keeps the dungeon brain
-// off on a raid map, so a raid that walks in stands at the entrance.
+// WHAT THIS IS. The five-player dungeon coordinator owns a family's party from
+// RESET to EXIT. Nothing owned a raid: `guild raid form` could convert a group,
+// but nobody decided when, nobody brought forty characters to a door, and
+// nobody walked them through it. This is that owner. FORM the raid from the
+// seats the bridge wrote, ASSEMBLE it at the door, ENTER together, HOLD inside
+// until it is ready, CLEAR with the dungeon brain armed on the head, and
+// RECOVER from a wipe by running back (#640). DungeonClearMayArmHere below keeps
+// the brain off a raid map in every phase but CLEAR.
 //
 // IT RUNS ONLY ON AN OPERATOR'S ORDER. The trigger is the head's roster `job`
 // reading `raid:<keyword>`, and the only writer of that value is the bridge's
@@ -13357,6 +13357,11 @@ struct RaidDoor
     float stageY;
     float stageZ;
     unsigned minLevel;
+    // The mod-playerbots fight strategy for the inside map, which the bots'
+    // own ApplyInstanceStrategies installs on map change (PlayerbotAI.cpp,
+    // "moltencore" for map 409). HOLD checks every raid member carries it
+    // (#640).
+    char const* fightStrategy;
 };
 
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
@@ -13381,13 +13386,67 @@ constexpr long RAID_FORM_WAIT_SECONDS = 2 * 60;
 constexpr long RAID_ASSEMBLE_WAIT_SECONDS = 15 * 60;
 constexpr long RAID_ENTER_WAIT_SECONDS = 3 * 60;
 
+// -- inside: HOLD, CLEAR, RECOVER (#640) --------------------------------------
+//
+// HOLD IS WHERE A RAID GETS READY, AND IT IS BOUNDED BOTH WAYS. At least
+// RAID_HOLD_SETTLE_SECONDS, so the buffs the bots cast on arrival land before
+// the brain walks off. At most RAID_HOLD_WAIT_SECONDS for stragglers, corpses
+// and eating: a member who never arrives, a corpse nobody can rez, or a mage who
+// drinks to 79 percent for ever must not hold thirty-nine others at the door.
+// The dungeon brain's own pre-boss muster tops the raid off again before every
+// boss, so HOLD only has to get it moving, not full.
+constexpr long RAID_HOLD_SETTLE_SECONDS = 45;
+constexpr long RAID_HOLD_WAIT_SECONDS = 5 * 60;
+// Health or mana below this, out of combat, is still resting.
+constexpr unsigned RAID_HOLD_READY_PCT = 80;
+
+// A WIPE, IN THE DUNGEON BRAIN'S OWN TERMS. mod-dungeon-clear reads a raid as
+// wiped when RaidWipeFractionPct (90) of the members on the map are dead and
+// nobody is still engaged (DcRezDecision.h, the fraction verdict), and on a
+// live run it then disables itself. The runner uses the same number so the two
+// cannot disagree about whether the fight is over: a brain that has let go of a
+// raid the runner still calls alive would stand there until the stall clock ran
+// out. Nobody alive inside is a wipe whatever the fraction.
+constexpr unsigned RAID_WIPE_PCT = 90;
+
+// THE CORPSE RUN IS WALKED FOR THIS LONG, PER GHOST. A ghost is walked from
+// the graveyard to the door and knocked through, and the core resurrects it at
+// the entrance (HandleMoveWorldportAck: a ghost entering the map its corpse is
+// on). A ghost still out after this is no longer walked, and the module's
+// ordinary revival takes over for it; the raid goes on with whoever made it.
+// Counted per ghost from when the run first saw it released, so a raid that
+// wipes twice gives the second run-back its own window.
+constexpr long RAID_RUNBACK_WAIT_SECONDS = 15 * 60;
+bool RaidGhostMayBeWalked(long ghostSeconds);
+
+// CLEAR'S STALL LADDER. A raid that has credited no boss and not moved its head
+// for DUNGEON_CLEAR_STALL_SECONDS (the dungeon watchdog's own window and yards,
+// with the same bounded busy hold) is regrouped: back to HOLD with the brain
+// told to let go, rested and rebuffed, and armed again from a clean state. Two
+// regroups that do not restart it are followed by one `dc skip`, and the ladder
+// starts again. Progress resets it. There is no rung that ends the run: the
+// order stands until the operator ends it.
+constexpr unsigned RAID_CLEAR_REGROUPS = 2;
+
+enum class RaidClearStallAction : std::uint8_t
+{
+    Nothing,
+    Regroup,
+    Skip,
+};
+
+RaidClearStallAction RaidClearStallDecision(bool stalled, unsigned regroupsSinceProgress,
+                                            unsigned maximumRegroups);
+
 enum class RaidRunPhase : std::uint8_t
 {
     Idle,      // no order, or the order ended
     Form,      // the head's group is converted and the seats invited
     Assemble,  // the head walks to the staging point and the raid gathers
     Enter,     // the head stands on the door; members are knocked through, he goes last
-    Inside,    // the head is in the instance; the raid holds (clearing is a later slice)
+    Hold,      // inside at the entrance, the brain off: gather, rez, rest, mark the tank (#640)
+    Clear,     // the dungeon brain is armed on the head and the raid clears (#640)
+    Recover,   // a wipe, or the head outside: release, run back, walk in (#640)
 };
 
 char const* RaidRunPhaseName(RaidRunPhase phase);
@@ -13420,6 +13479,26 @@ struct RaidRunFacts
     bool headInside{false};
     // How long the current phase has held, in seconds.
     long heldSeconds{0};
+
+    // -- inside, for HOLD, CLEAR and RECOVER (#640) --
+    // The head is alive, wherever he is.
+    bool headAlive{false};
+    // Raid members on the inside map, alive and dead (a corpse not yet
+    // released counts as dead inside).
+    unsigned insideAlive{0};
+    unsigned insideDead{0};
+    // Living members inside below RAID_HOLD_READY_PCT health, or mana for a
+    // class that has mana: the raid is still eating and drinking.
+    unsigned insideResting{0};
+    // Any member inside is in combat.
+    bool insideCombat{false};
+    // Raid ghosts, anywhere, whose corpse is inside and whose run-back is
+    // still walked (RaidGhostMayBeWalked).
+    unsigned ghosts{0};
+    // CLEAR's stall ladder asks for a regroup this poll (RaidClearStallDecision).
+    bool stallRegroup{false};
+    // Every encounter the instance script keeps is done.
+    bool cleared{false};
 };
 
 struct RaidRunStep
@@ -13431,8 +13510,17 @@ struct RaidRunStep
     bool knockMembers{false}; // knock every member standing in the door
     bool knockHead{false};    // and the head, who goes last
     bool release{false};      // the order ended: let go of the aim and the raid
+    // -- inside (#640) --
+    bool prepare{false};      // HOLD: mark the head main tank, apply the raid strategy
+    bool armClear{false};     // CLEAR: the dungeon brain may be armed on this raid map
+    bool standDown{false};    // leaving CLEAR: tell the brain to let go, once
+    bool releaseDead{false};  // RECOVER: release every raid member lying dead inside
+    bool runBack{false};      // RECOVER: walk every ghost of the raid to the door
     char const* why{""};
 };
+
+// Is the raid wiped, by RAID_WIPE_PCT? See that constant.
+bool RaidWiped(RaidRunFacts const& facts);
 
 // One poll of the raid run.
 //
@@ -13445,6 +13533,22 @@ struct RaidRunStep
 // ENTER HAS NO WAY BACK TO ASSEMBLE. Once members are being knocked through, a
 // straggler who wanders off is left, not waited for: going back would strand
 // whoever already crossed inside with no head.
+//
+// INSIDE (#640), in the order the checks are made:
+//   - A WIPE (RaidWiped) is RECOVER wherever the head is: the dead inside are
+//     released and every ghost is walked back and knocked through the door.
+//   - THE HEAD OUTSIDE after the raid has been in is RECOVER too: he walks (or,
+//     as a ghost, is walked) back to the door and crosses last, as at ENTER.
+//   - RECOVER lasts while any ghost is still being walked back, even with the
+//     head inside; in HOLD and CLEAR a ghost is walked back without a phase
+//     change.
+//   - THE HEAD DEAD INSIDE with the raid still standing is left to the raid's
+//     healers: the phase holds and the brain elects the next tank meanwhile.
+//   - CLEAR stays CLEAR until its stall ladder asks for a regroup, which is
+//     HOLD with the brain told to let go.
+//   - Anything else with the head inside is HOLD, and HOLD becomes CLEAR when
+//     the raid is in, alive, rested and out of combat, or when the wait for
+//     that is over, and never before RAID_HOLD_SETTLE_SECONDS.
 RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts);
 
 // Who is knocked, in order: every member standing in the door first, the head
@@ -13462,6 +13566,11 @@ std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
 // run's first slice would walk forty characters into Molten Core and the brain
 // would start pulling the first pack the moment the family crossed: a clear
 // nobody ordered, by a raid the readiness report calls unready.
+//
+// ORDERED MEANS THE FAMILY'S RAID RUN IS IN CLEAR (#640), which only an
+// operator's raid order reaches, and only after HOLD. HOLD and RECOVER keep the
+// brain off: a raid that is still gathering, eating or running back is not one
+// the brain may start pulling for.
 bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered);
 
 // -- and the row that asks for any of it -------------------------------------
@@ -14785,6 +14894,32 @@ std::vector<DcOnTimelineEvent> DcOnTimelineEvents(std::map<std::string, DcOnMark
 // `text` cut to fit the detail column, marked with "..." when it was cut.
 std::string RunTimelineDetail(std::string const& text,
                               std::size_t max = RUN_TIMELINE_DETAIL_MAX);
+
+// -- the raid run's timeline (#640, in #617's table) --------------------------
+//
+// The same diff-of-two-snapshots rule the dungeon coordinator's timeline uses
+// (RunTimelineEvents): one row per phase change and per decision, nothing for a
+// poll that changed nothing. `portal` is the raid keyword; `runNumber` is the
+// attempt, one more than the wipes so far, so a reader can split a night's rows
+// into pulls.
+struct RaidTimelineSnapshot
+{
+    std::string phase{"IDLE"};
+    std::string why;
+    std::string keyword;
+    uint32_t runId{0};
+    unsigned bossesDone{0};
+    unsigned bossesTotal{0};
+    unsigned wipes{0};
+    unsigned released{0};     // corpses released on the raid's behalf, in all
+    unsigned regroups{0};     // stall regroups, in all
+    unsigned skips{0};        // `dc skip`s, in all
+    bool mainTankMarked{false};
+    bool cleared{false};
+};
+
+std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& before,
+                                                 RaidTimelineSnapshot const& after);
 
 // --------------------------------------- the family's tank, made one (#626) --
 //
