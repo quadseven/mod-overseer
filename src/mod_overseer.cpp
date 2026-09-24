@@ -40040,12 +40040,23 @@ private:
             if (level == trainedLevel && !wantsTalents)
                 continue;
 
-            LOG_INFO("module.overseer", "overseer: training '{}' at level {} (spec_tab {})",
-                     name, static_cast<uint32>(level), static_cast<uint32>(specTab));
+            OverseerDecisions::RosterTraining const training =
+                OverseerDecisions::RosterTrainingFor(RosterFactoryGrants());
+            if (training.skills)
+                LOG_INFO("module.overseer", "overseer: training '{}' at level {} (spec_tab {})",
+                         name, static_cast<uint32>(level), static_cast<uint32>(specTab));
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: training '{}' at level {} (spec_tab {}) - factory grants are "
+                         "off, so no skills, riding or spells are granted; it learns at a "
+                         "trainer and pays", name, static_cast<uint32>(level),
+                         static_cast<uint32>(specTab));
 
             PlayerbotFactory factory(bot, level);
-            factory.InitSkills();
-            factory.InitClassSpells();
+            if (training.skills)
+                factory.InitSkills();
+            if (training.classSpells)
+                factory.InitClassSpells();
 
             // THE FOURTH BLOCKER, AND THE ONE NOBODY HAD NAMED (infra#2757,
             // infra#2782). This is also where the alchemy all five hold came
@@ -40082,17 +40093,20 @@ private:
             // Restored unconditionally, because a character left holding zero
             // free slots could never learn the trade it is being sent to learn -
             // which would swap one silent blocker for another.
-            uint32 const freeProfessionSlots = bot->GetFreePrimaryProfessionPoints();
-            if (freeProfessionSlots)
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' has {} free primary profession slot(s); holding "
-                         "them shut for the trainer-table sweep so it cannot take one "
-                         "without a trainer", name, freeProfessionSlots);
-            bot->SetFreePrimaryProfessions(0);  // Player.h:1796
-            factory.InitAvailableSpells();
-            bot->SetFreePrimaryProfessions(static_cast<uint16>(freeProfessionSlots));
+            if (training.trainerSpells)
+            {
+                uint32 const freeProfessionSlots = bot->GetFreePrimaryProfessionPoints();
+                if (freeProfessionSlots)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has {} free primary profession slot(s); holding "
+                             "them shut for the trainer-table sweep so it cannot take one "
+                             "without a trainer", name, freeProfessionSlots);
+                bot->SetFreePrimaryProfessions(0);  // Player.h:1796
+                factory.InitAvailableSpells();
+                bot->SetFreePrimaryProfessions(static_cast<uint16>(freeProfessionSlots));
+            }
 
-            if (hasTree)
+            if (hasTree && training.talents)
                 SpendTalents(bot, static_cast<uint32>(specTab));
 
             bot->SendTalentsInfoData(false);
@@ -46545,6 +46559,16 @@ private:
     // watchable. Anything that reasons about a POV being observable - the
     // stream feature above all - is reasoning about a promise this key can
     // withdraw. Leave it on wherever there are clients to spare.
+    // Does a level-up hand the roster skills, riding and spells with no
+    // trainer and no gold? ON by default, which is how the module has always
+    // behaved. See RosterTrainingFor in overseer_decisions.h for what each
+    // switch covers. Read per poll, like the keys around it, so a
+    // `.reload config` takes effect.
+    static bool RosterFactoryGrants()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.Train.Factory", true);
+    }
+
     static bool RosterRequiresAClient()
     {
         return sConfigMgr->GetOption<bool>("Overseer.RequireClient", true);

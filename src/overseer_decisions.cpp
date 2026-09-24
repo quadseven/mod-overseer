@@ -14961,4 +14961,14 @@ char const* FinderStepWord(FinderStep step)
     return "unknown";
 }
 
+RosterTraining RosterTrainingFor(bool factoryGrants)
+{
+    RosterTraining training;
+    training.skills = factoryGrants;
+    training.classSpells = factoryGrants;
+    training.trainerSpells = factoryGrants;
+    training.talents = true;
+    return training;
+}
+
 }  // namespace OverseerDecisions
