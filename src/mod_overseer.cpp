@@ -42632,6 +42632,8 @@ private:
                 detail = DoCast(player, command, status, rowResult, _pendingCasts, id);
             else if (kind == "guild")
                 detail = DoGuild(player, command, targetArg, status, rowResult);
+            else if (kind == "bot" && command == "open items")
+                detail = DoOpenLockboxes(player, status, rowResult);
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
@@ -42747,6 +42749,34 @@ private:
         }
 
         SayHowTheQueueIsDoing(pending, executed, held, oldestPendingAge);
+    }
+
+    // Queue the playerbot actions that naturally unlock and open carried
+    // lockboxes. The upstream actions perform the Pick Lock spell and skill
+    // checks; this module only refuses a character that cannot perform them.
+    static char const* DoOpenLockboxes(Player* player, char const*& status,
+                                       std::string& rowResult)
+    {
+        if (!player || player->getClass() != CLASS_ROGUE)
+            return "lockbox opening requires a rogue";
+        if (!player->HasSpell(1804))
+            return "the rogue has not learned Pick Lock";
+        if (player->GetSkillValue(SKILL_LOCKPICKING) == 0)
+            return "the rogue has no Lockpicking skill";
+
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
+        if (!botAI)
+            return "target has no bot AI (selfbot not enabled?)";
+
+        botAI->HandleCommand(CHAT_MSG_WHISPER, "unlock items", player);
+        botAI->HandleCommand(CHAT_MSG_WHISPER, "open items", player);
+        status = "delivered";
+        rowResult = "{\"outcome\":\"queued\",\"mechanism\":\"Pick Lock spell and Lockpicking skill\",\"actions\":[\"unlock items\",\"open items\"]}";
+        LOG_INFO("module.overseer",
+                 "overseer: queued natural lockbox opening for '{}' through Pick Lock and "
+                 "Lockpicking; no skill was granted",
+                 player->GetName());
+        return "";
     }
 
     // Speak as the character would. Language matches mod-playerbots' own

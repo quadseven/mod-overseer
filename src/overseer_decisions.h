@@ -57,6 +57,22 @@
 namespace OverseerDecisions
 {
 
+struct LockboxFacts
+{
+    bool rogue{false};
+    bool holdsLockedBox{false};
+    bool hasPickLockSpell{false};
+    bool hasLockpickingSkill{false};
+};
+
+enum class LockboxStep : std::uint8_t
+{
+    Refuse,
+    UnlockAndOpen,
+};
+
+LockboxStep LockboxNext(LockboxFacts const& facts);
+
 // A failed aim read is not the same thing as a successful read of an empty
 // column. Keep the last known council decision through a transient database
 // failure; otherwise one failed poll turns a steady aim into 0 and the next
