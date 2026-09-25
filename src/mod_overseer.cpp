@@ -42150,7 +42150,7 @@ private:
                         ss << ",'" << Esc(sample.source) << "'";
                 }
             }
-            ss << "','" << Esc(d.job) << "'"
+            ss << ",'" << Esc(d.job) << "'"
                << ',' << d.questAim
                << ",'" << Esc(d.travelTarget) << "'"
                << ',' << static_cast<uint32>(d.grouped)
