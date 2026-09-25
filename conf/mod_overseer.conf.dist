@@ -405,7 +405,7 @@
 #                     discard-unearned-gold removes the guild dues the guild's
 #                     bots mailed a family character. Each
 #                     has a dry run that writes what it would remove and changes
-#                     nothing; the dry run is refused while this is off too.
+#                     nothing. Dry runs work while this is off; apply rows do not.
 #
 #        Default:     0
 #

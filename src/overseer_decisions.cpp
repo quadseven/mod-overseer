@@ -15581,7 +15581,7 @@ bool NameListHas(std::vector<std::string> const& list, std::string const& name)
 NaturalizeRefusal NaturalizeVerdictFor(NaturalizeRequest const& request, NaturalizeFacts const& facts,
                                        bool asDryRun)
 {
-    if (!facts.enabled)
+    if (!facts.enabled && !asDryRun)
         return NaturalizeRefusal::Disabled;
     if (!request.ok)
         return NaturalizeRefusal::BadRequest;

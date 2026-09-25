@@ -193,8 +193,10 @@ void TestVerdict()
 
     NaturalizeFacts f = GuildBot();
     f.enabled = false;
-    Check("off by default refuses everything, dry runs too",
-          NaturalizeVerdictFor(reset, f, true) == NaturalizeRefusal::Disabled);
+    Check("off by default refuses changes but permits a dry run",
+          NaturalizeVerdictFor(reset, f, true) == NaturalizeRefusal::None);
+    Check("off by default refuses an apply",
+          NaturalizeVerdictFor(reset, f, false) == NaturalizeRefusal::Disabled);
 
     Check("a bad row is refused before anything is read",
           NaturalizeVerdictFor(ParseNaturalizeRequest("reset-level-9"), GuildBot(), true) ==

@@ -17748,7 +17748,7 @@ enum class NaturalizeRefusal : std::uint8_t
 };
 
 // The first gate that fails, in the enum's order. A DRY RUN IS REFUSED ONLY BY
-// THE GATES THAT SAY THE ROW IS WRONG (disabled, bad request, no character,
+// THE GATES THAT SAY THE ROW IS WRONG (bad request, no character,
 // wrong guild, wrong mode for the character). The gates that say "not yet"
 // (auctions, COD mail, the playerbots gate, the train factory, a client, the
 // ledger) do not stop a dry run, whose job is to show the operator what a
