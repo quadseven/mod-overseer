@@ -79,11 +79,18 @@ jobs:
           g++ --version | head -1
           shopt -s nullglob
           found=0
+          # THE DECISIONS ARE COMPILED ONCE, NOT ONCE PER TEST. The file is over
+          # sixteen thousand lines and every test used to compile it again: on
+          # 2026-09-26 main took 9 min 58 s of this job's 10-minute limit for
+          # about 160 tests, and three more tests timed a pull request out.
+          # Same flags, same warnings (said once instead of per test), and each
+          # test still links against exactly that translation unit.
+          g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
           for test in tests/test_*.cpp; do
             found=1
             name="$(basename "$test" .cpp)"
             echo "== $test"
-            g++ -std=c++17 -Wall -Wextra -Isrc src/overseer_decisions.cpp "$test" -o "$name"
+            g++ -std=c++17 -Wall -Wextra -Isrc overseer_decisions.o "$test" -o "$name"
             "./$name"
           done
           test "$found" = 1 || { echo "no tests/test_*.cpp found"; exit 1; }
