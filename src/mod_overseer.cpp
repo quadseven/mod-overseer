@@ -24931,6 +24931,18 @@ private:
                 continue;
             }
 
+            auto const rosterFamily = families.find(name);
+            if (rosterFamily != families.end())
+            {
+                auto const run = _dungeonRunCoordinators.find(rosterFamily->second);
+                if (run != _dungeonRunCoordinators.end() &&
+                    run->second.leaderClientHoldActive)
+                {
+                    StandDownDungeonBrain(name, bot, botAI);
+                    continue;
+                }
+            }
+
             // ...AND THE RUN CAN BE OVER, WHICH THIS DRIVE HAD NO WAY TO LEARN
             // (#351). See StandDownDungeonBrain for the whole argument,
             // including why disarming belongs here and not at the coordinator.
@@ -28996,6 +29008,14 @@ private:
     struct DungeonRunCoordinatorState
     {
         DungeonRunPhase phase{DungeonRunPhase::Idle};
+        time_t leaderClientOpenSince{0};
+        time_t leaderClientLostSince{0};
+        bool loggedLeaderClientHold{false};
+        bool leaderClientHoldActive{false};
+        bool leaderClientLostOutcome{false};
+        // Said once per hold at a door (#735), and cleared when the gate opens,
+        // so a leader whose client flaps is named once per hold, not per poll.
+        bool loggedLeaderClientGate{false};
         std::string portalKeyword;   // which DungeonPortal this run is for
         // WHERE THIS RUN IS GATHERING, RESOLVED ONCE WHEN IT STARTS. It lives
         // with the run rather than with the portal because it is not a property
@@ -30495,6 +30515,44 @@ private:
     // anchor, so each starts fresh from the poll the run can be driven again.
     // The mark and the skip count are left alone: a hold is not progress, and
     // an issuer that flickers must not be able to reset the ladder.
+    // THE LEADER'S CLIENT IS THE RUN'S HANDS (#735). Only a client-attached
+    // leader can issue the dungeon-clear, so a party that goes through the door
+    // or starts clearing while that client is absent or still settling fights
+    // with nobody able to steer it. Measured: a client that dropped every 65s
+    // let the run enter between two drops, and the family wiped leaderless.
+    // True means the transition waits; the line is said once per hold.
+    bool LeaderClientGateHolds(DungeonRunCoordinatorState& coord,
+                               std::string const& leaderName,
+                               OverseerDecisions::LeaderClientGate gate,
+                               char const* transition)
+    {
+        if (gate == OverseerDecisions::LeaderClientGate::Open)
+        {
+            if (coord.loggedLeaderClientGate)
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} for '{}' is no longer held - the "
+                         "leader's client has stayed connected for {}s",
+                         transition, leaderName,
+                         static_cast<uint32>(
+                             OverseerDecisions::DUNGEON_LEADER_CLIENT_SETTLE_SECONDS));
+            coord.loggedLeaderClientGate = false;
+            return false;
+        }
+        if (!coord.loggedLeaderClientGate)
+        {
+            coord.loggedLeaderClientGate = true;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} for '{}' waits - {}",
+                     transition, leaderName,
+                     gate == OverseerDecisions::LeaderClientGate::NoClient
+                         ? "the leader has no client connected, and only a "
+                           "client-attached leader can issue the clear"
+                         : "the leader's client has not stayed connected long enough "
+                           "to be trusted through the door");
+        }
+        return true;
+    }
+
     void HoldClearingClock(DungeonRunCoordinatorState& coord,
                            OverseerDecisions::ClearingClock clock, uint32 insideMapId)
     {
@@ -38697,6 +38755,26 @@ private:
         std::string const leaderJob = jobIt == jobs.end() ? std::string("quest") : jobIt->second;
 
         DungeonRunCoordinatorState& coord = _dungeonRunCoordinators[family];
+        time_t const clientNow = std::time(nullptr);
+        Player* const clientLeader = ObjectAccessor::FindPlayerByName(leaderName);
+        WorldSession* const leaderSession = clientLeader && clientLeader->IsInWorld()
+                                                ? clientLeader->GetSession()
+                                                : nullptr;
+        bool const leaderSocketOpen = leaderSession && !leaderSession->IsSocketClosed();
+        if (!leaderSocketOpen)
+            coord.leaderClientOpenSince = 0;
+        else if (!coord.leaderClientOpenSince)
+            coord.leaderClientOpenSince = clientNow;
+        if (!leaderSocketOpen)
+        {
+            if (!coord.leaderClientLostSince)
+                coord.leaderClientLostSince = clientNow;
+        }
+        else
+            coord.leaderClientLostSince = 0;
+        OverseerDecisions::LeaderClientGate const leaderClientGate =
+            OverseerDecisions::DungeonLeaderClientGate(
+                leaderSocketOpen, coord.leaderClientOpenSince, clientNow);
 
         // Bag pressure outranks dungeon progress. This check deliberately
         // happens after the roster census and before job/campaign decisions,
@@ -38716,6 +38794,89 @@ private:
         // the town drive does not think is owed.
         {
             RunBagReading const bags = ReadRunBags(members);
+
+            bool const runHasMembersInside = bags.anyMemberInside &&
+                (coord.phase == DungeonRunPhase::Enter ||
+                 coord.phase == DungeonRunPhase::StagedInside ||
+                 coord.phase == DungeonRunPhase::Clearing);
+            if (runHasMembersInside)
+            {
+                OverseerDecisions::LeaderClientLossAction const loss =
+                    OverseerDecisions::DungeonLeaderClientLoss(
+                        leaderSocketOpen, coord.leaderClientLostSince, clientNow);
+                if (loss == OverseerDecisions::LeaderClientLossAction::Hold)
+                {
+                    coord.leaderClientHoldActive = true;
+                    if (!coord.loggedLeaderClientHold)
+                    {
+                        coord.loggedLeaderClientHold = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run for '{}' is held because the leader's "
+                                 "client disconnected; members inside stay put for up to {} seconds",
+                                 leaderName, static_cast<uint32>(
+                                     OverseerDecisions::DUNGEON_LEADER_CLIENT_LOST_SECONDS));
+                    }
+                    for (std::string const& member : members)
+                    {
+                        Player* const held = ObjectAccessor::FindPlayerByName(member);
+                        if (!held || !InDungeonRun(held))
+                            continue;
+                        PlayerbotAI* const heldAI = GET_PLAYERBOT_AI(held);
+                        if (heldAI)
+                            HoldCharacterStill(held, heldAI, member, "leader_client_lost",
+                                static_cast<uint32>(OverseerDecisions::DUNGEON_LEADER_CLIENT_LOST_SECONDS),
+                                false);
+                        StandDownDungeonBrain(member, held, heldAI);
+                    }
+                    Player* const insideMember = FirstMemberInsideARun(members);
+                    HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldLeaderAway,
+                                      insideMember ? insideMember->GetMapId() : 0u);
+                    return;
+                }
+                if (loss == OverseerDecisions::LeaderClientLossAction::Abandon)
+                {
+                    coord.leaderClientHoldActive = false;
+                    if (coord.loggedLeaderClientHold)
+                    {
+                        coord.loggedLeaderClientHold = false;
+                        LOG_INFO("module.overseer",
+                                 "overseer: dungeon run hold for '{}' ended because the "
+                                 "leader's client did not return within {} seconds; evacuating",
+                                 leaderName, static_cast<uint32>(
+                                     OverseerDecisions::DUNGEON_LEADER_CLIENT_LOST_SECONDS));
+                    }
+                    coord.leaderClientLostOutcome = true;
+                    coord.stalledReason = "the leader client remained disconnected while members were inside";
+                    for (std::string const& member : members)
+                    {
+                        Player* const held = ObjectAccessor::FindPlayerByName(member);
+                        if (held)
+                            ReleaseHold(member, held, "leader client loss exceeded its bound",
+                                        "leader_client_lost");
+                    }
+                    coord.phase = DungeonRunPhase::Exiting;
+                    coord.crossing.best = 0.f;
+                    coord.crossing.since = clientNow;
+                    coord.loggedCrossingAim = false;
+                    coord.loggedCrossingWaiting = false;
+                    return;
+                }
+                if (coord.loggedLeaderClientHold)
+                {
+                    coord.leaderClientHoldActive = false;
+                    coord.loggedLeaderClientHold = false;
+                    LOG_INFO("module.overseer",
+                             "overseer: dungeon run hold for '{}' ended because the leader's "
+                             "client returned; members may move again",
+                             leaderName);
+                    for (std::string const& member : members)
+                    {
+                        Player* const held = ObjectAccessor::FindPlayerByName(member);
+                        if (held)
+                            ReleaseHold(member, held, "leader client returned", "leader_client_lost");
+                    }
+                }
+            }
 
             // THE DOOR IS SHUT FOR AS LONG AS ANYBODY HAS NO ROOM (#631), asked
             // without the EXIT exemption below: a family walking out for bag
@@ -40863,10 +41024,12 @@ private:
                                             coord.runId
                                                 ? coord.runId
                                                 : ActiveRunIdOnMap(portal->insideMapId),
-                                            OverseerDecisions::DungeonRunExitOutcome(
-                                                coord.provedComplete,
-                                                !coord.stalledReason.empty(),
-                                                coord.evacuated),
+                                            coord.leaderClientLostOutcome
+                                                ? "client_lost"
+                                                : OverseerDecisions::DungeonRunExitOutcome(
+                                                      coord.provedComplete,
+                                                      !coord.stalledReason.empty(),
+                                                      coord.evacuated),
                                             reason, IsDungeonJob(leaderJob));
                         }
                         return;
@@ -41183,6 +41346,8 @@ private:
                     return;
                 }
 
+                if (LeaderClientGateHolds(coord, leaderName, leaderClientGate, "CLEARING"))
+                    return;
                 coord.phase = DungeonRunPhase::Clearing;
                 coord.awaitingSince = std::time(nullptr);
                 coord.anchorSet = false;
@@ -41764,6 +41929,7 @@ private:
         // group and nothing else. The staging backstop below still bounds a
         // barrier that never opens.
         if (OverseerDecisions::DungeonRunBarrierMet(states, DUNGEON_APPROACH_LIMITS) &&
+            !LeaderClientGateHolds(coord, leaderName, leaderClientGate, "ENTER") &&
             !DungeonDoorWaitsForTheGroup(coord, members, leaderName, "BARRIER"))
         {
             // THE BARRIER IS A ONE-WAY DOOR INTO ENTER, not a condition ENTER

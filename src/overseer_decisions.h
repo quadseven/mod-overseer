@@ -57,6 +57,37 @@
 namespace OverseerDecisions
 {
 
+// A DUNGEON RUN'S LEADER MUST HOLD A CLIENT (#735). Only a client-attached
+// leader can issue the dungeon-clear, so ENTER and CLEARING wait until the
+// leader's socket has stayed open for the settle window (a measured flap ran
+// every 65s, so a shorter window lets a run through between two drops). A
+// client lost with members inside holds them for the lost window, then the
+// run leaves with the `client_lost` outcome.
+constexpr std::time_t DUNGEON_LEADER_CLIENT_SETTLE_SECONDS = 120;
+constexpr std::time_t DUNGEON_LEADER_CLIENT_LOST_SECONDS = 300;
+
+enum class LeaderClientGate
+{
+    Open,
+    NoClient,
+    Settling,
+};
+
+LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
+                                         std::time_t now,
+                                         std::time_t settleSeconds = DUNGEON_LEADER_CLIENT_SETTLE_SECONDS);
+
+enum class LeaderClientLossAction
+{
+    Continue,
+    Hold,
+    Abandon,
+};
+
+LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, std::time_t lostSince,
+                                               std::time_t now,
+                                               std::time_t maxWaitSeconds = DUNGEON_LEADER_CLIENT_LOST_SECONDS);
+
 struct LockboxFacts
 {
     bool rogue{false};
