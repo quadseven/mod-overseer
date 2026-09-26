@@ -3565,9 +3565,6 @@ void ReloadRaidSpecTargets()
     g_raidSpec.swap(targets);
 }
 
-// Defined after OverseerWorldScript, whose SpendTalents it uses.
-void SpendTalentsTowardSeat(Player* player, char const* when);
-
 // Exactly the unique key of overseer_event. Keeping the two identical is what
 // makes the in-memory coalescing and the ON DUPLICATE KEY UPDATE agree: a
 // repeat that collapses in RAM is the same repeat that would collapse in the
@@ -6024,6 +6021,10 @@ private:
     std::map<std::string, time_t> _handback;
 };
 }  // namespace
+
+// Outside the anonymous namespace, like the definition after
+// OverseerWorldScript (whose SpendTalents it uses), so the two are one function.
+void SpendTalentsTowardSeat(Player* player, char const* when);
 
 /*
  * Chat capture.
