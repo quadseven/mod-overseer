@@ -64,7 +64,7 @@ LeaderIntentRequest Req(LeaderIntentKind kind, char const* owner, char const* ta
     return request;
 }
 
-LeaderIntentLimits const LIMITS{};  // dwell 90, flap 90, stale 75, operator 600
+LeaderIntentLimits const LIMITS{};  // dwell 90, flap 90, stale 75, operator 300
 
 void AFreeLeaderIsGrantedAndRenewed()
 {
@@ -157,11 +157,11 @@ void TheCampaignAndTheOperatorNeverWait()
     Check("the run waits for the operator", v.answer == LeaderIntentAnswer::Deferred);
     // The operator's order has no rule renewing it and still holds him well
     // past the ordinary staleness.
-    v = AskLeaderIntent(state, Req(LeaderIntentKind::DungeonRun, "dungeon run", "door"), 300,
+    v = AskLeaderIntent(state, Req(LeaderIntentKind::DungeonRun, "dungeon run", "door"), 200,
                         LIMITS);
     Check("the operator order outlives an ordinary staleness",
           v.answer == LeaderIntentAnswer::Deferred);
-    v = AskLeaderIntent(state, Req(LeaderIntentKind::DungeonRun, "dungeon run", "door"), 603,
+    v = AskLeaderIntent(state, Req(LeaderIntentKind::DungeonRun, "dungeon run", "door"), 303,
                         LIMITS);
     Check("and ends after its own lifetime", v.answer == LeaderIntentAnswer::Granted);
 }

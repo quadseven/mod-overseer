@@ -18223,8 +18223,10 @@ struct LeaderIntentLimits
     // (the party poll, 30 s) with room for a late tick.
     std::time_t staleSeconds{75};
     // An operator's order has no rule asking for it again every poll, so it
-    // holds the leader this long unless the operator gives another.
-    std::time_t operatorSeconds{600};
+    // holds the leader this long unless the operator gives another. Short
+    // enough that an order given in passing does not keep the campaign's own
+    // run waiting behind it for long.
+    std::time_t operatorSeconds{300};
 };
 
 // Jev's pick for the family, read from the bridge's column. Requests of this
