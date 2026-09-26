@@ -16573,4 +16573,91 @@ bool WalkNeedsRetarget(float runningX, float runningY, float newX, float newY, f
     return rx * rx + ry * ry < limits.closeEnoughYards * limits.closeEnoughYards;
 }
 
+RaidSpecTarget const* RaidSpecTargetFor(std::vector<RaidSpecTarget> const& book, std::string const& name)
+{
+    if (name.empty())
+        return nullptr;
+    std::string const want = LowerAscii(name);
+    for (RaidSpecTarget const& t : book)
+        if (LowerAscii(t.name) == want)
+            return &t;
+    return nullptr;
+}
+
+std::vector<TalentLearnStep> PlanTalentSpend(std::vector<TalentSlot> slots, unsigned freePoints)
+{
+    std::sort(slots.begin(), slots.end(), [](TalentSlot const& a, TalentSlot const& b) {
+        return a.row != b.row ? a.row < b.row : a.col != b.col ? a.col < b.col : a.talentId < b.talentId;
+    });
+    unsigned spent = 0;
+    for (TalentSlot const& s : slots)
+        spent += s.known;
+
+    auto rowSpent = [&](unsigned row) {
+        unsigned n = 0;
+        for (TalentSlot const& s : slots)
+            if (s.row == row)
+                n += s.known;
+        return n;
+    };
+    auto prerequisiteHeld = [&](TalentSlot const& slot) {
+        if (!slot.dependsOn)
+            return true;
+        for (TalentSlot const& s : slots)
+            if (s.talentId == slot.dependsOn)
+                return s.known >= slot.dependsOnRank + 1;
+        return false;   // the prerequisite is in no tree read here
+    };
+
+    std::vector<TalentLearnStep> steps;
+    bool progress = true;
+    while (freePoints && progress)
+    {
+        progress = false;
+        // The capped pass first: 5 a row opens the deepest rows soonest. Only
+        // when it places nothing does a row take more than 5.
+        for (bool capped : {true, false})
+        {
+            for (TalentSlot& slot : slots)
+            {
+                while (freePoints && slot.known < slot.ranks && spent >= slot.row * 5 &&
+                       (!capped || rowSpent(slot.row) < 5) && prerequisiteHeld(slot))
+                {
+                    steps.push_back({slot.talentId, slot.known});
+                    ++slot.known;
+                    ++spent;
+                    --freePoints;
+                    progress = true;
+                }
+            }
+            if (progress)
+                break;
+        }
+    }
+    return steps;
+}
+
+SeatTalentVerdict SeatTalentVerdictFor(bool onRoster, RaidSpecTarget const* target, unsigned classId,
+                                       unsigned freePoints)
+{
+    SeatTalentVerdict v;
+    if (onRoster)
+        v.said = "a family character; TrainRoster spends its points in the roster tree";
+    else if (!target)
+        v.said = "no raid seat target; the playerbots level-up action picks";
+    else if (target->classId != classId)
+        v.said = "the seat target was written for another class; the lineup is stale";
+    else if (target->tab > 2)
+        v.said = "the seat target names no talent tab (0 to 2)";
+    else if (!freePoints)
+        v.said = "no free talent point to spend";
+    else
+    {
+        v.spend = true;
+        v.tab = target->tab;
+        v.said = "spends its free talent points in the tree its raid seat needs";
+    }
+    return v;
+}
+
 }  // namespace OverseerDecisions
