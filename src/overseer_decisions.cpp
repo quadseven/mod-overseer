@@ -6822,6 +6822,14 @@ HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts)
     return {HeldGroundStep::Hold, "lethal ground but no safe move is known"};
 }
 
+RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& facts)
+{
+    if (!facts.sick || facts.groundTopLevel < facts.memberLevel + facts.levelGap)
+        return RevivedSickGroundStep::Stay;
+    return facts.hearthReady ? RevivedSickGroundStep::Hearth
+                             : RevivedSickGroundStep::HoldOutOfCombat;
+}
+
 TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates)
 {
     TravelTargetChoice choice;
@@ -14874,6 +14882,10 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
     // 1. A choice already made is kept.
     if (facts.choseHealer)
         return healer(GhostRecoveryReason::AlreadyChose);
+
+    // 1a. Do not stack Resurrection Sickness when the corpse remains reachable.
+    if (facts.healerUsedRecently && facts.corpseRunPossible)
+        return verdict;
 
     // 2. It has already died here inside the window.
     if (limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths)

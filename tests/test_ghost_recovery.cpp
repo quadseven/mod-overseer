@@ -71,6 +71,15 @@ int main()
     Check("a first death with nothing near the corpse runs back",
           DecideGhostRecovery(Quiet()), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
 
+    {
+        GhostRecoveryFacts f = Quiet();
+        f.deathsHere = 2;
+        f.healerUsedRecently = true;
+        f.corpseRunPossible = true;
+        Check("recent spirit-healer use prefers a possible corpse run",
+              DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
+    }
+
     // Zork at 09:06:33: the second death inside the window, in one place.
     {
         GhostRecoveryFacts f = Quiet();
