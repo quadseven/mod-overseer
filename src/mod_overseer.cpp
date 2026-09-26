@@ -7930,7 +7930,7 @@ private:
 
         // Runs LAST on purpose: it hands out the leader that the block above
         // has just finished correcting.
-        KeepRosterFollowing(group, present);
+        KeepRosterFollowing(group, present, wantsToLead);
     }
 
     // ---------------------- one hold, for every verb that has to cast (#335) --
@@ -9771,10 +9771,19 @@ private:
     // PlayerbotSecurity::CheckLevelFor short-circuits on `from == bot`
     // (PlayerbotSecurity.cpp:178) before the master is consulted at all. A bot
     // that now has a master is no more and no less commandable than before.
-    void KeepRosterFollowing(Group* group, std::vector<Player*> const& present)
+    void KeepRosterFollowing(Group* group, std::vector<Player*> const& present,
+                             std::string const& rosterLeaderName)
     {
         if (!group)
             return;
+
+        Player* rosterLeader = rosterLeaderName.empty()
+                                   ? nullptr
+                                   : ObjectAccessor::FindPlayerByName(rosterLeaderName);
+        bool const rosterLeaderPresent =
+            rosterLeader && rosterLeader->IsInWorld() &&
+            std::find(present.begin(), present.end(), rosterLeader) != present.end() &&
+            rosterLeader->GetGroup() == group;
 
         // The leader the GROUP actually has, not the one the roster prefers.
         // Those differ for one poll every time leadership drifts, and a family
@@ -9783,6 +9792,66 @@ private:
         Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
         if (!leader)
             return;
+
+        OverseerDecisions::FamilyLeadership const leadership =
+            OverseerDecisions::DecideFamilyLeadership(
+                rosterLeaderPresent, leader == rosterLeader,
+                GET_PLAYERBOT_AI(leader) &&
+                    GET_PLAYERBOT_AI(leader)->HasStrategy("new rpg", BOT_STATE_NON_COMBAT));
+        // With no `lead` row the group keeps whatever leader it has (#129), so
+        // there is no roster head to wait for and nothing here applies.
+        if (!rosterLeaderName.empty() && leadership.holdFollowers)
+        {
+            // The core may promote a remaining member when the roster head
+            // leaves. That is a server group detail, not permission to steer
+            // the family toward that member or grant it the leader's mover.
+            // Keep every present family member under the existing wait hold
+            // until the roster head is back in this party. Measured (#736): a
+            // level 35 member promoted this way was granted `new rpg`,
+            // wandered onto level 55 ground and died four times.
+            if (_heldForAbsentHead.insert(rosterLeaderName).second)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is not leading this party ({}) - the family "
+                         "holds where it stands until he is back, and no member leads "
+                         "in his place",
+                         rosterLeaderName,
+                         rosterLeaderPresent ? "the server handed the lead to another member"
+                                             : "he is not in the world");
+            for (Player* member : present)
+            {
+                if (!member || member->GetGroup() != group)
+                    continue;
+                std::string const name = member->GetName();
+                auto const escort = _dungeonEscorts.find(name);
+                if (escort != _dungeonEscorts.end() && escort->second.catchUp)
+                {
+                    EndOneEscort(name, escort->second.granted);
+                    _dungeonEscorts.erase(escort);
+                }
+                HoldFarFromLeader(member, name);
+            }
+            return;
+        }
+
+        // THE HEAD IS BACK, AND THE HOLD ABOVE ENDS ON THE FIRST POLL THAT SEES
+        // IT. The far hold's own release is measured from the gap to the
+        // leader and would otherwise leave the family standing for the whole
+        // CATCH_UP_FAR_HOLD_SECONDS after he returned.
+        if (!rosterLeaderName.empty() && _heldForAbsentHead.erase(rosterLeaderName))
+        {
+            for (Player* member : present)
+            {
+                if (!member || member == leader || member->GetGroup() != group)
+                    continue;
+                if (!_catchUpHeldFar.count(member->GetName()))
+                    ReleaseHold(member->GetName(), member, "the roster leader is back",
+                                FAR_HOLD_VERB);
+            }
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' leads this party again - the family's wait for him "
+                     "is released",
+                     rosterLeaderName);
+        }
 
         // WHETHER THIS FAMILY WAITS IN TOWN FOR ITS CAMPAIGN (2026-09-24), read
         // off the roster on every poll rather than remembered from another
@@ -10049,6 +10118,7 @@ private:
             }
 
             if (mayCarry && !leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
+                leadership.grantNewRpg &&
                 !HeldAfterRevival(leader->GetName()) &&
                 !HeldStill(leader->GetName()))
             {
@@ -10462,7 +10532,7 @@ private:
             // that has stopped producing motion; it cannot help a follower
             // whose every step is aimed straight at a cliff face. See
             // FOLLOW_CATCH_UP_YARDS and DriveCatchUp.
-            DriveCatchUp(p, leader);
+            DriveCatchUp(p, leader, rosterLeaderName);
         }
 
         // AND THE OTHER HALF OF THE SAME ANSWER (#404). Everything above walks a
@@ -19460,6 +19530,8 @@ private:
     // read by DriveCatchUp before it starts another walk, and ended by
     // EndFarHold. See CATCH_UP_FOOT_LIMIT_YARDS.
     std::map<std::string, time_t> _catchUpHeldFar;
+    // Roster heads whose family is held because he is not leading (#736).
+    std::set<std::string> _heldForAbsentHead;
 
     // ...AND WHICH OF THEM ARE HELD OFF A LETHAL LEG RATHER THAN FOR THE
     // DISTANCE (#697). Written beside `_catchUpHeldFar` by the travel drive
@@ -19801,8 +19873,15 @@ private:
     // Refuses to touch an escort a run holds: the run's staging point is the
     // authority on where this member should be, and the run's sweep is the
     // authority on when it stops. See DungeonEscort::catchUp.
-    bool CatchUpToward(std::string const& name, Player* leader)
+    bool CatchUpToward(std::string const& name, Player* leader,
+                       std::string const& rosterLeaderName)
     {
+        if (!rosterLeaderName.empty() &&
+            OverseerDecisions::DecideCatchUpAimSource(
+                leader && leader->IsInWorld(),
+                leader && leader->GetName() == rosterLeaderName, false) ==
+                OverseerDecisions::CatchUpAimSource::Unavailable)
+            return false;
         DungeonEscort& escort = _dungeonEscorts[name];
         // A HOME ERRAND IS NOT A WALK TO INTERRUPT (#348). It is walking this
         // member to the inn that stops it being dragged back across an ocean
@@ -20112,17 +20191,19 @@ private:
         }
     }
 
-    // Is the leader standing somewhere a follower can be sent? A position in
-    // the air is not an aim - it is the exact landing point the issue is
-    // about. IsInFlight is Unit.h:1709 and IsFalling Unit.h:1718, both public;
-    // IsFalling reads the movement flags AND the spline (Unit.cpp:15957-15961),
-    // so a leader mid-drop off a ledge is caught as well as one on a taxi.
+    // Is the leader alive and standing somewhere a follower can be sent? A
+    // position in the air is not an aim, and a dead character's position is
+    // its corpse, not its live location. IsInFlight is Unit.h:1709 and
+    // IsFalling Unit.h:1718, both public; IsFalling reads the movement flags
+    // AND the spline (Unit.cpp:15957-15961), so a leader mid-drop off a ledge
+    // is caught as well as one on a taxi.
     // Asked of the WORLD rather than of this module's own flight bookkeeping,
     // for the reason DriveTravel's in-flight guard gives: a taxi upstream
     // rolled on its own is still a taxi.
     static bool OnTheGround(Player* p)
     {
-        return p && p->IsInWorld() && !p->IsInFlight() && !p->IsFalling();
+        return p && p->IsInWorld() && p->IsAlive() && !p->IsInFlight() &&
+               !p->IsFalling();
     }
 
     // THE ONE READING, TAKEN THE SAME WAY AT BOTH CALL SITES (#241). Two
@@ -20227,7 +20308,7 @@ private:
                       : "it never took off, so it follows its leader again on foot");
     }
 
-    void DriveCatchUp(Player* p, Player* leader)
+    void DriveCatchUp(Player* p, Player* leader, std::string const& rosterLeaderName)
     {
         std::string const name = p->GetName();
         SettleFlightLoan(p, name);
@@ -20335,8 +20416,9 @@ private:
             // leader who has walked on is re-aimed at, measured from memory of
             // where the last aim pointed, at FOLLOW_CATCH_UP_REAIM_YARDS - see
             // that constant for why the figure is what it is. A leader in the
-            // air is simply not re-aimed at: the follower keeps walking to the
-            // last place he stood, which is a place a character can stand.
+            // air, or dead, is simply not re-aimed at: the follower keeps
+            // walking to the last place he stood alive, which is a place a
+            // character can stand, and never to a corpse (#736).
             //
             // RE-CLAIMED EVERY POLL EITHER WAY, exactly as the run's
             // EscortToward is. TravelAimBook::Claim is idempotent against the
@@ -20372,7 +20454,7 @@ private:
             // statements above, so this branch is only ever on one map.
             aim.followerGapToLeader = gap;
             if (OverseerDecisions::CatchUpAimIsStale(aim, FOLLOW_CATCH_UP_AIM_LIMITS))
-                CatchUpToward(name, leader);
+                CatchUpToward(name, leader, rosterLeaderName);
             else if (!_travelAims.Claim(name, it->second.aim,
                                         OverseerDecisions::TravelOwner::CatchUp))
                 _catchUpRefused[name] = _travelAims.ClaimRefusal(name);
@@ -20522,7 +20604,7 @@ private:
         if (!stranded && FollowStepHolds(p, leader))
             return;
 
-        if (CatchUpToward(name, leader))
+        if (CatchUpToward(name, leader, rosterLeaderName))
             LOG_INFO("module.overseer",
                      "overseer: '{}' is {} yards behind '{}' and {} - so it is released "
                      "to walk to where the leader stands under its own aim, and handed "
@@ -21163,7 +21245,7 @@ private:
         if (walk != _dungeonEscorts.end() && !walk->second.catchUp)
             return;  // another owner's walk still has him; asked again next poll
         _catchUpRefused.erase(leaderName);
-        CatchUpToward(leaderName, target);
+        CatchUpToward(leaderName, target, std::string());
         auto const aimed = _dungeonEscorts.find(leaderName);
         if (aimed != _dungeonEscorts.end() && aimed->second.catchUp)
         {

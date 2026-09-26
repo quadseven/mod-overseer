@@ -1852,6 +1852,26 @@ bool HeadTakesTheLead(bool headNamed, bool headPresent, bool headInThisGroup,
     return headNamed && headPresent && headInThisGroup && !headLeads;
 }
 
+FamilyLeadership DecideFamilyLeadership(bool rosterLeaderPresent,
+                                        bool partyLeaderIsRosterLeader,
+                                        bool leaderCarriesNewRpg)
+{
+    if (!rosterLeaderPresent || !partyLeaderIsRosterLeader)
+        return FamilyLeadership{FamilyLeader::None, true, false};
+    return FamilyLeadership{FamilyLeader::RosterLeader, false,
+                            !leaderCarriesNewRpg};
+}
+
+CatchUpAimSource DecideCatchUpAimSource(bool rosterLeaderPresent,
+                                        bool candidateIsRosterLeader,
+                                        bool surveyedRoutePoint)
+{
+    if (!rosterLeaderPresent || !candidateIsRosterLeader)
+        return CatchUpAimSource::Unavailable;
+    return surveyedRoutePoint ? CatchUpAimSource::SurveyedRoutePoint
+                              : CatchUpAimSource::RosterLeaderPosition;
+}
+
 FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats)
 {
     FamilyGroupPlan plan;
