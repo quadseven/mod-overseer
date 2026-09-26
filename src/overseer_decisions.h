@@ -8126,6 +8126,27 @@ char const* LoneLegStepWord(LoneLegStep step);
 // The reason in words, for the log line and the regroup's refusal.
 char const* LoneLegReasonWord(LoneLegReason why);
 
+// A member already held for a far catch-up must not wait on ground that the
+// #697 lone-walker rule calls lethal.
+struct HeldGroundFacts
+{
+    uint32_t memberLevel{0};
+    uint32_t groundTopLevel{0};
+    uint32_t levelGap{3};
+    bool hearthReady{false};
+    bool safeSpotKnown{false};
+    uint32_t recentDeathsHere{0};
+};
+
+enum class HeldGroundStep : std::uint8_t { Hold, Hearth, WalkToSafety };
+struct HeldGroundVerdict
+{
+    HeldGroundStep step{HeldGroundStep::Hold};
+    char const* reason{"ground is survivable or no safe move is known"};
+};
+
+HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts);
+
 // One spawn of the wanted role standing on the character's own map. The
 // caller has already asked whether this character may interact with it, the
 // same way the bank and repair candidate lists arrive already asked.
