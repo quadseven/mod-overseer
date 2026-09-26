@@ -6813,6 +6813,8 @@ HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts)
 {
     // THE SAME THREE-LEVEL MARGIN AS #697'S LONE-LEG TEST. Unknown ground is
     // not evidence that a stationary hold is lethal.
+    if (facts.resting)
+        return {HeldGroundStep::Hold, "an inn or a city is never lethal ground"};
     if (!facts.groundTopLevel || facts.groundTopLevel < facts.memberLevel + facts.levelGap)
         return {HeldGroundStep::Hold, "ground is below the #697 lethal margin"};
     if (facts.hearthReady)
@@ -6824,7 +6826,11 @@ HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts)
 
 RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& facts)
 {
-    if (!facts.sick || facts.groundTopLevel < facts.memberLevel + facts.levelGap)
+    // AN INN OR A CITY IS NEVER LETHAL GROUND. Measured: Zug, resting in the
+    // Valley of Strength, read a level 80 spawn within 30 yards and hearthed
+    // thirty feet to Orgrimmar's inn.
+    if (!facts.sick || facts.resting ||
+        facts.groundTopLevel < facts.memberLevel + facts.levelGap)
         return RevivedSickGroundStep::Stay;
     return facts.hearthReady ? RevivedSickGroundStep::Hearth
                              : RevivedSickGroundStep::HoldOutOfCombat;

@@ -20578,9 +20578,11 @@ private:
                 {
                     OverseerDecisions::HeldGroundFacts ground;
                     ground.memberLevel = p->GetLevel();
-                    ground.groundTopLevel = HostileSpawnsNear(p, p->GetMapId(), p->GetPositionX(),
-                                                              p->GetPositionY(),
-                                                              REVIVAL_AGGRO_RADIUS, 0).level;
+                    ground.resting = p->HasPlayerFlag(PLAYER_FLAGS_RESTING);
+                    ground.groundTopLevel = ground.resting
+                        ? 0u
+                        : HostileSpawnsNear(p, p->GetMapId(), p->GetPositionX(),
+                                            p->GetPositionY(), REVIVAL_AGGRO_RADIUS, 0).level;
                     ground.levelGap = LONE_LEG_LIMITS.levelGap;
                     uint32 const stone = HearthstoneSpellOf(p);
                     ground.hearthReady = stone && !p->HasSpellCooldown(stone) &&
@@ -26728,8 +26730,11 @@ private:
         OverseerDecisions::RevivedSickGroundFacts facts;
         facts.sick = sick;
         facts.memberLevel = bot->GetLevel();
-        facts.groundTopLevel = HostileSpawnsNear(bot, bot->GetMapId(), bot->GetPositionX(),
-                                                 bot->GetPositionY(), REVIVAL_AGGRO_RADIUS, 0).level;
+        facts.resting = bot->HasPlayerFlag(PLAYER_FLAGS_RESTING);
+        facts.groundTopLevel = facts.resting
+            ? 0u
+            : HostileSpawnsNear(bot, bot->GetMapId(), bot->GetPositionX(),
+                                bot->GetPositionY(), REVIVAL_AGGRO_RADIUS, 0).level;
         facts.levelGap = LONE_LEG_LIMITS.levelGap;
         uint32 const stone = HearthstoneSpellOf(bot);
         facts.hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
@@ -29693,6 +29698,8 @@ private:
         // line while none of them is worth twelve a minute. 255 is "nothing
         // said yet" and is not a CrossingAction.
         uint8 crossingSaid{255};
+        // When a long berth hold last said why it is still holding.
+        time_t crossingHoldSaidAt{0};
         // The berth sweep, kept against the berth it answered about. See
         // BerthIsGuarded: this caches a reading of static spawn data, not a
         // reading of the live grid, which is the only reason it may be
@@ -36150,9 +36157,28 @@ private:
                              leaderName, boat,
                              std::fabs(leader->GetPositionZ() - route.berthZ), why);
                 if (fresh)
+                {
+                    coord.crossingHoldSaidAt = std::time(nullptr);
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is at the berth for '{}' on map {} - {}",
                              leaderName, boat, route.world.originMap, why);
+                }
+                // A HOLD THAT NEVER ENDS WAS SILENT. The line above is said on
+                // the transition only, so a leader held on the pier for half an
+                // hour beside a moored ship said nothing about which of the
+                // three boarding conditions was failing. Once a minute it says.
+                else if (std::time(nullptr) - coord.crossingHoldSaidAt >= 60)
+                {
+                    coord.crossingHoldSaidAt = std::time(nullptr);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' still holds at the berth for '{}' - transport found "
+                             "{}, docked here {}, stop left {}ms (needs {}), {} of {} member(s) "
+                             "gathered, level with the berth {}",
+                             leaderName, boat, route.world.transportFound ? "yes" : "no",
+                             route.world.dockedAtOrigin ? "yes" : "no", route.world.dwellLeftMs,
+                             CROSSING_MIN_BOARD_DWELL_MS, step.gathered + 1, step.waiting,
+                             LevelWithBerth(leader, route) ? "yes" : "no");
+                }
                 break;
 
             case OverseerDecisions::CrossingAction::Fetch:
