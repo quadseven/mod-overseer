@@ -31109,7 +31109,49 @@ private:
             return "still on map " + std::to_string(insideMapId) + ": " + inside;
         if (!fighting.empty())
             return "still in combat: " + fighting;
-        return "";
+
+        // AND THE COPY ITSELF MUST BE EMPTY, WHOEVER IS IN IT. The loop above
+        // counts only family members this module steers; the core refuses the
+        // reset for ANY player standing in the bound copy (InstanceMap::Reset
+        // returns m_mapRefMgr.IsEmpty()). Five attempts on 2026-09-25 asked
+        // anyway, three times in ten seconds each, and closed reset_failed
+        // naming nobody. Waiting here costs the reset backstop at most, and
+        // the hold line names who is inside.
+        uint32 instanceId = 0;
+        std::vector<std::string> const occupants =
+            PlayersInBoundCopy(leader, insideMapId, instanceId);
+        return OverseerDecisions::InstanceOccupiedBlocker(insideMapId, instanceId, occupants,
+                                                          members);
+    }
+
+    // EVERY PLAYER STANDING IN THE COPY OF `insideMapId` THE LEADER IS BOUND TO,
+    // bot or client, family or not - the same list InstanceMap::Reset reads.
+    // Empty when he is bound to no copy or the copy is not loaded, which is
+    // also when the core would reset it (Group::ResetInstances: `!map ||
+    // Reset()`). `instanceId` is the bound copy's id, 0 when there is none.
+    static std::vector<std::string> PlayersInBoundCopy(Player* leader, uint32 insideMapId,
+                                                       uint32& instanceId)
+    {
+        std::vector<std::string> names;
+        instanceId = 0;
+        if (!leader)
+            return names;
+        // PlayerGetBoundInstance  InstanceSaveMgr.h:207
+        InstancePlayerBind* bind = sInstanceSaveMgr->PlayerGetBoundInstance(
+            leader->GetGUID(), insideMapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (!bind || !bind->save)
+            return names;
+        instanceId = bind->save->GetInstanceId();
+        // FindMap  MapMgr.h  Map* FindMap(uint32 mapId, uint32 instanceId) const,
+        // the lookup Group::ResetInstances itself makes.
+        Map* map = sMapMgr->FindMap(insideMapId, instanceId);
+        if (!map)
+            return names;
+        // GetPlayers  Map.h  MapRefMgr& GetPlayers()
+        for (MapReference const& ref : map->GetPlayers())
+            if (Player* player = ref.GetSource())
+                names.push_back(player->GetName());
+        return names;
     }
 
     // DO THE RESET, AND THEN READ THE WORLD BACK.
@@ -31213,10 +31255,20 @@ private:
         if (InstancePlayerBind* after = sInstanceSaveMgr->PlayerGetBoundInstance(
                 leader->GetGUID(), insideMapId, DUNGEON_DIFFICULTY_NORMAL))
         {
+            // AND WHO WAS IN IT, read the same way the gate before the reset
+            // reads it, so a refusal that gate did not predict says so.
+            uint32 copy = 0;
+            std::vector<std::string> const occupants =
+                PlayersInBoundCopy(leader, insideMapId, copy);
+            std::string inIt;
+            for (std::string const& name : occupants)
+                inIt += (inIt.empty() ? "" : ", ") + name;
             why = "'" + leaderName + "' is still bound to instance " +
                   std::to_string(after->save ? after->save->GetInstanceId() : 0) +
                   " on map " + std::to_string(insideMapId) +
-                  " after the reset, so the instance was not empty when it was asked";
+                  " after the reset, so the instance was not empty when it was asked" +
+                  (inIt.empty() ? std::string(" (nobody is standing in it now)")
+                                : " (in it now: " + inIt + ")");
             return false;
         }
 
@@ -39562,7 +39614,11 @@ private:
                 // the two look different in the log because they are different.
                 std::string const where =
                     onTheOutsideMap
-                        ? OverseerDecisions::ApproachWhere(gap)
+                        // WHICH POINT THE YARDS ARE TO. On the corridor leg
+                        // the gap is to the corridor's start, and "73y out"
+                        // read as the door sent four closes' worth of
+                        // diagnosis to the staging point (2026-09-25/26).
+                        ? OverseerDecisions::ApproachWhereOnLeg(gap, onTheCorridor)
                         : "on map " + std::to_string(uint32(leader->GetMapId())) +
                               " rather than map " + std::to_string(portal->outsideMapId);
                 // AND IT NAMES THE OTHER CAUSE TOO (#367), which the reading
