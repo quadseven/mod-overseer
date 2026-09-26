@@ -351,6 +351,32 @@ bool NearTheVoidPlane(float currentZ, float catchYards)
     return currentZ <= VOID_PLANE_Z + catchYards;
 }
 
+bool ProvenBelowTheWorld(TerrainReading const& reading,
+                         TerrainRecoveryLimits const& limits)
+{
+    bool const onTheGround =
+        ReadingStandsOnTheGround(reading, limits.footingReach);
+    bool const gap =
+        BelowTerrainNeedsRecovery(reading.z, reading.surfaceAboveZ,
+                                  reading.surfaceValid, onTheGround,
+                                  limits.minimumGap) ||
+        LargeSurfaceMismatchNeedsRecovery(reading.z, reading.surfaceAboveZ,
+                                          reading.surfaceValid, onTheGround,
+                                          limits.overrideGap);
+    if (!gap || onTheGround)
+        return false;
+    return !reading.movementMeasured || reading.falling;
+}
+
+UnmeasuredLeaderGround ClassifyUnmeasuredLeaderGround(bool leaderFalling,
+                                                      bool polygonAtItsFeet)
+{
+    if (leaderFalling)
+        return UnmeasuredLeaderGround::WaitForLanding;
+    return polygonAtItsFeet ? UnmeasuredLeaderGround::AimAtLeader
+                            : UnmeasuredLeaderGround::Unmeasurable;
+}
+
 namespace
 {
 
@@ -461,6 +487,32 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         LargeSurfaceMismatchNeedsRecovery(reading.z, reading.surfaceAboveZ,
                                           reading.surfaceValid, onTheGround,
                                           limits.overrideGap);
+    // THE SUSTAINED-FALL WINDOW (#725), tracked before the early return so a
+    // clean poll closes it. Open only while the character is measured falling
+    // with nothing under it; a poll gap longer than the window itself means
+    // the drive was not looking (a stand-down), so the window starts again
+    // rather than counting time nobody measured.
+    bool const fallingUnsupported =
+        holds && !onTheGround && reading.movementMeasured && reading.falling;
+    if (!fallingUnsupported ||
+        (state.fallingSince &&
+         now - state.fallingSeen > limits.fallingWindowSeconds) ||
+        (state.fallingSince &&
+         reading.z > state.fallingStartZ + limits.footingReach))
+    {
+        state.fallingSince = 0;
+        state.fallingSeen = 0;
+    }
+    if (fallingUnsupported)
+    {
+        if (!state.fallingSince)
+        {
+            state.fallingSince = now;
+            state.fallingStartZ = reading.z;
+        }
+        state.fallingSeen = now;
+    }
+
     if (!holds)
         return TerrainRecoveryVerdict{};
 
@@ -495,13 +547,6 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
     }
 
     float const ordinaryLiftZ = reading.surfaceAboveZ + limits.liftClearance;
-    if (!NearTheVoidPlane(reading.z, limits.voidCatchYards) &&
-        !LiftDestinationIsValid(reading.z, ordinaryLiftZ, reading.surfaceValid,
-                                limits.maxLiftYards))
-    {
-        state.lastAttempt = now;
-        return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
-    }
 
     // THE LAST STRETCH ABOVE THE KILL PLANE, WHERE THE BOUND STOPS APPLYING
     // (#188). Read this AFTER the on-the-ground branch above and not before
@@ -540,6 +585,39 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         return TerrainRecoveryVerdict{
             TerrainRemedy::LiftToSurface,
             ordinaryLiftZ};
+    }
+
+    // NOT FALLING IS STANDING ON SOMETHING (#725). Read after the void catch,
+    // which answers a different question and keeps its own bound, and before
+    // anything that can lift. Every lift outside the band used to rest on a
+    // surface overhead plus the ABSENCE of a navmesh polygon and of a floor
+    // the probes could see - and in Orgrimmar, the Cleft of Shadow, caves and
+    // bridges that is simply what the ground reads as. On 2026-09-26 'Zug'
+    // was lifted from (1830.7, -3956.4, 19.1) to z 47.5 mid-walk and fell
+    // back down the rock wall on the operator's stream. A lift is a teleport;
+    // it is only a remedy for a character the world is not holding up.
+    if (reading.movementMeasured)
+    {
+        if (!reading.falling)
+        {
+            if (state.saidNotFalling)
+                return TerrainRecoveryVerdict{};
+            state.saidNotFalling = true;
+            return TerrainRecoveryVerdict{TerrainRemedy::NotFalling, 0.f};
+        }
+        // Falling: let the fall finish. Only a fall that has gone on, with
+        // nothing under it and without the body rising, for the whole window
+        // is one the world is not going to end.
+        if (limits.fallingWindowSeconds <= 0 || !state.fallingSince ||
+            now - state.fallingSince < limits.fallingWindowSeconds)
+            return TerrainRecoveryVerdict{};
+    }
+
+    if (!LiftDestinationIsValid(reading.z, ordinaryLiftZ, reading.surfaceValid,
+                                limits.maxLiftYards))
+    {
+        state.lastAttempt = now;
+        return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
     }
 
     // NO POLYGON. The ladder, and it is short on purpose: the failure this
@@ -2303,6 +2381,7 @@ bool TerrainRemedyEndsTheErrand(TerrainRemedy remedy, bool onTheGround)
         case TerrainRemedy::Nothing:       return false;
         case TerrainRemedy::LiftToSurface: return true;
         case TerrainRemedy::GiveUp:        return !onTheGround;
+        case TerrainRemedy::NotFalling:    return false;
     }
     return true;
 }
