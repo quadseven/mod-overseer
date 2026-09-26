@@ -49,11 +49,13 @@ run_decisions() {
   local workdir
   workdir="$(mktemp -d)"
   trap 'rm -rf "$workdir"' RETURN
+  # Compiled once and linked into every test, as check.decisions.yml does.
+  g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o "$workdir/overseer_decisions.o"
   for test_src in tests/test_*.cpp; do
     found=1
     name="$(basename "$test_src" .cpp)"
     echo "-- $test_src"
-    g++ -std=c++17 -Wall -Wextra -Isrc src/overseer_decisions.cpp "$test_src" -o "$workdir/$name"
+    g++ -std=c++17 -Wall -Wextra -Isrc "$workdir/overseer_decisions.o" "$test_src" -o "$workdir/$name"
     "$workdir/$name"
   done
   test "$found" = 1 || { echo "no tests/test_*.cpp found" >&2; return 1; }
