@@ -1135,6 +1135,34 @@ float ApproachDistance(ApproachGap const& gap);
 // because every failure line this replaces named the symptom and not the cause.
 std::string ApproachWhere(ApproachGap const& gap);
 
+// THE SAME WORDS, SAYING WHICH POINT THE YARDS ARE MEASURED TO. On a corridor
+// door the leader first walks to the corridor's start, and while he does the
+// gap is measured to THAT point, not to the staging point. Measured on the dev
+// realm 2026-09-25/26: four Ragefire runs in a row closed "GATHERING held for
+// more than 12 minutes and never opened - Uzza (73y out)". The 73 yards were
+// to the corridor's start on the pass; the leader stood 70 yards (flat) from
+// the staging point, 22 yards off corridor point 2, and did not move. Read as
+// "73 yards from the door", the line sent the diagnosis to the staging point.
+// `toCorridorStart` false gives ApproachWhere's words unchanged.
+std::string ApproachWhereOnLeg(ApproachGap const& gap, bool toCorridorStart);
+
+// ------------------------------- a reset needs the instance empty (#144) --
+//
+// WHO IS STANDING IN THE INSTANCE THE RESET IS ABOUT TO ASK FOR, in words, or
+// empty when nobody is. Group::ResetInstances resets a bound instance only
+// when InstanceMap::Reset finds its map empty, so a reset asked while anybody
+// stands in it is refused, and the refusal reached the run only as "still
+// bound to instance 10 ... the instance was not empty". Measured on the dev
+// realm 2026-09-25: five Ragefire attempts in a row closed that way, each
+// asking three times in ten seconds and naming nobody. The roster check before
+// it counts only the family members this module steers on the map; this is
+// the core's own list of the players in that one copy, family or not, so the
+// run waits (and walks its own members out) instead of asking and failing.
+// `occupants` is every player on the instance map; `family` is the roster.
+std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceId,
+                                    std::vector<std::string> const& occupants,
+                                    std::vector<std::string> const& family);
+
 // A DOOR AT THE BOTTOM OF A RAVINE IS REACHED BY A CORRIDOR, NOT BY A BEARING
 // (#242).
 //

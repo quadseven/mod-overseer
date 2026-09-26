@@ -1187,6 +1187,39 @@ std::string ApproachWhere(ApproachGap const& gap)
     return where;
 }
 
+std::string ApproachWhereOnLeg(ApproachGap const& gap, bool toCorridorStart)
+{
+    std::string where = ApproachWhere(gap);
+    if (toCorridorStart)
+        where += " from the start of the approach corridor, not the staging point";
+    return where;
+}
+
+std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceId,
+                                    std::vector<std::string> const& occupants,
+                                    std::vector<std::string> const& family)
+{
+    if (occupants.empty())
+        return "";
+    std::string names;
+    for (std::string const& name : occupants)
+    {
+        bool ours = false;
+        for (std::string const& member : family)
+            if (member == name)
+            {
+                ours = true;
+                break;
+            }
+        if (!names.empty())
+            names += ", ";
+        names += name + (ours ? " (family)" : " (not of this family)");
+    }
+    return "instance " + std::to_string(instanceId) + " of map " + std::to_string(mapId) +
+           " still has " + std::to_string(occupants.size()) +
+           " player(s) in it, and the core resets only an empty instance: " + names;
+}
+
 ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& route,
                             ApproachLimits const& limits)
 {
