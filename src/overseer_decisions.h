@@ -8136,6 +8136,8 @@ struct HeldGroundFacts
     bool hearthReady{false};
     bool safeSpotKnown{false};
     uint32_t recentDeathsHere{0};
+    // In an inn or a city (the core's resting flag): under guards, never lethal.
+    bool resting{false};
 };
 
 enum class HeldGroundStep : std::uint8_t { Hold, Hearth, WalkToSafety };
@@ -17239,6 +17241,8 @@ struct RevivedSickGroundFacts
     uint32_t groundTopLevel{0};
     uint32_t levelGap{3};
     bool hearthReady{false};
+    // In an inn or a city (the core's resting flag): under guards, never lethal.
+    bool resting{false};
 };
 RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& facts);
 
