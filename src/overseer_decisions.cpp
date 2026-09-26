@@ -9446,13 +9446,25 @@ StagingCorridorPlan PlanStagingCorridor(std::vector<RoutePoint> const& corridor,
     // stamping it here rather than after the test is what lets a caller that is
     // too far off walk TOWARD the corridor instead of abandoning it. See the
     // header on TooFarToJoin for the journey that was being thrown away.
-    plan.joinIndex = join;
-    plan.joinYards = joinDistance;
+    // A LONG CITY CROSSING IS NOT A CORRIDOR JOIN. The nearest point can be
+    // hundreds of yards away through walls even when the corridor has a
+    // walkable entry on the surveyed graph. Route to the end opposite the aim
+    // first, then let the corridor take over once that measured entry is near.
+    // This keeps the unmeasured leg on the surveyed planner (#217, #396).
     if (joinDistance > limits.joinYards)
     {
+        if (limits.distantJoinAtEntry)
+        {
+            join = end == 0 ? corridor.size() - 1 : 0;
+            joinDistance = PlaneDistance(corridor[join].x, corridor[join].y, fromX, fromY);
+        }
+        plan.joinIndex = join;
+        plan.joinYards = joinDistance;
         plan.verdict = StagingCorridorVerdict::TooFarToJoin;
         return plan;
     }
+    plan.joinIndex = join;
+    plan.joinYards = joinDistance;
 
     // WALKING TOWARD THE AIM, WHICHEVER WAY ALONG THE CORRIDOR THAT IS (#356).
     // The points between the join and the aim are the walk either way round;

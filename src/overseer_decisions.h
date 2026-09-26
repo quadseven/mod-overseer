@@ -10922,6 +10922,9 @@ struct StagingCorridorLimits
     // routes with a different lookahead must pass its own; the corridor this
     // module ships stands 193 yards apart at its widest.
     float maxLegYards{250.f};
+    // A character too far from a city corridor must reach its entry by survey
+    // before joining. Other callers retain nearest-point catch-up behavior.
+    bool distantJoinAtEntry{false};
 };
 
 struct StagingCorridorPlan
