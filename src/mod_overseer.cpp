@@ -10106,7 +10106,9 @@ private:
             {
                 if (!leader->IsAlive() || leader->IsInCombat())
                     WaiveLeaderDwell(leaderName);
-                if (OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(leaderName), false))
+                bool const campaignActive = FamilyOnADungeonRun(FamilyOfCharacter(leaderName));
+                if (OverseerDecisions::QuestDriveMayTakeCampaignLeader(campaignActive) &&
+                    OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(leaderName), false))
                     AskForLeader(leaderName, OverseerDecisions::LeaderIntentKind::QuestDrive,
                                  "quest drive", std::string(),
                                  "the family travels on the leader's own quest status");
@@ -11818,6 +11820,31 @@ private:
                            std::map<std::string, std::string> const& travelAims,
                            std::map<std::string, std::string> const& jobs)
     {
+        std::string leaderName;
+        for (auto const& row : roster)
+            if (row.second)
+                leaderName = row.first;
+        bool const campaignActive = !leaderName.empty() &&
+                                    FamilyOnADungeonRun(FamilyOfCharacter(leaderName));
+        // THE CAMPAIGN OWNS ITS LEADER UNTIL IDLE (#557). RECOVERING includes
+        // its backoff, so a quest in the leader's log cannot pull the family
+        // out of the town where the next campaign step expects it.
+        if (!OverseerDecisions::QuestDriveMayTakeCampaignLeader(campaignActive))
+        {
+            if (_questCampaignWaitSaid.insert(leaderName).second)
+            {
+                auto const coord = _dungeonRunCoordinators.find(FamilyOfCharacter(leaderName));
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' quest drive stands down because its dungeon campaign "
+                         "is {}; the family waits in town",
+                         leaderName, coord == _dungeonRunCoordinators.end()
+                                         ? "active"
+                                         : DungeonRunPhaseName(coord->second.phase));
+            }
+            return;
+        }
+        if (!leaderName.empty())
+            _questCampaignWaitSaid.erase(leaderName);
         // Everybody present and steerable this tick. Resolved once here and
         // never held past this call: the pointers are valid for the length of
         // this world-thread tick and nothing below logs anybody out.
@@ -12373,8 +12400,27 @@ private:
                 if (!quest)
                     continue;
 
-                candidates.push_back(
-                    {questId, quest, QuestServesTheYoungest(questId, bot, youngest, present)});
+                // A QUEST DRIVE CANNOT TAKE THE FAMILY ABOVE ITS YOUNGEST
+                // MEMBER (#697). QuestLevel and MinLevel are the template's
+                // quest and minimum levels; either can describe the ground
+                // this target would take the party onto.
+                if (youngest && !OverseerDecisions::QuestDriveTargetFitsYoungest(
+                                    static_cast<int>(youngest->GetLevel()),
+                                    quest->GetQuestLevel(), quest->MinLevel,
+                                    LONE_LEG_LIMITS.levelGap))
+                {
+                    if (_questLevelRefusalSaid.insert(questId).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: quest {} ({}) refused for '{}' - level {} exceeds "
+                                 "youngest member's level {} by more than {}",
+                                 questId, quest->GetTitle(), name, std::max(quest->GetQuestLevel(),
+                                 quest->MinLevel), static_cast<uint32>(youngest->GetLevel()),
+                                 LONE_LEG_LIMITS.levelGap);
+                    skipped = true;
+                    continue;
+                }
+                candidates.push_back({questId, quest,
+                                      QuestServesTheYoungest(questId, bot, youngest, present)});
             }
 
             // The best-scoring candidate, and on a tie the EARLIEST slot -
@@ -60815,6 +60861,12 @@ private:
         RepickMemory repick;
     };
     std::map<std::string, AimState> _lastAim;
+    // A campaign phase holds each leader's quest drive. One line per
+    // continuous wait; cleared when the coordinator returns to Idle.
+    std::set<std::string> _questCampaignWaitSaid;
+    // Quest templates are stable for the process lifetime, so each rejected
+    // quest is logged once rather than once per family poll.
+    std::set<uint32> _questLevelRefusalSaid;
     // Last successful council aim read. A failed SELECT must not look like a
     // deliberate clear and restart every active quest on the next good poll.
     std::map<std::string, uint32> _questAims;

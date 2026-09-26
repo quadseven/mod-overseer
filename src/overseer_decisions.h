@@ -2879,6 +2879,14 @@ unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewe
 // True for any streak of one or more attempts that never got inside.
 bool DungeonCampaignRecovers(unsigned trailingFailures);
 
+// A campaign owns its family's leader until its coordinator returns to Idle.
+bool QuestDriveMayTakeCampaignLeader(bool campaignActive);
+
+// A quest drive must not choose work above the youngest member by more than
+// the shared lone-leg level gap. Quest levels are supplied by quest_template.
+bool QuestDriveTargetFitsYoungest(int youngestLevel, int questLevel, int minLevel,
+                                  int maximumLevelGap);
+
 // A RECOVERY THE MODULE WROTE DOWN AND HAS NOT APPLIED OUTLIVES A RESTART
 // (2026-09-24). Measured on the dev realm: the Horde family's campaign 12
 // failed its seventh attempt in a row at 10:47:59 ("GATHERING was refused: the
