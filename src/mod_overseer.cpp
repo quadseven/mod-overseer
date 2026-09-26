@@ -12406,7 +12406,7 @@ private:
                 // this target would take the party onto.
                 if (youngest && !OverseerDecisions::QuestDriveTargetFitsYoungest(
                                     static_cast<int>(youngest->GetLevel()),
-                                    quest->GetQuestLevel(), quest->MinLevel,
+                                    quest->GetQuestLevel(), static_cast<int>(quest->GetMinLevel()),
                                     LONE_LEG_LIMITS.levelGap))
                 {
                     if (_questLevelRefusalSaid.insert(questId).second)
@@ -12414,7 +12414,7 @@ private:
                                  "overseer: quest {} ({}) refused for '{}' - level {} exceeds "
                                  "youngest member's level {} by more than {}",
                                  questId, quest->GetTitle(), name, std::max(quest->GetQuestLevel(),
-                                 quest->MinLevel), static_cast<uint32>(youngest->GetLevel()),
+                                 static_cast<int32>(quest->GetMinLevel())), static_cast<uint32>(youngest->GetLevel()),
                                  LONE_LEG_LIMITS.levelGap);
                     skipped = true;
                     continue;
