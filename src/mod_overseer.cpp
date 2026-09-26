@@ -34304,13 +34304,16 @@ private:
                    : OverseerDecisions::RitualSummonerChoice();
         if (leader && available.name.empty())
         {
-            doneWhy = "no qualifying summoner: " + available.why;
-            if (coord.summonSaid != doneWhy)
+            // The sentence lives on the coordinator, which outlives this poll;
+            // doneWhy is a pointer the caller reads after we return.
+            std::string const why = "no qualifying summoner: " + available.why;
+            if (coord.summonSaid != why)
             {
-                coord.summonSaid = doneWhy;
+                coord.summonSaid = why;
                 LOG_WARN("module.overseer", "overseer: summon rung for '{}' ends - {}",
-                         leaderName, doneWhy);
+                         leaderName, why);
             }
+            doneWhy = coord.summonSaid.c_str();
             return true;
         }
 
