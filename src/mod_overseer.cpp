@@ -50615,7 +50615,7 @@ private:
             deposits = r->Fetch()[0].Get<uint64>();
             withdrawals = r->Fetch()[1].Get<uint64>();
         }
-        uint64 const amount = GuildBankGoldToDiscard(bankMoney, deposits, withdrawals);
+        uint64 const amount = OverseerDecisions::GuildBankGoldToDiscard(bankMoney, deposits, withdrawals);
         o << ",\"guild\":" << J(guild->GetName()) << ",\"bank_money\":" << bankMoney
           << ",\"family_deposits\":" << deposits << ",\"family_withdrawals\":" << withdrawals
           << ",\"would_discard\":" << amount;
