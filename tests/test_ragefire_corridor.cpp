@@ -64,7 +64,7 @@ constexpr float STANDOFF = 20.f;           // DUNGEON_STAGING_STANDOFF_YARDS
 constexpr float BARRIER = 10.f;            // DUNGEON_BARRIER_RADIUS_YARDS
 constexpr float STEP = 60.f;               // TRAVEL_STEP_YARDS
 constexpr float STEP_VERTICAL = 20.f;      // TRAVEL_STEP_VERTICAL_YARDS
-constexpr float ROUTE_MIN = 400.f;         // TRAVEL_ROUTE_MIN_YARDS, the join bound
+constexpr float JOIN_RADIUS = 15.f;        // close enough to step onto the corridor
 constexpr float LOOKAHEAD = 250.f;         // TRAVEL_ROUTE_LOOKAHEAD_YARDS
 constexpr float HOME_TOWN = 250.f;         // CAMPAIGN_HOME_TOWN_YARDS
 // PathGenerator smooths at most MAX_POINT_PATH_LENGTH 74 points of
@@ -193,9 +193,27 @@ StagingPoint Staging()
 StagingCorridorLimits AdapterLimits()
 {
     StagingCorridorLimits limits;
-    limits.joinYards = ROUTE_MIN;
+    limits.joinYards = JOIN_RADIUS;
     limits.maxLegYards = LOOKAHEAD;
+    limits.distantJoinAtEntry = true;
     return limits;
+}
+
+// A LEADER ON THE CITY'S UPPER WALKWAYS DOES NOT JOIN THE NEAREST LOWER
+// CORRIDOR POINT THROUGH A WALL (#217, #396). The surveyed route must reach the
+// corridor entry first, even when point 9 is only 303 yards away in a straight
+// line.
+void TheFarCityJoinStartsAtTheSurveyedEntry(Row const& row)
+{
+    if (row.corridor.size() < 2)
+        return;
+    RoutePoint const city{1769.f, -4082.f, 44.f};
+    StagingCorridorPlan const plan = PlanStagingCorridor(
+        row.corridor, row.approachX, row.approachY, city.x, city.y, AdapterLimits());
+    Check("the far city position is routed to the corridor before joining",
+          plan.verdict == StagingCorridorVerdict::TooFarToJoin);
+    Check("the far join is the corridor entry rather than the nearest point",
+          plan.joinIndex == 0);
 }
 
 void TheRowCarriesACorridorThatEndsOnTheStagingPoint(Row const& row)
@@ -318,6 +336,7 @@ int main()
     TheRowCarriesACorridorThatEndsOnTheStagingPoint(row);
     TheHomeIsTheOrgrimmarInn(row);
     TheCorridorIsUsedForTheWalksThatNeedIt(row);
+    TheFarCityJoinStartsAtTheSurveyedEntry(row);
     TheFirstLegIsWalkableFromWhereThePartyArrives(row);
 
     if (failures)

@@ -2379,6 +2379,8 @@ constexpr uint32 DUNGEON_RUN_POLL_MS = 5000;
 // constant the way INTERACTION_DISTANCE is (see TRAVEL_ARRIVED_POSITION_YARDS
 // above), so this is that consensus number, not a measurement.
 constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
+// A nearby corridor point may be stepped onto; farther city joins need survey.
+constexpr float DUNGEON_CORRIDOR_JOIN_YARDS = 15.0f;
 
 // AND THE OTHER TWO DIMENSIONS OF IT (#217). The radius above is a circle drawn
 // on a map, and for the whole of this module's life it was the entire content
@@ -18394,8 +18396,11 @@ private:
         // it or RouteLegStep cannot advance. Passing them rather than leaning on
         // the header's defaults means a change to either cannot leave the
         // corridor rule reading a stale copy.
-        limits.joinYards = TRAVEL_ROUTE_MIN_YARDS;
+        // A corridor is joined directly only at close range. Farther away, the
+        // surveyed planner to the corridor entry (#217, #396).
+        limits.joinYards = DUNGEON_CORRIDOR_JOIN_YARDS;
         limits.maxLegYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
+        limits.distantJoinAtEntry = true;
 
         for (DungeonPortal const& portal : DungeonPortals())
         {
@@ -18627,14 +18632,11 @@ private:
         // one, and it is strictly more than the leg had before, when it was one
         // stretch of a route whose LAST legs were the ones that killed.
         //
-        // AND THE NEAREST POINT IS THE RIGHT ONE TO AIM AT for the same reason
-        // it is the right one to join at: the corridor cannot say anything about
-        // ground it did not measure, so the only quantity this rule can honestly
-        // minimise is the number of yards spent off it, and the nearest point is
-        // what minimises it. Aiming further along the corridor to get a "better"
-        // entry would be choosing more unmeasured ground on a guess about ground
-        // nobody has read, which is the shape of mistake that put a hand-written
-        // staging point into the wall of a mine shaft (#121).
+        // A NEARBY POINT MAY BE JOINED DIRECTLY; A DISTANT ONE GOES THROUGH THE
+        // SURVEYED ENTRY (#217, #396). The nearest point is still the right
+        // answer when it is within the arrival tolerance. Beyond that, city
+        // walls can make even a short straight line unreachable, so the
+        // decision layer chooses the corridor entry for the surveyed leg.
         float aimX = want.GetPositionX();
         float aimY = want.GetPositionY();
         if (corridor.joinFirst)
