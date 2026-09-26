@@ -253,6 +253,7 @@ char const* Name(TerrainRemedy r)
         case TerrainRemedy::Nothing:       return "Nothing";
         case TerrainRemedy::LiftToSurface: return "LiftToSurface";
         case TerrainRemedy::GiveUp:        return "GiveUp";
+        case TerrainRemedy::NotFalling:    return "NotFalling";
     }
     return "?";
 }
@@ -347,6 +348,7 @@ void ARepeatedConditionIsABoundedSeriesAndThenSilence()
             case TerrainRemedy::LiftToSurface: ++lifts; break;
             case TerrainRemedy::GiveUp:        ++giveUps; break;
             case TerrainRemedy::Nothing:       ++nothings; break;
+            case TerrainRemedy::NotFalling:    ++nothings; break;
         }
     }
     // 396 minutes, one ladder per ten of them, so at most forty of each and

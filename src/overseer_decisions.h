@@ -429,6 +429,15 @@ enum class TerrainRemedy
     // condition ever went clear: one lift per ten minutes rather than one lift
     // and then silence until the character dies.
     GiveUp,
+
+    // SAY IT ONCE AND MOVE NOTHING: THE CHARACTER IS NOT FALLING (#725).
+    // A surface overhead and no floor any probe can see are what layered
+    // geometry reads as - a cave, the Cleft of Shadow, a building, a bridge,
+    // a canyon rim over a path, or a walk spline cutting through a rock face.
+    // A character that is not falling is standing on (or being carried
+    // through) something, so this is a note about the probes, not a
+    // character below the world. It ends no errand.
+    NotFalling,
 };
 
 // ONE POLL'S WORTH OF WORLD, as the adapter measured it. Grouped rather than
@@ -475,6 +484,19 @@ struct TerrainReading
     // before #296. The asymmetry is the same one StandingOnTheGround argues
     // for: this can only ever take a lift AWAY, never authorize one.
     bool floorBelowValid{false};
+    // AND WHAT THE CHARACTER ITSELF IS DOING (#725). Every reading above is a
+    // probe of the world around the character; this is the character's own
+    // movement state, Unit::IsFalling (MOVEMENTFLAG_FALLING / FALLING_FAR or a
+    // fall spline). The probes cannot tell a floor they do not see from no
+    // floor at all, and layered geometry (Orgrimmar, the Cleft of Shadow,
+    // caves, bridges) is exactly where they do not see it. A character that
+    // is not falling is standing on something.
+    //
+    // `movementMeasured` FALSE PRESERVES THE OLD BEHAVIOUR, for the reason
+    // floorBelowValid defaults the way it does: this can only ever take a
+    // lift AWAY. The adapter always measures it.
+    bool movementMeasured{false};
+    bool falling{false};
 };
 
 struct TerrainRecoveryVerdict
@@ -550,6 +572,13 @@ struct TerrainRecoveryLimits
     // anywhere a scripted traversal happens. ZERO DISABLES IT.
     float voidCatchYards{0.f};
     float maxLiftYards{0.f};
+    // HOW LONG A CHARACTER HAS TO HAVE BEEN FALLING, WITH NOTHING UNDER IT
+    // AND WITHOUT RISING, BEFORE AN ORDINARY LIFT IS EVEN CONSIDERED (#725).
+    // A lift is a teleport, so it is the last resort and not the first
+    // answer: a fall that is going to finish finishes inside this window, and
+    // a walk spline cutting through a rock face is never falling. Read only
+    // for a reading with `movementMeasured`; the void catch ignores it.
+    time_t fallingWindowSeconds{0};
 };
 
 bool LiftDestinationIsValid(float currentZ, float destinationZ,
@@ -608,6 +637,17 @@ struct TerrainRecoveryState
     // the next poll and a catch that did nothing never does: the bound
     // separates the two without needing a clock.
     bool caughtBelow{false};
+    // THE SUSTAINED-FALL WINDOW (#725). When the character was first read
+    // falling with nothing under it, when it was last read that way, and the
+    // height it was at when the window opened: a body that has risen since is
+    // climbing, not falling, whatever its flags say. Zero `fallingSince` means
+    // no window is open.
+    time_t fallingSince{0};
+    time_t fallingSeen{0};
+    float fallingStartZ{0.f};
+    // The "not falling, so it is standing on something" note, said once per
+    // episode for the same reason `saidOnGround` is.
+    bool saidNotFalling{false};
     // WHERE THIS EPISODE STARTED. Anchored on the first poll that holds, and
     // the episode is abandoned when the character turns up on another map or
     // more than `episodeRadius` away.
@@ -817,10 +857,54 @@ bool NearTheVoidPlane(float currentZ, float catchYards);
 // into the band. The remedy is still a lift, so it is still same map, same x,
 // same y: catching a character above the plane cannot split the family, and
 // letting it cross the plane demonstrably can.
+//
+// AND NOTHING OUTSIDE THE BAND IS LIFTED UNLESS IT IS FALLING (#725). A
+// reading with `movementMeasured` whose character is not falling gets
+// NotFalling, once per episode, and nothing moves: the surface overhead is
+// layered geometry and a missing navmesh is unknown, not evidence. One that
+// is falling gets Nothing (the fall finishes on its own) until it has been
+// falling with nothing under it, without rising, for `fallingWindowSeconds`;
+// only then does the ladder above run. Measured on 2026-09-26 in Orgrimmar:
+// 'Zug' at map 1 (1830.7, -3956.4, 19.1), surface z 47.0, no local navmesh,
+// was lifted straight up to z 47.5 mid-walk and was seen falling back down
+// the rock wall.
 TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
                                            TerrainReading const& reading,
                                            TerrainRecoveryLimits const& limits,
                                            time_t now);
+
+// IS THIS CHARACTER BELOW THE WORLD, ON EVIDENCE AND NOT ON A MISSING
+// READING (#725)? A surface overhead by the gap, no instrument standing it on
+// the ground, and (where the movement state was measured) falling. What the
+// other drives read as "terrain recovery owns this character"; a character
+// that is merely under a roof with no polygon Detour can see is not owned by
+// anything and keeps its errand.
+bool ProvenBelowTheWorld(TerrainReading const& reading,
+                         TerrainRecoveryLimits const& limits);
+
+// WHAT TO DO WITH A LEADER WHOSE GROUND THE HEIGHT QUERY CANNOT FIND (#725).
+//
+// The catch-up aim measures the leader's ground by searching DOWN from just
+// above its feet. In layered geometry - a walk through the Cleft of Shadow, a
+// spline cutting a rock face, a cave under a canyon - that search finds
+// nothing while the leader is plainly not falling, and the old sentence
+// called that "what a character BELOW the world reads as". It is not.
+//
+//   - FALLING: the leader is in the air. The aim waits for it to land.
+//   - NOT FALLING, POLYGON AT ITS FEET: it is standing on navmesh the height
+//     query did not see. Its own position is the aim.
+//   - NOT FALLING, NO POLYGON: it is somewhere neither instrument can
+//     measure. Not below the world, and not a point to send anybody to
+//     either; the aim waits (#188's crater point is exactly such a point).
+enum class UnmeasuredLeaderGround
+{
+    WaitForLanding,
+    AimAtLeader,
+    Unmeasurable,
+};
+
+UnmeasuredLeaderGround ClassifyUnmeasuredLeaderGround(bool leaderFalling,
+                                                      bool polygonAtItsFeet);
 
 // A VERTICAL GAP IS A STEP'S BUSINESS, NOT AN ERRAND'S.
 //

@@ -583,6 +583,13 @@ constexpr OverseerDecisions::FallBaselineLimits FALL_BASELINE_LIMITS{
 // no answer. Two yards is comfortably over any collision height in the game.
 constexpr float TERRAIN_RECOVERY_FOOTING_REACH_YARDS = 2.0f;
 
+// HOW LONG A CHARACTER MUST HAVE BEEN FALLING, WITH NO FLOOR UNDER IT AND
+// WITHOUT RISING, BEFORE AN ORDINARY LIFT IS CONSIDERED (#725). A fall
+// the world is going to end ends well inside five seconds; a walk spline that
+// cuts a rock face in Orgrimmar is not falling at all. Five polls, so one
+// stray reading cannot open it.
+constexpr time_t TERRAIN_RECOVERY_FALLING_WINDOW_SECONDS = 5;
+
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
@@ -592,7 +599,8 @@ constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_EPISODE_RADIUS_YARDS,
     TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
     TERRAIN_RECOVERY_VOID_CATCH_YARDS,
-    30.0f};
+    30.0f,
+    TERRAIN_RECOVERY_FALLING_WINDOW_SECONDS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -19135,37 +19143,68 @@ private:
         }
         if (shore == AimShore::NoGround)
         {
-            // AND THE OTHER WAY AN AIM CAN NAME NOWHERE (#188). Rationed on the
-            // same clock and for the same reason: a leader under the terrain
-            // stays under it until something else moves it, and this is asked
-            // every party poll.
-            //
-            // LOUD, AND NOT A SILENT NO-OP, because what it costs is real. A
-            // follower that is not given a catch-up aim keeps `follow`, and
-            // `follow` past FOLLOW_CATCH_UP_YARDS is the failure #70 and #404
-            // exist about. That is still the better of the two: the aim this
-            // replaces was a point four of five characters walked into, and two
-            // of them fell to the crater floor from it.
-            time_t const now = std::time(nullptr);
-            if (now - escort.badGroundSaid >= CATCH_UP_BAD_GROUND_SAID_SECONDS)
+            // AND THE OTHER WAY AN AIM CAN NAME NOWHERE (#188), WHICH IS NOT
+            // THE SAME THING AS BELOW THE WORLD (#725). The height query
+            // looks down from just above the leader's feet, and in layered
+            // geometry - the Cleft of Shadow, a cave under a canyon, a walk
+            // spline cutting a rock face - it finds nothing while the leader
+            // is plainly not falling. So the leader's own movement state and
+            // the navmesh at its own feet decide, not the missing reading:
+            // see OverseerDecisions::ClassifyUnmeasuredLeaderGround.
+            OverseerDecisions::UnmeasuredLeaderGround const unmeasured =
+                OverseerDecisions::ClassifyUnmeasuredLeaderGround(
+                    leader->IsFalling(),
+                    NavmeshRoutes(leader, leader->GetPositionX(),
+                                  leader->GetPositionY(),
+                                  leader->GetPositionZ()));
+            if (unmeasured == OverseerDecisions::UnmeasuredLeaderGround::AimAtLeader)
             {
-                escort.badGroundSaid = now;
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' is not aimed at '{}' because the terrain has no "
-                         "ground within reach of where that leader is standing "
-                         "(map {}, {:.1f}, {:.1f}, {:.1f}) - which is what a character "
-                         "BELOW the world reads as, since the surface search only looks "
-                         "downward. The aim is not written rather than copied, because "
-                         "copying it is how four of five characters ended up standing on "
-                         "one below-world point and two of them fell to the crater floor "
-                         "(#188). It keeps following until the leader is somewhere "
-                         "measurable",
-                         name, leader->GetName(),
-                         static_cast<uint32>(leader->GetMapId()),
-                         leader->GetPositionX(), leader->GetPositionY(),
-                         leader->GetPositionZ());
+                // STANDING ON NAVMESH THE HEIGHT QUERY DID NOT SEE. Its own
+                // position is ground a follower can be routed to.
+                ax = leader->GetPositionX();
+                ay = leader->GetPositionY();
+                az = leader->GetPositionZ();
             }
-            return false;
+            else
+            {
+                // Rationed on the same clock and for the same reason as the
+                // water line: this is asked every party poll.
+                //
+                // LOUD, AND NOT A SILENT NO-OP, because what it costs is real.
+                // A follower that is not given a catch-up aim keeps `follow`,
+                // and `follow` past FOLLOW_CATCH_UP_YARDS is the failure #70
+                // and #404 exist about. That is still the better of the two:
+                // an unmeasured point is what four of five characters walked
+                // into on 2026-09-19, and two of them fell from it (#188).
+                time_t const now = std::time(nullptr);
+                if (now - escort.badGroundSaid >= CATCH_UP_BAD_GROUND_SAID_SECONDS)
+                {
+                    escort.badGroundSaid = now;
+                    bool const falling =
+                        unmeasured ==
+                        OverseerDecisions::UnmeasuredLeaderGround::WaitForLanding;
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is not aimed at '{}' because the height "
+                             "query finds no ground under where that leader is standing "
+                             "(map {}, {:.1f}, {:.1f}, {:.1f}) and {} (#725). The "
+                             "aim is not written, because an unmeasured point is not one "
+                             "to send a follower to (#188). It keeps following, and the "
+                             "aim is written again as soon as the leader is somewhere "
+                             "measurable",
+                             name, leader->GetName(),
+                             static_cast<uint32>(leader->GetMapId()),
+                             leader->GetPositionX(), leader->GetPositionY(),
+                             leader->GetPositionZ(),
+                             falling
+                                 ? "the leader is FALLING, so the aim waits for it to "
+                                   "land"
+                                 : "the leader is NOT falling and has no navmesh "
+                                   "polygon at its feet, so it is on (or walking "
+                                   "through) layered geometry neither instrument can "
+                                   "measure - not below the world");
+                }
+                return false;
+            }
         }
         std::ostringstream aim;
         aim << "at:" << leader->GetMapId() << ':' << ax << ',' << ay << ',' << az;
@@ -24440,6 +24479,13 @@ private:
             reading.x = bot->GetPositionX();
             reading.y = bot->GetPositionY();
             reading.z = bot->GetPositionZ();
+            // THE CHARACTER'S OWN MOVEMENT STATE (#725). The probes below
+            // cannot tell a floor they do not see from no floor at all, and
+            // layered geometry is exactly where they do not see it. A
+            // character that is not falling is standing on something, so no
+            // lift outside the void band is issued without this saying so.
+            reading.movementMeasured = true;
+            reading.falling = bot->IsFalling();
             // THE ORDINARY REACH FIRST, ALWAYS, and the deep one only where it
             // came back empty in the band. Written this way round rather than
             // as a widened probe for everybody so that not one reading outside
@@ -24479,9 +24525,15 @@ private:
             // BEHIND THE SAME gapCouldMatter GATE as the Detour probes, for
             // the same reason: a reading that cannot possibly require recovery
             // does not need a second opinion about why not.
+            //
+            // SEARCHED FROM A STRIDE ABOVE THE FEET (#725), so a floor a
+            // walk spline has put the character a yard or two under is still
+            // the floor it is on. FloorUnderfoot folds the sign, so the reach
+            // is the same stride in both directions.
             reading.floorBelowValid =
                 gapCouldMatter &&
-                SurfaceAt(bot, reading.x, reading.y, reading.z,
+                SurfaceAt(bot, reading.x, reading.y,
+                          reading.z + TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
                           reading.floorBelowZ);
             // ONE FOLD, READ IN TWO PLACES. The step below asks the same
             // question to choose the remedy and this line asks it to choose
@@ -24503,10 +24555,13 @@ private:
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
+            // PROVEN, NOT INFERRED FROM A MISSING POLYGON (#725). This set
+            // tells the other drives that terrain recovery owns the character;
+            // a character under a roof that is not falling is owned by nothing
+            // and keeps its errand.
             bool const belowTerrain = gapCouldMatter &&
-                OverseerDecisions::BelowTerrainNeedsRecovery(
-                    reading.z, reading.surfaceAboveZ, reading.surfaceValid,
-                    reading.hasLocalNavmesh, TERRAIN_RECOVERY_GAP_YARDS);
+                OverseerDecisions::ProvenBelowTheWorld(reading,
+                                                       TERRAIN_RECOVERY_LIMITS);
             if (belowTerrain)
                 _belowTerrain.insert(LowerName(name));
             else
@@ -24517,6 +24572,34 @@ private:
                     memory, reading, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::Nothing)
                 continue;
+
+            // NOT FALLING, SO STANDING ON SOMETHING (#725). Said once per
+            // episode, with every reading that went into it, and nothing is
+            // moved, released or recorded as this module's doing: nothing was
+            // done. This is the line the Orgrimmar lifts of 2026-09-26 turn
+            // into.
+            if (verdict.remedy == OverseerDecisions::TerrainRemedy::NotFalling)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
+                         "reads {:.1f} yards under a surface at z {:.1f}, with {} and "
+                         "{}, but it is NOT FALLING, so it is standing on (or walking "
+                         "through) geometry the height probes do not see - a cave, a "
+                         "building, a bridge or a rock face. Layered ground, not a "
+                         "character below the world, and a missing navmesh is unknown "
+                         "rather than evidence (#725). NOTHING IS BEING MOVED and "
+                         "its errand is kept. Staying quiet about this character for "
+                         "this episode",
+                         name, static_cast<uint32>(bot->GetMapId()), reading.x,
+                         reading.y, reading.z, reading.surfaceAboveZ - reading.z,
+                         reading.surfaceAboveZ,
+                         reading.hasLocalNavmesh ? "a local navmesh polygon"
+                                                 : "no local navmesh",
+                         reading.floorBelowValid
+                             ? "the nearest floor under it more than a stride away"
+                             : "no floor found under its feet");
+                continue;
+            }
 
             // WHOSE DOING A DEATH IN THE NEXT FEW SECONDS WAS (#188). A remedy
             // is the one movement this module KNOWS it caused, which makes it
@@ -24694,15 +24777,22 @@ private:
                 LOG_WARN("module.overseer",
                          "overseer: '{}' read as below the world at map {} position "
                          "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
-                         "{}; LIFTED straight up to z {:.1f} at the same "
+                         "{}, FALLING for {}s with {} and without rising (#725); "
+                         "LIFTED straight up to z {:.1f} at the same "
                          "x/y, onto the nearest layer over its feet at z {:.1f} rather "
                          "than the highest one in reach (#592) - it keeps quest aim "
                          "job='{}' quest={} travel='{}' and its party. "
                          "If this is a real recovery the next poll is clean; if the same "
                          "condition comes back it escalates rather than repeating",
                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                         surface, surface - fromZ, footing, liftZ, nearestLayerZ, job,
-                         questAim, travelTarget);
+                         surface, surface - fromZ, footing,
+                         memory.fallingSince
+                             ? static_cast<uint32>(std::time(nullptr) - memory.fallingSince)
+                             : 0u,
+                         reading.floorBelowValid
+                             ? "the nearest floor under it more than a stride away"
+                             : "no floor found under its feet",
+                         liftZ, nearestLayerZ, job, questAim, travelTarget);
                 continue;
             }
 
