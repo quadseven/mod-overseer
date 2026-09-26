@@ -36235,19 +36235,30 @@ private:
                 // LEADER BACK. Close this attempt so recovery can bring the
                 // family to its shared inn before the next crossing (#739).
                 releaseTheLeader("the crossing attempt is ending for a split family");
+                // THE STRAGGLER IS WHOEVER IS NOT GATHERED, held or not, readable
+                // or not (dead, offline, on another map): the farthest one is named.
                 OverseerDecisions::CrossingMember const* held = nullptr;
                 for (OverseerDecisions::CrossingMember const& member : route.members)
                 {
-                    if (member.readable && !member.isLeader && member.heldTooFarNoFlight &&
-                        (!held || member.leaderDistance > held->leaderDistance))
+                    if (member.isLeader || member.aboard)
+                        continue;
+                    bool const gathered = member.readable &&
+                                          member.mapId == route.world.originMap &&
+                                          member.leaderDistance <= CROSSING_GATHER_YARDS;
+                    if (gathered)
+                        continue;
+                    if (!held || !member.readable ||
+                        (held->readable && member.leaderDistance > held->leaderDistance))
                         held = &member;
                 }
                 if (held)
                 {
-                    uint32 const yards = static_cast<uint32>(held->leaderDistance);
+                    std::string const where = held->readable
+                        ? std::to_string(static_cast<uint32>(held->leaderDistance)) + " yards away"
+                        : std::string("out of reach (dead, offline or on another map)");
                     std::string const reason = "the family is split at the berth: '" +
-                        held->name + "' is held " + std::to_string(yards) +
-                        " yards away with no flight, so the family regroups before the crossing";
+                        held->name + "' is " + where + " after the wait for it, so the family "
+                        "regroups before the crossing";
                     if (fresh)
                         LOG_WARN("module.overseer", "overseer: '{}' - {}",
                                  leaderName, reason);
