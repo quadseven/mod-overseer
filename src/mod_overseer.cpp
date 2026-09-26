@@ -1461,6 +1461,20 @@ constexpr OverseerDecisions::RatchetLimits TRAVEL_RATCHET{
     OverseerDecisions::RatchetReading::DistanceToTarget,
     TRAVEL_PROGRESS_YARDS, TRAVEL_BACKSTOP_SECONDS};
 
+// THE STUCK WINDOW (wow-overseer#335 follow-up). An errand is released as
+// making no progress only after a whole window in which the character got no
+// nearer by `minGainYards`, moved no further along its surveyed route, and
+// covered under `minMovedYards` of ground. Sixty seconds: long enough for a
+// path that bends away from the goal around a lake or a ridge, short enough
+// that the window closes inside upstream's ninety-second teleport clock, which
+// DriveTravel holds while it judges.
+constexpr OverseerDecisions::ErrandProgressLimits ERRAND_PROGRESS_LIMITS{60, 10.f, 25.f};
+
+// A running walk is re-sent only for a step more than 15 yards from the one it
+// is walking to, or once it is within 8 yards of that one (wow-overseer#335
+// follow-up). See OverseerDecisions::WalkNeedsRetarget.
+constexpr OverseerDecisions::WalkRetargetLimits WALK_RETARGET_LIMITS{15.f, 8.f};
+
 // FLIGHT (#68). Five constants, and every one of them is a threshold on a
 // decision that did not exist before: whether to fly to an errand instead of
 // walking to it.
@@ -4697,6 +4711,237 @@ void RecordDeath(Player* player)
     g_deathQueue.push_back(std::move(d));
 }
 
+// ONE MOVEMENT OWNER PER FAMILY LEADER (wow-overseer#335 follow-up).
+//
+// The book every rule that moves a family leader asks before it writes a
+// strategy, an aim or a hold for him. The decision is
+// OverseerDecisions::AskLeaderIntent; this is the world's half: which names
+// are leaders, the configuration, Jev's current pick for each family, and the
+// log lines, which are the measurement the change is judged by:
+//
+//   overseer: leader intent 'Grug' -> errand by travel column 'banker' ...
+//
+// is one intent change, and a leader that walks like a person has a handful of
+// them in ten minutes, not the dozens of handoffs measured before it.
+//
+// World-thread only, like every other per-character map in this module. Lost on
+// a restart, which costs one fresh grant per leader.
+struct LeaderIntentBookState
+{
+    bool enabled{true};
+    OverseerDecisions::LeaderIntentLimits limits{};
+    std::set<std::string> leaders;
+    std::map<std::string, OverseerDecisions::LeaderIntentState> states;
+    std::map<std::string, OverseerDecisions::LeaderIntentPreference> preferences;
+    // Leaders whose leaked `stay` was taken off, so it is said once per leak.
+    std::set<std::string> staySaid;
+};
+
+LeaderIntentBookState& LeaderIntentBook()
+{
+    static LeaderIntentBookState book;
+    return book;
+}
+
+// Configuration, re-read on the party poll so a conf reload takes effect.
+void ReloadLeaderIntentConfig()
+{
+    LeaderIntentBookState& book = LeaderIntentBook();
+    book.enabled = sConfigMgr->GetOption<bool>("Overseer.LeaderIntent.Enable", true, false);
+    uint32 const dwell =
+        sConfigMgr->GetOption<uint32>("Overseer.LeaderIntent.DwellSeconds", 90, false);
+    book.limits.dwellSeconds = std::clamp<uint32>(dwell, 30, 300);
+    book.limits.flapCooldownSeconds = book.limits.dwellSeconds;
+}
+
+bool LeaderIntentApplies(std::string const& name)
+{
+    LeaderIntentBookState const& book = LeaderIntentBook();
+    return book.enabled && book.leaders.count(name) != 0;
+}
+
+OverseerDecisions::LeaderIntentPreference LeaderIntentPreferenceFor(std::string const& name)
+{
+    LeaderIntentBookState const& book = LeaderIntentBook();
+    auto const it = book.preferences.find(name);
+    return it == book.preferences.end() ? OverseerDecisions::LeaderIntentPreference{}
+                                        : it->second;
+}
+
+// Ask the book for a leader. True when the asking rule may act on him this poll
+// (granted, renewed or retargeted). A character that is not a family leader,
+// or a world with the book switched off, is always true: the book governs
+// leaders and nothing else.
+bool AskForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
+                  std::string const& owner, std::string const& target, std::string const& why)
+{
+    if (!LeaderIntentApplies(name))
+        return true;
+    LeaderIntentBookState& book = LeaderIntentBook();
+    OverseerDecisions::LeaderIntentState& state = book.states[name];
+    OverseerDecisions::LeaderIntentKind const was = state.kind;
+    std::string const wasOwner = state.owner;
+    time_t const wasSince = state.since;
+    OverseerDecisions::LeaderIntentRequest request;
+    request.kind = kind;
+    request.owner = owner;
+    request.target = target;
+    request.why = why;
+    time_t const now = std::time(nullptr);
+    OverseerDecisions::LeaderIntentVerdict const verdict = OverseerDecisions::AskLeaderIntent(
+        state, request, now, book.limits, LeaderIntentPreferenceFor(name));
+    switch (verdict.answer)
+    {
+        case OverseerDecisions::LeaderIntentAnswer::Granted:
+            LOG_INFO("module.overseer",
+                     "overseer: leader intent '{}' -> {} by {}{} ({}) - {}", name,
+                     OverseerDecisions::LeaderIntentKindWord(kind), owner,
+                     target.empty() ? std::string() : " '" + target + "'",
+                     verdict.replaced != OverseerDecisions::LeaderIntentKind::None
+                         ? std::string("takes him from ") +
+                               OverseerDecisions::LeaderIntentKindWord(verdict.replaced) +
+                               " by " + verdict.replacedOwner + " after " +
+                               std::to_string(now - wasSince) + "s"
+                         : was != OverseerDecisions::LeaderIntentKind::None
+                               ? std::string("the ") +
+                                     OverseerDecisions::LeaderIntentKindWord(was) + " by " +
+                                     wasOwner + " before it had stopped asking"
+                               : std::string("he was free"),
+                     why);
+            return true;
+        case OverseerDecisions::LeaderIntentAnswer::Retargeted:
+            LOG_DEBUG("module.overseer", "overseer: leader intent '{}' keeps {} by {}, now '{}'",
+                      name, OverseerDecisions::LeaderIntentKindWord(kind), owner, target);
+            return true;
+        case OverseerDecisions::LeaderIntentAnswer::Renewed:
+            return true;
+        case OverseerDecisions::LeaderIntentAnswer::Deferred:
+            if (verdict.sayIt)
+                LOG_INFO("module.overseer",
+                         "overseer: leader intent '{}' stays {} by {}; {} by {}{} waits - {}{}",
+                         name, OverseerDecisions::LeaderIntentKindWord(state.kind),
+                         state.owner.empty() ? std::string("nobody") : state.owner,
+                         OverseerDecisions::LeaderIntentKindWord(kind), owner,
+                         target.empty() ? std::string() : " '" + target + "'", verdict.reason,
+                         verdict.waitSeconds > 0
+                             ? " (" + std::to_string(verdict.waitSeconds) + "s left)"
+                             : std::string());
+            return false;
+    }
+    return false;
+}
+
+// The owner is done with the leader. Said once, with how it ended.
+void EndForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
+                  std::string const& owner, OverseerDecisions::LeaderIntentEnd how,
+                  std::string const& why)
+{
+    if (!LeaderIntentApplies(name))
+        return;
+    LeaderIntentBookState& book = LeaderIntentBook();
+    auto const it = book.states.find(name);
+    if (it == book.states.end())
+        return;
+    time_t const now = std::time(nullptr);
+    time_t const since = it->second.since;
+    if (!OverseerDecisions::EndLeaderIntent(it->second, kind, owner, how, now, book.limits))
+        return;
+    LOG_INFO("module.overseer", "overseer: leader intent '{}' ends {} by {} ({}) after {}s - {}",
+             name, OverseerDecisions::LeaderIntentKindWord(kind), owner,
+             how == OverseerDecisions::LeaderIntentEnd::Completed ? "completed"
+             : how == OverseerDecisions::LeaderIntentEnd::Failed  ? "failed"
+                                                                  : "abandoned",
+             now - since, why);
+}
+
+// What holds the leader now; None when he is free or not a leader.
+OverseerDecisions::LeaderIntentKind LeaderIntentNow(std::string const& name)
+{
+    if (!LeaderIntentApplies(name))
+        return OverseerDecisions::LeaderIntentKind::None;
+    LeaderIntentBookState const& book = LeaderIntentBook();
+    auto const it = book.states.find(name);
+    if (it == book.states.end() ||
+        OverseerDecisions::LeaderIntentFree(it->second, std::time(nullptr), book.limits))
+        return OverseerDecisions::LeaderIntentKind::None;
+    return it->second.kind;
+}
+
+// The leader died or entered combat: whatever outranks his intent may take him.
+void WaiveLeaderDwell(std::string const& name)
+{
+    if (!LeaderIntentApplies(name))
+        return;
+    auto const it = LeaderIntentBook().states.find(name);
+    if (it != LeaderIntentBook().states.end())
+        OverseerDecisions::WaiveLeaderIntentDwell(it->second);
+}
+
+// The travel column let go. The column-driven intents end with it; the regroup,
+// the fetch and an operator order are ended by their own owners, and the quest
+// drive is not a column walk. A dungeon run re-claims on its next poll and,
+// never waiting, takes him straight back.
+void EndLeaderColumnIntent(std::string const& name, std::string const& why)
+{
+    OverseerDecisions::LeaderIntentKind const kind = LeaderIntentNow(name);
+    switch (kind)
+    {
+        case OverseerDecisions::LeaderIntentKind::EconomyErrand:
+        case OverseerDecisions::LeaderIntentKind::TownErrand:
+        case OverseerDecisions::LeaderIntentKind::Respec:
+        case OverseerDecisions::LeaderIntentKind::TrainingStop:
+        case OverseerDecisions::LeaderIntentKind::Hearth:
+        case OverseerDecisions::LeaderIntentKind::DungeonRun:
+            break;
+        default:
+            return;
+    }
+    std::string const owner = LeaderIntentBook().states[name].owner;
+    bool const done = why.find("arrived") != std::string::npos ||
+                      why.find("reached") != std::string::npos ||
+                      why.find("done") != std::string::npos ||
+                      why.find("stepped through") != std::string::npos;
+    EndForLeader(name, kind, owner,
+                 done ? OverseerDecisions::LeaderIntentEnd::Completed
+                      : OverseerDecisions::LeaderIntentEnd::Failed,
+                 why);
+}
+
+// Which intent a claim of the travel column is, by the owner that claims it.
+// The owner word is what the travel drive asks under each poll too, so the two
+// asks renew one intent rather than competing.
+void LeaderIntentForTravelOwner(OverseerDecisions::TravelOwner owner,
+                                OverseerDecisions::LeaderIntentKind& kind,
+                                std::string& ownerWord)
+{
+    switch (owner)
+    {
+        case OverseerDecisions::TravelOwner::HomeErrand:
+            kind = OverseerDecisions::LeaderIntentKind::Hearth;
+            ownerWord = "home errand";
+            return;
+        case OverseerDecisions::TravelOwner::CatchUp:
+            kind = OverseerDecisions::LeaderIntentKind::FetchMember;
+            ownerWord = "fetch";
+            return;
+        case OverseerDecisions::TravelOwner::Run:
+        case OverseerDecisions::TravelOwner::WalkBackIn:
+            kind = OverseerDecisions::LeaderIntentKind::DungeonRun;
+            ownerWord = "dungeon run";
+            return;
+        case OverseerDecisions::TravelOwner::Respec:
+            kind = OverseerDecisions::LeaderIntentKind::Respec;
+            ownerWord = "respec";
+            return;
+        case OverseerDecisions::TravelOwner::TrainingStop:
+            kind = OverseerDecisions::LeaderIntentKind::TrainingStop;
+            ownerWord = "training stop";
+            return;
+    }
+    kind = OverseerDecisions::LeaderIntentKind::TownErrand;
+    ownerWord = "travel column";
+}
+
 // ----------------------------------------------------------- errand column --
 //
 // THE ONE OWNER OF `overseer_roster.travel_npc`, AND OF EVERYTHING THAT MOVES
@@ -4874,6 +5119,10 @@ public:
         // clock on. Nothing here reads or writes `best`, so the meaning of a
         // zero mark stays entirely OverseerDecisions::Ratchet's to define.
         OverseerDecisions::RatchetState progress;
+        // THE STUCK WINDOW (wow-overseer#335 follow-up): distance, route and
+        // ground over about a minute, read before an errand is released as
+        // making no progress. See OverseerDecisions::ReadErrandProgress.
+        OverseerDecisions::ErrandProgressWindow progressWindow;
         // WHEN THIS ERRAND BEGAN, and never moved afterwards. Not
         // `progress.since`, which is the ratchet's clock: that one is restarted
         // by every yard of progress and held through every flight, because it
@@ -5134,6 +5383,20 @@ public:
             }
             return false;
         }
+        // A FAMILY LEADER'S COLUMN IS WRITTEN ONLY FOR THE INTENT THAT HOLDS
+        // HIM (wow-overseer#335 follow-up). The fences above are about whose
+        // errand the column already carries; this is about whose turn it is.
+        // A refusal here leaves the column exactly as it was.
+        {
+            OverseerDecisions::LeaderIntentKind kind = OverseerDecisions::LeaderIntentKind::None;
+            std::string ownerWord;
+            LeaderIntentForTravelOwner(owner, kind, ownerWord);
+            if (!AskForLeader(name, kind, ownerWord, target, "claims the travel column"))
+            {
+                _claimRefusalSaid[name] = "another intent that holds the leader";
+                return false;
+            }
+        }
         _claimRefusalSaid.erase(name);
         // A LIVE RUN TAKING THE COLUMN OVER SOMEBODY'S WALK IS SAID, ONCE PER
         // TAKEOVER (#656). The next claim finds the aim is the book's own and
@@ -5167,7 +5430,42 @@ public:
         // than inside it precisely because the line above erases `_state`: a
         // new aim is a new errand, and this has to outlive that erase.
         _claimed[name] = target;
+        _claimOwner[name] = owner;
         return true;
+    }
+
+    // Which owner claimed the aim now in the column, when this book wrote it.
+    // False for an aim somebody else wrote (the bridge's errands).
+    bool ClaimedBy(std::string const& name, std::string const& target,
+                   OverseerDecisions::TravelOwner& owner) const
+    {
+        auto const claimed = _claimed.find(name);
+        auto const by = _claimOwner.find(name);
+        if (claimed == _claimed.end() || claimed->second != target || by == _claimOwner.end())
+            return false;
+        owner = by->second;
+        return true;
+    }
+
+    // Would Claim refuse this aim on its fences, without writing anything? For
+    // a rule that must not start what it cannot carry out: a leader's walk back
+    // for a member is refused while the bridge's errand sits in his column, and
+    // starting it anyway was a fetch begun and abandoned inside one poll.
+    bool FenceRefuses(std::string const& name, std::string const& target,
+                      OverseerDecisions::TravelOwner owner)
+    {
+        auto const it = _state.find(name);
+        if (it != _state.end() && it->second.target == target)
+            return false;
+        OverseerDecisions::TravelClaimFacts facts(owner);
+        facts.learnSkill = LearnSkillPending(name);
+        facts.column = CurrentTravelNpc(name);
+        auto const ours = _claimed.find(name);
+        facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
+        facts.target = target;
+        OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
+        return verdict != OverseerDecisions::TravelClaim::Write &&
+               verdict != OverseerDecisions::TravelClaim::Outrank;
     }
 
     // Why this character's last claim was refused, or empty when the last
@@ -5190,6 +5488,9 @@ public:
         _lastEnd[name] = ErrandEnd{why.empty() ? std::string("a release that did not name itself")
                                                : why,
                                    false};
+        // A leader's column intent ends with its errand, completed or failed
+        // by what the release says; nothing is ended for anybody else.
+        EndLeaderColumnIntent(name, why.empty() ? std::string("a release") : why);
         // THE COLUMN WRITE IS THE ONE PART OF THIS THAT IS NOW CONDITIONAL
         // (mod-overseer#435). `_claimed` already answers "did this book put
         // the walker at its CURRENT aim" - so when it says no, this Release
@@ -5255,6 +5556,7 @@ public:
         // ended would be forgotten before whatever re-arms this column next
         // writes to it, which is the entire failure it exists to answer.
         _claimed.erase(name);
+        _claimOwner.erase(name);
         // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
         // twenty-minute backstop, and a state entry outliving its errand is
         // inherited by the NEXT errand at the same target - which is then
@@ -5342,6 +5644,8 @@ public:
                 "the column being emptied outside this module (another owner cleared it)",
                 true};
             _claimed.erase(it->first);
+            _claimOwner.erase(it->first);
+            EndLeaderColumnIntent(it->first, "the column was emptied outside this module");
             it = _state.erase(it);
         }
         // A landing has no `_state` entry, because Release erased it, so the
@@ -5490,6 +5794,8 @@ public:
                                    false};
         _landed.erase(name);
         _claimed.erase(name);
+        _claimOwner.erase(name);
+        EndLeaderColumnIntent(name, "a point aim left from before this worldserver started");
         _state.erase(name);
     }
 
@@ -5606,6 +5912,7 @@ private:
     // by Claim, which is its only door into the column, and erased by Release
     // and PruneVanished - every way an errand can end.
     std::map<std::string, std::string> _claimed;
+    std::map<std::string, OverseerDecisions::TravelOwner> _claimOwner;
     // What ended each character's last errand; see LastEnd. Never erased: one
     // short string per roster character, overwritten by the next ending.
     std::map<std::string, ErrandEnd> _lastEnd;
@@ -6961,8 +7268,13 @@ private:
         // ONE PARTY PER FAMILY (#548). This used to be one party for the whole
         // roster under whichever `lead` row sorted first, which put an Alliance
         // five and a Horde five in a single party of enemies.
-        for (OverseerDecisions::FamilyRoster const& roster :
-             OverseerDecisions::PartitionRosterByFamily(rows))
+        std::vector<OverseerDecisions::FamilyRoster> const rosters =
+            OverseerDecisions::PartitionRosterByFamily(rows);
+        // THE LEADERS THE INTENT BOOK GOVERNS, and Jev's current picks for
+        // them, before any rule of this poll asks it anything.
+        RefreshLeaderIntentBook(rosters);
+
+        for (OverseerDecisions::FamilyRoster const& roster : rosters)
         {
             std::vector<Player*> present;
             for (OverseerDecisions::FamilyMember const& member : roster.members)
@@ -6978,6 +7290,134 @@ private:
                     present.push_back(p);
             }
             KeepFamilyGrouped(present, roster.leader);
+        }
+
+        // After every rule of this poll has asked: what the book holds each
+        // leader for and what is on the table, for the bridge and for Jev.
+        PublishLeaderIntents(rosters);
+    }
+
+    SchemaColumns _familyIntentColumns{SchemaColumns::Unknown};
+
+    bool FamilyIntentTablePresent()
+    {
+        if (_familyIntentColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_family_intent",
+                "'leader_name','current_kind','on_the_table','chosen_kind','chosen_until'", 5);
+            _familyIntentColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_family_intent is missing "
+                         "(2026_09_26_00_overseer_family_intent.sql has not been applied) - "
+                         "the leader intent book still runs, on its own static order, and "
+                         "Jev's picks are not read");
+        }
+        return _familyIntentColumns == SchemaColumns::Present;
+    }
+
+    // The leader set, the configuration and Jev's picks, once per party poll.
+    void RefreshLeaderIntentBook(std::vector<OverseerDecisions::FamilyRoster> const& rosters)
+    {
+        ReloadLeaderIntentConfig();
+        LeaderIntentBookState& book = LeaderIntentBook();
+        std::set<std::string> leaders;
+        for (OverseerDecisions::FamilyRoster const& roster : rosters)
+            if (!roster.family.empty() && !roster.leader.empty())
+                leaders.insert(roster.leader);
+        // A character that stopped leading loses its book and its pick.
+        for (auto it = book.states.begin(); it != book.states.end();)
+            it = leaders.count(it->first) ? std::next(it) : book.states.erase(it);
+        book.leaders.swap(leaders);
+
+        book.preferences.clear();
+        if (!book.enabled || !FamilyIntentTablePresent())
+            return;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT leader_name, chosen_kind, chosen_target, UNIX_TIMESTAMP(chosen_until) "
+            "FROM overseer_family_intent "
+            "WHERE chosen_by = 'jev' AND chosen_until > NOW()");
+        if (!result)
+            return;
+        do
+        {
+            Field* row = result->Fetch();
+            std::string const leader = row[0].Get<std::string>();
+            if (!book.leaders.count(leader))
+                continue;
+            OverseerDecisions::LeaderIntentPreference pick;
+            pick.kind = OverseerDecisions::ParseLeaderIntentKind(row[1].Get<std::string>());
+            pick.target = row[2].Get<std::string>();
+            pick.until = static_cast<time_t>(row[3].Get<uint64>());
+            if (pick.kind == OverseerDecisions::LeaderIntentKind::None)
+                continue;
+            std::string const signature = row[1].Get<std::string>() + "|" + pick.target;
+            auto const said = _leaderPickSaid.find(leader);
+            if (said == _leaderPickSaid.end() || said->second != signature)
+            {
+                _leaderPickSaid[leader] = signature;
+                LOG_INFO("module.overseer",
+                         "overseer: Jev picks {}{} for the family of '{}' - that request now "
+                         "ranks above the module's own rules until the pick expires; the "
+                         "campaign's run and an operator order still come first",
+                         OverseerDecisions::LeaderIntentKindWord(pick.kind),
+                         pick.target.empty() ? std::string() : " '" + pick.target + "'",
+                         leader);
+            }
+            book.preferences[leader] = pick;
+        } while (result->NextRow());
+    }
+
+    std::map<std::string, std::string> _leaderPickSaid;
+
+    // A copy cut to the column's width on a character boundary.
+    static std::string Fit(std::string text, size_t bytes)
+    {
+        TruncateUtf8(text, bytes);
+        return text;
+    }
+
+    // One row per leader, the module's columns only. See the migration.
+    void PublishLeaderIntents(std::vector<OverseerDecisions::FamilyRoster> const& rosters)
+    {
+        LeaderIntentBookState& book = LeaderIntentBook();
+        if (!book.enabled || !FamilyIntentTablePresent())
+            return;
+        time_t const now = std::time(nullptr);
+        for (OverseerDecisions::FamilyRoster const& roster : rosters)
+        {
+            if (roster.family.empty() || roster.leader.empty())
+                continue;
+            OverseerDecisions::LeaderIntentState const& state = book.states[roster.leader];
+            bool const live = !OverseerDecisions::LeaderIntentFree(state, now, book.limits);
+            std::string table;
+            for (OverseerDecisions::LeaderIntentRequest const& ask :
+                 OverseerDecisions::LeaderIntentsOnTheTable(
+                     state, now, book.limits, LeaderIntentPreferenceFor(roster.leader)))
+            {
+                std::string const line =
+                    std::string(OverseerDecisions::LeaderIntentKindWord(ask.kind)) + "|" +
+                    ask.owner + "|" + ask.target;
+                if (table.size() + line.size() + 1 > 1000)
+                    break;
+                table += (table.empty() ? "" : "\n") + line;
+            }
+            CharacterDatabase.Execute(
+                "INSERT INTO overseer_family_intent (leader_name, family, current_kind, "
+                "current_owner, current_target, current_since, on_the_table, changes, module_at) "
+                "VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}', {}, NOW()) "
+                "ON DUPLICATE KEY UPDATE family = VALUES(family), "
+                "current_kind = VALUES(current_kind), current_owner = VALUES(current_owner), "
+                "current_target = VALUES(current_target), current_since = VALUES(current_since), "
+                "on_the_table = VALUES(on_the_table), changes = VALUES(changes), "
+                "module_at = VALUES(module_at)",
+                Esc(roster.leader), Esc(roster.family),
+                live ? OverseerDecisions::LeaderIntentKindWord(state.kind) : "none",
+                Esc(Fit(live ? state.owner : std::string(), 32)),
+                Esc(Fit(live ? state.target : std::string(), 96)),
+                live ? "FROM_UNIXTIME(" + std::to_string(state.since) + ")" : std::string("NULL"),
+                EscLong(table), state.changes);
         }
     }
 
@@ -7937,10 +8377,26 @@ private:
             record.addedStay = plan.addStay;
             record.removedFollow = plan.dropFollow;
             record.removedNewRpg = plan.dropNewRpg;
+            // AN EXPIRED HOLD'S UNDO IS CARRIED, NOT OVERWRITTEN
+            // (wow-overseer#335 follow-up). A hold past its ceiling that no
+            // release has reached yet still has its `+stay` on, so the plan
+            // above reads "stay already on" and records nothing to undo. The
+            // old record was the only one that knew the `stay` was this
+            // module's, and replacing it left `stay` on the character for good
+            // - the measured leader carried it between every hold and walked
+            // in stutter steps under it.
+            if (existing != holds.end())
+            {
+                record.addedStay = record.addedStay || existing->second.addedStay;
+                record.removedFollow = record.removedFollow || existing->second.removedFollow;
+                record.removedNewRpg = record.removedNewRpg || existing->second.removedNewRpg;
+            }
             record.until = time(nullptr) + ceilingSeconds;
             record.verb = verb ? verb : "";
-            record.stoodItUp = wasSitting;
-            record.dismountedIt = wasMounted;
+            record.stoodItUp =
+                wasSitting || (existing != holds.end() && existing->second.stoodItUp);
+            record.dismountedIt =
+                wasMounted || (existing != holds.end() && existing->second.dismountedIt);
             AnchorHoldWhereItStands(record, who);
             holds[name] = record;
             LOG_INFO("module.overseer",
@@ -9385,9 +9841,31 @@ private:
             // no aim and no escort, and the next town errand hands it back
             // through DriveTravel's own grant.
             std::string const leaderName = leader->GetName();
-            bool const mayCarry = OverseerDecisions::LeaderCarriesNewRpg(
+            bool mayCarry = OverseerDecisions::LeaderCarriesNewRpg(
                 TownJobFor(leaderName),
                 !_travelAims.TargetFor(leaderName).empty() || IsEscorted(leaderName));
+            // THE INTENT BOOK DECIDES WHO HOLDS THE LEADER (wow-overseer#335
+            // follow-up); this block only carries it out. The quest drive is
+            // the leader's baseline and asks for him like every other rule,
+            // at the lowest rank, so an errand, a regroup or the run takes him
+            // from it and gives him back when they end. While a walking intent
+            // holds him he carries `new rpg`; while none does, the old rule
+            // above answers, so a family in town with nothing to walk to still
+            // has it taken off.
+            if (LeaderIntentApplies(leaderName))
+            {
+                if (!leader->IsAlive() || leader->IsInCombat())
+                    WaiveLeaderDwell(leaderName);
+                if (OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(leaderName), false))
+                    AskForLeader(leaderName, OverseerDecisions::LeaderIntentKind::QuestDrive,
+                                 "quest drive", std::string(),
+                                 "the family travels on the leader's own quest status");
+                OverseerDecisions::LeaderIntentKind const held = LeaderIntentNow(leaderName);
+                if (held != OverseerDecisions::LeaderIntentKind::None &&
+                    held != OverseerDecisions::LeaderIntentKind::OperatorOrder)
+                    mayCarry = OverseerDecisions::LeaderIntentWalksUnderNewRpg(held);
+                KeepLeaderStayHonest(leader, leaderName, leaderAI, held);
+            }
             if (!mayCarry && leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 !HeldAfterRevival(leaderName) && !HeldStill(leaderName))
             {
@@ -9833,6 +10311,53 @@ private:
         // last one's. See DriveFetch.
         DriveFetch(group, leader, present);
         KeepTheFamilyTogether(group, leader, present);
+    }
+
+    // A `stay` NOBODY HOLDS IS TAKEN OFF A LEADER (wow-overseer#335 follow-up).
+    //
+    // Upstream's `stay` is a default action at relevance 1.0 that calls
+    // StopMoving on a moving bot whenever it runs (StayActions.cpp), and it
+    // runs on every tick the leader's walk yields: MoveFarTo returns false
+    // while it waits on its last move (NewRpgBaseAction.cpp), the engine falls
+    // through to `stay`, `stay` stops him and clears the wait, and the next
+    // tick walks again. Walk a tick, stop, walk a tick - the stutter step the
+    // operator watched. Measured on the dev realm, 2026-09-26: the leader's
+    // regroup holds read "stay already on" when placed and "stay left alone"
+    // when lifted, and he had been sent `stay` 18 times in a week off his own
+    // family's bot speech. Nothing ever took it off again.
+    //
+    // Every hold this module places records the `stay` it added and removes it
+    // itself, so a leader carrying `stay` with no hold, no revival grace and no
+    // operator order behind it carries somebody else's leftover. It comes off,
+    // said once per leak.
+    void KeepLeaderStayHonest(Player* leader, std::string const& leaderName,
+                              PlayerbotAI* leaderAI, OverseerDecisions::LeaderIntentKind held)
+    {
+        LeaderIntentBookState& book = LeaderIntentBook();
+        bool const carries = leaderAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
+        if (!carries)
+        {
+            book.staySaid.erase(leaderName);
+            return;
+        }
+        // Inside an instance the dungeon-clear engine runs the party and may
+        // hold its tank with `stay` between pulls; that is not this rule's.
+        Map* const map = leader->GetMap();
+        if (HeldStill(leaderName) || HeldAfterRevival(leaderName) ||
+            held == OverseerDecisions::LeaderIntentKind::OperatorOrder ||
+            held == OverseerDecisions::LeaderIntentKind::Regroup || !map || map->Instanceable())
+            return;
+        leaderAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
+        if (book.staySaid.insert(leaderName).second)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' leads and carried `stay` that no hold, revival or "
+                     "operator order of this module put there - taken off, because "
+                     "upstream's `stay` stops a moving bot on every tick its walk yields "
+                     "and that is a leader walking in stutter steps{}",
+                     leaderName,
+                     leaderAI->HasStrategy("stay", BOT_STATE_NON_COMBAT)
+                         ? std::string(". IT DID NOT COME OFF")
+                         : std::string());
     }
 
     // Point the roster at the quests they keep talking about.
@@ -11207,6 +11732,24 @@ private:
                                                   : travelTarget);
                 }
                 continue;
+            }
+
+            // A LEADER IS DRIVEN TO HIS QUEST ONLY WHILE THE QUEST DRIVE HOLDS
+            // HIM (wow-overseer#335 follow-up). An errand, a regroup, a walk
+            // back for a member, the run or an operator order that holds him in
+            // the intent book is not overwritten with a quest status here.
+            if (LeaderIntentApplies(name))
+            {
+                OverseerDecisions::LeaderIntentKind const held = LeaderIntentNow(name);
+                if (held != OverseerDecisions::LeaderIntentKind::None &&
+                    held != OverseerDecisions::LeaderIntentKind::QuestDrive)
+                {
+                    LOG_DEBUG("module.overseer",
+                              "overseer: '{}' is held by the leader intent '{}' - the quest "
+                              "drive stands down for it",
+                              name, OverseerDecisions::LeaderIntentKindWord(held));
+                    continue;
+                }
             }
 
             if (state.travelHeld)
@@ -18910,7 +19453,11 @@ private:
             PlayerbotAI* const ai = SteerableAI(leader);
             if (!ai)
                 continue;
-            bool const onErrand = !_travelAims.TargetFor(name).empty() || IsEscorted(name);
+            // A walking intent in the leader's book is an errand too: a fetch
+            // or a run granted this poll whose column write lands next poll.
+            bool const onErrand =
+                !_travelAims.TargetFor(name).empty() || IsEscorted(name) ||
+                OverseerDecisions::LeaderIntentWalksUnderNewRpg(LeaderIntentNow(name));
             bool const mayCarry =
                 OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(name), onErrand);
             OverseerDecisions::UnissuedFlightStep const step =
@@ -19983,10 +20530,14 @@ private:
     // TravelAimBook::Release is one and EndOneEscort is one: a hand-back that
     // only happens on the path that took it is a hand-back an unforeseen
     // `return` can skip.
-    void EndTheRegroupWait(std::string const& why)
+    void EndTheRegroupWait(std::string const& why,
+                           OverseerDecisions::LeaderIntentEnd how =
+                               OverseerDecisions::LeaderIntentEnd::Abandoned)
     {
         if (!_regroupWaiting)
             return;
+        EndForLeader(_regroupLeader, OverseerDecisions::LeaderIntentKind::Regroup, "regroup", how,
+                     why);
         std::string const held = _regroupLeader;
         std::string const waitedFor = _regroupWaitingFor;
         _regroupWaiting = false;
@@ -20189,7 +20740,10 @@ private:
                                   : "everybody is back within " +
                                         std::to_string(static_cast<uint32>(
                                             REGROUP_LIMITS.rejoinYards)) +
-                                        " yards of the leader");
+                                        " yards of the leader",
+                              verdict.notWaitedFor
+                                  ? OverseerDecisions::LeaderIntentEnd::Abandoned
+                                  : OverseerDecisions::LeaderIntentEnd::Completed);
             return;
         }
 
@@ -20231,7 +20785,8 @@ private:
                       verdict.waitingFor, static_cast<uint32>(verdict.worstYards),
                       verdict.waitingFor,
                       static_cast<uint32>(REGROUP_STANDDOWN_SECONDS / 60));
-            EndTheRegroupWait("the gap stopped closing and the backstop gave up on it");
+            EndTheRegroupWait("the gap stopped closing and the backstop gave up on it",
+                              OverseerDecisions::LeaderIntentEnd::Failed);
             return;
         }
 
@@ -20241,6 +20796,21 @@ private:
         // that is walking, which is a family that thinks it is waiting and is
         // not - the exact shape of the failures this file has three comments
         // about, where a grant that did not take was reported as one that did.
+        // ASK THE LEADER'S INTENT BOOK FIRST (wow-overseer#335 follow-up). A
+        // leader on an errand inside its dwell, or taken by the run or an
+        // operator order, is not stopped for a regroup; the family carries on
+        // this poll and the regroup asks again on the next. One that was
+        // already waiting and has been taken by a higher-ranked intent is let
+        // go, so the new owner can walk him.
+        if (!AskForLeader(leaderName, OverseerDecisions::LeaderIntentKind::Regroup, "regroup",
+                          verdict.waitingFor,
+                          "'" + verdict.waitingFor + "' is " +
+                              std::to_string(static_cast<uint32>(verdict.worstYards)) +
+                              " yards behind and walking back"))
+        {
+            EndTheRegroupWait("another intent holds the leader - see the leader intent line");
+            return;
+        }
         if (!HoldForTheFamily(leader, leaderName))
         {
             LOG_ERROR("module.overseer",
@@ -20249,7 +20819,8 @@ private:
                       "member will keep chasing a leader that keeps moving",
                       verdict.waitingFor,
                       static_cast<uint32>(verdict.worstYards), leaderName);
-            EndTheRegroupWait("the leader could not be held");
+            EndTheRegroupWait("the leader could not be held",
+                              OverseerDecisions::LeaderIntentEnd::Failed);
             return;
         }
         bool const fresh = !_regroupWaiting;
@@ -20313,6 +20884,7 @@ private:
         bool wanted{false};
     };
     std::map<std::string, Fetch> _fetches;              // leader -> the fetch
+    std::map<std::string, std::string> _fetchFenceSaid;  // leader -> column said
     std::map<std::string, time_t> _fetchStandDown;      // member -> when its last fetch ended
 
     bool LeaderIsFetching(std::string const& leaderName) const
@@ -20359,11 +20931,15 @@ private:
     // down is handed back whichever way the fetch ended; and the member stands
     // down whichever way it ended, which is the bound that stops the leader
     // going back and forth.
-    void EndFetch(std::string const& leaderName, std::string const& why)
+    void EndFetch(std::string const& leaderName, std::string const& why,
+                  OverseerDecisions::LeaderIntentEnd how =
+                      OverseerDecisions::LeaderIntentEnd::Abandoned)
     {
         auto const it = _fetches.find(leaderName);
         if (it == _fetches.end())
             return;
+        EndForLeader(leaderName, OverseerDecisions::LeaderIntentKind::FetchMember, "fetch", how,
+                     why);
         std::string const target = it->second.target;
         _fetches.erase(it);
         _fetchStandDown[target] = std::time(nullptr);
@@ -20469,7 +21045,8 @@ private:
                                                     "lifts and it follows (#697)")
                                       : std::string(" yards away, back within the line a "
                                                     "catch-up may walk, so its hold lifts and "
-                                                    "it walks the rest")));
+                                                    "it walks the rest")),
+                             OverseerDecisions::LeaderIntentEnd::Completed);
                     return;
                 case OverseerDecisions::FetchStep::GiveUp:
                     EndFetch(leaderName,
@@ -20477,7 +21054,8 @@ private:
                                  std::to_string(static_cast<uint32>(FETCH_CEILING_SECONDS / 60)) +
                                  " minutes without getting within " +
                                  std::to_string(static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS)) +
-                                 " yards of it");
+                                 " yards of it",
+                             OverseerDecisions::LeaderIntentEnd::Failed);
                     return;
                 case OverseerDecisions::FetchStep::Abandon:
                     EndFetch(leaderName,
@@ -20488,10 +21066,20 @@ private:
                              : !facts.targetFetchable
                                  ? std::string("it is dead, out of the world, out of the "
                                                "party or on another map")
-                                 : "the leader's aim at it was refused - " + fetch.refusal);
+                                 : "the leader's aim at it was refused - " + fetch.refusal,
+                             OverseerDecisions::LeaderIntentEnd::Failed);
                     return;
                 case OverseerDecisions::FetchStep::Continue:
                     break;
+            }
+            // Still his: renewed every poll. Taken by a higher-ranked intent
+            // (the run, an operator order, Jev's pick), the fetch lets go.
+            if (!AskForLeader(leaderName, OverseerDecisions::LeaderIntentKind::FetchMember,
+                              "fetch", fetch.target,
+                              "walks back for '" + fetch.target + "'"))
+            {
+                EndFetch(leaderName, "another intent took the leader - see the leader intent line");
+                return;
             }
             fetch.wanted = true;
             auto const walk = _dungeonEscorts.find(leaderName);
@@ -20558,6 +21146,32 @@ private:
         OverseerDecisions::FetchRunAnswer const runAnswer =
             OverseerDecisions::RunLetsTheLeaderFetch(FetchRunPhaseFor(leaderName));
         if (runAnswer == OverseerDecisions::FetchRunAnswer::Refuse)
+            return;
+
+        // NOT STARTED WHEN IT CANNOT BE CARRIED OUT (wow-overseer#335
+        // follow-up). The walk back is a claim on the leader's travel column,
+        // and the column's fences refuse it while the bridge's own errand sits
+        // there. Measured 2026-09-26: "goes back for 'Og'" at 02:12:07, the aim
+        // refused the same second, "stops going back" at 02:12:37 - a start
+        // and a stop for a walk that never began. Said once per column.
+        if (_travelAims.FenceRefuses(leaderName, "fetch:" + pick,
+                                     OverseerDecisions::TravelOwner::CatchUp))
+        {
+            std::string const column = TravelAimBook::CurrentTravelNpc(leaderName);
+            if (_fetchFenceSaid[leaderName] != column)
+            {
+                _fetchFenceSaid[leaderName] = column;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' does not go back for '{}' yet - its travel column "
+                         "holds '{}', which the walk back may not overwrite, so the fetch "
+                         "waits for that errand to end",
+                         leaderName, pick, column);
+            }
+            return;
+        }
+        _fetchFenceSaid.erase(leaderName);
+        if (!AskForLeader(leaderName, OverseerDecisions::LeaderIntentKind::FetchMember, "fetch",
+                          pick, "'" + pick + "' is held too far away to walk back itself"))
             return;
 
         Fetch& fetch = _fetches[leaderName];
@@ -21564,6 +22178,7 @@ private:
                 // clock starts now rather than carrying the last errand's over.
                 state.progress.best = 0.f;
                 state.progress.since = std::time(nullptr);
+                state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
                 // And a new errand answers for its own bodies and nobody
                 // else's - see TravelState::errandSince.
                 state.errandSince = std::time(nullptr);
@@ -21615,6 +22230,31 @@ private:
             // and that is the point: it is granted below, at the instant the walk
             // is issued, and taken back when the escort ends. See the escort
             // section above for why those two things cannot be separated.
+            // A FAMILY LEADER WALKS THIS ERRAND ONLY WHILE IT IS HIS INTENT
+            // (wow-overseer#335 follow-up). Asked every poll, which is what
+            // keeps the intent live; a deferral leaves the column exactly as it
+            // is and walks nothing this poll, with the backstop and the stuck
+            // window held as they are for a flight, so waiting its turn is not
+            // counted against the errand.
+            {
+                OverseerDecisions::LeaderIntentKind kind =
+                    OverseerDecisions::IsMaintenanceErrand(target)
+                        ? OverseerDecisions::LeaderIntentKind::EconomyErrand
+                        : OverseerDecisions::LeaderIntentKind::TownErrand;
+                std::string owner = "travel column";
+                OverseerDecisions::TravelOwner claimedBy{};
+                if (_travelAims.ClaimedBy(name, columnAim, claimedBy))
+                    LeaderIntentForTravelOwner(claimedBy, kind, owner);
+                if (!AskForLeader(name, kind, owner, target, "walks to '" + target + "'"))
+                {
+                    state.progress.since = std::time(nullptr);
+                    state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
+                    continue;
+                }
+                if (!bot->IsAlive() || bot->IsInCombat())
+                    WaiveLeaderDwell(name);
+            }
+
             bool const escorted = IsEscorted(name);
 
             // ...AND UNLESS IT IS CUT OFF FROM ITS LEADER ON AN ERRAND IT CAN
@@ -22082,6 +22722,7 @@ private:
             if (bot->IsInFlight())
             {
                 state.progress.since = std::time(nullptr);
+                state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
                 if (state.flightSince)
                     state.flightSince = std::time(nullptr);
                 continue;
@@ -22225,17 +22866,16 @@ private:
             // through `new rpg`, which is to say only by the leader and by an
             // escorted follower - exactly the two this drive is walking.
             //
-            // THE LEVER IS THE COUNTER. `stuckTs` and `stuckAttempts` are
-            // plain public fields of the public `rpgInfo` struct
-            // (NewRpgInfo.h:20, :81-82), and MoveFarTo owns both: it resets
-            // them whenever the walk gets nearer (NewRpgBaseAction.cpp:91-95)
-            // and nothing else writes them at all. A walk that genuinely
-            // cannot land is still bounded: the twenty-minute backstop below
-            // releases the errand as unreachable, on the ground, which is what
-            // "unreachable" should mean. Said once per errand when it was
-            // actually about to fire, because that is the moment worth having
-            // in the log: five attempts with no progress is a path problem
-            // somebody may want to look at, and the teleport used to hide it.
+            // THE LEVER IS THE CLOCK, NOT THE COUNTER (wow-overseer#335
+            // follow-up; it was the counter until then). `stuckTs` and
+            // `stuckAttempts` are plain public fields of the public `rpgInfo`
+            // struct (NewRpgInfo.h:20, :81-82). MoveFarTo resets both whenever
+            // the walk gets five yards nearer (NewRpgBaseAction.cpp:91-95) and
+            // teleports only when BOTH have run out: five tries and ninety
+            // seconds. This drive now restarts the ninety seconds on each poll
+            // it holds the walk and leaves the counter alone, and releases a
+            // walk that went nowhere for a whole window below, on the ground,
+            // which is what "unreachable" should mean.
             //
             // AND IT IS ONLY A LEVER WHILE SOMETHING IS PULLING IT (#498).
             // MoveFarTo runs only under `new rpg`, so for a character not
@@ -22260,48 +22900,34 @@ private:
             // move, and so never counts against - is covered on the same terms
             // as one still walking.
             bool const countsForThisCharacter = CanBeSentToNpc(botAI);
+            // THE TELEPORT CLOCK IS HELD WHILE THIS DRIVE JUDGES THE WALK
+            // (wow-overseer#335 follow-up). Upstream teleports on five tries
+            // AND ninety seconds since the last five-yard improvement
+            // (NewRpgBaseAction.cpp). This drive used to release the errand at
+            // the fifth try, and a try is one AI re-entry, so a 2,933-yard
+            // banker walk was released 15 s after it began (measured
+            // 2026-09-26, 02:11:41 to 02:11:56) on a path that had only bent
+            // away from the goal. Now the errand is judged over a window below
+            // (ReadErrandProgress: nearer, further along its route, or ground
+            // covered), and while it is judged the ninety-second half of the
+            // fuse is restarted every poll - never the counter, which stays
+            // upstream's. Polls are at most fifteen seconds apart and the
+            // window ends a no-progress errand within about a minute, so the
+            // teleport is out of reach for as long as this drive holds the walk,
+            // and an impossible walk costs a minute, not the twenty the
+            // backstop allows.
+            if (countsForThisCharacter && botAI->rpgInfo.stuckAttempts >= 1)
+                botAI->rpgInfo.stuckTs = getMSTime();
             if (countsForThisCharacter && botAI->rpgInfo.stuckAttempts >= 5 &&
                 !state.stuckSaid)
             {
                 state.stuckSaid = true;
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' has made no progress toward '{}' in {} tries and "
-                         "upstream would teleport it there after {} seconds - held on the "
-                         "ground instead, the errand's own {}-minute backstop decides",
-                         name, target, botAI->rpgInfo.stuckAttempts,
-                         UPSTREAM_MOVE_FAR_STUCK_SECONDS,
-                         static_cast<uint32>(TRAVEL_BACKSTOP_SECONDS / 60));
-            }
-            // NEVER LET THE UPSTREAM TELEPORT FUSE BECOME A WALL-HACK. Five
-            // failed MoveFarTo attempts are already the core's own proof that
-            // this route is not landing. Releasing here leaves the character
-            // on its current ground and lets the producer choose a different
-            // safe target; resetting the counters and continuing would keep
-            // issuing the same impossible walk until the twenty-minute
-            // backstop, while allowing upstream to snap the bot to a cliff.
-            if (OverseerDecisions::TravelStuckDecision(
-                    botAI->rpgInfo.stuckAttempts, 5, countsForThisCharacter) ==
-                OverseerDecisions::TravelStuckAction::Release)
-            {
-                bool const backoff =
-                    _travelAims.NoteNoProgressRelease(name, target);
-                if (backoff)
-                {
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' has been released {} times for no progress "
-                             "toward '{}' - bounded backoff for {} minutes before the aim "
-                             "may be re-issued",
-                             name, TRAVEL_STUCK_BACKOFF_RELEASES, target,
-                             static_cast<uint32>(TRAVEL_STUCK_BACKOFF_SECONDS / 60));
-                    _travelAims.Refuse(name, target,
-                                       "repeated no-progress releases; bounded backoff is active");
-                }
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' was sent to '{}' and made no progress in {} "
-                         "attempts - releasing the errand before upstream can teleport it",
-                         name, target, botAI->rpgInfo.stuckAttempts);
-                _travelAims.Release(name, "the travel drive (no progress in five stuck attempts)");
-                continue;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has had {} tries toward '{}' without a five-yard "
+                         "improvement - upstream's teleport clock is held, and the errand is "
+                         "judged on distance, route and ground over {}s instead",
+                         name, botAI->rpgInfo.stuckAttempts, target,
+                         static_cast<uint32>(ERRAND_PROGRESS_LIMITS.windowSeconds));
             }
             // MoveFarTo owns these counters. It resets them when the bot makes
             // measurable progress; resetting them here on every poll would
@@ -22985,6 +23611,48 @@ private:
             // distance to the thing this character was sent to - and, below,
             // what this drive does about a stall, which is the only part that
             // was ever this site's own.
+            // STUCK ONLY WHEN A WHOLE WINDOW WENT NOWHERE (wow-overseer#335
+            // follow-up). See the teleport clock above and
+            // OverseerDecisions::ReadErrandProgress. Read only while the walk's
+            // writer runs: a character not carrying `new rpg` is not walking
+            // this errand, so its window says nothing about the errand.
+            if (countsForThisCharacter)
+            {
+                OverseerDecisions::ErrandProgressReading reading;
+                reading.distance = distance;
+                reading.x = bot->GetPositionX();
+                reading.y = bot->GetPositionY();
+                reading.route = _travelAims.RouteMarkOf(name);
+                if (OverseerDecisions::ReadErrandProgress(state.progressWindow, reading,
+                                                          std::time(nullptr),
+                                                          ERRAND_PROGRESS_LIMITS) ==
+                    OverseerDecisions::ErrandProgress::NoProgress)
+                {
+                    bool const backoff = _travelAims.NoteNoProgressRelease(name, target);
+                    if (backoff)
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' has been released {} times for no progress "
+                                 "toward '{}' - bounded backoff for {} minutes before the aim "
+                                 "may be re-issued",
+                                 name, TRAVEL_STUCK_BACKOFF_RELEASES, target,
+                                 static_cast<uint32>(TRAVEL_STUCK_BACKOFF_SECONDS / 60));
+                        _travelAims.Refuse(name, target,
+                                           "repeated no-progress releases; bounded backoff is active");
+                    }
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' was sent to '{}' and in {}s got no {} yards nearer, no further along its route and covered under {} yards of ground - releasing the errand, on the ground where it stands",
+                             name, target,
+                             static_cast<uint32>(ERRAND_PROGRESS_LIMITS.windowSeconds),
+                             static_cast<uint32>(ERRAND_PROGRESS_LIMITS.minGainYards),
+                             static_cast<uint32>(ERRAND_PROGRESS_LIMITS.minMovedYards));
+                    _travelAims.Release(name, "the travel drive (no progress over the stuck window)");
+                    continue;
+                }
+            }
+            else
+                state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
+
             time_t const backstop = OverseerDecisions::TravelBackstopSeconds(
                 target, TRAVEL_BACKSTOP_SECONDS, ECONOMY_TRAVEL_BACKSTOP_SECONDS);
             OverseerDecisions::RatchetLimits limits = TRAVEL_RATCHET;
@@ -23190,7 +23858,20 @@ private:
                     // (NewRpgBaseAction.cpp:57-83).
                     float const ddx = wander->pos.GetPositionX() - aimAt.GetPositionX();
                     float const ddy = wander->pos.GetPositionY() - aimAt.GetPositionY();
-                    bool const samePlace = entry || (ddx * ddx + ddy * ddy) <= 1.0f;
+                    // AND A WALK IN FLIGHT IS NOT RE-SENT FOR A STEP THAT HAS
+                    // NOT MEANINGFULLY MOVED (wow-overseer#335 follow-up). A
+                    // new step within a few yards of the running one, while the
+                    // character is moving and not about to reach it, is the same
+                    // walk; re-sending it resets upstream's walk state for
+                    // nothing. A character standing still is re-sent as before,
+                    // which is what renews the lease on a doorstep (#122).
+                    bool const sameWalk =
+                        bot->isMoving() &&
+                        !OverseerDecisions::WalkNeedsRetarget(
+                            wander->pos.GetPositionX(), wander->pos.GetPositionY(),
+                            aimAt.GetPositionX(), aimAt.GetPositionY(), bot->GetPositionX(),
+                            bot->GetPositionY(), WALK_RETARGET_LIMITS);
+                    bool const samePlace = entry || (ddx * ddx + ddy * ddy) <= 1.0f || sameWalk;
                     atSameDestination = wander->npcEntry == entry && samePlace;
                 }
             }
@@ -42909,7 +43590,7 @@ private:
         // this function, from the database's clock rather than this host's.
         QueryResult result = CharacterDatabase.Query(
             "SELECT id, target_name, command, kind, channel, target_arg, "
-            "TIMESTAMPDIFF(SECOND, updated_at, NOW()) FROM overseer_command "
+            "TIMESTAMPDIFF(SECOND, updated_at, NOW()), source FROM overseer_command "
             "WHERE status = 'pending' ORDER BY updated_at ASC, id ASC LIMIT {}",
             COMMANDS_PER_POLL);
         if (!result)
@@ -42944,6 +43625,9 @@ private:
             std::string kind = fields[3].Get<std::string>();
             std::string channel = fields[4].Get<std::string>();
             std::string targetArg = fields[5].Get<std::string>();
+            // Who queued it: `discord:`/`web:` for the operator, anything else
+            // for one of the bridge's own rules. See LeaderCommandRefusal.
+            std::string const source = fields[7].Get<std::string>();
 
             // The SELECT is ordered oldest first, so the FIRST row carries the
             // age the health line below judges. Clamped at zero because a
@@ -43060,6 +43744,7 @@ private:
             // kind='share' and kind='sell' fill the same column, for the same
             // reason: the row must carry ITS OWN outcome.
             std::string rowResult;
+            std::string leaderRefusal;
 
             // Claimed and about to run: this row is work done, whatever it
             // answers (mod-overseer#230).
@@ -43158,8 +43843,32 @@ private:
                 detail = DoGuild(player, command, targetArg, status, rowResult);
             else if (kind == "bot" && command == "open items")
                 detail = DoOpenLockboxes(player, status, rowResult);
+            // A FAMILY LEADER'S MOVEMENT IS HIS INTENT BOOK'S (wow-overseer#335
+            // follow-up). `follow`, `stay`, `reset ai` and the `nc` toggles of
+            // `new rpg`, `follow` and `stay` from any of the bridge's own rules
+            // are refused for him, with the reason in the row. Measured on the
+            // dev realm over a week: 164 `reset ai`, 89 `follow` and 63 `stay`
+            // queued off the family's own bot speech, and `nc +/-new rpg` every
+            // ten minutes from the life rule, each one stopping and restarting
+            // the walk the book had him on. The operator's own orders pass,
+            // and become his intent.
+            else if (!(leaderRefusal = OverseerDecisions::LeaderCommandRefusal(
+                           LeaderIntentApplies(targetName), source, command))
+                          .empty())
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: command {} ('{}' from {}) for '{}' refused - {}", id,
+                         command, source.empty() ? std::string("an unnamed source") : source,
+                         targetName, leaderRefusal);
+                detail = leaderRefusal.c_str();
+            }
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
+                if (LeaderIntentApplies(targetName) &&
+                    OverseerDecisions::CommandSourceIsOperator(source) &&
+                    !OverseerDecisions::LeaderCommandRefusal(true, "a rule", command).empty())
+                    AskForLeader(targetName, OverseerDecisions::LeaderIntentKind::OperatorOrder,
+                                 "operator", command, "the operator's own order");
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
                 // this side of the hand-off, and it is what separates "the
                 // command did nothing" from "there was nothing to do".
@@ -47823,7 +48532,12 @@ private:
 
     static bool RosterRequiresAClient()
     {
-        return sConfigMgr->GetOption<bool>("Overseer.RequireClient", true);
+        // QUIET WHEN THE KEY IS ABSENT (wow-overseer#335 follow-up). This is
+        // read on every drive's hot path through Steerable, and the core logs
+        // "Missing property" on every read of an absent key unless told not
+        // to: 12,897 of 13,462 worldserver lines in one measured dev window,
+        // enough to push the movement evidence out of log rotation.
+        return sConfigMgr->GetOption<bool>("Overseer.RequireClient", true, false);
     }
 
     // WHO MAY PLAY WITH NOBODY WATCHING. The parsing and the predicate are
@@ -47838,7 +48552,7 @@ private:
     static std::vector<std::string> HeadlessRoster()
     {
         return OverseerDecisions::HeadlessRosterNames(
-            sConfigMgr->GetOption<std::string>("Overseer.HeadlessRoster", ""));
+            sConfigMgr->GetOption<std::string>("Overseer.HeadlessRoster", "", false));
     }
 
     // Form a guild, look at what it covers, find who would fill the holes, and

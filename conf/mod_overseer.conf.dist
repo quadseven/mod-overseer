@@ -361,6 +361,38 @@
 
 ########################################
 #
+#    ONE MOVEMENT OWNER PER FAMILY LEADER
+#
+#    Every rule that moves a family leader (a regroup, a walk back for a
+#    member, a town or economy errand, a training stop, the trip home, the
+#    quest drive, the dungeon run) asks one intent book first, and only the
+#    rule holding him may write his strategies, aims or holds. Each change is
+#    logged once as "leader intent '<name>' -> <kind> by <rule>".
+#
+
+#
+#    Overseer.LeaderIntent.Enable
+#        Description: Route every rule that moves a family leader through the
+#                     intent book. 0 restores the old behaviour, where each
+#                     rule acts on the leader on its own poll.
+#        Default:     1
+#
+#Overseer.LeaderIntent.Enable = 1
+
+#
+#    Overseer.LeaderIntent.DwellSeconds
+#        Description: How long a granted intent keeps the leader before a
+#                     higher-ranked rule may take him, unless it completes,
+#                     fails, or he dies or enters combat. The campaign's own
+#                     run and an operator order never wait. Also the cooldown
+#                     before a rule that gave up early may ask again.
+#                     Clamped to 30-300.
+#        Default:     90
+#
+#Overseer.LeaderIntent.DwellSeconds = 90
+
+########################################
+#
 #    TRAINING THE ROSTER
 #
 #    Each time a roster character changes level the module trains it. It

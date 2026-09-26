@@ -18156,6 +18156,289 @@ unsigned LoweredSkillValue(unsigned value, unsigned targetLevel);
 constexpr unsigned NATURALIZE_MAIL_ITEMS = 12;
 unsigned MailsNeededFor(unsigned items);
 
+// ------------------------------------------------------------------------
+// ONE MOVEMENT OWNER PER FAMILY LEADER (wow-overseer#335 follow-up).
+//
+// MEASURED on the dev realm, 2026-09-26 02:07-02:12 UTC, while the operator
+// watched the leader's stream and called his walking "stutter steps": in five
+// minutes at least six rules took turns steering one leader. The bridge handed
+// him `follow` twice, the regroup hold took it off 6 s later, the hold was
+// placed and lifted 30 s apart, a banker errand was released 15 s after it was
+// issued, the quest rule granted `new rpg` and took it off a minute later, and
+// a walk back for a member 6,400 yards away was started and refused inside a
+// minute. Each handoff stops the character and starts it again, and a
+// character that stops and starts every few seconds is what the operator saw.
+//
+// SO EVERY RULE THAT MOVES A LEADER NOW ASKS ONE BOOK FIRST. The book holds the
+// leader's single current intent: what it is, which rule asked, since when,
+// and a minimum dwell. A rule asks each poll it still wants the leader; the
+// book answers Granted, Renewed, Retargeted or Deferred, and only a granted or
+// renewed rule may write strategies, aims or holds for him. A lower-ranked
+// request waits for the current intent to end; a higher-ranked one waits for
+// the dwell unless the leader died or entered combat (the dwell is waived) or
+// it is an operator order or the campaign's own run, which never wait. An
+// owner that stops asking is gone after `staleSeconds`, so a rule that forgets
+// to say it is done cannot hold a leader forever. Pure, like everything in
+// this file: the caller reads the world and the clock and writes the log.
+// ------------------------------------------------------------------------
+
+// Ordered by rank, lowest first. The number is the rank.
+enum class LeaderIntentKind : std::uint8_t
+{
+    None = 0,
+    QuestDrive,     // `new rpg` carries the leader on the family's quest drive
+    EconomyErrand,  // a maintenance errand: sell, repair, bank, mail, restock
+    TownErrand,     // a walk to a named NPC: banker, vendor, trainer, auctioneer
+    Respec,         // a walk to a class trainer for a talent reset
+    TrainingStop,   // the head walks the family to a member's trainer
+    Regroup,        // held still while a member closes the gap
+    FetchMember,    // walks back for a member held too far away
+    Hearth,         // the family's trip home: hearth, inn, bind
+    DungeonRun,     // the campaign's run: staging, corridor, door, reset, exit
+    OperatorOrder,  // an order the operator gave
+};
+
+// The word used in the log line and in the bridge's `family_intent` column.
+char const* LeaderIntentKindWord(LeaderIntentKind kind);
+
+// The inverse, for the column the bridge writes. Unknown words are None.
+LeaderIntentKind ParseLeaderIntentKind(std::string const& word);
+
+// Does this intent walk the leader under his own `new rpg`? True for the quest
+// drive and for every errand or walk; false for None, Regroup (held still) and
+// an operator order (whose own verb decides).
+bool LeaderIntentWalksUnderNewRpg(LeaderIntentKind kind);
+
+struct LeaderIntentLimits
+{
+    // How long a granted intent keeps the leader before a higher-ranked request
+    // may take him, unless it ends first. The operator asked for 60-120 s.
+    std::time_t dwellSeconds{90};
+    // An owner that ended its own intent before the dwell ran out may not
+    // ask for the same kind again for this long. The regroup hold was placed
+    // and lifted 30 s apart twice in two minutes on the measured window.
+    std::time_t flapCooldownSeconds{90};
+    // An owner that has not asked again for this long has stopped wanting the
+    // leader, whether or not it said so. Longer than the slowest asking poll
+    // (the party poll, 30 s) with room for a late tick.
+    std::time_t staleSeconds{75};
+    // An operator's order has no rule asking for it again every poll, so it
+    // holds the leader this long unless the operator gives another.
+    std::time_t operatorSeconds{600};
+};
+
+// Jev's pick for the family, read from the bridge's column. Requests of this
+// kind (and target, when one is named) rank just below the campaign's own run
+// until `until`; the static order is the fallback below Jev's threshold.
+struct LeaderIntentPreference
+{
+    LeaderIntentKind kind{LeaderIntentKind::None};
+    std::string target;
+    std::time_t until{0};
+};
+
+struct LeaderIntentRequest
+{
+    LeaderIntentKind kind{LeaderIntentKind::None};
+    std::string owner;   // the rule asking: "regroup", "fetch", "travel column"...
+    std::string target;  // what about: an NPC, a member, an aim; may be empty
+    std::string why;     // one clause for the log line
+};
+
+struct LeaderIntentState
+{
+    LeaderIntentKind kind{LeaderIntentKind::None};
+    std::string owner;
+    std::string target;
+    std::string why;
+    std::time_t since{0};       // when this intent was granted
+    std::time_t lastAsked{0};   // when its owner last asked for it
+    bool dwellWaived{false};    // death or combat since it was granted
+    // Per kind, the time before which a request of that kind is deferred
+    // because its owner gave it up early (flap damping).
+    std::map<std::uint8_t, std::time_t> cooldownUntil;
+    // What the last deferral said to each asking owner, so a caller logs it
+    // once per change rather than every poll.
+    std::map<std::string, std::string> deferralSaid;
+    // How many times the intent changed, for the measurement the issue asks.
+    std::uint32_t changes{0};
+    // Every request asked recently, granted or not, keyed by kind and owner:
+    // what is "on the table" for Jev to choose between.
+    struct Ask
+    {
+        LeaderIntentRequest request;
+        std::time_t at{0};
+    };
+    std::map<std::string, Ask> asks;
+};
+
+// The requests asked within `staleSeconds` of `now`, highest rank first (ties
+// by kind, then owner). The current intent is among them while it is live.
+std::vector<LeaderIntentRequest> LeaderIntentsOnTheTable(LeaderIntentState const& state,
+                                                         std::time_t now,
+                                                         LeaderIntentLimits const& limits,
+                                                         LeaderIntentPreference const& preference = {});
+
+enum class LeaderIntentAnswer : std::uint8_t
+{
+    Granted,     // a new intent; the caller logs it once and acts
+    Renewed,     // the same intent asked again; act, say nothing
+    Retargeted,  // the same owner and kind, a new target; act, log at debug
+    Deferred,    // somebody else has the leader; do not act on him
+};
+
+struct LeaderIntentVerdict
+{
+    LeaderIntentAnswer answer{LeaderIntentAnswer::Deferred};
+    // Granted over a live intent: who lost the leader. None when he was free.
+    LeaderIntentKind replaced{LeaderIntentKind::None};
+    std::string replacedOwner;
+    // Deferred: who holds him, and how long the dwell or cooldown has left
+    // (0 when the holder simply outranks the request and has no end in sight).
+    std::string holder;
+    std::time_t waitSeconds{0};
+    // Deferred: the reason, one clause, and whether it differs from the last
+    // one said so the caller logs it once.
+    std::string reason;
+    bool sayIt{false};
+};
+
+// The rank a request gets: its kind's own, raised just below DungeonRun when
+// it is Jev's current pick for the family.
+int LeaderIntentRank(LeaderIntentKind kind, std::string const& target,
+                     LeaderIntentPreference const& preference, std::time_t now);
+
+// Ask for the leader. See the block above for the rules.
+LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
+                                    LeaderIntentRequest const& request, std::time_t now,
+                                    LeaderIntentLimits const& limits,
+                                    LeaderIntentPreference const& preference = {});
+
+enum class LeaderIntentEnd : std::uint8_t
+{
+    Completed,  // it got there, or it did what it was for
+    Failed,     // it cannot be done: no progress, refused, unreachable
+    Abandoned,  // its owner no longer wants it (a heuristic changed its mind)
+};
+
+// The owner ends its own intent. Ignored unless `kind` and `owner` hold the
+// leader now, so a rule cannot end somebody else's. An Abandoned end inside
+// the dwell starts the flap cooldown for that kind. Returns whether it ended.
+bool EndLeaderIntent(LeaderIntentState& state, LeaderIntentKind kind,
+                     std::string const& owner, LeaderIntentEnd how, std::time_t now,
+                     LeaderIntentLimits const& limits);
+
+// The leader died or entered combat: the current intent loses its dwell, so
+// whatever ranks above it may take him on its next ask.
+void WaiveLeaderIntentDwell(LeaderIntentState& state);
+
+// Does the book currently hold the leader for this kind and owner? For the
+// executors (the `new rpg` grant, the travel drive) that act between asks.
+bool LeaderIntentHeldBy(LeaderIntentState const& state, LeaderIntentKind kind,
+                        std::string const& owner, std::time_t now,
+                        LeaderIntentLimits const& limits);
+
+// Is the leader free, meaning no live intent holds him? A stale one is free.
+bool LeaderIntentFree(LeaderIntentState const& state, std::time_t now,
+                      LeaderIntentLimits const& limits);
+
+// Was this `overseer_command` row put there by the operator? Its `source`
+// names the writer: `discord:<id>` for an order typed to the Discord bot and
+// `web:<page>` for one clicked on the site. Everything else is a rule of the
+// bridge's own (`overseer:life`, `overseer:goal`, `kin:<caller>`) or the
+// in-game ear (`heard:<speaker>`), which is NOT counted as the operator here:
+// measured over 7 days on the dev realm it queued `reset ai` 164 times,
+// `follow` 89 times and `stay` 63 times off lines the family's own bots said
+// ("I am out of reagents for ..."), because it tells a typed line from bot
+// speech by what the bridge itself authored, and upstream speaks too.
+bool CommandSourceIsOperator(std::string const& source);
+
+// A command the bridge queued for a character, read before it is handed to the
+// bot engine. A family leader's movement belongs to the book above, so a verb
+// that would move him on some other rule's say-so is refused: `follow` (a
+// leader follows nobody; the family follows him), `stay`, `reset ai` (which
+// wipes every strategy the book's executors set), and the `nc` strategy
+// toggles that put `new rpg`, `follow` or `stay` on or off. An operator's own
+// order is never refused here. Returns the refusal reason, empty when the
+// command may run.
+std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
+                                 std::string const& command);
+
+// ------------------------------------------------------------------------
+// AN ERRAND IS STUCK ONLY WHEN IT HAS STOPPED GETTING ANYWHERE FOR A WINDOW.
+//
+// The travel drive released an errand after upstream's `stuckAttempts` hit
+// five. MoveFarTo counts an attempt on every AI re-entry that is not five
+// yards nearer, so five is about fifteen seconds of a path that bends away
+// from the goal, and the measured banker walk was released 15 s after it was
+// issued on a 2,933-yard trip. This reads progress over a window instead
+// (about 60 s): the straight-line distance closed by `minGainYards`, the
+// surveyed route's cursor moved on (a path that goes around first, #606), or
+// the character covered `minMovedYards` of ground at all (a pathfinder route
+// bending away from the goal). Only a full window with none of the three is
+// NoProgress.
+// ------------------------------------------------------------------------
+
+struct ErrandProgressLimits
+{
+    std::time_t windowSeconds{60};
+    float minGainYards{10.f};
+    float minMovedYards{25.f};
+};
+
+struct ErrandProgressReading
+{
+    float distance{0.f};  // straight line to the goal, yards
+    float x{0.f};         // where the character stands
+    float y{0.f};
+    RouteMark route;      // its surveyed route and cursor, if it has one
+};
+
+struct ErrandProgressWindow
+{
+    bool open{false};
+    std::time_t since{0};
+    float distance{0.f};
+    float x{0.f};
+    float y{0.f};
+    RouteMark route;
+};
+
+enum class ErrandProgress : std::uint8_t
+{
+    Settling,     // the window is still filling; nothing to say yet
+    Progressing,  // a full window with progress; a new window starts now
+    NoProgress,   // a full window with none; the errand is stuck for real
+};
+
+ErrandProgress ReadErrandProgress(ErrandProgressWindow& window,
+                                  ErrandProgressReading const& reading, std::time_t now,
+                                  ErrandProgressLimits const& limits);
+
+// ------------------------------------------------------------------------
+// A WALK ALREADY GOING WHERE IT IS SENT IS NOT SENT AGAIN.
+//
+// The travel drive re-aims the upstream wander walk whenever its aim point
+// differs from the last one by more than a yard, and the route leg the drive
+// hands it moves as the cursor advances and as the leader it follows drifts.
+// Every re-aim restarts MoveFarTo's spline from a standstill. This keeps the
+// running walk unless the new point is materially different: more than
+// `retargetYards` from the running one, or nearer the character than
+// `closeEnoughYards` (the running leg is about to end anyway).
+// ------------------------------------------------------------------------
+
+struct WalkRetargetLimits
+{
+    float retargetYards{15.f};
+    float closeEnoughYards{8.f};
+};
+
+// `runningX/Y` is where the running walk is headed, `newX/Y` the point the
+// drive would now send, `fromX/Y` where the character stands. True means
+// re-issue; false means leave the running walk alone.
+bool WalkNeedsRetarget(float runningX, float runningY, float newX, float newY, float fromX,
+                       float fromY, WalkRetargetLimits const& limits);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
