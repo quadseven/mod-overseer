@@ -10425,9 +10425,12 @@ private:
         }
         // Inside an instance the dungeon-clear engine runs the party and may
         // hold its tank with `stay` between pulls; that is not this rule's.
-        // And only while an intent that walks him holds him: a `stay` the
-        // operator put on him in person, or one on a leader with nothing to do,
-        // is not this rule's to take off.
+        // And only while an intent that walks him holds him; a leader with
+        // nothing to do keeps his `stay`. An operator pin sent through the
+        // command queue is protected for as long as it holds him (up to five
+        // minutes). A `stay` whispered straight to the bot in game is not seen
+        // by this module and IS taken off while he walks: send it through the
+        // command queue to keep it.
         Map* const map = leader->GetMap();
         if (HeldStill(leaderName) || HeldAfterRevival(leaderName) ||
             !OverseerDecisions::LeaderIntentWalksUnderNewRpg(held) || !map ||
@@ -20903,8 +20906,10 @@ private:
             // because EndTheRegroupWait below does nothing for a wait that
             // had not started, and a regroup intent with no hold behind it
             // would keep every errand waiting on nothing.
+            // Abandoned, not Failed, so the flap cooldown keeps a hold that
+            // keeps failing from taking him off his errand every dwell.
             EndForLeader(leaderName, OverseerDecisions::LeaderIntentKind::Regroup, "regroup",
-                         OverseerDecisions::LeaderIntentEnd::Failed,
+                         OverseerDecisions::LeaderIntentEnd::Abandoned,
                          "the leader could not be held");
             LOG_ERROR("module.overseer",
                       "overseer: '{}' is {} yards behind '{}' and the leader "
