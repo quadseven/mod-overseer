@@ -15644,8 +15644,8 @@ NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
 
     if (words.empty())
     {
-        req.error = "empty; say reset-level-1, reset-level-55, strip-family-grants, lower-to-natural-level or "
-                    "discard-unearned-gold";
+        req.error = "empty; say reset-level-1, reset-level-55, strip-family-grants, lower-to-natural-level, "
+                    "discard-unearned-gold or discard-guild-bank-gold";
         return req;
     }
 
@@ -15660,10 +15660,12 @@ NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
         req.mode = NaturalizeMode::LowerToNaturalLevel;
     else if (mode == "discard-unearned-gold")
         req.mode = NaturalizeMode::DiscardUnearnedGold;
+    else if (mode == "discard-guild-bank-gold")
+        req.mode = NaturalizeMode::DiscardGuildBankGold;
     else
     {
         req.error = "unknown mode; say reset-level-1, reset-level-55, strip-family-grants, "
-                    "lower-to-natural-level or discard-unearned-gold";
+                    "lower-to-natural-level, discard-unearned-gold or discard-guild-bank-gold";
         return req;
     }
 
@@ -15750,6 +15752,8 @@ NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
         req.parts = NATURALIZE_PART_LOWER;
     else if (req.mode == NaturalizeMode::DiscardUnearnedGold)
         req.parts = NATURALIZE_PART_GOLD;
+    else if (req.mode == NaturalizeMode::DiscardGuildBankGold)
+        req.parts = NATURALIZE_PART_GUILD_BANK_GOLD;
     else if (!sawParts)
         req.parts = NATURALIZE_STRIP_PARTS;
 
@@ -15776,6 +15780,8 @@ char const* NaturalizeModeWord(NaturalizeMode mode)
             return "lower-to-natural-level";
         case NaturalizeMode::DiscardUnearnedGold:
             return "discard-unearned-gold";
+        case NaturalizeMode::DiscardGuildBankGold:
+            return "discard-guild-bank-gold";
         case NaturalizeMode::Unknown:
             break;
     }
@@ -15800,6 +15806,8 @@ char const* NaturalizePartWord(unsigned part)
             return "lower";
         case NATURALIZE_PART_GOLD:
             return "gold";
+        case NATURALIZE_PART_GUILD_BANK_GOLD:
+            return "guild_bank_gold";
         default:
             break;
     }
@@ -16200,6 +16208,13 @@ std::uint64_t DuesAmountFromSource(std::string const& source)
     if (!AllDigits(n) || n.size() > 12)
         return 0;
     return std::stoull(n);
+}
+
+std::uint64_t GuildBankGoldToDiscard(std::uint64_t bankMoney, std::uint64_t deposits,
+                                    std::uint64_t withdrawals)
+{
+    std::uint64_t const netDeposits = deposits > withdrawals ? deposits - withdrawals : 0;
+    return std::min(bankMoney, netDeposits);
 }
 
 DuesDiscard DuesDiscardFor(std::vector<DuesLetter> const& letters, std::uint64_t purse)

@@ -6681,6 +6681,8 @@ using OverseerDecisions::LowerSpellDecisionFor;
 using OverseerDecisions::LowerSpellFacts;
 using OverseerDecisions::NATURALIZE_PART_LOWER;
 using OverseerDecisions::NATURALIZE_PART_GOLD;
+using OverseerDecisions::NATURALIZE_PART_GUILD_BANK_GOLD;
+using OverseerDecisions::GuildBankGoldToDiscard;
 using OverseerDecisions::DuesAmountFromSource;
 using OverseerDecisions::DuesDiscard;
 using OverseerDecisions::DuesDiscardFor;
@@ -49531,7 +49533,7 @@ private:
                 std::string const part = r->Fetch()[0].Get<std::string>();
                 for (unsigned bit : {NATURALIZE_PART_RESET, NATURALIZE_PART_ITEMS, NATURALIZE_PART_RIDING,
                                      NATURALIZE_PART_WEAPONS, NATURALIZE_PART_SPELLS, NATURALIZE_PART_LOWER,
-                                     NATURALIZE_PART_GOLD})
+                                     NATURALIZE_PART_GOLD, NATURALIZE_PART_GUILD_BANK_GOLD})
                     if (part == NaturalizePartWord(bit))
                         facts.partsAlreadyDone |= bit;
             } while (r->NextRow());
@@ -49909,6 +49911,8 @@ private:
             changed = NaturalizeLower(player, request.targetLevel, apply, o, blocked);
         else if (request.mode == NaturalizeMode::DiscardUnearnedGold)
             changed = NaturalizeDiscardGold(player, apply, o);
+        else if (request.mode == NaturalizeMode::DiscardGuildBankGold)
+            changed = NaturalizeDiscardGuildBankGold(player, apply, o, blocked);
         else
             changed = NaturalizeStrip(player, request.parts, apply, o);
         o << '}';
@@ -49931,7 +49935,7 @@ private:
             // earlier run keeps its first date.
             for (unsigned bit : {NATURALIZE_PART_RESET, NATURALIZE_PART_ITEMS, NATURALIZE_PART_RIDING,
                                  NATURALIZE_PART_WEAPONS, NATURALIZE_PART_SPELLS, NATURALIZE_PART_LOWER,
-                                 NATURALIZE_PART_GOLD})
+                                 NATURALIZE_PART_GOLD, NATURALIZE_PART_GUILD_BANK_GOLD})
                 if (request.parts & bit)
                     CharacterDatabase.Execute(
                         "INSERT IGNORE INTO overseer_naturalized (guid, part, name) VALUES ({}, '{}', '{}')",
@@ -50578,6 +50582,104 @@ private:
         player->m_mailsUpdated = true;
         if (d.fromPurse)
             player->ModifyMoney(-static_cast<int32>(d.fromPurse));
+        return true;
+    }
+
+    // DISCARD THE FAMILY'S GUILD BANK GOLD. Event type 4 is
+    // GUILD_BANK_LOG_DEPOSIT_MONEY and type 5 is
+    // GUILD_BANK_LOG_WITHDRAW_MONEY in the pinned core. Subtract family
+    // withdrawals before capping the remainder at the bank's live balance.
+    bool NaturalizeDiscardGuildBankGold(Player* player, bool apply, std::ostringstream& o, bool& blocked)
+    {
+        uint32 const guildId = player->GetGuildId();
+        Guild* guild = guildId ? sGuildMgr->GetGuildById(guildId) : nullptr;
+        if (!guild)
+        {
+            blocked = true;
+            o << ",\"blocked\":" << J("the character has no guild")
+              << ",\"guild\":\"\",\"bank_money\":0,\"family_deposits\":0"
+                 ",\"family_withdrawals\":0,\"would_discard\":0";
+            return false;
+        }
+
+        uint64 const bankMoney = guild->GetTotalBankMoney();
+        uint64 deposits = 0;
+        uint64 withdrawals = 0;
+        if (QueryResult r = CharacterDatabase.Query(
+                "SELECT COALESCE(SUM(CASE WHEN e.EventType = 4 THEN e.ItemOrMoney ELSE 0 END), 0), "
+                "COALESCE(SUM(CASE WHEN e.EventType = 5 THEN e.ItemOrMoney ELSE 0 END), 0) "
+                "FROM guild_bank_eventlog e JOIN characters c ON c.guid = e.PlayerGuid "
+                "JOIN overseer_roster roster ON roster.name = c.name "
+                "WHERE e.guildid = {} AND e.EventType IN (4, 5)", guildId))
+        {
+            deposits = r->Fetch()[0].Get<uint64>();
+            withdrawals = r->Fetch()[1].Get<uint64>();
+        }
+        uint64 const amount = GuildBankGoldToDiscard(bankMoney, deposits, withdrawals);
+        o << ",\"guild\":" << J(guild->GetName()) << ",\"bank_money\":" << bankMoney
+          << ",\"family_deposits\":" << deposits << ",\"family_withdrawals\":" << withdrawals
+          << ",\"would_discard\":" << amount;
+        if (!apply || amount == 0)
+            return false;
+
+        if (guild->GetLeaderGUID() != player->GetGUID())
+        {
+            // Guild bank withdrawals are unlimited only when the rank's
+            // configured daily money allowance is UINT32_MAX.
+            uint32 const guid = player->GetGUID().GetCounter();
+            QueryResult member = CharacterDatabase.Query(
+                "SELECT r.BankMoneyPerDay FROM guild_member m JOIN guild_rank r "
+                "ON r.guildid = m.guildid AND r.rid = m.rank WHERE m.guildid = {} AND m.guid = {}",
+                guildId, guid);
+            if (!member || member->Fetch()[0].Get<uint32>() != UINT32_MAX)
+            {
+                blocked = true;
+                o << ",\"blocked\":" << J("the character is neither the guild master nor allowed unlimited bank withdrawals");
+                return false;
+            }
+        }
+        if (amount > static_cast<uint64>(INT32_MAX))
+        {
+            blocked = true;
+            o << ",\"blocked\":" << J("the amount exceeds the core's supported money move");
+            return false;
+        }
+        WorldSession* session = player->GetSession();
+        if (!session)
+        {
+            blocked = true;
+            o << ",\"blocked\":" << J("the character has no session to withdraw guild bank money");
+            return false;
+        }
+
+        uint32 const purseBefore = player->GetMoney();
+        uint64 const bankBefore = guild->GetTotalBankMoney();
+        bool const moved = guild->HandleMemberWithdrawMoney(session, static_cast<uint32>(amount), false);
+        uint32 const purseAfterWithdraw = player->GetMoney();
+        uint64 const bankAfterWithdraw = guild->GetTotalBankMoney();
+        bool const witnessed = moved && bankBefore >= bankAfterWithdraw &&
+                               bankBefore - bankAfterWithdraw == amount &&
+                               purseAfterWithdraw >= purseBefore && purseAfterWithdraw - purseBefore == amount;
+        if (!witnessed || purseAfterWithdraw < amount)
+        {
+            blocked = true;
+            o << ",\"blocked\":" << J("the core refused or did not complete the guild bank withdrawal")
+              << ",\"bank_before\":" << bankBefore << ",\"bank_after\":" << bankAfterWithdraw
+              << ",\"purse_before\":" << purseBefore << ",\"purse_after\":" << purseAfterWithdraw;
+            return bankBefore != bankAfterWithdraw || purseBefore != purseAfterWithdraw;
+        }
+
+        player->ModifyMoney(-static_cast<int32>(amount));
+        uint32 const purseAfter = player->GetMoney();
+        uint64 const bankAfter = guild->GetTotalBankMoney();
+        o << ",\"bank_before\":" << bankBefore << ",\"bank_after\":" << bankAfter
+          << ",\"purse_before\":" << purseBefore << ",\"purse_after\":" << purseAfter;
+        if (bankBefore - bankAfter != amount || purseAfter != purseBefore)
+        {
+            blocked = true;
+            o << ",\"blocked\":" << J("the bank or purse did not match the requested withdrawal");
+            return true;
+        }
         return true;
     }
 

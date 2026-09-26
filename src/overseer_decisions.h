@@ -17894,6 +17894,8 @@ char const* KeepStepWord(KeepStep step);
 //                        letters it has not opened, and, from its purse, the
 //                        dues it has already taken out (never more than the
 //                        purse holds).
+//   discard-guild-bank-gold  a family guild's master or an unrestricted
+//                        withdrawer removes family deposits still in its bank.
 //
 // Grammar: `<mode> [dry-run] [parts:<p>,<p>...] [level:<N>]`. A dry run writes
 // exactly what the real run would remove to the row's result and changes
@@ -17913,6 +17915,7 @@ enum class NaturalizeMode : std::uint8_t
     LowerToNaturalLevel,
     DiscardUnearnedGold,
     ResetDeathKnight,     // reset-level-55
+    DiscardGuildBankGold, // appended, so no earlier value moves
 };
 
 // reset-level-1 and reset-level-55: one reset, two class starts. Both record
@@ -17930,6 +17933,7 @@ enum NaturalizePart : unsigned
     NATURALIZE_PART_SPELLS = 1u << 4,
     NATURALIZE_PART_LOWER = 1u << 5,
     NATURALIZE_PART_GOLD = 1u << 6,
+    NATURALIZE_PART_GUILD_BANK_GOLD = 1u << 7,
 };
 constexpr unsigned NATURALIZE_STRIP_PARTS = NATURALIZE_PART_ITEMS | NATURALIZE_PART_RIDING |
                                             NATURALIZE_PART_WEAPONS | NATURALIZE_PART_SPELLS;
@@ -18242,6 +18246,11 @@ std::vector<unsigned> BoostLevelAchievements(std::vector<CompletedAchievement> c
 // The bridge's dues rows carry their amount in the source tag,
 // `guilddues:<copper>`. The amount, or 0 for any other source.
 std::uint64_t DuesAmountFromSource(std::string const& source);
+
+// Roster bank deposits, less their withdrawals, capped at the guild bank's
+// current balance. The result is never negative.
+std::uint64_t GuildBankGoldToDiscard(std::uint64_t bankMoney, std::uint64_t deposits,
+                                    std::uint64_t withdrawals);
 
 // A dues letter: from a guild member who is not on the roster (a factory-made
 // guild bot), to a family character, subject "Guild dues". `money` is what it
