@@ -26697,6 +26697,17 @@ private:
                  name, led ? "`new rpg`" : botAI->GetMaster() ? "`follow`" : "nothing to restore");
     }
 
+    // DECLARED BEFORE ITS USE: a member function's parameter type must be
+    // complete where the function is declared, unlike a body (#746).
+    struct RevivedSicknessState
+    {
+        bool hasDecision{false};
+        OverseerDecisions::RevivedSickGroundStep lastDecision{
+            OverseerDecisions::RevivedSickGroundStep::Stay};
+        std::vector<std::string> removedCombat;
+        bool addedFlee{false};
+    };
+
     // A sick revival cannot fight on ground inside the #697 lethal margin (#746).
     // It hearths when possible; otherwise the shared stillness hold and combat
     // strategy command path keep it passive until spell 15007 ends.
@@ -60479,14 +60490,6 @@ private:
     // to upstream's defaults and there is no `stay` left to take off.
     std::map<std::string, std::pair<int64, bool>> _revivalHoldUntil;
 
-    struct RevivedSicknessState
-    {
-        bool hasDecision{false};
-        OverseerDecisions::RevivedSickGroundStep lastDecision{
-            OverseerDecisions::RevivedSickGroundStep::Stay};
-        std::vector<std::string> removedCombat;
-        bool addedFlee{false};
-    };
     std::map<std::string, RevivedSicknessState> _revivedSickness;
     std::map<std::string, int64> _lastSpiritHealerUse;
 
