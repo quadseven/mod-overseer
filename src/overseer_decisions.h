@@ -4727,6 +4727,15 @@ enum class GearRefusal
     // A weapon that can go in the off hand and nowhere else, for a character
     // that cannot dual wield.
     NeedsDualWield,
+    // THE OFF HAND IS NOT FOR THIS ROLE'S USE OF IT. A held-in-off-hand
+    // (INVTYPE_HOLDABLE) is a caster's piece: a melee character never wears
+    // one, and neither does a tank who can hold a shield. An off-hand-only
+    // weapon is refused to that tank too, because a shield is the tank's
+    // off hand. Measured on the dev realm 2026-09-26: the Alliance head, a
+    // Protection warrior lowered to 38, was handed a Sorcerer Sphere and wore
+    // it where his shield had been, and died four times in thirteen minutes.
+    // The core would have let him; this is the role's answer, not the core's.
+    NotForRole,
 };
 
 struct GearVerdict

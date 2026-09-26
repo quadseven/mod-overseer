@@ -3290,6 +3290,9 @@ constexpr int INV_BODY = 4;
 // this InventoryType straight to EQUIPMENT_SLOT_OFFHAND (PlayerStorage.cpp:
 // 191-194) and then refuses it there without dual wield (:2034-2038).
 constexpr int INV_WEAPON_OFF_HAND = 22;
+// Held in the off hand: an orb, a tome, a candle. Any class may hold one and
+// the core asks for no skill; it is still a caster's piece (see NotForRole).
+constexpr int INV_HOLDABLE = 23;
 
 // Item level's whole remaining influence. See the header for why it is a
 // tiebreak and not an answer.
@@ -3669,6 +3672,27 @@ GearUsability GearUsable(GearItem const& item, GearWearer const& who)
     {
         answer.refusal = GearRefusal::NeedsDualWield;
         answer.why = "an off-hand weapon, and this character cannot dual wield";
+        return answer;
+    }
+
+    // WHAT THE OFF HAND IS FOR, BY ROLE (NotForRole in the header). A
+    // held-in-off-hand carries caster stats or nothing a fighter wears, and
+    // any number it scores for a melee character or a shield tank is the
+    // item-level tiebreak and nothing else - which is exactly enough to beat an
+    // empty off hand, so it was put on. A tank who cannot hold a shield (a
+    // feral druid) is left alone: a held piece is the only off hand it has.
+    bool const shieldTank = who.role == GearRole::Tank && who.shield;
+    if (item.inventoryType == INV_HOLDABLE && (shieldTank || who.role == GearRole::Melee))
+    {
+        answer.refusal = GearRefusal::NotForRole;
+        answer.why = shieldTank ? "held in the off hand, and a tank holds a shield there"
+                                : "held in the off hand, a caster's piece and no use in melee";
+        return answer;
+    }
+    if (item.itemClass == CLASS_WEAPON && item.inventoryType == INV_WEAPON_OFF_HAND && shieldTank)
+    {
+        answer.refusal = GearRefusal::NotForRole;
+        answer.why = "an off-hand weapon, and a tank holds a shield there";
         return answer;
     }
 
