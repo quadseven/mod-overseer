@@ -2086,6 +2086,18 @@ bool DungeonCampaignRecovers(unsigned trailingFailures)
     return trailingFailures > 0;
 }
 
+bool QuestDriveMayTakeCampaignLeader(bool campaignActive)
+{
+    return !campaignActive;
+}
+
+bool QuestDriveTargetFitsYoungest(int youngestLevel, int questLevel, int minLevel,
+                                  int maximumLevelGap)
+{
+    int const targetLevel = std::max(questLevel, minLevel);
+    return maximumLevelGap <= 0 || targetLevel <= youngestLevel + maximumLevelGap;
+}
+
 IdleCampaignPlan IdleCampaignRecovery(unsigned trailingFailures, bool recoveryAppliedForStreak,
                                       CampaignRecoveryRow const& newest)
 {
