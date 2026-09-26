@@ -7378,6 +7378,41 @@ private:
         return text;
     }
 
+    // What this module is doing with one member, in the words Jev reads.
+    std::string MemberStateWord(std::string const& name, Player* leader) const
+    {
+        Player* const p = ObjectAccessor::FindPlayerByName(name, false);
+        if (!p || !p->IsInWorld())
+            return "not in the world";
+        if (!p->IsAlive())
+            return "dead";
+        if (HeldOffLethalLeg(name))
+            return "held off a walk that kept killing it";
+        if (HeldWaitingForLeader(name))
+            return "held where it stands, too far to walk back";
+        if (IsCatchingUp(name))
+            return "walking back to the leader";
+        if (IsWalkingHome(name))
+            return "walking to the inn";
+        if (HeldStill(name))
+            return "held still";
+        if (!_travelAims.TargetFor(name).empty())
+            return "on an errand of its own";
+        if (leader && p->GetMapId() == leader->GetMapId() && p->IsInCombat())
+            return "fighting";
+        return "following";
+    }
+
+    static std::string MemberYardsWord(std::string const& name, Player* leader)
+    {
+        Player* const p = ObjectAccessor::FindPlayerByName(name, false);
+        if (!p || !p->IsInWorld() || !leader || !leader->IsInWorld())
+            return "unknown";
+        if (p->GetMapId() != leader->GetMapId())
+            return "another map";
+        return std::to_string(static_cast<uint32>(p->GetDistance2d(leader)));
+    }
+
     // One row per leader, the module's columns only. See the migration.
     void PublishLeaderIntents(std::vector<OverseerDecisions::FamilyRoster> const& rosters)
     {
@@ -7403,21 +7438,48 @@ private:
                     break;
                 table += (table.empty() ? "" : "\n") + line;
             }
+            // WHAT JEV COULD NOT SEE (wow-overseer#335 follow-up): how far the
+            // leader is from what his column resolved to, and what this
+            // module is doing with each member.
+            Player* const leader = ObjectAccessor::FindPlayerByName(roster.leader, false);
+            std::string goalYards = "NULL";
+            uint32 goalMap = 0;
+            float goalX = 0.f;
+            float goalY = 0.f;
+            if (leader && leader->IsInWorld() &&
+                _travelAims.ResolvedPoint(roster.leader, goalMap, goalX, goalY) &&
+                goalMap == leader->GetMapId())
+                goalYards = std::to_string(
+                    static_cast<uint32>(leader->GetDistance2d(goalX, goalY)));
+            std::string members;
+            for (OverseerDecisions::FamilyMember const& member : roster.members)
+            {
+                if (member.name == roster.leader)
+                    continue;
+                std::string const line =
+                    member.name + "|" + MemberStateWord(member.name, leader) + "|" +
+                    MemberYardsWord(member.name, leader);
+                if (members.size() + line.size() + 1 > 1000)
+                    break;
+                members += (members.empty() ? "" : "\n") + line;
+            }
             CharacterDatabase.Execute(
                 "INSERT INTO overseer_family_intent (leader_name, family, current_kind, "
-                "current_owner, current_target, current_since, on_the_table, changes, module_at) "
-                "VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}', {}, NOW()) "
+                "current_owner, current_target, current_since, on_the_table, changes, "
+                "goal_yards, members_state, module_at) "
+                "VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}', {}, {}, '{}', NOW()) "
                 "ON DUPLICATE KEY UPDATE family = VALUES(family), "
                 "current_kind = VALUES(current_kind), current_owner = VALUES(current_owner), "
                 "current_target = VALUES(current_target), current_since = VALUES(current_since), "
                 "on_the_table = VALUES(on_the_table), changes = VALUES(changes), "
+                "goal_yards = VALUES(goal_yards), members_state = VALUES(members_state), "
                 "module_at = VALUES(module_at)",
                 Esc(roster.leader), Esc(roster.family),
                 live ? OverseerDecisions::LeaderIntentKindWord(state.kind) : "none",
                 Esc(Fit(live ? state.owner : std::string(), 32)),
                 Esc(Fit(live ? state.target : std::string(), 96)),
                 live ? "FROM_UNIXTIME(" + std::to_string(state.since) + ")" : std::string("NULL"),
-                EscLong(table), state.changes);
+                EscLong(table), state.changes, goalYards, EscLong(members));
         }
     }
 
