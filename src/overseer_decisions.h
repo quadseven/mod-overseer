@@ -17737,12 +17737,16 @@ char const* KeepStepWord(KeepStep step);
 // ------------------------------------------------------------ naturalize --
 //
 // kind='naturalize': undo what was handed to a character rather than earned,
-// one character per row. Two modes, both approved by the operator per
-// character list, both irreversible, both gated off by default:
+// one character per row. Every mode is approved by the operator per
+// character list, irreversible, and gated off by default:
 //
 //   reset-level-1        a guild bot of a listed guild starts over at level 1
 //                        at its race's start, keeping its character, name,
 //                        race, class, account, guild membership and rank.
+//   reset-level-55       the same reset for a death knight, which has no level
+//                        1: it starts over as a fresh level 55 death knight at
+//                        its class's start, with what the core gives a new one
+//                        and nothing else (the operator's decision, 2026-09-26).
 //   strip-family-grants  a family character loses what was granted to it
 //                        without a trainer, gold or loot: GM-issued items,
 //                        riding, untrained weapon skills and every class
@@ -17767,7 +17771,8 @@ char const* KeepStepWord(KeepStep step);
 // exactly what the real run would remove to the row's result and changes
 // nothing. `parts:` limits a strip to some of items, riding, weapons and
 // spells; `level:` is required by lower-to-natural-level and refused by the
-// others.
+// others. A death knight is refused reset-level-1 and every other class is
+// refused reset-level-55, so the level in the word is the level it gets.
 //
 // Everything below is decided here, with no world, so a test can pin what is
 // kept and what is removed. The adapter reads facts and does what these say.
@@ -17779,7 +17784,12 @@ enum class NaturalizeMode : std::uint8_t
     StripFamilyGrants,
     LowerToNaturalLevel,
     DiscardUnearnedGold,
+    ResetDeathKnight,     // reset-level-55
 };
+
+// reset-level-1 and reset-level-55: one reset, two class starts. Both record
+// the ledger's `reset` part, so a character reset by either is not reset again.
+bool IsResetMode(NaturalizeMode mode);
 
 // The parts a run touches, as bits so a ledger row per part can say which
 // ones have already been done.
@@ -17810,7 +17820,7 @@ struct NaturalizeRequest
 
 NaturalizeRequest ParseNaturalizeRequest(std::string const& command);
 
-// "reset-level-1", "strip-family-grants".
+// "reset-level-1", "reset-level-55", "strip-family-grants", ...
 char const* NaturalizeModeWord(NaturalizeMode mode);
 // "reset", "items", "riding", "weapons", "spells": the ledger's part column.
 char const* NaturalizePartWord(unsigned part);
@@ -17849,7 +17859,8 @@ enum class NaturalizeRefusal : std::uint8_t
     NotInNaturalGuild,
     FamilyMember,        // reset: never a family character
     NotFamily,           // strip: only a family character
-    DeathKnight,         // reset: the class starts at 55, so level 1 is not a start
+    DeathKnight,         // reset-level-1: the class starts at 55, so level 1 is not a start
+    NotDeathKnight,      // reset-level-55: only a death knight starts at 55
     OpenAuction,         // reset: an auction or bid would deliver after it
     CodMail,             // reset: a COD mail cannot be deleted by its receiver
     PlayerbotsGateOff,   // reset: the factory would re-kit a level 1 bot
@@ -17915,6 +17926,27 @@ ResetTreatment ResetTreatmentFor(ResetPart part);
 // The level a reset takes a character to: 1, by name and by the operator's
 // decision, not the realm's configured start level (which a realm may raise).
 constexpr unsigned NATURALIZE_RESET_LEVEL = 1;
+// And a death knight's: 55, the level the core creates one at by default and
+// the one the operator named. Also a constant, not the realm's configured
+// heroic start level.
+constexpr unsigned NATURALIZE_DEATH_KNIGHT_RESET_LEVEL = 55;
+
+// What a reset puts back beyond the class and race tables the core already
+// keys by class: the level, which start gold, how much of the starting food
+// (Player::Create gives a death knight 10, everyone else 4), and the free
+// talent points. A new death knight has none at 55: CalculateTalentsPoints
+// pays it only what its Ebon Hold quests grant, and the reset removes those
+// quests. The core would otherwise count 46 until its next login, because it
+// keeps the old quest total in memory and the character is not yet in the
+// Ebon Hold when the level is set. level 0 for a mode that is not a reset.
+struct ResetStart
+{
+    unsigned level{0};
+    bool heroicStartMoney{false};   // CONFIG_START_HEROIC_PLAYER_MONEY
+    unsigned startFood{0};
+    unsigned freeTalentPoints{0};
+};
+ResetStart ResetStartFor(NaturalizeMode mode);
 char const* ResetPartWord(ResetPart part);
 char const* ResetTreatmentWord(ResetTreatment treatment);
 
@@ -17944,7 +17976,8 @@ struct BotValueAction
     char const* why;
 };
 
-std::vector<BotValueAction> ResetRandomBotValues();
+// `level` is set to the reset's start level (ResetStartFor(mode).level).
+std::vector<BotValueAction> ResetRandomBotValues(unsigned startLevel);
 
 // ---- strip: spells ----
 

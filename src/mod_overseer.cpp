@@ -6261,7 +6261,9 @@ using OverseerDecisions::ParseNaturalizeRequest;
 using OverseerDecisions::RESET_PARTS;
 using OverseerDecisions::ResetPart;
 using OverseerDecisions::ResetPartWord;
+using OverseerDecisions::IsResetMode;
 using OverseerDecisions::ResetRandomBotValues;
+using OverseerDecisions::ResetStartFor;
 using OverseerDecisions::ResetTreatmentFor;
 using OverseerDecisions::ResetTreatmentWord;
 using OverseerDecisions::StripSpellDecision;
@@ -48273,9 +48275,10 @@ private:
                 continue;
             }
 
-            if (check.request.mode == NaturalizeMode::ResetLevelOne)
+            if (IsResetMode(check.request.mode))
             {
-                // To the race's start, and logged out once there. The bot's AI
+                // To the race's start (a death knight's is its class's, in the
+                // Ebon Hold), and logged out once there. The bot's AI
                 // answers the teleport the way it answers any other.
                 PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(), player->getClass());
                 if (info && player->TeleportTo(info->mapId, info->positionX, info->positionY, info->positionZ,
@@ -48477,8 +48480,8 @@ private:
 
         bool changed = false;
         bool blocked = false;
-        if (request.mode == NaturalizeMode::ResetLevelOne)
-            changed = NaturalizeReset(player, apply, o);
+        if (IsResetMode(request.mode))
+            changed = NaturalizeReset(player, ResetStartFor(request.mode), apply, o);
         else if (request.mode == NaturalizeMode::LowerToNaturalLevel)
             changed = NaturalizeLower(player, request.targetLevel, apply, o, blocked);
         else if (request.mode == NaturalizeMode::DiscardUnearnedGold)
@@ -48522,11 +48525,13 @@ private:
         return changed ? NaturalizeOutcome::Changed : NaturalizeOutcome::Unchanged;
     }
 
-    // RESET TO LEVEL 1. Each step is the call the core itself makes for it:
+    // RESET TO THE CLASS START: level 1, or 55 for a death knight
+    // (reset-level-55). Each step is the call the core itself makes for it:
     // `.reset level` for the level, Player::Create for the starting outfit,
     // Player::resetSpells for the spells, the mail-delete handler's state for
     // the mail. Order matters in three places, each marked.
-    bool NaturalizeReset(Player* player, bool apply, std::ostringstream& o)
+    bool NaturalizeReset(Player* player, OverseerDecisions::ResetStart const& start, bool apply,
+                         std::ostringstream& o)
     {
         using namespace NaturalizeNames;
 
@@ -48598,10 +48603,11 @@ private:
                 ++activeQuests;
 
         PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(), player->getClass());
-        // Level 1, whatever the realm's configured start level: the mode's name
-        // and the operator's decision are both level 1.
-        uint32 const startLevel = OverseerDecisions::NATURALIZE_RESET_LEVEL;
-        uint32 const startMoney = sWorld->getIntConfig(CONFIG_START_PLAYER_MONEY);
+        // Level 1, or 55 for a death knight, whatever the realm's configured
+        // start levels: the mode's name and the operator's decision say which.
+        uint32 const startLevel = start.level;
+        uint32 const startMoney = sWorld->getIntConfig(start.heroicStartMoney ? CONFIG_START_HEROIC_PLAYER_MONEY
+                                                                               : CONFIG_START_PLAYER_MONEY);
 
         o << ",\"removes\":{\"level\":" << uint32(player->GetLevel()) << ",\"items\":" << items
           << ",\"buyback\":" << buyback << ",\"inbox_mail\":" << mails << ",\"inbox_mail_items\":" << mailItems
@@ -48618,7 +48624,7 @@ private:
 
         o << ",\"playerbots_values\":[";
         first = true;
-        for (BotValueAction const& a : ResetRandomBotValues())
+        for (BotValueAction const& a : ResetRandomBotValues(startLevel))
         {
             o << (first ? "" : ",") << "{\"event\":" << J(a.event) << ",\"step\":"
               << J(a.step == BotValueStep::Set ? "set" : a.step == BotValueStep::Clear ? "clear" : "leave")
@@ -48750,6 +48756,10 @@ private:
         player->InitStatsForLevel(true);
         player->InitGlyphsForLevel();
         player->InitTalentForLevel();
+        // A new death knight has no talent points at 55 (ResetStart says why);
+        // InitTalentForLevel counted them outside the Ebon Hold with the old
+        // quest total. At level 1 this is the 0 it already has.
+        player->SetFreeTalentPoints(start.freeTalentPoints);
         player->SetUInt32Value(PLAYER_XP, 0);
         player->_ApplyAllLevelScaleItemMods(true);
 
@@ -48809,7 +48819,7 @@ private:
                     switch (proto->Spells[0].SpellCategory)
                     {
                         case SPELL_CATEGORY_FOOD:
-                            count = 4;
+                            count = start.startFood;
                             break;
                         case SPELL_CATEGORY_DRINK:
                             count = 2;
@@ -48850,7 +48860,7 @@ private:
         // The playerbots per-bot values (ResetRandomBotValues says which and
         // why; `randomize` is deliberately left alone).
         uint32 const low = player->GetGUID().GetCounter();
-        for (BotValueAction const& a : ResetRandomBotValues())
+        for (BotValueAction const& a : ResetRandomBotValues(startLevel))
         {
             if (a.step == BotValueStep::Set)
                 sRandomPlayerbotMgr.SetValue(low, a.event, a.value);

@@ -15515,13 +15515,16 @@ NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
 
     if (words.empty())
     {
-        req.error = "empty; say reset-level-1, strip-family-grants, lower-to-natural-level or discard-unearned-gold";
+        req.error = "empty; say reset-level-1, reset-level-55, strip-family-grants, lower-to-natural-level or "
+                    "discard-unearned-gold";
         return req;
     }
 
     std::string const mode = LowerAscii(words[0]);
     if (mode == "reset-level-1")
         req.mode = NaturalizeMode::ResetLevelOne;
+    else if (mode == "reset-level-55")
+        req.mode = NaturalizeMode::ResetDeathKnight;
     else if (mode == "strip-family-grants")
         req.mode = NaturalizeMode::StripFamilyGrants;
     else if (mode == "lower-to-natural-level")
@@ -15530,8 +15533,8 @@ NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
         req.mode = NaturalizeMode::DiscardUnearnedGold;
     else
     {
-        req.error = "unknown mode; say reset-level-1, strip-family-grants, lower-to-natural-level or "
-                    "discard-unearned-gold";
+        req.error = "unknown mode; say reset-level-1, reset-level-55, strip-family-grants, "
+                    "lower-to-natural-level or discard-unearned-gold";
         return req;
     }
 
@@ -15612,7 +15615,7 @@ NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
         return req;
     }
 
-    if (req.mode == NaturalizeMode::ResetLevelOne)
+    if (IsResetMode(req.mode))
         req.parts = NATURALIZE_PART_RESET;
     else if (req.mode == NaturalizeMode::LowerToNaturalLevel)
         req.parts = NATURALIZE_PART_LOWER;
@@ -15625,12 +15628,19 @@ NaturalizeRequest ParseNaturalizeRequest(std::string const& command)
     return req;
 }
 
+bool IsResetMode(NaturalizeMode mode)
+{
+    return mode == NaturalizeMode::ResetLevelOne || mode == NaturalizeMode::ResetDeathKnight;
+}
+
 char const* NaturalizeModeWord(NaturalizeMode mode)
 {
     switch (mode)
     {
         case NaturalizeMode::ResetLevelOne:
             return "reset-level-1";
+        case NaturalizeMode::ResetDeathKnight:
+            return "reset-level-55";
         case NaturalizeMode::StripFamilyGrants:
             return "strip-family-grants";
         case NaturalizeMode::LowerToNaturalLevel:
@@ -15702,13 +15712,15 @@ NaturalizeRefusal NaturalizeVerdictFor(NaturalizeRequest const& request, Natural
     if (!facts.guildListed)
         return NaturalizeRefusal::NotInNaturalGuild;
 
-    bool const reset = request.mode == NaturalizeMode::ResetLevelOne;
+    bool const reset = IsResetMode(request.mode);
     if (reset && facts.inFamily)
         return NaturalizeRefusal::FamilyMember;
     if (!reset && !facts.inFamily)
         return NaturalizeRefusal::NotFamily;
-    if (reset && facts.deathKnight)
+    if (request.mode == NaturalizeMode::ResetLevelOne && facts.deathKnight)
         return NaturalizeRefusal::DeathKnight;
+    if (request.mode == NaturalizeMode::ResetDeathKnight && !facts.deathKnight)
+        return NaturalizeRefusal::NotDeathKnight;
     bool const lower = request.mode == NaturalizeMode::LowerToNaturalLevel;
     if (lower && request.targetLevel >= facts.level)
         return NaturalizeRefusal::LevelNotLower;
@@ -15750,7 +15762,9 @@ char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal)
         case NaturalizeRefusal::NotFamily:
             return "only a family character is stripped";
         case NaturalizeRefusal::DeathKnight:
-            return "a death knight starts at 55, so it has no level 1 to go back to";
+            return "a death knight starts at 55, so it has no level 1 to go back to; say reset-level-55";
+        case NaturalizeRefusal::NotDeathKnight:
+            return "only a death knight starts at 55; say reset-level-1";
         case NaturalizeRefusal::OpenAuction:
             return "it has an open auction or bid, which would deliver after the reset";
         case NaturalizeRefusal::CodMail:
@@ -15855,10 +15869,27 @@ char const* ResetTreatmentWord(ResetTreatment treatment)
     return "unknown";
 }
 
-std::vector<BotValueAction> ResetRandomBotValues()
+ResetStart ResetStartFor(NaturalizeMode mode)
+{
+    ResetStart start;
+    if (mode == NaturalizeMode::ResetLevelOne)
+    {
+        start.level = NATURALIZE_RESET_LEVEL;
+        start.startFood = 4;
+    }
+    else if (mode == NaturalizeMode::ResetDeathKnight)
+    {
+        start.level = NATURALIZE_DEATH_KNIGHT_RESET_LEVEL;
+        start.heroicStartMoney = true;
+        start.startFood = 10;
+    }
+    return start;
+}
+
+std::vector<BotValueAction> ResetRandomBotValues(unsigned startLevel)
 {
     return {
-        {"level", BotValueStep::Set, 1, "what RandomizeFirst records for a level 1 start"},
+        {"level", BotValueStep::Set, startLevel, "the level the reset starts it at, as RandomizeFirst records one"},
         {"dead", BotValueStep::Clear, 0, "the old life's death timer"},
         {"revive", BotValueStep::Clear, 0, "a revive would refresh and grind-teleport the new life"},
         {"randomize", BotValueStep::Leave, 0,

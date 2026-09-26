@@ -395,9 +395,11 @@
 #    EVERYTHING NATURAL
 #
 #    Overseer.Natural.Enabled
-#        Description: Whether kind='naturalize' rows run at all. All four
+#        Description: Whether kind='naturalize' rows run at all. All five
 #                     modes are irreversible: reset-level-1 takes a guild bot
-#                     back to level 1 at its race's start; strip-family-grants
+#                     back to level 1 at its race's start; reset-level-55
+#                     takes a guild death knight back to a fresh level 55 death
+#                     knight at its class's start; strip-family-grants
 #                     removes a family character's GM-issued items, riding,
 #                     untrained weapon skills and free class spells;
 #                     lower-to-natural-level level:<N> takes a family character

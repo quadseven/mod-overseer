@@ -45,7 +45,11 @@ using OverseerDecisions::DuesDiscardFor;
 using OverseerDecisions::DuesLetter;
 using OverseerDecisions::ExperienceBetween;
 using OverseerDecisions::NATURALIZE_PART_GOLD;
+using OverseerDecisions::NATURALIZE_DEATH_KNIGHT_RESET_LEVEL;
 using OverseerDecisions::NATURALIZE_RESET_LEVEL;
+using OverseerDecisions::IsResetMode;
+using OverseerDecisions::ResetStart;
+using OverseerDecisions::ResetStartFor;
 using OverseerDecisions::LoweredSkillValue;
 using OverseerDecisions::LowerSpellDecisionFor;
 using OverseerDecisions::LowerSpellFacts;
@@ -107,6 +111,18 @@ void TestParse()
 
     r = ParseNaturalizeRequest("reset-level-1 dry-run");
     Check("reset dry-run parses", r.ok && r.dryRun);
+
+    r = ParseNaturalizeRequest("reset-level-55 dry-run");
+    Check("the death knight reset parses",
+          r.ok && r.mode == NaturalizeMode::ResetDeathKnight && r.dryRun && r.parts == NATURALIZE_PART_RESET);
+    Check("its word is the level it goes to",
+          std::string(NaturalizeModeWord(NaturalizeMode::ResetDeathKnight)) == "reset-level-55");
+    Check("both resets are resets", IsResetMode(NaturalizeMode::ResetLevelOne) &&
+                                        IsResetMode(NaturalizeMode::ResetDeathKnight) &&
+                                        !IsResetMode(NaturalizeMode::StripFamilyGrants) &&
+                                        !IsResetMode(NaturalizeMode::LowerToNaturalLevel));
+    Check("the 55 reset takes no parts: or level:", !ParseNaturalizeRequest("reset-level-55 parts:items").ok &&
+                                                        !ParseNaturalizeRequest("reset-level-55 level:55").ok);
 
     r = ParseNaturalizeRequest("  STRIP-FAMILY-GRANTS   Dry-Run ");
     Check("case and spacing do not matter", r.ok && r.mode == NaturalizeMode::StripFamilyGrants && r.dryRun);
@@ -220,6 +236,49 @@ void TestVerdict()
     f.deathKnight = true;
     Check("the death knight is refused a level 1 reset",
           NaturalizeVerdictFor(reset, f, true) == NaturalizeRefusal::DeathKnight);
+    Check("...and told the mode that fits it",
+          std::strstr(NaturalizeRefusalSaid(NaturalizeRefusal::DeathKnight), "reset-level-55") != nullptr);
+
+    // reset-level-55: the operator's 2026-09-26 decision for the guild's death
+    // knight. The same gates as a level 1 reset, for a death knight only.
+    NaturalizeRequest const dk = ParseNaturalizeRequest("reset-level-55");
+    Check("the death knight may be reset to a fresh 55", NaturalizeVerdictFor(dk, f, false) == NaturalizeRefusal::None);
+    Check("...and dry-run first", NaturalizeVerdictFor(dk, f, true) == NaturalizeRefusal::None);
+    Check("a class that starts at 1 is refused a 55 reset, dry run too",
+          NaturalizeVerdictFor(dk, GuildBot(), true) == NaturalizeRefusal::NotDeathKnight);
+    Check("...and told the mode that fits it",
+          std::strstr(NaturalizeRefusalSaid(NaturalizeRefusal::NotDeathKnight), "reset-level-1") != nullptr);
+    NaturalizeFacts dkFamily = FamilyMember();
+    dkFamily.deathKnight = true;
+    Check("a family death knight is never reset",
+          NaturalizeVerdictFor(dk, dkFamily, true) == NaturalizeRefusal::FamilyMember);
+    NaturalizeFacts dkElsewhere = f;
+    dkElsewhere.guildListed = false;
+    Check("a death knight outside the listed guilds is refused",
+          NaturalizeVerdictFor(dk, dkElsewhere, true) == NaturalizeRefusal::NotInNaturalGuild);
+    NaturalizeFacts dkOff = f;
+    dkOff.enabled = false;
+    Check("Overseer.Natural.Enabled off refuses the 55 reset's apply",
+          NaturalizeVerdictFor(dk, dkOff, false) == NaturalizeRefusal::Disabled);
+    NaturalizeFacts dkGate = f;
+    dkGate.playerbotsGateCovers = false;
+    Check("the 55 reset waits for the playerbots gate too",
+          NaturalizeVerdictFor(dk, dkGate, false) == NaturalizeRefusal::PlayerbotsGateOff);
+    NaturalizeFacts dkCod = f;
+    dkCod.codMail = 1;
+    Check("COD mail stops the 55 reset", NaturalizeVerdictFor(dk, dkCod, false) == NaturalizeRefusal::CodMail);
+    NaturalizeFacts dkAuction = f;
+    dkAuction.openAuctions = 1;
+    Check("an open auction stops the 55 reset",
+          NaturalizeVerdictFor(dk, dkAuction, false) == NaturalizeRefusal::OpenAuction);
+    NaturalizeFacts dkClient = f;
+    dkClient.clientAttached = true;
+    Check("the 55 reset never acts under a live client",
+          NaturalizeVerdictFor(dk, dkClient, false) == NaturalizeRefusal::ClientAttached);
+    NaturalizeFacts dkDone = f;
+    dkDone.partsAlreadyDone = NATURALIZE_PART_RESET;
+    Check("a death knight already reset is not reset again",
+          NaturalizeVerdictFor(dk, dkDone, false) == NaturalizeRefusal::AlreadyDone);
 
     f = GuildBot();
     f.openAuctions = 1;
@@ -333,12 +392,25 @@ void TestResetKeepsAndRemoves()
     }
     Check("exactly four parts survive a reset: identity, guild, rank, played time", kept == 4);
     Check("a reset goes to level 1, not to a realm's configured start", NATURALIZE_RESET_LEVEL == 1);
+
+    // What each reset puts back, as Player::Create gives a new character of
+    // the class: a death knight at 55 with the heroic start gold, ten of its
+    // starting food, and no talent points until its Ebon Hold chain pays them.
+    ResetStart const one = ResetStartFor(NaturalizeMode::ResetLevelOne);
+    Check("a level 1 reset starts at 1 with the normal start gold and four food",
+          one.level == 1 && !one.heroicStartMoney && one.startFood == 4 && one.freeTalentPoints == 0);
+    ResetStart const dk = ResetStartFor(NaturalizeMode::ResetDeathKnight);
+    Check("a death knight reset starts at 55", dk.level == 55 && NATURALIZE_DEATH_KNIGHT_RESET_LEVEL == 55);
+    Check("...with the heroic start gold", dk.heroicStartMoney);
+    Check("...and ten of its starting food, as Player::Create gives a death knight", dk.startFood == 10);
+    Check("...and no free talent points: a new one earns them in the Ebon Hold chain", dk.freeTalentPoints == 0);
+    Check("a mode that is no reset has no start", ResetStartFor(NaturalizeMode::StripFamilyGrants).level == 0);
     Check("every part and treatment has a word for the result", wordsOk);
 }
 
 void TestResetBotValues()
 {
-    std::vector<BotValueAction> const steps = ResetRandomBotValues();
+    std::vector<BotValueAction> const steps = ResetRandomBotValues(NATURALIZE_RESET_LEVEL);
     auto find = [&](char const* event) -> BotValueAction const* {
         for (BotValueAction const& a : steps)
             if (std::string(a.event) == event)
@@ -358,6 +430,12 @@ void TestResetBotValues()
     Check("add is left: the guild keeps it online", find("add") && find("add")->step == BotValueStep::Leave);
     for (BotValueAction const& a : steps)
         Check("every value says why", std::strlen(a.why) > 0);
+
+    bool dkLevel = false;
+    for (BotValueAction const& a : ResetRandomBotValues(NATURALIZE_DEATH_KNIGHT_RESET_LEVEL))
+        if (std::string(a.event) == "level")
+            dkLevel = a.step == BotValueStep::Set && a.value == 55;
+    Check("a death knight reset records level 55 for playerbots", dkLevel);
 }
 
 // ------------------------------------------------------------------ strip
