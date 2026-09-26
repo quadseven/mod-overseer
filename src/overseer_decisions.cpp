@@ -17,6 +17,26 @@
 namespace OverseerDecisions
 {
 
+LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
+                                         std::time_t now, std::time_t settleSeconds)
+{
+    if (!socketOpen)
+        return LeaderClientGate::NoClient;
+    if (openSince <= 0 || now - openSince < settleSeconds)
+        return LeaderClientGate::Settling;
+    return LeaderClientGate::Open;
+}
+
+LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, std::time_t lostSince,
+                                               std::time_t now, std::time_t maxWaitSeconds)
+{
+    if (socketOpen)
+        return LeaderClientLossAction::Continue;
+    if (lostSince <= 0 || now - lostSince <= maxWaitSeconds)
+        return LeaderClientLossAction::Hold;
+    return LeaderClientLossAction::Abandon;
+}
+
 LockboxStep LockboxNext(LockboxFacts const& facts)
 {
     if (!facts.rogue || !facts.holdsLockedBox || !facts.hasPickLockSpell
