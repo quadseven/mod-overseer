@@ -1470,6 +1470,11 @@ constexpr OverseerDecisions::RatchetLimits TRAVEL_RATCHET{
 // DriveTravel holds while it judges.
 constexpr OverseerDecisions::ErrandProgressLimits ERRAND_PROGRESS_LIMITS{60, 10.f, 25.f};
 
+// A window whose last reading is older than this missed polls (a hold, a
+// flight, a deferral, a fight) and starts again instead of judging them. Two
+// travel polls.
+constexpr time_t ERRAND_PROGRESS_GAP_SECONDS = 30;
+
 // A running walk is re-sent only for a step more than 15 yards from the one it
 // is walking to, or once it is within 8 yards of that one (wow-overseer#335
 // follow-up). See OverseerDecisions::WalkNeedsRetarget.
@@ -2108,8 +2113,15 @@ constexpr OverseerDecisions::CatchUpAimLimits FOLLOW_CATCH_UP_AIM_LIMITS{
 // therefore waits for precisely the walk this module already issues, and stops
 // on the poll that walk would end - which is what stops "the family is together
 // again" and "the walk is over" from being two readings that can disagree.
+// HOW FAR BACK A MEMBER MAY BE AND STILL BE WAITED FOR STANDING STILL
+// (wow-overseer#335 follow-up). About three minutes at run speed. Measured
+// 2026-09-26 03:33 UTC: the leader was held "for at most 1200s" for a member
+// 7,391 yards back. Past this line the member walks back under its catch-up
+// aim while the family carries on; see RegroupLimits::maxWaitYards.
+constexpr float REGROUP_MAX_WAIT_YARDS = 1200.0f;
+
 constexpr OverseerDecisions::RegroupLimits REGROUP_LIMITS{
-    FOLLOW_CATCH_UP_YARDS, FOLLOW_CATCH_UP_DONE_YARDS};
+    FOLLOW_CATCH_UP_YARDS, FOLLOW_CATCH_UP_DONE_YARDS, REGROUP_MAX_WAIT_YARDS};
 
 // IS THE STRAGGLER ACTUALLY CLOSING THE GAP, AND FOR HOW LONG MAY IT NOT BE?
 //
@@ -5123,6 +5135,8 @@ public:
         // ground over about a minute, read before an errand is released as
         // making no progress. See OverseerDecisions::ReadErrandProgress.
         OverseerDecisions::ErrandProgressWindow progressWindow;
+        // When the window was last read, so a gap in the polls restarts it.
+        time_t progressWindowRead{0};
         // WHEN THIS ERRAND BEGAN, and never moved afterwards. Not
         // `progress.since`, which is the ratchet's clock: that one is restarted
         // by every yard of progress and held through every flight, because it
@@ -5391,7 +5405,11 @@ public:
             OverseerDecisions::LeaderIntentKind kind = OverseerDecisions::LeaderIntentKind::None;
             std::string ownerWord;
             LeaderIntentForTravelOwner(owner, kind, ownerWord);
-            if (!AskForLeader(name, kind, ownerWord, target, "claims the travel column"))
+            bool const fetchHoldsHim =
+                kind == OverseerDecisions::LeaderIntentKind::FetchMember &&
+                LeaderIntentNow(name) == OverseerDecisions::LeaderIntentKind::FetchMember;
+            if (!fetchHoldsHim &&
+                !AskForLeader(name, kind, ownerWord, target, "claims the travel column"))
             {
                 _claimRefusalSaid[name] = "another intent that holds the leader";
                 return false;
@@ -10407,10 +10425,13 @@ private:
         }
         // Inside an instance the dungeon-clear engine runs the party and may
         // hold its tank with `stay` between pulls; that is not this rule's.
+        // And only while an intent that walks him holds him: a `stay` the
+        // operator put on him in person, or one on a leader with nothing to do,
+        // is not this rule's to take off.
         Map* const map = leader->GetMap();
         if (HeldStill(leaderName) || HeldAfterRevival(leaderName) ||
-            held == OverseerDecisions::LeaderIntentKind::OperatorOrder ||
-            held == OverseerDecisions::LeaderIntentKind::Regroup || !map || map->Instanceable())
+            !OverseerDecisions::LeaderIntentWalksUnderNewRpg(held) || !map ||
+            map->Instanceable())
             return;
         leaderAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
         if (book.staySaid.insert(leaderName).second)
@@ -20878,6 +20899,13 @@ private:
         }
         if (!HoldForTheFamily(leader, leaderName))
         {
+            // The book granted a regroup that never held him: end it here,
+            // because EndTheRegroupWait below does nothing for a wait that
+            // had not started, and a regroup intent with no hold behind it
+            // would keep every errand waiting on nothing.
+            EndForLeader(leaderName, OverseerDecisions::LeaderIntentKind::Regroup, "regroup",
+                         OverseerDecisions::LeaderIntentEnd::Failed,
+                         "the leader could not be held");
             LOG_ERROR("module.overseer",
                       "overseer: '{}' is {} yards behind '{}' and the leader "
                       "cannot be held still for it - so nothing waits, and that "
@@ -22302,6 +22330,11 @@ private:
             // window held as they are for a flight, so waiting its turn is not
             // counted against the errand.
             {
+                // The teleport clock first, so a leader whose walk is deferred
+                // behind another intent is not teleported by the walk he was
+                // already on (see the stuck window below for the clock).
+                if (CanBeSentToNpc(botAI) && botAI->rpgInfo.stuckAttempts >= 1)
+                    botAI->rpgInfo.stuckTs = getMSTime();
                 OverseerDecisions::LeaderIntentKind kind =
                     OverseerDecisions::IsMaintenanceErrand(target)
                         ? OverseerDecisions::LeaderIntentKind::EconomyErrand
@@ -22310,7 +22343,15 @@ private:
                 OverseerDecisions::TravelOwner claimedBy{};
                 if (_travelAims.ClaimedBy(name, columnAim, claimedBy))
                     LeaderIntentForTravelOwner(claimedBy, kind, owner);
-                if (!AskForLeader(name, kind, owner, target, "walks to '" + target + "'"))
+                // A walk back for a member is about the member, not the point
+                // the walk is aimed at this poll, so the intent keeps naming
+                // the member DriveFetch asked for and a Jev pick of it holds.
+                std::string const about =
+                    kind == OverseerDecisions::LeaderIntentKind::FetchMember &&
+                            !FetchTargetOf(name).empty()
+                        ? FetchTargetOf(name)
+                        : target;
+                if (!AskForLeader(name, kind, owner, about, "walks to '" + target + "'"))
                 {
                     state.progress.since = std::time(nullptr);
                     state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
@@ -23681,17 +23722,29 @@ private:
             // OverseerDecisions::ReadErrandProgress. Read only while the walk's
             // writer runs: a character not carrying `new rpg` is not walking
             // this errand, so its window says nothing about the errand.
-            if (countsForThisCharacter)
+            // A window is judged only over polls that walked: fighting, dead,
+            // sitting to eat or drink, or a gap in the polls (a hold, a flight,
+            // a deferral) starts it again rather than counting as no progress.
+            time_t const windowNow = std::time(nullptr);
+            bool const walking = countsForThisCharacter && bot->IsAlive() &&
+                                 !bot->IsInCombat() && bot->IsStandState();
+            if (!walking || windowNow - state.progressWindowRead > ERRAND_PROGRESS_GAP_SECONDS)
+                state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
+            state.progressWindowRead = windowNow;
+            if (walking)
             {
                 OverseerDecisions::ErrandProgressReading reading;
                 reading.distance = distance;
                 reading.x = bot->GetPositionX();
                 reading.y = bot->GetPositionY();
                 reading.route = _travelAims.RouteMarkOf(name);
+                // UPSTREAM'S OWN COUNTER MUST AGREE. MoveFarTo zeroes it on every
+                // five-yard improvement, so a window that read nothing while the
+                // counter stayed at zero was a walk that never tried.
                 if (OverseerDecisions::ReadErrandProgress(state.progressWindow, reading,
-                                                          std::time(nullptr),
-                                                          ERRAND_PROGRESS_LIMITS) ==
-                    OverseerDecisions::ErrandProgress::NoProgress)
+                                                          windowNow, ERRAND_PROGRESS_LIMITS) ==
+                        OverseerDecisions::ErrandProgress::NoProgress &&
+                    botAI->rpgInfo.stuckAttempts >= 1)
                 {
                     bool const backoff = _travelAims.NoteNoProgressRelease(name, target);
                     if (backoff)
@@ -23715,8 +23768,6 @@ private:
                     continue;
                 }
             }
-            else
-                state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
 
             time_t const backstop = OverseerDecisions::TravelBackstopSeconds(
                 target, TRAVEL_BACKSTOP_SECONDS, ECONOMY_TRAVEL_BACKSTOP_SECONDS);
@@ -43929,11 +43980,22 @@ private:
             }
             else if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(player))
             {
+                // The operator's pin (`stay`, `follow`) is his intent until the
+                // operator releases it or it runs out; a releasing verb ends it.
+                // Any other operator verb is carried out and holds nothing.
                 if (LeaderIntentApplies(targetName) &&
-                    OverseerDecisions::CommandSourceIsOperator(source) &&
-                    !OverseerDecisions::LeaderCommandRefusal(true, "a rule", command).empty())
-                    AskForLeader(targetName, OverseerDecisions::LeaderIntentKind::OperatorOrder,
-                                 "operator", command, "the operator's own order");
+                    OverseerDecisions::CommandSourceIsOperator(source))
+                {
+                    if (OverseerDecisions::OperatorOrderPins(command))
+                        AskForLeader(targetName,
+                                     OverseerDecisions::LeaderIntentKind::OperatorOrder,
+                                     "operator", command, "the operator's own order");
+                    else if (OverseerDecisions::OperatorOrderReleases(command))
+                        EndForLeader(targetName,
+                                     OverseerDecisions::LeaderIntentKind::OperatorOrder,
+                                     "operator", OverseerDecisions::LeaderIntentEnd::Completed,
+                                     "the operator released him ('" + command + "')");
+                }
                 // READ THE ENGINE FIRST. `before` is only meaningful taken on
                 // this side of the hand-off, and it is what separates "the
                 // command did nothing" from "there was nothing to do".

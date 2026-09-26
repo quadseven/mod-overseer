@@ -283,6 +283,40 @@ void TheTableListsWhatIsAsked()
                                         table[0].kind == LeaderIntentKind::FetchMember);
 }
 
+void TheSameRuleChangingKindIsARetarget()
+{
+    // Review of #724: the travel column's owner asks as an economy errand for
+    // 'vendor' and as a town errand for 'trainer'. Rewriting the column must
+    // not defer the owner behind its own previous kind.
+    LeaderIntentState state;
+    AskLeaderIntent(state, Req(LeaderIntentKind::EconomyErrand, "travel column", "vendor"), 0,
+                    LIMITS);
+    LeaderIntentVerdict v =
+        AskLeaderIntent(state, Req(LeaderIntentKind::TownErrand, "travel column", "trainer"), 15,
+                        LIMITS);
+    Check("the column owner's new kind is a retarget", v.answer == LeaderIntentAnswer::Retargeted);
+    Check("it holds the new kind", state.kind == LeaderIntentKind::TownErrand &&
+                                       state.target == "trainer");
+    Check("and it is not a change of owner", state.changes == 1);
+}
+
+void OperatorVerbsPinAndRelease()
+{
+    using OverseerDecisions::OperatorOrderPins;
+    using OverseerDecisions::OperatorOrderReleases;
+    Check("stay pins", OperatorOrderPins("stay"));
+    Check("follow pins", OperatorOrderPins("Follow"));
+    Check("nc +stay pins", OperatorOrderPins("nc +stay"));
+    Check("nc -stay does not pin", !OperatorOrderPins("nc -stay"));
+    Check("nc +new rpg does not pin", !OperatorOrderPins("nc +new rpg"));
+    Check("nc -stay releases", OperatorOrderReleases("nc -stay"));
+    Check("nc -follow releases", OperatorOrderReleases("nc -follow,+grind"));
+    Check("nc +new rpg releases", OperatorOrderReleases("nc +new rpg"));
+    Check("reset ai releases", OperatorOrderReleases("reset ai"));
+    Check("stay does not release", !OperatorOrderReleases("stay"));
+    Check("flee is neither", !OperatorOrderPins("co +flee") && !OperatorOrderReleases("co +flee"));
+}
+
 void WordsRoundTrip()
 {
     for (int k = 0; k <= static_cast<int>(LeaderIntentKind::OperatorOrder); ++k)
@@ -400,6 +434,8 @@ int main()
     TheTableListsWhatIsAsked();
     WordsRoundTrip();
     TheMeasuredWindowSettles();
+    TheSameRuleChangingKindIsARetarget();
+    OperatorVerbsPinAndRelease();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

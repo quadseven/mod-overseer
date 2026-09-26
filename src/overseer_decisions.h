@@ -6534,6 +6534,15 @@ struct RegroupLimits
     // the far line and ends at the near one, so a straggler can only make the
     // family wait once.
     float rejoinYards{0.f};
+    // HOW FAR BACK A MEMBER MAY BE AND STILL BE WAITED FOR STANDING STILL
+    // (wow-overseer#335 follow-up). Zero means no limit, as before. Measured on
+    // the dev realm 2026-09-26 03:33 UTC: the leader was held still for up to
+    // twenty minutes for a member 7,391 yards back, which at run speed is a
+    // quarter of an hour of a leader standing in a field. People wait a few
+    // minutes; past that they carry on and let the straggler catch up, go back
+    // for it, or meet at the inn. A member further back than this is left to
+    // walk back under its catch-up aim while the family carries on.
+    float maxWaitYards{0.f};
 };
 
 // One member of the family, as this poll found it. Every field is a fact the
@@ -6605,6 +6614,9 @@ enum class RegroupClaim : std::uint8_t
     // on without it and is not holding the leader for it either: the leader is
     // the one walking.
     Fetched,
+    // FURTHER BACK THAN ANYBODY STANDS STILL FOR (RegroupLimits::maxWaitYards).
+    // It walks back under its catch-up aim while the family carries on.
+    TooFarToWaitFor,
 };
 
 char const* RegroupClaimName(RegroupClaim claim);
@@ -18336,6 +18348,15 @@ void WaiveLeaderIntentDwell(LeaderIntentState& state);
 
 // Does the book currently hold the leader for this kind and owner? For the
 // executors (the `new rpg` grant, the travel drive) that act between asks.
+// Does an operator's order to a leader pin him (`stay`, `follow`, or an `nc`
+// list that puts either on)? A pin is his intent until the operator releases
+// it or it runs out; any other operator verb is carried out and holds nothing.
+bool OperatorOrderPins(std::string const& command);
+
+// Does it release him (`nc` taking `stay` or `follow` off, or putting `new rpg`
+// on, or `reset ai`)? A release ends the operator's pin at once.
+bool OperatorOrderReleases(std::string const& command);
+
 bool LeaderIntentHeldBy(LeaderIntentState const& state, LeaderIntentKind kind,
                         std::string const& owner, std::time_t now,
                         LeaderIntentLimits const& limits);

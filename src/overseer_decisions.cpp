@@ -5605,6 +5605,9 @@ char const* RegroupClaimName(RegroupClaim claim)
         case RegroupClaim::StoodDown:     return "stood down";
         case RegroupClaim::AimRefused:    return "catch-up aim refused";
         case RegroupClaim::Fetched:       return "the leader is going back for it";
+        case RegroupClaim::TooFarToWaitFor:
+            return "too far back to hold the leader still for; it walks back while the "
+                   "family carries on";
     }
     return "unknown";
 }
@@ -5656,6 +5659,8 @@ RegroupClaim ReadRegroupClaim(RegroupMember const& member,
         return RegroupClaim::Fetched;
     if (!member.aimRefusedBecause.empty())
         return RegroupClaim::AimRefused;
+    if (limits.maxWaitYards > 0.f && member.yards > limits.maxWaitYards)
+        return RegroupClaim::TooFarToWaitFor;
     return RegroupClaim::Rejoining;
 }
 
@@ -16269,6 +16274,21 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
         ClearLeaderIntent(state);
 
     bool const live = state.kind != LeaderIntentKind::None;
+    // THE SAME RULE CHANGING WHAT IT ASKS FOR IS A RETARGET, NOT A HANDOFF. The
+    // travel column's owner asks as an economy errand for 'vendor' and as a
+    // town errand for 'trainer'; when the bridge rewrites the column, the rule
+    // holding the leader is still the one asking, and deferring it behind its
+    // own previous kind left the leader on neither errand until it went stale.
+    if (live && state.owner == request.owner && state.kind != request.kind)
+    {
+        state.kind = request.kind;
+        state.target = request.target;
+        state.why = request.why;
+        state.lastAsked = now;
+        state.deferralSaid.erase(request.owner);
+        verdict.answer = LeaderIntentAnswer::Retargeted;
+        return verdict;
+    }
     if (live && state.kind == request.kind && state.owner == request.owner)
     {
         state.lastAsked = now;
@@ -16360,6 +16380,62 @@ void WaiveLeaderIntentDwell(LeaderIntentState& state)
 {
     if (state.kind != LeaderIntentKind::None)
         state.dwellWaived = true;
+}
+
+namespace
+{
+
+// The `nc` items of a command, each without its +/-/~ and with that sign.
+std::vector<std::pair<char, std::string>> NcItems(std::string const& verb)
+{
+    std::vector<std::pair<char, std::string>> out;
+    if (verb.rfind("nc ", 0) != 0)
+        return out;
+    std::string const rest = verb.substr(3);
+    std::size_t start = 0;
+    while (start <= rest.size())
+    {
+        std::size_t const comma = rest.find(',', start);
+        std::string item = LowerTrimmed(
+            rest.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+        char sign = '+';
+        if (!item.empty() && (item[0] == '+' || item[0] == '-' || item[0] == '~'))
+        {
+            sign = item[0];
+            item = LowerTrimmed(item.substr(1));
+        }
+        if (!item.empty())
+            out.emplace_back(sign, item);
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+bool OperatorOrderPins(std::string const& command)
+{
+    std::string const verb = LowerTrimmed(command);
+    if (verb == "stay" || verb == "follow")
+        return true;
+    for (auto const& item : NcItems(verb))
+        if (item.first == '+' && (item.second == "stay" || item.second == "follow"))
+            return true;
+    return false;
+}
+
+bool OperatorOrderReleases(std::string const& command)
+{
+    std::string const verb = LowerTrimmed(command);
+    if (verb == "reset ai" || verb == "reset botai")
+        return true;
+    for (auto const& item : NcItems(verb))
+        if ((item.first == '-' && (item.second == "stay" || item.second == "follow")) ||
+            (item.first == '+' && item.second == "new rpg"))
+            return true;
+    return false;
 }
 
 bool LeaderIntentHeldBy(LeaderIntentState const& state, LeaderIntentKind kind,
