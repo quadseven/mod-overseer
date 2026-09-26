@@ -36022,49 +36022,37 @@ private:
 
             case OverseerDecisions::CrossingAction::Fetch:
             {
-                releaseTheLeader("the crossing is fetching a held follower");
-                if (_fetches.find(leaderName) != _fetches.end())
-                    break;
-                std::vector<OverseerDecisions::FetchCandidate> candidates;
+                // A FAMILY SPLIT AT THE BERTH CANNOT BE FIXED BY WALKING THE
+                // LEADER BACK. Close this attempt so recovery can bring the
+                // family to its shared inn before the next crossing (#739).
+                releaseTheLeader("the crossing attempt is ending for a split family");
+                OverseerDecisions::CrossingMember const* held = nullptr;
                 for (OverseerDecisions::CrossingMember const& member : route.members)
                 {
-                    if (!member.heldTooFarNoFlight || member.isLeader)
-                        continue;
-                    Player* const target = ObjectAccessor::FindPlayerByName(member.name);
-                    if (!target || !leader)
-                        continue;
-                    OverseerDecisions::FetchCandidate candidate;
-                    candidate.name = member.name;
-                    candidate.seen = target->IsInWorld();
-                    candidate.sameMap = target->GetMapId() == leader->GetMapId();
-                    candidate.alive = target->IsAlive();
-                    candidate.heldTooFar = true;
-                    candidate.yards = target->GetDistance2d(leader);
-                    candidates.push_back(candidate);
+                    if (member.readable && !member.isLeader && member.heldTooFarNoFlight &&
+                        (!held || member.leaderDistance > held->leaderDistance))
+                        held = &member;
                 }
-                std::string const targetName = OverseerDecisions::PickFetchTarget(
-                    candidates, FETCH_LIMITS, false);
-                Player* const target = targetName.empty()
-                    ? nullptr : ObjectAccessor::FindPlayerByName(targetName, false);
-                if (target && AskForLeader(leaderName,
-                        OverseerDecisions::LeaderIntentKind::FetchMember, "fetch",
-                        targetName, "held beyond the crossing foot limit"))
+                if (held)
                 {
-                    Fetch& fetch = _fetches[leaderName];
-                    fetch = Fetch{};
-                    fetch.target = targetName;
-                    fetch.since = std::time(nullptr);
-                    fetch.wanted = true;
-                    AimFetch(fetch, leaderName, target);
+                    uint32 const yards = static_cast<uint32>(held->leaderDistance);
+                    std::string const reason = "the family is split at the berth: '" +
+                        held->name + "' is held " + std::to_string(yards) +
+                        " yards away with no flight, so the family regroups before the crossing";
                     if (fresh)
-                        LOG_WARN("module.overseer",
-                                 "overseer: '{}' leaves the berth to fetch held follower '{}' "
-                                 "before the crossing - {}", leaderName, targetName, why);
+                        LOG_WARN("module.overseer", "overseer: '{}' - {}",
+                                 leaderName, reason);
+                    std::vector<std::string> family;
+                    for (OverseerDecisions::CrossingMember const& member : route.members)
+                        if (member.readable)
+                            family.push_back(member.name);
+                    EndRunAndDecide(coord, leaderName, portal, 0, "split_failed", reason,
+                                    IsDungeonJob(leaderJob), &family);
                 }
                 else if (fresh)
                     LOG_WARN("module.overseer",
-                             "overseer: '{}' must fetch a held follower before crossing, "
-                             "but no fetch can start - {}", leaderName, why);
+                             "overseer: '{}' cannot cross with the family split at the berth - {}",
+                             leaderName, why);
                 break;
             }
 

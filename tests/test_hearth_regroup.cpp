@@ -187,6 +187,15 @@ void TheMeasuredFailureRegroupsByHearthstone()
     f.hearthRegroupReady = true;
     CheckWord("the measured failure hearths to the shared inn", RunRecoveryHeuristic(f),
               RunRecovery::HearthRegroup);
+
+    // A member held beyond the crossing foot limit cannot be helped by the
+    // walking regroup wait. A split at the berth therefore meets at the inn (#739).
+    RunFailureFacts splitAtBerth = f;
+    splitAtBerth.outcome = "split_failed";
+    splitAtBerth.reason = "the family is split at the berth";
+    splitAtBerth.farthestMemberYards = 1800.f;
+    CheckWord("a split at the berth regroups by hearthstone",
+              RunRecoveryHeuristic(splitAtBerth), RunRecovery::HearthRegroup);
     Check("and it is offered to the bridge",
           RunRecoveryOptions(f).find("hearth_regroup") != std::string::npos);
     Check("applicable", RunRecoveryApplicable(RunRecovery::HearthRegroup, f));

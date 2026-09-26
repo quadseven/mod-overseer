@@ -2252,6 +2252,12 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
         !TriedTwiceRunning(facts.tried, RunRecovery::Summon))
         return RunRecovery::Summon;
 
+    // A party split at a berth has a member the walking regroup cannot reach (#739).
+    // When the shared inn is ready, meet there before trying the one-copy walk.
+    if (facts.outcome == "split_failed" && facts.hearthRegroupReady &&
+        Mentions(facts.reason, "split at the berth"))
+        return pick(RunRecovery::HearthRegroup);
+
     // A party on both sides of the door, or in two copies of it, is collected
     // by RESET's walk out and then enters together.
     if (facts.outcome == "split_failed" || facts.membersApart > 0)
