@@ -167,6 +167,18 @@ void ALongBerthWaitFetchesAFollowerHeldPastTheFootLimit()
     members[1].heldTooFarNoFlight = true;
     CrossingStep const step = ReadCrossing(w, members, Limits());
     CheckAction("held follower starts a fetch", step.action, CrossingAction::Fetch);
+
+    // A STRAGGLER HELD BY NOTHING SPLITS THE CROSSING TOO, once the wait is up.
+    std::vector<CrossingMember> loose = {Leader(1, 3.f), Follower(1, 900.f)};
+    CrossingStep const splits = ReadCrossing(w, loose, Limits());
+    CheckAction("an ungathered, unheld member splits the crossing after the wait", splits.action,
+                CrossingAction::Fetch);
+
+    // Before the wait is up, the same family still holds for the boat.
+    CrossingWorld early = Docks();
+    early.leaderWaitSeconds = 120;
+    CrossingStep const waits = ReadCrossing(early, loose, Limits());
+    CheckAction("before the wait a straggler is waited for", waits.action, CrossingAction::Hold);
 }
 
 // ------------------------------------------------------------ boarding --

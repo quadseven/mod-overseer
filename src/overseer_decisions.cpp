@@ -6271,11 +6271,13 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         step.leg = CrossingLeg::WaitForTransport;
         // A LEADER WAITING CANNOT RELEASE A HELD FOLLOWER (#739). Fetch it
         // before continuing to board, using the crossing's bounded wait.
+        // ANY MEMBER STILL NOT GATHERED AFTER THE WAIT SPLITS THE CROSSING, not
+        // only one held past the foot limit. Measured: the Lady Mehley docked at
+        // Theramore with 33 seconds of its stop left and 4 of 5 gathered, the
+        // missing member was held by nothing, and the family waited for every
+        // boat after it. Past the wait the family regroups at the inn instead.
         step.heldFollowerNeedsFetch = world.leaderWaitSeconds >= limits.fetchWaitSeconds &&
-            std::any_of(members.begin(), members.end(), [&](CrossingMember const& member) {
-                return member.readable && !member.isLeader && !member.aboard &&
-                       member.heldTooFarNoFlight && member.leaderDistance > limits.fetchPastYards;
-            });
+            step.waiting > 0 && step.gathered + 1 < step.waiting;
         if (step.heldFollowerNeedsFetch)
         {
             step.action = CrossingAction::Fetch;
