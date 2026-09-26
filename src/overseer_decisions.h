@@ -2670,6 +2670,34 @@ char const* ClearingClockHoldReason(ClearingClock clock);
 bool HeadTakesTheLead(bool headNamed, bool headPresent, bool headInThisGroup,
                       bool headLeads);
 
+// WHO LEADS THE FAMILY IS THE ROSTER'S HEAD, NEVER WHOEVER THE SERVER PROMOTED
+// (#736). When the head is not in the world, or the server has handed the group
+// to another member, the family holds and nobody is granted the leader's
+// `new rpg`; a catch-up aim is only ever the head or a surveyed point toward him.
+enum class FamilyLeader : std::uint8_t { None, RosterLeader };
+
+struct FamilyLeadership
+{
+    FamilyLeader leader{FamilyLeader::None};
+    bool holdFollowers{false};
+    bool grantNewRpg{false};
+};
+
+FamilyLeadership DecideFamilyLeadership(bool rosterLeaderPresent,
+                                        bool partyLeaderIsRosterLeader,
+                                        bool leaderCarriesNewRpg);
+
+enum class CatchUpAimSource : std::uint8_t
+{
+    Unavailable,
+    RosterLeaderPosition,
+    SurveyedRoutePoint,
+};
+
+CatchUpAimSource DecideCatchUpAimSource(bool rosterLeaderPresent,
+                                        bool candidateIsRosterLeader,
+                                        bool surveyedRoutePoint);
+
 // ------------------------------------------- one group per family (#607) --
 //
 // EACH FAMILY IS ONE GROUP, AND THE HEAD LEADS IT WHENEVER HE IS ONLINE.
