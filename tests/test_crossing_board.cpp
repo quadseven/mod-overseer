@@ -132,6 +132,8 @@ CrossingLimits Limits()
     l.berthArrivedYards = 12.f;
     l.gatherYards = 30.f;
     l.minBoardDwellMs = 15000;
+    l.fetchPastYards = 1500.f;
+    l.fetchWaitSeconds = 300;
     return l;
 }
 
@@ -155,6 +157,16 @@ CrossingMember Follower(std::uint32_t map, float fromLeader, bool aboard = false
     m.mapId = map;
     m.leaderDistance = fromLeader;
     return m;
+}
+
+void ALongBerthWaitFetchesAFollowerHeldPastTheFootLimit()
+{
+    CrossingWorld w = Docks();
+    w.leaderWaitSeconds = 301;
+    std::vector<CrossingMember> members = {Leader(1, 3.f), Follower(1, 2448.f)};
+    members[1].heldTooFarNoFlight = true;
+    CrossingStep const step = ReadCrossing(w, members, Limits());
+    CheckAction("held follower starts a fetch", step.action, CrossingAction::Fetch);
 }
 
 // ------------------------------------------------------------ boarding --
@@ -598,6 +610,7 @@ void TheBuildSaysItBoards()
 int main()
 {
     ADockedBoatWithTheFamilyAtTheBerthIsBoarded();
+    ALongBerthWaitFetchesAFollowerHeldPastTheFootLimit();
     AtTheBerthWithTheBoatAwayIsStillAHold();
     TooLittleOfTheStopLeftWaitsForTheNextOne();
     AStragglerOnThePierHoldsTheBoarding();

@@ -80,6 +80,7 @@ RunFailureFacts AllianceFourthFailure()
     f.streak = 4;
     f.summonAfter = RUN_RECOVERY_SUMMON_AFTER_DEFAULT;
     f.summonReady = true;
+    f.summonerReady = true;
     return f;
 }
 
@@ -108,6 +109,12 @@ void TheSummonRungOpensAtTheStreak()
     f = AllianceFourthFailure();
     f.summonAfter = 0;
     Check("SummonAfterFailures = 0 shuts it", RunRecoverySummonOpen(f), false);
+
+    f = AllianceFourthFailure();
+    f.summonerReady = false;
+    Check("stone without a qualifying summoner is not offered", Offered(f, "summon"), false);
+    CheckWord("without a summoner the chooser falls to regroup", RunRecoveryHeuristic(f),
+              RunRecovery::Regroup);
     Check("and applicability agrees", RunRecoveryApplicable(RunRecovery::Summon, f), false);
 }
 

@@ -2186,7 +2186,7 @@ bool RunRecoveryApplicable(RunRecovery recovery, RunFailureFacts const& facts)
     switch (recovery)
     {
         case RunRecovery::HearthRegroup: return facts.hearthRegroupReady;
-        case RunRecovery::Summon:        return RunRecoverySummonOpen(facts);
+        case RunRecovery::Summon:        return RunRecoverySummonOpen(facts) && facts.summonerReady;
         case RunRecovery::DungeonFinder: return RunRecoveryFinderOpen(facts);
         default:                         return true;
     }
@@ -2248,7 +2248,8 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
     // rung comes round again.
     if (RunRecoveryFinderOpen(facts) && !TriedTwiceRunning(facts.tried, RunRecovery::DungeonFinder))
         return RunRecovery::DungeonFinder;
-    if (RunRecoverySummonOpen(facts) && !TriedTwiceRunning(facts.tried, RunRecovery::Summon))
+    if (RunRecoverySummonOpen(facts) && facts.summonerReady &&
+        !TriedTwiceRunning(facts.tried, RunRecovery::Summon))
         return RunRecovery::Summon;
 
     // A party on both sides of the door, or in two copies of it, is collected
@@ -2367,6 +2368,16 @@ RecoveryWaitStep RecoveryWaitNext(RecoveryWaitFacts const& facts)
     if (facts.since && facts.now - facts.since >= static_cast<std::time_t>(facts.ceilingSeconds))
         return RecoveryWaitStep::Ceiling;
     return RecoveryWaitStep::Wait;
+}
+
+char const* RecoveryEndReason(std::time_t since, std::time_t now, unsigned ceilingSeconds,
+                              bool campaignMatches)
+{
+    if (!campaignMatches)
+        return "campaign_changed";
+    if (since && now - since >= static_cast<std::time_t>(ceilingSeconds))
+        return "backstop";
+    return "";
 }
 
 char const* StagingStallWord(StagingStall stall)
@@ -6032,6 +6043,7 @@ char const* CrossingActionName(CrossingAction action)
         case CrossingAction::Refuse:    return "refuse";
         case CrossingAction::Walk:      return "walk";
         case CrossingAction::Hold:      return "hold";
+        case CrossingAction::Fetch:     return "fetch";
         case CrossingAction::Ride:      return "ride";
         case CrossingAction::Disembark: return "disembark";
         case CrossingAction::Done:      return "done";
@@ -6239,6 +6251,18 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
     if (step.leaderAtBerth)
     {
         step.leg = CrossingLeg::WaitForTransport;
+        // A LEADER WAITING CANNOT RELEASE A HELD FOLLOWER (#739). Fetch it
+        // before continuing to board, using the crossing's bounded wait.
+        step.heldFollowerNeedsFetch = world.leaderWaitSeconds >= limits.fetchWaitSeconds &&
+            std::any_of(members.begin(), members.end(), [&](CrossingMember const& member) {
+                return member.readable && !member.isLeader && !member.aboard &&
+                       member.heldTooFarNoFlight && member.leaderDistance > limits.fetchPastYards;
+            });
+        if (step.heldFollowerNeedsFetch)
+        {
+            step.action = CrossingAction::Fetch;
+            return step;
+        }
         bool const everybodyHere = step.waiting == 0 || step.gathered + 1 >= step.waiting;
         step.action = world.dockedAtOrigin && world.dwellLeftMs >= limits.minBoardDwellMs &&
                               everybodyHere
@@ -6335,6 +6359,10 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
                    "because a reclaim would restart the clock the death breaker "
                    "measures from";
         }
+
+        case CrossingAction::Fetch:
+            return "the leader has waited at the berth long enough and a follower past the foot limit "
+                   "has no flight, so the leader goes back for that follower before the crossing";
 
         case CrossingAction::Walk:
             return "the leader is on map " + origin + " with " +
