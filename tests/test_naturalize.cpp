@@ -43,6 +43,7 @@ using OverseerDecisions::DuesAmountFromSource;
 using OverseerDecisions::DuesDiscard;
 using OverseerDecisions::DuesDiscardFor;
 using OverseerDecisions::DuesLetter;
+using OverseerDecisions::GuildBankGoldToDiscard;
 using OverseerDecisions::ExperienceBetween;
 using OverseerDecisions::NATURALIZE_PART_GOLD;
 using OverseerDecisions::NATURALIZE_DEATH_KNIGHT_RESET_LEVEL;
@@ -737,6 +738,18 @@ void TestDues()
     Check("the gold mode parses", r.ok && r.mode == NaturalizeMode::DiscardUnearnedGold && r.dryRun &&
                                       r.parts == NATURALIZE_PART_GOLD);
     Check("it takes no level", !ParseNaturalizeRequest("discard-unearned-gold level:30").ok);
+    NaturalizeRequest const bank = ParseNaturalizeRequest("discard-guild-bank-gold dry-run");
+    Check("guild bank gold parses as its own ledger part",
+          bank.ok && bank.mode == NaturalizeMode::DiscardGuildBankGold && bank.dryRun &&
+              bank.parts == OverseerDecisions::NATURALIZE_PART_GUILD_BANK_GOLD &&
+              std::string(NaturalizeModeWord(bank.mode)) == "discard-guild-bank-gold" &&
+              std::string(NaturalizePartWord(bank.parts)) == "guild_bank_gold");
+    Check("guild bank gold takes no level", !ParseNaturalizeRequest("discard-guild-bank-gold level:30").ok);
+    Check("family withdrawals are subtracted before the bank cap",
+          GuildBankGoldToDiscard(1000, 900, 200) == 700);
+    Check("guild bank discard is capped at the live balance",
+          GuildBankGoldToDiscard(1000, 2000, 100) == 1000);
+    Check("guild bank discard never goes negative", GuildBankGoldToDiscard(1000, 100, 200) == 0);
     NaturalizeFacts bot = GuildBot();
     Check("a guild bot has no family gold to lose", NaturalizeVerdictFor(r, bot, true) == NaturalizeRefusal::NotFamily);
     Check("the gold part has a ledger word", std::string(NaturalizePartWord(NATURALIZE_PART_GOLD)) == "gold");
