@@ -69,7 +69,7 @@ std::string ReadFile(char const* path)
 std::string TrainRosterBody(std::string const& source)
 {
     std::size_t const begin = source.find("    void TrainRoster()\n");
-    std::size_t const end = source.find("    void SpendTalents(Player* bot, uint32 tabpage)", begin);
+    std::size_t const end = source.find("    static void SpendTalents(Player* bot, uint32 tabpage)", begin);
     if (begin == std::string::npos || end == std::string::npos)
         return "";
     return source.substr(begin, end - begin);

@@ -3513,6 +3513,58 @@ void ReloadKeepReservations()
     SetKeepReservations(std::move(reservations));
 }
 
+// ------------------------------------------------- overseer_raid_spec ------
+//
+// The talent tree each guild raider's raid seat needs, written by the site
+// from its lineup and read here once a minute. Asked on map threads by the
+// level-up and login hooks (SpendTalentsTowardSeat), hence the lock. The rule
+// is OverseerDecisions::SeatTalentVerdictFor, pinned by tests/test_seat_talents.cpp.
+std::mutex g_raidSpecMutex;
+std::vector<OverseerDecisions::RaidSpecTarget> g_raidSpec;
+
+bool RaidSpecTargetOf(std::string const& name, OverseerDecisions::RaidSpecTarget& out)
+{
+    std::lock_guard<std::mutex> guard(g_raidSpecMutex);
+    OverseerDecisions::RaidSpecTarget const* found = OverseerDecisions::RaidSpecTargetFor(g_raidSpec, name);
+    if (!found)
+        return false;
+    out = *found;
+    return true;
+}
+
+// A world without the table (2026_09_25_10_overseer_raid_spec.sql not applied)
+// or a failed read keeps what was read last, as the keep reservations do. The
+// table is asked about first so a missing one costs no SQL error per minute.
+void ReloadRaidSpecTargets()
+{
+    QueryResult present = CharacterDatabase.Query(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'overseer_raid_spec'");
+    if (!present || present->Fetch()[0].Get<uint64>() == 0)
+        return;
+    QueryResult count = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_raid_spec");
+    if (!count)
+        return;
+    std::vector<OverseerDecisions::RaidSpecTarget> targets;
+    if (count->Fetch()[0].Get<uint64>() > 0)
+    {
+        QueryResult rows = CharacterDatabase.Query("SELECT name, class, tab FROM overseer_raid_spec");
+        if (!rows)
+            return;
+        do
+        {
+            Field* f = rows->Fetch();
+            OverseerDecisions::RaidSpecTarget t;
+            t.name = f[0].Get<std::string>();
+            t.classId = f[1].Get<uint8>();
+            t.tab = f[2].Get<uint8>();
+            targets.push_back(std::move(t));
+        } while (rows->NextRow());
+    }
+    std::lock_guard<std::mutex> guard(g_raidSpecMutex);
+    g_raidSpec.swap(targets);
+}
+
 // Exactly the unique key of overseer_event. Keeping the two identical is what
 // makes the in-memory coalescing and the ON DUPLICATE KEY UPDATE agree: a
 // repeat that collapses in RAM is the same repeat that would collapse in the
@@ -5970,6 +6022,10 @@ private:
 };
 }  // namespace
 
+// Outside the anonymous namespace, like the definition after
+// OverseerWorldScript (whose SpendTalents it uses), so the two are one function.
+void SpendTalentsTowardSeat(Player* player, char const* when);
+
 /*
  * Chat capture.
  *
@@ -6246,7 +6302,12 @@ public:
     // slot, which is the honest answer rather than a guessed one.
     void OnPlayerLogin(Player* player) override
     {
-        if (!player || !OnRoster(player->GetName()))
+        if (!player)
+            return;
+        // A guild raider logging in with points it has not spent (a level
+        // gained before its seat was planned, a death knight's quest points).
+        SpendTalentsTowardSeat(player, "login");
+        if (!OnRoster(player->GetName()))
             return;
         SeedWornSlots(player);
     }
@@ -6282,6 +6343,10 @@ public:
             return;
         RecordEvent(player, "level_up", player->GetLevel(), "",
                     "from " + std::to_string(static_cast<uint32>(oldLevel)));
+        // GiveLevel has already counted the new points (InitTalentForLevel),
+        // and the playerbots level-up action runs later, on the bot's own AI
+        // update, where it finds nothing left to spend.
+        SpendTalentsTowardSeat(player, "level-up");
     }
 
     void OnPlayerQuestAccept(Player* player, Quest const* quest) override
@@ -6612,6 +6677,10 @@ using OverseerDecisions::DuesLetter;
 
 class OverseerWorldScript : public WorldScript
 {
+    // The level-up and login hooks spend a guild raider's points with the same
+    // walk TrainRoster uses for the family.
+    friend void SpendTalentsTowardSeat(Player* player, char const* when);
+
 public:
     OverseerWorldScript() : WorldScript("OverseerWorldScript") {}
 
@@ -6650,6 +6719,9 @@ public:
             // restart - which is precisely when a character is most likely to
             // do something worth having a record of.
             ReloadRosterNames();
+            // And the seat targets, so the first level-up after a restart
+            // follows its seat rather than playerbots' random pick.
+            ReloadRaidSpecTargets();
             // And the item story book (#567), for the roster's reason: a guild
             // member's equip is recorded only for an item the book knows, so
             // an empty book after a restart would drop the equip that finishes
@@ -6685,6 +6757,15 @@ public:
         {
             _watchTimer = 0;
             ReloadWatchList();
+        }
+        // The seat targets change when the site re-plans a lineup, which is
+        // minutes apart; a minute's lag costs at most one level-up's points
+        // going to playerbots' own pick.
+        _raidSpecTimer += diff;
+        if (_raidSpecTimer >= 60000)
+        {
+            _raidSpecTimer = 0;
+            ReloadRaidSpecTargets();
         }
         if (_rosterTimer >= ROSTER_POLL_MS)
         {
@@ -41897,19 +41978,19 @@ private:
     // points at all. Every talent the family could have had before level 60 was
     // being left on the table by a path that reported success.
     //
-    // WHY ROW ORDER MATTERS. A talent tier only unlocks once enough points sit
-    // in the tiers above it, so an out-of-order walk silently learns nothing
-    // past the first locked row. std::map iterates ascending, which is the
-    // order the tree itself requires.
-    //
-    // WHY FIVE POINTS PER ROW. That is the tier requirement, so it is also the
-    // least that opens the next row. Without the cap a five-rank talent on row
-    // 0 can eat every point a low-level character has and the tree never opens.
-    void SpendTalents(Player* bot, uint32 tabpage)
+    // WHERE THE POINTS GO is OverseerDecisions::PlanTalentSpend, pinned by
+    // tests/test_seat_talents.cpp: rows top down, one rank a step, 5 a row
+    // while a deeper row can take points, a tier only once the tree holds row x
+    // 5 points, and a talent only after its prerequisite. The walk this
+    // replaced asked for the highest rank the free points could pay for, so
+    // with the one point a level brings it bought only rank 1s and stalled
+    // once row 0's were held, leaving the rest to the playerbots pick.
+    static void SpendTalents(Player* bot, uint32 tabpage)
     {
         uint32 const classMask = bot->getClassMask();
+        uint8 const spec = bot->GetActiveSpec();
 
-        std::map<uint32, std::vector<TalentEntry const*>> rows;
+        std::vector<OverseerDecisions::TalentSlot> slots;
         for (uint32 i = 0; i < sTalentStore.GetNumRows(); ++i)
         {
             TalentEntry const* talent = sTalentStore.LookupEntry(i);
@@ -41923,31 +42004,38 @@ private:
             if ((classMask & tab->ClassMask) == 0)
                 continue;
 
-            rows[talent->Row].push_back(talent);
+            OverseerDecisions::TalentSlot slot;
+            slot.talentId = talent->TalentID;
+            slot.row = talent->Row;
+            slot.col = talent->Col;
+            slot.dependsOn = talent->DependsOn;
+            slot.dependsOnRank = talent->DependsOnRank;
+            for (uint32 rank = 0; rank < MAX_TALENT_RANK; ++rank)
+            {
+                if (!talent->RankID[rank])
+                    continue;
+                slot.ranks = rank + 1;
+                if (bot->HasTalent(talent->RankID[rank], spec))
+                    slot.known = rank + 1;
+            }
+            if (slot.ranks)
+                slots.push_back(slot);
         }
 
-        for (auto const& row : rows)
+        for (OverseerDecisions::TalentLearnStep const& step :
+             OverseerDecisions::PlanTalentSpend(slots, bot->GetFreeTalentPoints()))
         {
             uint32 const before = bot->GetFreeTalentPoints();
-            for (TalentEntry const* talent : row.second)
+            bot->LearnTalent(step.talentId, step.rankIndex);
+            // LearnTalent refuses without a word. A refusal here means the
+            // plan and the core disagree about the tree; stop rather than
+            // walk the rest of a plan built on a step that did not happen.
+            if (bot->GetFreeTalentPoints() == before)
             {
-                uint32 const free = bot->GetFreeTalentPoints();
-                if (!free || before - free >= 5)
-                    break;
-
-                uint32 maxRank = 0;
-                for (uint32 rank = 0; rank < std::min<uint32>(MAX_TALENT_RANK, free); ++rank)
-                    if (talent->RankID[rank])
-                        maxRank = rank;
-
-                // A talent behind a prerequisite is unlearnable until the
-                // prerequisite is held, and LearnTalent refuses silently rather
-                // than complaining, so the dependency is satisfied first.
-                if (talent->DependsOn)
-                    bot->LearnTalent(talent->DependsOn,
-                                     std::min<uint32>(talent->DependsOnRank, free - 1));
-
-                bot->LearnTalent(talent->TalentID, maxRank);
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' could not learn talent {} rank {} in tab {}; {} point(s) left unspent",
+                         bot->GetName(), step.talentId, step.rankIndex + 1, tabpage, before);
+                break;
             }
         }
     }
@@ -59878,6 +59966,7 @@ private:
     // is nobody to evict yet because nothing logs a roster character in any
     // more (#131) - only a client can.
     uint32 _rosterTimer = 0;
+    uint32 _raidSpecTimer = 0;
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
@@ -60157,6 +60246,34 @@ private:
     uint32 _deathTimer = 0;
     bool _watchLoaded = false;
 };
+
+// A GUILD RAIDER'S FREE TALENT POINTS GO TO ITS SEAT'S TREE (overseer_raid_spec).
+// The family is TrainRoster's; a bot with no target is left to playerbots.
+void SpendTalentsTowardSeat(Player* player, char const* when)
+{
+    if (!player || !player->IsInWorld() || !player->GetFreeTalentPoints())
+        return;
+    std::string const name = player->GetName();
+    OverseerDecisions::RaidSpecTarget target;
+    bool const hasTarget = RaidSpecTargetOf(name, target);
+    if (!hasTarget)
+        return;
+    uint32 const free = player->GetFreeTalentPoints();
+    OverseerDecisions::SeatTalentVerdict const verdict = OverseerDecisions::SeatTalentVerdictFor(
+        OnRoster(name), &target, player->getClass(), free);
+    if (!verdict.spend)
+    {
+        LOG_DEBUG("module.overseer", "overseer: seat talents for '{}' at {} - not spent: {}", name, when,
+                  verdict.said);
+        return;
+    }
+    OverseerWorldScript::SpendTalents(player, verdict.tab);
+    player->SendTalentsInfoData(false);
+    LOG_INFO("module.overseer",
+             "overseer: seat talents - '{}' (level {}) spent {} of {} free point(s) in talent tab {} at {}",
+             name, static_cast<uint32>(player->GetLevel()), free - player->GetFreeTalentPoints(), free,
+             verdict.tab, when);
+}
 
 // THE DOOR STAYS SHUT WHILE THE FAMILY HAS NO BAG ROOM (#631).
 //

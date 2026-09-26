@@ -18495,6 +18495,75 @@ struct WalkRetargetLimits
 bool WalkNeedsRetarget(float runningX, float runningY, float newX, float newY, float fromX,
                        float fromY, WalkRetargetLimits const& limits);
 
+// ------------------------------------------------------- seat talents --
+//
+// overseer_raid_spec: the talent tree each guild raider's raid seat needs,
+// written by the site from its lineup (eight groups of one tank, one healer and
+// three damage dealers). A guild bot levelling from 1 spends each free point in
+// that tree as it gets it, at the level-up and at login, before the playerbots
+// level-up action can pick a tree at random and keep it.
+//
+// Only free points are spent. Points already in another tree stay; moving them
+// is a respec at a trainer, which is not this rule.
+
+struct RaidSpecTarget
+{
+    std::string name;
+    unsigned classId{0};
+    unsigned tab{0};    // TalentTab.tabpage, 0 to 2
+};
+
+// The target for a character name, ignoring case; nullptr when it has none.
+RaidSpecTarget const* RaidSpecTargetFor(std::vector<RaidSpecTarget> const& book, std::string const& name);
+
+struct SeatTalentVerdict
+{
+    bool spend{false};
+    unsigned tab{0};
+    char const* said{""};   // literal, no quote character
+};
+
+// Spend the free points in the seat's tree, or say why not: a family
+// character (TrainRoster spends its points in the roster's tree), no target,
+// a target written for another class (a stale lineup), a tab outside 0 to 2,
+// or nothing free to spend.
+SeatTalentVerdict SeatTalentVerdictFor(bool onRoster, RaidSpecTarget const* target, unsigned classId,
+                                       unsigned freePoints);
+
+// ONE TREE'S TALENTS, as the adapter reads them from Talent.dbc and the
+// character: where each sits, how many ranks it has, how many are held, and
+// the talent (and 0-based rank) it needs first.
+struct TalentSlot
+{
+    unsigned talentId{0};
+    unsigned row{0};
+    unsigned col{0};
+    unsigned ranks{0};
+    unsigned known{0};
+    unsigned dependsOn{0};
+    unsigned dependsOnRank{0};
+};
+
+// One LearnTalent call: the talent and the 0-based rank to learn, always the
+// next rank of that talent, so each step costs exactly one point.
+struct TalentLearnStep
+{
+    unsigned talentId{0};
+    unsigned rankIndex{0};
+};
+
+// Where `freePoints` go in one tree. Rows top down, and within a row by
+// column, each talent to its last rank before the next; at most 5 points in a
+// row while a deeper row can still take points, because 5 is the tier
+// requirement and so the least that opens the next row. A row opens once the
+// tree holds row x 5 points, and a talent waits for its prerequisite, the
+// core's own two rules (Player::LearnTalent). Points no rule allows are left.
+//
+// WHY ONE RANK A STEP. The walk this replaces asked for the highest rank the
+// free points could pay for, so with the one point a level brings it only ever
+// bought rank 1, and stalled once row 0's first ranks were held.
+std::vector<TalentLearnStep> PlanTalentSpend(std::vector<TalentSlot> slots, unsigned freePoints);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
