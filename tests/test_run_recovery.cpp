@@ -193,6 +193,16 @@ void ARecoveryWaitEndsOnItsConditionOrItsCeiling()
     Check("ceiling ends it", RecoveryWaitNext(f) == RecoveryWaitStep::Ceiling, true);
 }
 
+void EveryRecoveryHasANamedCampaignAndClockEnd()
+{
+    Check("campaign move has a named end",
+          std::string(RecoveryEndReason(1000, 1100, 600, false)) == "campaign_changed", true);
+    Check("expired rung has a named end",
+          std::string(RecoveryEndReason(1000, 1600, 600, true)) == "backstop", true);
+    Check("live rung continues", std::string(RecoveryEndReason(1000, 1100, 600, true)).empty(),
+          true);
+}
+
 void AStagingStallIsAskedEveryThirdRearm()
 {
     Check("not at zero", StagingStallAskAt(0), false);
@@ -325,6 +335,7 @@ int main()
     TheBackoffGrowsIsCappedAndIsNeverZero();
     OnlyOfferedWordsParse();
     ARecoveryWaitEndsOnItsConditionOrItsCeiling();
+    EveryRecoveryHasANamedCampaignAndClockEnd();
     AStagingStallIsAskedEveryThirdRearm();
     AGiveUpOnTheGroundLeavesTheErrandAlone();
     TheTimelineSaysWhatEndedTheErrandAndWhichRecovery();

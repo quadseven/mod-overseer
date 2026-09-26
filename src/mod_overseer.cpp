@@ -1384,6 +1384,12 @@ constexpr uint32 CROSSING_STEP_POINT_ID = 0;
 // missing backstop. Half an hour is many boat periods and is short enough that
 // a family walking somewhere lethal is stopped the same evening.
 constexpr uint32 CROSSING_BACKSTOP_SECONDS = 1800;
+// HOW LONG A LEADER WAITS AT A BERTH BEFORE HE GOES BACK FOR A HELD FOLLOWER
+// (#739). Five minutes, the run's own crossing backstop
+// (DUNGEON_CROSSING_BACKSTOP_SECONDS, declared further down): long enough for a
+// follower who is on its way to arrive, and far short of the two hours a
+// leader stood at the Theramore berth for a follower held 2,448 yards off.
+constexpr uint32 CROSSING_FETCH_WAIT_SECONDS = 5 * 60;
 
 // The same question for an aimed POSITION, and it needs a different answer.
 // Everything above reasons about a creature: the slack exists because the
@@ -2847,6 +2853,10 @@ constexpr unsigned DUNGEON_RECOVERY_BACKOFF_CAP_SECONDS = 900;
 // A restage walk ends at this ceiling, or when the leader has got no nearer
 // for the stall window, and the next attempt opens either way.
 constexpr unsigned DUNGEON_RECOVERY_WALK_CEILING_SECONDS = 2400;
+// THE OUTER BOUND ON ANY RUNG (#739), behind each rung's own ceiling below. A
+// summon rung read RECOVERING for more than two hours on the dev realm; twice
+// the longest rung ceiling ends such a rung whatever its own clock says.
+constexpr unsigned DUNGEON_RECOVERY_BACKSTOP_SECONDS = 2 * DUNGEON_RECOVERY_WALK_CEILING_SECONDS;
 constexpr unsigned DUNGEON_RECOVERY_WALK_STALL_SECONDS = 300;
 constexpr float DUNGEON_RECOVERY_WALK_PROGRESS_YARDS = 20.f;
 // Where a restage walk hands over to the next attempt's own staging.
@@ -33045,6 +33055,10 @@ private:
         float stoneYards = -1.f;
         GameObjectData const* const stone = DoorMeetingStone(portal, &stoneYards);
         facts.summonReady = stone != nullptr;
+        OverseerDecisions::RitualSummonerChoice const summoner =
+            stone ? ChooseRecoverySummoner(leader, members, stone)
+                  : OverseerDecisions::RitualSummonerChoice();
+        facts.summonerReady = !summoner.name.empty();
         facts.summonNote =
             stone ? "the door's meeting stone stands " +
                         std::to_string(static_cast<uint32>(stoneYards)) +
@@ -33054,6 +33068,8 @@ private:
                         std::to_string(static_cast<uint32>(
                             OverseerDecisions::SUMMON_RUNG_STONE_SEARCH_YARDS)) +
                         "y of the door, so no summon";
+        if (stone && !facts.summonerReady)
+            facts.summonNote += "; no qualifying summoner: " + summoner.why;
         OverseerDecisions::FinderReadiness const finder = OverseerDecisions::ReadFinderReadiness(
             ReadFinderFacts(leaderName, members, portal), false);
         facts.dungeonFinderReady = finder.ready;
@@ -33646,9 +33662,31 @@ private:
     // hand straight to the next attempt or walk or wait until the recovery has
     // done its work (or reached its ceiling).
     void DriveRecovering(DungeonRunCoordinatorState& coord, std::string const& leaderName,
-                         std::vector<std::string> const& members, DungeonPortal const& portal)
+                         std::vector<std::string> const& members, DungeonPortal const& portal,
+                         std::string const& leaderJob)
     {
         std::time_t const now = std::time(nullptr);
+        char const* const endReason = OverseerDecisions::RecoveryEndReason(
+            coord.recoveryChosen ? coord.recoveryActSince : coord.recoverySince, now,
+            DUNGEON_RECOVERY_BACKSTOP_SECONDS,
+            IsDungeonJob(leaderJob) && DungeonKeywordForJob(leaderJob) == portal.keyword);
+        if (*endReason && (std::string(endReason) == "campaign_changed" || coord.recoveryChosen))
+        {
+            LOG_WARN("module.overseer", "overseer: RECOVERING ends for '{}' - {}", leaderName,
+                     endReason);
+            if (coord.recovery == OverseerDecisions::RunRecovery::Summon)
+                RestoreRitualSummoner(coord, ObjectAccessor::FindPlayerByName(leaderName));
+            _travelAims.Release(leaderName, "the recovery campaign ended");
+            // A CHANGED CAMPAIGN GOES BACK TO IDLE, NOT INTO ITS NEXT ATTEMPT.
+            // RearmAfterRecovery keeps the portal, so it would re-arm the dungeon
+            // the family was taken off; IDLE reads the leader's job afresh on
+            // the next poll. A rung past its backstop re-arms as any other does.
+            if (std::string(endReason) == "campaign_changed")
+                coord = DungeonRunCoordinatorState();
+            else
+                RearmAfterRecovery(coord, false);
+            return;
+        }
         if (!coord.recoveryChosen)
         {
             if (now - coord.recoverySince < static_cast<std::time_t>(coord.recoveryWaitSeconds))
@@ -33702,9 +33740,12 @@ private:
                 }
             }
             if (chosen == OverseerDecisions::RunRecovery::Summon &&
-                !DoorMeetingStone(portal))
+                (!DoorMeetingStone(portal) ||
+                 ChooseRecoverySummoner(ObjectAccessor::FindPlayerByName(leaderName), members,
+                                        DoorMeetingStone(portal)).name.empty()))
             {
                 coord.recoveryFacts.summonReady = false;
+                coord.recoveryFacts.summonerReady = false;
                 chosen = OverseerDecisions::RunRecoveryHeuristic(coord.recoveryFacts);
                 chosenBy = "heuristic";
             }
@@ -34258,6 +34299,23 @@ private:
             doneWhy = "the door has no meeting stone";
             return true;
         }
+        OverseerDecisions::RitualSummonerChoice const available =
+            leader ? ChooseRecoverySummoner(leader, members, stone)
+                   : OverseerDecisions::RitualSummonerChoice();
+        if (leader && available.name.empty())
+        {
+            // The sentence lives on the coordinator, which outlives this poll;
+            // doneWhy is a pointer the caller reads after we return.
+            std::string const why = "no qualifying summoner: " + available.why;
+            if (coord.summonSaid != why)
+            {
+                coord.summonSaid = why;
+                LOG_WARN("module.overseer", "overseer: summon rung for '{}' ends - {}",
+                         leaderName, why);
+            }
+            doneWhy = coord.summonSaid.c_str();
+            return true;
+        }
 
         // A ROW IN FLIGHT IS WAITED FOR, and its verdict is read before
         // anything else is asked. Not found yet is a row whose insert is still
@@ -34326,8 +34384,7 @@ private:
             leader->GetExactDist2d(stone->posX, stone->posY) <=
                 OverseerDecisions::SUMMON_RUNG_AT_STONE_YARDS)
         {
-            OverseerDecisions::RitualSummonerChoice const choice =
-                ChooseRecoverySummoner(leader, members, stone);
+            OverseerDecisions::RitualSummonerChoice const& choice = available;
             if (choice.name.empty())
             {
                 doneWhy = "no eligible warlock is online with Ritual of Summoning and a Soul Shard";
@@ -35776,6 +35833,7 @@ private:
         for (std::string const& name : members)
         {
             OverseerDecisions::CrossingMember member;
+            member.name = name;
             member.isLeader = name == leaderName;
 
             Player* p = ObjectAccessor::FindPlayerByName(name);
@@ -35790,6 +35848,7 @@ private:
 
             member.readable = true;
             member.mapId = p->GetMapId();
+            member.heldTooFarNoFlight = !member.isLeader && HeldWaitingForLeader(name);
 
             // ASKED OF THE MEMBER, NOT OF THE BOAT, AND MATCHED BY IDENTITY, so
             // the answer does not depend on which map the boat is on.
@@ -35959,6 +36018,54 @@ private:
                              "overseer: '{}' is at the berth for '{}' on map {} - {}",
                              leaderName, boat, route.world.originMap, why);
                 break;
+
+            case OverseerDecisions::CrossingAction::Fetch:
+            {
+                releaseTheLeader("the crossing is fetching a held follower");
+                if (_fetches.find(leaderName) != _fetches.end())
+                    break;
+                std::vector<OverseerDecisions::FetchCandidate> candidates;
+                for (OverseerDecisions::CrossingMember const& member : route.members)
+                {
+                    if (!member.heldTooFarNoFlight || member.isLeader)
+                        continue;
+                    Player* const target = ObjectAccessor::FindPlayerByName(member.name);
+                    if (!target || !leader)
+                        continue;
+                    OverseerDecisions::FetchCandidate candidate;
+                    candidate.name = member.name;
+                    candidate.seen = target->IsInWorld();
+                    candidate.sameMap = target->GetMapId() == leader->GetMapId();
+                    candidate.alive = target->IsAlive();
+                    candidate.heldTooFar = true;
+                    candidate.yards = target->GetDistance2d(leader);
+                    candidates.push_back(candidate);
+                }
+                std::string const targetName = OverseerDecisions::PickFetchTarget(
+                    candidates, FETCH_LIMITS, false);
+                Player* const target = targetName.empty()
+                    ? nullptr : ObjectAccessor::FindPlayerByName(targetName, false);
+                if (target && AskForLeader(leaderName,
+                        OverseerDecisions::LeaderIntentKind::FetchMember, "fetch",
+                        targetName, "held beyond the crossing foot limit"))
+                {
+                    Fetch& fetch = _fetches[leaderName];
+                    fetch = Fetch{};
+                    fetch.target = targetName;
+                    fetch.since = std::time(nullptr);
+                    fetch.wanted = true;
+                    AimFetch(fetch, leaderName, target);
+                    if (fresh)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' leaves the berth to fetch held follower '{}' "
+                                 "before the crossing - {}", leaderName, targetName, why);
+                }
+                else if (fresh)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' must fetch a held follower before crossing, "
+                             "but no fetch can start - {}", leaderName, why);
+                break;
+            }
 
             case OverseerDecisions::CrossingAction::Ride:
                 // NOTHING IS AIMED. A travel aim now would walk a passenger off
@@ -39594,6 +39701,12 @@ private:
             }
             coord.loggedHomeHold = false;
 
+            // A berth fetch owns the leader's aim until its target rejoins;
+            // reading the crossing again would overwrite that fetch with the
+            // berth aim on the next poll.
+            if (coord.crossingSince && _fetches.find(leaderName) != _fetches.end())
+                return;
+
             // CAN THE LEADER GET TO THIS DOOR AT ALL? ASKED BEFORE THE RESET,
             // WHICH IS THE ONLY PLACE IT IS STILL FREE TO ASK (#158).
             //
@@ -39665,11 +39778,15 @@ private:
                     std::time(nullptr) - coord.crossingSince >
                         time_t(CROSSING_BACKSTOP_SECONDS))
                     route.world.overdue = true;
+                route.world.leaderWaitSeconds = coord.crossingSince
+                    ? static_cast<uint32>(std::time(nullptr) - coord.crossingSince) : 0;
 
                 OverseerDecisions::CrossingLimits limits;
                 limits.berthArrivedYards = CROSSING_BERTH_ARRIVED_YARDS;
                 limits.gatherYards = CROSSING_GATHER_YARDS;
                 limits.minBoardDwellMs = CROSSING_MIN_BOARD_DWELL_MS;
+                limits.fetchPastYards = CATCH_UP_FOOT_LIMIT_YARDS;
+                limits.fetchWaitSeconds = CROSSING_FETCH_WAIT_SECONDS;
                 OverseerDecisions::CrossingStep const step =
                     OverseerDecisions::ReadCrossing(route.world, route.members, limits);
 
@@ -40050,7 +40167,7 @@ private:
         // leader it asks SteerableAI for itself.
         if (coord.phase == DungeonRunPhase::Recovering)
         {
-            DriveRecovering(coord, leaderName, members, *portal);
+            DriveRecovering(coord, leaderName, members, *portal, leaderJob);
             return;
         }
 

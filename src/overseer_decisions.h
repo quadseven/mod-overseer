@@ -3025,6 +3025,8 @@ struct RunFailureFacts
     unsigned summonAfter{0};
     // The door has a meeting stone the summon rung can use.
     bool summonReady{false};
+    // THE CASTER MUST QUALIFY NOW (#739), not merely a stone be nearby.
+    bool summonerReady{false};
     std::string summonNote;
     // Overseer.Recovery.DungeonFinder is on and the family can queue as one
     // group of five for its campaign's dungeon now.
@@ -3097,6 +3099,9 @@ enum class RecoveryWaitStep : std::uint8_t
 };
 
 RecoveryWaitStep RecoveryWaitNext(RecoveryWaitFacts const& facts);
+// THE RECOVERY ENDS ON ITS BACKSTOP OR A CAMPAIGN CHANGE (#739).
+char const* RecoveryEndReason(std::time_t since, std::time_t now, unsigned ceilingSeconds,
+                              bool campaignMatches);
 
 // WHEN A STAGING ERRAND KEEPS BEING TAKEN BACK. Asked every
 // STAGING_STALL_ASK_EVERY re-arms of one attempt.
@@ -7447,6 +7452,8 @@ enum class CrossingAction : std::uint8_t
     // drive stamps a fresh errand clock whenever the target it sees differs
     // from the one it had, and it had just released this one on arrival.
     Hold,
+    // THE BERTH FETCH REGROUPS THE FAMILY BEFORE BOARDING (#739).
+    Fetch,
     // The LEADER is aboard. DO NOTHING, DELIBERATELY: the transport is the
     // mechanism and anything issued now would fight it. A separate value from
     // Wait because "doing nothing because the boat is sailing" and "doing
@@ -7500,9 +7507,11 @@ char const* CrossingActionName(CrossingAction action);
 // transport identity, so the answer does not depend on where the boat is.
 struct CrossingMember
 {
+    std::string name;
     bool readable{false};
     bool isLeader{false};
     bool aboard{false};       // the member's own transport IS this route's
+    bool heldTooFarNoFlight{false};
     std::uint32_t mapId{0};
     float berthDistance{0.f}; // yards, two-dimensional; meaningless off-map
     // Yards, two-dimensional, to the LEADER, read only for a member on the
@@ -7555,6 +7564,7 @@ struct CrossingWorld
     // How much of that stop is left, in milliseconds. Meaningless unless one of
     // the two above is true.
     std::uint32_t dwellLeftMs{0};
+    std::uint32_t leaderWaitSeconds{0};
 };
 
 struct CrossingLimits
@@ -7571,6 +7581,8 @@ struct CrossingLimits
     // off at the far end. A step started as the boat casts off is a character
     // walked off the end of a pier into the harbour, or off a deck over it.
     std::uint32_t minBoardDwellMs{0};
+    float fetchPastYards{0.f};
+    std::uint32_t fetchWaitSeconds{0};
 };
 
 struct CrossingStep
@@ -7594,6 +7606,7 @@ struct CrossingStep
     // CrossingLimits::gatherYards of him. Board needs this to equal
     // `waiting - 1`.
     std::size_t gathered{0};
+    bool heldFollowerNeedsFetch{false};
 };
 
 // THE ORDER OF THE TESTS IS THE FAIL-CLOSED RULE, WRITTEN OUT.
