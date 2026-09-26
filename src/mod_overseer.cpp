@@ -7297,16 +7297,19 @@ private:
         PublishLeaderIntents(rosters);
     }
 
-    SchemaColumns _familyIntentColumns{SchemaColumns::Unknown};
+    // Unknown until asked, then present or absent: SchemaColumns's three
+    // states, as a plain int because that enum is declared further down the
+    // class and a member's type must be declared before it.
+    int8 _familyIntentColumns{-1};
 
     bool FamilyIntentTablePresent()
     {
-        if (_familyIntentColumns == SchemaColumns::Unknown)
+        if (_familyIntentColumns < 0)
         {
             bool const present = SchemaHasColumns(
                 "overseer_family_intent",
                 "'leader_name','current_kind','on_the_table','chosen_kind','chosen_until'", 5);
-            _familyIntentColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            _familyIntentColumns = present ? 1 : 0;
             if (!present)
                 LOG_WARN("module.overseer",
                          "overseer: overseer_family_intent is missing "
@@ -7314,7 +7317,7 @@ private:
                          "the leader intent book still runs, on its own static order, and "
                          "Jev's picks are not read");
         }
-        return _familyIntentColumns == SchemaColumns::Present;
+        return _familyIntentColumns == 1;
     }
 
     // The leader set, the configuration and Jev's picks, once per party poll.
