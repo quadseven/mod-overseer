@@ -302,6 +302,7 @@
 // header so that something other than this translation unit can reach them -
 // see overseer_decisions.h for why that was worth a file.
 #include "overseer_decisions.h"
+#include "overseer_crash.h"
 
 #include <algorithm>
 #include <atomic>
@@ -60781,6 +60782,9 @@ public:
 
 void Addmod_overseerScripts()
 {
+    // Install the crash trace before constructing scripts or starting module work.
+    std::string const logDir = sConfigMgr->GetOption<std::string>("LogsDir", ".");
+    InstallCrashTrace(logDir.c_str());
     // The loot council's steer on the roster's roll votes (patches/
     // mod-playerbots/0015). Installed before any bot can vote.
     SetLootRollSteer(&CouncilSteerRoll);
