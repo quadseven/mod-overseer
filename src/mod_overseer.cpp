@@ -20566,6 +20566,39 @@ private:
                         return;
                     }
                 }
+                // THE SPOT IT IS HELD ON IS JUDGED TOO (#744). #697 reads the leg
+                // to the family; a member held still where the spawns are well
+                // above it dies there instead, again after every revive (Ugga,
+                // Tanaris, five deaths in 44 minutes, every one `driven by idle`).
+                // Such a member takes its own hearthstone through the #697 hearth
+                // above, on the next poll, and the hold ends when it lands.
+                if (lethal == _lethalLegHeld.end() || !lethal->second.hearth)
+                {
+                    OverseerDecisions::HeldGroundFacts ground;
+                    ground.memberLevel = p->GetLevel();
+                    ground.groundTopLevel = HostileSpawnsNear(p, p->GetMapId(), p->GetPositionX(),
+                                                              p->GetPositionY(),
+                                                              REVIVAL_AGGRO_RADIUS, 0).level;
+                    ground.levelGap = LONE_LEG_LIMITS.levelGap;
+                    uint32 const stone = HearthstoneSpellOf(p);
+                    ground.hearthReady = stone && !p->HasSpellCooldown(stone) &&
+                                         !HearthPendingFor(name);
+                    OverseerDecisions::HeldGroundVerdict const verdict =
+                        OverseerDecisions::DecideHeldGround(ground);
+                    if (verdict.step == OverseerDecisions::HeldGroundStep::Hearth)
+                    {
+                        LethalLegHold& held = _lethalLegHeld[name];
+                        held = LethalLegHold{};
+                        held.why = OverseerDecisions::LoneLegReason::Ground;
+                        held.hearth = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' (level {}) is held on ground where spawns reach "
+                                 "level {}, and its hearthstone is ready - it hearths to its "
+                                 "bind rather than wait there to be killed (#744)",
+                                 name, ground.memberLevel, ground.groundTopLevel);
+                        return;
+                    }
+                }
                 if (OverseerDecisions::FarCatchUpStaysHeld(
                         gap, holdLifts, std::time(nullptr) - heldFar->second,
                         CATCH_UP_FAR_HOLD_SECONDS))
