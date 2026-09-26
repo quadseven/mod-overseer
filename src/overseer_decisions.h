@@ -17226,7 +17226,21 @@ struct GhostRecoveryFacts
     bool healerGraveyardSafe{false};
     // An earlier poll of this same death already chose the spirit healer.
     bool choseHealer{false};
+    // A spirit-healer resurrection happened within the sickness window.
+    bool healerUsedRecently{false};
+    bool corpseRunPossible{false};
 };
+
+enum class RevivedSickGroundStep : std::uint8_t { Stay, Hearth, HoldOutOfCombat };
+struct RevivedSickGroundFacts
+{
+    bool sick{false};
+    uint32_t memberLevel{0};
+    uint32_t groundTopLevel{0};
+    uint32_t levelGap{3};
+    bool hearthReady{false};
+};
+RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& facts);
 
 struct GhostRecoveryLimits
 {

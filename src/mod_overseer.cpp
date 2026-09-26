@@ -717,6 +717,7 @@ constexpr float GHOST_CORPSE_THREAT_RADIUS = float(CORPSE_RECLAIM_RADIUS);
 // ladder is left to take it. A released ghost starts at the graveyard, so this
 // is a walk back of however far the dead engine carried it in one poll.
 constexpr int64 GHOST_HEALER_WALK_SECONDS = 120;
+constexpr int64 SPIRIT_HEALER_SICKNESS_SECONDS = 600;
 // How far round the ghost to look for the spirit healer itself.
 constexpr float GHOST_HEALER_SWEEP_YARDS = 60.0f;
 // Two deaths here, three levels above, ninety seconds of waiting.
@@ -8115,6 +8116,7 @@ private:
     // the `expectedVerb` argument there - so it must be the same string at the
     // place that holds and the places that release.
     static constexpr char const* STAGE_HOLD_VERB = "stage";
+    static constexpr char const* REVIVED_SICK_HOLD_VERB = "revived sickness";
 
     static std::map<std::string, HoldRecord>& HoldsInForce()
     {
@@ -26008,6 +26010,7 @@ private:
                 _healerExpected.erase(name);
                 EndGhostRecovery(botAI, name);
                 ReleaseRevivalHold(botAI, name);
+                DriveRevivedSickness(bot, botAI, name);
                 continue;
             }
 
@@ -26694,6 +26697,87 @@ private:
                  name, led ? "`new rpg`" : botAI->GetMaster() ? "`follow`" : "nothing to restore");
     }
 
+    // A sick revival cannot fight on ground inside the #697 lethal margin (#746).
+    // It hearths when possible; otherwise the shared stillness hold and combat
+    // strategy command path keep it passive until spell 15007 ends.
+    void DriveRevivedSickness(Player* bot, PlayerbotAI* botAI, std::string const& name)
+    {
+        bool const sick = bot->HasAura(15007);
+        auto current = _revivedSickness.find(name);
+        if (!sick)
+        {
+            if (current != _revivedSickness.end())
+            {
+                ReleaseRevivedSickness(bot, botAI, name, current->second);
+                _revivedSickness.erase(current);
+            }
+            return;
+        }
+        RevivedSicknessState& state = _revivedSickness[name];
+        OverseerDecisions::RevivedSickGroundFacts facts;
+        facts.sick = sick;
+        facts.memberLevel = bot->GetLevel();
+        facts.groundTopLevel = HostileSpawnsNear(bot, bot->GetMapId(), bot->GetPositionX(),
+                                                 bot->GetPositionY(), REVIVAL_AGGRO_RADIUS, 0).level;
+        facts.levelGap = LONE_LEG_LIMITS.levelGap;
+        uint32 const stone = HearthstoneSpellOf(bot);
+        facts.hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
+        auto const step = OverseerDecisions::DecideRevivedSickGround(facts);
+
+        if (state.hasDecision && state.lastDecision != step)
+            ReleaseRevivedSickness(bot, botAI, name, state);
+        if (!state.hasDecision || state.lastDecision != step)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' revived with Resurrection Sickness on ground reaching "
+                     "level {} (member level {}, lethal gap {}) - decision: {} (#746)",
+                     name, facts.groundTopLevel, facts.memberLevel, facts.levelGap,
+                     step == OverseerDecisions::RevivedSickGroundStep::Hearth ? "hearth" :
+                     step == OverseerDecisions::RevivedSickGroundStep::HoldOutOfCombat
+                         ? "hold out of combat" : "stay");
+            state.lastDecision = step;
+            state.hasDecision = true;
+        }
+        if (step == OverseerDecisions::RevivedSickGroundStep::Hearth)
+        {
+            char const* status = "error";
+            std::string evidence;
+            DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+            return;
+        }
+        if (step != OverseerDecisions::RevivedSickGroundStep::HoldOutOfCombat)
+            return;
+
+        HoldCharacterStill(bot, botAI, name, REVIVED_SICK_HOLD_VERB,
+                           static_cast<uint32>(SPIRIT_HEALER_SICKNESS_SECONDS + 90), false);
+        for (char const* strategy : {"pull", "aoe", "grind"})
+        {
+            if (StrategyPresent(botAI, StrategyItem{strategy, true}) &&
+                std::find(state.removedCombat.begin(), state.removedCombat.end(), strategy) ==
+                    state.removedCombat.end())
+            {
+                botAI->ChangeStrategy((std::string("-") + strategy).c_str(), BOT_STATE_COMBAT);
+                state.removedCombat.emplace_back(strategy);
+            }
+        }
+        if (!StrategyPresent(botAI, StrategyItem{"flee", true}))
+        {
+            botAI->ChangeStrategy("+flee", BOT_STATE_COMBAT);
+            state.addedFlee = true;
+        }
+    }
+
+    void ReleaseRevivedSickness(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                                RevivedSicknessState& state)
+    {
+        ReleaseHold(name, bot, "Resurrection Sickness ended", REVIVED_SICK_HOLD_VERB);
+        for (std::string const& strategy : state.removedCombat)
+            botAI->ChangeStrategy(("+" + strategy).c_str(), BOT_STATE_COMBAT);
+        if (state.addedFlee)
+            botAI->ChangeStrategy("-flee", BOT_STATE_COMBAT);
+        state = RevivedSicknessState{};
+    }
+
     // Answer a resurrect offer this character is sitting on. True when the
     // offer was taken and the character is on its way back, false when it was
     // declined and the recovery below should carry on as if there had never
@@ -27022,6 +27106,12 @@ private:
         facts.ghostSeconds = static_cast<long>(now - ghostTime);
         facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty();
         facts.choseHealer = st.choseHealer;
+        auto const healerUse = _lastSpiritHealerUse.find(name);
+        facts.healerUsedRecently =
+            healerUse != _lastSpiritHealerUse.end() &&
+            now >= healerUse->second &&
+            now - healerUse->second <= SPIRIT_HEALER_SICKNESS_SECONDS;
+        facts.corpseRunPossible = true;
         OverseerDecisions::GhostRecoveryVerdict const verdict =
             OverseerDecisions::DecideGhostRecovery(facts, GHOST_RECOVERY_LIMITS);
 
@@ -27113,6 +27203,7 @@ private:
                      "instead of reclaiming its corpse at ({:.0f}, {:.0f}) - resurrection "
                      "sickness and durability loss included, as for any player who does",
                      name, healerName, st.healerGrave->name, st.corpseX, st.corpseY);
+            _lastSpiritHealerUse[name] = now;
             ReturnCorpseRun(botAI, st);
             _ghostRecovery.erase(name);
             HoldAfterRevival(bot, botAI, name, bot->GetMapId(), bot->GetPositionX(),
@@ -60387,6 +60478,17 @@ private:
     // costs nothing, because a restart also resets every bot's strategies
     // to upstream's defaults and there is no `stay` left to take off.
     std::map<std::string, std::pair<int64, bool>> _revivalHoldUntil;
+
+    struct RevivedSicknessState
+    {
+        bool hasDecision{false};
+        OverseerDecisions::RevivedSickGroundStep lastDecision{
+            OverseerDecisions::RevivedSickGroundStep::Stay};
+        std::vector<std::string> removedCombat;
+        bool addedFlee{false};
+    };
+    std::map<std::string, RevivedSicknessState> _revivedSickness;
+    std::map<std::string, int64> _lastSpiritHealerUse;
 
     // WHAT EACH GHOST WAS DECIDED TO DO ABOUT ITS CORPSE (#664), keyed by
     // name and tied to one death by its ghost time. World thread only, from
