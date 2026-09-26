@@ -11,6 +11,7 @@
 
 #include "overseer_decisions.h"
 
+#include <iterator>
 #include <utility>
 
 namespace OverseerDecisions
@@ -5604,6 +5605,9 @@ char const* RegroupClaimName(RegroupClaim claim)
         case RegroupClaim::StoodDown:     return "stood down";
         case RegroupClaim::AimRefused:    return "catch-up aim refused";
         case RegroupClaim::Fetched:       return "the leader is going back for it";
+        case RegroupClaim::TooFarToWaitFor:
+            return "too far back to hold the leader still for; it walks back while the "
+                   "family carries on";
     }
     return "unknown";
 }
@@ -5655,6 +5659,8 @@ RegroupClaim ReadRegroupClaim(RegroupMember const& member,
         return RegroupClaim::Fetched;
     if (!member.aimRefusedBecause.empty())
         return RegroupClaim::AimRefused;
+    if (limits.maxWaitYards > 0.f && member.yards > limits.maxWaitYards)
+        return RegroupClaim::TooFarToWaitFor;
     return RegroupClaim::Rejoining;
 }
 
@@ -16139,6 +16145,432 @@ unsigned LoweredSkillValue(unsigned value, unsigned targetLevel)
 unsigned MailsNeededFor(unsigned items)
 {
     return (items + NATURALIZE_MAIL_ITEMS - 1) / NATURALIZE_MAIL_ITEMS;
+}
+
+
+// ---------------------------------------------------------------------------
+// One movement owner per family leader. See the header.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+struct LeaderIntentWord
+{
+    LeaderIntentKind kind;
+    char const* word;
+};
+
+constexpr LeaderIntentWord LEADER_INTENT_WORDS[] = {
+    {LeaderIntentKind::None, "none"},
+    {LeaderIntentKind::QuestDrive, "quest"},
+    {LeaderIntentKind::EconomyErrand, "economy"},
+    {LeaderIntentKind::TownErrand, "errand"},
+    {LeaderIntentKind::Respec, "respec"},
+    {LeaderIntentKind::TrainingStop, "training"},
+    {LeaderIntentKind::Regroup, "regroup"},
+    {LeaderIntentKind::FetchMember, "fetch"},
+    {LeaderIntentKind::Hearth, "hearth"},
+    {LeaderIntentKind::DungeonRun, "dungeon"},
+    {LeaderIntentKind::OperatorOrder, "operator"},
+};
+
+bool LeaderIntentLive(LeaderIntentState const& state, std::time_t now,
+                      LeaderIntentLimits const& limits)
+{
+    std::time_t const stale = state.kind == LeaderIntentKind::OperatorOrder
+                                  ? limits.operatorSeconds
+                                  : limits.staleSeconds;
+    return state.kind != LeaderIntentKind::None && now - state.lastAsked <= stale;
+}
+
+std::string LeaderIntentAskKey(LeaderIntentRequest const& request)
+{
+    return std::to_string(static_cast<int>(request.kind)) + "|" + request.owner;
+}
+
+bool LeaderIntentNeverWaits(LeaderIntentKind kind)
+{
+    return kind == LeaderIntentKind::OperatorOrder || kind == LeaderIntentKind::DungeonRun;
+}
+
+void ClearLeaderIntent(LeaderIntentState& state)
+{
+    state.kind = LeaderIntentKind::None;
+    state.owner.clear();
+    state.target.clear();
+    state.why.clear();
+    state.since = 0;
+    state.lastAsked = 0;
+    state.dwellWaived = false;
+}
+
+std::string LowerTrimmed(std::string const& text)
+{
+    std::size_t begin = 0;
+    std::size_t end = text.size();
+    while (begin < end && (text[begin] == ' ' || text[begin] == '\t'))
+        ++begin;
+    while (end > begin && (text[end - 1] == ' ' || text[end - 1] == '\t'))
+        --end;
+    std::string out = text.substr(begin, end - begin);
+    for (char& c : out)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
+
+}  // namespace
+
+char const* LeaderIntentKindWord(LeaderIntentKind kind)
+{
+    for (LeaderIntentWord const& entry : LEADER_INTENT_WORDS)
+        if (entry.kind == kind)
+            return entry.word;
+    return "none";
+}
+
+LeaderIntentKind ParseLeaderIntentKind(std::string const& word)
+{
+    std::string const wanted = LowerTrimmed(word);
+    for (LeaderIntentWord const& entry : LEADER_INTENT_WORDS)
+        if (wanted == entry.word)
+            return entry.kind;
+    return LeaderIntentKind::None;
+}
+
+bool LeaderIntentWalksUnderNewRpg(LeaderIntentKind kind)
+{
+    switch (kind)
+    {
+        case LeaderIntentKind::QuestDrive:
+        case LeaderIntentKind::EconomyErrand:
+        case LeaderIntentKind::TownErrand:
+        case LeaderIntentKind::Respec:
+        case LeaderIntentKind::TrainingStop:
+        case LeaderIntentKind::FetchMember:
+        case LeaderIntentKind::Hearth:
+        case LeaderIntentKind::DungeonRun:
+            return true;
+        case LeaderIntentKind::None:
+        case LeaderIntentKind::Regroup:
+        case LeaderIntentKind::OperatorOrder:
+            return false;
+    }
+    return false;
+}
+
+int LeaderIntentRank(LeaderIntentKind kind, std::string const& target,
+                     LeaderIntentPreference const& preference, std::time_t now)
+{
+    int const own = static_cast<int>(kind) * 10;
+    bool const preferred = preference.kind != LeaderIntentKind::None &&
+                           now < preference.until && kind == preference.kind &&
+                           (preference.target.empty() || preference.target == target);
+    // Jev's pick outranks every heuristic rule, and never the campaign's own
+    // run or the operator: "keep operator orders and campaigns first".
+    int const jevRank = static_cast<int>(LeaderIntentKind::DungeonRun) * 10 - 5;
+    if (preferred && own < jevRank)
+        return jevRank;
+    return own;
+}
+
+LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
+                                    LeaderIntentRequest const& request, std::time_t now,
+                                    LeaderIntentLimits const& limits,
+                                    LeaderIntentPreference const& preference)
+{
+    LeaderIntentVerdict verdict;
+    auto defer = [&](std::string const& holder, std::time_t wait, std::string const& reason) {
+        verdict.answer = LeaderIntentAnswer::Deferred;
+        verdict.holder = holder;
+        verdict.waitSeconds = wait;
+        verdict.reason = reason;
+        std::string& said = state.deferralSaid[request.owner];
+        verdict.sayIt = said != reason;
+        said = reason;
+        return verdict;
+    };
+
+    if (request.kind == LeaderIntentKind::None)
+        return defer(std::string(), 0, "a request that names no intent");
+
+    // On the table whatever the answer, so the bridge can offer it to Jev.
+    for (auto it = state.asks.begin(); it != state.asks.end();)
+        it = now - it->second.at > limits.staleSeconds ? state.asks.erase(it) : std::next(it);
+    state.asks[LeaderIntentAskKey(request)] = LeaderIntentState::Ask{request, now};
+
+    // An owner that stopped asking has let go, said or not.
+    if (state.kind != LeaderIntentKind::None && !LeaderIntentLive(state, now, limits))
+        ClearLeaderIntent(state);
+
+    bool const live = state.kind != LeaderIntentKind::None;
+    // THE SAME RULE CHANGING WHAT IT ASKS FOR IS A RETARGET, NOT A HANDOFF. The
+    // travel column's owner asks as an economy errand for 'vendor' and as a
+    // town errand for 'trainer'; when the bridge rewrites the column, the rule
+    // holding the leader is still the one asking, and deferring it behind its
+    // own previous kind left the leader on neither errand until it went stale.
+    if (live && state.owner == request.owner && state.kind != request.kind)
+    {
+        state.kind = request.kind;
+        state.target = request.target;
+        state.why = request.why;
+        state.lastAsked = now;
+        state.deferralSaid.erase(request.owner);
+        verdict.answer = LeaderIntentAnswer::Retargeted;
+        return verdict;
+    }
+    if (live && state.kind == request.kind && state.owner == request.owner)
+    {
+        state.lastAsked = now;
+        state.deferralSaid.erase(request.owner);
+        if (state.target == request.target)
+        {
+            verdict.answer = LeaderIntentAnswer::Renewed;
+            return verdict;
+        }
+        state.target = request.target;
+        state.why = request.why;
+        verdict.answer = LeaderIntentAnswer::Retargeted;
+        return verdict;
+    }
+
+    bool const urgent = LeaderIntentNeverWaits(request.kind);
+    auto const cooling = state.cooldownUntil.find(static_cast<std::uint8_t>(request.kind));
+    if (!urgent && cooling != state.cooldownUntil.end() && now < cooling->second)
+        return defer(live ? state.owner : std::string(), cooling->second - now,
+                     std::string("it gave up '") + LeaderIntentKindWord(request.kind) +
+                         "' inside its dwell a moment ago");
+
+    if (live)
+    {
+        int const held = LeaderIntentRank(state.kind, state.target, preference, now);
+        int const asked = LeaderIntentRank(request.kind, request.target, preference, now);
+        std::time_t const ran = now - state.since;
+        bool const dwellOver = state.dwellWaived || ran >= limits.dwellSeconds;
+        if (asked <= held)
+            return defer(state.owner, 0,
+                         std::string("'") + LeaderIntentKindWord(state.kind) +
+                             "' holds the leader and ranks at or above this request");
+        if (!urgent && !dwellOver)
+            return defer(state.owner, limits.dwellSeconds - ran,
+                         std::string("'") + LeaderIntentKindWord(state.kind) +
+                             "' is inside its minimum dwell");
+        verdict.replaced = state.kind;
+        verdict.replacedOwner = state.owner;
+    }
+
+    state.kind = request.kind;
+    state.owner = request.owner;
+    state.target = request.target;
+    state.why = request.why;
+    state.since = now;
+    state.lastAsked = now;
+    state.dwellWaived = false;
+    state.deferralSaid.erase(request.owner);
+    ++state.changes;
+    verdict.answer = LeaderIntentAnswer::Granted;
+    return verdict;
+}
+
+bool EndLeaderIntent(LeaderIntentState& state, LeaderIntentKind kind,
+                     std::string const& owner, LeaderIntentEnd how, std::time_t now,
+                     LeaderIntentLimits const& limits)
+{
+    if (state.kind == LeaderIntentKind::None || state.kind != kind || state.owner != owner)
+        return false;
+    if (how == LeaderIntentEnd::Abandoned && now - state.since < limits.dwellSeconds)
+        state.cooldownUntil[static_cast<std::uint8_t>(kind)] = now + limits.flapCooldownSeconds;
+    ClearLeaderIntent(state);
+    return true;
+}
+
+std::vector<LeaderIntentRequest> LeaderIntentsOnTheTable(LeaderIntentState const& state,
+                                                         std::time_t now,
+                                                         LeaderIntentLimits const& limits,
+                                                         LeaderIntentPreference const& preference)
+{
+    std::vector<LeaderIntentRequest> out;
+    for (auto const& entry : state.asks)
+        if (now - entry.second.at <= limits.staleSeconds)
+            out.push_back(entry.second.request);
+    std::stable_sort(out.begin(), out.end(),
+                     [&](LeaderIntentRequest const& a, LeaderIntentRequest const& b) {
+                         int const ra = LeaderIntentRank(a.kind, a.target, preference, now);
+                         int const rb = LeaderIntentRank(b.kind, b.target, preference, now);
+                         if (ra != rb)
+                             return ra > rb;
+                         if (a.kind != b.kind)
+                             return a.kind > b.kind;
+                         return a.owner < b.owner;
+                     });
+    return out;
+}
+
+void WaiveLeaderIntentDwell(LeaderIntentState& state)
+{
+    if (state.kind != LeaderIntentKind::None)
+        state.dwellWaived = true;
+}
+
+namespace
+{
+
+// The `nc` items of a command, each without its +/-/~ and with that sign.
+std::vector<std::pair<char, std::string>> NcItems(std::string const& verb)
+{
+    std::vector<std::pair<char, std::string>> out;
+    if (verb.rfind("nc ", 0) != 0)
+        return out;
+    std::string const rest = verb.substr(3);
+    std::size_t start = 0;
+    while (start <= rest.size())
+    {
+        std::size_t const comma = rest.find(',', start);
+        std::string item = LowerTrimmed(
+            rest.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+        char sign = '+';
+        if (!item.empty() && (item[0] == '+' || item[0] == '-' || item[0] == '~'))
+        {
+            sign = item[0];
+            item = LowerTrimmed(item.substr(1));
+        }
+        if (!item.empty())
+            out.emplace_back(sign, item);
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+bool OperatorOrderPins(std::string const& command)
+{
+    std::string const verb = LowerTrimmed(command);
+    if (verb == "stay" || verb == "follow")
+        return true;
+    for (auto const& item : NcItems(verb))
+        if (item.first == '+' && (item.second == "stay" || item.second == "follow"))
+            return true;
+    return false;
+}
+
+bool OperatorOrderReleases(std::string const& command)
+{
+    std::string const verb = LowerTrimmed(command);
+    if (verb == "reset ai" || verb == "reset botai")
+        return true;
+    for (auto const& item : NcItems(verb))
+        if ((item.first == '-' && (item.second == "stay" || item.second == "follow")) ||
+            (item.first == '+' && item.second == "new rpg"))
+            return true;
+    return false;
+}
+
+bool LeaderIntentHeldBy(LeaderIntentState const& state, LeaderIntentKind kind,
+                        std::string const& owner, std::time_t now,
+                        LeaderIntentLimits const& limits)
+{
+    return LeaderIntentLive(state, now, limits) && state.kind == kind && state.owner == owner;
+}
+
+bool LeaderIntentFree(LeaderIntentState const& state, std::time_t now,
+                      LeaderIntentLimits const& limits)
+{
+    return !LeaderIntentLive(state, now, limits);
+}
+
+bool CommandSourceIsOperator(std::string const& source)
+{
+    return source.rfind("discord:", 0) == 0 || source.rfind("web:", 0) == 0;
+}
+
+std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
+                                 std::string const& command)
+{
+    if (!isFamilyLeader || CommandSourceIsOperator(source))
+        return std::string();
+    std::string const verb = LowerTrimmed(command);
+    if (verb == "follow")
+        return "a family leader follows nobody - the family follows him, and where he "
+               "walks is decided by the one intent book";
+    if (verb == "stay")
+        return "a family leader is held still only by the intent book's regroup or an "
+               "operator order";
+    if (verb == "reset ai" || verb == "reset botai")
+        return "resetting a family leader's engine wipes the strategies the intent book "
+               "set for the walk he is on";
+    // `nc +new rpg`, `nc -follow,+stay` and the like: every item of a non-combat
+    // strategy change that names a mover the book owns.
+    if (verb.rfind("nc ", 0) == 0)
+    {
+        std::string rest = verb.substr(3);
+        std::size_t start = 0;
+        while (start <= rest.size())
+        {
+            std::size_t const comma = rest.find(',', start);
+            std::string item = LowerTrimmed(
+                rest.substr(start, comma == std::string::npos ? std::string::npos
+                                                               : comma - start));
+            if (!item.empty() && (item[0] == '+' || item[0] == '-' || item[0] == '~'))
+                item = LowerTrimmed(item.substr(1));
+            if (item == "new rpg" || item == "follow" || item == "stay")
+                return "`" + item + "` on a family leader is set by the intent book's own "
+                       "executors, not toggled from outside";
+            if (comma == std::string::npos)
+                break;
+            start = comma + 1;
+        }
+    }
+    return std::string();
+}
+
+// ---------------------------------------------------------------------------
+// Errand progress over a window. See the header.
+// ---------------------------------------------------------------------------
+
+ErrandProgress ReadErrandProgress(ErrandProgressWindow& window,
+                                  ErrandProgressReading const& reading, std::time_t now,
+                                  ErrandProgressLimits const& limits)
+{
+    auto restart = [&]() {
+        window.open = true;
+        window.since = now;
+        window.distance = reading.distance;
+        window.x = reading.x;
+        window.y = reading.y;
+        window.route = reading.route;
+    };
+    if (!window.open)
+    {
+        restart();
+        return ErrandProgress::Settling;
+    }
+    if (now - window.since < limits.windowSeconds)
+        return ErrandProgress::Settling;
+
+    float const dx = reading.x - window.x;
+    float const dy = reading.y - window.y;
+    bool const closed = window.distance - reading.distance >= limits.minGainYards;
+    bool const alongRoute = RouteMarkAdvanced(window.route, reading.route);
+    bool const moved = dx * dx + dy * dy >= limits.minMovedYards * limits.minMovedYards;
+    bool const progressed = closed || alongRoute || moved;
+    restart();
+    return progressed ? ErrandProgress::Progressing : ErrandProgress::NoProgress;
+}
+
+bool WalkNeedsRetarget(float runningX, float runningY, float newX, float newY, float fromX,
+                       float fromY, WalkRetargetLimits const& limits)
+{
+    float const mx = newX - runningX;
+    float const my = newY - runningY;
+    if (mx * mx + my * my > limits.retargetYards * limits.retargetYards)
+        return true;
+    float const rx = runningX - fromX;
+    float const ry = runningY - fromY;
+    return rx * rx + ry * ry < limits.closeEnoughYards * limits.closeEnoughYards;
 }
 
 }  // namespace OverseerDecisions
