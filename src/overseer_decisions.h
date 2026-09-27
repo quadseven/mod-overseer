@@ -3047,6 +3047,9 @@ struct RunFailureFacts
     // group of five for its campaign's dungeon now.
     bool dungeonFinderReady{false};
     std::string dungeonFinderNote;
+    // Overseer.DungeonFinder.Default: the finder is how this realm's families
+    // go in, so its rung is open from the first failure (see RunRecoveryFinderOpen).
+    bool finderIsDefault{false};
     // A member is held where it stands because the walk to its family kept
     // killing it or crosses ground well above its level (#697). A regroup
     // wait cannot bring it in, and a hearth regroup can.
@@ -17654,6 +17657,20 @@ bool SummonRowFinished(std::string const& status);
 // Default of Overseer.Recovery.DungeonFinder: off. The dev realm turns it on
 // in its own conf.
 constexpr bool RUN_RECOVERY_FINDER_DEFAULT = false;
+
+// THE DUNGEON FINDER AS THE WAY IN (infra#4762, 2026-09-27). The operator chose
+// the finder as the ordinary way a family enters its dungeon: queue, accept, and
+// the core teleports the group in. Off unless a realm's conf turns on
+// Overseer.DungeonFinder.Default; the walk, the crossing and the staging all stay
+// as they were for a realm that does not.
+constexpr bool RUN_FINDER_IS_DEFAULT = false;
+
+// Does THIS attempt go in by the finder rather than walk? Only when the switch is
+// on, the family can queue now, and this run number has not already tried the
+// finder. The last half is what bounds it: a finder attempt that fails is followed
+// by the ordinary walk for the same run, not by the finder again.
+bool FinderIsTheWayIn(bool finderIsDefault, bool familyCanQueue, std::uint32_t runNumber,
+                      std::uint32_t finderTriedForRun);
 
 // The dungeon finder's role bits (lfg::LfgRoles).
 constexpr std::uint8_t FINDER_ROLE_LEADER = 0x01;

@@ -359,6 +359,22 @@
 #
 #Overseer.Recovery.DungeonFinder = 0
 
+#    Overseer.DungeonFinder.Default
+#        Description: The dungeon finder as the WAY IN, not only the last
+#                     recovery rung (infra#4762). With it on, a family whose
+#                     group can queue skips the walk, the home bind and any
+#                     continent crossing: once RESET has reset the instance,
+#                     the run queues the family for its campaign's own dungeon
+#                     and the core teleports the group in. A finder attempt
+#                     that does not take the family in is followed by the
+#                     ordinary walk for that same run, and the recovery ladder
+#                     offers the finder from the first failure (no summon rung
+#                     to wait for). Needs Overseer.Recovery.DungeonFinder = 1.
+#
+#        Default:     0
+#
+#Overseer.DungeonFinder.Default = 0
+
 ########################################
 #
 #    ONE MOVEMENT OWNER PER FAMILY LEADER

@@ -29435,6 +29435,9 @@ private:
         bool finderJoined{false};
         std::time_t finderSince{0};
         uint32 finderDungeonId{0};
+        // The run number whose attempt already went to the finder as the way in
+        // (OverseerDecisions::FinderIsTheWayIn), so a failed one walks next.
+        uint32 finderDefaultRun{0};
         std::map<std::string, uint32> finderAccepted;
         std::string finderSaid;
         // MAKING ROOM INSIDE (see MakeRoomInside): who has had the loot rule
@@ -33295,6 +33298,7 @@ private:
         OverseerDecisions::FinderReadiness const finder = OverseerDecisions::ReadFinderReadiness(
             ReadFinderFacts(leaderName, members, portal), false);
         facts.dungeonFinderReady = finder.ready;
+        facts.finderIsDefault = FinderIsDefault();
         facts.dungeonFinderNote = finder.ready ? "the dungeon finder can queue the family"
                                                : "no dungeon finder (" + finder.whyNot + ")";
         return facts;
@@ -33317,6 +33321,27 @@ private:
     {
         return sConfigMgr->GetOption<bool>("Overseer.Recovery.DungeonFinder",
                                            OverseerDecisions::RUN_RECOVERY_FINDER_DEFAULT);
+    }
+
+    // Overseer.DungeonFinder.Default: the finder is how a family goes in, and
+    // walking to the door is what follows a finder attempt that failed
+    // (infra#4762). Needs Overseer.Recovery.DungeonFinder too, which is the
+    // switch every finder queue this module makes is read against.
+    static bool FinderIsDefault()
+    {
+        return RecoveryFinderEnabled() &&
+               sConfigMgr->GetOption<bool>("Overseer.DungeonFinder.Default",
+                                           OverseerDecisions::RUN_FINDER_IS_DEFAULT);
+    }
+
+    bool FamilyCanQueue(std::string const& leaderName, std::vector<std::string> const& members,
+                        DungeonPortal const& portal, std::string* whyNot = nullptr)
+    {
+        OverseerDecisions::FinderReadiness const ready = OverseerDecisions::ReadFinderReadiness(
+            ReadFinderFacts(leaderName, members, portal), false);
+        if (whyNot)
+            *whyNot = ready.whyNot;
+        return ready.ready;
     }
 
     // THE MEETING STONE THAT SERVES A DOOR: the nearest GAMEOBJECT_TYPE_
@@ -33698,6 +33723,7 @@ private:
         next.capKnown = coord.capKnown;
         next.resetSince = std::time(nullptr);
         next.recoveryStreak = coord.recoveryStreak;
+        next.finderDefaultRun = coord.finderDefaultRun;
         coord = next;
     }
 
@@ -35057,6 +35083,44 @@ private:
     // ENTER had brought it through the door. The identity of the attempt is
     // carried the way RearmAfterRecovery carries it; everything a phase before
     // STAGED_INSIDE would have set up is not needed from here.
+    // THE RUN GOES IN BY THE FINDER (infra#4762). The finder rung's own poll
+    // (DriveFinderRung, under RECOVERING) queues, accepts and stages the run
+    // inside; this only hands the reset run to it, without a failure, a streak,
+    // or a recovery row, because nothing failed. A finder attempt that gives up
+    // ends in RearmAfterRecovery like the rung always has, and this run number
+    // then walks.
+    void EnterFinderAsTheWayIn(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                               DungeonPortal const& portal)
+    {
+        std::time_t const now = std::time(nullptr);
+        _travelAims.Release(leaderName, "the dungeon finder is this run's way in");
+        coord.finderDefaultRun = coord.runNumber;
+        coord.phase = DungeonRunPhase::Recovering;
+        coord.recoverySince = now;
+        coord.recoveryWaitSeconds = 0;
+        coord.recoveryChosen = true;
+        coord.recovery = OverseerDecisions::RunRecovery::DungeonFinder;
+        coord.recoveryBy = "the realm's way in";
+        coord.recoveryActSince = now;
+        coord.recoveryBest = -1.f;
+        coord.recoveryBestAt = now;
+        coord.recoveryTownReached = false;
+        coord.finderJoined = false;
+        coord.finderSince = 0;
+        coord.finderDungeonId = 0;
+        coord.finderAccepted.clear();
+        coord.finderSaid.clear();
+        coord.recoveryNote = "run " + std::to_string(coord.runNumber) +
+                             ": in by the dungeon finder";
+        LOG_WARN("module.overseer",
+                 "overseer: dungeon run {} of campaign {} - map {} is reset and the family of "
+                 "'{}' goes in by the DUNGEON FINDER for '{}', the way in this realm uses "
+                 "(Overseer.DungeonFinder.Default). If the queue does not take it in, this "
+                 "run walks to the door instead",
+                 coord.runNumber, coord.campaignId, portal.insideMapId, leaderName,
+                 portal.keyword);
+    }
+
     void StageInsideAfterFinder(DungeonRunCoordinatorState& coord)
     {
         DungeonRunCoordinatorState next;
@@ -40047,8 +40111,12 @@ private:
             // (its backstop, or the death breaker), or the member is somewhere
             // nothing can walk it from. A hold that could only be ended by a
             // timer of its own is the thing this deliberately is not.
+            // THE FINDER AS THE WAY IN (infra#4762) TAKES A FAMILY FROM WHEREVER IT
+            // STANDS, so neither the home bind nor the continent crossing below
+            // is waited on for it. Asked once here, for both.
+            bool const finderWay = FinderIsDefault() && FamilyCanQueue(leaderName, members, *portal);
             std::vector<std::string> const owedAHome = MembersOwedAHome(members, *portal);
-            if (!owedAHome.empty())
+            if (!finderWay && !owedAHome.empty())
             {
                 // SAID ONCE PER HOLD, on the idle coordinator's own flag, the
                 // same discipline `loggedHold` and `loggedCampaignOver` keep: a
@@ -40130,7 +40198,9 @@ private:
             uint32 const crossingOrigin =
                 offOutsideMap ? leader->GetMapId() : coord.crossingOriginMap;
 
-            if (offOutsideMap ||
+            // A family going in by the finder crosses nothing; one already
+            // aboard is still landed first, because the queue waits for it.
+            if ((!finderWay && offOutsideMap) ||
                 (coord.crossingPassengers && crossingOrigin != portal->outsideMapId))
             {
                 // THE GOAL ON THE FAR SIDE IS THE DOOR, by the portal's own
@@ -40266,6 +40336,7 @@ private:
             // The state is a scratch one: IDLE is deciding whether to open a
             // run, not walking a leg, and marking the run's own corridor passed
             // before the run exists is exactly the drift #220 is about.
+            if (!finderWay)
             {
                 OverseerDecisions::ApproachRouteState scratch;
                 DungeonApproachAim const first = DungeonApproachAimFor(
@@ -40859,6 +40930,17 @@ private:
                 // and a count carried over would tell the operator that the run
                 // now starting had already been interrupted before it began.
                 coord.stagingRearms = 0;
+
+                // THE FINDER AS THE WAY IN (infra#4762): the instance is reset,
+                // and this run goes in by the queue rather than the walk. Once
+                // per run number, so a finder attempt that fails walks next.
+                if (OverseerDecisions::FinderIsTheWayIn(
+                        FinderIsDefault(), FamilyCanQueue(leaderName, members, *portal),
+                        coord.runNumber, coord.finderDefaultRun))
+                {
+                    EnterFinderAsTheWayIn(coord, leaderName, *portal);
+                    return;
+                }
 
                 DungeonApproachAim const first = DungeonApproachAimFor(
                     *portal, coord.approach[leaderName], leader, coord.stageX,

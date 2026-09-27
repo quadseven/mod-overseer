@@ -15128,13 +15128,28 @@ bool RunRecoverySummonOpen(RunFailureFacts const& facts)
 
 bool RunRecoveryFinderOpen(RunFailureFacts const& facts)
 {
-    if (!facts.dungeonFinderReady || facts.summonAfter == 0 ||
-        facts.streak < facts.summonAfter)
+    if (!facts.dungeonFinderReady)
+        return false;
+    // THE REALM'S WAY IN (infra#4762): open from the first failure, with no
+    // summon rung to wait for.
+    if (facts.finderIsDefault)
+        return true;
+    if (facts.summonAfter == 0 || facts.streak < facts.summonAfter)
         return false;
     // ONLY AFTER THE SUMMON RUNG FAILED: it was applied after an earlier
     // failure of this streak, and this failure followed it. A door with no
-    // stone has no summon rung to wait for.
-    return SummonsTriedThisStreak(facts) > 0 || !facts.summonReady;
+    // stone has no summon rung to wait for, AND NEITHER DOES A FAMILY WITH NO
+    // SUMMONER (2026-09-27): the summon rung is only chosen with one ready, so
+    // without one it never runs and this rung waited for it for good. Measured
+    // on wow-dev, the Horde family (levels 13 to 17, no warlock) was on its
+    // ninth failure in a row with the stone 25 yards from the door.
+    return SummonsTriedThisStreak(facts) > 0 || !facts.summonReady || !facts.summonerReady;
+}
+
+bool FinderIsTheWayIn(bool finderIsDefault, bool familyCanQueue, std::uint32_t runNumber,
+                      std::uint32_t finderTriedForRun)
+{
+    return finderIsDefault && familyCanQueue && runNumber != finderTriedForRun;
 }
 
 SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
