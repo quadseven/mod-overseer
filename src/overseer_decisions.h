@@ -16008,9 +16008,11 @@ constexpr char const* NoMailboxOnMap   = "no mailbox on this map";
 constexpr char const* MailboxTooFar    = "nearest mailbox is beyond the cap";
 constexpr char const* OtherSidesGround = "the way to the nearest mailbox crosses the other side's ground";
 constexpr char const* GroundRefused    = "the ground toward the mailbox does not hold";
-// The classic ruleset (Classic::IsExpansionContinent): no walk starts on
-// Outland or Northrend. Worth asking again: a random bot there is moved back to
-// the classic continents by its next random teleport.
+// The classic ruleset (Classic::IsOutsideClassic): no walk starts on Outland
+// or Northrend. The Blood Elf and Draenei starting lands are not refused (#765).
+// Worth asking again: the gate reads where the character stands when the row is
+// served, and a character leaves on its own feet, its hearthstone or a boat.
+// A random teleport is not counted on: a natural guild member never gets one.
 constexpr char const* ExpansionContinent = "character stands in Outland or Northrend, outside the classic world";
 
 // Endings of a walk that started.
@@ -17011,10 +17013,31 @@ constexpr uint32_t PROFESSION_SKILL_CAP = 300;
 constexpr uint32_t OUTLAND_MAP_ID = 530;
 constexpr uint32_t NORTHREND_MAP_ID = 571;
 
-// Outland or Northrend. A walk or a travel aim that would start or end on one
-// of these is refused. The Blood Elf and Draenei starting lands are physically
-// on map 530 and count as Outland here on purpose: the ruleset names the map.
+// THE BLOOD ELF AND DRAENEI STARTING LANDS (#765). They stand on map 530,
+// but they are where those two races level from 1 to about 20, as a player
+// who rolls one does before taking the boat or the orb to the old world.
+// Reading the whole map as Outland left 42 guild members on the starting isles
+// at level 8, refused every errand. The zones, with their two capitals, where
+// those races' trainers are.
+constexpr uint32_t EVERSONG_WOODS_ZONE_ID = 3430;
+constexpr uint32_t GHOSTLANDS_ZONE_ID = 3433;
+constexpr uint32_t SILVERMOON_CITY_ZONE_ID = 3487;
+constexpr uint32_t AZUREMYST_ISLE_ZONE_ID = 3524;
+constexpr uint32_t BLOODMYST_ISLE_ZONE_ID = 3525;
+constexpr uint32_t THE_EXODAR_ZONE_ID = 3557;
+
+// Outland or Northrend, by the map alone. True for the starting lands too, so a
+// question that has a zone asks IsOutsideClassic instead.
 bool IsExpansionContinent(uint32_t mapId);
+
+// One of the six zones above, on map 530. The Isle of Quel'Danas is not one:
+// it is level-70 content.
+bool IsStartingLand(uint32_t mapId, uint32_t zoneId);
+
+// The question a walk or a travel aim asks of where a character stands, and of
+// where it would be sent: Outland or Northrend, except the starting lands. A
+// walk that would start or end outside is refused.
+bool IsOutsideClassic(uint32_t mapId, uint32_t zoneId);
 
 // May a trainer sell a profession rank whose ceiling is `rankMaxSkill` (the
 // core's SpellLearnSkillNode::maxvalue, step x 75)? Apprentice through Artisan

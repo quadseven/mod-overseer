@@ -12871,21 +12871,51 @@ private:
             trainer->GetTrainerRequirement(), bot->getClass());
     }
 
+    // Is the ground at (x, y, z) on `bot`'s own map outside the classic world?
+    // Asked of a destination, whose zone is read off the map's own area data.
+    static bool GroundOutsideClassic(Player* bot, float x, float y, float z)
+    {
+        namespace C = OverseerDecisions::Classic;
+        uint32 const mapId = bot->GetMapId();
+        if (!C::IsExpansionContinent(mapId))
+            return false;
+        Map* map = bot->GetMap();
+        uint32 const zoneId = map ? map->GetZoneId(bot->GetPhaseMask(), x, y, z) : 0;
+        return C::IsOutsideClassic(mapId, zoneId);
+    }
+
     bool ResolveTravelTarget(Player* bot, std::string const& target,
                              uint32& outEntry, WorldPosition& outPos,
                              uint32 wantSkill = 0, std::string* outSaid = nullptr)
     {
-        // THE CLASSIC RULESET. Every branch below resolves on the character's
-        // own map, so one question here covers them all: a character standing
-        // in Outland or Northrend is aimed nowhere, and an `at:` aim naming
-        // 530 or 571 can only match a character already there. The caller's
-        // release path logs `said` and lets the errand go.
-        if (bot && OverseerDecisions::Classic::IsExpansionContinent(bot->GetMapId()))
+        // THE CLASSIC RULESET. Every branch of the resolve resolves on the
+        // character's own map, so two questions here cover them all: a
+        // character standing in Outland or Northrend is aimed nowhere, and one
+        // standing in the Blood Elf or Draenei starting lands (map 530 too,
+        // #765) is aimed only at ground inside them. The caller's release path
+        // logs `said` and lets the errand go.
+        if (bot && OverseerDecisions::Classic::IsOutsideClassic(bot->GetMapId(), bot->GetZoneId()))
         {
             if (outSaid)
                 *outSaid = "stands in Outland or Northrend, outside the classic world";
             return false;
         }
+        if (!ResolveTravelTargetOnMap(bot, target, outEntry, outPos, wantSkill, outSaid))
+            return false;
+        if (bot && GroundOutsideClassic(bot, outPos.GetPositionX(), outPos.GetPositionY(),
+                                        outPos.GetPositionZ()))
+        {
+            if (outSaid)
+                *outSaid = "would be sent out of the starting lands into Outland";
+            return false;
+        }
+        return true;
+    }
+
+    bool ResolveTravelTargetOnMap(Player* bot, std::string const& target,
+                                  uint32& outEntry, WorldPosition& outPos,
+                                  uint32 wantSkill, std::string* outSaid)
+    {
 
         // A PLACE, NOT A CREATURE: `at:<map>:<x>,<y>,<z>`. Answered before the
         // NPC index is even built, because no spawn is involved - the aim names
@@ -23339,8 +23369,10 @@ private:
             std::string said;
             // A pin on Outland or Northrend is not reused: the resolve below
             // refuses it under the classic ruleset and the errand is released.
+            // A pin inside the Blood Elf or Draenei starting lands is (#765).
             if (state.pinned && state.mapId == bot->GetMapId()
-                && !OverseerDecisions::Classic::IsExpansionContinent(state.mapId))
+                && !OverseerDecisions::Classic::IsOutsideClassic(state.mapId, bot->GetZoneId())
+                && !GroundOutsideClassic(bot, state.x, state.y, state.z))
             {
                 entry = state.entry;
                 pos = WorldPosition(state.mapId, state.x, state.y, state.z);
@@ -59715,8 +59747,10 @@ private:
         // THE CLASSIC RULESET. A walk is always on the walker's own map, so a
         // guild member standing in Outland or Northrend would be walked to an
         // Outland or Northrend mailbox, trainer or vendor. It is refused before
-        // anything is held, and the row says why.
-        if (D::Classic::IsExpansionContinent(ev.mapId))
+        // anything is held, and the row says why. A member in the Blood Elf or
+        // Draenei starting lands walks (#765); the destinations below are then
+        // kept to those lands.
+        if (D::Classic::IsOutsideClassic(ev.mapId, who->GetZoneId()))
             return refuse(R::ExpansionContinent);
 
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(who);
@@ -59836,6 +59870,19 @@ private:
                 spawns.push_back(Spawn{uint32(data->spawnId), data->id, data->posX, data->posY,
                                        data->posZ});
         }
+        // THE STARTING LANDS ARE AN ISLAND OF THE CLASSIC WORLD ON AN OUTLAND
+        // MAP (#765). A walker there is walked only to a mailbox, trainer,
+        // vendor or spawn inside them; one in Hellfire Peninsula is not a
+        // destination for a character on Azuremyst Isle. With none left, the
+        // chooser below says there is no such destination, which is true.
+        if (D::Classic::IsExpansionContinent(ev.mapId))
+            spawns.erase(std::remove_if(spawns.begin(), spawns.end(),
+                                        [who](Spawn const& spawn)
+                                        {
+                                            return GroundOutsideClassic(who, spawn.x, spawn.y,
+                                                                        spawn.z);
+                                        }),
+                         spawns.end());
         ev.mailboxesOnMap = static_cast<uint32>(spawns.size());
 
         std::vector<D::MailboxCandidate> candidates;
