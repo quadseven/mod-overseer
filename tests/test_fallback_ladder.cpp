@@ -190,6 +190,42 @@ void ADoorWithNoStoneGoesStraightToTheFinder()
     Check("but never before the streak", RunRecoveryFinderOpen(f), false);
 }
 
+// A FAMILY WITH NO SUMMONER HAS NO SUMMON RUNG TO WAIT FOR (2026-09-27). The
+// Horde campaign 20: nine failures in a row, the stone 25 yards from the door,
+// and no warlock in a family of levels 13 to 17.
+void AFamilyWithNoSummonerGoesStraightToTheFinder()
+{
+    RunFailureFacts f = AllianceFourthFailure();
+    f.summonerReady = false;
+    f.dungeonFinderReady = true;
+    f.streak = 9;
+    Check("no summoner: the finder opens", RunRecoveryFinderOpen(f));
+    CheckWord("and is chosen", RunRecoveryHeuristic(f), RunRecovery::DungeonFinder);
+    f.streak = 2;
+    Check("still not before the streak", RunRecoveryFinderOpen(f), false);
+}
+
+// THE FINDER AS THE REALM'S WAY IN (infra#4762): open from the first failure,
+// never when the family cannot queue, and one finder attempt per run number.
+void TheFinderAsTheWayIn()
+{
+    RunFailureFacts f = AllianceFourthFailure();
+    f.streak = 1;
+    f.finderIsDefault = true;
+    f.dungeonFinderReady = true;
+    Check("default: open at the first failure", RunRecoveryFinderOpen(f));
+    CheckWord("and chosen first", RunRecoveryHeuristic(f), RunRecovery::DungeonFinder);
+    f.dungeonFinderReady = false;
+    Check("default but unable to queue: shut", RunRecoveryFinderOpen(f), false);
+
+    Check("the switch off never goes in by the finder", FinderIsTheWayIn(false, true, 3, 0), false);
+    Check("on and able: this run goes in by it", FinderIsTheWayIn(true, true, 3, 0));
+    Check("unable to queue: it walks", FinderIsTheWayIn(true, false, 3, 0), false);
+    Check("tried for this run already: it walks", FinderIsTheWayIn(true, true, 3, 3), false);
+    Check("the next run tries it again", FinderIsTheWayIn(true, true, 4, 3));
+    Check("the realm default leaves it off", RUN_FINDER_IS_DEFAULT == false);
+}
+
 void TheWordsRoundTrip()
 {
     RunRecovery back{};
@@ -559,6 +595,8 @@ int main()
     TheFinderComesOnlyAfterTheSummon();
     ASummonFromAnEarlierStreakDoesNotCount();
     ADoorWithNoStoneGoesStraightToTheFinder();
+    AFamilyWithNoSummonerGoesStraightToTheFinder();
+    TheFinderAsTheWayIn();
     TheWordsRoundTrip();
     TheRungWalksWaitsAndSummons();
     TheRowIsFoundAgainByItsSource();
