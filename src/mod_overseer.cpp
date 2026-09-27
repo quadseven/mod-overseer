@@ -3978,6 +3978,61 @@ std::vector<CouncilRollWon> g_councilWon;
 // sixty seconds a roll is open, so its winner can still be matched to it.
 constexpr time_t COUNCIL_ROLL_FORGET_SECONDS = 90;
 
+// WHAT A GUILD FINDER RUN'S MEMBERS LOOTED (the guild coordinator's runs; see
+// DoGuildFinderRun). The loot hooks run on map threads and the run is read on
+// the world thread, so the tally is behind its own lock. Only characters in a
+// run are counted: every other loot on the realm leaves on the atomic test
+// without taking the lock. Keyed by raw guid, bounded by the runs in flight.
+struct GuildRunLootTally
+{
+    uint32 items{0};
+    std::vector<uint32> notable;  // item entries of notable quality, at most 16
+};
+std::mutex g_guildRunLootMutex;
+std::atomic<bool> g_guildRunLootAny{false};
+std::map<uint64, GuildRunLootTally> g_guildRunLoot;
+
+void NoteGuildRunLoot(Player const* looter, uint32 count, uint32 notableEntry)
+{
+    if (!looter || !g_guildRunLootAny.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard<std::mutex> guard(g_guildRunLootMutex);
+    auto const it = g_guildRunLoot.find(looter->GetGUID().GetRawValue());
+    if (it == g_guildRunLoot.end())
+        return;
+    it->second.items += count ? count : 1;
+    if (notableEntry && it->second.notable.size() < 16)
+        it->second.notable.push_back(notableEntry);
+}
+
+// Start counting for these characters, or stop and hand back what they took.
+void TrackGuildRunLoot(std::vector<uint64> const& guids)
+{
+    std::lock_guard<std::mutex> guard(g_guildRunLootMutex);
+    for (uint64 guid : guids)
+        g_guildRunLoot[guid] = GuildRunLootTally();
+    g_guildRunLootAny.store(!g_guildRunLoot.empty(), std::memory_order_relaxed);
+}
+
+GuildRunLootTally TakeGuildRunLoot(std::vector<uint64> const& guids)
+{
+    GuildRunLootTally total;
+    std::lock_guard<std::mutex> guard(g_guildRunLootMutex);
+    for (uint64 guid : guids)
+    {
+        auto const it = g_guildRunLoot.find(guid);
+        if (it == g_guildRunLoot.end())
+            continue;
+        total.items += it->second.items;
+        for (uint32 entry : it->second.notable)
+            if (total.notable.size() < 16)
+                total.notable.push_back(entry);
+        g_guildRunLoot.erase(it);
+    }
+    g_guildRunLootAny.store(!g_guildRunLoot.empty(), std::memory_order_relaxed);
+    return total;
+}
+
 // THE STEER (patches/mod-playerbots/0015). Asked by LootRollAction before its
 // own rule, on a map thread, for every open roll this bot has not voted on.
 // Only a roster character in a party (not a raid, which runs master loot)
@@ -6492,6 +6547,9 @@ public:
                           ObjectGuid lootGuid) override
     {
         Item* live = TakeLootedItem(player, item, count);
+        // A guild finder run's tally counts every loot, notable or not; only
+        // the entry of a notable one is read, off the item found alive.
+        NoteGuildRunLoot(player, count, live ? live->GetEntry() : 0);
         if (!live)
             return;
         RecordItemLoot(player, live, OverseerDecisions::ItemVia::Loot,
@@ -6515,6 +6573,7 @@ public:
         // pointer is trusted: only the name and the roll's own guid are read
         // here, plus the item's guid when the store hook found it alive.
         Item* live = TakeLootedItem(player, item, count);
+        NoteGuildRunLoot(player, count, live ? live->GetEntry() : 0);
         if (player && roll)
         {
             std::lock_guard<std::mutex> guard(g_councilMutex);
@@ -35167,6 +35226,724 @@ private:
         return true;
     }
 
+    // ================================== a guild group by the dungeon finder ==
+    //
+    // THE GUILD'S OWN FIVE-MAN (OverseerDecisions::ParseGuildFinderRequest).
+    // wow-overseer's guild coordinator chooses five online members of one bot
+    // guild, a tank, a healer and three damage dealers, and a dungeon for them,
+    // and hands the pick here as one `guild` row on the tank. This forms the
+    // party the way an accepted invite does (Group::Create, Group::AddMember,
+    // the calls CMSG_GROUP_ACCEPT ends in), queues it through the finder with
+    // each member's seat as its role, accepts the proposal through the core's
+    // own handler, and reads the run back until it is over. The row stays
+    // `verifying` for the whole run and is ended with the outcome in `result`.
+    //
+    // WHY THE TANK IS MADE ITS OWN MASTER. A guild member is a random bot, and
+    // a random bot in a group whose leader is another bot has no master
+    // (PlayerbotAI::FindNewMaster takes a person or a selfbot only), so the
+    // other four would not follow anybody, and mod-dungeon-clear refuses a
+    // `dc on` from a true bot (IsAuthorized: the issuer must be a person or a
+    // selfbot in the group). A bot whose master is itself is a selfbot
+    // (IsSelfBot: master == bot), exactly as each family's leader is. So the
+    // tank leads, the other four take it as master on their next tick
+    // (UpdateAIGroupMaster), and the tank may issue `dc on`. When the group is
+    // disbanded, UpdateAIGroupMaster clears the random bot's master on its own
+    // (no group + master + IsRandomBot), and it goes back to its own life.
+    //
+    // NOTHING HERE MOVES ANYBODY. The finder's teleport takes the group in; the
+    // finder's own "teleport out" (CMSG_LFG_TELEPORT, the button a player
+    // presses) brings the living out; mod-dungeon-clear walks the dungeon.
+
+    // Overseer.GuildFinder.Enable: may a `finder-run` row queue a guild group.
+    static bool GuildFinderEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.GuildFinder.Enable", false);
+    }
+
+    // Overseer.GuildFinder.MaxGroups: guild groups in flight at once. Each is
+    // one more active map on a world whose map-update thread pool is sized for
+    // its two continents, so the default is small.
+    static uint32 GuildFinderMaxGroups()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.GuildFinder.MaxGroups", 2);
+    }
+
+    enum class GuildRunPhase
+    {
+        Queue,    // joined; the finder has not taken the group in yet
+        Inside,   // the group is in its dungeon
+        Leaving,  // over; the living are being taken out before the disband
+    };
+
+    struct GuildRun
+    {
+        uint32 id{0};
+        std::string tank;
+        // The tank first, then the healer, then the three damage dealers.
+        std::vector<std::string> names;
+        std::vector<OverseerDecisions::GuildSeat> seats;
+        std::vector<uint64> guids;
+        std::string keyword;
+        uint32 dungeonId{0};
+        uint32 mapId{0};
+        uint32 instanceId{0};
+        uint64 groupGuid{0};
+        GuildRunPhase phase{GuildRunPhase::Queue};
+        std::time_t queuedAt{0};
+        std::time_t enteredAt{0};
+        std::time_t emptySince{0};
+        std::time_t leavingSince{0};
+        std::time_t heartbeatAt{0};
+        std::map<std::string, uint32> accepted;
+        std::map<std::string, bool> alive;
+        std::map<std::string, uint32> deathsOf;
+        std::map<std::string, uint8> levelAt;
+        uint32 deaths{0};
+        uint32 ilvlAtEntry{0};
+        uint32 bossesDone{0};
+        uint32 bossesTotal{0};
+        bool dcAccepted{false};
+        std::time_t dcTriedAt{0};
+        std::string outcome;
+        std::string why;
+        std::string said;
+    };
+    std::vector<GuildRun> _guildRuns;
+
+    // Groups a restarted worldserver left behind: the finder group persists in
+    // the database, its dungeon-clear flag and this module's memory do not.
+    struct GuildRunStray
+    {
+        std::string tank;
+        std::vector<std::string> names;
+        std::time_t until{0};
+        bool teleported{false};
+    };
+    std::vector<GuildRunStray> _guildRunStrays;
+    bool _guildRunStraysRead{false};
+
+    static uint32 EquippedItemLevel(Player* p)
+    {
+        uint32 sum = 0;
+        if (!p)
+            return 0;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            if (Item* item = p->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (ItemTemplate const* proto = item->GetTemplate())
+                    sum += proto->ItemLevel;
+        return sum;
+    }
+
+    static char const* GuildSeatWord(OverseerDecisions::GuildSeat seat)
+    {
+        switch (seat)
+        {
+            case OverseerDecisions::GuildSeat::Tank:   return "tank";
+            case OverseerDecisions::GuildSeat::Healer: return "healer";
+            case OverseerDecisions::GuildSeat::Damage: return "dps";
+        }
+        return "dps";
+    }
+
+    // The row's `result`, from what the run has seen so far.
+    std::string GuildRunJson(GuildRun const& run, char const* phase,
+                             GuildRunLootTally const* loot, uint32 ilvlNow,
+                             std::time_t now) const
+    {
+        std::ostringstream o;
+        o << "{\"phase\":" << J(phase) << ",\"outcome\":" << J(run.outcome)
+          << ",\"why\":" << J(run.why) << ",\"keyword\":" << J(run.keyword)
+          << ",\"dungeon_id\":" << run.dungeonId << ",\"map\":" << run.mapId
+          << ",\"seconds_queued\":"
+          << (run.enteredAt ? run.enteredAt - run.queuedAt : now - run.queuedAt)
+          << ",\"seconds_inside\":" << (run.enteredAt ? now - run.enteredAt : 0)
+          << ",\"deaths\":" << run.deaths << ",\"bosses_done\":" << run.bossesDone
+          << ",\"bosses_total\":" << run.bossesTotal
+          << ",\"dc_on\":" << (run.dcAccepted ? "true" : "false")
+          << ",\"ilvl_start\":" << run.ilvlAtEntry << ",\"ilvl_end\":" << ilvlNow;
+        if (loot)
+        {
+            o << ",\"loot_items\":" << loot->items << ",\"loot_notable\":[";
+            for (std::size_t i = 0; i < loot->notable.size(); ++i)
+                o << (i ? "," : "") << loot->notable[i];
+            o << ']';
+        }
+        o << ",\"members\":[";
+        for (std::size_t i = 0; i < run.names.size(); ++i)
+        {
+            std::string const& name = run.names[i];
+            Player* const p = ObjectAccessor::FindPlayerByName(name, false);
+            auto const lv = run.levelAt.find(name);
+            auto const dd = run.deathsOf.find(name);
+            o << (i ? "," : "") << "{\"name\":" << J(name)
+              << ",\"seat\":" << J(GuildSeatWord(run.seats[i]))
+              << ",\"level_start\":" << (lv == run.levelAt.end() ? 0 : unsigned(lv->second))
+              << ",\"level_end\":" << (p ? unsigned(p->GetLevel()) : 0)
+              << ",\"deaths\":" << (dd == run.deathsOf.end() ? 0 : dd->second) << '}';
+        }
+        o << "]}";
+        return o.str();
+    }
+
+    char const* DoGuildFinderRun(Player* tank, std::string const& command,
+                                 char const*& status, std::string& out, uint32 id)
+    {
+        using OverseerDecisions::GuildSeat;
+        std::string const tankName = tank->GetName();
+        auto refuse = [&](std::string const& why) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"phase\":\"refused\",\"outcome\":\"refused\",\"why\":" << J(why)
+              << ",\"request\":" << J(command) << '}';
+            out = o.str();
+            status = "error";
+            LOG_WARN("module.overseer", "overseer: guild finder run {} for '{}' refused - {}",
+                     id, tankName, why);
+            // `detail` must outlive this call; the reason is in `result`.
+            return "refused: see result";
+        };
+
+        if (!GuildFinderEnabled())
+            return refuse("Overseer.GuildFinder.Enable is off");
+        if (!sLFGMgr->isOptionEnabled(lfg::LFG_OPTION_ENABLE_DUNGEON_FINDER))
+            return refuse("the realm's DungeonFinder.OptionsMask does not carry the dungeon finder");
+        OverseerDecisions::GuildFinderRequest const request =
+            OverseerDecisions::ParseGuildFinderRequest(command, tankName);
+        if (request.error != OverseerDecisions::GuildFinderRefusal::None)
+            return refuse(OverseerDecisions::GuildFinderRefusalWord(request.error));
+        if (_guildRuns.size() >= GuildFinderMaxGroups())
+            return refuse("the realm already has " + std::to_string(_guildRuns.size()) +
+                          " guild groups out (Overseer.GuildFinder.MaxGroups)");
+
+        DungeonPortal const* const portal = FindDungeonPortal(request.keyword);
+        if (!portal)
+            return refuse("no dungeon portal answers to '" + request.keyword + "'");
+        std::string dungeonWhy;
+        LFGDungeonEntry const* const dungeon = FinderDungeonForDoor(*portal, dungeonWhy);
+        if (!dungeon)
+            return refuse(dungeonWhy.empty() ? "the door has no dungeon finder entry" : dungeonWhy);
+
+        std::vector<std::string> names{tankName, request.healer};
+        std::vector<GuildSeat> seats{GuildSeat::Tank, GuildSeat::Healer};
+        for (std::string const& name : request.damage)
+        {
+            names.push_back(name);
+            seats.push_back(GuildSeat::Damage);
+        }
+        for (GuildRun const& run : _guildRuns)
+            for (std::string const& name : names)
+                if (std::find(run.names.begin(), run.names.end(), name) != run.names.end())
+                    return refuse("'" + name + "' is already in guild run " +
+                                  std::to_string(run.id));
+
+        uint32 const guildId = tank->GetGuildId();
+        if (!guildId)
+            return refuse("the tank is in no guild");
+        std::vector<Player*> players;
+        for (std::string const& name : names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (!p || !p->IsInWorld() || !p->GetSession())
+                return refuse("'" + name + "' is not in the world");
+            if (OnRoster(name))
+                return refuse("'" + name + "' is a family member, which its own campaign directs");
+            if (!GET_PLAYERBOT_AI(p))
+                return refuse("'" + name + "' is not a bot");
+            if (p->GetGuildId() != guildId)
+                return refuse("'" + name + "' is not in the tank's guild");
+            if (!p->IsAlive())
+                return refuse("'" + name + "' is dead");
+            if (p->IsInCombat())
+                return refuse("'" + name + "' is in combat");
+            if (p->GetMap() && p->GetMap()->Instanceable())
+                return refuse("'" + name + "' is inside an instance or a battleground");
+            if (p->GetGroup())
+                return refuse("'" + name + "' is already in a group");
+            if (sLFGMgr->GetState(p->GetGUID()) != lfg::LFG_STATE_NONE)
+                return refuse("'" + name + "' is already in the dungeon finder");
+            sLFGMgr->InitializeLockedDungeons(p, nullptr);
+            lfg::LfgLockMap const& locks = sLFGMgr->GetLockedDungeons(p->GetGUID());
+            auto const lock = locks.find(dungeon->ID + (dungeon->TypeID << 24));
+            if (lock != locks.end() && lock->second)
+                return refuse("'" + name + "' is locked out of it (" +
+                              OverseerDecisions::FinderLockWord(lock->second) + ")");
+            players.push_back(p);
+        }
+
+        // THE PARTY, AS AN ACCEPTED INVITE MAKES IT (GroupHandler.cpp,
+        // HandleGroupAcceptOpcode: Create the leader's group, then AddMember).
+        Group* group = new Group();
+        if (!group->Create(tank))
+        {
+            delete group;
+            return refuse("the core would not form a party under the tank");
+        }
+        sGroupMgr->AddGroup(group);
+        for (std::size_t i = 1; i < players.size(); ++i)
+            if (!group->AddMember(players[i]))
+            {
+                group->Disband();
+                return refuse("'" + names[i] + "' could not join the party");
+            }
+
+        // THE TANK LEADS AND IS ITS OWN MASTER (see the top of this section).
+        if (PlayerbotAI* tankAI = GET_PLAYERBOT_AI(tank))
+            tankAI->SetMaster(tank);
+
+        ClearFinderBook(names);
+        for (Player* p : players)
+            ReanchorFallForTheFinder(p);
+        lfg::LfgDungeonSet dungeons;
+        dungeons.insert(dungeon->ID);
+        sLFGMgr->JoinLfg(tank, OverseerDecisions::GuildSeatRoleMask(GuildSeat::Tank), dungeons, "");
+        for (std::size_t i = 1; i < players.size(); ++i)
+        {
+            WorldPacket roles(CMSG_LFG_SET_ROLES, 1);
+            roles << uint8(OverseerDecisions::GuildSeatRoleMask(seats[i]));
+            roles.rpos(0);
+            players[i]->GetSession()->HandleLfgSetRolesOpcode(roles);
+        }
+        lfg::LfgState const state = sLFGMgr->GetState(group->GetGUID());
+        if (state == lfg::LFG_STATE_NONE)
+        {
+            FinderBookEntry const told = FinderBookFor(tankName);
+            std::string const why =
+                std::string("the finder did not take the group (") +
+                (told.joinResult ? OverseerDecisions::FinderJoinResultWord(told.joinResult)
+                                 : "the role check failed") +
+                ")";
+            group->Disband();
+            return refuse(why);
+        }
+
+        GuildRun run;
+        run.id = id;
+        run.tank = tankName;
+        run.names = names;
+        run.seats = seats;
+        for (Player* p : players)
+        {
+            run.guids.push_back(p->GetGUID().GetRawValue());
+            run.alive[p->GetName()] = true;
+            run.levelAt[p->GetName()] = p->GetLevel();
+        }
+        run.keyword = request.keyword;
+        run.dungeonId = dungeon->ID;
+        run.mapId = portal->insideMapId;
+        run.groupGuid = group->GetGUID().GetRawValue();
+        run.queuedAt = std::time(nullptr);
+        run.heartbeatAt = run.queuedAt;
+        TrackGuildRunLoot(run.guids);
+        LOG_WARN("module.overseer",
+                 "overseer: GUILD FINDER RUN {} - '{}' leads '{}', '{}', '{}', '{}' into finder "
+                 "dungeon {} ('{}', map {}); after the role check the group is in state {}",
+                 id, tankName, names[1], names[2], names[3], names[4], dungeon->ID,
+                 request.keyword, portal->insideMapId, static_cast<unsigned>(FinderStateOf(state)));
+        out = GuildRunJson(run, "queued", nullptr, 0, run.queuedAt);
+        _guildRuns.push_back(run);
+        status = "verifying";
+        return "queued";
+    }
+
+    // The row, rewritten while it is still this run's, and its clock touched
+    // so neither sweep ends it as abandoned (the bridge's CLAIM_STALE_SECONDS).
+    static void WriteGuildRunRow(uint32 id, char const* status, std::string const& detail,
+                                 std::string const& result)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}', "
+            "updated_at = NOW() WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            status, Esc(detail), EscLong(result), id, g_runToken);
+    }
+
+    // THE RUN IS OVER: the living are taken out by the finder's own teleport,
+    // and the next poll disbands the group (see Leaving in DriveGuildFinderRuns).
+    void EndGuildRun(GuildRun& run, std::string const& outcome, std::string const& why,
+                     std::time_t now)
+    {
+        run.outcome = outcome;
+        run.why = why;
+        run.phase = GuildRunPhase::Leaving;
+        run.leavingSince = now;
+        Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
+        Group* const group = tank ? tank->GetGroup() : nullptr;
+        // Still queued (a group that was never taken in): out of the queue
+        // first, since a disbanded group's queue entry is not the core's to
+        // forget on its own.
+        if (group && group->GetGUID().GetRawValue() == run.groupGuid && LeaveGuildRunQueue(group))
+            LOG_INFO("module.overseer",
+                     "overseer: guild finder run {} leaves the finder's queue", run.id);
+        if (group && group->isLFGGroup())
+        {
+            for (std::string const& name : run.names)
+            {
+                Player* const p = ObjectAccessor::FindPlayerByName(name);
+                if (!p || !p->IsInWorld() || !p->GetSession() || !p->IsAlive() ||
+                    p->IsInCombat() || p->GetMapId() != run.mapId)
+                    continue;
+                WorldPacket leave(CMSG_LFG_TELEPORT, 1);
+                leave << uint8(1);  // true: out
+                leave.rpos(0);
+                p->GetSession()->HandleLfgTeleportOpcode(leave);
+            }
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: GUILD FINDER RUN {} ('{}', '{}') is over - {}: {}. {} death(s), {} "
+                 "of {} bosses, {}s inside",
+                 run.id, run.tank, run.keyword, outcome, why, run.deaths, run.bossesDone,
+                 run.bossesTotal, run.enteredAt ? now - run.enteredAt : 0);
+    }
+
+    static bool LeaveGuildRunQueue(Group* group)
+    {
+        lfg::LfgState const state = sLFGMgr->GetState(group->GetGUID());
+        if (state != lfg::LFG_STATE_ROLECHECK && state != lfg::LFG_STATE_QUEUED &&
+            state != lfg::LFG_STATE_PROPOSAL)
+            return false;
+        sLFGMgr->LeaveLfg(group->GetGUID());
+        return true;
+    }
+
+    // ONE POLL OF EVERY GUILD RUN, from DeliverPendingCommands.
+    void DriveGuildFinderRuns()
+    {
+        std::time_t const now = std::time(nullptr);
+        DriveGuildRunStrays(now);
+        std::vector<GuildRun> still;
+        for (GuildRun& run : _guildRuns)
+        {
+            if (DriveGuildRun(run, now))
+                still.push_back(std::move(run));
+        }
+        _guildRuns.swap(still);
+    }
+
+    // False once the run's row is ended.
+    bool DriveGuildRun(GuildRun& run, std::time_t now)
+    {
+        Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
+        Group* const group = tank ? tank->GetGroup() : nullptr;
+        bool const ourGroup = group && group->GetGUID().GetRawValue() == run.groupGuid;
+
+        if (run.phase == GuildRunPhase::Queue)
+        {
+            OverseerDecisions::FinderPollFacts poll;
+            poll.joined = true;
+            poll.state = FinderStateOf(ourGroup ? sLFGMgr->GetState(group->GetGUID())
+                                                : lfg::LFG_STATE_NONE);
+            poll.familySize = static_cast<unsigned>(run.names.size());
+            uint32 const headInstance = tank && tank->IsInWorld() &&
+                                                tank->GetMapId() == run.mapId
+                                            ? tank->GetInstanceId()
+                                            : 0;
+            for (std::string const& name : run.names)
+            {
+                Player* const p = ObjectAccessor::FindPlayerByName(name);
+                if (!p || !p->IsInWorld() || !p->IsAlive() || p->IsInCombat())
+                    poll.anyoneNotReady = true;
+                if (p && p->IsInWorld() && headInstance && p->GetMapId() == run.mapId &&
+                    p->GetInstanceId() == headInstance)
+                    ++poll.inside;
+                FinderBookEntry const entry = FinderBookFor(name);
+                if (entry.proposalId && entry.proposalAt >= run.queuedAt)
+                    poll.proposalSeen = true;
+                ReanchorFallForTheFinder(p);
+            }
+            poll.waitedSeconds = static_cast<unsigned>(now - run.queuedAt);
+            OverseerDecisions::FinderStep const step = OverseerDecisions::FinderNext(poll);
+            std::string const said = OverseerDecisions::FinderStepWord(step);
+            if (said != run.said)
+                LOG_INFO("module.overseer",
+                         "overseer: guild finder run {} - {} (state {}, {} of {} inside, {}s)",
+                         run.id, said, static_cast<unsigned>(poll.state), poll.inside,
+                         poll.familySize, poll.waitedSeconds);
+            run.said = said;
+            switch (step)
+            {
+                case OverseerDecisions::FinderStep::Inside:
+                    run.phase = GuildRunPhase::Inside;
+                    run.enteredAt = now;
+                    run.instanceId = headInstance;
+                    for (std::string const& name : run.names)
+                        run.ilvlAtEntry +=
+                            EquippedItemLevel(ObjectAccessor::FindPlayerByName(name));
+                    LOG_WARN("module.overseer",
+                             "overseer: GUILD FINDER RUN {} - '{}' and the group are inside map "
+                             "{} ({} of {}), {}s after the queue",
+                             run.id, run.tank, run.mapId, poll.inside, poll.familySize,
+                             poll.waitedSeconds);
+                    WriteGuildRunRow(run.id, "verifying", "inside",
+                                     GuildRunJson(run, "inside", nullptr, run.ilvlAtEntry, now));
+                    run.heartbeatAt = now;
+                    return true;
+                case OverseerDecisions::FinderStep::GiveUp:
+                {
+                    FinderBookEntry const told = FinderBookFor(run.tank);
+                    std::string const why =
+                        poll.waitedSeconds >= poll.ceilingSeconds
+                            ? "nothing took the group in within " +
+                                  std::to_string(poll.ceilingSeconds) + "s"
+                            : std::string("the core let the group go (") +
+                                  (told.joinAt >= run.queuedAt && told.joinResult
+                                       ? OverseerDecisions::FinderJoinResultWord(told.joinResult)
+                                       : "a failed role check or a proposal that did not hold") +
+                                  ")";
+                    EndGuildRun(run, "not entered", why, now);
+                    return true;
+                }
+                case OverseerDecisions::FinderStep::Accept:
+                    for (std::string const& name : run.names)
+                    {
+                        FinderBookEntry const entry = FinderBookFor(name);
+                        if (!entry.proposalId || entry.proposalAt < run.queuedAt ||
+                            run.accepted[name] == entry.proposalId)
+                            continue;
+                        Player* const p = ObjectAccessor::FindPlayerByName(name);
+                        if (!p || !p->GetSession())
+                            continue;
+                        run.accepted[name] = entry.proposalId;
+                        WorldPacket answer(CMSG_LFG_PROPOSAL_RESULT, 4 + 1);
+                        answer << uint32(entry.proposalId);
+                        answer << uint8(1);
+                        answer.rpos(0);
+                        p->GetSession()->HandleLfgProposalResultOpcode(answer);
+                    }
+                    return true;
+                case OverseerDecisions::FinderStep::Teleport:
+                    for (std::string const& name : run.names)
+                    {
+                        Player* const p = ObjectAccessor::FindPlayerByName(name);
+                        if (!p || !p->IsInWorld() || !p->GetSession() || p->IsBeingTeleported())
+                            continue;
+                        if (headInstance && p->GetMapId() == run.mapId &&
+                            p->GetInstanceId() == headInstance)
+                            continue;
+                        WorldPacket in(CMSG_LFG_TELEPORT, 1);
+                        in << uint8(0);  // false: in
+                        in.rpos(0);
+                        p->GetSession()->HandleLfgTeleportOpcode(in);
+                    }
+                    return true;
+                case OverseerDecisions::FinderStep::Join:
+                case OverseerDecisions::FinderStep::Wait:
+                    return true;
+            }
+            return true;
+        }
+
+        if (run.phase == GuildRunPhase::Inside)
+        {
+            OverseerDecisions::GuildRunPoll poll;
+            poll.groupSize = static_cast<unsigned>(run.names.size());
+            Map* instanceMap = nullptr;
+            for (std::string const& name : run.names)
+            {
+                Player* const p = ObjectAccessor::FindPlayerByName(name);
+                if (!p || !p->IsInWorld())
+                    continue;
+                bool const isAlive = p->IsAlive();
+                auto const was = run.alive.find(name);
+                if (was != run.alive.end() && was->second && !isAlive)
+                {
+                    ++run.deaths;
+                    ++run.deathsOf[name];
+                }
+                run.alive[name] = isAlive;
+                if (p->GetMapId() != run.mapId ||
+                    (run.instanceId && p->GetInstanceId() != run.instanceId))
+                    continue;
+                ++poll.inside;
+                if (isAlive)
+                    ++poll.aliveInside;
+                if (!instanceMap)
+                    instanceMap = p->GetMap();
+            }
+            if (InstanceMap* im = instanceMap ? instanceMap->ToInstanceMap() : nullptr)
+                if (InstanceScript* script = im->GetInstanceScript())
+                {
+                    run.bossesTotal = script->GetEncounterCount();
+                    run.bossesDone = 0;
+                    for (uint32 i = 0; i < run.bossesTotal; ++i)
+                        if (script->GetBossState(i) == DONE)
+                            ++run.bossesDone;
+                }
+            poll.bossesDone = run.bossesDone;
+            poll.bossesTotal = run.bossesTotal;
+            poll.finderFinished =
+                ourGroup && sLFGMgr->GetState(group->GetGUID()) == lfg::LFG_STATE_FINISHED_DUNGEON;
+            poll.groupGone = !ourGroup;
+            poll.secondsInside = static_cast<unsigned>(now - run.enteredAt);
+            if (poll.inside)
+                run.emptySince = 0;
+            else if (!run.emptySince)
+                run.emptySince = now;
+            poll.secondsEmpty = run.emptySince ? static_cast<unsigned>(now - run.emptySince) : 0;
+
+            // THE DUNGEON BRAIN, ARMED ONCE PER STAY AND RETRIED A MINUTE
+            // APART. Sent to every member inside, from the tank, as the family's
+            // drive sends it: a non-leader returns true at once and follows the
+            // elected leader; only the leader's answer says the run is enabled.
+            if (!run.dcAccepted && poll.inside && tank && tank->IsInWorld() &&
+                now - run.dcTriedAt >= 60)
+            {
+                run.dcTriedAt = now;
+                bool all = true;
+                for (std::string const& name : run.names)
+                {
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    PlayerbotAI* const ai = p ? GET_PLAYERBOT_AI(p) : nullptr;
+                    if (!ai || p->GetMapId() != run.mapId)
+                        continue;
+                    if (!ai->DoSpecificAction("dc on", Event("dc", "", tank), true))
+                        all = false;
+                }
+                run.dcAccepted = all;
+                LOG_INFO("module.overseer",
+                         "overseer: guild finder run {} - 'dc on' from '{}' {}", run.id,
+                         run.tank, all ? "accepted" : "refused (see playerbots.dungeonclear)");
+            }
+
+            OverseerDecisions::GuildRunVerdict const verdict = OverseerDecisions::GuildRunNext(poll);
+            if (verdict != OverseerDecisions::GuildRunVerdict::Running)
+            {
+                std::string why;
+                switch (verdict)
+                {
+                    case OverseerDecisions::GuildRunVerdict::Cleared:
+                        why = poll.finderFinished ? "the finder says the dungeon is finished"
+                                                  : "every boss is down";
+                        break;
+                    case OverseerDecisions::GuildRunVerdict::Wiped:
+                        why = "everybody inside is dead";
+                        break;
+                    case OverseerDecisions::GuildRunVerdict::Abandoned:
+                        why = poll.groupGone ? "the group is gone"
+                                             : "nobody has been inside for " +
+                                                   std::to_string(poll.secondsEmpty) + "s";
+                        break;
+                    case OverseerDecisions::GuildRunVerdict::TimedOut:
+                        why = "inside for " + std::to_string(poll.secondsInside) + "s";
+                        break;
+                    default:
+                        break;
+                }
+                EndGuildRun(run, OverseerDecisions::GuildRunVerdictWord(verdict), why, now);
+                return true;
+            }
+            if (now - run.heartbeatAt >= 60)
+            {
+                run.heartbeatAt = now;
+                WriteGuildRunRow(run.id, "verifying", "inside",
+                                 GuildRunJson(run, "inside", nullptr, 0, now));
+            }
+            return true;
+        }
+
+        // LEAVING: the living were sent out on the poll that ended the run. The
+        // group is disbanded once nobody alive is still inside, or after half a
+        // minute whatever happens, and the row is ended.
+        bool livingInside = false;
+        for (std::string const& name : run.names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (p && p->IsInWorld() && p->IsAlive() && p->GetMapId() == run.mapId)
+                livingInside = true;
+        }
+        if (livingInside && now - run.leavingSince < 30)
+            return true;
+        uint32 ilvlNow = 0;
+        for (std::string const& name : run.names)
+            ilvlNow += EquippedItemLevel(ObjectAccessor::FindPlayerByName(name));
+        if (ourGroup)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: guild finder run {} - the group under '{}' is disbanded and its "
+                     "members go back to their own lives",
+                     run.id, run.tank);
+            group->Disband();
+        }
+        GuildRunLootTally const loot = TakeGuildRunLoot(run.guids);
+        bool const entered = run.enteredAt != 0;
+        WriteGuildRunRow(run.id, entered ? "applied" : "error", run.outcome,
+                         GuildRunJson(run, "done", &loot, entered ? ilvlNow : 0, now));
+        return false;
+    }
+
+    // A RESTART LEAVES THE GROUP BEHIND. The finder group is saved with its
+    // members and they log back in inside the dungeon, with the dungeon brain's
+    // flag and this module's memory gone. Rows this process did not claim are
+    // ended by ExpireAbandonedClaims; their groups are read once here and, for
+    // a quarter of an hour, the living are taken out and the group disbanded as
+    // soon as the tank is back in the world.
+    void DriveGuildRunStrays(std::time_t now)
+    {
+        if (!_guildRunStraysRead)
+        {
+            _guildRunStraysRead = true;
+            if (QueryResult rows = CharacterDatabase.Query(
+                    "SELECT target_name, command FROM overseer_command WHERE kind = 'guild' "
+                    "AND command LIKE 'finder-run %' AND status IN ('claimed', 'verifying') "
+                    "AND claimed_by <> '{}' AND created_at > NOW() - INTERVAL 3 HOUR",
+                    g_runToken))
+                do
+                {
+                    std::string const tank = rows->Fetch()[0].Get<std::string>();
+                    OverseerDecisions::GuildFinderRequest const request =
+                        OverseerDecisions::ParseGuildFinderRequest(
+                            rows->Fetch()[1].Get<std::string>(), tank);
+                    if (request.error != OverseerDecisions::GuildFinderRefusal::None)
+                        continue;
+                    GuildRunStray stray;
+                    stray.tank = tank;
+                    stray.names = {tank, request.healer};
+                    stray.names.insert(stray.names.end(), request.damage.begin(),
+                                       request.damage.end());
+                    stray.until = now + 15 * 60;
+                    _guildRunStrays.push_back(stray);
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' led a guild finder run the last worldserver did not "
+                             "finish; its finder group is taken out and disbanded when it is back",
+                             tank);
+                } while (rows->NextRow());
+        }
+        if (_guildRunStrays.empty())
+            return;
+        std::vector<GuildRunStray> still;
+        for (GuildRunStray& stray : _guildRunStrays)
+        {
+            Player* const tank = ObjectAccessor::FindPlayerByName(stray.tank);
+            Group* const group = tank ? tank->GetGroup() : nullptr;
+            if (!group || !group->isLFGGroup())
+            {
+                if (now < stray.until)
+                    still.push_back(stray);
+                continue;
+            }
+            if (!stray.teleported)
+            {
+                stray.teleported = true;
+                for (std::string const& name : stray.names)
+                {
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    if (!p || !p->GetSession() || !p->IsAlive() || p->IsInCombat() ||
+                        p->GetGroup() != group || !p->GetMap() || !p->GetMap()->IsDungeon())
+                        continue;
+                    WorldPacket leave(CMSG_LFG_TELEPORT, 1);
+                    leave << uint8(1);
+                    leave.rpos(0);
+                    p->GetSession()->HandleLfgTeleportOpcode(leave);
+                }
+                still.push_back(stray);
+                continue;
+            }
+            LOG_WARN("module.overseer",
+                     "overseer: the finder group '{}' led before the restart is disbanded",
+                     stray.tank);
+            group->Disband();
+        }
+        _guildRunStrays.swap(still);
+    }
+
     // HOW OFTEN THE LAST RUNG WAS NEEDED TODAY, per family: the rows marked
     // 'dungeon_finder' since midnight on the database's clock.
     unsigned FinderUsesToday(std::string const& family)
@@ -44597,6 +45374,10 @@ private:
         // poll reads where the walker is and hands it its next leg (#569).
         ResolveMailWalks(sincePollMs);
 
+        // ...and the guild coordinator's finder runs, which are driven from
+        // the queue to the end of the run and hold their row until then.
+        DriveGuildFinderRuns();
+
         // Then end any cast hold that outlived the row that placed it (#335).
         // AFTER the five above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
@@ -44881,6 +45662,12 @@ private:
                                        _pendingLearns, id);
             else if (kind == "cast")
                 detail = DoCast(player, command, status, rowResult, _pendingCasts, id);
+            else if (kind == "guild" && OverseerDecisions::IsGuildFinderRow(command))
+                // THE GUILD COORDINATOR'S FIVE-MAN, on kind='guild' and routed
+                // on the first word as the walks ride `mail` and `cast`, so no
+                // ENUM migration is needed. DoGuild's own verbs never begin
+                // with this word.
+                detail = DoGuildFinderRun(player, command, status, rowResult, id);
             else if (kind == "guild")
                 detail = DoGuild(player, command, targetArg, status, rowResult);
             else if (kind == "bot" && command == "open items")

@@ -17849,6 +17849,112 @@ FinderStep FinderNext(FinderPollFacts const& facts);
 // "join", "wait", "accept", "inside", "give up".
 char const* FinderStepWord(FinderStep step);
 
+// ------------------------------------ a guild group by the dungeon finder --
+//
+// THE GUILD'S OWN FIVE-MAN (wow-overseer's guild coordinator). The families
+// are the only parties this module directs; the rest of each bot guild levels
+// alone. The coordinator picks five online members of one guild by level band
+// and role, and a `guild` row carries its pick here:
+//
+//   finder-run <keyword> <healer> <dps> <dps> <dps>
+//
+// with the row's target as the tank, who leads. The keyword is a portal row's
+// (FindDungeonPortal), so the finder's own entry for that door is the one the
+// family rung already resolves (FinderDungeonForDoor). The module forms the
+// party the way an accepted invite does, makes the tank its own master so the
+// other four follow it and mod-dungeon-clear takes its `dc on`, joins the
+// finder with each member's seat as its role, accepts the proposal, and reads
+// the run back until it is over. Nothing is granted and nobody is moved by
+// this module: the finder's own teleport takes the group in and out.
+constexpr char GUILD_FINDER_VERB[] = "finder-run";
+constexpr unsigned GUILD_FINDER_GROUP_SIZE = 5;
+// A run nobody ends is ended here: long enough for a low dungeon cleared at a
+// careful pull, short enough that a stalled group is let go the same hour.
+constexpr unsigned GUILD_RUN_CEILING_SECONDS = 50 * 60;
+// Nobody on the dungeon's map for this long, after the group was inside, is
+// a group that has left (a release to the graveyard outside, a level-up
+// teleport, a logout) and the run is over.
+constexpr unsigned GUILD_RUN_EMPTY_SECONDS = 90;
+
+enum class GuildFinderRefusal : std::uint8_t
+{
+    None,
+    NotThisVerb,
+    Malformed,
+    BadName,
+    SameNameTwice,
+};
+
+struct GuildFinderRequest
+{
+    GuildFinderRefusal error{GuildFinderRefusal::None};
+    std::string keyword;
+    std::string healer;
+    // Exactly three.
+    std::vector<std::string> damage;
+};
+
+// Is this `guild` row the finder run rather than a DoGuild verb? On the first
+// word, the way a walk rides `mail` and `cast`, so no ENUM migration is needed.
+bool IsGuildFinderRow(std::string const& command);
+
+// The row, checked: a portal keyword (lower-case letters and hyphens), then
+// four character names (letters only), none of them the tank's and none twice.
+GuildFinderRequest ParseGuildFinderRequest(std::string const& command,
+                                           std::string const& tank);
+
+char const* GuildFinderRefusalWord(GuildFinderRefusal refusal);
+
+enum class GuildSeat : std::uint8_t
+{
+    Tank,
+    Healer,
+    Damage,
+};
+
+// The role bits a member answers the finder's role check with. One seat per
+// member, not every role its class could fill: the coordinator chose who
+// tanks and who heals from the talent tree each plays, and the finder's own
+// role assignment must not undo that. The tank leads.
+std::uint8_t GuildSeatRoleMask(GuildSeat seat);
+
+// Once the group is inside, read every poll until the run is over.
+struct GuildRunPoll
+{
+    unsigned groupSize{0};
+    // Members on the dungeon's map, in the group's copy of it.
+    unsigned inside{0};
+    unsigned aliveInside{0};
+    unsigned secondsInside{0};
+    // How long nobody has been inside (0 while somebody is).
+    unsigned secondsEmpty{0};
+    // The core's LFG_STATE_FINISHED_DUNGEON for the group: the last boss died.
+    bool finderFinished{false};
+    unsigned bossesDone{0};
+    unsigned bossesTotal{0};
+    // The group is gone, or the tank is no longer in it.
+    bool groupGone{false};
+    unsigned ceilingSeconds{GUILD_RUN_CEILING_SECONDS};
+    unsigned emptySeconds{GUILD_RUN_EMPTY_SECONDS};
+};
+
+enum class GuildRunVerdict : std::uint8_t
+{
+    Running,
+    Cleared,    // the finder says the dungeon is finished, or every boss is down
+    Wiped,      // everybody inside is dead at once
+    Abandoned,  // nobody inside for emptySeconds, or the group is gone
+    TimedOut,   // inside past the ceiling
+};
+
+// ONE POLL of a group that has been inside. Cleared is asked first: a group
+// whose last boss died has cleared it whatever happens after. A wipe is every
+// member inside dead at the same poll with at least one member inside.
+GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
+
+// "running", "cleared", "wiped", "abandoned", "timed out".
+char const* GuildRunVerdictWord(GuildRunVerdict verdict);
+
 // ------------------------- what a level-up hands the roster (the operator) --
 //
 // TrainRoster runs on every level change of a roster character. With factory

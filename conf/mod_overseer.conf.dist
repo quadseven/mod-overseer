@@ -375,6 +375,31 @@
 #
 #Overseer.DungeonFinder.Default = 0
 
+#    Overseer.GuildFinder.Enable
+#        Description: Let the control plane's guild coordinator send a bot
+#                     guild's own five-man through the dungeon finder: a
+#                     `guild` row `finder-run <keyword> <healer> <dps> <dps>
+#                     <dps>` on the tank forms the party (as an accepted invite
+#                     does), queues it with each member's seat as its role,
+#                     arms mod-dungeon-clear inside and reads the run back to
+#                     its end (cleared, wiped, abandoned, timed out) into the
+#                     row's `result`. Family members are refused; the families
+#                     have their own campaigns. 0 refuses every such row.
+#
+#        Default:     0
+#
+#Overseer.GuildFinder.Enable = 0
+
+#    Overseer.GuildFinder.MaxGroups
+#        Description: Guild groups in flight at once. Each is one more active
+#                     map for the world's map-update threads, so keep it at or
+#                     under MapUpdate.Threads unless the realm has been measured
+#                     with more.
+#
+#        Default:     2
+#
+#Overseer.GuildFinder.MaxGroups = 2
+
 ########################################
 #
 #    ONE MOVEMENT OWNER PER FAMILY LEADER

@@ -15588,6 +15588,165 @@ char const* FinderStepWord(FinderStep step)
     return "unknown";
 }
 
+// ------------------------------------ a guild group by the dungeon finder --
+
+namespace
+{
+std::vector<std::string> GuildFinderWords(std::string const& command)
+{
+    std::vector<std::string> words;
+    std::string word;
+    for (char c : command)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        {
+            if (!word.empty())
+                words.push_back(word);
+            word.clear();
+            continue;
+        }
+        word.push_back(c);
+    }
+    if (!word.empty())
+        words.push_back(word);
+    return words;
+}
+
+bool IsCharacterName(std::string const& word)
+{
+    if (word.empty() || word.size() > 12)
+        return false;
+    for (char c : word)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')))
+            return false;
+    return true;
+}
+
+bool IsPortalKeyword(std::string const& word)
+{
+    if (word.empty() || word.size() > 32 || word.front() == '-' || word.back() == '-')
+        return false;
+    for (char c : word)
+        if (!((c >= 'a' && c <= 'z') || c == '-'))
+            return false;
+    return true;
+}
+
+std::string LowerName(std::string const& name)
+{
+    std::string out;
+    for (char c : name)
+        out.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+    return out;
+}
+}  // namespace
+
+bool IsGuildFinderRow(std::string const& command)
+{
+    std::vector<std::string> const words = GuildFinderWords(command);
+    return !words.empty() && words[0] == GUILD_FINDER_VERB;
+}
+
+GuildFinderRequest ParseGuildFinderRequest(std::string const& command, std::string const& tank)
+{
+    GuildFinderRequest out;
+    std::vector<std::string> const words = GuildFinderWords(command);
+    if (words.empty() || words[0] != GUILD_FINDER_VERB)
+    {
+        out.error = GuildFinderRefusal::NotThisVerb;
+        return out;
+    }
+    if (words.size() != 2 + (GUILD_FINDER_GROUP_SIZE - 1))
+    {
+        out.error = GuildFinderRefusal::Malformed;
+        return out;
+    }
+    if (!IsPortalKeyword(words[1]))
+    {
+        out.error = GuildFinderRefusal::Malformed;
+        return out;
+    }
+    std::vector<std::string> seen{LowerName(tank)};
+    if (!IsCharacterName(tank))
+    {
+        out.error = GuildFinderRefusal::BadName;
+        return out;
+    }
+    for (std::size_t i = 2; i < words.size(); ++i)
+    {
+        if (!IsCharacterName(words[i]))
+        {
+            out.error = GuildFinderRefusal::BadName;
+            return out;
+        }
+        std::string const lower = LowerName(words[i]);
+        for (std::string const& known : seen)
+            if (known == lower)
+            {
+                out.error = GuildFinderRefusal::SameNameTwice;
+                return out;
+            }
+        seen.push_back(lower);
+    }
+    out.keyword = words[1];
+    out.healer = words[2];
+    out.damage.assign(words.begin() + 3, words.end());
+    return out;
+}
+
+char const* GuildFinderRefusalWord(GuildFinderRefusal refusal)
+{
+    switch (refusal)
+    {
+        case GuildFinderRefusal::None:          return "";
+        case GuildFinderRefusal::NotThisVerb:   return "not a finder-run row";
+        case GuildFinderRefusal::Malformed:
+            return "a finder-run row is: finder-run <keyword> <healer> <dps> <dps> <dps>";
+        case GuildFinderRefusal::BadName:       return "a name in the row is not a character name";
+        case GuildFinderRefusal::SameNameTwice: return "the row names one character twice";
+    }
+    return "unknown";
+}
+
+std::uint8_t GuildSeatRoleMask(GuildSeat seat)
+{
+    switch (seat)
+    {
+        case GuildSeat::Tank:   return FINDER_ROLE_LEADER | FINDER_ROLE_TANK;
+        case GuildSeat::Healer: return FINDER_ROLE_HEALER;
+        case GuildSeat::Damage: return FINDER_ROLE_DAMAGE;
+    }
+    return FINDER_ROLE_DAMAGE;
+}
+
+GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
+{
+    if (poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal))
+        return GuildRunVerdict::Cleared;
+    if (poll.inside && poll.aliveInside == 0)
+        return GuildRunVerdict::Wiped;
+    if (poll.groupGone)
+        return GuildRunVerdict::Abandoned;
+    if (!poll.inside && poll.secondsEmpty >= poll.emptySeconds)
+        return GuildRunVerdict::Abandoned;
+    if (poll.secondsInside >= poll.ceilingSeconds)
+        return GuildRunVerdict::TimedOut;
+    return GuildRunVerdict::Running;
+}
+
+char const* GuildRunVerdictWord(GuildRunVerdict verdict)
+{
+    switch (verdict)
+    {
+        case GuildRunVerdict::Running:   return "running";
+        case GuildRunVerdict::Cleared:   return "cleared";
+        case GuildRunVerdict::Wiped:     return "wiped";
+        case GuildRunVerdict::Abandoned: return "abandoned";
+        case GuildRunVerdict::TimedOut:  return "timed out";
+    }
+    return "unknown";
+}
+
 RosterTraining RosterTrainingFor(bool factoryGrants)
 {
     RosterTraining training;
