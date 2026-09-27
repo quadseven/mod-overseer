@@ -32419,8 +32419,29 @@ private:
 
         // isBGGroup/isBFGroup/isLFGGroup  Group.h:222-225
         if (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup())
+        {
+            // If nobody is inside the instance, disband the finder group first,
+            // then allow the reset to proceed. The finder group will be reformed
+            // on the next run.
+            Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+            bool const hadInside = [&]() -> bool
+            {
+                for (std::string const& name : members)
+                {
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!SteerableAI(member)) continue;
+                    if (member->GetMapId() == insideMapId) return true;
+                }
+                return false;
+            }();
+            if (!hadInside)
+            {
+                LeaveTheFinderGroup(leaderName, coord.runNumber, insideMapId);
+                return "";
+            }
             return "this is a battleground, battlefield or dungeon-finder group, which "
                    "Group::ResetInstances refuses outright";
+        }
 
         // GetDifficulty  Player.h:1948  Difficulty GetDifficulty(bool isRaid) const
         if (leader->GetDifficulty(false) != DUNGEON_DIFFICULTY_NORMAL)
