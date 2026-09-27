@@ -17401,6 +17401,41 @@ struct GuildDeathMark
 // (DriveStuckRevival owns the family).
 bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool hasAI);
 
+// ------------------------------- a natural guild member goes to its trainer --
+//
+// A natural guild member is granted no spells (playerbots patch 0024), and
+// nothing sent one to a trainer. Measured on wow-dev (2026-09-27): members at
+// levels 10 to 16 knew 4 to 7 spells, where a class trainer sells 12 to 15 by
+// level 12 for about 25 silver, and they held 38 to 55 silver. 92 of them died
+// 603 times in 45 minutes, to hostiles within 0 to 3 levels of their own: a
+// level-12 character casting level-1 ranks. So a member that can afford a
+// class spell walks to the nearest trainer of its class on its map and buys
+// it there, with its own gold.
+struct TrainerSpot
+{
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+// Index into `spots` of the nearest on `mapId` within `maxYards` of (x, y),
+// or -1.
+int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, float x, float y,
+                       float maxYards);
+
+enum class GuildTrainingStep
+{
+    Nothing,  // nothing it can afford to learn, or no trainer to learn it from
+    Walk,     // aim its wander at the trainer
+    Learn,    // it stands at the trainer: buy what it can afford
+};
+
+// `affordable` is how many class spells this trainer would teach it that it
+// has the gold for; `yards` its distance to the trainer; `reach` the
+// interaction distance.
+GuildTrainingStep DecideGuildTraining(unsigned affordable, bool trainerFound, float yards,
+                                      float reach);
+
 // Drop marks older than `minutes` before `now`.
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes);
 
