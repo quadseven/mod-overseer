@@ -17037,6 +17037,22 @@ enum class ExitHearthStep
 // asked every poll for ever.
 constexpr unsigned EXIT_HEARTH_ATTEMPTS = 3;
 
+// A CROSSING MEMBER WHOSE INN IS FAR NEARER THE BERTH HEARTHS BEFORE IT WALKS
+// (2026-09-27). Measured on wow-dev: a gear-up errand left the Alliance leader
+// at the Darnassus auctioneer, on Teldrassil, when his family's campaign sent
+// him to the Theramore berth 15,500 yards away. Every walk ended 14,664 yards
+// short, because no leg of a family's route may be a boat, and every bearing was
+// refused; the crossing's backstop only restarts the same walk. His hearthstone
+// was bound at Ratchet, 3,150 yards from that berth. So a member on the
+// crossing's own map whose bind is on that map and at least `savesYards` nearer
+// the berth than the member is uses the stone first, and walks from the inn.
+// Aboard, on another map, or bound elsewhere, nothing changes.
+constexpr float CROSSING_HEARTH_SAVES_YARDS = 2000.f;
+
+bool CrossingMemberHearths(bool onOriginMap, bool aboard, HomeBind const& bind,
+                           uint32_t originMap, float memberToBerthYards, float berthX,
+                           float berthY, float savesYards = CROSSING_HEARTH_SAVES_YARDS);
+
 // How long an episode may hold adoption back. Past this the coordinator adopts
 // as it did before, so a member held in combat, or a hold that never settles,
 // cannot keep the run unowned for good.
