@@ -15015,6 +15015,40 @@ char const* GhostRecoveryWord(GhostRecovery choice)
     return "unknown";
 }
 
+void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes)
+{
+    int64_t const oldest = now - int64_t(minutes) * 60;
+    marks.erase(std::remove_if(marks.begin(), marks.end(),
+                               [&](GuildDeathMark const& m) { return m.ghostTime < oldest; }),
+                marks.end());
+}
+
+bool NoteGuildDeath(std::vector<GuildDeathMark>& marks, GuildDeathMark const& mark)
+{
+    for (GuildDeathMark const& m : marks)
+        if (m.ghostTime == mark.ghostTime)
+            return false;
+    marks.push_back(mark);
+    return true;
+}
+
+unsigned CountGuildDeathsNear(std::vector<GuildDeathMark> const& marks, int64_t now,
+                              uint32_t mapId, float x, float y, float radius, uint32_t minutes)
+{
+    int64_t const oldest = now - int64_t(minutes) * 60;
+    unsigned n = 0;
+    for (GuildDeathMark const& m : marks)
+    {
+        if (m.ghostTime < oldest || m.mapId != mapId)
+            continue;
+        float const dx = m.x - x;
+        float const dy = m.y - y;
+        if (dx * dx + dy * dy <= radius * radius)
+            ++n;
+    }
+    return n;
+}
+
 char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
 {
     switch (reason)

@@ -17378,6 +17378,36 @@ char const* GhostRecoveryWord(GhostRecovery choice);
 // A sentence fragment saying why, for the log line.
 char const* GhostRecoveryReasonText(GhostRecoveryReason reason);
 
+// ------------------------------------ a natural guild member's own deaths --
+//
+// THE REPEAT TEST ABOVE READS overseer_death, AND ONLY THE FAMILY HAS ROWS
+// THERE (RecordDeath returns for anyone off the roster). A natural guild's
+// random-bot members die in the same loop the test was cut for: sampled on the
+// dev realm every 30 s for ten minutes (2026-09-27), 66 of them died 194 times,
+// were alive a median 83 s between deaths and a ghost a median 101 s, beside
+// the same corpse. So the module remembers their deaths itself, one mark per
+// death (the corpse's ghost time and place), and counts the marks near a
+// corpse the same way the SQL counts rows.
+struct GuildDeathMark
+{
+    int64_t ghostTime{0};
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+// Drop marks older than `minutes` before `now`.
+void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes);
+
+// Adds `mark` unless a mark with its ghost time is already there (one death is
+// seen on many polls). True when it was added.
+bool NoteGuildDeath(std::vector<GuildDeathMark>& marks, GuildDeathMark const& mark);
+
+// Marks on `mapId` within `radius` yards of (x, y) no older than `minutes`:
+// the same question as the overseer_death COUNT in the module's ghost drive.
+unsigned CountGuildDeathsNear(std::vector<GuildDeathMark> const& marks, int64_t now,
+                              uint32_t mapId, float x, float y, float radius, uint32_t minutes);
+
 // ----------------------------- a seasonal spawn is not a destination (#686) --
 //
 // THE CORE PUTS AN EVENT'S SPAWNS IN THE WORLD ONLY WHILE THE EVENT RUNS.
