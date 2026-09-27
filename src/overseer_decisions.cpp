@@ -10279,6 +10279,11 @@ std::string TravelAimBesideBind(std::string const& bindAim, std::string const& c
 
 // ------------- standing at a counter long enough to trade there (#378) ------
 
+bool TakesNewRpgOffOnArrival(CounterArrival arrival, std::string const& job)
+{
+    return arrival == CounterArrival::Done && !LeaderCarriesNewRpg(job, false);
+}
+
 CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby)
 {
     // NOT A COUNTER, NOT THIS DECISION. Answered first and answered `Done`,
