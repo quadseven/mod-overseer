@@ -18,6 +18,7 @@
 
 #include "overseer_decisions.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -64,7 +65,6 @@ constexpr float STANDOFF = 20.f;           // DUNGEON_STAGING_STANDOFF_YARDS
 constexpr float BARRIER = 10.f;            // DUNGEON_BARRIER_RADIUS_YARDS
 constexpr float STEP = 60.f;               // TRAVEL_STEP_YARDS
 constexpr float STEP_VERTICAL = 20.f;      // TRAVEL_STEP_VERTICAL_YARDS
-constexpr float JOIN_RADIUS = 15.f;        // close enough to step onto the corridor
 constexpr float LOOKAHEAD = 250.f;         // TRAVEL_ROUTE_LOOKAHEAD_YARDS
 constexpr float HOME_TOWN = 250.f;         // CAMPAIGN_HOME_TOWN_YARDS
 // PathGenerator smooths at most MAX_POINT_PATH_LENGTH 74 points of
@@ -190,10 +190,30 @@ StagingPoint Staging()
                                DungeonStagingStandoffYards(door, STANDOFF, BARRIER));
 }
 
+// A `constexpr float NAME = ...;` of src/mod_overseer.cpp, followed through
+// one name if it is defined as another constant. Read rather than copied, so the
+// join radius these checks use is the one the adapter passes (#752 copied 15 here
+// and the source could change without this file noticing). Negative if absent.
+float ReadSourceConstant(std::string const& name, int depth = 0)
+{
+    std::ifstream source("src/mod_overseer.cpp");
+    std::stringstream text;
+    text << source.rdbuf();
+    std::string const all = text.str();
+    std::smatch match;
+    std::regex const byName("constexpr float " + name + R"( = ([A-Za-z0-9_.]+?)f?;)");
+    if (!std::regex_search(all, match, byName))
+        return -1.f;
+    std::string const value = match[1].str();
+    if (std::isdigit(static_cast<unsigned char>(value[0])))
+        return std::strtof(value.c_str(), nullptr);
+    return depth < 2 ? ReadSourceConstant(value, depth + 1) : -1.f;
+}
+
 StagingCorridorLimits AdapterLimits()
 {
     StagingCorridorLimits limits;
-    limits.joinYards = JOIN_RADIUS;
+    limits.joinYards = ReadSourceConstant("DUNGEON_CORRIDOR_JOIN_YARDS");
     limits.maxLegYards = LOOKAHEAD;
     limits.distantJoinAtEntry = true;
     return limits;
@@ -216,9 +236,30 @@ void TheFarCityJoinStartsAtTheSurveyedEntry(Row const& row)
           plan.joinIndex == 0);
 }
 
+// A LEADER HANDED FROM THE APPROACH LEG TO THE STAGING LEG JOINS WHERE HE
+// STANDS. Measured on wow-dev 2026-09-27: the approach leg ends as soon as the
+// leader is nearer the staging point than the approach point is, and point 2
+// already is, so Zug was handed the staging walk about 21 yards from point 2.
+// With a 15 yard join he was sent back to point 0 at the inn, 113 yards away,
+// found no surveyed way there and walked out of the city.
+void TheLegHandoffJoinsTheNearestPoint(Row const& row)
+{
+    if (row.corridor.size() < 4)
+        return;
+    RoutePoint const handoff{1731.f, -4381.f, 36.f};
+    StagingCorridorPlan const plan = PlanStagingCorridor(
+        row.corridor, row.corridor.back().x, row.corridor.back().y, handoff.x, handoff.y,
+        AdapterLimits());
+    Check("a leader handed the staging leg beside point 2 joins the corridor",
+          plan.verdict == StagingCorridorVerdict::Joined);
+    Check("and joins at point 2, not at the inn", plan.joinIndex == 2);
+}
+
 void TheRowCarriesACorridorThatEndsOnTheStagingPoint(Row const& row)
 {
     Check("the ragefire row is in the portal table", row.found);
+    Check("the adapter's corridor join radius is read from the source",
+          ReadSourceConstant("DUNGEON_CORRIDOR_JOIN_YARDS") > 0.f);
     Check("the ragefire row carries a measured corridor", row.corridor.size() >= 2);
     if (row.corridor.size() < 2)
         return;
@@ -337,6 +378,7 @@ int main()
     TheHomeIsTheOrgrimmarInn(row);
     TheCorridorIsUsedForTheWalksThatNeedIt(row);
     TheFarCityJoinStartsAtTheSurveyedEntry(row);
+    TheLegHandoffJoinsTheNearestPoint(row);
     TheFirstLegIsWalkableFromWhereThePartyArrives(row);
 
     if (failures)

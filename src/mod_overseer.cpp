@@ -2380,7 +2380,15 @@ constexpr uint32 DUNGEON_RUN_POLL_MS = 5000;
 // above), so this is that consensus number, not a measurement.
 constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
 // A nearby corridor point may be stepped onto; farther city joins need survey.
-constexpr float DUNGEON_CORRIDOR_JOIN_YARDS = 15.0f;
+// ONE BEARING STEP, NOT FIFTEEN YARDS (2026-09-27). The approach leg hands the
+// leader to the staging leg as soon as he is nearer the staging point than the
+// approach point is, and on the Ragefire corridor point 2 already is, so Zug was
+// handed over about 21 yards off point 2. Fifteen called that off the corridor
+// and sent him back to point 0 at the inn, 113 yards behind him; the survey had
+// no way there and he walked out of the city. A step is what the corridor's own
+// legs already cross by bearing (its widest is 66), and it is still far short of
+// the 303 yards through a wall that #752 routes to the entry.
+constexpr float DUNGEON_CORRIDOR_JOIN_YARDS = TRAVEL_STEP_YARDS;
 
 // AND THE OTHER TWO DIMENSIONS OF IT (#217). The radius above is a circle drawn
 // on a map, and for the whole of this module's life it was the entire content
