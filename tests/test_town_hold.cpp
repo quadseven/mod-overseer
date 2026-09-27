@@ -40,6 +40,8 @@ using OverseerDecisions::FamilyHoldsInTown;
 using OverseerDecisions::HoldsInTown;
 using OverseerDecisions::LeaderCarriesNewRpg;
 using OverseerDecisions::SplitFollowerDrivesItself;
+using OverseerDecisions::TakesNewRpgOffOnArrival;
+using OverseerDecisions::CounterArrival;
 
 namespace
 {
@@ -164,6 +166,31 @@ void TheModuleAsksInTheThreePlaces()
           true);
 }
 
+// wow-overseer#378, measured 2026-09-27: Zug reached the Orgrimmar mailbox at
+// 21:44:35, kept `new rpg` until the 21:45:05 poll, and walked 70 yards off it.
+void AnArrivalInTownKeepsTheLeaderWhereItLanded()
+{
+    Check("town run, released", TakesNewRpgOffOnArrival(CounterArrival::Done, "town run"),
+          true);
+    Check("questing, released", TakesNewRpgOffOnArrival(CounterArrival::Done, "quest"), false);
+    Check("no job, released", TakesNewRpgOffOnArrival(CounterArrival::Done, ""), false);
+    // A counter takes its own hold; a gap still being closed is not an arrival.
+    Check("town run, at a counter",
+          TakesNewRpgOffOnArrival(CounterArrival::StandAndTrade, "town run"), false);
+    Check("town run, closing the gap",
+          TakesNewRpgOffOnArrival(CounterArrival::CloseTheGap, "town run"), false);
+
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string const source = buffer.str();
+    std::size_t const asked2 = source.find("OverseerDecisions::TakesNewRpgOffOnArrival(arrival,");
+    std::size_t const released = source.find(
+        "_travelAims.Release(name, \"the travel drive (arrived)\");");
+    Check("the arrival asks", asked2 != std::string::npos, true);
+    Check("before the release", asked2 != std::string::npos && asked2 < released, true);
+}
+
 }  // namespace
 
 int main()
@@ -175,6 +202,7 @@ int main()
     AQuestingCutOffFollowerRoamsAsBefore();
     ACutOffFollowerInTownStaysUnlessItHasAnErrand();
     TheModuleAsksInTheThreePlaces();
+    AnArrivalInTownKeepsTheLeaderWhereItLanded();
 
     if (failures)
     {

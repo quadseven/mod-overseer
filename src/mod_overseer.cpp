@@ -23913,6 +23913,22 @@ private:
                         // for it. See TrainFishingOnArrival.
                         TrainFishingOnArrival(name, bot, entry);
 
+                        // AND AN ARRIVAL IN TOWN IS NOT HANDED A RANDOM STATUS
+                        // (wow-overseer#378): see TakesNewRpgOffOnArrival. Before
+                        // the release, for the reason the counter hold above is.
+                        PlayerbotAI* const arrivedAI = GET_PLAYERBOT_AI(bot);
+                        if (arrivedAI &&
+                            OverseerDecisions::TakesNewRpgOffOnArrival(arrival,
+                                                                       TownJobFor(name)) &&
+                            arrivedAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                        {
+                            arrivedAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' reached '{}' while its family waits in "
+                                     "town - `new rpg` is taken off as it lands, so it stands "
+                                     "there instead of walking off on a status of its own",
+                                     name, target);
+                        }
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' reached '{}' (creature {}) - errand done, "
                                  "releasing", name, target, entry);

@@ -12209,6 +12209,20 @@ enum class CounterArrival : std::uint8_t
 // than releasing rather than better.
 CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby);
 
+// AN ARRIVAL IN TOWN THAT IS NOT A COUNTER KEEPS THE LEADER WHERE IT LANDED
+// (quadseven/wow-overseer#378). Measured on the dev realm 2026-09-27: the town
+// errand aimed Zug at the Orgrimmar mailbox, he reached it at 21:44:35 and was
+// released, and by the next party poll at 21:45:05, when the town wait took
+// `new rpg` off him, he had walked 70 yards on a random status with the family
+// behind him. The bridge judges arrival on two still readings a tick apart, so
+// it never saw him there, and the errand timed out 176 yards away. A counter
+// takes its hold BEFORE the release for exactly this reason; an `at:` aim has
+// no counter to hold at, so the town wait's own answer (LeaderCarriesNewRpg
+// with no errand) is applied at the release instead of a poll later.
+//
+// True when the arrival released the errand (`Done`) and `job` is the town wait.
+bool TakesNewRpgOffOnArrival(CounterArrival arrival, std::string const& job);
+
 
 // --------------- a deliberate errand: go learn THIS node (#388) -----------
 //
