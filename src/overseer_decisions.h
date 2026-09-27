@@ -1278,6 +1278,26 @@ std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceI
                                     std::vector<std::string> const& occupants,
                                     std::vector<std::string> const& family);
 
+// WHICH GROUP SHAPES REFUSE A DUNGEON RESET, and which one the run undoes
+// itself (#761). Group::ResetInstances returns at once for a battleground,
+// battlefield or dungeon-finder group. The first two are not this module's to
+// leave. A finder group is: once nobody is inside, RESETTING disbands it
+// (LeaveTheFinderGroup) and the family's own party forms again under its head.
+// Counting it as a blocker here held every run after a finder run at RESET
+// until the backstop closed it reset_failed, because the disband sits below
+// the blocker check and was never reached. So a finder group is no blocker,
+// and neither is its leadership, since the group is about to be let go.
+// Occupancy is still checked after this, so a finder group with anybody inside
+// keeps waiting. Empty when the group's shape allows the reset.
+struct ResetGroupShape
+{
+    bool battleground = false;
+    bool battlefield = false;
+    bool finderGroup = false;
+    bool leaderLeads = true;   // the family's leader is the group's leader
+};
+std::string ResetGroupShapeBlocker(ResetGroupShape const& shape, std::string const& leaderName);
+
 // A DOOR AT THE BOTTOM OF A RAVINE IS REACHED BY A CORRIDOR, NOT BY A BEARING
 // (#242).
 //

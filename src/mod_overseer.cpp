@@ -32375,9 +32375,11 @@ private:
     //
     //   2. NOT A BATTLEGROUND, BATTLEFIELD OR DUNGEON-FINDER GROUP:
     //      Group::ResetInstances returns immediately for those
-    //      (Group.cpp:2330). The roster's group is an ordinary party, so this
-    //      can only fire if something else put them in a queue - which is worth
-    //      a line rather than a silent nothing.
+    //      (Group.cpp:2330). A battleground or battlefield group is worth a
+    //      line rather than a silent nothing. A dungeon-finder group is not a
+    //      blocker (#761): a run the finder took in leaves the family in one,
+    //      and RESETTING disbands it (LeaveTheFinderGroup) once nobody is
+    //      inside, so its leadership is not checked either.
     //
     //   3. NORMAL DUNGEON DIFFICULTY. INSTANCE_RESET_ALL breaks out at once
     //      unless leader->GetDifficulty(false) == DUNGEON_DIFFICULTY_NORMAL
@@ -32416,15 +32418,21 @@ private:
         if (!group)
             return "the leader is in no group, so there is no group instance to reset";
 
-        // IsLeader  Group.h:239  bool IsLeader(ObjectGuid guid) const
-        if (!group->IsLeader(leader->GetGUID()))
-            return "'" + leaderName + "' is not the group leader, and the instance a "
-                   "grouped character lands in is chosen from the GROUP leader's bind";
-
+        // A FINDER GROUP IS NOT A BLOCKER (#761): RESETTING disbands it below
+        // once nobody is inside (LeaveTheFinderGroup). Refusing it here kept
+        // that call from ever being reached, and every run after a finder run
+        // closed reset_failed.
+        OverseerDecisions::ResetGroupShape shape;
         // isBGGroup/isBFGroup/isLFGGroup  Group.h:222-225
-        if (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup())
-            return "this is a battleground, battlefield or dungeon-finder group, which "
-                   "Group::ResetInstances refuses outright";
+        shape.battleground = group->isBGGroup();
+        shape.battlefield = group->isBFGroup();
+        shape.finderGroup = group->isLFGGroup();
+        // IsLeader  Group.h:239  bool IsLeader(ObjectGuid guid) const
+        shape.leaderLeads = group->IsLeader(leader->GetGUID());
+        std::string const shapeBlocker =
+            OverseerDecisions::ResetGroupShapeBlocker(shape, leaderName);
+        if (!shapeBlocker.empty())
+            return shapeBlocker;
 
         // GetDifficulty  Player.h:1948  Difficulty GetDifficulty(bool isRaid) const
         if (leader->GetDifficulty(false) != DUNGEON_DIFFICULTY_NORMAL)
