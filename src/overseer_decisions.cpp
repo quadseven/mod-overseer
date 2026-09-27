@@ -15015,6 +15015,11 @@ char const* GhostRecoveryWord(GhostRecovery choice)
     return "unknown";
 }
 
+bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool hasAI)
+{
+    return !onRoster && botSession && !playerClient && hasAI;
+}
+
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes)
 {
     int64_t const oldest = now - int64_t(minutes) * 60;

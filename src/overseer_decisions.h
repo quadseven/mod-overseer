@@ -17396,6 +17396,11 @@ struct GuildDeathMark
     float y{0.f};
 };
 
+// Whether the guild ghost drive steers this natural guild member: a bot
+// session with a playerbot AI and no player's client, and not on the roster
+// (DriveStuckRevival owns the family).
+bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool hasAI);
+
 // Drop marks older than `minutes` before `now`.
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes);
 
