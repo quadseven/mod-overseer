@@ -6989,6 +6989,7 @@ public:
             // block. Reuses this timer rather than adding a new one; there is
             // no reason this needs a different poll interval.
             DriveStuckRevival();
+            DriveGuildGhostRecovery();
             // Same cadence again, and after the revival drive on purpose: a
             // character resurrected on this tick is alive by the time this one
             // asks, so a party that just recovered from a wipe inside the
@@ -27181,6 +27182,71 @@ private:
         st.leased.clear();
     }
 
+    // ------------------------------------- the natural guilds' own ghosts --
+    //
+    // CORPSE RUN, SPIRIT HEALER OR WAIT, FOR THE GUILD TOO. DriveGhostRecovery
+    // was cut for the family, and DriveStuckRevival only walks the roster. The
+    // natural guilds' random-bot members (Overseer.Natural.Guilds) die in the
+    // same loop: sampled on the dev realm every 30 s for ten minutes
+    // (2026-09-27), 66 of them died 194 times, alive a median 83 s between
+    // deaths and a ghost a median 101 s, reclaiming beside what killed them.
+    // A third of the guild was a ghost at any moment, and the guild
+    // coordinator's runs were refused over dead members four times in a row.
+    //
+    // The same decision, carried out the same way, with two differences. The
+    // repeat test counts deaths this drive remembers (overseer_death has rows
+    // only for the family). And there is no stuck-revival ladder behind it:
+    // where the family would be handed to the ladder, the dead engine gets its
+    // corpse run back. The spirit healer is asked the way a client asks it, so
+    // resurrection sickness and durability loss apply as for any player.
+    void DriveGuildGhostRecovery()
+    {
+        std::vector<std::string> const guilds = NaturalGuilds();
+        if (guilds.empty())
+            return;
+        std::vector<uint32> guildIds;
+        for (std::string const& guildName : guilds)
+            if (Guild* guild = sGuildMgr->GetGuildByName(guildName))
+                guildIds.push_back(guild->GetId());
+        if (guildIds.empty())
+            return;
+
+        int64 const now = time(nullptr);
+        for (auto const& itr : ObjectAccessor::GetPlayers())
+        {
+            Player* bot = itr.second;
+            if (!bot || !bot->IsInWorld() ||
+                std::find(guildIds.begin(), guildIds.end(), bot->GetGuildId()) == guildIds.end())
+                continue;
+            std::string const name = bot->GetName();
+            if (OnRoster(name))
+                continue;  // DriveStuckRevival owns the family
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            if (bot->IsAlive())
+            {
+                EndGhostRecovery(botAI, name);
+                ReleaseRevivalHold(botAI, name);
+                continue;
+            }
+
+            Corpse* corpse = bot->GetCorpse();
+            if (!corpse)
+                continue;  // not released yet: the dead engine releases it
+            std::vector<OverseerDecisions::GuildDeathMark>& marks = _guildDeathMarks[name];
+            OverseerDecisions::PruneGuildDeathMarks(marks, now, GHOST_REPEAT_MINUTES);
+            OverseerDecisions::NoteGuildDeath(
+                marks, {corpse->GetGhostTime(), corpse->GetMapId(), corpse->GetPositionX(),
+                        corpse->GetPositionY()});
+            unsigned const deathsHere = OverseerDecisions::CountGuildDeathsNear(
+                marks, now, corpse->GetMapId(), corpse->GetPositionX(), corpse->GetPositionY(),
+                GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
+            DriveGhostRecovery(bot, botAI, name, corpse, deathsHere, /*ladder*/ false);
+        }
+    }
+
     // The death is over: the character is alive again.
     void EndGhostRecovery(PlayerbotAI* botAI, std::string const& name)
     {
@@ -27205,7 +27271,14 @@ private:
     // One poll for one ghost. True when this poll is spoken for and the
     // stuck-revival ladder must not act on it; false to let the ladder run as
     // it always has.
-    bool DriveGhostRecovery(Player* bot, PlayerbotAI* botAI, std::string const& name, Corpse* corpse)
+    //
+    // `knownDeathsHere` is a caller's own count of deaths near this corpse, for
+    // a character overseer_death has no rows for (DriveGuildGhostRecovery).
+    // `ladder` false means no stuck-revival ladder follows this drive for the
+    // character: where the family would be handed to the ladder, the corpse
+    // run is handed back to the dead engine instead.
+    bool DriveGhostRecovery(Player* bot, PlayerbotAI* botAI, std::string const& name, Corpse* corpse,
+                            unsigned knownDeathsHere = 0, bool ladder = true)
     {
         // Open world only, and only a released ghost whose corpse is on the
         // map it stands on. Instances, battlegrounds and dungeon runs have
@@ -27242,7 +27315,8 @@ private:
                 deaths = row->Fetch()[0].Get<uint64>();
             // This death's own row may still be in the flush queue; it is a
             // death here all the same.
-            st.deathsHere = static_cast<unsigned>(std::max<uint64>(deaths, 1));
+            st.deathsHere = static_cast<unsigned>(
+                std::max<uint64>({deaths, uint64(knownDeathsHere), uint64(1)}));
 
             st.spawnThreat = HostileSpawnsNear(bot, st.mapId, st.corpseX, st.corpseY,
                                                GHOST_CORPSE_THREAT_RADIUS, bot->GetLevel());
@@ -27316,6 +27390,11 @@ private:
                 LeaseCorpseRun(bot, botAI, st, false);
                 return true;
             case OverseerDecisions::GhostRecovery::Ladder:
+                if (!ladder)
+                {
+                    ReturnCorpseRun(botAI, st);
+                    return false;
+                }
                 LeaseCorpseRun(bot, botAI, st, false);
                 return false;
             case OverseerDecisions::GhostRecovery::SpiritHealer:
@@ -27332,6 +27411,15 @@ private:
         if (now - st.healerSince > GHOST_HEALER_WALK_SECONDS)
         {
             st.healerWalkSpent = true;
+            if (!ladder)
+            {
+                ReturnCorpseRun(botAI, st);
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' chose the spirit healer at '{}' {}s ago and never "
+                         "stood at one - the corpse run goes back to the dead engine",
+                         name, st.healerGrave->name, now - st.healerSince);
+                return false;
+            }
             LeaseCorpseRun(bot, botAI, st, false);
             LOG_WARN("module.overseer",
                      "overseer: '{}' chose the spirit healer at '{}' {}s ago and never stood "
@@ -61776,6 +61864,8 @@ private:
     // saved strategy list is only ever added on top of those, so nothing this
     // module leased off is left missing.
     std::map<std::string, GhostRecoveryState> _ghostRecovery;
+    // A natural guild member's recent deaths (DriveGuildGhostRecovery), by name.
+    std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
 
     // What KeepRosterFollowing knew about each follower's position last
     // time round, so a stall is measured against ITS OWN best position
