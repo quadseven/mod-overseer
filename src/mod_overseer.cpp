@@ -27235,10 +27235,15 @@ private:
                 std::find(guildIds.begin(), guildIds.end(), bot->GetGuildId()) == guildIds.end())
                 continue;
             std::string const name = bot->GetName();
-            if (OnRoster(name))
-                continue;  // DriveStuckRevival owns the family
-            PlayerbotAI* botAI = SteerableAI(bot);
-            if (!botAI)
+            // NOT SteerableAI: that gate admits a client or a headless ROSTER
+            // bot by name, so it refused every guild member and this drive
+            // steered nobody on its first deploy. A guild member is a random
+            // bot: a bot session with an AI and no client.
+            WorldSession const* session = bot->GetSession();
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            if (!OverseerDecisions::GuildGhostDriven(OnRoster(name), session && session->IsBot(),
+                                                    ClientAttached(bot) && !(session && session->IsBot()),
+                                                    botAI != nullptr))
                 continue;
 
             if (bot->IsAlive())

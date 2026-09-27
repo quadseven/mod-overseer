@@ -17,6 +17,7 @@
 #include <vector>
 
 using OverseerDecisions::CountGuildDeathsNear;
+using OverseerDecisions::GuildGhostDriven;
 using OverseerDecisions::GuildDeathMark;
 using OverseerDecisions::NoteGuildDeath;
 using OverseerDecisions::PruneGuildDeathMarks;
@@ -62,6 +63,13 @@ int main()
           "a death older than the window does not count");
     PruneGuildDeathMarks(marks, now, 10);
     Check(marks.size() == 2, "pruning drops only the death older than the window");
+
+    // Who the drive steers: a random bot off the roster, and nobody else. The
+    // first deploy gated on the roster's own test and steered nobody.
+    Check(GuildGhostDriven(false, true, false, true), "a guild random bot is steered");
+    Check(!GuildGhostDriven(true, true, false, true), "a family member is left to its own drive");
+    Check(!GuildGhostDriven(false, false, true, false), "a player's character is never steered");
+    Check(!GuildGhostDriven(false, true, false, false), "a bot with no AI is not steered");
 
     if (failures)
     {
