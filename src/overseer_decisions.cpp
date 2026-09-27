@@ -14741,6 +14741,29 @@ bool IsExpansionContinent(uint32_t mapId)
     return mapId == OUTLAND_MAP_ID || mapId == NORTHREND_MAP_ID;
 }
 
+bool IsStartingLand(uint32_t mapId, uint32_t zoneId)
+{
+    if (mapId != OUTLAND_MAP_ID)
+        return false;
+    switch (zoneId)
+    {
+        case EVERSONG_WOODS_ZONE_ID:
+        case GHOSTLANDS_ZONE_ID:
+        case SILVERMOON_CITY_ZONE_ID:
+        case AZUREMYST_ISLE_ZONE_ID:
+        case BLOODMYST_ISLE_ZONE_ID:
+        case THE_EXODAR_ZONE_ID:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsOutsideClassic(uint32_t mapId, uint32_t zoneId)
+{
+    return IsExpansionContinent(mapId) && !IsStartingLand(mapId, zoneId);
+}
+
 bool ClassicRankAllowed(uint32_t rankMaxSkill)
 {
     return rankMaxSkill <= PROFESSION_SKILL_CAP;

@@ -10,7 +10,8 @@
  *
  *   - The numbers themselves, which the overseer site mirrors in classic.py
  *     and checks against this header.
- *   - Which maps are outside the classic world.
+ *   - Which maps are outside the classic world, and that the Blood Elf and
+ *     Draenei starting lands on map 530 are not (#765).
  *   - Which profession ranks and recipes a trainer may still sell.
  *   - That the walk refusal passes through to the trainer and vendor walks
  *     unchanged, and is worth asking again.
@@ -79,6 +80,32 @@ void OnlyOutlandAndNorthrendAreOutside()
     Check("Northrend is outside", C::IsExpansionContinent(571), true);
 }
 
+void TheStartingLandsAreInside()
+{
+    // #765: 18 draenei on Azuremyst Isle and 24 blood elves in Eversong Woods
+    // were refused every errand as if they stood in Outland.
+    Check("Azuremyst Isle", C::IsOutsideClassic(530, 3524), false);
+    Check("Eversong Woods", C::IsOutsideClassic(530, 3430), false);
+    Check("Ghostlands", C::IsOutsideClassic(530, 3433), false);
+    Check("Bloodmyst Isle", C::IsOutsideClassic(530, 3525), false);
+    Check("Silvermoon City", C::IsOutsideClassic(530, 3487), false);
+    Check("The Exodar", C::IsOutsideClassic(530, 3557), false);
+    Check("the starting lands are named", C::IsStartingLand(530, 3524), true);
+
+    Check("Hellfire Peninsula is Outland", C::IsOutsideClassic(530, 3483), true);
+    Check("Shattrath is Outland", C::IsOutsideClassic(530, 3703), true);
+    Check("the Isle of Quel'Danas is level-70 ground", C::IsOutsideClassic(530, 4080), true);
+    Check("an unknown zone on 530 is Outland", C::IsOutsideClassic(530, 0), true);
+    Check("Northrend whatever the zone", C::IsOutsideClassic(571, 3524), true);
+    Check("Borean Tundra", C::IsOutsideClassic(571, 3537), true);
+
+    Check("Elwynn Forest", C::IsOutsideClassic(0, 12), false);
+    Check("Durotar", C::IsOutsideClassic(1, 14), false);
+    Check("a starting zone id on another map is not a starting land",
+          C::IsStartingLand(0, 3430), false);
+    Check("the map question alone still names 530", C::IsExpansionContinent(530), true);
+}
+
 void ArtisanIsTheLastRank()
 {
     // SpellLearnSkillNode::maxvalue is step x 75.
@@ -109,7 +136,7 @@ void TheWalkRefusal()
               WalkRefusalFor(WalkGoal::Trainer, M::ExpansionContinent), M::ExpansionContinent);
     CheckText("the vendor walk passes it through",
               WalkRefusalFor(WalkGoal::Vendor, M::ExpansionContinent), M::ExpansionContinent);
-    Check("a random bot there is moved home by its next teleport, so ask again",
+    Check("a character there can walk, hearth or sail out, so ask again",
           MailWalkRefusalRetryable(M::ExpansionContinent), true);
     Check("and so is an errand walk", ErrandWalkRefusalRetryable(M::ExpansionContinent), true);
 }
@@ -120,6 +147,7 @@ int main()
 {
     TheNumbers();
     OnlyOutlandAndNorthrendAreOutside();
+    TheStartingLandsAreInside();
     ArtisanIsTheLastRank();
     RecipesStopAtThreeHundred();
     TheWalkRefusal();
