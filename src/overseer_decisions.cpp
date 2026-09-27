@@ -2086,9 +2086,9 @@ bool DungeonCampaignRecovers(unsigned trailingFailures)
     return trailingFailures > 0;
 }
 
-bool QuestDriveMayTakeCampaignLeader(bool campaignActive)
+bool QuestDriveMayTakeCampaignLeader(bool campaignActive, bool crossingUnderWay)
 {
-    return !campaignActive;
+    return !campaignActive && !crossingUnderWay;
 }
 
 bool QuestDriveTargetFitsYoungest(int youngestLevel, int questLevel, int minLevel,

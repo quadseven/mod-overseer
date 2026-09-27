@@ -2880,7 +2880,14 @@ unsigned DungeonRunTrailingFailures(std::vector<std::string> const& outcomesNewe
 bool DungeonCampaignRecovers(unsigned trailingFailures);
 
 // A campaign owns its family's leader until its coordinator returns to Idle.
-bool QuestDriveMayTakeCampaignLeader(bool campaignActive);
+//
+// AND WHILE ITS CROSSING IS UNDER WAY (2026-09-27). A continent crossing runs
+// inside IDLE, before RESET, so `campaignActive` reads false for all of it. The
+// step aboard gives the berth aim back so the aim cannot walk him off the deck,
+// and on wow-dev that left the Alliance leader free: two seconds later the quest
+// drive took him ("leader intent 'Grug' -> quest by quest drive (he was free)"),
+// the four followers sailed for Menethil without him, and the crossing split.
+bool QuestDriveMayTakeCampaignLeader(bool campaignActive, bool crossingUnderWay);
 
 // A quest drive must not choose work above the youngest member by more than
 // the shared lone-leg level gap. Quest levels are supplied by quest_template.

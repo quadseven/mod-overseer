@@ -10116,8 +10116,10 @@ private:
             {
                 if (!leader->IsAlive() || leader->IsInCombat())
                     WaiveLeaderDwell(leaderName);
-                bool const campaignActive = FamilyOnADungeonRun(FamilyOfCharacter(leaderName));
-                if (OverseerDecisions::QuestDriveMayTakeCampaignLeader(campaignActive) &&
+                std::string const family = FamilyOfCharacter(leaderName);
+                bool const campaignActive = FamilyOnADungeonRun(family);
+                if (OverseerDecisions::QuestDriveMayTakeCampaignLeader(campaignActive,
+                                                                       FamilyCrossing(family)) &&
                     OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(leaderName), false))
                     AskForLeader(leaderName, OverseerDecisions::LeaderIntentKind::QuestDrive,
                                  "quest drive", std::string(),
@@ -11836,10 +11838,13 @@ private:
                 leaderName = row.first;
         bool const campaignActive = !leaderName.empty() &&
                                     FamilyOnADungeonRun(FamilyOfCharacter(leaderName));
+        bool const crossing = !leaderName.empty() &&
+                              FamilyCrossing(FamilyOfCharacter(leaderName));
         // THE CAMPAIGN OWNS ITS LEADER UNTIL IDLE (#557). RECOVERING includes
         // its backoff, so a quest in the leader's log cannot pull the family
-        // out of the town where the next campaign step expects it.
-        if (!OverseerDecisions::QuestDriveMayTakeCampaignLeader(campaignActive))
+        // out of the town where the next campaign step expects it. A crossing
+        // under way owns him as well, though it runs inside IDLE.
+        if (!OverseerDecisions::QuestDriveMayTakeCampaignLeader(campaignActive, crossing))
         {
             if (_questCampaignWaitSaid.insert(leaderName).second)
             {
@@ -30414,6 +30419,16 @@ private:
         auto const it = _dungeonRunCoordinators.find(family);
         return it != _dungeonRunCoordinators.end() &&
                it->second.phase != DungeonRunPhase::Idle;
+    }
+
+    // Is this family's campaign crossing to another continent? Asked apart from
+    // the phase because the crossing runs inside IDLE: from the first step
+    // toward the berth (`crossingSince`) until nobody is aboard any more.
+    bool FamilyCrossing(std::string const& family) const
+    {
+        auto const it = _dungeonRunCoordinators.find(family);
+        return it != _dungeonRunCoordinators.end() &&
+               (it->second.crossingSince != 0 || it->second.crossingPassengers);
     }
 
     // THE ONLY PLACE A STAGING AIM IS BUILT, AND THEREFORE THE ONLY PLACE THE
