@@ -26146,16 +26146,16 @@ private:
             {
                 // If the character recently used spirit healer (within 10 min),
                 // prefer corpse run to avoid stacking Resurrection Sickness.
-                bool const recentlyUsedSpiritHealer = [&]() -> bool
+                int64 const since = [&]() -> int64
                 {
                     auto const it = g_recoveryMarks.find(LowerName(name));
                     if (it != g_recoveryMarks.end() && it->second.last_spirit_healer != 0)
                     {
-                        int64 const since = time(nullptr) - it->second.last_spirit_healer;
-                        return since < 600; /* 10 minutes */
+                        return time(nullptr) - it->second.last_spirit_healer;
                     }
-                    return false;
+                    return 0;
                 }();
+                bool const recentlyUsedSpiritHealer = since > 0 && since < 600; /* 10 minutes */
                 if (recentlyUsedSpiritHealer)
                 {
                     LOG_INFO("module.overseer",
