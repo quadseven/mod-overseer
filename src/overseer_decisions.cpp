@@ -14886,6 +14886,20 @@ HearthRegroupStep HearthRegroupStepFor(bool inHearthSet, float yardsFromInn, boo
     return HearthRegroupStep::Travel;
 }
 
+bool CrossingMemberHearths(bool onOriginMap, bool aboard, HomeBind const& bind,
+                           uint32_t originMap, float memberToBerthYards, float berthX,
+                           float berthY, float savesYards)
+{
+    if (!onOriginMap || aboard || !bind.known || bind.mapId != originMap)
+        return false;
+    if (!(memberToBerthYards >= 0.f) || !(savesYards >= 0.f))
+        return false;
+    float const dx = bind.x - berthX;
+    float const dy = bind.y - berthY;
+    float const innToBerth = std::sqrt(dx * dx + dy * dy);
+    return memberToBerthYards - innToBerth >= savesYards;
+}
+
 char const* HearthRegroupStepWord(HearthRegroupStep step)
 {
     switch (step)

@@ -29769,6 +29769,12 @@ private:
         // proof that a route still existed, with no identity and no expiry, so
         // a transport that was removed or rerouted would have left a leader
         // walking at a place nothing sailed from any more.
+        // THE CROSSING'S OWN HEARTHS (OverseerDecisions::CrossingMemberHearths):
+        // casts asked per member, and the step last said per member so each line
+        // is said once. Dropped for a member the moment the rule no longer asks
+        // it to hearth, which is also what a hearth that landed looks like.
+        std::map<std::string, unsigned> crossingHearthAttempts;
+        std::map<std::string, std::string> crossingHearthSaid;
         uint32 crossingRouteEntry{0};
         uint32 crossingOriginMap{0};
         uint32 crossingDestinationMap{0};
@@ -36080,6 +36086,135 @@ private:
         return route;
     }
 
+    // THE CROSSING'S HEARTHS (2026-09-27). See
+    // OverseerDecisions::CrossingMemberHearths for what was measured. Every
+    // member the rule names is driven through the same cast the hearth regroup
+    // uses (ExitFailureHearthStep, then DoHearth or a hold first), bounded by
+    // EXIT_HEARTH_ATTEMPTS. True while the LEADER is the one hearthing, so the
+    // caller leaves the crossing unread for that poll; a follower's cast never
+    // holds the leader's walk.
+    bool CrossingHearthsHoldLeader(DungeonRunCoordinatorState& coord, CrossingRoute const& route,
+                                   std::string const& leaderName,
+                                   std::vector<std::string> const& members)
+    {
+        if (!route.world.berthKnown)
+            return false;
+        std::vector<std::string> names{leaderName};
+        for (std::string const& name : members)
+            if (name != leaderName)
+                names.push_back(name);
+
+        bool leaderBusy = false;
+        for (std::string const& name : names)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            auto const forget = [&]() {
+                coord.crossingHearthAttempts.erase(name);
+                coord.crossingHearthSaid.erase(name);
+            };
+            if (!SteerableAI(bot) || !bot->IsInWorld())
+            {
+                forget();
+                continue;
+            }
+            OverseerDecisions::HomeBind bind;
+            bind.known = true;
+            bind.mapId = static_cast<uint32_t>(bot->m_homebindMapId);
+            bind.areaId = static_cast<uint32_t>(bot->m_homebindAreaId);
+            bind.x = bot->m_homebindX;
+            bind.y = bot->m_homebindY;
+            bind.z = bot->m_homebindZ;
+            bool aboard = false;
+            if (Transport* onBoard = bot->GetTransport())
+                aboard = onBoard->ToMotionTransport() != nullptr;
+            bool const onOrigin = bot->GetMapId() == route.world.originMap;
+            float const toBerth =
+                onOrigin ? bot->GetExactDist2d(route.berthX, route.berthY) : -1.f;
+            if (!OverseerDecisions::CrossingMemberHearths(onOrigin, aboard, bind,
+                                                          route.world.originMap, toBerth,
+                                                          route.berthX, route.berthY))
+            {
+                forget();
+                continue;
+            }
+
+            OverseerDecisions::ExitHearthFacts cast;
+            cast.inWorld = true;
+            cast.onInsideMap = true;
+            uint32 const spellId = HearthstoneSpellOf(bot);
+            cast.alive = bot->IsAlive();
+            cast.carriesStone = spellId != 0;
+            cast.onCooldown = spellId && bot->HasSpellCooldown(spellId);
+            cast.inCombat = bot->IsInCombat();
+            cast.moving = bot->isMoving();
+            cast.pending = HearthPendingFor(name);
+            cast.attempts = coord.crossingHearthAttempts[name];
+            OverseerDecisions::ExitHearthStep const step =
+                OverseerDecisions::ExitFailureHearthStep(cast);
+
+            float const innToBerth = std::hypot(bind.x - route.berthX, bind.y - route.berthY);
+            std::string const word = OverseerDecisions::ExitHearthStepWord(step);
+            bool const changed = coord.crossingHearthSaid[name] != word;
+            coord.crossingHearthSaid[name] = word;
+            bool const isLeader = name == leaderName;
+
+            switch (step)
+            {
+                case OverseerDecisions::ExitHearthStep::Cast:
+                {
+                    char const* status = "error";
+                    std::string evidence;
+                    ++coord.crossingHearthAttempts[name];
+                    char const* const refusal =
+                        DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+                    if (!refusal || !*refusal)
+                        LOG_WARN("module.overseer",
+                                 "overseer: crossing hearth - '{}' is {:.0f} yards from the "
+                                 "berth for '{}' and its stone is bound {:.0f} yards from it, so "
+                                 "it hearths rather than walks (attempt {} of {})",
+                                 name, toBerth, route.transportName, innToBerth,
+                                 coord.crossingHearthAttempts[name],
+                                 OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                    else
+                        LOG_WARN("module.overseer",
+                                 "overseer: crossing hearth - '{}' could not hearth: {} "
+                                 "(attempt {} of {})",
+                                 name, refusal, coord.crossingHearthAttempts[name],
+                                 OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                    leaderBusy = leaderBusy || isLeader;
+                    break;
+                }
+                case OverseerDecisions::ExitHearthStep::StopFirst:
+                {
+                    CastHoldReport report;
+                    HoldStillAndReport(bot, name, "hearth", report);
+                    if (changed)
+                        LOG_INFO("module.overseer",
+                                 "overseer: crossing hearth - '{}' is moving, so it is held "
+                                 "still first and the hearth is cast on a later poll",
+                                 name);
+                    leaderBusy = leaderBusy || isLeader;
+                    break;
+                }
+                case OverseerDecisions::ExitHearthStep::Waiting:
+                    leaderBusy = leaderBusy || isLeader;
+                    break;
+                case OverseerDecisions::ExitHearthStep::Impossible:
+                case OverseerDecisions::ExitHearthStep::NotInside:
+                    if (changed)
+                        LOG_INFO("module.overseer",
+                                 "overseer: crossing hearth - '{}' would hearth to an inn "
+                                 "{:.0f} yards from the berth rather than walk {:.0f}, and "
+                                 "cannot: {}. It walks",
+                                 name, innToBerth, toBerth,
+                                 OverseerDecisions::ExitHearthImpossibleReason(
+                                     cast, OverseerDecisions::EXIT_HEARTH_ATTEMPTS));
+                    break;
+            }
+        }
+        return leaderBusy;
+    }
+
     // ACT ON THE STEP. Three actions move the leader: Walk aims him at the
     // berth, Board steps him onto a docked deck, WalkOff steps him onto the far
     // landing. The rest say something and, from the berth on, keep him HELD:
@@ -39982,6 +40117,13 @@ private:
                 CrossingRoute route = ReadCrossingFromWorld(
                     coord, members, leaderName, leader, crossingOrigin,
                     portal->outsideMapId, door ? door->x : 0.f, door ? door->y : 0.f);
+
+                // A MEMBER FAR FROM THE BERTH AND BOUND NEAR IT HEARTHS FIRST
+                // (2026-09-27). While the leader's own stone is being used, the
+                // crossing is not read: aiming him at the berth would walk him
+                // out of the cast.
+                if (CrossingHearthsHoldLeader(coord, route, leaderName, members))
+                    return;
 
                 // THE BACKSTOP IS APPLIED TO THE READING, not inside it: the
                 // clock is the caller's and the verdict is the decision's.
