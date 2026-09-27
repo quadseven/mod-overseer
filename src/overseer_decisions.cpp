@@ -1319,6 +1319,19 @@ std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceI
            " player(s) in it, and the core resets only an empty instance: " + names;
 }
 
+std::string ResetGroupShapeBlocker(ResetGroupShape const& shape, std::string const& leaderName)
+{
+    if (shape.battleground || shape.battlefield)
+        return "this is a battleground or battlefield group, which "
+               "Group::ResetInstances refuses outright";
+    if (shape.finderGroup)
+        return "";
+    if (!shape.leaderLeads)
+        return "'" + leaderName + "' is not the group leader, and the instance a "
+               "grouped character lands in is chosen from the GROUP leader's bind";
+    return "";
+}
+
 ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& route,
                             ApproachLimits const& limits)
 {
