@@ -19,9 +19,11 @@ void Check(char const* what, bool got, bool want)
 void ACampaignKeepsTheLeaderForItsFamily()
 {
     using OverseerDecisions::QuestDriveMayTakeCampaignLeader;
-    Check("idle campaign", QuestDriveMayTakeCampaignLeader(false), true);
-    Check("reset", QuestDriveMayTakeCampaignLeader(true), false);
-    Check("recovering", QuestDriveMayTakeCampaignLeader(true), false);
+    Check("idle campaign", QuestDriveMayTakeCampaignLeader(false, false), true);
+    Check("reset", QuestDriveMayTakeCampaignLeader(true, false), false);
+    Check("recovering", QuestDriveMayTakeCampaignLeader(true, false), false);
+    // The step aboard releases the berth aim inside IDLE (2026-09-27).
+    Check("idle but crossing", QuestDriveMayTakeCampaignLeader(false, true), false);
 }
 
 void QuestTargetsStayWithinTheYoungestMembersLevelGap()
