@@ -17377,6 +17377,9 @@ struct RevivedSickGroundFacts
     bool hearthReady{false};
     // In an inn or a city (the core's resting flag): under guards, never lethal.
     bool resting{false};
+    // A natural guild member rests out its sickness wherever it stands: at
+    // item level 2 to 5 it cannot afford to fight at a quarter of its stats.
+    bool restWhileSick{false};
 };
 RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& facts);
 
@@ -17480,6 +17483,30 @@ enum class GuildTrainingStep
 // interaction distance.
 GuildTrainingStep DecideGuildTraining(unsigned affordable, bool trainerFound, float yards,
                                       float reach);
+
+// ------------------------------- a natural guild member buys its own weapon --
+//
+// Measured on wow-dev (2026-09-28): natural guild members at levels 10 to 16
+// wore item level 2 to 5 gear and died about 550 times in 30 minutes, to
+// creatures at or up to two levels above them. Nothing sends one to a vendor.
+// A weapon first, as the family's town errand does (wow-overseer#398).
+
+struct WeaponOffer
+{
+    uint32_t itemLevel{0};
+    uint32_t price{0};   // copper
+    float yards{0.f};    // to the vendor
+};
+
+// Index of the offer to walk to, or -1. The best item level that beats the
+// worn main hand by at least `minGain` and costs no more than the purse less
+// `reserve`; on a tie the cheaper, then the nearer.
+int ChooseWeaponOffer(std::vector<WeaponOffer> const& offers, uint32_t wornItemLevel,
+                      uint64_t purse, uint64_t reserve, uint32_t minGain);
+
+// The weapon skill spell a weapon master teaches for an item subclass
+// (ItemSubclassWeapon), or 0 for a subclass no weapon master sells.
+uint32_t WeaponSkillSpellFor(uint32_t weaponSubclass);
 
 // Drop marks older than `minutes` before `now`.
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes);
