@@ -11269,6 +11269,34 @@ bool IsLearnRow(std::string const& command)
     return !words.empty() && words[0] == "use";
 }
 
+bool IsWeaponTrainRow(std::string const& command)
+{
+    std::vector<std::string> const words = LearnWords(command);
+    return !words.empty() && words[0] == WEAPON_TRAIN_VERB;
+}
+
+WeaponTrainRequest ParseWeaponTrainRequest(std::string const& command)
+{
+    WeaponTrainRequest request;
+    std::vector<std::string> const words = LearnWords(command);
+    uint32_t skill = 0;
+    if (words.size() != 2 || words[0] != WEAPON_TRAIN_VERB ||
+        !LearnKeyed(words[1], "skill", skill) || skill == 0)
+    {
+        request.error = WeaponTrainRefusal::Malformed;
+        return request;
+    }
+    request.skill = skill;
+    return request;
+}
+
+bool WeaponTrainRefusalRetryable(std::string const& reason)
+{
+    return reason == WeaponTrainRefusal::NoTrainer ||
+           reason == WeaponTrainRefusal::NotTaught ||
+           reason == WeaponTrainRefusal::Dead;
+}
+
 LearnRequest ParseLearnRequest(std::string const& command)
 {
     LearnRequest request;
