@@ -57065,6 +57065,8 @@ private:
                                      char const*& status, std::string& out)
     {
         namespace R = OverseerDecisions::WeaponTrainRefusal;
+        if (!who)
+            return "no character";
         OverseerDecisions::WeaponTrainRequest const request =
             OverseerDecisions::ParseWeaponTrainRequest(command);
         auto refuse = [&](char const* reason) -> char const*
@@ -57092,6 +57094,8 @@ private:
 
         for (Creature* npc : nearby)
         {
+            if (!npc || !npc->IsInWorld())
+                continue;
             // THE GATE, the core's own: the same call the trainer handler makes.
             if (!who->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
                 continue;
@@ -57116,7 +57120,16 @@ private:
                   << ",\"money_after\":" << who->GetMoney() << "}";
                 out = o.str();
                 if (!learned)
+                {
+                    // Said loudly when money moved and the skill did not, so a
+                    // charge without a skill is seen before the row is retried.
+                    if (who->GetMoney() != moneyBefore)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' paid {} copper at '{}' and was NOT taught "
+                                 "weapon skill {}", who->GetName(),
+                                 moneyBefore - who->GetMoney(), npc->GetName(), request.skill);
                     return R::NotTaught;
+                }
                 LOG_INFO("module.overseer",
                          "overseer: '{}' LEARNED weapon skill {} from '{}' (creature {}, "
                          "spell {}) for {} copper of its own - bought, not granted",
