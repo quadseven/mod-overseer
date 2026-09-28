@@ -27830,7 +27830,9 @@ private:
                 if (equipResult == EQUIP_ERR_OK)
                 {
                     bot->SwapItem(item->GetPos(), dest);
-                    worn2 = Player::IsEquipmentPos(item->GetPos());
+                    // Read off the destination slot itself, not the moved item.
+                    Item* const there = bot->GetItemByPos(dest);
+                    worn2 = there && there->GetEntry() == itemId;
                 }
             }
         LOG_INFO("module.overseer",
