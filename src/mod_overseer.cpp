@@ -327,6 +327,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -25779,7 +25780,12 @@ private:
             // into.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::NotFalling)
             {
-                LOG_WARN("module.overseer",
+                // ONCE PER PLACE, AT INFO (#775): nothing is wrong and nothing
+                // is done, so it is a note about the ground and not a warning.
+                if (!_terrainNoted.insert(OverseerDecisions::TerrainNoteCell(
+                        bot->GetMapId(), reading.x, reading.y)).second)
+                    continue;
+                LOG_INFO("module.overseer",
                          "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
                          "reads {:.1f} yards under a surface at z {:.1f}, with {} and "
                          "{}, but it is NOT FALLING, so it is standing on (or walking "
@@ -26036,7 +26042,13 @@ private:
             {
                 if (onTheGround)
                 {
-                    LOG_ERROR("module.overseer",
+                    // THE DETECTOR BEING WRONG IS NOT AN ERROR (#775). Said at
+                    // INFO and once per place for the process; the loud ERROR
+                    // below stays for the reading that cannot tell.
+                    if (!_terrainNoted.insert(OverseerDecisions::TerrainNoteCell(
+                            fromMap, fromX, fromY)).second)
+                        continue;
+                    LOG_INFO("module.overseer",
                               "overseer: '{}' at map {} position ({:.1f}, {:.1f}, {:.1f}) "
                               "reads {:.1f} yards under a surface at z {:.1f}, but this "
                               "module finds ground at its own feet ({}), so it is "
@@ -62304,6 +62316,8 @@ private:
     // OverseerDecisions::TerrainRecoveryStep, where it is tested without a
     // world.
     std::map<std::string, OverseerDecisions::TerrainRecoveryState> _terrainRecovery;
+    // Places a "nothing is being moved" terrain note was already said about (#775).
+    std::unordered_set<uint64_t> _terrainNoted;
 
     // Names currently proven below the world. This is a world-thread-only
     // publication between terrain recovery and the travel/quest/dungeon
