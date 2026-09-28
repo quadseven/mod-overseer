@@ -7442,9 +7442,9 @@ private:
     static bool MakesWayForAClient(std::string const& name,
                                    std::set<std::string> const& streamClaims)
     {
-        uint32 account = 0;
-        if (ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(name))
-            account = sCharacterCache->GetCharacterAccountIdByGuid(guid);
+        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(name);
+        uint32 const account =
+            guid.IsEmpty() ? 0 : sCharacterCache->GetCharacterAccountIdByGuid(guid);
         return OverseerDecisions::HeadlessMakesWayForAClient(
             streamClaims.count(name) > 0,
             account != 0 && sWorldSessionMgr->FindSession(account) != nullptr);
