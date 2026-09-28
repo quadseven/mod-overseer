@@ -262,6 +262,8 @@
 #include "TransportMgr.h"
 #include "World.h"
 #include "WorldSession.h"
+// sWorldSessionMgr->FindSession: is a real client open on an account (infra#4835).
+#include "WorldSessionMgr.h"
 #include "TradeData.h"
 #include "Opcodes.h"
 #include "WorldPacket.h"
@@ -7401,6 +7403,57 @@ private:
         sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
     }
 
+    // Unknown until asked, then present or absent. overseer_stream belongs to
+    // the map and the stream agent, not to this module's schema, so a world
+    // without it simply has no streams and nothing ever makes way for one.
+    int8 _streamTablePresent{-1};
+
+    // The characters the stream agent is bringing a client up for, or holding
+    // one for, right now. See OverseerDecisions::StreamRowClaimsAClient.
+    std::set<std::string> StreamClaims()
+    {
+        std::set<std::string> claimed;
+        if (_streamTablePresent < 0)
+            _streamTablePresent =
+                SchemaHasColumns("overseer_stream", "'character','state','updated_at'", 3) ? 1 : 0;
+        if (_streamTablePresent != 1)
+            return claimed;
+        // `character` is backticked: CHARACTER is a reserved word in MySQL 8.
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT `character`, state, TIMESTAMPDIFF(SECOND, updated_at, NOW()) "
+            "FROM overseer_stream WHERE state IN ('starting', 'live')");
+        if (!result)
+            return claimed;
+        do
+        {
+            Field* row = result->Fetch();
+            if (OverseerDecisions::StreamRowClaimsAClient(row[1].Get<std::string>(),
+                                                          row[2].Get<int64>()))
+                claimed.insert(row[0].Get<std::string>());
+        } while (result->NextRow());
+        return claimed;
+    }
+
+    // Is a client coming for this character, so that a headless copy of it must
+    // make way (infra#4835)? A stream row claiming it, or a real session open
+    // on its account. Bot sessions are never added to the session map, so a
+    // session found there is a client: logging in, at the character screen, or
+    // in the world.
+    static bool MakesWayForAClient(std::string const& name,
+                                   std::set<std::string> const& streamClaims)
+    {
+        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(name);
+        uint32 const account =
+            guid.IsEmpty() ? 0 : sCharacterCache->GetCharacterAccountIdByGuid(guid);
+        return OverseerDecisions::HeadlessMakesWayForAClient(
+            streamClaims.count(name) > 0,
+            account != 0 && sWorldSessionMgr->FindSession(account) != nullptr);
+    }
+
+    // Headless characters currently held out of the world for a client, so the
+    // hand-over is logged once each way rather than every roster poll.
+    std::set<std::string> _madeWayForClient;
+
     void KeepRosterAttended()
     {
         // The whole list is read every pass, because the event hooks need the
@@ -7411,6 +7464,7 @@ private:
         // every row and it is a string parse, not a lookup.
         HeadlessRosterCache() = HeadlessRoster();
         std::vector<std::string> const& headless = HeadlessRosterCache();
+        std::set<std::string> const streamClaims = StreamClaims();
 
         for (std::string const& name : names)
         {
@@ -7426,8 +7480,25 @@ private:
                 // and there is nothing to do. With this character named in
                 // Overseer.HeadlessRoster it is the state this key exists to
                 // end: log it in as a headless bot so it plays.
+                //
+                // UNLESS A CLIENT IS COMING FOR IT (infra#4835). Logging it in
+                // now would put a bot in the world under an arriving client,
+                // which is the crash the headless list was built to avoid.
                 if (OverseerDecisions::NamedInHeadlessRoster(name, headless))
                 {
+                    if (MakesWayForAClient(name, streamClaims))
+                    {
+                        if (_madeWayForClient.insert(name).second)
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' is on the headless roster but a client "
+                                     "is coming for it - leaving it logged out for the client",
+                                     name);
+                        continue;
+                    }
+                    if (_madeWayForClient.erase(name))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' no longer has a client coming - handing it "
+                                 "back to headless play", name);
                     SpawnHeadlessRosterBot(name);
                 }
                 continue;
@@ -7442,6 +7513,21 @@ private:
 
             if (session->IsBot())
             {
+                // A CLIENT IS COMING FOR IT (infra#4835): log the headless
+                // copy out now, on the world thread, so the client finds the
+                // character free instead of mod-playerbots' secure login
+                // evicting it mid-login.
+                if (MakesWayForAClient(name, streamClaims))
+                {
+                    _madeWayForClient.insert(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is in the world headless and a client is "
+                             "coming for it - logging the headless copy out so the "
+                             "client can take the character", name);
+                    EvictHeadlessBot(player);
+                    continue;   // player is freed
+                }
+
                 if (OverseerDecisions::MayPlayHeadless(
                         name, RosterRequiresAClient(), headless))
                 {
