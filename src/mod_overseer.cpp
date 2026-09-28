@@ -13696,13 +13696,23 @@ private:
     {
         if (seconds <= 0 || !who)
             return 0;
+        // Each name is escaped by Esc() and, besides, must be a character name
+        // this realm can hold (letters, at most twelve) or it is left out.
+        auto const plain = [](std::string const& name)
+        {
+            return !name.empty() && name.size() <= 12 &&
+                   std::all_of(name.begin(), name.end(),
+                               [](unsigned char ch) { return std::isalpha(ch) != 0; });
+        };
+        if (!plain(who->GetName()))
+            return 0;
         std::string names = "'" + Esc(who->GetName()) + "'";
         if (Group* const group = who->GetGroup())
         {
             for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
             {
                 Player* const member = ref->GetSource();
-                if (member && member != who)
+                if (member && member != who && plain(member->GetName()))
                     names += ",'" + Esc(member->GetName()) + "'";
             }
         }
