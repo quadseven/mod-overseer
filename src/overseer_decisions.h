@@ -5627,6 +5627,28 @@ char const* QuestItemHoldWord(QuestItemHold hold);
 // always has.
 char const* SellQuestRefusal(uint32_t itemClass, QuestItemHold hold);
 
+// ------------------------------------------------- junk to sell (#787) --
+//
+// A guild member who wants to buy a weapon often has no room in its bags.
+// Before the buy, sell the grey items first, lowest price first. Never sell
+// a protected item (equipped, equipped upgrade, or a quest item).
+
+// One item the member may sell to a vendor. The caller reads the member's
+// bags and hands each stack with a sell price; this function decides which
+// to sell first to make room.
+struct JunkItem
+{
+    uint32_t itemEntry{0};     // the ItemTemplate entry id
+    uint32_t sellPrice{0};     // copper, from ItemTemplate::SellPrice
+    uint32_t quality{0};       // ItemTemplate::Quality: 0 poor, 1 common, ...
+    bool isProtected{false};    // equipped, equipped upgrade, or quest item
+};
+
+// Indexes of the items to sell to a vendor, in the order they should be
+// offered. Grey items (quality 0) are chosen first; on a tie, lowest price
+// first. Protected items are never chosen.
+std::vector<size_t> ChooseJunkToSell(std::vector<JunkItem> const& items, size_t slotsNeeded);
+
 // --------------------------------------- destroy what nothing will buy (#614) --
 //
 // A released quest item with no sell price can never leave the bags by sale:

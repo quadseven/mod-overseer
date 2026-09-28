@@ -11,6 +11,7 @@
 
 #include "overseer_decisions.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include <iterator>
@@ -4833,6 +4834,55 @@ char const* SellQuestRefusal(uint32_t itemClass, QuestItemHold hold)
     if (itemClass == 12 && hold != QuestItemHold::Released)
         return "item is a quest item";
     return "";
+}
+
+// ------------------------------------------------- junk to sell (#787) --
+
+std::vector<size_t> ChooseJunkToSell(std::vector<JunkItem> const& items, size_t slotsNeeded)
+{
+    std::vector<size_t> result;
+    if (slotsNeeded == 0)
+        return result;
+
+    // Build a list of candidates: non-protected, grey quality items.
+    // Keep track of original indices.
+    struct Candidate
+    {
+        size_t index;
+        uint32_t price;
+    };
+    std::vector<Candidate> candidates;
+
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        JunkItem const& item = items[i];
+        // Never sell protected items (equipped, upgrade, or quest item).
+        if (item.isProtected)
+            continue;
+        // Only grey items (quality 0) are junk.
+        if (item.quality != 0)
+            continue;
+        candidates.push_back({i, item.sellPrice});
+    }
+
+    // Sort candidates: grey quality first (already guaranteed), then lowest
+    // price first. Ties go to the lower index to keep the answer stable
+    // regardless of input order.
+    std::sort(candidates.begin(), candidates.end(),
+              [](Candidate const& a, Candidate const& b) {
+                  if (a.price != b.price)
+                      return a.price < b.price;
+                  return a.index < b.index;
+              });
+
+    // Take the first N candidates (lowest price first).
+    for (size_t i = 0; i < candidates.size() && i < slotsNeeded; ++i)
+        result.push_back(candidates[i].index);
+
+    // Sort the result by original index so the caller can sell in a stable order.
+    std::sort(result.begin(), result.end());
+
+    return result;
 }
 
 // --------------------------------------- destroy what nothing will buy (#614) --
