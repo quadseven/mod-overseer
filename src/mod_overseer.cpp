@@ -27829,6 +27829,14 @@ private:
             return;
         }
 
+        // An expired bench entry is dropped as the member's offers are read.
+        {
+            std::map<uint32, std::time_t>& bench = _guildWeaponBenched[name];
+            std::time_t const now = std::time(nullptr);
+            for (auto it = bench.begin(); it != bench.end();)
+                it = it->second <= now ? bench.erase(it) : std::next(it);
+        }
+
         // 2. THE BEST WEAPON A VENDOR ON ITS MAP SELLS IT.
         std::vector<OverseerDecisions::WeaponOffer> offers;
         std::vector<std::pair<NpcSpot const*, uint32>> sources;
