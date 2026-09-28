@@ -13476,6 +13476,18 @@ bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
     return inWorld && isBotSession && MayPlayHeadless(name, requireClient, headless);
 }
 
+bool StreamRowClaimsAClient(std::string const& state, long long secondsSinceWritten)
+{
+    if (state != "starting" && state != "live")
+        return false;
+    return secondsSinceWritten <= STREAM_CLAIM_SECONDS;
+}
+
+bool HeadlessMakesWayForAClient(bool streamRowClaimsAClient, bool realSessionOnAccount)
+{
+    return streamRowClaimsAClient || realSessionOnAccount;
+}
+
 std::vector<FamilyRoster> PartitionRosterByFamily(std::vector<FamilyMember> const& rows)
 {
     std::vector<FamilyRoster> out;

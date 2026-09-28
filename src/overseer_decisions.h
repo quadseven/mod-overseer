@@ -15718,6 +15718,10 @@ DrowningHoldAction DrowningHoldDecision(DrowningHoldFacts const& facts,
 // which. Spawning is gated on the list alone and never on RequireClient, so
 // switching the eviction off cannot silently start spawning the characters
 // that have clients coming.
+//
+// Since infra#4835 the either/or is decided per moment rather than per name: a
+// listed character makes way while a client is coming for it. See
+// HeadlessMakesWayForAClient.
 
 // The names in a comma-separated config value, trimmed, in the order given.
 //
@@ -15872,6 +15876,47 @@ bool RosterCharacterIsSteerable(bool clientAttached, bool inWorld,
                                 bool isBotSession, std::string const& name,
                                 bool requireClient,
                                 std::vector<std::string> const& headless);
+
+// A HEADLESS CHARACTER MAKES WAY FOR A REAL CLIENT (infra#4835).
+//
+// The family heads used to be kept off Overseer.HeadlessRoster, because a real
+// client logging in as a character already in the world as a bot is the crash
+// that removed the original KeepRosterOnline. So a head was in the world only
+// while somebody watched his stream, and #736 lets no member lead in his place:
+// with nobody watching, the whole family stood still.
+//
+// "Watched or played, never both" still holds. It is decided per moment rather
+// than per name: a listed character plays headless UNTIL a client is coming for
+// it, is logged out so the client finds the character free, and is logged back
+// in headless once the client has gone.
+//
+// Two signals say a client is coming, and either is enough:
+//   - the stream agent's own row. The agent writes `starting` before it
+//     launches a client and keeps `live` fresh while it holds one, so a head is
+//     logged out at least one roster poll before the launched client can reach
+//     the character screen (a login takes 45 to 60 seconds on that box).
+//   - a real session already open on the character's account, for a client
+//     the agent did not start. Bot sessions are never in the session map, so
+//     any session found there is a person or the agent at the login screen.
+//
+// A `starting` row is written once, and a login may queue for the screen for
+// up to four minutes before it runs, so the row is believed for
+// STREAM_CLAIM_SECONDS after its last write. `live` rows are re-stamped by the
+// agent every few seconds. An abandoned row therefore keeps a head out of the
+// world for ten minutes at most, never for the seven days a recording's
+// mandate runs. `requested` is not enough on its own: the viewer's page keeps
+// that row fresh whether or not any agent is running to serve it, and the
+// family must not stall behind a request nobody can answer.
+constexpr long long STREAM_CLAIM_SECONDS = 600;
+
+// Does this overseer_stream row say a client is on its way or already in
+// charge? `secondsSinceWritten` is the age of the row's updated_at; a negative
+// age (a clock skew) counts as fresh, the direction that keeps a character
+// from being logged in under an arriving client.
+bool StreamRowClaimsAClient(std::string const& state, long long secondsSinceWritten);
+
+// Should a character on the headless roster make way for a client now?
+bool HeadlessMakesWayForAClient(bool streamRowClaimsAClient, bool realSessionOnAccount);
 
 // ------------------------------------------- the story of a notable item (#567) --
 //

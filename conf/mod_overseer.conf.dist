@@ -272,15 +272,25 @@
 #                     is not in the world, which is the half that was deleted
 #                     with KeepRosterOnline when the camera rule arrived.
 #
-#                     THE ONE RULE: never name a character that a client logs
-#                     in. These names must be disjoint from whatever the client
-#                     host launches. A real client logging in as a character
-#                     that is already in the world as a bot is the crash that
-#                     removed the original KeepRosterOnline - mod-playerbots'
-#                     secure login force-evicts the bot holding that guid while
-#                     this module's drives are still steering it by name. A
-#                     character is either watched or played, never both, and
-#                     this list is where that is decided.
+#                     THE ONE RULE: a character is either watched or played,
+#                     never both at once. A real client logging in as a
+#                     character that is already in the world as a bot is the
+#                     crash that removed the original KeepRosterOnline -
+#                     mod-playerbots' secure login force-evicts the bot holding
+#                     that guid while this module's drives are still steering
+#                     it by name.
+#
+#                     A NAME HERE MAKES WAY FOR A CLIENT (infra#4835). While
+#                     its overseer_stream row is 'starting' or 'live' and was
+#                     written in the last 10 minutes, or while a real client
+#                     session is open on its account, it is not logged in
+#                     headless, and a headless copy already in the world is
+#                     logged out. When the client has gone it is logged back
+#                     in headless. So a character the stream agent logs in on
+#                     demand, like a family head, may be listed here and plays
+#                     whenever nobody is watching. Anything else that logs a
+#                     client in without a stream row is covered only by the
+#                     session check, which runs every roster poll (5s).
 #
 #                     This is why spawning is gated on this list alone and
 #                     never on RequireClient: switching the eviction off must
