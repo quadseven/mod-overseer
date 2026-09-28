@@ -15020,6 +15020,35 @@ bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool ha
     return !onRoster && botSession && !playerClient && hasAI;
 }
 
+int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, float x, float y,
+                       float maxYards)
+{
+    int best = -1;
+    float bestD2 = maxYards * maxYards;
+    for (std::size_t i = 0; i < spots.size(); ++i)
+    {
+        if (spots[i].mapId != mapId)
+            continue;
+        float const dx = spots[i].x - x;
+        float const dy = spots[i].y - y;
+        float const d2 = dx * dx + dy * dy;
+        if (d2 <= bestD2)
+        {
+            bestD2 = d2;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+GuildTrainingStep DecideGuildTraining(unsigned affordable, bool trainerFound, float yards,
+                                      float reach)
+{
+    if (!affordable || !trainerFound)
+        return GuildTrainingStep::Nothing;
+    return yards <= reach ? GuildTrainingStep::Learn : GuildTrainingStep::Walk;
+}
+
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes)
 {
     int64_t const oldest = now - int64_t(minutes) * 60;

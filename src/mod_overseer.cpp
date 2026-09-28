@@ -6990,6 +6990,7 @@ public:
             // no reason this needs a different poll interval.
             DriveStuckRevival();
             DriveGuildGhostRecovery();
+            DriveGuildTraining();
             // Same cadence again, and after the revival drive on purpose: a
             // character resurrected on this tick is alive by the time this one
             // asks, so a party that just recovered from a wipe inside the
@@ -27268,6 +27269,173 @@ private:
         }
     }
 
+    // ---------------------------------- a natural guild member's own trainer --
+    //
+    // A natural guild member is granted no spells (playerbots patch 0024), and
+    // nothing sent one to a trainer. Measured on wow-dev (2026-09-27): members
+    // at levels 10 to 16 knew 4 to 7 spells where a class trainer sells 12 to
+    // 15 by level 12 for about 25 silver, and they held 38 to 55 silver. 92 of
+    // them died 603 times in 45 minutes to hostiles 0 to 3 levels above them:
+    // level-12 characters casting level-1 ranks. So once a minute a member
+    // that can afford a class spell is aimed at the nearest trainer of its
+    // class on its map (the aimed wander, patch 0005), walks there, and buys
+    // what it can afford through the core's Trainer::TeachSpell, which takes
+    // the gold. Nothing is granted.
+    static constexpr float GUILD_TRAINER_WALK_YARDS = 3000.0f;
+    static constexpr float GUILD_TRAINER_REACH_YARDS = 5.0f;
+
+    void LoadClassTrainerSpots()
+    {
+        _classTrainersLoaded = true;
+        for (auto const& spawn : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureData const& data = spawn.second;
+            Trainer::Trainer const* trainer = sObjectMgr->GetTrainer(data.id);
+            if (!trainer || trainer->GetTrainerType() != Trainer::Type::Class)
+                continue;
+            uint8 const cls = static_cast<uint8>(trainer->GetTrainerRequirement());
+            _classTrainerSpots[cls].push_back({data.mapid, data.posX, data.posY});
+            _classTrainerEntries[cls].push_back({data.id, data.posZ});
+        }
+    }
+
+    // Class spells this trainer would teach `bot` now that it has the gold for.
+    static unsigned AffordableClassSpells(Trainer::Trainer* trainer, Player* bot,
+                                          std::vector<uint32>* ids = nullptr)
+    {
+        unsigned n = 0;
+        uint64 money = bot->GetMoney();
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+        {
+            if (!trainer->CanTeachSpell(bot, &spell) || spell.MoneyCost > money)
+                continue;
+            money -= spell.MoneyCost;
+            ++n;
+            if (ids)
+                ids->push_back(spell.SpellId);
+        }
+        return n;
+    }
+
+    void DriveGuildTraining()
+    {
+        std::time_t const now = std::time(nullptr);
+        if (now - _guildTrainingAt < 60)
+            return;
+        _guildTrainingAt = now;
+        std::vector<std::string> const guilds = NaturalGuilds();
+        if (guilds.empty())
+            return;
+        std::vector<uint32> guildIds;
+        for (std::string const& guildName : guilds)
+            if (Guild* guild = sGuildMgr->GetGuildByName(guildName))
+                guildIds.push_back(guild->GetId());
+        if (guildIds.empty())
+            return;
+        if (!_classTrainersLoaded)
+            LoadClassTrainerSpots();
+
+        for (auto const& itr : ObjectAccessor::GetPlayers())
+        {
+            Player* bot = itr.second;
+            if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
+                std::find(guildIds.begin(), guildIds.end(), bot->GetGuildId()) == guildIds.end())
+                continue;
+            std::string const name = bot->GetName();
+            WorldSession const* session = bot->GetSession();
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            if (!OverseerDecisions::GuildGhostDriven(OnRoster(name), session && session->IsBot(),
+                                                    ClientAttached(bot) && !(session && session->IsBot()),
+                                                    botAI != nullptr))
+                continue;
+            if (!bot->IsAlive() || bot->IsInCombat() || bot->GetGroup() || bot->IsInFlight() ||
+                !bot->GetMap() || bot->GetMap()->Instanceable() ||
+                !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                continue;
+
+            // The trainers of its class on its map that would teach it and
+            // are not hostile to it.
+            FactionTemplateEntry const* mine = bot->GetFactionTemplateEntry();
+            std::vector<OverseerDecisions::TrainerSpot> spots;
+            std::vector<std::pair<uint32, float>> entries;
+            auto const& allSpots = _classTrainerSpots[bot->getClass()];
+            auto const& allEntries = _classTrainerEntries[bot->getClass()];
+            for (std::size_t i = 0; i < allSpots.size(); ++i)
+            {
+                if (allSpots[i].mapId != bot->GetMapId())
+                    continue;
+                uint32 const entry = allEntries[i].first;
+                Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
+                CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
+                if (!trainer || !tmpl || !trainer->IsTrainerValidForPlayer(bot))
+                    continue;
+                FactionTemplateEntry const* theirs =
+                    sFactionTemplateStore.LookupEntry(tmpl->faction);
+                if (!mine || !theirs || theirs->IsHostileTo(*mine))
+                    continue;
+                spots.push_back(allSpots[i]);
+                entries.push_back(allEntries[i]);
+            }
+            int const pick = OverseerDecisions::NearestTrainerSpot(
+                spots, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                GUILD_TRAINER_WALK_YARDS);
+            Trainer::Trainer* trainer =
+                pick >= 0 ? sObjectMgr->GetTrainer(entries[pick].first) : nullptr;
+            unsigned const affordable = trainer ? AffordableClassSpells(trainer, bot) : 0;
+            float const yards =
+                pick >= 0 ? bot->GetExactDist2d(spots[pick].x, spots[pick].y) : 0.f;
+            // Standing next to the creature counts as arriving even when the
+            // spawn point is a few yards off.
+            Creature* npc = pick >= 0 ? bot->FindNearestCreature(entries[pick].first,
+                                                                 GUILD_TRAINER_REACH_YARDS * 3)
+                                      : nullptr;
+            OverseerDecisions::GuildTrainingStep const step = OverseerDecisions::DecideGuildTraining(
+                affordable, trainer != nullptr, npc ? 0.f : yards, GUILD_TRAINER_REACH_YARDS);
+
+            if (step == OverseerDecisions::GuildTrainingStep::Nothing)
+            {
+                _guildTrainingSentTo.erase(name);
+                continue;
+            }
+            uint32 const entry = entries[pick].first;
+            if (step == OverseerDecisions::GuildTrainingStep::Walk)
+            {
+                botAI->rpgInfo.ChangeToWanderNpc(
+                    entry, WorldPosition(bot->GetMapId(), spots[pick].x, spots[pick].y,
+                                         entries[pick].second, 0.f));
+                if (_guildTrainingSentTo[name] != entry)
+                {
+                    _guildTrainingSentTo[name] = entry;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' (level {}) can afford {} class spell(s) and walks "
+                             "{:.0f} yards to trainer {} to learn them",
+                             name, bot->GetLevel(), affordable, yards, entry);
+                }
+                continue;
+            }
+
+            if (!npc || !bot->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
+                continue;
+            std::vector<uint32> ids;
+            AffordableClassSpells(trainer, bot, &ids);
+            uint64 const before = bot->GetMoney();
+            unsigned learned = 0;
+            for (uint32 spellId : ids)
+            {
+                uint64 const had = bot->GetMoney();
+                trainer->TeachSpell(npc, bot, spellId);
+                if (bot->GetMoney() < had)
+                    ++learned;
+            }
+            _guildTrainingSentTo.erase(name);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) learned {} of {} class spell(s) at trainer {} "
+                     "for {} copper of its own",
+                     name, bot->GetLevel(), learned, ids.size(), entry,
+                     before - bot->GetMoney());
+        }
+    }
+
     // The death is over: the character is alive again.
     void EndGhostRecovery(PlayerbotAI* botAI, std::string const& name)
     {
@@ -35706,8 +35874,7 @@ private:
         run.why = why;
         run.phase = GuildRunPhase::Leaving;
         run.leavingSince = now;
-        Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
-        Group* const group = tank ? tank->GetGroup() : nullptr;
+        Group* const group = RunGroup(run.groupGuid);
         // Still queued (a group that was never taken in): out of the queue
         // first, since a disbanded group's queue entry is not the core's to
         // forget on its own.
@@ -35760,11 +35927,38 @@ private:
     }
 
     // False once the run's row is ended.
+    // THE RUN'S GROUP, BY ITS OWN GUID (infra#4799). It used to be read off
+    // the tank, and a tank lost between maps took the group with it: the run
+    // read "not entered", nobody was taken back out, and the group was never
+    // disbanded, so four members stayed inside Ragefire Chasm.
+    static Group* RunGroup(uint64 groupGuid)
+    {
+        if (!groupGuid)
+            return nullptr;
+        return sGroupMgr->GetGroupByGUID(ObjectGuid(groupGuid).GetCounter());
+    }
+
+    // The instance the run is in: the tank's, else any member's on the map.
+    static uint32 RunInstance(std::vector<std::string> const& names, std::string const& tankName,
+                              uint32 mapId)
+    {
+        Player* const tank = ObjectAccessor::FindPlayerByName(tankName);
+        if (tank && tank->IsInWorld() && tank->GetMapId() == mapId)
+            return tank->GetInstanceId();
+        for (std::string const& name : names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (p && p->IsInWorld() && p->GetMapId() == mapId)
+                return p->GetInstanceId();
+        }
+        return 0;
+    }
+
     bool DriveGuildRun(GuildRun& run, std::time_t now)
     {
         Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
-        Group* const group = tank ? tank->GetGroup() : nullptr;
-        bool const ourGroup = group && group->GetGUID().GetRawValue() == run.groupGuid;
+        Group* const group = RunGroup(run.groupGuid);
+        bool const ourGroup = group != nullptr;
 
         if (run.phase == GuildRunPhase::Queue)
         {
@@ -35773,10 +35967,7 @@ private:
             poll.state = FinderStateOf(ourGroup ? sLFGMgr->GetState(group->GetGUID())
                                                 : lfg::LFG_STATE_NONE);
             poll.familySize = static_cast<unsigned>(run.names.size());
-            uint32 const headInstance = tank && tank->IsInWorld() &&
-                                                tank->GetMapId() == run.mapId
-                                            ? tank->GetInstanceId()
-                                            : 0;
+            uint32 const headInstance = RunInstance(run.names, run.tank, run.mapId);
             for (std::string const& name : run.names)
             {
                 Player* const p = ObjectAccessor::FindPlayerByName(name);
@@ -61887,6 +62078,14 @@ private:
     std::map<std::string, GhostRecoveryState> _ghostRecovery;
     // A natural guild member's recent deaths (DriveGuildGhostRecovery), by name.
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
+    // DriveGuildTraining: every class trainer spawn by the class it serves, the
+    // entry each spot is, the trainer each member was last sent to, and when
+    // the drive last ran.
+    std::map<uint8, std::vector<OverseerDecisions::TrainerSpot>> _classTrainerSpots;
+    std::map<uint8, std::vector<std::pair<uint32, float>>> _classTrainerEntries;
+    bool _classTrainersLoaded{false};
+    std::map<std::string, uint32> _guildTrainingSentTo;
+    std::time_t _guildTrainingAt{0};
 
     // What KeepRosterFollowing knew about each follower's position last
     // time round, so a stall is measured against ITS OWN best position
