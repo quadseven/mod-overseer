@@ -15042,6 +15042,13 @@ char const* GhostRecoveryWord(GhostRecovery choice)
     return "unknown";
 }
 
+bool OnOtherFactionsGround(bool alliance, uint32_t zoneId)
+{
+    if (alliance)
+        return zoneId == 14 || zoneId == 1637;
+    return zoneId == 12 || zoneId == 1519;
+}
+
 bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool hasAI)
 {
     return !onRoster && botSession && !playerClient && hasAI;
