@@ -2685,6 +2685,10 @@ constexpr time_t DUNGEON_REJOIN_BACKSTOP_SECONDS = TRAVEL_BACKSTOP_SECONDS;
 // short enough that the line lands while the party is still on the first pull
 // rather than after the wipe.
 constexpr time_t DUNGEON_ARMING_GRACE_SECONDS = 60;
+// How long CLEARING holds its stall clock for a leader off the dungeon map
+// before the run is walked out through EXIT (2026-09-28: 17 minutes of a
+// family standing still in Scarlet Monastery).
+constexpr long DUNGEON_LEADER_AWAY_SECONDS = 180;
 
 // How long a REFUSED `dc on` waits before it is issued again (#140).
 //
@@ -29962,6 +29966,9 @@ private:
         // on its row as what it was rather than as an ordinary 'left'. Empty for
         // every other way out.
         std::string stalledReason;
+        // WHEN THE LEADER LEFT THE DUNGEON MAP while CLEARING, or 0 while it is
+        // there. See DUNGEON_LEADER_AWAY_SECONDS.
+        time_t leaderAwaySince{0};
         // AND WHETHER IT WAS FINISHED, which is a different fact from why it is
         // leaving (#226). Set by CLEARING when every encounter the map credits
         // has been credited, read by EXIT so the row says 'complete' rather than
@@ -43277,10 +43284,40 @@ private:
             Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
             if (!leader || leader->GetMapId() != portal->insideMapId)
             {
+                // THE HOLD IS BOUNDED. On 2026-09-28 the family stood inside
+                // Scarlet Monastery for 17 minutes (01:15 to 01:32Z) with the
+                // stall clock held because 'Grug' was not on the map. A leader
+                // that is not back within DUNGEON_LEADER_AWAY_SECONDS is not
+                // coming back to this run: the party is walked out through
+                // EXIT, as the stall watchdog does, rather than standing still.
+                time_t const now = std::time(nullptr);
+                if (!coord.leaderAwaySince)
+                    coord.leaderAwaySince = now;
+                if (OverseerDecisions::LeaderAwayEndsRun(coord.leaderAwaySince, now,
+                                                         DUNGEON_LEADER_AWAY_SECONDS))
+                {
+                    coord.stalledReason = "the leader '" + leaderName +
+                                          "' was off map " + std::to_string(portal->insideMapId) +
+                                          " for more than " +
+                                          std::to_string(DUNGEON_LEADER_AWAY_SECONDS) + "s";
+                    LOG_ERROR("module.overseer",
+                              "overseer: dungeon run {} of campaign {} - {}. Walking the "
+                              "party back out through EXIT instead of holding the stall "
+                              "clock with everybody standing still",
+                              coord.runNumber, coord.campaignId, coord.stalledReason);
+                    coord.leaderAwaySince = 0;
+                    coord.phase = DungeonRunPhase::Exiting;
+                    coord.crossing.best = 0.f;
+                    coord.crossing.since = now;
+                    coord.loggedCrossingAim = false;
+                    coord.loggedCrossingWaiting = false;
+                    return;
+                }
                 HoldClearingClock(coord, OverseerDecisions::ClearingClockState(true, false, true),
                                   portal->insideMapId);
                 return;
             }
+            coord.leaderAwaySince = 0;
 
             // HAS THE RUN ACTUALLY GONE ANYWHERE (#171)? Asked BEFORE the
             // arming verdict below, because that verdict answers itself once
