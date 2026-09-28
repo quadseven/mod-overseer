@@ -27847,6 +27847,9 @@ private:
                     !IsMainHandType(proto->InventoryType) || line->ExtendedCost ||
                     line->maxcount || bot->CanUseItem(proto) != EQUIP_ERR_OK)
                     continue;
+                if (auto const b = _guildWeaponBenched[name].find(proto->ItemId);
+                    b != _guildWeaponBenched[name].end() && std::time(nullptr) < b->second)
+                    continue;
                 offers.push_back({proto->ItemLevel, proto->BuyPrice,
                                   bot->GetExactDist2d(spot.x, spot.y)});
                 sources.emplace_back(&spot, proto->ItemId);
@@ -27873,6 +27876,31 @@ private:
                 vendorSlot = int32(i);
         if (vendorSlot < 0)
             return;
+        // The core's own refusals, asked first so the log says which one and
+        // the item is benched for an hour instead of being asked for again.
+        std::string refusal;
+        {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+            uint32 const price = proto ? uint32(std::floor(
+                proto->BuyPrice * bot->GetReputationPriceDiscount(vendor))) : 0;
+            ItemPosCountVec dest;
+            if (!proto)
+                refusal = "no such item";
+            else if (!bot->HasEnoughMoney(price))
+                refusal = "cannot afford " + std::to_string(price) + " copper";
+            else if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, 1) != EQUIP_ERR_OK)
+                refusal = "no room in its bags";
+        }
+        if (!refusal.empty())
+        {
+            _guildWeaponBenched[name][itemId] = std::time(nullptr) + 3600;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) does not buy item {} at vendor {} - {}; not "
+                     "offered to it again for an hour",
+                     name, bot->GetLevel(), itemId, spot.entry, refusal);
+            _guildWeaponSentTo.erase(name);
+            return;
+        }
         WorldSession* session = bot->GetSession();
         uint64 const before = bot->GetMoney();
         uint32 const carriedBefore = bot->GetItemCount(itemId, false);
@@ -27899,8 +27927,10 @@ private:
         // "bought ... for 0 copper" was a refusal).
         if (bot->GetItemCount(itemId, false) <= carriedBefore)
         {
+            _guildWeaponBenched[name][itemId] = std::time(nullptr) + 3600;
             LOG_INFO("module.overseer",
-                     "overseer: '{}' (level {}) was refused item {} at vendor {} - {} copper held",
+                     "overseer: '{}' (level {}) was refused item {} at vendor {} - {} copper held; "
+                     "not offered to it again for an hour",
                      name, bot->GetLevel(), itemId, spot.entry, bot->GetMoney());
             _guildWeaponSentTo.erase(name);
             return;
@@ -62754,6 +62784,9 @@ private:
     std::vector<NpcSpot> _weaponMasterSpots;
     bool _weaponSpotsLoaded{false};
     std::map<std::string, uint32> _guildWeaponSentTo;
+    // name -> item -> until when that item is not offered to that member again,
+    // after a refusal (the same member was refused the same item every minute).
+    std::map<std::string, std::map<uint32, std::time_t>> _guildWeaponBenched;
     std::time_t _guildTrainingAt{0};
 
     // What KeepRosterFollowing knew about each follower's position last
