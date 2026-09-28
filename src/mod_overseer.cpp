@@ -4400,9 +4400,10 @@ std::map<std::string, std::deque<FallSample>> g_fallSamples;
 // able to blame itself for.
 struct RecoveryMark
 {
-    uint8 rung = 0;       // memory.attempts AFTER the remedy: 1 = the lift
-    uint8 prevRung = 0;   // and before it, so a repeat is visible as a climb
-    time_t at = 0;        // 0 = this module has never moved this character
+    uint8 rung = 0;               // memory.attempts AFTER the remedy: 1 = the lift
+    uint8 prevRung = 0;           // and before it, so a repeat is visible as a climb
+    time_t at = 0;                // 0 = this module has never moved this character
+    time_t last_spirit_healer = 0;// 0 = spirit healer not used, Unix epoch when last used
 };
 
 // WHY THE FALL BASELINE GUARD DECLINED, ON THE LAST POLL THAT LOOKED (#281).
@@ -26490,27 +26491,54 @@ private:
             // remembers which deaths were announced and is cleared the moment
             // the character is alive again, so a second death is announced
             // again and the first is not repeated every poll.
+            // Also: if the character just got a spirit-healer resurrection within
+            // the last 10 minutes, prefer corpse run to avoid stacking
+            // Resurrection Sickness. See mod-overseer#746.
             auto const healerExpected = [&](int64 deadSeconds) -> bool
             {
+                // If the character recently used spirit healer (within 10 min),
+                // prefer corpse run to avoid stacking Resurrection Sickness.
+                int64 const since = [&]() -> int64
+                {
+                    auto const it = g_recoveryMarks.find(LowerName(name));
+                    if (it != g_recoveryMarks.end() && it->second.last_spirit_healer != 0)
+                    {
+                        return time(nullptr) - it->second.last_spirit_healer;
+                    }
+                    return 0;
+                }();
+                bool const recentlyUsedSpiritHealer = since > 0 && since < 600; /* 10 minutes */
+                if (recentlyUsedSpiritHealer)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' recently used spirit healer ({}s ago), "
+                             "preferring corpse run to avoid stacking sickness",
+                             name, int(since));
+                    return false;
+                }
                 bool const inRun = InDungeonRun(bot);
                 Player* rezzer = inRun ? LivingResurrectorFor(bot) : nullptr;
                 if (rezzer && deadSeconds < STUCK_REVIVAL_HEALER_SECONDS)
                 {
                     if (_healerExpected.insert(name).second)
-                        LOG_INFO("module.overseer",
-                                 "overseer: '{}' is dead on map {} with '{}' alive in the "
-                                 "party and a dungeon run open - the dungeon module's "
-                                 "post-combat rez is expected to walk the healer to the "
-                                 "corpse, so this drive stands down for up to {}s before "
-                                 "recovering it itself",
-                                 name, static_cast<uint32>(bot->GetMapId()),
-                                 rezzer->GetName(), STUCK_REVIVAL_HEALER_SECONDS);
+                    {
+                        // Track that this character just used spirit healer
+                        auto const trk = g_recoveryMarks.find(LowerName(name));
+                        if (trk != g_recoveryMarks.end())
+                        {
+                            trk->second.last_spirit_healer = time(nullptr);
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' resurrected via spirit healer, "
+                                     "tracking cooldown",
+                                     name);
+                        }
+                    }
                     return true;
                 }
 
                 if (_healerExpected.erase(name))
                     LOG_WARN("module.overseer",
-                             "overseer: '{}' is still dead after {}s and {} - the healer "
+                             "module.overseer: '{}' is still dead after {}s and {} - the healer "
                              "is no longer waited for; recovering as in the open world",
                              name, deadSeconds,
                              rezzer ? "the dungeon module's rez budget has passed"
