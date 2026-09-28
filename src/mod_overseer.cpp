@@ -4659,6 +4659,47 @@ constexpr size_t MAX_DEATH_QUEUE = 200;
 // is merely dead), and pushes a struct under a mutex. FlushDeaths, called
 // only from OnUpdate on the world thread, is the only code that touches
 // MySQL for this table.
+// A NATURAL GUILD MEMBER'S DEATH, SAID IN THE LOG (infra#4799). RecordDeath
+// keeps overseer_death to the roster, and several readers count that table
+// by map and zone, so a guild's hundreds of deaths an hour do not go there.
+// The guild dies about 800 times an hour on the dev realm with nothing saying
+// to what; this line says it: the killer, its level and rank, how many were
+// on the member, and the member's own level, health pool and gear.
+static bool InNaturalGuild(Player* p)
+{
+    if (!p || !p->GetGuildId())
+        return false;
+    Guild* guild = sGuildMgr->GetGuildById(p->GetGuildId());
+    if (!guild)
+        return false;
+    std::vector<std::string> const names = OverseerDecisions::ParseNameList(
+        sConfigMgr->GetOption<std::string>("Overseer.Natural.Guilds", ""));
+    return std::find(names.begin(), names.end(), guild->GetName()) != names.end();
+}
+
+static void LogGuildDeath(Player* killed, char const* kind, std::string const& killerName,
+                          uint32 killerEntry, uint32 killerLevel, uint32 killerRank)
+{
+    if (!InNaturalGuild(killed) || OnRoster(killed->GetName()))
+        return;
+    uint32 ilvl = 0;
+    uint32 items = 0;
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        if (Item* item = killed->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+        {
+            ilvl += item->GetTemplate()->ItemLevel;
+            ++items;
+        }
+    LOG_INFO("module.overseer",
+             "overseer: guild death - '{}' (level {}, class {}, {} max health, {} item(s) "
+             "averaging item level {}) killed by {} '{}' (entry {}, level {}, rank {}) with {} "
+             "attacker(s) on it, map {} zone {}{}",
+             killed->GetName(), killed->GetLevel(), killed->getClass(), killed->GetMaxHealth(),
+             items, items ? ilvl / items : 0, kind, killerName, killerEntry, killerLevel,
+             killerRank, killed->getAttackers().size(), killed->GetMapId(), killed->GetZoneId(),
+             killed->GetGroup() ? ", grouped" : "");
+}
+
 void RecordDeath(Player* player)
 {
     if (!player)
@@ -6658,6 +6699,7 @@ public:
         if (!killer || !killed)
             return;
         RememberKiller(killed, "player", killer->GetName(), 0);
+        LogGuildDeath(killed, "player", killer->GetName(), 0, killer->GetLevel(), 0);
     }
 
     // Same capture, the creature-killed-a-player side (Unit.cpp:14311).
@@ -6666,6 +6708,9 @@ public:
         if (!killer || !killed)
             return;
         RememberKiller(killed, "creature", killer->GetName(), killer->GetEntry());
+        LogGuildDeath(killed, "creature", killer->GetName(), killer->GetEntry(),
+                      killer->GetLevel(),
+                      killer->GetCreatureTemplate() ? killer->GetCreatureTemplate()->rank : 0);
     }
 
     // Deaths carry no subject, so every death in an hour lands on one row with
