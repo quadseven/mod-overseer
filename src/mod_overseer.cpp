@@ -27601,6 +27601,16 @@ private:
     // with its own gold; otherwise it walks to the vendor on its map that sells
     // the best weapon it can use and afford (keeping GUILD_WEAPON_RESERVE for
     // repairs), buys it through the core's own vendor handler and puts it on.
+    // DECLARED BEFORE ITS USE: a member function's parameter type must be
+    // complete where the function is declared (#746).
+    struct NpcSpot
+    {
+        uint32 entry{0};
+        uint32 mapId{0};
+        float x{0.f};
+        float y{0.f};
+        float z{0.f};
+    };
     static constexpr uint32 GUILD_WEAPON_RESERVE = 500;
     static constexpr uint32 GUILD_WEAPON_MIN_GAIN = 3;
     static constexpr float GUILD_NPC_REACH_YARDS = 5.0f;
@@ -62514,14 +62524,6 @@ private:
     std::map<std::string, uint32> _guildTrainingSentTo;
     // DriveGuildWeaponFor: every vendor spawn that sells a weapon, every
     // weapon master spawn, and where each member was last sent.
-    struct NpcSpot
-    {
-        uint32 entry{0};
-        uint32 mapId{0};
-        float x{0.f};
-        float y{0.f};
-        float z{0.f};
-    };
     std::vector<NpcSpot> _weaponVendorSpots;
     std::vector<NpcSpot> _weaponMasterSpots;
     bool _weaponSpotsLoaded{false};

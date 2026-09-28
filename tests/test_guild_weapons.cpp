@@ -61,6 +61,15 @@ int main()
     sick.restWhileSick = true;
     Check(DecideRevivedSickGround(sick) == RevivedSickGroundStep::HoldOutOfCombat,
           "a guild member rests its sickness out on safe ground");
+    sick.groundTopLevel = 20;
+    Check(DecideRevivedSickGround(sick) == RevivedSickGroundStep::HoldOutOfCombat,
+          "on lethal ground with no stone ready it still holds out of combat");
+    sick.hearthReady = true;
+    Check(DecideRevivedSickGround(sick) == RevivedSickGroundStep::Hearth,
+          "on lethal ground with the stone ready it hearths away");
+    sick.resting = true;
+    Check(DecideRevivedSickGround(sick) == RevivedSickGroundStep::HoldOutOfCombat,
+          "in an inn it rests");
     sick.sick = false;
     Check(DecideRevivedSickGround(sick) == RevivedSickGroundStep::Stay,
           "no sickness, no rest");
