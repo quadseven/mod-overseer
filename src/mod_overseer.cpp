@@ -27727,6 +27727,7 @@ private:
     };
     static constexpr uint32 GUILD_WEAPON_RESERVE = 500;
     static constexpr uint32 GUILD_WEAPON_MIN_GAIN = 3;
+    static constexpr size_t GUILD_JUNK_SELL_BATCH = 16;
     static constexpr float GUILD_NPC_REACH_YARDS = 5.0f;
 
     static bool IsMainHandType(uint32 inventoryType)
@@ -27925,7 +27926,59 @@ private:
             else if (!bot->HasEnoughMoney(price))
                 refusal = "cannot afford " + std::to_string(price) + " copper";
             else if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, 1) != EQUIP_ERR_OK)
-                refusal = "no room in its bags";
+            {
+                // A player with full bags sells the grey items to the vendor
+                // in front of them, then buys (#787). The core's sell handler
+                // still asks the keep hook, so a reserved item stays.
+                std::vector<Item*> stacks;
+                std::vector<OverseerDecisions::JunkItem> junk;
+                auto collect = [&](uint8 bagPos, uint8 first, uint8 last)
+                {
+                    for (uint8 slot = first; slot < last; ++slot)
+                    {
+                        Item* held = bot->GetItemByPos(bagPos, slot);
+                        ItemTemplate const* held_proto = held ? held->GetTemplate() : nullptr;
+                        if (!held_proto || held_proto->SellPrice == 0)
+                            continue;
+                        OverseerDecisions::JunkItem entry;
+                        entry.itemEntry = held_proto->ItemId;
+                        entry.sellPrice = held_proto->SellPrice;
+                        entry.quality = held_proto->Quality;
+                        entry.isProtected = held_proto->Class == ITEM_CLASS_QUEST ||
+                                            held_proto->StartQuest != 0;
+                        stacks.push_back(held);
+                        junk.push_back(entry);
+                    }
+                };
+                collect(INVENTORY_SLOT_BAG_0, INVENTORY_SLOT_ITEM_START, INVENTORY_SLOT_ITEM_END);
+                for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+                    if (Bag* carried = bot->GetBagByPos(b))
+                        collect(b, 0, carried->GetBagSize());
+                uint32 sold = 0;
+                uint64 const moneyBeforeSale = bot->GetMoney();
+                for (size_t index : OverseerDecisions::ChooseJunkToSell(junk, GUILD_JUNK_SELL_BATCH))
+                {
+                    ObjectGuid const stackGuid = stacks[index]->GetGUID();
+                    WorldPacket raw(CMSG_SELL_ITEM, 8 + 8 + 4);
+                    raw << vendor->GetGUID();
+                    raw << stackGuid;
+                    raw << uint32(stacks[index]->GetCount());
+                    WorldPackets::Item::SellItem packet(std::move(raw));
+                    packet.Read();
+                    bot->GetSession()->HandleSellItemOpcode(packet);
+                    // Read back: the stack is gone from the bags or it was not sold.
+                    if (!bot->GetItemByGuid(stackGuid))
+                        ++sold;
+                }
+                if (sold)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' (level {}) sold {} junk stacks to vendor {} for {} "
+                             "copper to make room for item {}",
+                             name, bot->GetLevel(), sold, spot.entry,
+                             bot->GetMoney() - moneyBeforeSale, itemId);
+                if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, 1) != EQUIP_ERR_OK)
+                    refusal = "no room in its bags";
+            }
         }
         if (!refusal.empty())
         {
