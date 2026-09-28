@@ -11,6 +11,8 @@
 
 #include "overseer_decisions.h"
 
+#include <cmath>
+
 #include <iterator>
 #include <utility>
 
@@ -341,6 +343,15 @@ bool FloorUnderfoot(float currentZ, float floorBelowZ, bool floorBelowValid,
     float const separation = currentZ - floorBelowZ;
     float const magnitude = separation < 0.f ? -separation : separation;
     return magnitude <= reach;
+}
+
+uint64_t TerrainNoteCell(uint32_t mapId, float x, float y)
+{
+    // Offset so negative coordinates land in their own cells rather than
+    // folding onto the positive ones; a map is well inside +-2^20 cells.
+    int64_t const cx = int64_t(std::floor(x / TERRAIN_NOTE_CELL_YARDS)) + (int64_t(1) << 20);
+    int64_t const cy = int64_t(std::floor(y / TERRAIN_NOTE_CELL_YARDS)) + (int64_t(1) << 20);
+    return (uint64_t(mapId) << 42) | (uint64_t(cx & 0x1FFFFF) << 21) | uint64_t(cy & 0x1FFFFF);
 }
 
 bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach)

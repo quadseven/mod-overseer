@@ -777,6 +777,15 @@ bool FloorUnderfoot(float currentZ, float floorBelowZ, bool floorBelowValid,
 // path and not the other.
 bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach);
 
+// THE PLACE A "NOTHING IS BEING MOVED" TERRAIN NOTE IS ABOUT (mod-overseer#775).
+// Those notes are about the ground, not the character: a roof over the Orgrimmar
+// gate tunnel reads the same for every character walking under it. Keyed to a
+// TERRAIN_NOTE_CELL_YARDS square on one map, so the note is said once per place
+// for the life of the process. On wow-dev 2026-09-27 the per-episode memory let
+// the same few Orgrimmar streets log 1,643 times in a day, mostly at ERROR.
+constexpr float TERRAIN_NOTE_CELL_YARDS = 50.0f;
+uint64_t TerrainNoteCell(uint32_t mapId, float x, float y);
+
 // DID ANY INSTRUMENT FIND GROUND HERE AT ALL?
 //
 // THE SAME TWO INSTRUMENTS, WITH THE #262 CORRECTION TAKEN OFF, and that is
