@@ -27789,6 +27789,7 @@ private:
             return;
         WorldSession* session = bot->GetSession();
         uint64 const before = bot->GetMoney();
+        uint32 const carriedBefore = bot->GetItemCount(itemId, false);
         {
             WorldPacket raw(CMSG_LIST_INVENTORY, 8);
             raw << vendor->GetGUID();
@@ -27807,24 +27808,40 @@ private:
             packet.Read();
             session->HandleBuyItemOpcode(packet);
         }
-        bool worn2 = false;
-        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END && !worn2; ++slot)
+        // THE READ-BACK IS THE EVIDENCE: the core's handler returns nothing, so
+        // a purchase is a carried count that rose (2026-09-28: a line that read
+        // "bought ... for 0 copper" was a refusal).
+        if (bot->GetItemCount(itemId, false) <= carriedBefore)
         {
-            Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-            if (!item || item->GetEntry() != itemId)
-                continue;
-            uint16 dest = 0;
-            if (bot->CanEquipItem(NULL_SLOT, dest, item, true) == EQUIP_ERR_OK)
-            {
-                bot->SwapItem(item->GetPos(), dest);
-                worn2 = true;
-            }
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) was refused item {} at vendor {} - {} copper held",
+                     name, bot->GetLevel(), itemId, spot.entry, bot->GetMoney());
+            _guildWeaponSentTo.erase(name);
+            return;
         }
+        // Found wherever it landed, a bag as well as the backpack.
+        bool worn2 = false;
+        uint16 dest = 0;
+        InventoryResult equipResult = EQUIP_ERR_ITEM_NOT_FOUND;
+        if (Item* item = bot->GetItemByEntry(itemId))
+            if (!Player::IsEquipmentPos(item->GetPos()))
+            {
+                equipResult = bot->CanEquipItem(NULL_SLOT, dest, item, true);
+                if (equipResult == EQUIP_ERR_OK)
+                {
+                    bot->SwapItem(item->GetPos(), dest);
+                    // Read off the destination slot itself, not the moved item.
+                    Item* const there = bot->GetItemByPos(dest);
+                    worn2 = there && there->GetEntry() == itemId;
+                }
+            }
         LOG_INFO("module.overseer",
                  "overseer: '{}' (level {}) bought item {} (item level {}, over {}) at vendor {} "
                  "for {} copper of its own{}",
                  name, bot->GetLevel(), itemId, offers[pick].itemLevel, wornLevel, spot.entry,
-                 before - bot->GetMoney(), worn2 ? " and put it on" : " - not worn yet");
+                 before - bot->GetMoney(),
+                 worn2 ? " and put it on"
+                       : " - not worn (equip result " + std::to_string(uint32(equipResult)) + ")");
         _guildWeaponSentTo.erase(name);
     }
 
