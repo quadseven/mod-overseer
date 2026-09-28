@@ -46174,6 +46174,10 @@ private:
                 // grammars cannot collide.
                 detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Trainer, status,
                                 rowResult, _pendingMailWalks, id);
+            else if (kind == "cast" && OverseerDecisions::IsWeaponTrainRow(command))
+                // A WEAPON SKILL BOUGHT AT A WEAPON MASTER (wow-overseer#399), on
+                // kind='cast' and routed on the first word like `use`.
+                detail = DoTrainWeapon(player, command, status, rowResult);
             else if (kind == "cast" && OverseerDecisions::IsLearnRow(command))
                 // THE SAME `kind`, TWO GRAMMARS, AND NOTHING ELSE HERE KNOWS IT.
                 // A cast row begins with a spell id, which is digits; a learn
@@ -57019,6 +57023,112 @@ private:
             return 0;
         useSpellId = first;
         return static_cast<uint32>(proto->Spells[1].SpellId);
+    }
+
+    // -------------------------------------------- train-weapon (#399) --
+    //
+    // Buy one weapon skill from a trainer standing in interact range, through
+    // the core's own Trainer::TeachSpell, and read HasSkill back. See the
+    // banner on WEAPON_TRAIN_VERB in overseer_decisions.h. The trainer spell is
+    // found by what it teaches: the spell itself, or the spell its
+    // SPELL_EFFECT_LEARN_SPELL names, carries a SpellLearnSkillNode for the
+    // weapon skill.
+    static uint32 WeaponSkillTaughtBy(uint32 spellId)
+    {
+        if (SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(spellId))
+            return node->skill;
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info)
+            return 0;
+        for (SpellEffectInfo const& effect : info->GetEffects())
+        {
+            if (!effect.IsEffect(SPELL_EFFECT_LEARN_SPELL) || !effect.TriggerSpell)
+                continue;
+            if (SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(effect.TriggerSpell))
+                return node->skill;
+        }
+        return 0;
+    }
+
+    struct TrainerNearbyCheck
+    {
+        WorldObject const* from;
+        float range;
+        bool operator()(Creature* creature) const
+        {
+            return creature->IsAlive() && creature->HasNpcFlag(UNIT_NPC_FLAG_TRAINER)
+                && from->IsWithinDistInMap(creature, range);
+        }
+    };
+
+    static char const* DoTrainWeapon(Player* who, std::string const& command,
+                                     char const*& status, std::string& out)
+    {
+        namespace R = OverseerDecisions::WeaponTrainRefusal;
+        OverseerDecisions::WeaponTrainRequest const request =
+            OverseerDecisions::ParseWeaponTrainRequest(command);
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(reason)
+              << ",\"who\":" << J(who->GetName()) << ",\"skill\":" << request.skill
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+            return reason;
+        };
+        if (request.error[0])
+            return refuse(request.error);
+        if (!SkillLineIsCategory(request.skill, SKILL_CATEGORY_WEAPON))
+            return refuse(R::NotAWeapon);
+        if (who->HasSkill(request.skill))
+            return refuse(R::AlreadyHeld);
+        if (!who->IsAlive())
+            return refuse(R::Dead);
+
+        std::list<Creature*> nearby;
+        TrainerNearbyCheck check{who, 30.f};
+        Acore::CreatureListSearcher<TrainerNearbyCheck> searcher(who, nearby, check);
+        Cell::VisitObjects(who, searcher, 30.f);
+
+        for (Creature* npc : nearby)
+        {
+            // THE GATE, the core's own: the same call the trainer handler makes.
+            if (!who->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
+                continue;
+            Trainer::Trainer* trainer = sObjectMgr->GetTrainer(npc->GetEntry());
+            if (!trainer || !trainer->IsTrainerValidForPlayer(who))
+                continue;
+            for (Trainer::Spell const& spell : trainer->GetSpells())
+            {
+                if (WeaponSkillTaughtBy(spell.SpellId) != request.skill)
+                    continue;
+                if (!trainer->CanTeachSpell(who, &spell))
+                    continue;
+                uint32 const moneyBefore = who->GetMoney();
+                trainer->TeachSpell(npc, who, spell.SpellId);
+                std::ostringstream o;
+                bool const learned = who->HasSkill(request.skill);
+                o << "{\"outcome\":" << J(learned ? "learned" : "not learned")
+                  << ",\"who\":" << J(who->GetName()) << ",\"skill\":" << request.skill
+                  << ",\"spell\":" << spell.SpellId << ",\"trainer\":" << npc->GetEntry()
+                  << ",\"trainer_name\":" << J(npc->GetName())
+                  << ",\"money_before\":" << moneyBefore
+                  << ",\"money_after\":" << who->GetMoney() << "}";
+                out = o.str();
+                if (!learned)
+                    return R::NotTaught;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' LEARNED weapon skill {} from '{}' (creature {}, "
+                         "spell {}) for {} copper of its own - bought, not granted",
+                         who->GetName(), request.skill, npc->GetName(), npc->GetEntry(),
+                         spell.SpellId, moneyBefore - who->GetMoney());
+                RecordEvent(who, "learn", request.skill, "weapon skill",
+                            "bought this weapon skill from a weapon master");
+                status = "applied";
+                return "";
+            }
+        }
+        return refuse(R::NoTrainer);
     }
 
     static char const* DoLearnRecipe(Player* who, std::string const& command,

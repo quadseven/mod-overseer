@@ -13805,6 +13805,50 @@ bool IsLearnRow(std::string const& command);
 
 LearnRequest ParseLearnRequest(std::string const& command);
 
+// ------------------------------------------ weapon training (wow-overseer#399) --
+//
+// A CHARACTER CARRYING A WEAPON IT HAS NO SKILL FOR. Measured on the dev realm
+// on 2026-09-28: the level 35 mage carried a Silithid Ripper, a one-handed
+// sword, with no Swords skill, and wore no main hand at all; the level 38
+// warrior carried a Ravenwood Bow with no Bows skill. A player walks to a
+// weapon master and pays for the skill. The family's walk is the leader's
+// travel_npc aim at the weapon master, as every town counter is; this verb is
+// the purchase, for a member standing within interact range of one.
+//
+//   kind='cast'  train-weapon skill:<SkillLine id>
+//
+// The executor buys the trainer spell that teaches that weapon skill through
+// the core's own Trainer::TeachSpell (the money is taken and every rule the
+// trainer applies is applied) and reads HasSkill back. Nothing is granted.
+// It rides kind='cast' beside `use` and `walk-to-trainer`, routed on the first
+// word, so no ENUM migration is needed.
+constexpr char const* WEAPON_TRAIN_VERB = "train-weapon";
+
+struct WeaponTrainRequest
+{
+    uint32_t skill{0};
+    char const* error{""};  // empty when it parsed
+};
+
+bool IsWeaponTrainRow(std::string const& command);
+
+// `train-weapon skill:<id>`, a non-zero id, nothing else.
+WeaponTrainRequest ParseWeaponTrainRequest(std::string const& command);
+
+namespace WeaponTrainRefusal
+{
+constexpr char const* Malformed    = "malformed train-weapon command: want train-weapon skill:<id>";
+constexpr char const* NotAWeapon   = "that skill is not a weapon skill";
+constexpr char const* AlreadyHeld  = "the character already has that weapon skill";
+constexpr char const* NoTrainer    = "no trainer in reach teaches that weapon skill to this character";
+constexpr char const* NotTaught    = "the trainer did not teach it (the likely reason is money)";
+constexpr char const* Dead         = "character is dead";
+}  // namespace WeaponTrainRefusal
+
+// Worth writing again later: only the walls that move (no trainer in reach
+// yet, money, death). Malformed, not a weapon and already held never will.
+bool WeaponTrainRefusalRetryable(std::string const& reason);
+
 // THE FOUR THINGS A LEARN ROW CAN HONESTLY CLAIM. Shorter than CastOutcome's
 // list because the post-condition here is exact: Player::HasSpell is the
 // worldserver's own answer to the only question that matters, and it is
