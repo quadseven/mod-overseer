@@ -193,6 +193,28 @@ int main()
         ++failures;
     }
 
+    // Test: A sick member on lethal ground with a ready stone hearths, and without one is held out of combat.
+    // With the cooldown fix, a second death within 10 minutes of spirit-healer use should prefer corpse run.
+    {
+        GhostRecoveryFacts f = Quiet();
+        f.deathsHere = 2;
+        f.healerUsedRecently = true;   // spirit healer was used within 10 min
+        f.corpseRunPossible = true;    // corpse run is an option
+        Check("sick member with ready stone hearths prefers corpse run over spirit healer when recently used",
+              DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
+    }
+
+    // Test: A second death within 10 minutes of a spirit-healer revival does not choose the spirit healer again
+    // when a corpse run is possible. This verifies the 10-minute cooldown prevents stacking Resurrection Sickness.
+    {
+        GhostRecoveryFacts f = Quiet();
+        f.deathsHere = 3;
+        f.healerUsedRecently = true;   // first death used spirit healer within 10 min window
+        f.corpseRunPossible = true;    // corpse run is possible
+        Check("second death within 10 min of spirit-healer revival prefers corpse run, avoids sickness stacking",
+              DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
+    }
+
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
@@ -202,22 +224,3 @@ int main()
     return 0;
 }
 
-// Test: A sick member on lethal ground with a ready stone hearths, and without one is held out of combat.
-// With the cooldown fix, a second death within 10 minutes of spirit-healer use should prefer corpse run.
-{
-    GhostRecoveryFacts f = Quiet();
-    f.deathsHere = 2;
-    f.healerUsedRecently = true;   // spirit healer was used within 10 min
-    f.corpseRunPossible = true;    // corpse run is an option
-    Check(\"sick member with ready stone hearths prefers corpse run over spirit healer when recently used\",\n          DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
-}
-
-// Test: A second death within 10 minutes of a spirit-healer revival does not choose the spirit healer again
-// when a corpse run is possible. This verifies the 10-minute cooldown prevents stacking Resurrection Sickness.
-{
-    GhostRecoveryFacts f = Quiet();
-    f.deathsHere = 3;
-    f.healerUsedRecently = true;   // first death used spirit healer within 10 min window
-    f.corpseRunPossible = true;    // corpse run is possible
-    Check(\"second death within 10 min of spirit-healer revival prefers corpse run, avoids sickness stacking\",\n          DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
-}
