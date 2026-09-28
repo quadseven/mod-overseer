@@ -8666,7 +8666,27 @@ struct ErrandDeathLimits
     // worth trying again once whatever killed them has had time to be
     // somewhere else, and nothing here can tell a camp from a patrol.
     int64_t cooloffSeconds{15 * 60};
+    // THE SAME TARGET CALLED OFF AGAIN IS REFUSED FOR LONGER (mod-overseer#776).
+    // On wow-dev 2026-09-27 the Alliance family's walk to the Stormwind
+    // auctioneer was released at 20:26 after three deaths to Crushridge
+    // Maulers, refused for fifteen minutes, sent again at 20:53 over the same
+    // 3,856 yards, and released again: about sixty family deaths on `town run`
+    // between 20:00 and 22:00. Each release within `strikeMemorySeconds` of the
+    // last doubles the cool-off, up to `maxCooloffSeconds`.
+    int64_t maxCooloffSeconds{4 * 60 * 60};
+    int64_t strikeMemorySeconds{6 * 60 * 60};
+    // AND THE PARTY'S BODIES COUNT, NOT ONLY THE LEADER'S (#776). The leader
+    // carries the aim, but the four behind him walk the same ground: Ugga
+    // died four times to Blackrock Scouts in Redridge on the leader's errand
+    // at 20:56 to 21:00 while the leader's own count stayed under three. This
+    // many deaths across the whole party inside the window also calls it off.
+    uint32_t partyDeaths{5};
 };
+
+// The cool-off for a target released `strikes` times in a row (1 = the first
+// release): cooloffSeconds doubled per earlier strike, capped at
+// maxCooloffSeconds. Zero or fewer strikes is the first release.
+int64_t ErrandCooloffSeconds(uint32_t strikes, ErrandDeathLimits const& limits);
 
 // How much of the death table this errand is answerable for, in seconds. An
 // errand younger than the window is judged over its OWN life and not one
@@ -8687,6 +8707,12 @@ struct ErrandDeathToll
     // followers are farmed should also count is a real question and is not
     // this one.
     uint32_t deaths{0};
+    // Deaths of every member of the traveller's party, the traveller included,
+    // inside the same window (#776). Zero when the caller read none.
+    uint32_t partyDeaths{0};
+    // How many times in a row this rule has released THIS target for this
+    // character, the refusal now running included (#776). Zero when it never has.
+    uint32_t strikes{0};
     // Seconds since this character was last refused THIS target by this rule,
     // or -1 when it never was.
     int64_t sinceRefused{-1};

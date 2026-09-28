@@ -7245,8 +7245,8 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
 {
     ErrandDeathVerdict verdict;
 
-    bool const coolingOff =
-        toll.sinceRefused >= 0 && toll.sinceRefused < limits.cooloffSeconds;
+    int64_t const cooloff = ErrandCooloffSeconds(toll.strikes, limits);
+    bool const coolingOff = toll.sinceRefused >= 0 && toll.sinceRefused < cooloff;
 
     // 1. A CLAIMED AIM IS NEVER SIMPLY TAKEN OFF ITS CLAIMANT, whichever of
     //    the two things below would otherwise happen. Answered first because it
@@ -7282,7 +7282,7 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     if (coolingOff)
     {
         verdict.remedy = ErrandDeathRemedy::RefuseReissue;
-        verdict.coolOffRemaining = limits.cooloffSeconds - toll.sinceRefused;
+        verdict.coolOffRemaining = cooloff - toll.sinceRefused;
         return verdict;
     }
 
@@ -7290,10 +7290,21 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     //    three in five minutes", and the third death in five minutes IS the
     //    evidence - a rule that waits for a fourth body to be sure is a rule
     //    that costs a body to be sure.
-    if (toll.deaths >= limits.deaths)
+    if (toll.deaths >= limits.deaths ||
+        (limits.partyDeaths && toll.partyDeaths >= limits.partyDeaths))
         verdict.remedy = ErrandDeathRemedy::Release;
 
     return verdict;
+}
+
+int64_t ErrandCooloffSeconds(uint32_t strikes, ErrandDeathLimits const& limits)
+{
+    int64_t cooloff = limits.cooloffSeconds;
+    int64_t const cap =
+        limits.maxCooloffSeconds > cooloff ? limits.maxCooloffSeconds : cooloff;
+    for (uint32_t strike = 1; strike < strikes && cooloff < cap; ++strike)
+        cooloff *= 2;
+    return cooloff < cap ? cooloff : cap;
 }
 
 // ------------------------------- an errand that is eating the questing --
