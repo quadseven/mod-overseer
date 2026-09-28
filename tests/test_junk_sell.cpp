@@ -1,4 +1,4 @@
-// Spark-authored: qwen3-coder-next:q4_K_M on an on-prem DGX Spark, 2026-09-28; review pending
+// Spark-authored: qwen3-coder-next:q4_K_M on an on-prem Spark, 2026-09-28; review pending
 /*
  * Junk to sell before a weapon is bought (#787).
  *
