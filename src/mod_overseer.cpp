@@ -5977,6 +5977,34 @@ public:
         refusal.said = 0;
     }
 
+    // Record one more lethal release of `target` for `name` and return the
+    // strike count it now stands at: one more than before when the last one
+    // was the same target inside strikeMemorySeconds, else one (#776).
+    uint32_t NoteLethal(std::string const& name, std::string const& target,
+                        OverseerDecisions::ErrandDeathLimits const& limits)
+    {
+        time_t const now = std::time(nullptr);
+        LethalStrike& strike = _lethal[name];
+        bool const again = strike.target == target && strike.at &&
+                           now - strike.at < limits.strikeMemorySeconds;
+        strike.count = again ? strike.count + 1 : 1;
+        strike.target = target;
+        strike.at = now;
+        return strike.count;
+    }
+
+    // The strike count for this target, 0 when its last lethal release was
+    // another target or has aged out of memory (#776).
+    uint32_t LethalStrikes(std::string const& name, std::string const& target) const
+    {
+        auto const it = _lethal.find(name);
+        if (it == _lethal.end() || it->second.target != target)
+            return 0;
+        if (std::time(nullptr) - it->second.at >= ERRAND_DEATH_LIMITS.strikeMemorySeconds)
+            return 0;
+        return it->second.count;
+    }
+
     // Why this character's errand was called off, for the line that says it was.
     // Empty when nothing is refused, which no caller reaches: every reader of
     // this asks after SecondsSinceRefused has already said there is one.
@@ -6052,6 +6080,17 @@ private:
         time_t at{0};
         time_t said{0};  // when the re-issue was last reported, 0 = never
     };
+
+    // LETHAL RELEASES OF ONE TARGET IN A ROW (#776). Kept apart from `_refused`
+    // because an economy-budget refusal overwrites that entry and must neither
+    // add a strike nor forget one.
+    struct LethalStrike
+    {
+        std::string target;
+        uint32_t count{0};
+        time_t at{0};
+    };
+    std::unordered_map<std::string, LethalStrike> _lethal;
 
     struct NoProgressBackoff
     {
@@ -13651,6 +13690,43 @@ private:
         if (!result)
             return 0;  // no such table on this world, or no such deaths - same answer
 
+        return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
+    }
+
+    // Deaths of every member of `who`'s group inside the last `seconds`, `who`
+    // included, or just its own when it is in no group (#776). One COUNT over
+    // the names, through the same table and the same zero-window rule as
+    // RecentDeathCount.
+    uint32 RecentPartyDeathCount(Player* who, int64 seconds)
+    {
+        if (seconds <= 0 || !who)
+            return 0;
+        // Each name is escaped by Esc() and, besides, must be a character name
+        // this realm can hold (letters, at most twelve) or it is left out.
+        auto const plain = [](std::string const& name)
+        {
+            return !name.empty() && name.size() <= 12 &&
+                   std::all_of(name.begin(), name.end(),
+                               [](unsigned char ch) { return std::isalpha(ch) != 0; });
+        };
+        if (!plain(who->GetName()))
+            return 0;
+        std::string names = "'" + Esc(who->GetName()) + "'";
+        if (Group* const group = who->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* const member = ref->GetSource();
+                if (member && member != who && plain(member->GetName()))
+                    names += ",'" + Esc(member->GetName()) + "'";
+            }
+        }
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_death WHERE character_name IN ({}) "
+            "AND created_at >= NOW() - INTERVAL {} SECOND",
+            names, seconds);
+        if (!result)
+            return 0;
         return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
     }
 
@@ -22897,6 +22973,8 @@ private:
                 // its own - infra#2846, test_schema_degrade.py (#276). A zero window
                 // never reaches the database; RecentDeathCount owns that too.
                 toll.deaths = RecentDeathCount(name, window);
+                toll.partyDeaths = RecentPartyDeathCount(bot, window);
+                toll.strikes = _travelAims.LethalStrikes(name, target);
 
                 OverseerDecisions::ErrandDeathVerdict const verdict =
                     OverseerDecisions::ErrandDeathBreaker(toll, ERRAND_DEATH_LIMITS);
@@ -22913,6 +22991,8 @@ private:
                         // else, and asked through the loader for the same
                         // reason the count is (infra#2846).
                         std::string const killer = WorstRecentKiller(name, window);
+                        uint32_t const strikes =
+                            _travelAims.NoteLethal(name, target, ERRAND_DEATH_LIMITS);
 
                         LOG_WARN("module.overseer",
                                  // "releasing the errand" on ONE source line,
@@ -22925,11 +23005,14 @@ private:
                                  "this character for {} minutes, because clearing the column "
                                  "is not enough on its own: something outside this module "
                                  "writes it too and has re-armed a called-off errand within "
-                                 "five minutes before now",
+                                 "five minutes before now ({} party death(s); release {} "
+                                 "of this target in a row, #776)",
                                  name, toll.deaths, window, target,
                                  killer.empty() ? std::string()
                                                 : ", mostly to '" + killer + "'",
-                                 static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60));
+                                 static_cast<uint32>(OverseerDecisions::ErrandCooloffSeconds(
+                                     strikes, ERRAND_DEATH_LIMITS) / 60),
+                                 toll.partyDeaths, strikes);
                         _travelAims.Refuse(name, target,
                                            "it was killing this character");
                         _travelAims.Release(name, "the travel drive (deaths on the errand)");
