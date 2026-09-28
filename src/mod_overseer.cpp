@@ -27029,7 +27029,8 @@ private:
     // A sick revival cannot fight on ground inside the #697 lethal margin (#746).
     // It hearths when possible; otherwise the shared stillness hold and combat
     // strategy command path keep it passive until spell 15007 ends.
-    void DriveRevivedSickness(Player* bot, PlayerbotAI* botAI, std::string const& name)
+    void DriveRevivedSickness(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                              bool restWhileSick = false)
     {
         bool const sick = bot->HasAura(15007);
         auto current = _revivedSickness.find(name);
@@ -27054,6 +27055,7 @@ private:
         facts.levelGap = LONE_LEG_LIMITS.levelGap;
         uint32 const stone = HearthstoneSpellOf(bot);
         facts.hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
+        facts.restWhileSick = restWhileSick;
         auto const step = OverseerDecisions::DecideRevivedSickGround(facts);
 
         if (state.hasDecision && state.lastDecision != step)
@@ -27395,6 +27397,10 @@ private:
             {
                 EndGhostRecovery(botAI, name);
                 ReleaseRevivalHold(botAI, name);
+                // Resurrection Sickness is rested out, not fought through: at
+                // a quarter of its stats a member in starting gear dies to the
+                // first creature it meets.
+                DriveRevivedSickness(bot, botAI, name, /*restWhileSick*/ true);
                 continue;
             }
 
@@ -27542,6 +27548,8 @@ private:
             if (step == OverseerDecisions::GuildTrainingStep::Nothing)
             {
                 _guildTrainingSentTo.erase(name);
+                if (!bot->HasAura(15007))
+                    DriveGuildWeaponFor(bot, botAI, name);
                 continue;
             }
             uint32 const entry = entries[pick].first;
@@ -27581,6 +27589,233 @@ private:
                      name, bot->GetLevel(), learned, ids.size(), entry,
                      before - bot->GetMoney());
         }
+    }
+
+    // ------------------------------- a natural guild member's own weapon --
+    //
+    // Measured on wow-dev (2026-09-28): natural guild members at levels 10 to
+    // 16 wore item level 2 to 5 gear and died about 550 times in 30 minutes,
+    // to creatures at or up to two levels above them. A weapon first, as the
+    // family's town errand does (wow-overseer#398): a member carrying a better
+    // weapon it has no skill for walks to a weapon master and learns the skill
+    // with its own gold; otherwise it walks to the vendor on its map that sells
+    // the best weapon it can use and afford (keeping GUILD_WEAPON_RESERVE for
+    // repairs), buys it through the core's own vendor handler and puts it on.
+    static constexpr uint32 GUILD_WEAPON_RESERVE = 500;
+    static constexpr uint32 GUILD_WEAPON_MIN_GAIN = 3;
+    static constexpr float GUILD_NPC_REACH_YARDS = 5.0f;
+
+    static bool IsMainHandType(uint32 inventoryType)
+    {
+        return inventoryType == INVTYPE_WEAPON || inventoryType == INVTYPE_2HWEAPON ||
+               inventoryType == INVTYPE_WEAPONMAINHAND;
+    }
+
+    void LoadWeaponSpots()
+    {
+        _weaponSpotsLoaded = true;
+        for (auto const& spawn : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureData const& data = spawn.second;
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
+            if (!tmpl)
+                continue;
+            NpcSpot const spot{data.id, data.mapid, data.posX, data.posY, data.posZ};
+            if (tmpl->npcflag & UNIT_NPC_FLAG_VENDOR)
+                if (VendorItemData const* items = sObjectMgr->GetNpcVendorItemList(data.id))
+                    for (uint32 i = 0; i < items->GetItemCount(); ++i)
+                    {
+                        VendorItem const* line = items->GetItem(i);
+                        ItemTemplate const* proto =
+                            line ? sObjectMgr->GetItemTemplate(line->item) : nullptr;
+                        if (proto && proto->Class == ITEM_CLASS_WEAPON &&
+                            IsMainHandType(proto->InventoryType) && !line->ExtendedCost)
+                        {
+                            _weaponVendorSpots.push_back(spot);
+                            break;
+                        }
+                    }
+            if (Trainer::Trainer const* trainer = sObjectMgr->GetTrainer(data.id))
+                for (Trainer::Spell const& spell : trainer->GetSpells())
+                    if (spell.SpellId == 201 || spell.SpellId == 196 || spell.SpellId == 198 ||
+                        spell.SpellId == 1180 || spell.SpellId == 227)
+                    {
+                        _weaponMasterSpots.push_back(spot);
+                        break;
+                    }
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: guild weapons - {} weapon vendor spawn(s) and {} weapon master "
+                 "spawn(s) cached",
+                 _weaponVendorSpots.size(), _weaponMasterSpots.size());
+    }
+
+    bool FriendlySpot(Player* bot, NpcSpot const& spot, float maxYards)
+    {
+        if (spot.mapId != bot->GetMapId() ||
+            bot->GetExactDist2d(spot.x, spot.y) > maxYards)
+            return false;
+        CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(spot.entry);
+        FactionTemplateEntry const* mine = bot->GetFactionTemplateEntry();
+        FactionTemplateEntry const* theirs =
+            tmpl ? sFactionTemplateStore.LookupEntry(tmpl->faction) : nullptr;
+        return mine && theirs && !theirs->IsHostileTo(*mine);
+    }
+
+    // Walk to `spot`, or say it is here. True when standing at it.
+    bool GoToNpc(Player* bot, PlayerbotAI* botAI, std::string const& name, NpcSpot const& spot,
+                 char const* why)
+    {
+        if (bot->FindNearestCreature(spot.entry, GUILD_NPC_REACH_YARDS * 3))
+            return true;
+        botAI->rpgInfo.ChangeToWanderNpc(
+            spot.entry, WorldPosition(spot.mapId, spot.x, spot.y, spot.z, 0.f));
+        if (_guildWeaponSentTo[name] != spot.entry)
+        {
+            _guildWeaponSentTo[name] = spot.entry;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) walks {:.0f} yards to creature {} - {}", name,
+                     bot->GetLevel(), bot->GetExactDist2d(spot.x, spot.y), spot.entry, why);
+        }
+        return false;
+    }
+
+    void DriveGuildWeaponFor(Player* bot, PlayerbotAI* botAI, std::string const& name)
+    {
+        if (!_weaponSpotsLoaded)
+            LoadWeaponSpots();
+        Item* const worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        uint32 const wornLevel = worn ? worn->GetTemplate()->ItemLevel : 0;
+
+        // 1. A BETTER WEAPON IN THE BAGS IT HAS NO SKILL FOR: the weapon master.
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        {
+            Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+            if (!proto || proto->Class != ITEM_CLASS_WEAPON ||
+                !IsMainHandType(proto->InventoryType) ||
+                proto->ItemLevel < wornLevel + GUILD_WEAPON_MIN_GAIN ||
+                proto->RequiredLevel > bot->GetLevel())
+                continue;
+            uint32 const skill = proto->GetSkill();
+            uint32 const skillSpell = OverseerDecisions::WeaponSkillSpellFor(proto->SubClass);
+            if (!skill || !skillSpell || bot->GetSkillValue(skill) ||
+                !GetSkillRaceClassInfo(skill, bot->getRace(), bot->getClass()))
+                continue;
+            NpcSpot const* best = nullptr;
+            for (NpcSpot const& spot : _weaponMasterSpots)
+            {
+                Trainer::Trainer* trainer = sObjectMgr->GetTrainer(spot.entry);
+                Trainer::Spell const* spell = trainer ? trainer->GetSpell(skillSpell) : nullptr;
+                if (!spell || spell->MoneyCost + GUILD_WEAPON_RESERVE > bot->GetMoney() ||
+                    !FriendlySpot(bot, spot, GUILD_TRAINER_WALK_YARDS))
+                    continue;
+                if (!best || bot->GetExactDist2d(spot.x, spot.y) <
+                                 bot->GetExactDist2d(best->x, best->y))
+                    best = &spot;
+            }
+            if (!best)
+                continue;
+            if (!GoToNpc(bot, botAI, name, *best, "to learn the skill for the weapon it carries"))
+                return;
+            Creature* npc = bot->FindNearestCreature(best->entry, GUILD_NPC_REACH_YARDS * 3);
+            Trainer::Trainer* trainer = sObjectMgr->GetTrainer(best->entry);
+            if (npc && trainer && bot->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
+            {
+                uint64 const before = bot->GetMoney();
+                trainer->TeachSpell(npc, bot, skillSpell);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' {} spell {} at weapon master {} for {} copper of its own",
+                         name, bot->GetMoney() < before ? "learned" : "was not taught", skillSpell,
+                         best->entry, before - bot->GetMoney());
+                _guildWeaponSentTo.erase(name);
+            }
+            return;
+        }
+
+        // 2. THE BEST WEAPON A VENDOR ON ITS MAP SELLS IT.
+        std::vector<OverseerDecisions::WeaponOffer> offers;
+        std::vector<std::pair<NpcSpot const*, uint32>> sources;
+        for (NpcSpot const& spot : _weaponVendorSpots)
+        {
+            if (!FriendlySpot(bot, spot, GUILD_TRAINER_WALK_YARDS))
+                continue;
+            VendorItemData const* items = sObjectMgr->GetNpcVendorItemList(spot.entry);
+            if (!items)
+                continue;
+            for (uint32 i = 0; i < items->GetItemCount(); ++i)
+            {
+                VendorItem const* line = items->GetItem(i);
+                ItemTemplate const* proto = line ? sObjectMgr->GetItemTemplate(line->item) : nullptr;
+                if (!proto || proto->Class != ITEM_CLASS_WEAPON ||
+                    !IsMainHandType(proto->InventoryType) || line->ExtendedCost ||
+                    line->maxcount || bot->CanUseItem(proto) != EQUIP_ERR_OK)
+                    continue;
+                offers.push_back({proto->ItemLevel, proto->BuyPrice,
+                                  bot->GetExactDist2d(spot.x, spot.y)});
+                sources.emplace_back(&spot, proto->ItemId);
+            }
+        }
+        int const pick = OverseerDecisions::ChooseWeaponOffer(
+            offers, wornLevel, bot->GetMoney(), GUILD_WEAPON_RESERVE, GUILD_WEAPON_MIN_GAIN);
+        if (pick < 0)
+        {
+            _guildWeaponSentTo.erase(name);
+            return;
+        }
+        NpcSpot const& spot = *sources[pick].first;
+        uint32 const itemId = sources[pick].second;
+        if (!GoToNpc(bot, botAI, name, spot, "to buy a better weapon with its own gold"))
+            return;
+        Creature* vendor = bot->FindNearestCreature(spot.entry, GUILD_NPC_REACH_YARDS * 3);
+        if (!vendor || !bot->GetNPCIfCanInteractWith(vendor->GetGUID(), UNIT_NPC_FLAG_VENDOR))
+            return;
+        VendorItemData const* items = vendor->GetVendorItems();
+        int32 vendorSlot = -1;
+        for (uint32 i = 0; items && i < items->GetItemCount(); ++i)
+            if (VendorItem const* line = items->GetItem(i); line && line->item == itemId)
+                vendorSlot = int32(i);
+        if (vendorSlot < 0)
+            return;
+        WorldSession* session = bot->GetSession();
+        uint64 const before = bot->GetMoney();
+        {
+            WorldPacket raw(CMSG_LIST_INVENTORY, 8);
+            raw << vendor->GetGUID();
+            WorldPackets::Item::ListInventory listing(std::move(raw));
+            listing.Read();
+            session->HandleListInventoryOpcode(listing);
+        }
+        {
+            WorldPacket raw(CMSG_BUY_ITEM, 8 + 4 + 4 + 4 + 1);
+            raw << vendor->GetGUID();
+            raw << uint32(itemId);
+            raw << uint32(uint32(vendorSlot) + 1);
+            raw << uint32(1);
+            raw << uint8(0);
+            WorldPackets::Item::BuyItem packet(std::move(raw));
+            packet.Read();
+            session->HandleBuyItemOpcode(packet);
+        }
+        bool worn2 = false;
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END && !worn2; ++slot)
+        {
+            Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!item || item->GetEntry() != itemId)
+                continue;
+            uint16 dest = 0;
+            if (bot->CanEquipItem(NULL_SLOT, dest, item, true) == EQUIP_ERR_OK)
+            {
+                bot->SwapItem(item->GetPos(), dest);
+                worn2 = true;
+            }
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' (level {}) bought item {} (item level {}, over {}) at vendor {} "
+                 "for {} copper of its own{}",
+                 name, bot->GetLevel(), itemId, offers[pick].itemLevel, wornLevel, spot.entry,
+                 before - bot->GetMoney(), worn2 ? " and put it on" : " - not worn yet");
+        _guildWeaponSentTo.erase(name);
     }
 
     // The death is over: the character is alive again.
@@ -62277,6 +62512,20 @@ private:
     std::map<uint8, std::vector<std::pair<uint32, float>>> _classTrainerEntries;
     bool _classTrainersLoaded{false};
     std::map<std::string, uint32> _guildTrainingSentTo;
+    // DriveGuildWeaponFor: every vendor spawn that sells a weapon, every
+    // weapon master spawn, and where each member was last sent.
+    struct NpcSpot
+    {
+        uint32 entry{0};
+        uint32 mapId{0};
+        float x{0.f};
+        float y{0.f};
+        float z{0.f};
+    };
+    std::vector<NpcSpot> _weaponVendorSpots;
+    std::vector<NpcSpot> _weaponMasterSpots;
+    bool _weaponSpotsLoaded{false};
+    std::map<std::string, uint32> _guildWeaponSentTo;
     std::time_t _guildTrainingAt{0};
 
     // What KeepRosterFollowing knew about each follower's position last

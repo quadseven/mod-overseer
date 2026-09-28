@@ -6872,8 +6872,10 @@ RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& fact
     // AN INN OR A CITY IS NEVER LETHAL GROUND. Measured: Zug, resting in the
     // Valley of Strength, read a level 80 spawn within 30 yards and hearthed
     // thirty feet to Orgrimmar's inn.
-    if (!facts.sick || facts.resting ||
-        facts.groundTopLevel < facts.memberLevel + facts.levelGap)
+    bool const lethal = facts.groundTopLevel >= facts.memberLevel + facts.levelGap;
+    if (facts.sick && facts.restWhileSick && !lethal)
+        return RevivedSickGroundStep::HoldOutOfCombat;
+    if (!facts.sick || facts.resting || !lethal)
         return RevivedSickGroundStep::Stay;
     return facts.hearthReady ? RevivedSickGroundStep::Hearth
                              : RevivedSickGroundStep::HoldOutOfCombat;
@@ -15081,6 +15083,53 @@ GuildTrainingStep DecideGuildTraining(unsigned affordable, bool trainerFound, fl
     if (!affordable || !trainerFound)
         return GuildTrainingStep::Nothing;
     return yards <= reach ? GuildTrainingStep::Learn : GuildTrainingStep::Walk;
+}
+
+int ChooseWeaponOffer(std::vector<WeaponOffer> const& offers, uint32_t wornItemLevel,
+                      uint64_t purse, uint64_t reserve, uint32_t minGain)
+{
+    int best = -1;
+    for (std::size_t i = 0; i < offers.size(); ++i)
+    {
+        WeaponOffer const& o = offers[i];
+        if (o.itemLevel < wornItemLevel + minGain)
+            continue;
+        if (purse < reserve || o.price > purse - reserve)
+            continue;
+        if (best < 0)
+        {
+            best = static_cast<int>(i);
+            continue;
+        }
+        WeaponOffer const& b = offers[best];
+        if (o.itemLevel > b.itemLevel ||
+            (o.itemLevel == b.itemLevel &&
+             (o.price < b.price || (o.price == b.price && o.yards < b.yards))))
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+uint32_t WeaponSkillSpellFor(uint32_t weaponSubclass)
+{
+    switch (weaponSubclass)
+    {
+        case 0: return 196;     // axe
+        case 1: return 197;     // two-handed axe
+        case 2: return 264;     // bow
+        case 3: return 266;     // gun
+        case 4: return 198;     // mace
+        case 5: return 199;     // two-handed mace
+        case 6: return 200;     // polearm
+        case 7: return 201;     // sword
+        case 8: return 202;     // two-handed sword
+        case 10: return 227;    // staff
+        case 13: return 15590;  // fist weapon
+        case 15: return 1180;   // dagger
+        case 16: return 2567;   // thrown
+        case 18: return 5011;   // crossbow
+    }
+    return 0;
 }
 
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes)
