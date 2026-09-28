@@ -2654,6 +2654,11 @@ DcArmingStep DecideDcArming(bool issuerAvailable, bool recordIsForThisRun,
 // relogging into the dungeon was never armed again, and the run stood.
 bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap);
 
+// Whether a leader off the dungeon map since `awaySince` has been away longer
+// than `ceilingSeconds` at `now`, so the run is walked out rather than held.
+// A zero `awaySince` (not away) or a clock stepped backwards never ends it.
+bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds);
+
 // Does the CLEARING stall clock run this poll (#618)? Only while the brain can
 // actually be driven: `dc on` accepted for everyone inside, the leader
 // visible on the dungeon map, and a groupmate able to issue `dc skip`.

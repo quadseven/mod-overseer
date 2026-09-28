@@ -1846,6 +1846,11 @@ DcArmingStep DecideDcArming(bool issuerAvailable, bool recordIsForThisRun,
     return DcArmingStep::Issue;
 }
 
+bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds)
+{
+    return awaySince && now > awaySince && now - awaySince > ceilingSeconds;
+}
+
 bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap)
 {
     return !inWorld || !onDungeonMap;
