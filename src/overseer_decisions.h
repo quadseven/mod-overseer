@@ -17441,6 +17441,11 @@ struct GuildDeathMark
 // (DriveStuckRevival owns the family).
 bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool hasAI);
 
+// Whether `zoneId` is the other faction's home ground, where its guards kill
+// on sight: Durotar and Orgrimmar for the Alliance, Elwynn Forest and
+// Stormwind City for the Horde.
+bool OnOtherFactionsGround(bool alliance, uint32_t zoneId);
+
 // ------------------------------- a natural guild member goes to its trainer --
 //
 // A natural guild member is granted no spells (playerbots patch 0024), and

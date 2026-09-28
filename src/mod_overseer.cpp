@@ -27409,7 +27409,10 @@ private:
             unsigned const deathsHere = OverseerDecisions::CountGuildDeathsNear(
                 marks, now, corpse->GetMapId(), corpse->GetPositionX(), corpse->GetPositionY(),
                 GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
-            DriveGhostRecovery(bot, botAI, name, corpse, deathsHere, /*ladder*/ false);
+            bool const hostileGround = OverseerDecisions::OnOtherFactionsGround(
+                bot->GetTeamId() == TEAM_ALLIANCE, corpse->GetZoneId());
+            DriveGhostRecovery(bot, botAI, name, corpse, deathsHere, /*ladder*/ false,
+                               hostileGround);
         }
     }
 
@@ -27611,7 +27614,8 @@ private:
     // character: where the family would be handed to the ladder, the corpse
     // run is handed back to the dead engine instead.
     bool DriveGhostRecovery(Player* bot, PlayerbotAI* botAI, std::string const& name, Corpse* corpse,
-                            unsigned knownDeathsHere = 0, bool ladder = true)
+                            unsigned knownDeathsHere = 0, bool ladder = true,
+                            bool hostileGround = false)
     {
         // Open world only, and only a released ghost whose corpse is on the
         // map it stands on. Instances, battlegrounds and dungeon runs have
@@ -27683,6 +27687,17 @@ private:
         facts.ghostSeconds = static_cast<long>(now - ghostTime);
         facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty();
         facts.choseHealer = st.choseHealer;
+        // ON THE OTHER FACTION'S HOME GROUND THE CORPSE RUN IS THE TRAP. The
+        // guards stand over the corpse and the graveyard alike, and no wait
+        // moves them (2026-09-28: Alliance members died to Razor Hill Grunts
+        // again and again at the corpse). The spirit healer is taken even
+        // though its graveyard fails the safety test, and the bridge sends the
+        // member home by hearthstone as soon as it is alive.
+        if (hostileGround && st.healerGrave)
+        {
+            facts.healerGraveyardSafe = true;
+            facts.choseHealer = true;
+        }
         auto const healerUse = _lastSpiritHealerUse.find(name);
         facts.healerUsedRecently =
             healerUse != _lastSpiritHealerUse.end() &&

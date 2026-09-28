@@ -20,6 +20,7 @@ using OverseerDecisions::CountGuildDeathsNear;
 using OverseerDecisions::GuildGhostDriven;
 using OverseerDecisions::GuildDeathMark;
 using OverseerDecisions::NoteGuildDeath;
+using OverseerDecisions::OnOtherFactionsGround;
 using OverseerDecisions::PruneGuildDeathMarks;
 
 namespace
@@ -70,6 +71,14 @@ int main()
     Check(!GuildGhostDriven(true, true, false, true), "a family member is left to its own drive");
     Check(!GuildGhostDriven(false, false, true, false), "a player's character is never steered");
     Check(!GuildGhostDriven(false, true, false, false), "a bot with no AI is not steered");
+
+    // The other faction's home ground: Razor Hill Grunts killed Alliance
+    // members at their corpses in Durotar, over and over (2026-09-28).
+    Check(OnOtherFactionsGround(true, 14), "Durotar is Horde ground to the Alliance");
+    Check(OnOtherFactionsGround(true, 1637), "Orgrimmar is Horde ground to the Alliance");
+    Check(!OnOtherFactionsGround(false, 14), "Durotar is home to the Horde");
+    Check(OnOtherFactionsGround(false, 12), "Elwynn is Alliance ground to the Horde");
+    Check(!OnOtherFactionsGround(true, 40), "Westfall is nobody's guarded ground");
 
     if (failures)
     {
