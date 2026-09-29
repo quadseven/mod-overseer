@@ -26,7 +26,11 @@ using OverseerDecisions::GUILD_RUN_EMPTY_SECONDS;
 using OverseerDecisions::GuildFinderRefusal;
 using OverseerDecisions::GuildFinderRefusalWord;
 using OverseerDecisions::GuildFinderRequest;
+using OverseerDecisions::GUILD_RUN_REARM_SECONDS;
 using OverseerDecisions::GuildRunNext;
+using OverseerDecisions::GuildRunRearmFacts;
+using OverseerDecisions::GuildRunRearmNext;
+using OverseerDecisions::GuildRunRearmStep;
 using OverseerDecisions::GuildRunPoll;
 using OverseerDecisions::GuildRunVerdict;
 using OverseerDecisions::GuildRunVerdictWord;
@@ -216,6 +220,39 @@ void AGroupThatLeftOrOutstayedIsOver()
                            std::string(GuildRunVerdictWord(GuildRunVerdict::Cleared)) == "cleared");
 }
 
+// A guild run sat 4000s at 0 of 4 bosses after the dungeon brain disabled itself
+// on a healer death, because the group was armed once per stay and nothing ever
+// asked again. The re-arm is an idempotent verb, so what is decided here is only
+// WHEN to ask: after the first arming, while somebody is alive, once per cooldown.
+void ADisabledBrainIsAskedAgainWhileSomebodyLives()
+{
+    GuildRunRearmFacts f;
+    f.armed = true;
+    f.aliveInside = 4;
+    f.secondsSinceIssued = GUILD_RUN_REARM_SECONDS;
+    Check("armed, alive, cooldown spent: ask again",
+          GuildRunRearmNext(f) == GuildRunRearmStep::Issue);
+    f.aliveInside = 1;
+    Check("one survivor is enough", GuildRunRearmNext(f) == GuildRunRearmStep::Issue);
+}
+
+void TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming()
+{
+    GuildRunRearmFacts f;
+    f.armed = true;
+    f.aliveInside = 4;
+    f.secondsSinceIssued = GUILD_RUN_REARM_SECONDS - 1;
+    Check("inside the cooldown: wait", GuildRunRearmNext(f) == GuildRunRearmStep::Wait);
+
+    f.secondsSinceIssued = GUILD_RUN_REARM_SECONDS * 10;
+    f.armed = false;
+    Check("not armed yet: the first arming owns it", GuildRunRearmNext(f) == GuildRunRearmStep::Skip);
+
+    f.armed = true;
+    f.aliveInside = 0;
+    Check("nobody alive: nothing to re-arm", GuildRunRearmNext(f) == GuildRunRearmStep::Skip);
+}
+
 }  // namespace
 
 int main()
@@ -230,6 +267,8 @@ int main()
     AScriptlessInstanceIsClearedByTheCoreCreditMask();
     EverybodyInsideDeadIsAWipe();
     AGroupThatLeftOrOutstayedIsOver();
+    ADisabledBrainIsAskedAgainWhileSomebodyLives();
+    TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

@@ -36781,6 +36781,42 @@ private:
                          run.tank, all ? "accepted" : "refused (see playerbots.dungeonclear)");
             }
 
+            // ...AND ASKED AGAIN WHILE ANYBODY LIVES. The dungeon brain can turn
+            // itself off after the arming above (a wipe, a death it could not
+            // recover), and a group that is alive inside but disarmed idled to the
+            // ceiling once. `dc ensure` enables it only when it is off and touches
+            // nothing when it is on, so asking once a minute is safe.
+            {
+                OverseerDecisions::GuildRunRearmFacts rearm;
+                rearm.armed = run.dcAccepted;
+                rearm.aliveInside = poll.aliveInside;
+                rearm.secondsSinceIssued =
+                    now >= run.dcTriedAt ? static_cast<unsigned>(now - run.dcTriedAt) : 0;
+                if (OverseerDecisions::GuildRunRearmNext(rearm) ==
+                        OverseerDecisions::GuildRunRearmStep::Issue &&
+                    tank && tank->IsInWorld())
+                {
+                    run.dcTriedAt = now;
+                    bool all = true;
+                    for (std::string const& name : run.names)
+                    {
+                        Player* const p = ObjectAccessor::FindPlayerByName(name);
+                        PlayerbotAI* const ai = p ? GET_PLAYERBOT_AI(p) : nullptr;
+                        if (!ai || !p->IsAlive() || p->GetMapId() != run.mapId)
+                            continue;
+                        if (!ai->DoSpecificAction(OverseerDecisions::GUILD_RUN_REARM_VERB,
+                                                  Event("dc", "", tank), true))
+                            all = false;
+                    }
+                    if (!all)
+                        LOG_INFO("module.overseer",
+                                 "overseer: guild finder run {} - '{}' from '{}' refused (see "
+                                 "playerbots.dungeonclear); asked again in {}s",
+                                 run.id, OverseerDecisions::GUILD_RUN_REARM_VERB, run.tank,
+                                 OverseerDecisions::GUILD_RUN_REARM_SECONDS);
+                }
+            }
+
             OverseerDecisions::GuildRunVerdict const verdict = OverseerDecisions::GuildRunNext(poll);
             if (verdict != OverseerDecisions::GuildRunVerdict::Running)
             {
