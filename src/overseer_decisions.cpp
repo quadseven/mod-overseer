@@ -15991,6 +15991,14 @@ std::uint8_t GuildSeatRoleMask(GuildSeat seat)
     return FINDER_ROLE_DAMAGE;
 }
 
+GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
+{
+    if (!facts.armed || facts.aliveInside == 0)
+        return GuildRunRearmStep::Skip;
+    return facts.secondsSinceIssued >= facts.cooldownSeconds ? GuildRunRearmStep::Issue
+                                                             : GuildRunRearmStep::Wait;
+}
+
 GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
 {
     if (poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||

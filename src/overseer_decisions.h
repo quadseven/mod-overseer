@@ -18253,6 +18253,37 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 // "running", "cleared", "wiped", "abandoned", "timed out".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
 
+// THE DUNGEON BRAIN IS ASKED AGAIN, NOT ONLY ONCE. A guild run is armed once
+// per stay (`dc on`), and the dungeon module can disable itself afterwards (a
+// wipe, a member lost mid-run); a group that is alive inside but disarmed idles
+// until the ceiling. A group that stalled 4000s at 0 of 4 bosses did exactly
+// that. While somebody is alive inside, the poll asks again, once per cooldown,
+// with an IDEMPOTENT verb: `dc ensure` enables the run only when it is off and
+// answers true without touching a run that is under way. Plain `dc on` cannot
+// be the repeat, because an accepted one resets the run's transient state.
+constexpr char GUILD_RUN_REARM_VERB[] = "dc ensure";
+constexpr unsigned GUILD_RUN_REARM_SECONDS = 60;
+
+struct GuildRunRearmFacts
+{
+    // The first `dc on` was accepted for this run: the first arming owns
+    // everything before that.
+    bool armed{false};
+    unsigned aliveInside{0};
+    // Since the last `dc on` / `dc ensure` was issued for this run.
+    unsigned secondsSinceIssued{0};
+    unsigned cooldownSeconds{GUILD_RUN_REARM_SECONDS};
+};
+
+enum class GuildRunRearmStep : std::uint8_t
+{
+    Skip,   // not armed yet, or nobody alive to arm for
+    Wait,   // asked a moment ago
+    Issue,  // ask the dungeon brain to be on
+};
+
+GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts);
+
 // ------------------------- what a level-up hands the roster (the operator) --
 //
 // TrainRoster runs on every level change of a roster character. With factory
