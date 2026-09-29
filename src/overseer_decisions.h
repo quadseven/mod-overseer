@@ -17695,12 +17695,20 @@ struct TrainingStopMember
 {
     std::string name;
     uint32_t learnSkill{0};    // overseer_roster.learn_skill; 0 is nothing to learn
+    // How many class spells the member's own class trainer would teach it now
+    // that it has the gold for (2026-09-29). A class spell is a learn too: with
+    // Overseer.Train.Factory off nothing else buys one for the family.
+    uint32_t classSpells{0};
     bool withTheHead{false};   // alive, on the head's map, within TRAINING_STOP_WITH_HEAD_YARDS
     // How far the head stands from the nearest trainer that teaches this
     // member its learn, or below zero when no trainer on the map does.
     float trainerYards{-1.f};
     bool walkedThisStop{false};  // a leg for this member already ran in this stop
 };
+
+// Does the member have anything a trainer could sell it: a profession or a
+// class spell it can pay for?
+bool TrainingStopWants(TrainingStopMember const& member);
 
 struct TrainingStopFacts
 {
@@ -19198,6 +19206,25 @@ struct TalentLearnStep
 // free points could pay for, so with the one point a level brings it only ever
 // bought rank 1, and stalled once row 0's first ranks were held.
 std::vector<TalentLearnStep> PlanTalentSpend(std::vector<TalentSlot> slots, unsigned freePoints);
+
+// ----------------------------------------------- the `auras` probe --------
+//
+// What a living character carries, for the probe surface (`probe.py Ugga
+// auras`). A party frame cannot say whether a buff was never cast or is only
+// hidden by the client, and character_aura is saved on logout, so the module
+// answers from the live Player, as `spells` and `strategies` do.
+struct AuraFact
+{
+    uint32_t spellId{0};
+    uint32_t stacks{0};
+    int32_t remainingMs{-1};   // -1 for an aura with no duration
+    bool positive{false};
+    std::string caster;        // empty when the caster is gone or unknown
+};
+
+// {"auras":[{"spell":N,"stacks":N,"remaining_ms":N,"positive":B,"caster":S}],
+//  "count":N,"positive":N}
+std::string AuraProbeJson(std::vector<AuraFact> const& auras);
 
 }  // namespace OverseerDecisions
 
