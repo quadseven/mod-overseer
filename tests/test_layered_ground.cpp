@@ -52,6 +52,7 @@ char const* Name(TerrainRemedy remedy)
         case TerrainRemedy::LiftToSurface: return "LiftToSurface";
         case TerrainRemedy::GiveUp:        return "GiveUp";
         case TerrainRemedy::NotFalling:    return "NotFalling";
+        case TerrainRemedy::ReturnToLastGround: return "ReturnToLastGround";
     }
     return "?";
 }

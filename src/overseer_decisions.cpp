@@ -384,9 +384,37 @@ bool NearTheVoidPlane(float currentZ, float catchYards)
     return currentZ <= VOID_PLANE_Z + catchYards;
 }
 
+bool PlaneRingIsFlat(std::vector<TerrainSample> const& ring, float centerZ,
+                     float tolerance)
+{
+    if (ring.empty() || tolerance <= 0.f)
+        return false;
+    for (TerrainSample const& sample : ring)
+    {
+        if (!sample.valid)
+            return false;
+        float const d = sample.z - centerZ;
+        if ((d < 0.f ? -d : d) > tolerance)
+            return false;
+    }
+    return true;
+}
+
+bool OnTheHiddenPlane(TerrainReading const& reading,
+                      TerrainRecoveryLimits const& limits)
+{
+    if (limits.planeReach <= 0.f || !reading.onOpenMap ||
+        !reading.terrainValid || !reading.planeFlat)
+        return false;
+    float const d = reading.z - reading.terrainZ;
+    return (d < 0.f ? -d : d) <= limits.planeReach;
+}
+
 bool ProvenBelowTheWorld(TerrainReading const& reading,
                          TerrainRecoveryLimits const& limits)
 {
+    if (OnTheHiddenPlane(reading, limits))
+        return true;
     bool const onTheGround =
         ReadingStandsOnTheGround(reading, limits.footingReach);
     bool const gap =
@@ -431,6 +459,11 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
                                            TerrainRecoveryLimits const& limits,
                                            time_t now)
 {
+    // THE PLANE'S MEMORY SURVIVES EVERY RESET BELOW: the ground a character
+    // last stood on is what it needs after it has moved 250 yards or changed
+    // an episode, which is precisely what the resets are for.
+    TerrainRecoveryState::PlaneMemory const planeMemory = state.plane;
+
     // THE EPISODE IS ABANDONED FIRST, BEFORE ANYTHING IS DECIDED, and on every
     // poll rather than only on a clean one. An episode that can only end when
     // the condition goes false cannot end at all where the condition never
@@ -459,6 +492,8 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
         // over there has nothing to say about it.
         state = TerrainRecoveryState{};
     }
+
+    state.plane = planeMemory;
 
     // AND THE GIVE-UP EXPIRES (#188). Separate from the three above rather
     // than a fourth branch of them, because it answers a different question:
@@ -544,6 +579,86 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
             state.fallingStartZ = reading.z;
         }
         state.fallingSeen = now;
+    }
+
+    // THE HIDDEN PLANE, ANSWERED BEFORE ANYTHING THAT ASKS WHETHER THERE IS
+    // GROUND. See OnTheHiddenPlane: every instrument below says yes there,
+    // because the mesh and the footing are built on the same placeholder, and a
+    // yes was being logged as the detector being wrong while a character rode
+    // under the city.
+    bool const onThePlane = OnTheHiddenPlane(reading, limits);
+
+    // GROUND IS REMEMBERED ON EVERY POLL THAT IS SURE OF IT, before any early
+    // return: not on the plane, not falling, and either open sky over it (no
+    // gap to a surface) or standing on a layer above the terrain, which is a
+    // city floor and not the plane. Nothing else is recorded, so a position
+    // the character fell to or stood under a roof at is never somewhere it is
+    // sent back to.
+    if (!onThePlane && !reading.falling)
+    {
+        bool const layerAboveTerrain =
+            reading.terrainValid && limits.planeReach > 0.f &&
+            reading.z - reading.terrainZ > limits.planeReach;
+        if (!holds || layerAboveTerrain)
+        {
+            state.plane.ground.valid = true;
+            state.plane.ground.mapId = reading.mapId;
+            state.plane.ground.x = reading.x;
+            state.plane.ground.y = reading.y;
+            state.plane.ground.z = reading.z;
+            state.plane.ground.when = now;
+        }
+    }
+
+    if (onThePlane)
+    {
+        // A cooldown and not a retirement, the same shape as the ladder below:
+        // the bound re-arms once the forget window has passed since the last
+        // action, so a character that is put back on the plane tomorrow is
+        // returned again instead of being ignored for good.
+        if (limits.forgetSeconds > 0 && state.plane.lastAttempt &&
+            now - state.plane.lastAttempt >= limits.forgetSeconds)
+        {
+            state.plane.returns = 0;
+            state.plane.saidGiveUp = false;
+        }
+        if (state.plane.returns >= limits.maxPlaneReturns)
+        {
+            if (state.plane.saidGiveUp)
+                return TerrainRecoveryVerdict{};
+            state.plane.saidGiveUp = true;
+            state.plane.lastAttempt = now;
+            return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
+        }
+        LastGround const& g = state.plane.ground;
+        bool const groundUsable =
+            g.valid && g.mapId == reading.mapId &&
+            limits.lastGroundMaxAgeSeconds > 0 &&
+            now - g.when <= limits.lastGroundMaxAgeSeconds;
+        if (groundUsable)
+        {
+            ++state.plane.returns;
+            state.plane.lastAttempt = now;
+            TerrainRecoveryVerdict v;
+            v.remedy = TerrainRemedy::ReturnToLastGround;
+            v.groundMapId = reading.mapId;
+            v.groundX = g.x;
+            v.groundY = g.y;
+            v.groundZ = g.z;
+            return v;
+        }
+        if (reading.surfaceValid && reading.surfaceAboveZ > reading.z)
+        {
+            ++state.plane.returns;
+            state.plane.lastAttempt = now;
+            return TerrainRecoveryVerdict{
+                TerrainRemedy::LiftToSurface,
+                reading.surfaceAboveZ + limits.liftClearance};
+        }
+        // Nothing to go back to and no surface to climb to: say so, once.
+        ++state.plane.returns;
+        state.plane.lastAttempt = now;
+        return TerrainRecoveryVerdict{TerrainRemedy::GiveUp, 0.f};
     }
 
     if (!holds)
@@ -2482,6 +2597,7 @@ bool TerrainRemedyEndsTheErrand(TerrainRemedy remedy, bool onTheGround)
         case TerrainRemedy::LiftToSurface: return true;
         case TerrainRemedy::GiveUp:        return !onTheGround;
         case TerrainRemedy::NotFalling:    return false;
+        case TerrainRemedy::ReturnToLastGround: return true;
     }
     return true;
 }

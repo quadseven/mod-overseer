@@ -29,8 +29,8 @@ int main()
     std::size_t const gate = text.find("if (endsTheErrand)", snapshot);
     std::size_t const release = text.find("_travelAims.Release(name, ", gate);
     if (gate == std::string::npos || release == std::string::npos || !(gate < release) ||
-        text.find("OverseerDecisions::TerrainRemedyEndsTheErrand(verdict.remedy, onTheGround)") ==
-            std::string::npos)
+        text.find("OverseerDecisions::TerrainRemedyEndsTheErrand(") == std::string::npos ||
+        text.find("verdict.remedy, onTheGround && !onThePlane)") == std::string::npos)
     {
         std::cerr << "the terrain release must be gated on TerrainRemedyEndsTheErrand\n";
         return EXIT_FAILURE;
@@ -43,7 +43,7 @@ int main()
         return EXIT_FAILURE;
     }
 
-    std::size_t const detector = text.find("bool const belowTerrain = gapCouldMatter");
+    std::size_t const detector = text.find("bool const belowTerrain = (gapCouldMatter || onThePlane)");
     std::size_t const publish = text.find("_belowTerrain.insert(LowerName(name));", detector);
     std::size_t const clear = text.find("_belowTerrain.erase(LowerName(name));", detector);
     std::size_t const travelGate = text.find(

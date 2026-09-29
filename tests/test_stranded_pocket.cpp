@@ -67,6 +67,7 @@ char const* Name(TerrainRemedy r)
         case TerrainRemedy::LiftToSurface: return "LiftToSurface";
         case TerrainRemedy::GiveUp:        return "GiveUp";
         case TerrainRemedy::NotFalling:    return "NotFalling";
+        case TerrainRemedy::ReturnToLastGround: return "ReturnToLastGround";
     }
     return "?";
 }
@@ -269,6 +270,7 @@ void TwelveMinutesInThePocketIsStillABoundedLadder()
             case TerrainRemedy::GiveUp:        ++giveUps; break;
             case TerrainRemedy::Nothing:       ++nothings; break;
             case TerrainRemedy::NotFalling:    ++nothings; break;
+            case TerrainRemedy::ReturnToLastGround: ++nothings; break;
         }
     }
     // 720 seconds is one full forget window and a little over, so the ladder

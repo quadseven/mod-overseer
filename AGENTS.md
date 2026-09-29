@@ -212,6 +212,20 @@ Aim the party **leader** only, and watch the death table while it walks. If deat
 exceed roughly three in five minutes, clear the aim - the destination is not worth
 the crossing.
 
+### "Is there ground here" and "which ground" are two questions
+
+The map's height field under and beside Stormwind is a flat placeholder at z
+59.457, the city is models above it, and the navmesh has polygons on the
+placeholder because it is built from that terrain. A character that leaves the
+city floor lands on a plane every "is there ground" instrument agrees is ground:
+Detour finds a polygon at its feet, the footing fan holds on flat ground, and
+the terrain drive once logged that as the detector being wrong while the leader
+rode two thousand yards under the city and the sea beside it. Measure it before
+believing a reading: the raw terrain height (`Map::GetGridHeight`) at the
+character's own x and y, and a ring of it 25 yards out. Feet on the terrain and
+a ring that does not move is the plane, whatever a navmesh says
+(`OverseerDecisions::OnTheHiddenPlane`).
+
 ### Combat wedges travel
 
 A character can sit at full health, in combat, not dying and not moving, with a
