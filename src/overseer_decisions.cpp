@@ -15993,7 +15993,8 @@ std::uint8_t GuildSeatRoleMask(GuildSeat seat)
 
 GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
 {
-    if (poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal))
+    if (poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||
+        DungeonRunCompletion(poll.expectedMask, poll.creditedMask) == DungeonCompletion::Complete)
         return GuildRunVerdict::Cleared;
     if (poll.inside && poll.aliveInside == 0)
         return GuildRunVerdict::Wiped;
