@@ -20664,7 +20664,9 @@ private:
                   "this map to aim at, and an `at:` aim cannot name a coordinate on "
                   "another one, so nothing in this module can walk this follower to "
                   "anybody until somebody moves it. Following, a catch-up walk, an "
-                  "escort and a dungeon run are blocked for it until then. AN ERRAND IT "
+                  "escort and a WALKED dungeon run are blocked for it until then; a run by "
+                  "the dungeon finder is not, because the finder takes a family in from "
+                  "wherever each member stands (Overseer.DungeonFinder.Default). AN ERRAND IT "
                   "CAN RUN ALONE ON THIS MAP IS NOT: it may still be sent to an "
                   "innkeeper, a vendor, a repairer or a trainer under its own aim, and "
                   "binding at an innkeeper here is what stops the next death dragging "
@@ -34598,11 +34600,17 @@ private:
                                            OverseerDecisions::RUN_FINDER_IS_DEFAULT);
     }
 
+    // `finderGroupGoesFirst` is the IDLE coordinator's question, asked while the
+    // group a finder run made still stands: RESETTING disbands it before the
+    // queue (LeaveTheFinderGroup), so it is no reason to say no.
     bool FamilyCanQueue(std::string const& leaderName, std::vector<std::string> const& members,
-                        DungeonPortal const& portal, std::string* whyNot = nullptr)
+                        DungeonPortal const& portal, std::string* whyNot = nullptr,
+                        bool finderGroupGoesFirst = false)
     {
-        OverseerDecisions::FinderReadiness const ready = OverseerDecisions::ReadFinderReadiness(
-            ReadFinderFacts(leaderName, members, portal), false);
+        OverseerDecisions::FinderFacts facts = ReadFinderFacts(leaderName, members, portal);
+        facts.groupMayBeFinders = finderGroupGoesFirst;
+        OverseerDecisions::FinderReadiness const ready =
+            OverseerDecisions::ReadFinderReadiness(facts, false);
         if (whyNot)
             *whyNot = ready.whyNot;
         return ready.ready;
@@ -42279,7 +42287,9 @@ private:
             // THE FINDER AS THE WAY IN (infra#4762) TAKES A FAMILY FROM WHEREVER IT
             // STANDS, so neither the home bind nor the continent crossing below
             // is waited on for it. Asked once here, for both.
-            bool const finderWay = FinderIsDefault() && FamilyCanQueue(leaderName, members, *portal);
+            bool const finderWay =
+                FinderIsDefault() &&
+                FamilyCanQueue(leaderName, members, *portal, nullptr, true);
             std::vector<std::string> const owedAHome = MembersOwedAHome(members, *portal);
             if (!finderWay && !owedAHome.empty())
             {
