@@ -5552,7 +5552,8 @@ public:
         facts.target = target;
         OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
         bool const writes = verdict == OverseerDecisions::TravelClaim::Write ||
-                            verdict == OverseerDecisions::TravelClaim::Outrank;
+                            verdict == OverseerDecisions::TravelClaim::Outrank ||
+                            verdict == OverseerDecisions::TravelClaim::Preempt;
         if (!writes)
         {
             // SAID ONCE PER STATE, NOT ONCE PER POLL (#560). A catch-up is
@@ -5610,6 +5611,17 @@ public:
                                std::to_string(facts.learnSkill) + ") left pending"
                          : std::string());
 
+        // A TRAINING STOP TAKING THE COLUMN FROM A TOWN ERRAND IS SAID, ONCE PER
+        // TAKEOVER (2026-09-29), for the same reason a run's is: the bridge
+        // wrote the errand and will write it again when the column is empty.
+        if (verdict == OverseerDecisions::TravelClaim::Preempt)
+            LOG_INFO("module.overseer",
+                     "overseer: a training stop takes the travel column for '{}' - '{}' "
+                     "replaces the town errand '{}'. The family's class spells and "
+                     "professions come before its shopping, and the bridge writes the "
+                     "errand again when the stop lets go",
+                     name, target, facts.column);
+
         // Esc() rather than a bare interpolation, the same discipline every
         // other write in this file applies: the name came out of a table a
         // person edits, and a later change to the aim format cannot silently
@@ -5662,7 +5674,8 @@ public:
         facts.target = target;
         OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
         return verdict != OverseerDecisions::TravelClaim::Write &&
-               verdict != OverseerDecisions::TravelClaim::Outrank;
+               verdict != OverseerDecisions::TravelClaim::Outrank &&
+               verdict != OverseerDecisions::TravelClaim::Preempt;
     }
 
     // Why this character's last claim was refused, or empty when the last
@@ -44995,6 +45008,8 @@ private:
     {
         time_t openedAt{0};                // the stop's first leg; 0 when none is open
         time_t endedAt{0};                 // when the last stop ended; 0 when none has
+        // How long that stop asked the next to wait (TrainingStopRestSeconds).
+        uint32 restSeconds{OverseerDecisions::TRAINING_STOP_REST_SECONDS};
         std::set<std::string> walked;      // members already walked for in this stop
         std::set<std::string> retried;     // members whose leg was cut short once already
         OverseerDecisions::TrainingStopStep said{OverseerDecisions::TrainingStopStep::Walk};
@@ -45037,6 +45052,7 @@ private:
                 continue;
             std::string const headName = headRow->name;
             std::string const headJob = headRow->job;
+            uint32 const headLearnSkill = headRow->learnSkill;
             Player* head = ObjectAccessor::FindPlayerByName(headName);
             if (!SteerableAI(head))
                 continue;
@@ -45072,6 +45088,16 @@ private:
             facts.campaignArmed = IsDungeonJob(headJob) || OverseerDecisions::HoldsInTown(headJob);
             facts.head = HeadTravelFactsFor(headName);
             facts.columnFree = column.empty();
+            // A TOWN ERRAND'S AIM IS THE STOP'S TO TAKE (2026-09-29). Not one
+            // this book wrote (a respec walk, a fetch, a run's leg), and not
+            // while the head has a profession errand pending: Claim's fences
+            // are read again at the write, this only keeps the pick from
+            // calling the column taken when Claim would take it.
+            OverseerDecisions::TravelOwner columnOwner = OverseerDecisions::TravelOwner::CatchUp;
+            facts.columnPreemptible = !column.empty() && headLearnSkill == 0 &&
+                                      !_travelAims.ClaimedBy(headName, column, columnOwner) &&
+                                      OverseerDecisions::TrainingStopMayPreempt(column);
+            facts.restSeconds = stop.restSeconds;
             if (stop.openedAt)
                 facts.stopSeconds =
                     static_cast<uint32>(std::max<time_t>(1, now - stop.openedAt));
@@ -45090,7 +45116,7 @@ private:
             // class trainer search below is not run every poll for a family
             // that has just been to town.
             bool const stopMayOpen =
-                stop.openedAt != 0 || facts.sinceLastStop >= OverseerDecisions::TRAINING_STOP_REST_SECONDS;
+                stop.openedAt != 0 || facts.sinceLastStop >= facts.restSeconds;
             if (!_classTrainersLoaded)
                 LoadClassTrainerSpots();
             for (Row const& row : rows)
@@ -45144,12 +45170,13 @@ private:
                 OverseerDecisions::PickTrainingStopLeg(facts, members);
             if (OverseerDecisions::TrainingStopEnds(pick.step, stop.openedAt != 0))
             {
+                stop.restSeconds = OverseerDecisions::TrainingStopRestSeconds(pick.step);
                 LOG_INFO("module.overseer",
                          "overseer: {}'s training stop ends after {}s with {} leg(s) walked - "
                          "{}. The next may start in {} minutes",
                          family, facts.stopSeconds, static_cast<uint32>(stop.walked.size()),
                          OverseerDecisions::TrainingStopStepWord(pick.step),
-                         OverseerDecisions::TRAINING_STOP_REST_SECONDS / 60);
+                         stop.restSeconds / 60);
                 stop.openedAt = 0;
                 stop.endedAt = now;
                 stop.walked.clear();
