@@ -27587,9 +27587,9 @@ private:
 
     // Buy every class spell `trainer` would teach `bot` that it has the gold
     // for, through the core's own Trainer::TeachSpell, which takes the gold.
-    // Returns how many were paid for (TeachSpell returns void and reports a
-    // refusal to a client a bot does not have, so the purse is what is read
-    // back); `offered` takes how many were tried. Shared by a natural guild
+    // Returns how many the character now holds (TeachSpell returns void and
+    // reports a refusal to a client a bot does not have, so the spell book is
+    // what is read back, not the purse); `offered` takes how many were tried. Shared by a natural guild
     // member's own visit and the family's training stop.
     static unsigned BuyAffordableClassSpells(Trainer::Trainer* trainer, Creature* npc,
                                              Player* bot, std::size_t* offered = nullptr)
@@ -27601,9 +27601,8 @@ private:
         unsigned learned = 0;
         for (uint32 spellId : ids)
         {
-            uint64 const had = bot->GetMoney();
             trainer->TeachSpell(npc, bot, spellId);
-            if (bot->GetMoney() < had)
+            if (bot->HasSpell(spellId))
                 ++learned;
         }
         return learned;
