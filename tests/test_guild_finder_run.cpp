@@ -174,6 +174,25 @@ void TheFinderSayingFinishedIsACleared()
           GuildRunNext(none) == GuildRunVerdict::Running);
 }
 
+void AScriptlessInstanceIsClearedByTheCoreCreditMask()
+{
+    // Ragefire Chasm's script never calls SetBossState, so the run reads
+    // bossesTotal 0 and only the finder flag could clear it. The core's own
+    // encounter credit is the other witness.
+    GuildRunPoll p = Inside(5, 5);
+    p.bossesTotal = 0;
+    p.expectedMask = 0b1111;
+    p.creditedMask = 0b1111;
+    Check("every credited encounter clears a run with no boss list",
+          GuildRunNext(p) == GuildRunVerdict::Cleared);
+    p.creditedMask = 0b0111;
+    Check("three of four credited is still running", GuildRunNext(p) == GuildRunVerdict::Running);
+    p.expectedMask = 0;
+    p.creditedMask = 0b1111;
+    Check("a map that credits nothing cannot be cleared by the mask",
+          GuildRunNext(p) == GuildRunVerdict::Running);
+}
+
 void EverybodyInsideDeadIsAWipe()
 {
     Check("three inside, none alive", GuildRunNext(Inside(3, 0)) == GuildRunVerdict::Wiped);
@@ -208,6 +227,7 @@ int main()
     EachSeatAnswersWithItsOwnRoleAndTheTankLeads();
     ARunningGroupIsLeftToRun();
     TheFinderSayingFinishedIsACleared();
+    AScriptlessInstanceIsClearedByTheCoreCreditMask();
     EverybodyInsideDeadIsAWipe();
     AGroupThatLeftOrOutstayedIsOver();
     if (failures)

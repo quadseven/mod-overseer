@@ -308,6 +308,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -36728,6 +36729,22 @@ private:
                         if (script->GetBossState(i) == DONE)
                             ++run.bossesDone;
                 }
+            // THE CORE'S OWN ENCOUNTER CREDIT, FOR A SCRIPT THAT KEEPS NO BOSS
+            // LIST. Ragefire Chasm's script never calls SetBossState, so its
+            // encounter count is 0 and every run above read "0 of 0 bosses" and
+            // could only end on the finder flag: 1 of 20 runs cleared, the rest
+            // timed out or were lost. The same DungeonEncounter.dbc credit the
+            // campaign coordinator finishes on (CompletedEncounters,
+            // ExpectedEncounterMask) answers it. Wing maps expect 0 and stay on
+            // the finder flag.
+            poll.expectedMask = ExpectedEncounterMask(run.mapId);
+            poll.creditedMask = poll.expectedMask ? CompletedEncounters(tank) : 0;
+            if (!run.bossesTotal && poll.expectedMask)
+            {
+                run.bossesTotal = static_cast<uint32>(std::bitset<32>(poll.expectedMask).count());
+                run.bossesDone =
+                    static_cast<uint32>(std::bitset<32>(poll.creditedMask & poll.expectedMask).count());
+            }
             poll.bossesDone = run.bossesDone;
             poll.bossesTotal = run.bossesTotal;
             poll.finderFinished =

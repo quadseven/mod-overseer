@@ -18223,6 +18223,13 @@ struct GuildRunPoll
     bool finderFinished{false};
     unsigned bossesDone{0};
     unsigned bossesTotal{0};
+    // The core's own encounter credit for the map (DungeonEncounter.dbc bits the
+    // map can credit, and the bits the group's save has credited). Read for an
+    // instance whose script never calls SetBossState, where bossesTotal is 0
+    // and only the finder flag could otherwise clear it (Ragefire Chasm).
+    // expectedMask 0 means the map credits nothing, and clears nothing.
+    std::uint32_t expectedMask{0};
+    std::uint32_t creditedMask{0};
     // The group is gone, or the tank is no longer in it.
     bool groupGone{false};
     unsigned ceilingSeconds{GUILD_RUN_CEILING_SECONDS};
