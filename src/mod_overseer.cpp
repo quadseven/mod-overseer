@@ -27585,6 +27585,29 @@ private:
         return n;
     }
 
+    // Buy every class spell `trainer` would teach `bot` that it has the gold
+    // for, through the core's own Trainer::TeachSpell, which takes the gold.
+    // Returns how many the character now holds (TeachSpell returns void and
+    // reports a refusal to a client a bot does not have, so the spell book is
+    // what is read back, not the purse); `offered` takes how many were tried. Shared by a natural guild
+    // member's own visit and the family's training stop.
+    static unsigned BuyAffordableClassSpells(Trainer::Trainer* trainer, Creature* npc,
+                                             Player* bot, std::size_t* offered = nullptr)
+    {
+        std::vector<uint32> ids;
+        AffordableClassSpells(trainer, bot, &ids);
+        if (offered)
+            *offered = ids.size();
+        unsigned learned = 0;
+        for (uint32 spellId : ids)
+        {
+            trainer->TeachSpell(npc, bot, spellId);
+            if (bot->HasSpell(spellId))
+                ++learned;
+        }
+        return learned;
+    }
+
     void DriveGuildTraining()
     {
         std::time_t const now = std::time(nullptr);
@@ -27686,22 +27709,14 @@ private:
 
             if (!npc || !bot->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
                 continue;
-            std::vector<uint32> ids;
-            AffordableClassSpells(trainer, bot, &ids);
             uint64 const before = bot->GetMoney();
-            unsigned learned = 0;
-            for (uint32 spellId : ids)
-            {
-                uint64 const had = bot->GetMoney();
-                trainer->TeachSpell(npc, bot, spellId);
-                if (bot->GetMoney() < had)
-                    ++learned;
-            }
+            std::size_t offered = 0;
+            unsigned const learned = BuyAffordableClassSpells(trainer, npc, bot, &offered);
             _guildTrainingSentTo.erase(name);
             LOG_INFO("module.overseer",
                      "overseer: '{}' (level {}) learned {} of {} class spell(s) at trainer {} "
                      "for {} copper of its own",
-                     name, bot->GetLevel(), learned, ids.size(), entry,
+                     name, bot->GetLevel(), learned, offered, entry,
                      before - bot->GetMoney());
         }
     }
@@ -45071,10 +45086,15 @@ private:
             });
             std::vector<OverseerDecisions::TrainingStopMember> members;
             std::vector<uint32> trainers;
+            // A stop is worth opening only when one could start now, so the
+            // class trainer search below is not run every poll for a family
+            // that has just been to town.
+            bool const stopMayOpen =
+                stop.openedAt != 0 || facts.sinceLastStop >= OverseerDecisions::TRAINING_STOP_REST_SECONDS;
+            if (!_classTrainersLoaded)
+                LoadClassTrainerSpots();
             for (Row const& row : rows)
             {
-                if (!row.learnSkill)
-                    continue;
                 OverseerDecisions::TrainingStopMember member;
                 member.name = row.name;
                 member.learnSkill = row.learnSkill;
@@ -45086,15 +45106,36 @@ private:
                                                          OverseerDecisions::TRAINING_STOP_WITH_HEAD_YARDS);
                 uint32 trainer = 0;
                 // The spawn search only for a member the pick could walk for.
-                if (facts.campaignArmed && member.withTheHead && !member.walkedThisStop)
+                if (facts.campaignArmed && stopMayOpen && member.withTheHead && !member.walkedThisStop)
                 {
                     WorldPosition where;
-                    if (ResolveTravelTarget(bot, "profession trainer", trainer, where, row.learnSkill))
+                    if (row.learnSkill)
+                    {
+                        if (ResolveTravelTarget(bot, "profession trainer", trainer, where, row.learnSkill))
+                            member.trainerYards =
+                                head->GetExactDist2d(where.GetPositionX(), where.GetPositionY());
+                        else
+                            trainer = 0;
+                    }
+                    else if (bot->GetMoney() > 0 &&
+                             ResolveTravelTarget(bot, "class trainer", trainer, where))
+                    {
+                        // NO PROFESSION TO LEARN, SO A CLASS SPELL IS THE
+                        // LEARN (2026-09-29): the family is granted none
+                        // (Overseer.Train.Factory = 0) and no other path sends
+                        // it to a trainer, so a level 35 priest held no
+                        // Fortitude and nobody had a buff.
+                        Trainer::Trainer* classTrainer = sObjectMgr->GetTrainer(trainer);
+                        member.classSpells =
+                            classTrainer ? AffordableClassSpells(classTrainer, bot) : 0;
                         member.trainerYards =
                             head->GetExactDist2d(where.GetPositionX(), where.GetPositionY());
+                    }
                     else
                         trainer = 0;
                 }
+                if (!OverseerDecisions::TrainingStopWants(member))
+                    continue;
                 members.push_back(member);
                 trainers.push_back(trainer);
             }
@@ -45139,11 +45180,15 @@ private:
                 CreatureTemplate const* trainerTemplate = sObjectMgr->GetCreatureTemplate(entry);
                 LOG_INFO("module.overseer",
                          "overseer: TRAINING STOP for {} {} - '{}' walks the family {:.0f} "
-                         "yards to '{}' (creature {}) so '{}' can learn {} ({}). {}, and "
+                         "yards to '{}' (creature {}) so '{}' can learn {}. {}, and "
                          "'{}' keeps the lead",
                          family, opening ? "opens" : "goes on", headName, member.trainerYards,
                          trainerTemplate ? trainerTemplate->Name : std::string("a trainer"),
-                         entry, member.name, SkillName(member.learnSkill), member.learnSkill,
+                         entry, member.name,
+                         member.learnSkill
+                             ? std::string(SkillName(member.learnSkill)) + " (" +
+                                   std::to_string(member.learnSkill) + ")"
+                             : std::to_string(member.classSpells) + " class spell(s)",
                          facts.head.bagBlocked
                              ? "The campaign holds the family in town for bag room"
                              : facts.head.campaignBetweenAttempts
@@ -45181,20 +45226,31 @@ private:
     bool TeachAtTrainingStop(TrainingStopLegState& leg)
     {
         Trainer::Trainer* trainer = sObjectMgr->GetTrainer(leg.entry);
+        // A CLASS TRAINER TEACHES CLASS SPELLS, NOT A PROFESSION (2026-09-29):
+        // its members buy what they can afford with their own gold.
+        bool const classTrainer = trainer && trainer->GetTrainerType() == Trainer::Type::Class;
         std::map<std::string, ProfessionPlan> const plans = LoadProfessionPlans();
         std::vector<std::pair<std::string, Player*>> learners;
         std::vector<std::string> away;
         for (std::string const& name : leg.members)
         {
-            auto const plan = plans.find(name);
-            if (plan == plans.end() || !plan->second.learnSkill)
-                continue;
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!SteerableAI(bot) || !bot->IsAlive())
                 continue;
-            if (!trainer || !trainer->IsTrainerValidForPlayer(bot) ||
-                !TrainerSpellForSkill(trainer, bot, plan->second.learnSkill))
-                continue;
+            if (classTrainer)
+            {
+                if (!trainer->IsTrainerValidForPlayer(bot) || !AffordableClassSpells(trainer, bot))
+                    continue;
+            }
+            else
+            {
+                auto const plan = plans.find(name);
+                if (plan == plans.end() || !plan->second.learnSkill)
+                    continue;
+                if (!trainer || !trainer->IsTrainerValidForPlayer(bot) ||
+                    !TrainerSpellForSkill(trainer, bot, plan->second.learnSkill))
+                    continue;
+            }
             if (!bot->FindNearestCreature(leg.entry, TRAVEL_ARRIVED_YARDS))
             {
                 away.push_back(name);
@@ -45208,6 +45264,23 @@ private:
         uint32 learned = 0;
         for (auto const& [name, bot] : learners)
         {
+            if (classTrainer)
+            {
+                Creature* npc = bot->FindNearestCreature(leg.entry, TRAVEL_ARRIVED_YARDS);
+                if (!npc || !bot->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
+                    continue;
+                uint64 const before = bot->GetMoney();
+                std::size_t offered = 0;
+                unsigned const bought = BuyAffordableClassSpells(trainer, npc, bot, &offered);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) learned {} of {} class spell(s) at the "
+                         "training stop, trainer {}, for {} copper of its own",
+                         name, bot->GetLevel(), bought, static_cast<uint32>(offered), leg.entry,
+                         before - bot->GetMoney());
+                if (bought)
+                    ++learned;
+                continue;
+            }
             bool const held = bot->HasSkill(plans.at(name).learnSkill);
             uint32 const before = static_cast<uint32>(bot->GetPureMaxSkillValue(plans.at(name).learnSkill));
             TrainOnArrival(name, bot, leg.entry, plans.at(name));
@@ -47190,6 +47263,30 @@ private:
 
     // Free space, and what is worth selling. Grey items are the junk a
     // character is supposed to take to a vendor.
+    // What the living Player carries, so "why does nobody have a buff" is a
+    // question with an answer other than a screenshot. Reads the applied
+    // auras and changes nothing.
+    static std::string ProbeAuras(Player* bot)
+    {
+        std::vector<OverseerDecisions::AuraFact> facts;
+        for (auto const& entry : bot->GetAppliedAuras())
+        {
+            AuraApplication const* app = entry.second;
+            Aura const* aura = app ? app->GetBase() : nullptr;
+            if (!aura)
+                continue;
+            OverseerDecisions::AuraFact fact;
+            fact.spellId = entry.first;
+            fact.stacks = aura->GetStackAmount();
+            fact.remainingMs = aura->IsPermanent() ? -1 : aura->GetDuration();
+            fact.positive = app->IsPositive();
+            if (Unit* caster = aura->GetCaster())
+                fact.caster = caster->GetName();
+            facts.push_back(fact);
+        }
+        return OverseerDecisions::AuraProbeJson(facts);
+    }
+
     static std::string ProbeBags(Player* bot)
     {
         uint32 slots = 0;
@@ -47252,8 +47349,10 @@ private:
             out = ProbeGear(bot);
         else if (what == "bags")
             out = ProbeBags(bot);
+        else if (what == "auras")
+            out = ProbeAuras(bot);
         else
-            return "unknown probe (state|spells|talents|strategies|gear|bags)";
+            return "unknown probe (state|spells|talents|strategies|gear|bags|auras)";
 
         status = "delivered";
         return "";

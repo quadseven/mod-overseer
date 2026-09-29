@@ -15295,6 +15295,11 @@ bool SpawnStandsNow(int32_t gameEvent, bool eventActive)
     return true;
 }
 
+bool TrainingStopWants(TrainingStopMember const& member)
+{
+    return member.learnSkill != 0 || member.classSpells != 0;
+}
+
 TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
                                     std::vector<TrainingStopMember> const& members)
 {
@@ -15306,7 +15311,7 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
     }
     bool anyLearn = false;
     for (TrainingStopMember const& member : members)
-        anyLearn = anyLearn || (member.learnSkill != 0 && !member.walkedThisStop);
+        anyLearn = anyLearn || (TrainingStopWants(member) && !member.walkedThisStop);
     if (!anyLearn)
     {
         leg.step = TrainingStopStep::NothingToLearn;
@@ -15336,7 +15341,7 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
     for (std::size_t i = 0; i < members.size(); ++i)
     {
         TrainingStopMember const& member = members[i];
-        if (member.learnSkill == 0 || member.walkedThisStop || !member.withTheHead)
+        if (!TrainingStopWants(member) || member.walkedThisStop || !member.withTheHead)
             continue;
         anyWithTheHead = true;
         if (member.trainerYards < 0.f || member.trainerYards > TRAINING_STOP_YARDS)
@@ -17310,6 +17315,37 @@ SeatTalentVerdict SeatTalentVerdictFor(bool onRoster, RaidSpecTarget const* targ
         v.said = "spends its free talent points in the tree its raid seat needs";
     }
     return v;
+}
+
+std::string AuraProbeJson(std::vector<AuraFact> const& auras)
+{
+    auto quoted = [](std::string const& s) {
+        std::string out = "\"";
+        for (char ch : s)
+        {
+            if (ch == '"' || ch == '\\')
+                out += '\\';
+            out += ch;
+        }
+        return out + "\"";
+    };
+    std::string out = "{\"auras\":[";
+    uint32_t positive = 0;
+    for (std::size_t i = 0; i < auras.size(); ++i)
+    {
+        AuraFact const& a = auras[i];
+        if (i)
+            out += ",";
+        if (a.positive)
+            ++positive;
+        out += "{\"spell\":" + std::to_string(a.spellId) + ",\"stacks\":" +
+               std::to_string(a.stacks) + ",\"remaining_ms\":" + std::to_string(a.remainingMs) +
+               ",\"positive\":" + (a.positive ? "true" : "false") +
+               ",\"caster\":" + quoted(a.caster) + "}";
+    }
+    out += "],\"count\":" + std::to_string(auras.size()) +
+           ",\"positive\":" + std::to_string(positive) + "}";
+    return out;
 }
 
 }  // namespace OverseerDecisions

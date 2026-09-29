@@ -179,6 +179,53 @@ void TheHeadWalksTheFamilyTrainerByTrainer()
     Check("between attempts it walks too", leg.step == TrainingStopStep::Walk && leg.member == 0);
 }
 
+// THE FAMILY'S CLASS SPELLS (2026-09-29). Overseer.Train.Factory = 0 stopped
+// the level-up grant of class spells, and the stop above walked only for a
+// profession. Measured live on the dev realm in the Stockade: a level 35
+// priest held no Power Word: Fortitude, a level 35 mage no Arcane
+// Intellect, a level 37 paladin no blessing and a level 39 warrior no Battle
+// Shout, so no party frame carried a buff. A class spell is a learn too.
+TrainingStopMember ClassMember(char const* name, uint32_t affordable, float trainerYards,
+                               bool withTheHead = true)
+{
+    TrainingStopMember member = Member(name, 0, trainerYards, withTheHead);
+    member.classSpells = affordable;
+    return member;
+}
+
+void AClassSpellIsALearnToo()
+{
+    std::vector<TrainingStopMember> family = {
+        ClassMember("Grug", 4, 210.f),
+        ClassMember("Ugga", 9, 180.f),
+        ClassMember("Og", 0, 150.f),
+    };
+    TrainingStopLeg leg = PickTrainingStopLeg(HeldInTown(), family);
+    Check("a family with no profession learn walks for a member's class spells",
+          leg.step == TrainingStopStep::Walk && leg.member == 0);
+
+    family[0].walkedThisStop = true;
+    leg = PickTrainingStopLeg(HeldInTown(), family);
+    Check("then for the next member that can afford one",
+          leg.step == TrainingStopStep::Walk && leg.member == 1);
+
+    family[1].walkedThisStop = true;
+    leg = PickTrainingStopLeg(HeldInTown(), family);
+    Check("a member with nothing to buy is not walked for",
+          leg.step == TrainingStopStep::NothingToLearn);
+
+    std::vector<TrainingStopMember> far = {ClassMember("Ugga", 9, 2375.f)};
+    Check("a class trainer past the city is not walked to",
+          PickTrainingStopLeg(HeldInTown(), far).step == TrainingStopStep::NoTrainerInTown);
+    std::vector<TrainingStopMember> away = {ClassMember("Ugga", 9, 180.f, false)};
+    Check("nor for a member away from the family",
+          PickTrainingStopLeg(HeldInTown(), away).step == TrainingStopStep::NobodyWithTheHead);
+    Check("a member with neither a skill nor a spell wants nothing",
+          !OverseerDecisions::TrainingStopWants(Member("Og", 0, 100.f)));
+    Check("a skill is wanted", OverseerDecisions::TrainingStopWants(Member("Og", 186, 100.f)));
+    Check("a class spell is wanted", OverseerDecisions::TrainingStopWants(ClassMember("Og", 1, 100.f)));
+}
+
 void ItNeverTakesTheRunsTurn()
 {
     TrainingStopFacts staging = HeldInTown();
@@ -275,6 +322,24 @@ void TheAdapterIsWired()
           source.find("if (stop.retried.insert(walking->second.forMember).second)\n"
                       "                    stop.walked.erase(walking->second.forMember);") !=
               std::string::npos);
+
+    // THE FAMILY'S CLASS SPELLS (2026-09-29).
+    Check("a member with no profession learn is asked for its class trainer",
+          source.find("ResolveTravelTarget(bot, \"class trainer\", trainer, where)") !=
+              std::string::npos);
+    std::size_t const teachBody = source.find("bool TeachAtTrainingStop(TrainingStopLegState& leg)");
+    std::size_t const buys = source.find("BuyAffordableClassSpells(", teachBody);
+    std::size_t const bodyEnd = source.find("// Put the tank strategies on a character", teachBody);
+    Check("the leg's arrival buys the class spells its members can afford",
+          teachBody != std::string::npos && buys != std::string::npos && buys < bodyEnd);
+    std::size_t const helper = source.find("static unsigned BuyAffordableClassSpells(");
+    std::size_t const helperEnd = source.find("void DriveGuildTraining()", helper);
+    Check("a purchase is counted from the spell book, not the purse",
+          helper != std::string::npos && helperEnd != std::string::npos &&
+              source.find("bot->HasSpell(spellId)", helper) < helperEnd);
+    Check("the guild's trainer visit buys through the same helper",
+          source.find("BuyAffordableClassSpells(", source.find("void DriveGuildTraining()")) <
+              source.find("void DriveGuildWeaponFor("));
 }
 
 }  // namespace
@@ -284,6 +349,7 @@ int main()
     TheTownIsTheCity();
     TheStopClaimsLikeTheReset();
     TheHeadWalksTheFamilyTrainerByTrainer();
+    AClassSpellIsALearnToo();
     ItNeverTakesTheRunsTurn();
     ItIsBounded();
     TheAdapterIsWired();
