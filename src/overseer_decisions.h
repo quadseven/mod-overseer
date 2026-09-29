@@ -3773,6 +3773,7 @@ enum class TravelClaim : uint8_t
     Outrank,            // write the aim over a walk a live run outranks (#656)
     RefusedProfession,  // a profession errand is outstanding and would be overwritten
     RefusedForeign,     // the column holds an errand this book did not issue
+    Preempt,            // a training stop's write over one of the bridge's town errands
 };
 
 // WHOSE WALK AN AIM IS, NAMED AT EVERY CLAIM (#598). Claim took two bools,
@@ -17072,10 +17073,17 @@ constexpr uint32_t TOWN_STOP_MAX_SECONDS = 300;
 // same city. Measured on the dev realm on 2026-09-24 from where the Horde
 // family waits in Orgrimmar for Ragefire Chasm: the warrior trainer is 564
 // yards away and the nine profession trainers its learns need are 265 to 639.
-// 700 is the city and not the road out of it: #663's 2,375-yard walk still
-// waits, and at the 112 yards a minute the travel backstop measures, the
-// farthest trainer in the city is under six minutes' walk.
-constexpr float TRAINING_STOP_YARDS = 700.f;
+//
+// 1200 WHERE #688 SAID 700 (2026-09-29). The distance is read from where the
+// HEAD stands, and between two runs the head is walked around the city by the
+// bridge's town errands: with the head at an auctioneer the priest trainer the
+// stop had been walking to was 850 yards off, "no trainer for the learns left
+// is within 700 yards of the head" ended the stop with a member's 12 class
+// spells unbought, and the next was half an hour away. 1200 is the city and
+// still not the road out of it: #663's 2,375-yard walk waits, and at the 112
+// yards a minute the travel backstop measures the farthest trainer in the city
+// is under eleven minutes' walk, inside the backstop's twenty.
+constexpr float TRAINING_STOP_YARDS = 1200.f;
 
 // May `who` put its aim on the head right now?
 //
@@ -17690,6 +17698,19 @@ constexpr float TRAINING_STOP_WITH_HEAD_YARDS = 40.f;
 // How many travel polls the head stands at the trainer waiting for the
 // members it walked for to close in before the purchase is made without them.
 constexpr uint32_t TRAINING_STOP_REACH_POLLS = 4;
+// HOW LONG A STOP RESTS DEPENDS ON WHY IT ENDED (2026-09-29). The half hour
+// above is for a stop that did its work: everybody was walked for, so nothing
+// changes until somebody earns more gold. A stop that ended because the head
+// or the family stood where no trainer was, or because a run took the head,
+// ended for a reason the next few minutes change, and resting half an hour
+// after it left the Horde family's twelve unbought class spells waiting through
+// a whole town phase. The retry is a class-trainer search per member, so it is
+// minutes and not seconds.
+constexpr uint32_t TRAINING_STOP_RETRY_SECONDS = 5 * 60;
+// A stop that spent its 15 minutes with members still waiting has had its turn;
+// the next is ten minutes off, so the family is not held for a third of every
+// half hour but is not left for thirty minutes with spells unbought either.
+constexpr uint32_t TRAINING_STOP_SPENT_REST_SECONDS = 10 * 60;
 
 struct TrainingStopMember
 {
@@ -17721,6 +17742,14 @@ struct TrainingStopFacts
     HeadTravelFacts head;
     // The head's travel column is empty, or holds this stop's own aim.
     bool columnFree{false};
+    // The column holds one of the bridge's town errands (TrainingStopMayPreempt)
+    // and nothing this book wrote, and the head has no profession errand
+    // pending. The stop takes it: between two runs the town phase is the
+    // auctioneer errand's, and a stop that waited for an empty column never had
+    // a turn (2026-09-29).
+    bool columnPreemptible{false};
+    // How long the last stop asked to rest (TrainingStopRestSeconds).
+    uint32_t restSeconds{TRAINING_STOP_REST_SECONDS};
     // Seconds since this stop's first leg, or 0 when no stop is open.
     uint32_t stopSeconds{0};
     // Seconds since the last stop ended; UINT32_MAX when there has been none.
@@ -17736,7 +17765,7 @@ enum class TrainingStopStep : uint8_t
     SpentItsTime,     // this stop has run TRAINING_STOP_MAX_SECONDS
     NobodyWithTheHead,  // every member with a learn is away from the family
     NoTrainerInTown,  // every learn's trainer is past TRAINING_STOP_YARDS, or on no spawn
-    ColumnTaken,      // another errand holds the head's travel column
+    ColumnTaken,      // an errand the stop may not take holds the head's travel column
     Walk,             // walk the head to `member`'s trainer
 };
 
@@ -17761,6 +17790,18 @@ char const* TrainingStopStepWord(TrainingStopStep step);
 // has nothing left to walk for any reason other than a taken column, which
 // only means the next leg waits.
 bool TrainingStopEnds(TrainingStopStep step, bool stopOpen);
+
+// How long the next stop waits after one that ended for `step`: the full rest
+// after a stop that did its work, a short retry after one the head's or the
+// family's position cut short, and the spent rest after one that ran out of
+// time with members waiting.
+uint32_t TrainingStopRestSeconds(TrainingStopStep step);
+
+// Is `column` one of the bridge's town errands, which a training stop may take
+// the column from: a counter keyword, a ground aim, a bare creature entry (the
+// reagent vendor's) or a flight-master discovery walk. Not the empty column,
+// and not the keywords that carry a trainer's or a run's own walk.
+bool TrainingStopMayPreempt(std::string const& column);
 
 // ------------------ the fallback ladder: summon, then the dungeon finder --
 //

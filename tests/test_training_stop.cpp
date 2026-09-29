@@ -32,7 +32,11 @@ using OverseerDecisions::TOWN_STOP_NEAR_YARDS;
 using OverseerDecisions::TRAINING_STOP_MAX_SECONDS;
 using OverseerDecisions::TRAINING_STOP_REST_SECONDS;
 using OverseerDecisions::TRAINING_STOP_YARDS;
+using OverseerDecisions::TRAINING_STOP_RETRY_SECONDS;
+using OverseerDecisions::TRAINING_STOP_SPENT_REST_SECONDS;
 using OverseerDecisions::TrainingStopEnds;
+using OverseerDecisions::TrainingStopMayPreempt;
+using OverseerDecisions::TrainingStopRestSeconds;
 using OverseerDecisions::TrainingStopFacts;
 using OverseerDecisions::TrainingStopLeg;
 using OverseerDecisions::TrainingStopMember;
@@ -100,6 +104,9 @@ void TheTownIsTheCity()
     Check("...and the farthest profession trainer in the city", HeadErrandMayTravel(HeadErrand::TrainerTrip, between));
     between.trainerYards = TRAINING_STOP_YARDS + 1.f;
     Check("past the city it waits", !HeadErrandMayTravel(HeadErrand::TrainerTrip, between));
+    between.trainerYards = 850.f;  // Zayus from the auctioneer the head had walked to
+    Check("a trainer across the city from the auctioneer is still the town",
+          HeadErrandMayTravel(HeadErrand::TrainerTrip, between));
     between.trainerYards = 2375.f;  // #663's measured walk
     Check("#663's 2,375-yard walk still waits", !HeadErrandMayTravel(HeadErrand::TrainerTrip, between));
     between.trainerYards = -1.f;
@@ -130,11 +137,47 @@ void TheStopClaimsLikeTheReset()
     Check("a bridge trainer walk in the column is not written over",
           ReadTravelClaim(trainerWalk) == TravelClaim::RefusedProfession);
 
+    // THE STOP OUTRANKS THE BRIDGE'S TOWN ERRANDS (2026-09-29). Measured on the
+    // dev realm: the town phase between two Stockade runs is the auctioneer
+    // errand's, the bridge writes a counter, a ground aim or a reagent vendor's
+    // creature entry into the column every few minutes, and the stop that used
+    // to wait for an empty column never had a turn. A family that cannot buff
+    // is worse off than one that shops a few minutes later.
     TravelClaimFacts vendor(TravelOwner::TrainingStop);
     vendor.column = "vendor";
     vendor.target = "3363";
-    Check("a counter errand in the column is not written over",
-          ReadTravelClaim(vendor) == TravelClaim::RefusedForeign);
+    Check("a counter errand in the column is written over by the stop",
+          ReadTravelClaim(vendor) == TravelClaim::Preempt);
+    for (char const* aim : {"auctioneer", "repair", "banker", "guild banker",
+                            "at:1:1657.9,-4433.0,17.5", "11868", "flight master:64"})
+    {
+        TravelClaimFacts town(TravelOwner::TrainingStop);
+        town.column = aim;
+        town.target = "3363";
+        Check((std::string("the bridge's town aim '") + aim + "' gives way to the stop").c_str(),
+              ReadTravelClaim(town) == TravelClaim::Preempt);
+    }
+    TravelClaimFacts pending(TravelOwner::TrainingStop);
+    pending.learnSkill = 186;
+    pending.column = "vendor";
+    pending.target = "3363";
+    Check("a pending profession errand still fences the column",
+          ReadTravelClaim(pending) == TravelClaim::RefusedProfession);
+    TravelClaimFacts respecWalk(TravelOwner::TrainingStop);
+    respecWalk.column = "class trainer";
+    respecWalk.target = "3363";
+    Check("a keyword that is no town errand is not preempted",
+          ReadTravelClaim(respecWalk) != TravelClaim::Preempt);
+    TravelClaimFacts otherOwner(TravelOwner::Respec);
+    otherOwner.column = "vendor";
+    otherOwner.target = "3363";
+    Check("only the stop takes the column from a counter errand",
+          ReadTravelClaim(otherOwner) == TravelClaim::RefusedForeign);
+    Check("the preemptible aims are the town errands",
+          TrainingStopMayPreempt("11868") && TrainingStopMayPreempt("vendor") &&
+              TrainingStopMayPreempt("at:0:-8815.2,652.9,94.9") &&
+              TrainingStopMayPreempt("flight master:64") && !TrainingStopMayPreempt("") &&
+              !TrainingStopMayPreempt("profession trainer") && !TrainingStopMayPreempt("class trainer"));
 
     Check("a training stop is not a live run", !TravelOwnerIsALiveRun(TravelOwner::TrainingStop));
 }
@@ -275,13 +318,46 @@ void ItIsBounded()
     taken.columnFree = false;
     Check("a taken column waits",
           PickTrainingStopLeg(taken, Horde()).step == TrainingStopStep::ColumnTaken);
+    taken.columnPreemptible = true;
+    Check("unless the bridge's town errand holds it, and the stop takes it",
+          PickTrainingStopLeg(taken, Horde()).step == TrainingStopStep::Walk);
     Check("without ending the stop", !TrainingStopEnds(TrainingStopStep::ColumnTaken, true));
     Check("a walk does not end it", !TrainingStopEnds(TrainingStopStep::Walk, true));
     Check("nothing ends a stop that is not open", !TrainingStopEnds(TrainingStopStep::SpentItsTime, false));
 
     Check("every step has a sentence",
-          std::string(TrainingStopStepWord(TrainingStopStep::NoTrainerInTown)).find("700") !=
+          std::string(TrainingStopStepWord(TrainingStopStep::NoTrainerInTown)).find("1200") !=
               std::string::npos);
+}
+
+// A STOP THAT ENDED FOR A REASON THE WORLD WILL CHANGE DOES NOT REST HALF AN
+// HOUR (2026-09-29). Measured on the dev realm: the Horde family's stop ended
+// "no trainer within 700 yards of the head" because the head had walked to an
+// auctioneer, with one member's leg cut short and its 12 class spells unbought,
+// and the next stop was 30 minutes off, by which time the head was elsewhere
+// again.
+void ARestIsAsLongAsItsReason()
+{
+    Check("a stop that served everybody rests the full half hour",
+          TrainingStopRestSeconds(TrainingStopStep::NothingToLearn) == TRAINING_STOP_REST_SECONDS);
+    Check("a stop that spent its time rests ten minutes",
+          TrainingStopRestSeconds(TrainingStopStep::SpentItsTime) == TRAINING_STOP_SPENT_REST_SECONDS);
+    for (TrainingStopStep step : {TrainingStopStep::NoTrainerInTown, TrainingStopStep::NobodyWithTheHead,
+                                  TrainingStopStep::RunOwnsTravel})
+        Check("a stop cut short by where the head and family stood tries again in minutes",
+              TrainingStopRestSeconds(step) == TRAINING_STOP_RETRY_SECONDS);
+    Check("the retry is shorter than the spent rest, which is shorter than the full one",
+          TRAINING_STOP_RETRY_SECONDS < TRAINING_STOP_SPENT_REST_SECONDS &&
+              TRAINING_STOP_SPENT_REST_SECONDS < TRAINING_STOP_REST_SECONDS);
+
+    TrainingStopFacts retried = HeldInTown();
+    retried.restSeconds = TRAINING_STOP_RETRY_SECONDS;
+    retried.sinceLastStop = TRAINING_STOP_RETRY_SECONDS - 1;
+    Check("the rest a stop asked for is the one it waits",
+          PickTrainingStopLeg(retried, Horde()).step == TrainingStopStep::Resting);
+    retried.sinceLastStop = TRAINING_STOP_RETRY_SECONDS;
+    Check("and the stop may open when it is over",
+          PickTrainingStopLeg(retried, Horde()).step == TrainingStopStep::Walk);
 }
 
 std::string ReadModule()
@@ -323,6 +399,17 @@ void TheAdapterIsWired()
                       "                    stop.walked.erase(walking->second.forMember);") !=
               std::string::npos);
 
+    Check("the stop reads whether the column holds a town errand it may take",
+          source.find("facts.columnPreemptible =") != std::string::npos &&
+              source.find("OverseerDecisions::TrainingStopMayPreempt(column)") != std::string::npos);
+    Check("a book-owned aim (a respec walk, a run's leg) is never preempted",
+          source.find("!_travelAims.ClaimedBy(headName, column, columnOwner)") != std::string::npos);
+    Check("a stop that ends sets its own rest",
+          source.find("stop.restSeconds = OverseerDecisions::TrainingStopRestSeconds(pick.step);") !=
+              std::string::npos);
+    Check("the stop's claim over a town errand is said",
+          source.find("a training stop takes the travel column") != std::string::npos);
+
     // THE FAMILY'S CLASS SPELLS (2026-09-29).
     Check("a member with no profession learn is asked for its class trainer",
           source.find("ResolveTravelTarget(bot, \"class trainer\", trainer, where)") !=
@@ -352,6 +439,7 @@ int main()
     AClassSpellIsALearnToo();
     ItNeverTakesTheRunsTurn();
     ItIsBounded();
+    ARestIsAsLongAsItsReason();
     TheAdapterIsWired();
     if (failures)
     {

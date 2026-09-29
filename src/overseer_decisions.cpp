@@ -2807,6 +2807,11 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     if (facts.learnSkill != 0 &&
         !(TravelOwnerPassesAnEmptyLearnColumn(facts.owner) && facts.column.empty()))
         return TravelClaim::RefusedProfession;
+    // THE TRAINING STOP TAKES THE COLUMN FROM THE BRIDGE'S TOWN ERRANDS
+    // (2026-09-29), which the profession fence above has already excused: a
+    // pending profession errand never reaches here.
+    if (facts.owner == TravelOwner::TrainingStop && TrainingStopMayPreempt(facts.column))
+        return TravelClaim::Preempt;
     if (IsForeignTravelAim(facts.column))
         return TravelClaim::RefusedForeign;
     return TravelClaim::Write;
@@ -15326,7 +15331,7 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
         leg.step = TrainingStopStep::RunOwnsTravel;
         return leg;
     }
-    if (facts.stopSeconds == 0 && facts.sinceLastStop < TRAINING_STOP_REST_SECONDS)
+    if (facts.stopSeconds == 0 && facts.sinceLastStop < facts.restSeconds)
     {
         leg.step = TrainingStopStep::Resting;
         return leg;
@@ -15360,12 +15365,14 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
         leg.step = TrainingStopStep::NoTrainerInTown;
         return leg;
     }
-    leg.step = facts.columnFree ? TrainingStopStep::Walk : TrainingStopStep::ColumnTaken;
+    leg.step = facts.columnFree || facts.columnPreemptible ? TrainingStopStep::Walk
+                                                             : TrainingStopStep::ColumnTaken;
     return leg;
 }
 
 char const* TrainingStopStepWord(TrainingStopStep step)
 {
+    static_assert(TRAINING_STOP_YARDS == 1200.f, "the NoTrainerInTown sentence below says 1200 yards");
     switch (step)
     {
         case TrainingStopStep::NotACampaign:
@@ -15375,19 +15382,55 @@ char const* TrainingStopStepWord(TrainingStopStep step)
         case TrainingStopStep::RunOwnsTravel:
             return "the family's dungeon run is staging or under way";
         case TrainingStopStep::Resting:
-            return "the last training stop ended less than 30 minutes ago";
+            return "the last training stop has not finished resting";
         case TrainingStopStep::SpentItsTime:
             return "this training stop has had its 15 minutes";
         case TrainingStopStep::NobodyWithTheHead:
             return "every member with a learn is more than 40 yards from the head";
         case TrainingStopStep::NoTrainerInTown:
-            return "no trainer for the learns left is within 700 yards of the head";
+            return "no trainer for the learns left is within 1200 yards of the head";
         case TrainingStopStep::ColumnTaken:
-            return "another errand holds the head's travel column";
+            return "an errand a training stop may not take holds the head's travel column";
         case TrainingStopStep::Walk:
             return "walk";
     }
     return "unknown";
+}
+
+uint32_t TrainingStopRestSeconds(TrainingStopStep step)
+{
+    switch (step)
+    {
+        case TrainingStopStep::SpentItsTime:
+            return TRAINING_STOP_SPENT_REST_SECONDS;
+        case TrainingStopStep::NobodyWithTheHead:
+        case TrainingStopStep::NoTrainerInTown:
+        case TrainingStopStep::RunOwnsTravel:
+            return TRAINING_STOP_RETRY_SECONDS;
+        case TrainingStopStep::NotACampaign:
+        case TrainingStopStep::NothingToLearn:
+        case TrainingStopStep::Resting:
+        case TrainingStopStep::ColumnTaken:
+        case TrainingStopStep::Walk:
+            return TRAINING_STOP_REST_SECONDS;
+    }
+    return TRAINING_STOP_REST_SECONDS;
+}
+
+bool TrainingStopMayPreempt(std::string const& column)
+{
+    if (column.empty())
+        return false;
+    // A counter keyword or a ground aim: the economy passes' and the town
+    // errand's own.
+    if (IsForeignTravelAim(column) || column == "guild banker")
+        return true;
+    // A bare creature entry is the craft-supply pass's named vendor.
+    if (std::all_of(column.begin(), column.end(),
+                    [](char ch) { return ch >= '0' && ch <= '9'; }))
+        return true;
+    // A flight-master discovery walk is thousands of yards of errand.
+    return column.rfind("flight master:", 0) == 0;
 }
 
 bool TrainingStopEnds(TrainingStopStep step, bool stopOpen)

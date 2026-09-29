@@ -42,6 +42,7 @@ char const* Name(TravelClaim claim)
         case TravelClaim::Outrank:           return "write (a live run outranks it)";
         case TravelClaim::RefusedProfession: return "refused (profession)";
         case TravelClaim::RefusedForeign:    return "refused (foreign)";
+        case TravelClaim::Preempt:           return "write (a training stop takes it)";
     }
     return "unknown";
 }
