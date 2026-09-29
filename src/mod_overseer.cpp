@@ -28842,9 +28842,11 @@ private:
             // spells were never bought: no Fortitude, no Arcane Intellect, no
             // blessing, no Battle Shout in the dungeon. Innkeeper Allison of
             // the Gilded Rose (creature 6740, world DB: map 0, -8867.8,
-            // 673.7, 98.0) is 200 yards from the door and 62 to 75 yards from
-            // the Stormwind class trainers' street; the finder's own exit
-            // (areatrigger 503) already lands the family in this city.
+            // 673.7, 98.0) is 200 yards from the door, and the real Stormwind
+            // class trainers of the five classes stand 226 to 380 yards from
+            // the inn and 191 to 526 from the door, all inside a training
+            // stop's 1200 yards; the finder's own exit (areatrigger 503)
+            // already lands the family in this city.
             {"stockades", 0, 101, 34, 503, 0.f, 0.f, 0.f, {}, -8867.8f, 673.7f, 98.0f},
             // WAILING CAVERNS, AND THE FIRST ROW IN THIS TABLE WHOSE OUTSIDE
             // MAP IS NOT 0. The four numbers are read out of the pinned core's
