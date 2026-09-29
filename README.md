@@ -99,3 +99,10 @@ rebase it — see `patches/README.md`.
 force-push are blocked too). This is enforced by a GitHub Repository Ruleset,
 codified in `quadseven/infra`'s `pulumi/github/repos.py` (the `mod-overseer`
 entry), not by anything in this repo.
+
+### Failed dungeon exits
+
+When walking out fails, the hearth recovery keeps the original run state.
+Once every family member is observed outside, normal run finalization records
+the outcome and advances the same campaign. An unseen member is not proof
+of an exit; a member still inside remains in recovery.
