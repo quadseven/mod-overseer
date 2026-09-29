@@ -23863,6 +23863,7 @@ private:
                 {
                     if (TeachAtTrainingStop(stopLeg->second))
                     {
+                        NoteTrainingStopLeg(name, stopLeg->second);
                         _trainingStopLegs.erase(stopLeg);
                         _travelAims.Release(name,
                                             "the travel drive (training stop leg done on arrival)");
@@ -27580,44 +27581,105 @@ private:
         }
     }
 
-    // Class spells this trainer would teach `bot` now that it has the gold for.
+    // Class spells this trainer would teach `bot` now that it has the gold for,
+    // in the order a visit buys them (heals and buffs first, then by required
+    // level, so a rank is bought after the rank it needs).
     static unsigned AffordableClassSpells(Trainer::Trainer* trainer, Player* bot,
                                           std::vector<uint32>* ids = nullptr)
     {
-        unsigned n = 0;
-        uint64 money = bot->GetMoney();
+        std::vector<OverseerDecisions::ClassLearnCandidate> candidates;
         for (Trainer::Spell const& spell : trainer->GetSpells())
         {
-            if (!trainer->CanTeachSpell(bot, &spell) || spell.MoneyCost > money)
+            if (!trainer->CanTeachSpell(bot, &spell))
                 continue;
-            money -= spell.MoneyCost;
-            ++n;
-            if (ids)
-                ids->push_back(spell.SpellId);
+            OverseerDecisions::ClassLearnCandidate candidate;
+            candidate.spellId = spell.SpellId;
+            candidate.reqLevel = spell.ReqLevel;
+            candidate.cost = spell.MoneyCost;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.SpellId);
+            candidate.tier =
+                OverseerDecisions::ClassLearnTier(info ? info->SpellName[LOCALE_enUS] : nullptr);
+            candidates.push_back(candidate);
         }
-        return n;
+        std::vector<uint32> const plan =
+            OverseerDecisions::PlanClassLearns(std::move(candidates), bot->GetMoney());
+        if (ids)
+            ids->insert(ids->end(), plan.begin(), plan.end());
+        return static_cast<unsigned>(plan.size());
+    }
+
+    // WHY THE CORE REFUSED, FOR THE LOG. Trainer::TeachSpell returns void and
+    // reports its refusal (Trainer::FailReason: Unavailable, NotEnoughMoney,
+    // NotEnoughSkill) to a client a bot does not have, so the same three
+    // checks are asked here first and the answer is said when nothing was
+    // learned. Empty when the core would teach it.
+    static std::string ClassLearnRefusal(Trainer::Trainer* trainer, Creature* npc, Player* bot,
+                                         uint32 spellId)
+    {
+        if (!trainer->IsTrainerValidForPlayer(bot))
+            return "the trainer does not serve this class";
+        Trainer::Spell const* spell = trainer->GetSpell(spellId);
+        if (!spell)
+            return "FailReason::Unavailable (the trainer does not list it)";
+        if (!trainer->CanTeachSpell(bot, spell))
+            return "FailReason::NotEnoughSkill (known, level " + std::to_string(spell->ReqLevel) +
+                   ", a skill, a prior rank or a required spell is missing)";
+        if (!bot->HasEnoughMoney(static_cast<int32>(spell->MoneyCost * bot->GetReputationPriceDiscount(npc))))
+            return "FailReason::NotEnoughMoney (" + std::to_string(spell->MoneyCost) + " copper)";
+        return std::string();
     }
 
     // Buy every class spell `trainer` would teach `bot` that it has the gold
     // for, through the core's own Trainer::TeachSpell, which takes the gold.
-    // Returns how many the character now holds (TeachSpell returns void and
-    // reports a refusal to a client a bot does not have, so the spell book is
-    // what is read back, not the purse); `offered` takes how many were tried. Shared by a natural guild
-    // member's own visit and the family's training stop.
+    // Returns how many the character now holds (TeachSpell returns void, so
+    // the spell book and the purse are what is read back); `offered` takes how
+    // many were tried.
+    //
+    // IN PASSES, BECAUSE A RANK NEEDS THE RANK BEFORE IT (2026-09-29). The core
+    // offers rank N only once rank N-1 is known (Trainer::GetDefaultSpellState),
+    // so one list read at the door holds only the first ranks; after they are
+    // bought the next ranks are Available. Each pass reads the list again and
+    // buys, until a pass buys nothing. Shared by a natural guild member's own
+    // visit and the family's training stop.
     static unsigned BuyAffordableClassSpells(Trainer::Trainer* trainer, Creature* npc,
                                              Player* bot, std::size_t* offered = nullptr)
     {
-        std::vector<uint32> ids;
-        AffordableClassSpells(trainer, bot, &ids);
-        if (offered)
-            *offered = ids.size();
         unsigned learned = 0;
-        for (uint32 spellId : ids)
+        std::size_t tried = 0;
+        for (uint32 pass = 0; pass < OverseerDecisions::CLASS_LEARN_MAX_PASSES; ++pass)
         {
-            trainer->TeachSpell(npc, bot, spellId);
-            if (bot->HasSpell(spellId))
-                ++learned;
+            std::vector<uint32> ids;
+            AffordableClassSpells(trainer, bot, &ids);
+            unsigned boughtThisPass = 0;
+            for (uint32 spellId : ids)
+            {
+                ++tried;
+                uint64 const before = bot->GetMoney();
+                std::string const refusal = ClassLearnRefusal(trainer, npc, bot, spellId);
+                if (!refusal.empty())
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' was not taught spell {} by creature {} - {}",
+                             bot->GetName(), spellId, npc->GetEntry(), refusal);
+                    continue;
+                }
+                trainer->TeachSpell(npc, bot, spellId);
+                if (bot->HasSpell(spellId) || bot->GetMoney() < before)
+                {
+                    ++learned;
+                    ++boughtThisPass;
+                }
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' paid nothing and did not learn spell {} from "
+                             "creature {} - the core's learn hook refused it",
+                             bot->GetName(), spellId, npc->GetEntry());
+            }
+            if (!boughtThisPass)
+                break;
         }
+        if (offered)
+            *offered = tried;
         return learned;
     }
 
@@ -30782,6 +30844,11 @@ private:
         // When the finished leg first waited for the family's training stop
         // (TrainingStopHoldsRepairLegFor); zero when it has not.
         time_t trainingHoldSince{0};
+        // The same wait before a run OPENS (TrainingStopHoldsRunStartFor), and
+        // whether it has been said. On the idle coordinator, so a run that
+        // starts (which assigns a fresh state) clears both.
+        time_t trainingRunHoldSince{0};
+        bool loggedTrainingRunHold{false};
         // WHO THE LEG IS FINISHED WITH. A positive list rather than a count,
         // deliberately: a member is settled when it carries nothing damaged,
         // when it has been repaired, or when this leg has established that it
@@ -38822,6 +38889,52 @@ private:
         return true;
     }
 
+    bool TrainingStopHoldsRunStartFor(DungeonRunCoordinatorState& coord,
+                                      std::string const& leaderName,
+                                      std::vector<std::string> const& members)
+    {
+        std::string const family = FamilyOfCharacter(leaderName);
+        if (family.empty())
+            return false;
+        DriveTrainingStop(family);
+        time_t const now = std::time(nullptr);
+        bool open = false;
+        bool reachable = false;
+        for (std::string const& name : members)
+        {
+            auto const stop = _trainingStops.find(name);
+            if (stop == _trainingStops.end())
+                continue;
+            open = open || stop->second.openedAt != 0;
+            reachable = reachable || (stop->second.reachableAt != 0 &&
+                                      now - stop->second.reachableAt <= 30);
+        }
+        if ((open || reachable) && !coord.trainingRunHoldSince)
+            coord.trainingRunHoldSince = now;
+        uint32 const held =
+            coord.trainingRunHoldSince ? static_cast<uint32>(now - coord.trainingRunHoldSince) : 0;
+        if (!OverseerDecisions::TrainingStopHoldsRunStart(open, reachable, held))
+        {
+            if (coord.trainingRunHoldSince && coord.loggedTrainingRunHold)
+                LOG_INFO("module.overseer",
+                         "overseer: the next dungeon run for '{}' no longer waits for the "
+                         "family's training stop after {}s",
+                         leaderName, held);
+            coord.loggedTrainingRunHold = false;
+            return false;
+        }
+        if (!coord.loggedTrainingRunHold)
+        {
+            coord.loggedTrainingRunHold = true;
+            LOG_INFO("module.overseer",
+                     "overseer: the next dungeon run for '{}' waits for the family's training "
+                     "stop (class spells outstanding and a trainer in reach) for at most {} "
+                     "minutes; nothing is cancelled",
+                     leaderName, OverseerDecisions::TRAINING_STOP_RUN_HOLD_SECONDS / 60);
+        }
+        return true;
+    }
+
     void DriveRepairLeg(DungeonRunCoordinatorState& coord,
                         std::string const& leaderName,
                         std::vector<std::string> const& members)
@@ -41887,6 +42000,18 @@ private:
                 coord.holdSince = 0;
                 coord.loggedHold = false;
             }
+
+            // A NEWLY STARTED RUN WAITS FOR THE FAMILY'S TRAINING STOP
+            // (2026-09-29). The stop only walks while no run stages or is
+            // inside, so a run that opens the moment the queue is set takes the
+            // family away from a trainer it was about to reach and the class
+            // spells stay unbought. While a stop is open, or a member has class
+            // learns outstanding and a trainer in reach, the run does not open,
+            // for TRAINING_STOP_RUN_HOLD_SECONDS from the first poll that held.
+            // Not a cancellation: nothing is stopped, and past the bound the run
+            // opens whatever the stop has done.
+            if (TrainingStopHoldsRunStartFor(coord, leaderName, members))
+                return;
 
             std::string const dungeonKeyword = DungeonKeywordForJob(leaderJob);
             DungeonPortal const* portal = FindDungeonPortal(dungeonKeyword);
@@ -45063,6 +45188,8 @@ private:
         std::string forMember;             // whose learn the leg was walked for
         std::vector<std::string> members;  // who was with the head when it set off
         uint32 reachPolls{0};              // polls spent waiting at the trainer
+        // Members offered class spells at this trainer who learned none.
+        std::set<std::string> unlearned;
     };
     struct TrainingStopState
     {
@@ -45081,6 +45208,15 @@ private:
         // Members already told about as having no class trainer in reach, per
         // map ("Name@map"), so the log says it once and not every poll.
         std::set<std::string> noTrainerSaid;
+        // Legs a member has had in this stop that taught it nothing, and the
+        // members whose tries (TRAINING_STOP_LEARN_TRIES) are spent with the
+        // learns still owed. Both are per stop.
+        std::map<std::string, uint32> tries;
+        std::set<std::string> owed;
+        // When the last poll found a member with class learns outstanding and
+        // a trainer in reach and nothing to hold the stop back (a Walk or a
+        // taken column). Read by the run start, which waits for it.
+        time_t reachableAt{0};
     };
 
     // Read on the train poll after DriveRespec, and once more for one family
@@ -45169,6 +45305,7 @@ private:
                                       !_travelAims.ClaimedBy(headName, column, columnOwner) &&
                                       OverseerDecisions::TrainingStopMayPreempt(column);
             facts.restSeconds = stop.restSeconds;
+            facts.learnsOwed = !stop.owed.empty();
             if (stop.openedAt)
                 facts.stopSeconds =
                     static_cast<uint32>(std::max<time_t>(1, now - stop.openedAt));
@@ -45284,9 +45421,14 @@ private:
                 stop.endedMap = head->GetMapId();
                 stop.walked.clear();
                 stop.retried.clear();
+                stop.tries.clear();
+                stop.owed.clear();
                 stop.saidAny = false;
                 continue;
             }
+            if (pick.step == OverseerDecisions::TrainingStopStep::Walk ||
+                pick.step == OverseerDecisions::TrainingStopStep::ColumnTaken)
+                stop.reachableAt = now;
 
             if (pick.step == OverseerDecisions::TrainingStopStep::Walk)
             {
@@ -45352,6 +45494,29 @@ private:
     // TrainOnArrival is asked only of a member this trainer can teach, so its
     // "cannot teach" branch, which drops the learn, is never reached from here.
     //
+    // WHAT A FINISHED LEG SAYS ABOUT THE STOP (2026-09-29). A member offered
+    // class spells who learned none is walked for again, up to
+    // TRAINING_STOP_LEARN_TRIES legs, and after that its learns are owed and the
+    // stop ends "learns owed" (a short rest) rather than "nothing left" (the
+    // long one). A member that learned is settled.
+    void NoteTrainingStopLeg(std::string const& headName, TrainingStopLegState const& leg)
+    {
+        TrainingStopState& stop = _trainingStops[headName];
+        for (std::string const& name : leg.members)
+        {
+            if (!leg.unlearned.count(name))
+            {
+                stop.owed.erase(name);
+                continue;
+            }
+            uint32 const tries = ++stop.tries[name];
+            if (OverseerDecisions::TrainingStopLegRetries(1, 0, tries))
+                stop.walked.erase(name);
+            else
+                stop.owed.insert(name);
+        }
+    }
+
     // Returns true when the leg is over and false while it waits.
     bool TeachAtTrainingStop(TrainingStopLegState& leg)
     {
@@ -45397,8 +45562,24 @@ private:
             if (classTrainer)
             {
                 Creature* npc = bot->FindNearestCreature(leg.entry, TRAVEL_ARRIVED_YARDS);
-                if (!npc || !bot->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
+                // THE 5-YARD INTERACTION RADIUS IS NOT ASKED HERE (2026-09-29).
+                // The arrival radius is TRAVEL_ARRIVED_YARDS (12), the player's
+                // own interact check wants INTERACTION_DISTANCE (5), and
+                // the head stops where the walk ends, so a member standing 6
+                // to 12 yards off passed the arrival and was dropped by that
+                // check with no line said: "0 of 1 learned" and no
+                // "learned N of M". Trainer::TeachSpell has no distance rule
+                // of its own, so the checks that matter are asked and said.
+                if (!npc || !npc->IsAlive() || npc->IsHostileTo(bot))
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' at the training stop cannot use creature {} - {}",
+                             name, leg.entry,
+                             !npc ? "it is not within the arrival radius"
+                                  : !npc->IsAlive() ? "it is dead" : "it is hostile");
+                    leg.unlearned.insert(name);
                     continue;
+                }
                 uint64 const before = bot->GetMoney();
                 std::size_t offered = 0;
                 unsigned const bought = BuyAffordableClassSpells(trainer, npc, bot, &offered);
@@ -45409,6 +45590,9 @@ private:
                          before - bot->GetMoney());
                 if (bought)
                     ++learned;
+                else if (OverseerDecisions::TrainingStopLegRetries(
+                             static_cast<uint32>(offered), bought, 0))
+                    leg.unlearned.insert(name);
                 continue;
             }
             bool const held = bot->HasSkill(plans.at(name).learnSkill);
