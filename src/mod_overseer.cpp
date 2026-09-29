@@ -32719,7 +32719,8 @@ private:
     // five as inside. Said once per member and copy.
     static std::vector<OverseerDecisions::DungeonRunEntryState> DungeonRunCensus(
         std::vector<std::string> const& members, AreaTrigger const* door,
-        uint32 throughMapId, uint32& through, std::string const& headName = std::string())
+        uint32 throughMapId, uint32& through, std::string const& headName = std::string(),
+        bool leaving = false)
     {
         through = 0;
 
@@ -32780,7 +32781,8 @@ private:
                              name, memberMap, member->GetInstanceId(), headName, headInstance);
                 }
             }
-            else if (memberMap == throughMapId)
+            else if (OverseerDecisions::DungeonCrossingReachedMap(
+                         memberMap, door->map, throughMapId, leaving))
             {
                 state.through = true;
                 ++through;
@@ -32944,7 +32946,8 @@ private:
     {
         uint32 through = 0;
         std::vector<OverseerDecisions::DungeonRunEntryState> const states =
-            DungeonRunCensus(members, door, throughMapId, through, leaderName);
+            DungeonRunCensus(members, door, throughMapId, through, leaderName,
+                             purpose == EscortPurpose::LeaveInstance);
 
         // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63's lesson, applied to a
         // different journey). One more member through is the only thing that
@@ -33284,14 +33287,15 @@ private:
         coord.loggedNoWayOut = false;
 
         // THE SAME CENSUS THE CROSSING TAKES, against the exit door, so
-        // `through` means "out on the map outside". Asked on every poll of the
+        // `through` means "out of this instance". Finder returns may put
+        // members on different continents. Asked on every poll of the
         // hold rather than once: the answer changes as members leave, and this
         // is what notices that the last one has.
         uint32 out = 0;
         std::vector<OverseerDecisions::DungeonRunEntryState> const states =
-            DungeonRunCensus(members, door, portal.outsideMapId, out);
+            DungeonRunCensus(members, door, portal.outsideMapId, out, std::string(), true);
         // ASKED IN THE OTHER DIRECTION SINCE #384, SO THE FUNCTION IS NAMED FOR
-        // NEITHER. `through` here is "out on the map outside", so the wrong
+        // NEITHER. `through` here is "out of this instance", so the wrong
         // side is inside; the rejoin below asks the same question of the
         // entrance door, where the wrong side is outside. See the decision's
         // own header.

@@ -18,6 +18,10 @@ this way internally; this just makes the structure match the pin.
 
 ## Layout
 
+Dungeon finder returns can place members on their original continents. An exit
+and reset evacuation finish when every visible member has left the source
+dungeon map. Entry still requires the destination dungeon and the leader's copy.
+
 - `include.sh` — the module's entry point; AzerothCore's build globs `modules/*/`
   and uses this to discover a module, the same as every other module here.
 - `src/mod_overseer.cpp` — the whole module. One file, deliberately — see the
