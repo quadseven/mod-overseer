@@ -18158,9 +18158,10 @@ char const* FinderStepWord(FinderStep step);
 // this module: the finder's own teleport takes the group in and out.
 constexpr char GUILD_FINDER_VERB[] = "finder-run";
 constexpr unsigned GUILD_FINDER_GROUP_SIZE = 5;
-// A run nobody ends is ended here: long enough for a low dungeon cleared at a
-// careful pull, short enough that a stalled group is let go the same hour.
-constexpr unsigned GUILD_RUN_CEILING_SECONDS = 50 * 60;
+// A run nobody ends is ended here. A careful group rests between every pull,
+// so one low dungeon takes a couple of hours; a group that is dead or gone is
+// ended by the wipe and empty rules above this one, not by the clock.
+constexpr unsigned GUILD_RUN_CEILING_SECONDS = 120 * 60;
 // Nobody on the dungeon's map for this long, after the group was inside, is
 // a group that has left (a release to the graveyard outside, a level-up
 // teleport, a logout) and the run is over.
