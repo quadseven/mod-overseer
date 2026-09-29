@@ -17712,6 +17712,19 @@ constexpr uint32_t TRAINING_STOP_RETRY_SECONDS = 5 * 60;
 // half hour but is not left for thirty minutes with spells unbought either.
 constexpr uint32_t TRAINING_STOP_SPENT_REST_SECONDS = 10 * 60;
 
+// A LEG THAT TAUGHT NOBODY IS TRIED AGAIN, NOT CONCLUDED (2026-09-29). The
+// Alliance family reached its warrior trainer, 28 class spells offered, and
+// learned none, and the stop wrote "nobody has a learn left" and rested 30
+// minutes. A member whose visit learned nothing gets this many legs in one
+// stop before the stop says the learns are still owed.
+constexpr uint32_t TRAINING_STOP_LEARN_TRIES = 3;
+// The most passes one visit makes at a trainer. A rank-N spell is Available
+// only once rank N-1 is known, so each pass unlocks the next rank; the longest
+// class chain in the 3.3.5 tables is under ten ranks.
+constexpr uint32_t CLASS_LEARN_MAX_PASSES = 12;
+// A NEWLY STARTED CAMPAIGN RUN WAITS THIS LONG FOR THE TRAINING STOP.
+constexpr uint32_t TRAINING_STOP_RUN_HOLD_SECONDS = 20 * 60;
+
 struct TrainingStopMember
 {
     std::string name;
@@ -17754,6 +17767,9 @@ struct TrainingStopFacts
     uint32_t stopSeconds{0};
     // Seconds since the last stop ended; UINT32_MAX when there has been none.
     uint32_t sinceLastStop{UINT32_MAX};
+    // A member was walked for in this stop and its learns are still owed: its
+    // visit taught nothing, or was cut short, and its tries are spent.
+    bool learnsOwed{false};
 };
 
 enum class TrainingStopStep : uint8_t
@@ -17767,6 +17783,7 @@ enum class TrainingStopStep : uint8_t
     NoTrainerInTown,  // every learn's trainer is past TRAINING_STOP_YARDS, or on no spawn
     ColumnTaken,      // an errand the stop may not take holds the head's travel column
     Walk,             // walk the head to `member`'s trainer
+    LearnsOwed,       // a visit taught nothing and its tries are spent: not "nothing left"
 };
 
 struct TrainingStopLeg
@@ -17782,6 +17799,38 @@ struct TrainingStopLeg
 // member use cannot hold the stop.
 TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
                                     std::vector<TrainingStopMember> const& members);
+
+// Is a leg's result a failure to try again: the member's trainer offered
+// spells (`offered` > 0) and none was learned, with tries left in this stop.
+// A member who learned something, or was offered nothing, is not retried.
+bool TrainingStopLegRetries(uint32_t offered, uint32_t learned, uint32_t triesSoFar);
+
+// Does a campaign run that has not started yet wait for the training stop:
+// while a stop is open, or a member has class learns outstanding with a
+// reachable trainer, for at most TRAINING_STOP_RUN_HOLD_SECONDS counted from
+// the first poll that held. Never a cancellation: past the bound the run opens.
+bool TrainingStopHoldsRunStart(bool stopOpen, bool learnsReachable, uint32_t heldSeconds);
+
+// One class spell a trainer would teach a member now.
+struct ClassLearnCandidate
+{
+    uint32_t spellId{0};
+    uint32_t reqLevel{0};
+    uint32_t cost{0};
+    // 0 for a heal or a buff (the spells that keep a group alive and strong),
+    // 1 for the rest, so a purse that cannot buy everything buys these first.
+    uint32_t tier{1};
+};
+
+// The tier of a spell by its English name: 0 for the heals and buffs of the
+// five classes the families field, 1 otherwise.
+uint32_t ClassLearnTier(char const* englishName);
+
+// The order a class visit buys in: tier, then required level, then spell id,
+// which is ascending rank within a line. Returns the ids that the purse
+// `money` covers in that order, each cost taken from it as it is bought; a
+// spell it cannot cover is skipped and the cheaper ones behind it still buy.
+std::vector<uint32_t> PlanClassLearns(std::vector<ClassLearnCandidate> candidates, uint64_t money);
 
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);

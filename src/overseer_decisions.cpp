@@ -15319,7 +15319,7 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
         anyLearn = anyLearn || (TrainingStopWants(member) && !member.walkedThisStop);
     if (!anyLearn)
     {
-        leg.step = TrainingStopStep::NothingToLearn;
+        leg.step = facts.learnsOwed ? TrainingStopStep::LearnsOwed : TrainingStopStep::NothingToLearn;
         return leg;
     }
     // The trainer distance is each member's own; the run's state is the
@@ -15393,6 +15393,8 @@ char const* TrainingStopStepWord(TrainingStopStep step)
             return "an errand a training stop may not take holds the head's travel column";
         case TrainingStopStep::Walk:
             return "walk";
+        case TrainingStopStep::LearnsOwed:
+            return "a visit taught nothing and its tries are spent, so the learns are still owed";
     }
     return "unknown";
 }
@@ -15406,6 +15408,7 @@ uint32_t TrainingStopRestSeconds(TrainingStopStep step)
         case TrainingStopStep::NobodyWithTheHead:
         case TrainingStopStep::NoTrainerInTown:
         case TrainingStopStep::RunOwnsTravel:
+        case TrainingStopStep::LearnsOwed:
             return TRAINING_STOP_RETRY_SECONDS;
         case TrainingStopStep::NotACampaign:
         case TrainingStopStep::NothingToLearn:
@@ -15421,6 +15424,58 @@ bool TrainingStopRestStillApplies(TrainingStopStep lastEnd, uint32_t endedOnMap,
                                   uint32_t headMap)
 {
     return !(lastEnd == TrainingStopStep::NoTrainerInTown && endedOnMap != headMap);
+}
+
+bool TrainingStopLegRetries(uint32_t offered, uint32_t learned, uint32_t triesSoFar)
+{
+    return offered > 0 && learned == 0 && triesSoFar < TRAINING_STOP_LEARN_TRIES;
+}
+
+bool TrainingStopHoldsRunStart(bool stopOpen, bool learnsReachable, uint32_t heldSeconds)
+{
+    return (stopOpen || learnsReachable) && heldSeconds < TRAINING_STOP_RUN_HOLD_SECONDS;
+}
+
+uint32_t ClassLearnTier(char const* englishName)
+{
+    static char const* const FIRST[] = {
+        "Battle Shout", "Blessing of", "Devotion Aura", "Retribution Aura", "Concentration Aura",
+        "Lesser Heal", "Heal", "Greater Heal", "Flash Heal", "Renew", "Power Word: Shield",
+        "Power Word: Fortitude", "Holy Light", "Flash of Light", "Lay on Hands", "Purify",
+        "Cleanse", "Arcane Intellect", "Conjure Water", "Conjure Food", "Dampen Magic",
+        "Amplify Magic", "Frost Armor", "Ice Armor", "Mage Armor", "Mana Shield"};
+    if (!englishName)
+        return 1;
+    std::string const name(englishName);
+    for (char const* first : FIRST)
+    {
+        std::string const stem(first);
+        if (name.compare(0, stem.size(), stem) == 0 &&
+            (name.size() == stem.size() || name[stem.size()] == ' ' || name[stem.size()] == '('))
+            return 0;
+    }
+    return 1;
+}
+
+std::vector<uint32_t> PlanClassLearns(std::vector<ClassLearnCandidate> candidates, uint64_t money)
+{
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](ClassLearnCandidate const& a, ClassLearnCandidate const& b) {
+                         if (a.tier != b.tier)
+                             return a.tier < b.tier;
+                         if (a.reqLevel != b.reqLevel)
+                             return a.reqLevel < b.reqLevel;
+                         return a.spellId < b.spellId;
+                     });
+    std::vector<uint32_t> plan;
+    for (ClassLearnCandidate const& candidate : candidates)
+    {
+        if (candidate.cost > money)
+            continue;
+        money -= candidate.cost;
+        plan.push_back(candidate.spellId);
+    }
+    return plan;
 }
 
 bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds)
