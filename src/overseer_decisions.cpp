@@ -15417,6 +15417,17 @@ uint32_t TrainingStopRestSeconds(TrainingStopStep step)
     return TRAINING_STOP_REST_SECONDS;
 }
 
+bool TrainingStopRestStillApplies(TrainingStopStep lastEnd, uint32_t endedOnMap,
+                                  uint32_t headMap)
+{
+    return !(lastEnd == TrainingStopStep::NoTrainerInTown && endedOnMap != headMap);
+}
+
+bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds)
+{
+    return stopOpen && heldSeconds < TRAINING_STOP_MAX_SECONDS;
+}
+
 bool TrainingStopMayPreempt(std::string const& column)
 {
     if (column.empty())

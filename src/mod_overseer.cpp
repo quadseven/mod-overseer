@@ -28835,7 +28835,17 @@ private:
             // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
             // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
             // areatrigger_teleport.sql: (503,'Stockades Instance',0,-8764.83,846.075,87.4842,3.77934)
-            {"stockades", 0, 101, 34, 503, 0.f, 0.f, 0.f},
+            // THE STOCKADES ARE IN STORMWIND, SO THE CAMPAIGN'S TOWN IS STORMWIND
+            // (2026-09-29). The Alliance family was bound at Ratchet, a neutral
+            // goblin town in the Barrens with no Alliance class trainers, so a
+            // death or a hearth put it there between runs and its class
+            // spells were never bought: no Fortitude, no Arcane Intellect, no
+            // blessing, no Battle Shout in the dungeon. Innkeeper Allison of
+            // the Gilded Rose (creature 6740, world DB: map 0, -8867.8,
+            // 673.7, 98.0) is 200 yards from the door and 62 to 75 yards from
+            // the Stormwind class trainers' street; the finder's own exit
+            // (areatrigger 503) already lands the family in this city.
+            {"stockades", 0, 101, 34, 503, 0.f, 0.f, 0.f, {}, -8867.8f, 673.7f, 98.0f},
             // WAILING CAVERNS, AND THE FIRST ROW IN THIS TABLE WHOSE OUTSIDE
             // MAP IS NOT 0. The four numbers are read out of the pinned core's
             // own base world DB the same way every row above them is, and are
@@ -30767,6 +30777,9 @@ private:
         // means. It lives on the RUN rather than on this class because it
         // dies with the run, exactly as the staging clock beside it does.
         time_t repairSince{0};
+        // When the finished leg first waited for the family's training stop
+        // (TrainingStopHoldsRepairLegFor); zero when it has not.
+        time_t trainingHoldSince{0};
         // WHO THE LEG IS FINISHED WITH. A positive list rather than a count,
         // deliberately: a member is settled when it carries nothing damaged,
         // when it has been repaired, or when this leg has established that it
@@ -38759,9 +38772,52 @@ private:
             _travelAims.Release(name, "the repair leg ending");
         }
         coord.repairSince = 0;
+        coord.trainingHoldSince = 0;
         coord.repairSettled.clear();
         coord.repairSaid.clear();
         coord.phase = DungeonRunPhase::Resetting;
+    }
+
+    // THE REPAIR LEG WAITS FOR THE FAMILY'S TRAINING STOP (2026-09-29). Once
+    // every member is repaired the leg used to end on the same poll and RESET
+    // sent the family back into the dungeon finder within seconds. For the
+    // Alliance family that is the one moment it stands in a town with class
+    // trainers: the finder's exit (areatrigger 503) lands it in Stormwind, and
+    // between runs it is otherwise in Ratchet, which has none. So the training
+    // stop is offered its turn here, and while it is open the leg holds.
+    //
+    // BOUNDED, AND NOT A CANCELLATION: TrainingStopHoldsRepairLeg counts the
+    // stop's own 15 minutes from the first poll that held, the stop ends when
+    // nobody is left to walk for, and the stop only opens when a member has a
+    // class spell it can pay for and a trainer of its class is in reach. A
+    // family with nothing to learn, or no trainer in this town, is not held.
+    bool TrainingStopHoldsRepairLegFor(DungeonRunCoordinatorState& coord,
+                                       std::string const& leaderName,
+                                       std::vector<std::string> const& members)
+    {
+        std::string const family = FamilyOfCharacter(leaderName);
+        if (family.empty())
+            return false;
+        DriveTrainingStop(family);
+        bool open = false;
+        for (std::string const& name : members)
+        {
+            auto const stop = _trainingStops.find(name);
+            if (stop != _trainingStops.end() && stop->second.openedAt != 0)
+                open = true;
+        }
+        time_t const now = std::time(nullptr);
+        if (open && !coord.trainingHoldSince)
+            coord.trainingHoldSince = now;
+        uint32 const held =
+            coord.trainingHoldSince ? static_cast<uint32>(now - coord.trainingHoldSince) : 0;
+        if (!OverseerDecisions::TrainingStopHoldsRepairLeg(open, held))
+            return false;
+        LOG_DEBUG("module.overseer",
+                  "overseer: the repair leg for '{}'s party is done and waits for the family's "
+                  "training stop, {}s in",
+                  leaderName, held);
+        return true;
     }
 
     void DriveRepairLeg(DungeonRunCoordinatorState& coord,
@@ -38932,6 +38988,8 @@ private:
                 return;
 
             case OverseerDecisions::RepairLegVerdict::Finished:
+                if (TrainingStopHoldsRepairLegFor(coord, leaderName, members))
+                    return;
                 LOG_INFO("module.overseer",
                          "overseer: the repair leg for '{}'s party is done after {}s - every "
                          "member is repaired or had nothing to repair, so the next run opens "
@@ -45014,10 +45072,19 @@ private:
         std::set<std::string> retried;     // members whose leg was cut short once already
         OverseerDecisions::TrainingStopStep said{OverseerDecisions::TrainingStopStep::Walk};
         bool saidAny{false};
+        // Why the last stop ended and on which map its head stood, so a rest
+        // earned for want of a trainer is not served in a town that has one.
+        OverseerDecisions::TrainingStopStep endedStep{OverseerDecisions::TrainingStopStep::Walk};
+        uint32 endedMap{0};
+        // Members already told about as having no class trainer in reach, per
+        // map ("Name@map"), so the log says it once and not every poll.
+        std::set<std::string> noTrainerSaid;
     };
 
-    // Read on the train poll after DriveRespec.
-    void DriveTrainingStop()
+    // Read on the train poll after DriveRespec, and once more for one family
+    // when its run's repair leg is done (TrainingStopHoldsRepairLegFor), which
+    // is the moment the finder has just walked it out into Stormwind.
+    void DriveTrainingStop(std::string const& onlyFamily = std::string())
     {
         QueryResult result = CharacterDatabase.Query(
             "SELECT name, family, `lead`, job, learn_skill FROM overseer_roster WHERE enabled = 1");
@@ -45046,6 +45113,8 @@ private:
         time_t const now = std::time(nullptr);
         for (auto& [family, rows] : families)
         {
+            if (!onlyFamily.empty() && family != onlyFamily)
+                continue;
             auto const headRow = std::find_if(rows.begin(), rows.end(),
                                               [](Row const& row) { return row.lead; });
             if (headRow == rows.end())
@@ -45102,8 +45171,15 @@ private:
                 facts.stopSeconds =
                     static_cast<uint32>(std::max<time_t>(1, now - stop.openedAt));
             if (stop.endedAt)
+            {
                 facts.sinceLastStop =
                     static_cast<uint32>(std::max<time_t>(0, now - stop.endedAt));
+                // A stop that ended for want of a trainer rested for the town
+                // it ended in, not for this one.
+                if (!OverseerDecisions::TrainingStopRestStillApplies(
+                        stop.endedStep, stop.endedMap, head->GetMapId()))
+                    facts.sinceLastStop = UINT32_MAX;
+            }
 
             // THE HEAD FIRST when he has a learn of his own, then the others by
             // name, which is the order PickTrainingStopLeg walks them in.
@@ -45159,6 +45235,29 @@ private:
                     }
                     else
                         trainer = 0;
+
+                    // NO TRAINER OF ITS CLASS IN REACH IS SAID, AND SKIPPED
+                    // (2026-09-29): the stop walks for the members it can and
+                    // does not wait on one it cannot, and the log names who
+                    // and where so a priest with no trainer on this map is
+                    // not a silent gap.
+                    if (!row.learnSkill && bot->GetMoney() > 0 &&
+                        (trainer == 0 || member.trainerYards > OverseerDecisions::TRAINING_STOP_YARDS) &&
+                        (trainer == 0 || member.classSpells > 0) &&
+                        stop.noTrainerSaid
+                            .insert(row.name + "@" + std::to_string(head->GetMapId()))
+                            .second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: {}'s training stop skips '{}' (class {}) - no class "
+                                 "trainer that serves it is within {} yards of the head on map {} "
+                                 "({}), so the others are walked for and this one waits for a "
+                                 "town that has one",
+                                 family, row.name, static_cast<uint32>(bot->getClass()),
+                                 static_cast<uint32>(OverseerDecisions::TRAINING_STOP_YARDS),
+                                 static_cast<uint32>(head->GetMapId()),
+                                 trainer ? std::to_string(static_cast<uint32>(member.trainerYards)) +
+                                               " yards to the nearest"
+                                         : std::string("none found"));
                 }
                 if (!OverseerDecisions::TrainingStopWants(member))
                     continue;
@@ -45179,6 +45278,8 @@ private:
                          stop.restSeconds / 60);
                 stop.openedAt = 0;
                 stop.endedAt = now;
+                stop.endedStep = pick.step;
+                stop.endedMap = head->GetMapId();
                 stop.walked.clear();
                 stop.retried.clear();
                 stop.saidAny = false;

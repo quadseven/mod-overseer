@@ -17,6 +17,7 @@
 
 #include "overseer_decisions.h"
 
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -35,7 +36,9 @@ using OverseerDecisions::TRAINING_STOP_YARDS;
 using OverseerDecisions::TRAINING_STOP_RETRY_SECONDS;
 using OverseerDecisions::TRAINING_STOP_SPENT_REST_SECONDS;
 using OverseerDecisions::TrainingStopEnds;
+using OverseerDecisions::TrainingStopHoldsRepairLeg;
 using OverseerDecisions::TrainingStopMayPreempt;
+using OverseerDecisions::TrainingStopRestStillApplies;
 using OverseerDecisions::TrainingStopRestSeconds;
 using OverseerDecisions::TrainingStopFacts;
 using OverseerDecisions::TrainingStopLeg;
@@ -431,6 +434,119 @@ void TheAdapterIsWired()
 
 }  // namespace
 
+// THE ALLIANCE FAMILY'S CLASS TRAINING (2026-09-29, "no buffs on Grug's family in
+// the dungeons"). Grug's family (warrior 39, paladin 37, rogue 35, mage 35,
+// priest 35) knew no class spell it could buy: its between-run town and its
+// hearthstone were Ratchet, a neutral goblin town in the Barrens, and Ratchet has
+// no Alliance class trainer. Theramore, the nearest, is 2,800 yards away and has
+// no priest or rogue trainer. The Stockade is in Stormwind, the dungeon finder's
+// exit walks the family out into it, and every class has a trainer there within
+// 400 yards of the inn.
+struct Spot
+{
+    char const* who;
+    float x;
+    float y;
+};
+
+float Yards(Spot const& a, float x, float y)
+{
+    float const dx = a.x - x;
+    float const dy = a.y - y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+void TheStormwindTrainersAreInReach()
+{
+    // Innkeeper Allison of the Gilded Rose, creature 6740, world DB.
+    constexpr float INN_X = -8867.8f;
+    constexpr float INN_Y = 673.7f;
+    // The Stockade's way out (areatrigger 503) lands the family here.
+    constexpr float DOOR_X = -8764.83f;
+    constexpr float DOOR_Y = 846.075f;
+    // One real trainer per class, Stormwind, from creature/trainer rows.
+    Spot const stormwind[] = {
+        {"warrior Ander Germaine", -8705.4f, 329.6f},
+        {"paladin Arthur the Faithful", -8574.0f, 860.9f},
+        {"rogue Osborne the Night Man", -8752.3f, 377.6f},
+        {"priest Brother Benjamin", -8547.7f, 814.7f},
+        {"mage Jennea Cannon", -8990.0f, 862.9f},
+    };
+    for (Spot const& trainer : stormwind)
+    {
+        Check("every Stormwind class trainer is a town's walk from the inn the family binds at",
+              Yards(trainer, INN_X, INN_Y) <= TRAINING_STOP_YARDS);
+        Check("and from the door the finder's exit lands it at",
+              Yards(trainer, DOOR_X, DOOR_Y) <= TRAINING_STOP_YARDS);
+    }
+    // Theramore's warrior trainer from the Ratchet inn: the stop cannot walk it.
+    Spot const theramore{"warrior Captain Evencane", -3728.f, -4538.f};
+    Check("Theramore is past a training stop's reach from Ratchet",
+          Yards(theramore, -1050.f, -3665.f) > TRAINING_STOP_YARDS);
+
+    // A priest with no trainer in reach is skipped, and the mage is walked for.
+    TrainingStopMember priest = Member("Ugga", 0, -1.f);
+    priest.classSpells = 4;
+    TrainingStopMember mage = Member("Og", 0, 300.f);
+    mage.classSpells = 5;
+    TrainingStopFacts facts = HeldInTown();
+    TrainingStopLeg const pick = PickTrainingStopLeg(facts, {priest, mage});
+    Check("a class with no trainer in reach is skipped, not waited on",
+          pick.step == TrainingStopStep::Walk && pick.member == 1);
+    Check("and a family with none in reach ends its stop rather than starving",
+          PickTrainingStopLeg(facts, {priest}).step == TrainingStopStep::NoTrainerInTown &&
+              TrainingStopEnds(TrainingStopStep::NoTrainerInTown, true));
+}
+
+void ARestEarnedInRatchetIsNotServedInStormwind()
+{
+    Check("a stop that ended for want of a trainer stops resting once the head is on another map",
+          !TrainingStopRestStillApplies(TrainingStopStep::NoTrainerInTown, 1, 0));
+    Check("on the same map it still rests",
+          TrainingStopRestStillApplies(TrainingStopStep::NoTrainerInTown, 1, 1));
+    Check("a stop that served everybody rests wherever the head goes",
+          TrainingStopRestStillApplies(TrainingStopStep::NothingToLearn, 1, 0));
+    Check("and so does one that spent its time",
+          TrainingStopRestStillApplies(TrainingStopStep::SpentItsTime, 1, 0));
+}
+
+void TheRepairLegWaitsForAnOpenStopAndNoLonger()
+{
+    Check("no open stop, no wait", !TrainingStopHoldsRepairLeg(false, 0));
+    Check("an open stop holds the finished repair leg", TrainingStopHoldsRepairLeg(true, 0));
+    Check("for the stop's own budget",
+          TrainingStopHoldsRepairLeg(true, TRAINING_STOP_MAX_SECONDS - 1));
+    Check("and not a second past it", !TrainingStopHoldsRepairLeg(true, TRAINING_STOP_MAX_SECONDS));
+}
+
+void TheStockadesCampaignLivesInStormwind()
+{
+    std::string const source = ReadModule();
+    if (source.empty())
+    {
+        Check("src/mod_overseer.cpp is readable from the working directory", false);
+        return;
+    }
+    Check("the Stockades row names the Gilded Rose as the campaign's town",
+          source.find("{\"stockades\", 0, 101, 34, 503, 0.f, 0.f, 0.f, {}, -8867.8f, 673.7f, 98.0f},") !=
+              std::string::npos);
+    std::size_t const leg = source.find("void DriveRepairLeg(DungeonRunCoordinatorState& coord,");
+    std::size_t const finished =
+        source.find("case OverseerDecisions::RepairLegVerdict::Finished:", leg);
+    std::size_t const hold = source.find("if (TrainingStopHoldsRepairLegFor(coord, leaderName, members))", leg);
+    Check("the finished repair leg offers the training stop its turn before RESET",
+          leg != std::string::npos && finished != std::string::npos && hold != std::string::npos &&
+              hold > finished && hold < source.find("the repair leg for '{}'s party is done after", finished));
+    Check("the offer runs the stop for that family only",
+          source.find("void DriveTrainingStop(std::string const& onlyFamily = std::string())") !=
+              std::string::npos &&
+              source.find("DriveTrainingStop(family);") != std::string::npos);
+    Check("the head's rest is read against the map its last stop ended on",
+          source.find("OverseerDecisions::TrainingStopRestStillApplies(") != std::string::npos);
+    Check("a class with no trainer in reach is said once and skipped",
+          source.find("training stop skips '{}' (class {})") != std::string::npos);
+}
+
 int main()
 {
     TheTownIsTheCity();
@@ -441,6 +557,10 @@ int main()
     ItIsBounded();
     ARestIsAsLongAsItsReason();
     TheAdapterIsWired();
+    TheStormwindTrainersAreInReach();
+    ARestEarnedInRatchetIsNotServedInStormwind();
+    TheRepairLegWaitsForAnOpenStopAndNoLonger();
+    TheStockadesCampaignLivesInStormwind();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

@@ -17797,6 +17797,27 @@ bool TrainingStopEnds(TrainingStopStep step, bool stopOpen);
 // time with members waiting.
 uint32_t TrainingStopRestSeconds(TrainingStopStep step);
 
+// A REST THAT WAS EARNED IN ANOTHER TOWN DOES NOT APPLY IN THIS ONE
+// (2026-09-29). The Alliance family waits between runs in Ratchet, a neutral
+// goblin town with no Alliance class trainers, so its stops there ended
+// "no trainer in town" and rested five minutes. A stop that ended for want of a
+// trainer says nothing about a town that has one: when the head has since
+// changed maps (the dungeon finder walks the family out of the Stockade into
+// Stormwind, where every class has a trainer within a few hundred yards) the
+// rest is over. Any other ending rests as it always did.
+bool TrainingStopRestStillApplies(TrainingStopStep lastEnd, uint32_t endedOnMap,
+                                  uint32_t headMap);
+
+// THE RUN'S REPAIR LEG WAITS FOR AN OPEN TRAINING STOP (2026-09-29). Right after
+// a Stockade run the dungeon finder has put the family in Stormwind, and the
+// run coordinator was through REPAIRING and RESET and back in the finder queue
+// in about twenty-five seconds, so the class trainers a few hundred yards away
+// never had a turn. While a stop is open the repair leg holds, and the hold is
+// the stop's own budget (TRAINING_STOP_MAX_SECONDS) and no more: the leg's
+// wait is counted from the first poll that held it. Not a cancellation, a
+// pause that ends by itself.
+bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds);
+
 // Is `column` one of the bridge's town errands, which a training stop may take
 // the column from: a counter keyword, a ground aim, a bare creature entry (the
 // reagent vendor's) or a flight-master discovery walk. Not the empty column,
