@@ -36796,7 +36796,7 @@ private:
                         OverseerDecisions::GuildRunRearmStep::Issue &&
                     tank && tank->IsInWorld())
                 {
-                    run.dcTriedAt = now;
+                    bool any = false;
                     bool all = true;
                     for (std::string const& name : run.names)
                     {
@@ -36804,10 +36804,15 @@ private:
                         PlayerbotAI* const ai = p ? GET_PLAYERBOT_AI(p) : nullptr;
                         if (!ai || !p->IsAlive() || p->GetMapId() != run.mapId)
                             continue;
+                        any = true;
                         if (!ai->DoSpecificAction(OverseerDecisions::GUILD_RUN_REARM_VERB,
                                                   Event("dc", "", tank), true))
                             all = false;
                     }
+                    // Stamped only when something was actually sent, so a poll
+                    // that reached nobody does not spend the cooldown.
+                    if (any)
+                        run.dcTriedAt = now;
                     if (!all)
                         LOG_INFO("module.overseer",
                                  "overseer: guild finder run {} - '{}' from '{}' refused (see "
