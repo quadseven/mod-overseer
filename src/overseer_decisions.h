@@ -2124,6 +2124,11 @@ StagingHeight DungeonStagingHeight(bool probed, float ground, float fallbackZ, f
 // most needs to distinguish would have been indistinguishable from failure.
 // Being through is a third answer, not a bad distance, so it is a field of
 // its own.
+// Entry needs the destination map. Exit accepts finder returns to any map
+// outside the source dungeon, including a member's original continent.
+bool DungeonCrossingReachedMap(uint32_t memberMap, uint32_t sourceMap,
+                               uint32_t destinationMap, bool leaving);
+
 struct DungeonRunEntryState
 {
     std::string name;

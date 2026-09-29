@@ -1515,6 +1515,12 @@ ApproachLeg ApproachLegStep(ApproachRouteState& state, ApproachRoute const& rout
     return ApproachLeg::ToWaypoint;
 }
 
+bool DungeonCrossingReachedMap(uint32_t memberMap, uint32_t sourceMap,
+                               uint32_t destinationMap, bool leaving)
+{
+    return leaving ? memberMap != sourceMap : memberMap == destinationMap;
+}
+
 bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
                           float doorstepYards)
 {
