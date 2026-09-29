@@ -18285,6 +18285,16 @@ struct FinderFacts
     bool groupIsRaid{false};
     bool groupIsFinders{false};
     bool headLeads{false};
+    // THE ASKER WILL DISBAND A FINDER GROUP BEFORE IT QUEUES (2026-09-29). Set
+    // by the IDLE coordinator, which asks "would the finder be the way in?"
+    // while the group the last finder run made still stands: RESETTING lets it
+    // go (LeaveTheFinderGroup) before the family is queued again. Read as it
+    // stands, that group made the answer no, so a family that had just been
+    // in the Stockade by the finder was judged unable to queue for Razorfen
+    // Kraul, fell back to the walk, and was held for a home bind and a
+    // continent crossing the finder never needs. With this set, a finder
+    // group, and whoever it made its leader, is no reason to say no.
+    bool groupMayBeFinders{false};
     std::vector<FinderMember> family;
 };
 
@@ -18295,7 +18305,8 @@ struct FinderReadiness
 };
 
 // Can the family queue? The family is exactly the group: five members, one
-// party (not a raid, not already a finder group) led by the head, every member
+// party (not a raid, not already a finder group unless `groupMayBeFinders`)
+// led by the head (or by whoever a finder group made leader), every member
 // in the world and not locked. With `now`, every member must also be alive and
 // out of combat; without it (when a failure is being recorded, and the rung
 // may not run for a quarter of an hour) those two passing states are left to

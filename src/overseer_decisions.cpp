@@ -16008,11 +16008,14 @@ FinderReadiness ReadFinderReadiness(FinderFacts const& facts, bool now)
                                            : facts.dungeonWhy);
     if (!facts.groupExists)
         return no("the head is in no group");
-    if (facts.groupIsFinders)
+    bool const finderGroupGoes = facts.groupIsFinders && facts.groupMayBeFinders;
+    if (facts.groupIsFinders && !finderGroupGoes)
         return no("the group is already a dungeon finder group");
     if (facts.groupIsRaid)
         return no("the group is a raid, and the finder queues a party");
-    if (!facts.headLeads)
+    // The finder may hand the lead to somebody else, and the group is about to
+    // be disbanded, so whose it is does not matter (RESETTING's own reading).
+    if (!facts.headLeads && !finderGroupGoes)
         return no("the head does not lead the group");
     if (facts.family.size() != FINDER_GROUP_SIZE || facts.groupSize != FINDER_GROUP_SIZE)
         return no("the finder takes the family as one group of " +
