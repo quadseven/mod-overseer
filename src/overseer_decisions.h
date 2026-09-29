@@ -469,6 +469,14 @@ enum class TerrainRemedy
     // through) something, so this is a note about the probes, not a
     // character below the world. It ends no errand.
     NotFalling,
+
+    // BACK TO THE LAST GROUND THE CHARACTER STOOD ON, ON THE SAME MAP, because
+    // it is standing on the featureless plane under the world (see
+    // OnTheHiddenPlane). The verdict carries where: `groundMapId` is the
+    // reading's own map by construction, so the closure the block above argues
+    // for still holds - no remedy here can change a continent, and this one
+    // moves x and y only to a place the character itself already stood.
+    ReturnToLastGround,
 };
 
 // ONE POLL'S WORTH OF WORLD, as the adapter measured it. Grouped rather than
@@ -528,6 +536,53 @@ struct TerrainReading
     // lift AWAY. The adapter always measures it.
     bool movementMeasured{false};
     bool falling{false};
+    // THE TERRAIN ALONE, AT THE CHARACTER'S OWN X AND Y (Map::GetGridHeight,
+    // which never looks at a WMO or any other model). Every other reading on
+    // this struct is a height the CORE ANSWERS for a place, and the core
+    // answers with the highest thing it finds. This is the raw height field,
+    // and it is the one number that says which ground a character is on: the
+    // city floor of Stormwind is a model 37 yards over a flat placeholder
+    // terrain, and a character on the placeholder has a terrain height equal
+    // to its own z. FALSE BY DEFAULT: an unmeasured reading declines to say
+    // anything about a plane, which is the behaviour before this existed.
+    bool terrainValid{false};
+    float terrainZ{0.f};
+    // EVERY SAMPLE OF A RING OF TERRAIN HEIGHTS AROUND THE CHARACTER WAS AT ITS
+    // OWN HEIGHT, within a fraction of a yard (PlaneRingIsFlat). Real ground
+    // has relief; the placeholder under Stormwind and beyond it is one number
+    // to three decimals (59.459), measured at every position of the 2026-09-29
+    // ride and at a ring of eight samples 20 and 40 yards round each of them.
+    bool planeFlat{false};
+    // AN OPEN MAP: not an instance, not a battleground. An instance's terrain
+    // is a placeholder BY DESIGN and its floors are models, so a character
+    // standing on one is not under anything.
+    bool onOpenMap{false};
+};
+
+// One terrain height, or the core's answer that there is none.
+struct TerrainSample
+{
+    bool valid{false};
+    float z{0.f};
+};
+
+// IS THIS RING OF TERRAIN FEATURELESS AT THE CHARACTER'S OWN HEIGHT? Every
+// sample valid and within `tolerance` of `centerZ`. An empty ring, a sample
+// the core could not read, or a zero tolerance all answer FALSE: this is a
+// detector that can only ever take ground AWAY from a character, so every
+// reading it cannot make is a no.
+bool PlaneRingIsFlat(std::vector<TerrainSample> const& ring, float centerZ,
+                     float tolerance);
+
+// THE LAST PLACE THIS CHARACTER STOOD ON GROUND, remembered across episodes.
+struct LastGround
+{
+    bool valid{false};
+    std::uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+    time_t when{0};
 };
 
 struct TerrainRecoveryVerdict
@@ -537,6 +592,11 @@ struct TerrainRecoveryVerdict
     // sentinel: it is only ever computed from a surface reading the caller
     // declared valid.
     float liftZ{0.f};
+    // Where ReturnToLastGround goes. The map is the character's own.
+    std::uint32_t groundMapId{0};
+    float groundX{0.f};
+    float groundY{0.f};
+    float groundZ{0.f};
 };
 
 // The tunables, in one constant a reader can take in at once, following
@@ -610,7 +670,38 @@ struct TerrainRecoveryLimits
     // a walk spline cutting through a rock face is never falling. Read only
     // for a reading with `movementMeasured`; the void catch ignores it.
     time_t fallingWindowSeconds{0};
+    // HOW CLOSE TO THE RAW TERRAIN A CHARACTER'S FEET HAVE TO BE FOR IT TO BE
+    // STANDING ON THE TERRAIN AND NOT ON A MODEL ABOVE IT. A stride, the same
+    // reach the floor probe uses. ZERO DISABLES THE PLANE RUNG.
+    float planeReach{0.f};
+    // HOW OLD THE LAST GROUND MAY BE and still be somewhere to send a
+    // character. A place it stood on an hour ago is a place the world may have
+    // moved on from; past this the lift is used instead. ZERO DISABLES THE
+    // RETURN.
+    time_t lastGroundMaxAgeSeconds{0};
+    // HOW MANY RETURNS BEFORE THE LOUD GIVE-UP, per forget window. Two: one to
+    // fix it and one to prove the first did not stick, then the module says so
+    // instead of teleporting a character every second.
+    unsigned maxPlaneReturns{0};
 };
+
+// IS THIS CHARACTER STANDING ON THE FEATURELESS PLANE UNDER THE WORLD?
+//
+// Its feet are on the raw terrain (z within `planeReach` of the terrain-only
+// height), that terrain is featureless around it, and the map is an open one.
+// THAT IS A CONJUNCTION OF THREE MEASUREMENTS AND NOT ONE OF THEM IS
+// NEGOTIABLE: a hill has relief, a model floor is above the terrain, and an
+// instance's terrain is a placeholder on purpose.
+//
+// AND IT DELIBERATELY ANSWERS BEFORE THE NAVMESH DOES. The mesh is built from
+// the same placeholder, so it has polygons on the plane, Detour finds one at
+// the character's feet and the footing fan holds on flat ground: every
+// instrument that asks "is there ground" says yes, and on 2026-09-29 that
+// yes was logged as "the detector being wrong" while the leader rode two
+// thousand yards under Stormwind and the sea beside it. The question is not
+// whether there is ground but which.
+bool OnTheHiddenPlane(TerrainReading const& reading,
+                      TerrainRecoveryLimits const& limits);
 
 bool LiftDestinationIsValid(float currentZ, float destinationZ,
                             bool destinationSurfaceValid, float maxLiftYards);
@@ -682,6 +773,16 @@ struct TerrainRecoveryState
     // WHERE THIS EPISODE STARTED. Anchored on the first poll that holds, and
     // the episode is abandoned when the character turns up on another map or
     // more than `episodeRadius` away.
+    // WHAT THE PLANE RUNG REMEMBERS, kept outside the episode on purpose: the
+    // episode is abandoned when a character moves 250 yards or a map changes,
+    // and the ground it last stood on is exactly what it needs after moving.
+    struct PlaneMemory
+    {
+        LastGround ground;
+        unsigned returns{0};
+        time_t lastAttempt{0};
+        bool saidGiveUp{false};
+    } plane;
     bool anchored{false};
     uint32_t mapId{0};
     float x{0.f};

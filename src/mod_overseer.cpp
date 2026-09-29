@@ -595,6 +595,32 @@ constexpr float TERRAIN_RECOVERY_FOOTING_REACH_YARDS = 2.0f;
 // stray reading cannot open it.
 constexpr time_t TERRAIN_RECOVERY_FALLING_WINDOW_SECONDS = 5;
 
+// THE HIDDEN PLANE UNDER THE CITY (2026-09-29). The map's height field under
+// and beside Stormwind is a flat placeholder at z 59.457, the city is models
+// above it, and the navmesh has polygons on the placeholder, so a character
+// that has left the city floor reads as standing on ground. Measured from the
+// worldserver's own .map files at every position of the leader's ride, and at
+// a ring of eight samples 20 and 40 yards round each: the same value to three
+// decimals, where real ground moves by yards.
+//
+// A STRIDE FROM THE RAW TERRAIN is the reach for "standing on it": the same
+// two yards the floor probe uses. The ring is 25 yards out, eight samples, and
+// a quarter of a yard of relief is the most it may show - real hillside blows
+// through that in a stride, the placeholder does not move at all.
+constexpr float TERRAIN_PLANE_REACH_YARDS = 2.0f;
+constexpr float TERRAIN_PLANE_RING_YARDS = 25.0f;
+constexpr unsigned TERRAIN_PLANE_RING_SAMPLES = 8;
+constexpr float TERRAIN_PLANE_FLAT_TOLERANCE_YARDS = 0.25f;
+
+// HOW OLD THE LAST GROUND MAY BE and still be where a character is sent back
+// to: fifteen minutes, a lifetime of walking and not long enough for the
+// world under it to have changed.
+constexpr time_t TERRAIN_LAST_GROUND_MAX_AGE_SECONDS = 900;
+
+// Two returns, then a loud give-up, per forget window: one to fix it, one to
+// prove the first did not stick.
+constexpr unsigned TERRAIN_PLANE_MAX_RETURNS = 2;
+
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
@@ -605,7 +631,10 @@ constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
     TERRAIN_RECOVERY_VOID_CATCH_YARDS,
     30.0f,
-    TERRAIN_RECOVERY_FALLING_WINDOW_SECONDS};
+    TERRAIN_RECOVERY_FALLING_WINDOW_SECONDS,
+    TERRAIN_PLANE_REACH_YARDS,
+    TERRAIN_LAST_GROUND_MAX_AGE_SECONDS,
+    TERRAIN_PLANE_MAX_RETURNS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -25920,6 +25949,49 @@ private:
             // lift outside the void band is issued without this saying so.
             reading.movementMeasured = true;
             reading.falling = bot->IsFalling();
+            // WHICH GROUND, AND NOT ONLY WHETHER THERE IS ANY. The raw terrain
+            // height at the character's own x and y, which no model can
+            // answer for, and a ring of it around the feet: the placeholder
+            // under the city is one number to three decimals where real
+            // ground has relief. Measured on an open map only (an instance's
+            // terrain is a placeholder by design), and the ring only when the
+            // feet are on the terrain at all, so a character on a city floor
+            // pays for one lookup. See OverseerDecisions::OnTheHiddenPlane.
+            if (Map* const terrainMap = bot->GetMap())
+            {
+                reading.onOpenMap = !terrainMap->Instanceable();
+                float const terrain =
+                    terrainMap->GetGridHeight(reading.x, reading.y);
+                reading.terrainValid =
+                    reading.onOpenMap && terrain > INVALID_HEIGHT;
+                reading.terrainZ = terrain;
+                if (reading.terrainValid &&
+                    std::fabs(reading.z - terrain) <= TERRAIN_PLANE_REACH_YARDS)
+                {
+                    // Written as a literal for the reason HasLocalNavmesh
+                    // writes its angles as literals: M_PI is a POSIX
+                    // extension rather than a guarantee of <cmath>.
+                    static constexpr float FULL_TURN_RADIANS = 6.2831853f;
+                    std::vector<OverseerDecisions::TerrainSample> ring;
+                    for (unsigned i = 0; i < TERRAIN_PLANE_RING_SAMPLES; ++i)
+                    {
+                        float const angle = FULL_TURN_RADIANS *
+                                            static_cast<float>(i) /
+                                            static_cast<float>(TERRAIN_PLANE_RING_SAMPLES);
+                        float const h = terrainMap->GetGridHeight(
+                            reading.x + std::cos(angle) * TERRAIN_PLANE_RING_YARDS,
+                            reading.y + std::sin(angle) * TERRAIN_PLANE_RING_YARDS);
+                        OverseerDecisions::TerrainSample sample;
+                        sample.valid = h > INVALID_HEIGHT;
+                        sample.z = h;
+                        ring.push_back(sample);
+                    }
+                    reading.planeFlat = OverseerDecisions::PlaneRingIsFlat(
+                        ring, terrain, TERRAIN_PLANE_FLAT_TOLERANCE_YARDS);
+                }
+            }
+            bool const onThePlane = OverseerDecisions::OnTheHiddenPlane(
+                reading, TERRAIN_RECOVERY_LIMITS);
             // THE ORDINARY REACH FIRST, ALWAYS, and the deep one only where it
             // came back empty in the band. Written this way round rather than
             // as a widened probe for everybody so that not one reading outside
@@ -25993,7 +26065,7 @@ private:
             // tells the other drives that terrain recovery owns the character;
             // a character under a roof that is not falling is owned by nothing
             // and keeps its errand.
-            bool const belowTerrain = gapCouldMatter &&
+            bool const belowTerrain = (gapCouldMatter || onThePlane) &&
                 OverseerDecisions::ProvenBelowTheWorld(reading,
                                                        TERRAIN_RECOVERY_LIMITS);
             if (belowTerrain)
@@ -26088,7 +26160,8 @@ private:
             // Orgrimmar (one release per overhang). See
             // OverseerDecisions::TerrainRemedyEndsTheErrand.
             bool const endsTheErrand =
-                OverseerDecisions::TerrainRemedyEndsTheErrand(verdict.remedy, onTheGround);
+                OverseerDecisions::TerrainRemedyEndsTheErrand(
+                    verdict.remedy, onTheGround && !onThePlane);
             std::string travelTarget;
             std::string job;
             uint32 questAim = 0;
@@ -26129,6 +26202,59 @@ private:
             // the 204 recoveries measured on 2026-09-05 that was 204 silent
             // undos of errands the character was in the middle of, one of them
             // ten seconds after it had been sent to a vendor 39 yards away.
+            // BACK TO THE LAST GROUND, ON THE SAME MAP (the hidden plane). A
+            // character on the placeholder under the city is not standing on
+            // anything a walk can lead off, so it is put where it last stood
+            // on ground, by the same TeleportTo the lift below uses. The map
+            // is the character's own by construction and is checked again here
+            // because this is the one remedy that changes x and y. The errand
+            // that walked it there is released above and REFUSED here, so the
+            // next poll cannot write the same walk back.
+            if (verdict.remedy ==
+                OverseerDecisions::TerrainRemedy::ReturnToLastGround)
+            {
+                if (verdict.groundMapId != bot->GetMapId())
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' is on the hidden plane under the world at "
+                              "map {} ({:.1f}, {:.1f}, {:.1f}) and the ground it was to "
+                              "be returned to is on map {}; NOT MOVED - no remedy here "
+                              "changes a map (#188)",
+                              name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                              verdict.groundMapId);
+                    continue;
+                }
+                if (!travelTarget.empty())
+                    _travelAims.Refuse(name, travelTarget,
+                                       "it walked the character onto the plane under "
+                                       "the world");
+                bot->TeleportTo(bot->GetMapId(), verdict.groundX, verdict.groundY,
+                                verdict.groundZ, bot->GetOrientation());
+                OverseerDecisions::FallBaselineHandedOver(
+                    _fallBaseline[LowerName(name)], verdict.groundZ,
+                    std::time(nullptr));
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' WAS UNDER THE WORLD at map {} position "
+                          "({:.1f}, {:.1f}, {:.1f}): its feet are on the raw terrain "
+                          "(terrain z {:.3f}) and the terrain for {:.0f} yards round it "
+                          "is featureless, which is the placeholder plane under the "
+                          "city and not ground anybody walks on, whatever the navmesh "
+                          "there says (surface over it: {}). RETURNED to the last ground "
+                          "it stood on, map {} ({:.1f}, {:.1f}, {:.1f}), {}s ago. Its "
+                          "errand is released and refused: quest aim job='{}' quest={} "
+                          "travel='{}'. If this repeats the module gives up loudly "
+                          "instead of moving it again",
+                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                          reading.terrainZ, TERRAIN_PLANE_RING_YARDS,
+                          reading.surfaceValid ? std::to_string(reading.surfaceAboveZ)
+                                               : std::string("none"),
+                          verdict.groundMapId, verdict.groundX, verdict.groundY,
+                          verdict.groundZ,
+                          static_cast<uint32>(std::time(nullptr) - memory.plane.ground.when),
+                          job, questAim, travelTarget);
+                continue;
+            }
+
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::LiftToSurface)
             {
                 // THE NEAREST LAYER OVER THE FEET, NOT THE TOP OF THE STACK
@@ -26161,7 +26287,9 @@ private:
                 }
                 if (!OverseerDecisions::LiftDestinationIsValid(
                         fromZ, liftZ, std::isfinite(nearestLayerZ),
-                        nearThePlane ? 0.f : TERRAIN_RECOVERY_LIMITS.maxLiftYards))
+                        (nearThePlane || onThePlane)
+                            ? 0.f
+                            : TERRAIN_RECOVERY_LIMITS.maxLiftYards))
                 {
                     LOG_ERROR("module.overseer",
                               "overseer: '{}' refused a terrain lift from z {:.1f} to "
@@ -26272,6 +26400,26 @@ private:
             // which is a note about this rule. Without one, a real remedy was
             // tried and did not hold, which is a note about the world. They
             // send a reader to different places, so they say different things.
+            if (verdict.remedy == OverseerDecisions::TerrainRemedy::GiveUp && onThePlane)
+            {
+                if (!travelTarget.empty())
+                    _travelAims.Refuse(name, travelTarget,
+                                       "it walked the character onto the plane under "
+                                       "the world");
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' IS STILL UNDER THE WORLD at map {} position "
+                          "({:.1f}, {:.1f}, {:.1f}) on the hidden plane (terrain z "
+                          "{:.3f}, featureless for {:.0f} yards round it) and this module "
+                          "has returned it {} time(s) already, or has no ground on record "
+                          "and no surface to climb to. NOT MOVING IT AGAIN until the "
+                          "forget window has passed; somebody needs to look at what puts "
+                          "this character on the plane. Aim job='{}' quest={} travel='{}'",
+                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                          reading.terrainZ, TERRAIN_PLANE_RING_YARDS,
+                          memory.plane.returns, job, questAim, travelTarget);
+                continue;
+            }
+
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::GiveUp)
             {
                 if (onTheGround)
