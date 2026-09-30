@@ -31480,8 +31480,10 @@ private:
     // so an IDLE poll can keep asking (a member that was moving, one in combat,
     // a cast that never started) and hold adoption back while it does. Without
     // that the next poll adopts the member still casting and walks it at the
-    // same failed door. The episode ends when nobody is inside, when no hearth
-    // is possible, or at its ceiling; the campaign is never touched.
+    // same failed door. When the whole roster is confirmed outside, the saved
+    // run state goes through the ordinary close-and-count path. If someone is
+    // still inside or unavailable, the failed episode falls back to adoption
+    // without claiming a successful exit.
     struct ExitHearthEpisode
     {
         uint32 mapId{0};
@@ -31492,6 +31494,7 @@ private:
         std::time_t since{0};
         std::map<std::string, unsigned> attempts;
         std::map<std::string, std::string> lastStep;
+        DungeonRunCoordinatorState runState;
     };
     std::map<std::string, ExitHearthEpisode> _exitHearths;
 
@@ -31537,11 +31540,12 @@ private:
     // hearth is in play, which is what holds adoption back.
     bool DriveExitHearths(std::string const& family, std::string const& leaderName,
                           std::vector<std::string> const& members, ExitHearthEpisode& episode,
-                          char const* phase)
+                          char const* phase, bool& everyoneOutside)
     {
         using OverseerDecisions::ExitHearthStep;
 
         std::vector<ExitHearthStep> steps;
+        std::vector<ExitHearthFacts> factsByMember;
         for (std::string const& name : members)
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
@@ -31560,6 +31564,7 @@ private:
                 facts.attempts = episode.attempts[name];
             }
 
+            factsByMember.push_back(facts);
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
             steps.push_back(step);
             if (step == ExitHearthStep::NotInside)
@@ -31647,8 +31652,39 @@ private:
                     break;
             }
         }
+        everyoneOutside = OverseerDecisions::ExitHearthEveryoneOutside(factsByMember);
         return OverseerDecisions::ExitHearthHoldsAdoption(
             steps, static_cast<uint32>(std::time(nullptr) - episode.since));
+    }
+
+    bool FinishExitHearthRun(DungeonRunCoordinatorState& coord,
+                             std::string const& leaderName,
+                             std::vector<std::string> const& members,
+                             std::string const& leaderJob,
+                             ExitHearthEpisode const& episode,
+                             bool everyoneOutside)
+    {
+        if (!everyoneOutside)
+            return false;
+
+        DungeonPortal const* portal = FindDungeonPortal(episode.portal);
+        if (!portal)
+            return false;
+
+        coord = episode.runState;
+        char const* const outcome = OverseerDecisions::DungeonRunExitOutcome(
+            coord.provedComplete, !coord.stalledReason.empty(), coord.evacuated);
+        std::string const reason =
+            coord.provedComplete
+                ? "every encounter was credited; the whole party returned outside after "
+                  "the exit walk failed"
+                : "the whole party returned outside after the exit walk failed";
+        LOG_INFO("module.overseer",
+                 "overseer: dungeon run {} ended '{}' after the failed EXIT hearth episode - {}",
+                 episode.runId, outcome, reason);
+        EndRunAndDecide(coord, leaderName, *portal, episode.runId, outcome, reason,
+                        IsDungeonJob(leaderJob), &members);
+        return true;
     }
 
     // WHERE A RUN STANDS, in the words the fetch rule reads (2026-09-23). Here
@@ -41813,18 +41849,25 @@ private:
                     }
                 }
             // A FAILED EXIT'S HEARTH IS LET FINISH BEFORE THE RUN IS ADOPTED
-            // AGAIN (2026-09-24). Adopting here set EXIT on the next poll and
-            // walked the same member at the same failed door for another five
-            // minutes, once an episode, for an hour. The episode is dropped the
-            // moment nobody is inside, nobody can hearth, or its ceiling passes,
-            // and adoption then goes on exactly as before.
+            // AGAIN. Once the whole roster is confirmed outside, close and
+            // count the original attempt before the next RESET can begin.
             {
                 auto const episode = _exitHearths.find(family);
                 if (episode != _exitHearths.end())
                 {
-                    if (activeInside && activeInside->GetMapId() == episode->second.mapId &&
-                        DriveExitHearths(family, leaderName, members, episode->second, "IDLE"))
+                    bool everyoneOutside = false;
+                    if (DriveExitHearths(family, leaderName, members, episode->second,
+                                         "IDLE", everyoneOutside))
                         return;
+
+                    ExitHearthEpisode const finishedEpisode = episode->second;
+                    if (FinishExitHearthRun(coord, leaderName, members, leaderJob,
+                                           finishedEpisode, everyoneOutside))
+                    {
+                        _exitHearths.erase(episode);
+                        return;
+                    }
+
                     if (activeInside && activeInside->GetMapId() == episode->second.mapId)
                         LOG_WARN("module.overseer",
                                  "overseer: EXIT HEARTH - the episode on map {} is over "
@@ -43931,8 +43974,11 @@ private:
                             episode.runNumber = coord.runNumber;
                             episode.portal = coord.portalKeyword;
                             episode.since = std::time(nullptr);
+                            episode.runState = coord;
+                            bool everyoneOutside = false;
                             bool const inPlay =
-                                DriveExitHearths(family, leaderName, members, episode, "EXIT");
+                                DriveExitHearths(family, leaderName, members, episode,
+                                                 "EXIT", everyoneOutside);
                             if (inPlay)
                             {
                                 LOG_WARN("module.overseer",
@@ -43944,6 +43990,11 @@ private:
                                          portal->insideMapId,
                                          OverseerDecisions::EXIT_HEARTH_EPISODE_SECONDS / 60);
                                 _exitHearths[family] = episode;
+                            }
+                            else if (FinishExitHearthRun(coord, leaderName, members,
+                                                         leaderJob, episode, everyoneOutside))
+                            {
+                                return;
                             }
                             else
                             {

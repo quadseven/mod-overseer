@@ -27,6 +27,7 @@ using OverseerDecisions::EXIT_HEARTH_EPISODE_SECONDS;
 using OverseerDecisions::ExitFailureHearthInPlay;
 using OverseerDecisions::ExitFailureHearthStep;
 using OverseerDecisions::ExitHearthFacts;
+using OverseerDecisions::ExitHearthEveryoneOutside;
 using OverseerDecisions::ExitHearthHoldsAdoption;
 using OverseerDecisions::ExitHearthImpossibleReason;
 using OverseerDecisions::ExitHearthStep;
@@ -158,6 +159,21 @@ int main()
 
     // -- the family ------------------------------------------------------------
     {
+        std::vector<ExitHearthFacts> const allFamilyOut = {
+            ExitHearthFacts{true, false}, ExitHearthFacts{true, false}};
+        CheckBool("a seen family outside the instance has returned",
+                  ExitHearthEveryoneOutside(allFamilyOut), true);
+        std::vector<ExitHearthFacts> const oneInside = {
+            ExitHearthFacts{true, false}, ExitHearthFacts{true, true}};
+        CheckBool("a single member inside keeps the run open",
+                  ExitHearthEveryoneOutside(oneInside), false);
+        std::vector<ExitHearthFacts> const oneUnseen = {
+            ExitHearthFacts{true, false}, ExitHearthFacts{false, false}};
+        CheckBool("an offline member does not prove a successful exit",
+                  ExitHearthEveryoneOutside(oneUnseen), false);
+        CheckBool("an empty roster does not prove a successful exit",
+                  ExitHearthEveryoneOutside({}), false);
+
         // Ragefire: the leader inside, four outside.
         std::vector<ExitHearthStep> const zug = {
             ExitHearthStep::Cast, ExitHearthStep::NotInside, ExitHearthStep::NotInside,

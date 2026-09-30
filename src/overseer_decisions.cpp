@@ -15084,6 +15084,16 @@ bool ExitFailureHearthInPlay(std::vector<ExitHearthStep> const& steps)
     return false;
 }
 
+bool ExitHearthEveryoneOutside(std::vector<ExitHearthFacts> const& members)
+{
+    if (members.empty())
+        return false;
+    for (ExitHearthFacts const& member : members)
+        if (!member.inWorld || member.onInsideMap)
+            return false;
+    return true;
+}
+
 bool ExitHearthHoldsAdoption(std::vector<ExitHearthStep> const& steps, uint32_t episodeSeconds,
                              uint32_t ceilingSeconds)
 {

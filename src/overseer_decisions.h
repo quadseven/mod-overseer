@@ -17407,6 +17407,11 @@ char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts,
 // re-adopts as it always did.
 bool ExitFailureHearthInPlay(std::vector<ExitHearthStep> const& steps);
 
+// Every family member must be observed in the world and off the instance map
+// before a failed EXIT can be finalized. An absent member is not evidence that
+// the party got out.
+bool ExitHearthEveryoneOutside(std::vector<ExitHearthFacts> const& members);
+
 // Whether the IDLE coordinator holds off adopting the run a failed EXIT left
 // behind. Only while a hearth is in play and the episode is younger than its
 // ceiling; adopting would only walk the same party at the same failed door.
