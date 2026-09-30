@@ -64,13 +64,13 @@ void Check(char const* what, bool ok)
 }
 
 TrainingStopMember Member(char const* name, uint32_t skill, float trainerYards,
-                          bool withTheHead = true)
+                          bool onHeadMap = true)
 {
     TrainingStopMember member;
     member.name = name;
     member.learnSkill = skill;
     member.trainerYards = trainerYards;
-    member.withTheHead = withTheHead;
+    member.onHeadMap = onHeadMap;
     return member;
 }
 
@@ -203,13 +203,13 @@ void TheHeadWalksTheFamilyTrainerByTrainer()
     family[2].walkedThisStop = true;
     family[3].walkedThisStop = true;
     leg = PickTrainingStopLeg(open, family);
-    Check("a member away from the family is not walked for",
-          leg.step == TrainingStopStep::NobodyWithTheHead);
+    Check("a member on another map is not walked for",
+          leg.step == TrainingStopStep::NobodyOnHeadMap);
     Check("and the open stop ends", TrainingStopEnds(leg.step, true));
 
-    family[4].withTheHead = true;
+    family[4].onHeadMap = true;
     leg = PickTrainingStopLeg(open, family);
-    Check("once it is back with the family it is",
+    Check("once it is back on the head's map it is",
           leg.step == TrainingStopStep::Walk && leg.member == 4);
 
     family[4].walkedThisStop = true;
@@ -232,9 +232,9 @@ void TheHeadWalksTheFamilyTrainerByTrainer()
 // Intellect, a level 37 paladin no blessing and a level 39 warrior no Battle
 // Shout, so no party frame carried a buff. A class spell is a learn too.
 TrainingStopMember ClassMember(char const* name, uint32_t affordable, float trainerYards,
-                               bool withTheHead = true)
+                               bool onHeadMap = true)
 {
-    TrainingStopMember member = Member(name, 0, trainerYards, withTheHead);
+    TrainingStopMember member = Member(name, 0, trainerYards, onHeadMap);
     member.classSpells = affordable;
     return member;
 }
@@ -263,9 +263,12 @@ void AClassSpellIsALearnToo()
     std::vector<TrainingStopMember> far = {ClassMember("Ugga", 9, 2375.f)};
     Check("a class trainer past the city is not walked to",
           PickTrainingStopLeg(HeldInTown(), far).step == TrainingStopStep::NoTrainerInTown);
+    std::vector<TrainingStopMember> separated = {ClassMember("Ugga", 9, 1214.5f)};
+    Check("a same-map family member's reachable Stormwind trainer can be walked to",
+          PickTrainingStopLeg(HeldInTown(), separated).step == TrainingStopStep::Walk);
     std::vector<TrainingStopMember> away = {ClassMember("Ugga", 9, 180.f, false)};
-    Check("nor for a member away from the family",
-          PickTrainingStopLeg(HeldInTown(), away).step == TrainingStopStep::NobodyWithTheHead);
+    Check("nor for a member on another map",
+          PickTrainingStopLeg(HeldInTown(), away).step == TrainingStopStep::NobodyOnHeadMap);
     Check("a member with neither a skill nor a spell wants nothing",
           !OverseerDecisions::TrainingStopWants(Member("Og", 0, 100.f)));
     Check("a skill is wanted", OverseerDecisions::TrainingStopWants(Member("Og", 186, 100.f)));
@@ -329,7 +332,7 @@ void ItIsBounded()
     Check("nothing ends a stop that is not open", !TrainingStopEnds(TrainingStopStep::SpentItsTime, false));
 
     Check("every step has a sentence",
-          std::string(TrainingStopStepWord(TrainingStopStep::NoTrainerInTown)).find("1200") !=
+          std::string(TrainingStopStepWord(TrainingStopStep::NoTrainerInTown)).find("1500") !=
               std::string::npos);
 }
 
@@ -345,7 +348,7 @@ void ARestIsAsLongAsItsReason()
           TrainingStopRestSeconds(TrainingStopStep::NothingToLearn) == TRAINING_STOP_REST_SECONDS);
     Check("a stop that spent its time rests ten minutes",
           TrainingStopRestSeconds(TrainingStopStep::SpentItsTime) == TRAINING_STOP_SPENT_REST_SECONDS);
-    for (TrainingStopStep step : {TrainingStopStep::NoTrainerInTown, TrainingStopStep::NobodyWithTheHead,
+    for (TrainingStopStep step : {TrainingStopStep::NoTrainerInTown, TrainingStopStep::NobodyOnHeadMap,
                                   TrainingStopStep::RunOwnsTravel})
         Check("a stop cut short by where the head and family stood tries again in minutes",
               TrainingStopRestSeconds(step) == TRAINING_STOP_RETRY_SECONDS);
@@ -545,6 +548,10 @@ void TheStockadesCampaignLivesInStormwind()
           source.find("OverseerDecisions::TrainingStopRestStillApplies(") != std::string::npos);
     Check("a class with no trainer in reach is said once and skipped",
           source.find("training stop skips '{}' (class {})") != std::string::npos);
+    Check("same-map family members are included even when the party has spread out",
+          source.find("member.onHeadMap = SteerableAI(bot) && bot->IsAlive() &&\n"
+                      "                                   bot->GetMapId() == head->GetMapId();") !=
+              std::string::npos);
 }
 
 int main()

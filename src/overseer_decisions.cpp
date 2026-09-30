@@ -15463,23 +15463,23 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
         leg.step = TrainingStopStep::SpentItsTime;
         return leg;
     }
-    bool anyWithTheHead = false;
+    bool anyOnHeadMap = false;
     bool found = false;
     for (std::size_t i = 0; i < members.size(); ++i)
     {
         TrainingStopMember const& member = members[i];
-        if (!TrainingStopWants(member) || member.walkedThisStop || !member.withTheHead)
+        if (!TrainingStopWants(member) || member.walkedThisStop || !member.onHeadMap)
             continue;
-        anyWithTheHead = true;
+        anyOnHeadMap = true;
         if (member.trainerYards < 0.f || member.trainerYards > TRAINING_STOP_YARDS)
             continue;
         leg.member = i;
         found = true;
         break;
     }
-    if (!anyWithTheHead)
+    if (!anyOnHeadMap)
     {
-        leg.step = TrainingStopStep::NobodyWithTheHead;
+        leg.step = TrainingStopStep::NobodyOnHeadMap;
         return leg;
     }
     if (!found)
@@ -15494,7 +15494,7 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
 
 char const* TrainingStopStepWord(TrainingStopStep step)
 {
-    static_assert(TRAINING_STOP_YARDS == 1200.f, "the NoTrainerInTown sentence below says 1200 yards");
+    static_assert(TRAINING_STOP_YARDS == 1500.f, "the NoTrainerInTown sentence below says 1500 yards");
     switch (step)
     {
         case TrainingStopStep::NotACampaign:
@@ -15507,10 +15507,10 @@ char const* TrainingStopStepWord(TrainingStopStep step)
             return "the last training stop has not finished resting";
         case TrainingStopStep::SpentItsTime:
             return "this training stop has had its 15 minutes";
-        case TrainingStopStep::NobodyWithTheHead:
-            return "every member with a learn is more than 40 yards from the head";
+        case TrainingStopStep::NobodyOnHeadMap:
+            return "every member with a learn is on another map or unavailable";
         case TrainingStopStep::NoTrainerInTown:
-            return "no trainer for the learns left is within 1200 yards of the head";
+            return "no trainer for the learns left is within 1500 yards of the head";
         case TrainingStopStep::ColumnTaken:
             return "an errand a training stop may not take holds the head's travel column";
         case TrainingStopStep::Walk:
@@ -15527,7 +15527,7 @@ uint32_t TrainingStopRestSeconds(TrainingStopStep step)
     {
         case TrainingStopStep::SpentItsTime:
             return TRAINING_STOP_SPENT_REST_SECONDS;
-        case TrainingStopStep::NobodyWithTheHead:
+        case TrainingStopStep::NobodyOnHeadMap:
         case TrainingStopStep::NoTrainerInTown:
         case TrainingStopStep::RunOwnsTravel:
         case TrainingStopStep::LearnsOwed:
