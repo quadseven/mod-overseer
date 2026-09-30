@@ -289,6 +289,18 @@ void ItNeverTakesTheRunsTurn()
           PickTrainingStopLeg(inside, Horde()).step == TrainingStopStep::RunOwnsTravel);
     Check("and an open stop ends for it", TrainingStopEnds(TrainingStopStep::RunOwnsTravel, true));
 
+    TrainingStopFacts recovering = HeldInTown();
+    recovering.head.bagBlocked = false;
+    recovering.head.campaignBetweenAttempts = true;
+    recovering.head.trainerYards = 148.f;
+    Check("a nearby trainer is normally allowed between attempts",
+          HeadErrandMayTravel(HeadErrand::TrainerTrip, recovering.head));
+    recovering.head.familyMemberInsideInstance = true;
+    Check("a straggler still inside keeps travel with the run",
+          !HeadErrandMayTravel(HeadErrand::TrainerTrip, recovering.head));
+    Check("a recovering run with an instance straggler blocks training",
+          PickTrainingStopLeg(recovering, Horde()).step == TrainingStopStep::RunOwnsTravel);
+
     TrainingStopFacts questing = HeldInTown();
     questing.campaignArmed = false;
     Check("with no campaign armed the bridge's learn trips walk",

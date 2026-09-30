@@ -31086,6 +31086,9 @@ private:
     // hook, which a map thread can call, never reads it; DoorShutFor reads only
     // BagHeldMembers, under BagHeldLock.
     std::map<std::string, DungeonRunPhase> _familyRunPhaseByMember;
+    // A recovering coordinator can still have stragglers physically inside.
+    // Mark every roster member so town errands cannot split the family further.
+    std::set<std::string> _familyInstanceOccupants;
     // ...AND WHICH OF THEM BELONG TO A FAMILY WHOSE CAMPAIGN IS REGROUPING BY
     // HEARTHSTONE (2026-09-24), rebuilt beside it and read the same way.
     std::set<std::string> _hearthRegroupMembers;
@@ -31258,6 +31261,7 @@ private:
         }
         facts.hearthRegroup = _hearthRegroupMembers.count(name) > 0;
         facts.recoveryHoldsTheLeader = _recoveryHoldMembers.count(name) > 0;
+        facts.familyMemberInsideInstance = _familyInstanceOccupants.count(name) > 0;
         // AN ORDERED RAID OWNS THE HEAD THE SAME WAY (mod-overseer#634): FORM,
         // ASSEMBLE and ENTER walk him to the door, INSIDE holds him there, and
         // the family's lower claimants yield to it exactly as they yield to a
@@ -41458,6 +41462,7 @@ private:
         // Rebuilt below from this poll's coordinators, and empty when nothing
         // is driven, so a stale phase can never keep a drive yielding (#631).
         _familyRunPhaseByMember.clear();
+        _familyInstanceOccupants.clear();
         _hearthRegroupMembers.clear();
         _recoveryHoldMembers.clear();
         if (rosters.empty())
@@ -41508,6 +41513,18 @@ private:
             for (OverseerDecisions::FamilyMember const& member : roster->members)
                 members.push_back(member.name);
             DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
+            bool familyMemberInsideInstance = false;
+            for (OverseerDecisions::FamilyMember const& member : roster->members)
+            {
+                Player* bot = ObjectAccessor::FindPlayerByName(member.name);
+                if (bot && bot->GetMap() && bot->GetMap()->Instanceable())
+                {
+                    familyMemberInsideInstance = true;
+                    break;
+                }
+            }
+            if (familyMemberInsideInstance)
+                _familyInstanceOccupants.insert(members.begin(), members.end());
             bool const hearthRegroup =
                 RecoveryBringsTheFamily(_dungeonRunCoordinators[roster->family]);
             bool const holdsTheLeader =

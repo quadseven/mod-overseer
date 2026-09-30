@@ -17136,6 +17136,9 @@ enum class HeadErrand : uint8_t
 struct HeadTravelFacts
 {
     bool runInside{false};   // the coordinator is STAGED_INSIDE, CLEARING or EXIT
+    // A coordinator can be recovering between attempts while stragglers remain
+    // physically inside. In that case the dungeon still owns family travel.
+    bool familyMemberInsideInstance{false};
     bool runStaging{false};  // the coordinator is RESET, GATHERING, BARRIER or ENTER
     bool bagBlocked{false};  // a member is at or below the town trip's bag floor
     // How far the head stands from a town stop's counter, or below zero when
