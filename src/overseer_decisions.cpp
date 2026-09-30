@@ -14912,7 +14912,7 @@ bool HeadErrandMayTravel(HeadErrand who, HeadTravelFacts const& facts)
     // Inside, nothing but the run moves the head: every counter is on another
     // map, and a walk aimed at one is refused by the travel drive and then
     // locked out for fifteen minutes.
-    if (facts.runInside)
+    if (facts.runInside || facts.familyMemberInsideInstance)
         return who == HeadErrand::ActiveRun;
     // No bag room outranks the approach: the campaign hands the family to town
     // and does not stage until there is room. Upkeep, a trainer trip and the
@@ -14943,9 +14943,9 @@ char const* HeadErrandWaitReason(HeadErrand who, HeadTravelFacts const& facts)
 {
     if (HeadErrandMayTravel(who, facts))
         return "";
-    if (facts.runInside)
-        return "the family is inside its dungeon run, and the run walks it out before "
-               "anything else may move the head";
+    if (facts.runInside || facts.familyMemberInsideInstance)
+        return "the family still has a member inside its dungeon instance, and the run "
+               "gathers them before anything else may move the head";
     if (facts.bagBlocked)
         return "the family has no bag room, so the campaign waits for town upkeep to "
                "make some";
