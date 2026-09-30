@@ -15553,6 +15553,11 @@ bool TrainingStopLegRetries(uint32_t offered, uint32_t learned, uint32_t triesSo
     return offered > 0 && learned == 0 && triesSoFar < TRAINING_STOP_LEARN_TRIES;
 }
 
+bool TrainingStopArrivalMissed(bool hasAwayMembers, uint32_t reachPolls)
+{
+    return hasAwayMembers && reachPolls >= TRAINING_STOP_REACH_POLLS;
+}
+
 bool TrainingStopHoldsRunStart(bool stopOpen, bool learnsReachable, uint32_t heldSeconds)
 {
     return (stopOpen || learnsReachable) && heldSeconds < TRAINING_STOP_RUN_HOLD_SECONDS;

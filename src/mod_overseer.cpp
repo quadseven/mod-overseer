@@ -45753,8 +45753,11 @@ private:
 
         // A missed arrival is not a completed visit. NoteTrainingStopLeg uses
         // this set to give an unfinished learner another walk in the stop.
-        for (std::string const& name : away)
-            leg.unlearned.insert(name);
+        if (OverseerDecisions::TrainingStopArrivalMissed(!away.empty(), leg.reachPolls))
+        {
+            for (std::string const& name : away)
+                leg.unlearned.insert(name);
+        }
 
         uint32 learned = 0;
         for (auto const& [name, bot] : learners)

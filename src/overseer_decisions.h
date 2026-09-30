@@ -17908,6 +17908,10 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
 // A member who learned something, or was offered nothing, is not retried.
 bool TrainingStopLegRetries(uint32_t offered, uint32_t learned, uint32_t triesSoFar);
 
+// Whether one or more eligible members missed the trainer before the reach
+// wait expired, leaving their visit unfinished.
+bool TrainingStopArrivalMissed(bool hasAwayMembers, uint32_t reachPolls);
+
 // Does a campaign run that has not started yet wait for the training stop:
 // while a stop is open, or a member has class learns outstanding with a
 // reachable trainer, for at most TRAINING_STOP_RUN_HOLD_SECONDS counted from
