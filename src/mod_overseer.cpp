@@ -5146,6 +5146,7 @@ void LeaderIntentForTravelOwner(OverseerDecisions::TravelOwner owner,
             return;
         case OverseerDecisions::TravelOwner::Run:
         case OverseerDecisions::TravelOwner::WalkBackIn:
+        case OverseerDecisions::TravelOwner::Exit:
             kind = OverseerDecisions::LeaderIntentKind::DungeonRun;
             ownerWord = "dungeon run";
             return;
@@ -20230,6 +20231,13 @@ private:
     void EscortToward(std::string const& name, std::string const& aim, char const* what,
                       EscortPurpose purpose)
     {
+        OverseerDecisions::TravelOwner const owner =
+            purpose == EscortPurpose::LeaveInstance
+                ? OverseerDecisions::TravelOwner::Exit
+                : OverseerDecisions::TravelOwner::Run;
+        if (!_travelAims.Claim(name, aim, owner))
+            return;
+
         DungeonEscort& escort = _dungeonEscorts[name];
         escort.wanted = true;
         // Re-stated every poll rather than latched, for exactly the reason
@@ -20272,11 +20280,8 @@ private:
                      "the run's staging point is where the leader is going anyway",
                      what, name, from);
         }
-        // EVERY CALLER OF THIS IS THE RUN (#598): the doorway, the reset exit,
-        // REPAIR, TOWN and BARRIER. Claimed as the run's own so a pending learn
-        // over an empty column does not refuse it, which is what stranded a
-        // leader the barrier was waiting on.
-        _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::Run);
+        // EVERY CALLER IS A RUN WALK (#598). Its exit gets a distinct owner so
+        // it can take over a counter errand; other run walks keep that fence.
         if (escort.aim == aim)
             return;
 
