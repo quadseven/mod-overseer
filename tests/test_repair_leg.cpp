@@ -46,6 +46,7 @@ using OverseerDecisions::REPAIR_CANNOT_AFFORD;
 using OverseerDecisions::RepairLegMayTryAgain;
 using OverseerDecisions::RepairLegFacts;
 using OverseerDecisions::RepairLegMemberStep;
+using OverseerDecisions::RepairLegMustEvacuate;
 using OverseerDecisions::RepairLegStatus;
 using OverseerDecisions::RepairLegStep;
 using OverseerDecisions::RepairLegStepWord;
@@ -115,6 +116,22 @@ void ADamagedMemberIsWalkedToARepairer()
 {
     Step("damaged and nowhere near a counter", Member(true, true, false),
          RepairLegStep::Walk);
+}
+
+void RepairWaitsForEveryInstanceOccupantToLeave()
+{
+    if (RepairLegMustEvacuate(true))
+        return;
+    std::printf("FAIL an occupied instance must be evacuated before repair\n");
+    ++failures;
+}
+
+void RepairProceedsWhenNobodyIsInsideAnInstance()
+{
+    if (!RepairLegMustEvacuate(false))
+        return;
+    std::printf("FAIL repair must proceed when no roster member is inside an instance\n");
+    ++failures;
 }
 
 // AND THE POLL IT ARRIVES ON IS THE POLL TO SPEND. 47 of the 67 repair rows ever
@@ -407,6 +424,8 @@ void AnUnknownRefusalIsWorthAnotherPoll()
 int main()
 {
     ADamagedMemberIsWalkedToARepairer();
+    RepairWaitsForEveryInstanceOccupantToLeave();
+    RepairProceedsWhenNobodyIsInsideAnInstance();
     AMemberAlreadyAtARepairerIsRepairedNow();
     ARepairerInReachIsPreferredToAnyWalk();
     AnUndamagedMemberIsFinishedWhereverItStands();
