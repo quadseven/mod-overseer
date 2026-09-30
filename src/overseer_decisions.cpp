@@ -16249,6 +16249,9 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
         return GuildRunVerdict::Abandoned;
     if (!poll.inside && poll.secondsEmpty >= poll.emptySeconds)
         return GuildRunVerdict::Abandoned;
+    if (poll.inside && (!poll.tankAliveInside || !poll.healerAliveInside) &&
+        poll.secondsWithoutRoles >= poll.roleRecoverySeconds)
+        return GuildRunVerdict::Abandoned;
     if (poll.secondsInside >= poll.ceilingSeconds)
         return GuildRunVerdict::TimedOut;
     return GuildRunVerdict::Running;

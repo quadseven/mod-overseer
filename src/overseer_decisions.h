@@ -18402,6 +18402,9 @@ constexpr unsigned GUILD_RUN_CEILING_SECONDS = 120 * 60;
 // a group that has left (a release to the graveyard outside, a level-up
 // teleport, a logout) and the run is over.
 constexpr unsigned GUILD_RUN_EMPTY_SECONDS = 90;
+// A run without its assigned tank or healer cannot clear safely. Give those
+// members a short window to return before the living party is recalled.
+constexpr unsigned GUILD_RUN_ROLE_RECOVERY_SECONDS = 5 * 60;
 
 enum class GuildFinderRefusal : std::uint8_t
 {
@@ -18452,6 +18455,11 @@ struct GuildRunPoll
     // Members on the dungeon's map, in the group's copy of it.
     unsigned inside{0};
     unsigned aliveInside{0};
+    // Both roles selected for this five-player run must be alive in its copy.
+    bool tankAliveInside{true};
+    bool healerAliveInside{true};
+    unsigned secondsWithoutRoles{0};
+    unsigned roleRecoverySeconds{GUILD_RUN_ROLE_RECOVERY_SECONDS};
     unsigned secondsInside{0};
     // How long nobody has been inside (0 while somebody is).
     unsigned secondsEmpty{0};
@@ -18477,7 +18485,7 @@ enum class GuildRunVerdict : std::uint8_t
     Running,
     Cleared,    // the finder says the dungeon is finished, or every boss is down
     Wiped,      // everybody inside is dead at once
-    Abandoned,  // nobody inside for emptySeconds, or the group is gone
+    Abandoned,  // nobody inside, the group is gone, or a role stays unavailable
     TimedOut,   // inside past the ceiling
 };
 

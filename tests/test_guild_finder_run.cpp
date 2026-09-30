@@ -23,6 +23,7 @@ using OverseerDecisions::FINDER_ROLE_LEADER;
 using OverseerDecisions::FINDER_ROLE_TANK;
 using OverseerDecisions::GUILD_RUN_CEILING_SECONDS;
 using OverseerDecisions::GUILD_RUN_EMPTY_SECONDS;
+using OverseerDecisions::GUILD_RUN_ROLE_RECOVERY_SECONDS;
 using OverseerDecisions::GuildFinderRefusal;
 using OverseerDecisions::GuildFinderRefusalWord;
 using OverseerDecisions::GuildFinderRequest;
@@ -204,6 +205,37 @@ void EverybodyInsideDeadIsAWipe()
           GuildRunNext(Inside(0, 0)) != GuildRunVerdict::Wiped);
 }
 
+void ARunWithoutItsTankOrHealerGetsAbandonedAfterRecoveryGrace()
+{
+    GuildRunPoll missingBoth = Inside(3, 3);
+    missingBoth.tankAliveInside = false;
+    missingBoth.healerAliveInside = false;
+    missingBoth.secondsWithoutRoles = GUILD_RUN_ROLE_RECOVERY_SECONDS;
+    Check("three living damage dealers cannot keep a run without tank and healer alive",
+          GuildRunNext(missingBoth) == GuildRunVerdict::Abandoned);
+
+    GuildRunPoll missingTank = missingBoth;
+    missingTank.healerAliveInside = true;
+    Check("a run also yields when only its assigned tank is missing",
+          GuildRunNext(missingTank) == GuildRunVerdict::Abandoned);
+
+    GuildRunPoll missingHealer = missingBoth;
+    missingHealer.tankAliveInside = true;
+    Check("a run also yields when only its assigned healer is missing",
+          GuildRunNext(missingHealer) == GuildRunVerdict::Abandoned);
+
+    GuildRunPoll withinGrace = missingBoth;
+    withinGrace.secondsWithoutRoles = GUILD_RUN_ROLE_RECOVERY_SECONDS - 1;
+    Check("a brief role absence gets time to recover",
+          GuildRunNext(withinGrace) == GuildRunVerdict::Running);
+
+    GuildRunPoll rolesReturned = missingBoth;
+    rolesReturned.tankAliveInside = true;
+    rolesReturned.healerAliveInside = true;
+    Check("the run continues when both assigned roles return",
+          GuildRunNext(rolesReturned) == GuildRunVerdict::Running);
+}
+
 void AGroupThatLeftOrOutstayedIsOver()
 {
     GuildRunPoll empty = Inside(0, 0);
@@ -266,6 +298,7 @@ int main()
     TheFinderSayingFinishedIsACleared();
     AScriptlessInstanceIsClearedByTheCoreCreditMask();
     EverybodyInsideDeadIsAWipe();
+    ARunWithoutItsTankOrHealerGetsAbandonedAfterRecoveryGrace();
     AGroupThatLeftOrOutstayedIsOver();
     ADisabledBrainIsAskedAgainWhileSomebodyLives();
     TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming();
