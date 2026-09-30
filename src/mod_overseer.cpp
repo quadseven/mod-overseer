@@ -31481,9 +31481,11 @@ private:
     // a cast that never started) and hold adoption back while it does. Without
     // that the next poll adopts the member still casting and walks it at the
     // same failed door. The episode ends when nobody is inside, when no hearth
-    // is possible, or at its ceiling; the campaign is never touched.
+    // is possible, or at its ceiling. Once every member is observed outside,
+    // the original run is finalized through the ordinary campaign accounting.
     struct ExitHearthEpisode
     {
+        DungeonRunCoordinatorState run;  // preserved until every member has left
         uint32 mapId{0};
         uint32 runId{0};
         uint32 campaignId{0};
@@ -41816,12 +41818,38 @@ private:
             // AGAIN (2026-09-24). Adopting here set EXIT on the next poll and
             // walked the same member at the same failed door for another five
             // minutes, once an episode, for an hour. The episode is dropped the
-            // moment nobody is inside, nobody can hearth, or its ceiling passes,
-            // and adoption then goes on exactly as before.
+            // moment everybody is observed outside, the original run is finalized.
+            // If somebody remains inside after the hearth ceiling, adoption resumes.
             {
                 auto const episode = _exitHearths.find(family);
                 if (episode != _exitHearths.end())
                 {
+                    bool allOutside = !members.empty();
+                    for (std::string const& name : members)
+                    {
+                        Player* member = ObjectAccessor::FindPlayerByName(name);
+                        allOutside = allOutside && member && member->IsInWorld() &&
+                                     member->GetMapId() != episode->second.mapId;
+                    }
+                    DungeonPortal const* completedPortal =
+                        FindDungeonPortal(episode->second.run.portalKeyword);
+                    if (allOutside && completedPortal)
+                    {
+                        coord = episode->second.run;
+                        uint32 const finishedRunId = episode->second.runId;
+                        _exitHearths.erase(episode);
+                        EndRunAndDecide(coord, leaderName, *completedPortal, finishedRunId,
+                                        coord.leaderClientLostOutcome
+                                            ? "client_lost"
+                                            : OverseerDecisions::DungeonRunExitOutcome(
+                                                  coord.provedComplete,
+                                                  !coord.stalledReason.empty(), coord.evacuated),
+                                        "the failed exit recovered by hearth; every member is outside",
+                                        IsDungeonJob(leaderJob), &members);
+                        return;
+                    }
+                    if (!activeInside)
+                        return;  // an unseen member is not proof of an exit
                     if (activeInside && activeInside->GetMapId() == episode->second.mapId &&
                         DriveExitHearths(family, leaderName, members, episode->second, "IDLE"))
                         return;
@@ -43924,6 +43952,7 @@ private:
                         // in play. See ExitHearthEpisode.
                         {
                             ExitHearthEpisode episode;
+                            episode.run = coord;
                             episode.mapId = portal->insideMapId;
                             episode.runId = coord.runId ? coord.runId
                                                         : ActiveRunIdOnMap(portal->insideMapId);

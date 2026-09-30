@@ -42,6 +42,8 @@ run_decisions() {
   test "$file" = "$header" || { echo "version drift: VERSION=$file header=$header" >&2; return 1; }
   printf '%s\n' "$file" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not semver: $file" >&2; return 1; }
 
+  python3 -B tests/replay_exit_hearth_finalization.py
+
   echo "== decisions: compile and run"
   g++ --version | head -1
   shopt -s nullglob
