@@ -36512,6 +36512,7 @@ private:
         std::time_t queuedAt{0};
         std::time_t enteredAt{0};
         std::time_t emptySince{0};
+        std::time_t roleMissingSince{0};
         std::time_t leavingSince{0};
         std::time_t heartbeatAt{0};
         std::map<std::string, uint32> accepted;
@@ -36978,9 +36979,12 @@ private:
         {
             OverseerDecisions::GuildRunPoll poll;
             poll.groupSize = static_cast<unsigned>(run.names.size());
+            poll.tankAliveInside = false;
+            poll.healerAliveInside = false;
             Map* instanceMap = nullptr;
-            for (std::string const& name : run.names)
+            for (std::size_t i = 0; i < run.names.size(); ++i)
             {
+                std::string const& name = run.names[i];
                 Player* const p = ObjectAccessor::FindPlayerByName(name);
                 if (!p || !p->IsInWorld())
                     continue;
@@ -36997,10 +37001,29 @@ private:
                     continue;
                 ++poll.inside;
                 if (isAlive)
+                {
                     ++poll.aliveInside;
+                    if (i < run.seats.size())
+                    {
+                        if (run.seats[i] == OverseerDecisions::GuildSeat::Tank)
+                            poll.tankAliveInside = true;
+                        else if (run.seats[i] == OverseerDecisions::GuildSeat::Healer)
+                            poll.healerAliveInside = true;
+                    }
+                }
                 if (!instanceMap)
                     instanceMap = p->GetMap();
             }
+            bool const roleMissing =
+                poll.inside && (!poll.tankAliveInside || !poll.healerAliveInside);
+            if (roleMissing)
+            {
+                if (!run.roleMissingSince)
+                    run.roleMissingSince = now;
+                poll.secondsWithoutRoles = static_cast<unsigned>(now - run.roleMissingSince);
+            }
+            else
+                run.roleMissingSince = 0;
             if (InstanceMap* im = instanceMap ? instanceMap->ToInstanceMap() : nullptr)
                 if (InstanceScript* script = im->GetInstanceScript())
                 {
@@ -37117,9 +37140,14 @@ private:
                         why = "everybody inside is dead";
                         break;
                     case OverseerDecisions::GuildRunVerdict::Abandoned:
-                        why = poll.groupGone ? "the group is gone"
-                                             : "nobody has been inside for " +
-                                                   std::to_string(poll.secondsEmpty) + "s";
+                        if (poll.groupGone)
+                            why = "the group is gone";
+                        else if (!poll.inside)
+                            why = "nobody has been inside for " +
+                                  std::to_string(poll.secondsEmpty) + "s";
+                        else
+                            why = "the assigned tank and healer roles were not both alive inside "
+                                  "for " + std::to_string(poll.secondsWithoutRoles) + "s";
                         break;
                     case OverseerDecisions::GuildRunVerdict::TimedOut:
                         why = "inside for " + std::to_string(poll.secondsInside) + "s";
