@@ -45442,7 +45442,8 @@ private:
         std::string forMember;             // whose learn the leg was walked for
         std::vector<std::string> members;  // who was with the head when it set off
         uint32 reachPolls{0};              // polls spent waiting at the trainer
-        // Members offered class spells at this trainer who learned none.
+        // Members who did not finish this trainer visit, including those who
+        // were still following when the head reached the trainer.
         std::set<std::string> unlearned;
     };
     struct TrainingStopState
@@ -45807,6 +45808,14 @@ private:
         }
         if (!away.empty() && ++leg.reachPolls < OverseerDecisions::TRAINING_STOP_REACH_POLLS)
             return false;
+
+        // A missed arrival is not a completed visit. NoteTrainingStopLeg uses
+        // this set to give an unfinished learner another walk in the stop.
+        if (OverseerDecisions::TrainingStopArrivalMissed(!away.empty(), leg.reachPolls))
+        {
+            for (std::string const& name : away)
+                leg.unlearned.insert(name);
+        }
 
         uint32 learned = 0;
         for (auto const& [name, bot] : learners)

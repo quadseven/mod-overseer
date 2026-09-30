@@ -275,6 +275,17 @@ void AClassSpellIsALearnToo()
     Check("a class spell is wanted", OverseerDecisions::TrainingStopWants(ClassMember("Og", 1, 100.f)));
 }
 
+void ATrainingArrivalWaitKeepsLateMembersOwed()
+{
+    uint32_t const limit = OverseerDecisions::TRAINING_STOP_REACH_POLLS;
+    Check("keep waiting before the arrival limit",
+          !OverseerDecisions::TrainingStopArrivalMissed(true, limit - 1));
+    Check("an away learner at the arrival limit leaves the visit unfinished",
+          OverseerDecisions::TrainingStopArrivalMissed(true, limit));
+    Check("a group with nobody away has no missed arrival",
+          !OverseerDecisions::TrainingStopArrivalMissed(false, limit));
+}
+
 void ItNeverTakesTheRunsTurn()
 {
     TrainingStopFacts staging = HeldInTown();
@@ -437,6 +448,10 @@ void TheAdapterIsWired()
     std::size_t const bodyEnd = source.find("// Put the tank strategies on a character", teachBody);
     Check("the leg's arrival buys the class spells its members can afford",
           teachBody != std::string::npos && buys != std::string::npos && buys < bodyEnd);
+    Check("the expired away-member wait records an unfinished visit",
+          teachBody != std::string::npos &&
+              source.find("TrainingStopArrivalMissed(!away.empty(), leg.reachPolls)", teachBody) <
+                  bodyEnd && source.find("leg.unlearned.insert(name);", teachBody) < bodyEnd);
     std::size_t const helper = source.find("static unsigned BuyAffordableClassSpells(");
     std::size_t const helperEnd = source.find("void DriveGuildTraining()", helper);
     Check("a purchase is counted from the spell book, not the purse",
@@ -572,6 +587,7 @@ int main()
     TheStopClaimsLikeTheReset();
     TheHeadWalksTheFamilyTrainerByTrainer();
     AClassSpellIsALearnToo();
+    ATrainingArrivalWaitKeepsLateMembersOwed();
     ItNeverTakesTheRunsTurn();
     ItIsBounded();
     ARestIsAsLongAsItsReason();
