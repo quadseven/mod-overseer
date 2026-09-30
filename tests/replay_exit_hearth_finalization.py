@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[1]
 src = (root / 'src/mod_overseer.cpp').read_text()
-# AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] elder#1 (bot review, PR #801):
+# AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] reviewer pass one (bot review, PR #801):
 # Diagnose stale extraction anchors separately from handler failures.
 if "episode.run = coord;" not in src:
     raise SystemExit("EXIT must preserve the original coordinator")
@@ -27,7 +27,7 @@ struct DungeonRunCoordinatorState { unsigned campaignId=0,runNumber=0,runId=0,ru
 struct ExitHearthEpisode {unsigned mapId=0,runId=0; DungeonRunCoordinatorState run;};
 struct Player {unsigned map; bool inWorld=true; unsigned GetMapId(){return map;} bool IsInWorld(){return inWorld;}};
 Player outside{11},inside{777};
-// AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] elder#2 (bot review, PR #801):
+// AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] reviewer pass two (bot review, PR #801):
 // Resolve each member independently so one unseen or inside member blocks finalization.
 std::map<std::string,Player*> seen{{"Leader",&outside},{"Member",&outside}};
 namespace ObjectAccessor { Player* FindPlayerByName(std::string const& name){auto p=seen.find(name);return p==seen.end()?nullptr:p->second;} }
@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory() as directory:
     source = Path(directory) / "replay.cpp"
     binary = Path(directory) / "replay"
     source.write_text(prefix + block + suffix)
-    # AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] elder#3 (bot review, PR #801):
+    # AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] reviewer pass three (bot review, PR #801):
     # Bound both subprocesses so a wedged compiler or replay fails promptly.
     subprocess.run(["g++", "-std=c++17", str(source), "-o", str(binary)],
                    check=True, timeout=30)
