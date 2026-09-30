@@ -26,7 +26,7 @@ using uint32 = unsigned;
 struct DungeonRunCoordinatorState { unsigned campaignId=0,runNumber=0,runId=0,runsWanted=0; bool capKnown=false,provedComplete=false,evacuated=false,leaderClientLostOutcome=false; std::string portalKeyword,stalledReason; };
 struct ExitHearthEpisode {unsigned mapId=0,runId=0; DungeonRunCoordinatorState run;};
 struct Player {unsigned map; bool inWorld=true; unsigned GetMapId(){return map;} bool IsInWorld(){return inWorld;}};
-Player outside{1},inside{389};
+Player outside{11},inside{777};
 // AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] elder#2 (bot review, PR #801):
 // Resolve each member independently so one unseen or inside member blocks finalization.
 std::map<std::string,Player*> seen{{"Leader",&outside},{"Member",&outside}};
@@ -38,12 +38,12 @@ namespace OverseerDecisions { const char* DungeonRunExitOutcome(bool complete,bo
 std::map<std::string,ExitHearthEpisode> _exitHearths;
 DungeonRunCoordinatorState coord; int finalized=0; std::string outcome;
 bool DriveExitHearths(std::string const&,std::string const&,std::vector<std::string> const&,ExitHearthEpisode&,const char*){return true;}
-void EndRunAndDecide(DungeonRunCoordinatorState& c,std::string const&,DungeonPortal const&,unsigned id,const char* o,std::string const&,bool,std::vector<std::string> const*){assert(id==71); assert(c.campaignId==34 && c.runNumber==1 && c.runsWanted==50 && c.capKnown); finalized++; outcome=o;}
+void EndRunAndDecide(DungeonRunCoordinatorState& c,std::string const&,DungeonPortal const&,unsigned id,const char* o,std::string const&,bool,std::vector<std::string> const*){assert(id==7); assert(c.campaignId==9001 && c.runNumber==1 && c.runsWanted==50 && c.capKnown); finalized++; outcome=o;}
 void Poll(Player* activeInside){std::string family="Leader",leaderName="Leader",leaderJob="dungeon:ragefire"; std::vector<std::string> members{"Leader","Member"};
 '''
 suffix=r'''
 }
-int main(){ExitHearthEpisode e; e.mapId=389;e.runId=71;e.run.campaignId=34;e.run.runNumber=1;e.run.runId=71;e.run.runsWanted=50;e.run.capKnown=true;e.run.provedComplete=true;e.run.portalKeyword="ragefire";
+int main(){ExitHearthEpisode e; e.mapId=777;e.runId=7;e.run.campaignId=9001;e.run.runNumber=1;e.run.runId=7;e.run.runsWanted=50;e.run.capKnown=true;e.run.provedComplete=true;e.run.portalKeyword="test-dungeon";
 _exitHearths["Leader"]=e;Poll(nullptr);assert(finalized==1 && outcome=="complete");assert(_exitHearths.empty());Poll(nullptr);assert(finalized==1);
 _exitHearths["Leader"]=e;seen["Member"]=&inside;Poll(&inside);assert(finalized==1 && _exitHearths.size()==1);
 seen.erase("Member");Poll(nullptr);assert(finalized==1 && _exitHearths.size()==1);
