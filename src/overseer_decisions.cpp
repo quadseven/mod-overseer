@@ -10878,6 +10878,11 @@ RepairLegStep RepairLegMemberStep(RepairLegFacts const& facts)
     return RepairLegStep::Walk;
 }
 
+bool RepairLegMustEvacuate(bool anyMemberInsideInstance)
+{
+    return anyMemberInsideInstance;
+}
+
 char const* RepairLegStepWord(RepairLegStep step)
 {
     switch (step)

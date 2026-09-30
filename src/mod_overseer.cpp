@@ -39110,6 +39110,47 @@ private:
                         std::string const& leaderName,
                         std::vector<std::string> const& members)
     {
+        // Repairers are outdoor NPCs. A repair phase restored from an open run
+        // can still find family members on the instance map, where the `repair`
+        // travel role has no valid spawn and would retry forever. Let the same
+        // exit-trigger walk and server-side crossing packet used by reset move
+        // every instance occupant out before any member is sent to a repairer.
+        std::vector<uint32> occupiedInstanceMaps;
+        for (std::string const& name : members)
+        {
+            Player* const player = ObjectAccessor::FindPlayerByName(name);
+            if (!player || !player->GetMap() || !player->GetMap()->Instanceable())
+                continue;
+            uint32 const mapId = player->GetMapId();
+            if (std::find(occupiedInstanceMaps.begin(), occupiedInstanceMaps.end(), mapId) ==
+                occupiedInstanceMaps.end())
+                occupiedInstanceMaps.push_back(mapId);
+        }
+        if (OverseerDecisions::RepairLegMustEvacuate(!occupiedInstanceMaps.empty()))
+        {
+            for (uint32 const mapId : occupiedInstanceMaps)
+            {
+                DungeonPortal const* const portal =
+                    FindDungeonPortalByInsideMap(mapId, coord.portalKeyword);
+                if (!portal)
+                {
+                    if (!coord.loggedNoWayOut)
+                    {
+                        coord.loggedNoWayOut = true;
+                        LOG_ERROR("module.overseer",
+                                  "overseer: repair leg for '{}' cannot send its occupants "
+                                  "to a repairer while map {} is occupied, and no dungeon "
+                                  "exit is configured for that map; repair waits for an "
+                                  "operator-visible way out",
+                                  leaderName, mapId);
+                    }
+                    return;
+                }
+                WalkStragglersOut(members, leaderName, *portal, coord);
+            }
+            return;
+        }
+
         unsigned outstanding = 0;
         std::string owed;   // who is still owed a trip, for the overdue line
 

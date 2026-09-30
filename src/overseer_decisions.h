@@ -13062,6 +13062,11 @@ enum class RepairLegStep : std::uint8_t
 // the inn bind and the counter hold each paid for at the other end of the trip.
 RepairLegStep RepairLegMemberStep(RepairLegFacts const& facts);
 
+// Repairing needs a town repairer; an instance map has none. If any roster
+// member is still in an instance, the repair phase must walk occupants out
+// before it can send anyone to a repairer.
+bool RepairLegMustEvacuate(bool anyMemberInsideInstance);
+
 // "wait", "done", "repair", "walk". Here rather than in the adapter so the word
 // a log line carries is the word a test pins.
 char const* RepairLegStepWord(RepairLegStep step);
