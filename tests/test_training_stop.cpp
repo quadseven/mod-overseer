@@ -425,6 +425,10 @@ void TheAdapterIsWired()
     std::size_t const bodyEnd = source.find("// Put the tank strategies on a character", teachBody);
     Check("the leg's arrival buys the class spells its members can afford",
           teachBody != std::string::npos && buys != std::string::npos && buys < bodyEnd);
+    Check("members who miss the trainer arrival wait are kept owing a visit",
+          teachBody != std::string::npos &&
+              source.find("for (std::string const& name : away)\n            leg.unlearned.insert(name);",
+                          teachBody) < bodyEnd);
     std::size_t const helper = source.find("static unsigned BuyAffordableClassSpells(");
     std::size_t const helperEnd = source.find("void DriveGuildTraining()", helper);
     Check("a purchase is counted from the spell book, not the purse",
