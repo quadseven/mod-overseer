@@ -117,6 +117,17 @@ void ACounterErrandStillStands()
                Claim(TravelOwner::WalkBackIn, 0, "repair"), TravelClaim::RefusedForeign);
 }
 
+void AnExitCanPreemptATownErrand()
+{
+    CheckBool("an exit is a live run", TravelOwnerIsALiveRun(TravelOwner::Exit), true);
+    CheckClaim("an exit walks out over a vendor errand",
+               Claim(TravelOwner::Exit, 0, "vendor"), TravelClaim::Outrank);
+    CheckClaim("an exit keeps a trainer trip pending while taking the vendor aim",
+               Claim(TravelOwner::Exit, 197, "vendor"), TravelClaim::Outrank);
+    CheckClaim("ordinary staging still waits for a vendor errand",
+               Claim(TravelOwner::Run, 0, "vendor"), TravelClaim::RefusedForeign);
+}
+
 void EveryOtherOwnerKeepsItsFences()
 {
     CheckBool("a run is a live run", TravelOwnerIsALiveRun(TravelOwner::Run), true);
@@ -159,6 +170,7 @@ int main()
     TheMeasuredBarrierClaimIsWritten();
     TheTrainerTripWaitsForTheRun();
     ACounterErrandStillStands();
+    AnExitCanPreemptATownErrand();
     EveryOtherOwnerKeepsItsFences();
     TheBooksOwnAimIsStillAPlainWrite();
 

@@ -26,6 +26,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -151,6 +153,26 @@ void NobodyThatIsAlreadyOutIsWalkedAnywhere()
     DungeonWrongSide const evacuation = DungeonRunWrongSide(census);
     CheckNames("nobody to walk", evacuation.walk, {});
     CheckNames("nobody to name", evacuation.wait, {});
+}
+
+void ExitingUsesAnEvacuationClaimBeforeMarkingTheEscort()
+{
+    std::ifstream input("src/mod_overseer.cpp");
+    std::string source((std::istreambuf_iterator<char>(input)),
+                       std::istreambuf_iterator<char>());
+    std::size_t const start = source.find("void EscortToward(");
+    std::size_t const end = source.find("// THE CATCH-UP WALK", start);
+    std::string const body = source.substr(start, end - start);
+    std::size_t const exitOwner = body.find("purpose == EscortPurpose::LeaveInstance");
+    std::size_t const exitClaimOwner =
+        body.find("OverseerDecisions::TravelOwner::Exit", exitOwner);
+    std::size_t const claim = body.find("if (!_travelAims.Claim(name, aim, owner))");
+    std::size_t const markWanted = body.find("escort.wanted = true;");
+    CheckBool("exit purpose selects its claim before an escort is marked",
+              exitOwner != std::string::npos && exitClaimOwner != std::string::npos &&
+                  claim != std::string::npos && markWanted != std::string::npos &&
+                  exitOwner < exitClaimOwner && exitClaimOwner < claim && claim < markWanted,
+              true);
 }
 
 // A CORPSE WALKS NOWHERE, AND IT HOLDS THE INSTANCE OPEN JUST AS HARD. Naming
@@ -349,6 +371,7 @@ int main()
 {
     TheTwoLeftInsideAreTheOnesWalkedOut();
     NobodyThatIsAlreadyOutIsWalkedAnywhere();
+    ExitingUsesAnEvacuationClaimBeforeMarkingTheEscort();
     ADeadMemberIsNamedRatherThanWalked();
     AMemberSomewhereElseIsNotAStraggler();
     AnEmptyCensusWalksNobody();

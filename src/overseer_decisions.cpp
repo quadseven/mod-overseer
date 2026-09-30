@@ -2914,13 +2914,11 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     if (!facts.column.empty() && facts.column == facts.target)
         return TravelClaim::Write;
     // A LIVE RUN OUTRANKS EVERYTHING IN THE COLUMN BUT A COUNTER ERRAND
-    // (#656): a trainer walk, a positional walk, or the book's own catch-up
-    // aim that it no longer remembers after a restart. `learn_skill` stays
-    // pending and the trainer trip is walked after the run. A counter errand
-    // still falls through to the fences below; the run's maintenance hold
-    // already waits for the leader's.
+    // (#656), except an exit: once the run is finished, walking out takes
+    // priority over any town errand or the completed party remains trapped.
+    // `learn_skill` stays pending and the errand is walked after the run.
     if (TravelOwnerIsALiveRun(facts.owner) && !facts.column.empty() &&
-        !IsMaintenanceErrand(facts.column))
+        (!IsMaintenanceErrand(facts.column) || facts.owner == TravelOwner::Exit))
         return TravelClaim::Outrank;
     // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
     // or any dungeon run's aim over an empty column overwrites no trainer walk
@@ -2946,6 +2944,7 @@ bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner)
         case TravelOwner::CatchUp:
         case TravelOwner::Run:
         case TravelOwner::WalkBackIn:
+        case TravelOwner::Exit:
         case TravelOwner::Respec:
         case TravelOwner::TrainingStop:
             return true;
@@ -2961,6 +2960,7 @@ bool TravelOwnerIsALiveRun(TravelOwner owner)
     {
         case TravelOwner::Run:
         case TravelOwner::WalkBackIn:
+        case TravelOwner::Exit:
             return true;
         case TravelOwner::HomeErrand:
         case TravelOwner::CatchUp:

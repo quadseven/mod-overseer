@@ -3897,11 +3897,12 @@ enum class TravelOwner : uint8_t
 {
     HomeErrand,  // a walk to the campaign's inn (#348)
     CatchUp,     // a follower's catch-up walk to its leader (#138)
-    Run,         // a dungeon run's own aim: staging, corridor, berth, BARRIER,
-                 // crossing, town, repair or reset exit (wow-overseer#227)
+    Run,         // staging, corridor, berth, BARRIER, crossing, town or repair
+                 // for an active run (wow-overseer#227)
     WalkBackIn,  // a member walked back into the instance its run is in (#393)
     Respec,      // a walk to a class trainer of its own class for a talent reset (#626)
     TrainingStop,  // the head walking the family to a member's trainer in town (#688)
+    Exit,        // evacuating members after the run is complete
 };
 
 // DOES THIS OWNER'S AIM PASS A PROFESSION ERRAND WHOSE COLUMN IS EMPTY? The
@@ -3915,10 +3916,9 @@ enum class TravelOwner : uint8_t
 // walking to.
 bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner);
 
-// IS THIS OWNER A LIVE DUNGEON RUN (#656)? `Run` and `WalkBackIn`, the walks a
-// run makes while it is armed. A run claims only while it is live, so the
-// owner is enough to know it. These are the claims that outrank a pending
-// trainer trip and a positional walk. See TravelClaim::Outrank.
+// IS THIS OWNER A LIVE DUNGEON RUN (#656)? These owners claim only while a run
+// is live. An Exit also outranks counter errands because the finished party
+// must be able to leave the instance. See TravelClaim::Outrank.
 bool TravelOwnerIsALiveRun(TravelOwner owner);
 
 struct TravelClaimFacts
