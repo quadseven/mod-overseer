@@ -29057,7 +29057,7 @@ private:
             // 673.7, 98.0) is 200 yards from the door, and the real Stormwind
             // class trainers of the five classes stand 226 to 380 yards from
             // the inn and 191 to 526 from the door, all inside a training
-            // stop's 1200 yards; the finder's own exit (areatrigger 503)
+            // stop's 1500 yards; the finder's own exit (areatrigger 503)
             // already lands the family in this city.
             {"stockades", 0, 101, 34, 503, 0.f, 0.f, 0.f, {}, -8867.8f, 673.7f, 98.0f},
             // WAILING CAVERNS, AND THE FIRST ROW IN THIS TABLE WHOSE OUTSIDE
@@ -45532,13 +45532,11 @@ private:
                 member.learnSkill = row.learnSkill;
                 member.walkedThisStop = stop.walked.count(row.name) != 0;
                 Player* bot = row.name == headName ? head : ObjectAccessor::FindPlayerByName(row.name);
-                member.withTheHead = SteerableAI(bot) && bot->IsAlive() &&
-                                     bot->GetMapId() == head->GetMapId() &&
-                                     (bot == head || bot->GetExactDist2d(head) <=
-                                                         OverseerDecisions::TRAINING_STOP_WITH_HEAD_YARDS);
+                member.onHeadMap = SteerableAI(bot) && bot->IsAlive() &&
+                                   bot->GetMapId() == head->GetMapId();
                 uint32 trainer = 0;
                 // The spawn search only for a member the pick could walk for.
-                if (facts.campaignArmed && stopMayOpen && member.withTheHead && !member.walkedThisStop)
+                if (facts.campaignArmed && stopMayOpen && member.onHeadMap && !member.walkedThisStop)
                 {
                     WorldPosition where;
                     if (row.learnSkill)
@@ -45637,7 +45635,7 @@ private:
                 leg.entry = entry;
                 leg.forMember = member.name;
                 for (OverseerDecisions::TrainingStopMember const& other : members)
-                    if (other.withTheHead)
+                    if (other.onHeadMap)
                         leg.members.push_back(other.name);
                 _trainingStopLegs[headName] = leg;
                 CreatureTemplate const* trainerTemplate = sObjectMgr->GetCreatureTemplate(entry);

@@ -17180,16 +17180,16 @@ constexpr uint32_t TOWN_STOP_MAX_SECONDS = 300;
 // family waits in Orgrimmar for Ragefire Chasm: the warrior trainer is 564
 // yards away and the nine profession trainers its learns need are 265 to 639.
 //
-// 1200 WHERE #688 SAID 700 (2026-09-29). The distance is read from where the
+// 1500 WHERE #688 SAID 700 (2026-09-29). The distance is read from where the
 // HEAD stands, and between two runs the head is walked around the city by the
 // bridge's town errands: with the head at an auctioneer the priest trainer the
 // stop had been walking to was 850 yards off, "no trainer for the learns left
 // is within 700 yards of the head" ended the stop with a member's 12 class
-// spells unbought, and the next was half an hour away. 1200 is the city and
-// still not the road out of it: #663's 2,375-yard walk waits, and at the 112
-// yards a minute the travel backstop measures the farthest trainer in the city
-// is under eleven minutes' walk, inside the backstop's twenty.
-constexpr float TRAINING_STOP_YARDS = 1200.f;
+// spells unbought, and the next was half an hour away. 1500 yards includes the
+// measured Stormwind priest-trainer trip from the nearby Elwynn edge, but still
+// excludes #663's 2,375-yard walk. At 112 yards a minute, the new limit is
+// under fourteen minutes, inside the travel backstop's twenty.
+constexpr float TRAINING_STOP_YARDS = 1500.f;
 
 // May `who` put its aim on the head right now?
 //
@@ -17783,8 +17783,9 @@ bool SpawnStandsNow(int32_t gameEvent, bool eventActive);
 //
 // A GROUP OF PLAYERS WAITING IN A CITY WALKS TO THE TRAINERS TOGETHER. The
 // head keeps the lead and walks the family to one member's trainer at a time;
-// the members follow, and whoever stands there with a learn that trainer
-// teaches buys it (TrainOnArrival, the same purchase a learn trip ends in).
+// living roster members on the same map are included even when they are still
+// catching up, and whoever stands there with a learn that trainer teaches buys
+// it (TrainOnArrival, the same purchase a learn trip ends in).
 //
 // BOUNDED, NEVER A CANCELLATION. A stop runs only while the campaign is
 // between attempts or holding the family in town, never while a run stages or
@@ -17797,10 +17798,6 @@ bool SpawnStandsNow(int32_t gameEvent, bool eventActive);
 constexpr uint32_t TRAINING_STOP_MAX_SECONDS = 15 * 60;
 // How long after a stop ends before the next may start.
 constexpr uint32_t TRAINING_STOP_REST_SECONDS = 30 * 60;
-// A member this near the head when a leg starts is with the family and
-// arrives by following. Farther out it is somewhere else, and a leg walked
-// for it would teach nobody.
-constexpr float TRAINING_STOP_WITH_HEAD_YARDS = 40.f;
 // How many travel polls the head stands at the trainer waiting for the
 // members it walked for to close in before the purchase is made without them.
 constexpr uint32_t TRAINING_STOP_REACH_POLLS = 4;
@@ -17839,7 +17836,7 @@ struct TrainingStopMember
     // that it has the gold for (2026-09-29). A class spell is a learn too: with
     // Overseer.Train.Factory off nothing else buys one for the family.
     uint32_t classSpells{0};
-    bool withTheHead{false};   // alive, on the head's map, within TRAINING_STOP_WITH_HEAD_YARDS
+    bool onHeadMap{false};     // alive and on the head's map; followers may still be catching up
     // How far the head stands from the nearest trainer that teaches this
     // member its learn, or below zero when no trainer on the map does.
     float trainerYards{-1.f};
@@ -17885,7 +17882,7 @@ enum class TrainingStopStep : uint8_t
     RunOwnsTravel,    // the run is staging or inside
     Resting,          // the last stop ended less than TRAINING_STOP_REST_SECONDS ago
     SpentItsTime,     // this stop has run TRAINING_STOP_MAX_SECONDS
-    NobodyWithTheHead,  // every member with a learn is away from the family
+    NobodyOnHeadMap,    // every member with a learn is on another map or unavailable
     NoTrainerInTown,  // every learn's trainer is past TRAINING_STOP_YARDS, or on no spawn
     ColumnTaken,      // an errand the stop may not take holds the head's travel column
     Walk,             // walk the head to `member`'s trainer
