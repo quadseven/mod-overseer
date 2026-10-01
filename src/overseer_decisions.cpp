@@ -30,10 +30,11 @@ LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
     return LeaderClientGate::Open;
 }
 
-LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, std::time_t lostSince,
+LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuerAvailable,
+                                               std::time_t lostSince,
                                                std::time_t now, std::time_t maxWaitSeconds)
 {
-    if (socketOpen)
+    if (socketOpen && partyIssuerAvailable)
         return LeaderClientLossAction::Continue;
     if (lostSince <= 0 || now - lostSince <= maxWaitSeconds)
         return LeaderClientLossAction::Hold;
