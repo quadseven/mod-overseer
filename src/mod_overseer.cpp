@@ -33183,6 +33183,13 @@ private:
             return DungeonCrossingResult::GaveUp;
         }
 
+        // COMPLETION HAS TO KNOW WHICH DOORSTEP THE RUN OWNS. The finalizer
+        // releases the leader's exact recorded run aim; without this, the
+        // exit crossing's `at:` aim looks like a newer route and survives the
+        // run. Once the leader crosses out, later polls may not escort him
+        // again, so keep the aim recorded while this crossing is active.
+        coord.legAim[leaderName] = doorAim;
+
         OverseerDecisions::DungeonRunEntryState const* leaderState = nullptr;
         for (OverseerDecisions::DungeonRunEntryState const& state : states)
         {

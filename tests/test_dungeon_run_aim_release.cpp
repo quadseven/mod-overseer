@@ -70,6 +70,33 @@ void RunCompletionUsesAnExactCompareAndSwap()
           finalizer.find("_travelAims.ReleaseRunAim(") != std::string::npos);
 }
 
+void ExitCrossingRecordsTheAimRunCompletionMustRelease()
+{
+    std::ifstream file("src/mod_overseer.cpp");
+    std::stringstream contents;
+    contents << file.rdbuf();
+    std::string const source = contents.str();
+    std::size_t const crossing = source.find(
+        "DungeonCrossingResult DriveDungeonCrossing(");
+    Check("dungeon crossing exists", crossing != std::string::npos);
+    if (crossing == std::string::npos)
+        return;
+    std::size_t const end = source.find(
+        "// ---------------------------------------- dungeon run: the straggler",
+        crossing);
+    Check("dungeon crossing has a bounded body", end != std::string::npos);
+    if (end == std::string::npos)
+        return;
+    std::string const body = source.substr(crossing, end - crossing);
+    std::size_t const doorAim = body.find(
+        "std::string const doorAim = OverseerDecisions::TravelAimAtPosition(");
+    std::size_t const recordedAim = body.find(
+        "coord.legAim[leaderName] = doorAim;");
+    Check("the crossing records its exact door aim for run finalization",
+          doorAim != std::string::npos && recordedAim != std::string::npos &&
+              recordedAim > doorAim);
+}
+
 void GeneralTravelReleaseCannotEraseAChangedAim()
 {
     std::ifstream file("src/mod_overseer.cpp");
@@ -110,6 +137,7 @@ int main()
 {
     TheEndedRunCanClearOnlyItsExactPositionalAim();
     RunCompletionUsesAnExactCompareAndSwap();
+    ExitCrossingRecordsTheAimRunCompletionMustRelease();
     GeneralTravelReleaseCannotEraseAChangedAim();
 
     if (failures)
