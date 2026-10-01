@@ -13367,16 +13367,28 @@ private:
             }
         }
 
+        // `trainer:<entry>` names the same exact creature as a bare numeric
+        // aim, but keeps a class-training stop distinct from numeric vendor
+        // errands written by the Python bridge. Town-slot arbitration may
+        // preempt economy aims under bag pressure; it must never take this
+        // module-owned training walk.
+        bool const explicitTrainer = target.rfind("trainer:", 0) == 0;
+        std::string const entryText = explicitTrainer ? target.substr(8) : target;
+        if (explicitTrainer &&
+            (entryText.empty() ||
+             entryText.find_first_not_of("0123456789") != std::string::npos))
+            return false;
+
         BuildTravelIndex();
 
         uint32 wantedEntry = 0;
         uint32 wantedFlag = 0;
         std::string wantedName;
-        bool const numeric = !target.empty() &&
-                             target.find_first_not_of("0123456789") == std::string::npos;
+        bool const numeric = !entryText.empty() &&
+                             entryText.find_first_not_of("0123456789") == std::string::npos;
         if (numeric)
         {
-            wantedEntry = static_cast<uint32>(std::strtoul(target.c_str(), nullptr, 10));
+            wantedEntry = static_cast<uint32>(std::strtoul(entryText.c_str(), nullptr, 10));
             if (!wantedEntry)
                 return false;
         }
@@ -23901,7 +23913,7 @@ private:
                 // trainer does not teach it.
                 else if (auto const stopLeg = _trainingStopLegs.find(name);
                          stopLeg != _trainingStopLegs.end() &&
-                         target == std::to_string(stopLeg->second.entry))
+                         target == "trainer:" + std::to_string(stopLeg->second.entry))
                 {
                     if (TeachAtTrainingStop(stopLeg->second))
                     {
@@ -45733,7 +45745,7 @@ private:
             {
                 OverseerDecisions::TrainingStopMember const& member = members[pick.member];
                 uint32 const entry = trainers[pick.member];
-                if (!_travelAims.Claim(headName, std::to_string(entry),
+                if (!_travelAims.Claim(headName, "trainer:" + std::to_string(entry),
                                        OverseerDecisions::TravelOwner::TrainingStop))
                     continue;   // Claim has said why, once
                 bool const opening = stop.openedAt == 0;
