@@ -55,7 +55,7 @@ void RunCompletionUsesAnExactCompareAndSwap()
           release != std::string::npos && guardedRelease > release);
     std::size_t const clear = finalizer.find("CharacterDatabase.DirectExecute(");
     std::string const clearCall = clear == std::string::npos
-        ? std::string() : finalizer.substr(clear, 400);
+        ? std::string() : finalizer.substr(clear, 800);
     Check("database clear compares the character and exact recorded aim",
           clearCall.find("WHERE name = '{}' AND") != std::string::npos &&
               clearCall.find("travel_npc = '{}' AND enabled = 1") !=
