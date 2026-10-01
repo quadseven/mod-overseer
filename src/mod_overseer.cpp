@@ -1313,6 +1313,12 @@ constexpr float TRAVEL_WALK_SAMPLE_YARDS = TRAVEL_THREAT_RADIUS / 2.f;
 // perfectly good shop fifth in the list.
 constexpr std::size_t TRAVEL_WALK_CANDIDATES = GRAVEYARD_CANDIDATES;
 
+// COUNTERS ARE A LOCAL ERRAND. Beyond this distance the character is no
+// longer walking to a town service; it is crossing a large part of the map
+// without a route the mover can prove. Refuse that aim and let a later town
+// stop try again from a better position.
+constexpr float TRAVEL_COUNTER_MAX_WALK_YARDS = 1500.0f;
+
 // AND THE LONGEST WALK THAT IS READ AT ALL, so one absurd aim cannot turn this
 // into a sweep with a thousand points in it. Past this the tail of the line is
 // simply not judged, which is safe in exactly one direction: this gate may only
@@ -13494,6 +13500,11 @@ private:
         std::map<uint32, bool> mayDealWith;
         std::vector<OverseerDecisions::TravelTargetCandidate> candidates;
         std::vector<TravelSpawn const*> spawns;
+        unsigned distantUsableCounters = 0;
+        float nearestDistantCounterYards = -1.f;
+        bool const townCounterRole =
+            (wantedFlag & (UNIT_NPC_FLAG_VENDOR | UNIT_NPC_FLAG_REPAIR |
+                           UNIT_NPC_FLAG_BANKER | UNIT_NPC_FLAG_AUCTIONEER)) != 0;
         for (TravelSpawn const& spawn : _travelSpawns)
         {
             if (spawn.mapId != mapId)
@@ -13531,8 +13542,28 @@ private:
             candidate.entry = spawn.entry;
             candidate.distance = bot->GetDistance2d(spawn.x, spawn.y);
             candidate.mayInteract = known->second;
+            if (townCounterRole && candidate.mayInteract &&
+                candidate.distance > TRAVEL_COUNTER_MAX_WALK_YARDS)
+            {
+                ++distantUsableCounters;
+                if (nearestDistantCounterYards < 0.f ||
+                    candidate.distance < nearestDistantCounterYards)
+                    nearestDistantCounterYards = candidate.distance;
+                continue;
+            }
             candidates.push_back(candidate);
             spawns.push_back(&spawn);
+        }
+
+        if (townCounterRole && candidates.empty() && distantUsableCounters)
+        {
+            if (outSaid)
+                *outSaid = "the nearest counter this character may use is " +
+                           std::to_string(static_cast<uint32>(nearestDistantCounterYards + 0.5f)) +
+                           " yards away, beyond the " +
+                           std::to_string(static_cast<uint32>(TRAVEL_COUNTER_MAX_WALK_YARDS)) +
+                           "-yard limit for a town-service walk";
+            return false;
         }
 
         // WHAT IS STANDING AROUND EACH ONE (#267). Asked only of the spawns
@@ -13662,7 +13693,14 @@ private:
         OverseerDecisions::TravelTargetChoice const choice =
             OverseerDecisions::ChooseTravelTarget(candidates);
         if (outSaid)
+        {
             *outSaid = OverseerDecisions::TravelTargetExplanation(choice, candidates);
+            if (townCounterRole && distantUsableCounters)
+                *outSaid += "; " + std::to_string(distantUsableCounters) +
+                            " farther usable counter(s) are beyond the " +
+                            std::to_string(static_cast<uint32>(TRAVEL_COUNTER_MAX_WALK_YARDS)) +
+                            "-yard limit for a town-service walk";
+        }
         if (choice.verdict != OverseerDecisions::TravelTargetVerdict::Chosen)
             return false;
 
