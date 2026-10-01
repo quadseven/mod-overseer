@@ -13,8 +13,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 
 #include <iterator>
+#include <sstream>
 #include <utility>
 
 namespace OverseerDecisions
@@ -1671,6 +1673,30 @@ bool ArrivalReachesTrigger(float arrivalYards, float triggerRadiusYards)
     if (arrivalYards <= 0.f || triggerRadiusYards <= 0.f)
         return false;
     return arrivalYards < triggerRadiusYards;
+}
+
+std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z)
+{
+    auto buildAim = [mapId](float aimX, float aimY, float aimZ, int precision)
+    {
+        std::ostringstream aim;
+        aim << std::fixed << std::setprecision(precision) << "at:" << mapId << ':'
+            << aimX << ',' << aimY << ',' << aimZ;
+        return aim.str();
+    };
+
+    // One decimal is well inside the smallest dungeon-door arrival margin.
+    // Rare large coordinates can make three signed decimals exceed the roster
+    // column; whole yards still keep the rounded point within that margin.
+    std::string aim = buildAim(x, y, z, 1);
+    if (aim.size() <= TRAVEL_AIM_MAX_CHARS)
+        return aim;
+
+    aim = buildAim(x, y, z, 0);
+    if (aim.size() <= TRAVEL_AIM_MAX_CHARS)
+        return aim;
+
+    return {};
 }
 
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,

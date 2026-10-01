@@ -1343,7 +1343,7 @@ constexpr float TRAVEL_ARRIVED_YARDS = 12.0f;
 // looks exactly like a character that did not walk. Role keywords and
 // creature entries are nowhere near it; a berth two five-digit coordinates
 // from the origin is the first aim that can reach it.
-constexpr std::size_t TRAVEL_AIM_COLUMN_CHARS = 32;
+constexpr std::size_t TRAVEL_AIM_COLUMN_CHARS = OverseerDecisions::TRAVEL_AIM_MAX_CHARS;
 
 // How close the leader has to be to a berth before it counts as being AT
 // it. Deliberately the same order as TRAVEL_ARRIVED_YARDS and for the same
@@ -33084,11 +33084,18 @@ private:
         OverseerDecisions::DoorAimHeight const doorHeight =
             DoorAimHeightFor(door, states);
 
-        std::ostringstream aim;
-        // AreaTrigger::map/x/y  ObjectMgr.h:425,426,427
-        aim << "at:" << door->map << ':' << door->x << ',' << door->y << ','
-            << doorHeight.z;
-        std::string const doorAim = aim.str();
+        // AreaTrigger::map/x/y  ObjectMgr.h:425,426,427. Use the bounded
+        // formatter: default stream precision can exceed travel_npc's column.
+        std::string const doorAim = OverseerDecisions::TravelAimAtPosition(
+            door->map, door->x, door->y, doorHeight.z);
+        if (doorAim.empty())
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: dungeon run {} cannot format its door aim within the travel "
+                      "column limit for areatrigger {}",
+                      what, triggerId);
+            return DungeonCrossingResult::GaveUp;
+        }
 
         OverseerDecisions::DungeonRunEntryState const* leaderState = nullptr;
         for (OverseerDecisions::DungeonRunEntryState const& state : states)
@@ -33551,11 +33558,18 @@ private:
         OverseerDecisions::DoorAimHeight const doorHeight =
             DoorAimHeightFor(door, states, arriveWithin);
 
-        std::ostringstream aim;
-        // AreaTrigger::map/x/y  ObjectMgr.h:425,426,427
-        aim << "at:" << door->map << ':' << door->x << ',' << door->y << ','
-            << doorHeight.z;
-        std::string const doorAim = aim.str();
+        // AreaTrigger::map/x/y  ObjectMgr.h:425,426,427. Use the bounded
+        // formatter: default stream precision can exceed travel_npc's column.
+        std::string const doorAim = OverseerDecisions::TravelAimAtPosition(
+            door->map, door->x, door->y, doorHeight.z);
+        if (doorAim.empty())
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: cannot format a straggler's exit aim within the travel "
+                      "column limit for areatrigger {}",
+                      portal.exitTriggerId);
+            return 0;
+        }
 
         // UNDER A LEASE OF ITS OWN AND NOT THE RUN'S (#393). Everything
         // EscortToward marks is ended by SweepDungeonEscorts the poll after this
@@ -41426,11 +41440,19 @@ private:
                     y = trigger->y;
                     z = RaidDoorFloor(head->GetMap(), door, trigger);
                 }
-                std::ostringstream aim;
-                aim << std::fixed << std::setprecision(1) << "at:" << door->outsideMapId
-                    << ':' << x << ',' << y << ',' << z;
+                std::string const aim = OverseerDecisions::TravelAimAtPosition(
+                    door->outsideMapId, x, y, z);
+                if (aim.empty())
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: raid run for family '{}' cannot format its door "
+                              "aim within the travel column limit",
+                              roster.family);
+                    WriteRaidTimeline(roster, run, door);
+                    continue;
+                }
                 // A refusal is said by Claim itself, once per fence.
-                _travelAims.Claim(roster.leader, aim.str(), OverseerDecisions::TravelOwner::Run);
+                _travelAims.Claim(roster.leader, aim, OverseerDecisions::TravelOwner::Run);
             }
 
             if (step.knockMembers || step.knockHead)
