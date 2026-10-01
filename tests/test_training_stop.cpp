@@ -412,6 +412,10 @@ void TheAdapterIsWired()
           respecPoll != std::string::npos && stopPoll != std::string::npos && stopPoll > respecPoll);
     Check("its claim names its owner",
           source.find("OverseerDecisions::TravelOwner::TrainingStop))") != std::string::npos);
+    Check("training aims are namespaced away from numeric vendor errands",
+          source.find("\"trainer:\" + std::to_string(entry)") != std::string::npos &&
+              source.find("target == \"trainer:\" + std::to_string(stopLeg->second.entry)") !=
+                  std::string::npos);
     std::size_t const stopArrival = source.find("if (TeachAtTrainingStop(stopLeg->second))");
     std::size_t const respecArrival = source.find("if (RespecOnArrival(name, bot, entry, respec->second))");
     std::size_t const learnArrival = source.find("!TrainOnArrival(name, bot, entry, *plan))");
