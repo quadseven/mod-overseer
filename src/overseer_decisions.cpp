@@ -3029,6 +3029,13 @@ std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing)
     return said;
 }
 
+bool RunAimMayBeReleased(std::string const& current,
+                         std::string const& recordedRunAim)
+{
+    return !recordedRunAim.empty() && current == recordedRunAim &&
+           current.rfind("at:", 0) == 0;
+}
+
 LeftoverAim ReadLeftoverAim(LeftoverAimFacts const& facts)
 {
     if (facts.target.rfind("at:", 0) != 0)

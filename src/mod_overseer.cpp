@@ -5726,6 +5726,56 @@ public:
     // drive, goes through here, which is why it does three things and not one.
     void Release(std::string const& name, std::string const& why = std::string())
     {
+        ReleaseImpl(name, why, nullptr);
+    }
+
+    // Close a dungeon coordinator's travel state without giving back a newer
+    // route this same book may have claimed for another owner. A claim lost to
+    // a restart can still be cleared later by the coordinator's exact CAS.
+    bool ReleaseRunAim(std::string const& name, std::string const& expectedAim,
+                       std::string const& why)
+    {
+        bool mayClearRecordedAim = true;
+        auto const claimed = _claimed.find(name);
+        if (claimed != _claimed.end())
+        {
+            auto const owner = _claimOwner.find(name);
+            bool const runOwner = owner != _claimOwner.end() &&
+                (owner->second == OverseerDecisions::TravelOwner::Run ||
+                 owner->second == OverseerDecisions::TravelOwner::WalkBackIn ||
+                 owner->second == OverseerDecisions::TravelOwner::Exit);
+            mayClearRecordedAim = runOwner && claimed->second == expectedAim;
+        }
+        ReleaseImpl(name, why, &expectedAim);
+        return mayClearRecordedAim;
+    }
+
+    void ReleaseImpl(std::string const& name, std::string const& why,
+                     std::string const* expectedRunAim)
+    {
+        std::string const standing = CurrentTravelNpc(name);
+        auto const claimedAim = _claimed.find(name);
+        bool const claimed = claimedAim != _claimed.end() &&
+                             claimedAim->second == standing;
+        bool const changedSinceClaim = claimedAim != _claimed.end() && !claimed;
+        auto const owner = _claimOwner.find(name);
+        bool const claimedByRun = claimed && owner != _claimOwner.end() &&
+            (owner->second == OverseerDecisions::TravelOwner::Run ||
+             owner->second == OverseerDecisions::TravelOwner::WalkBackIn ||
+             owner->second == OverseerDecisions::TravelOwner::Exit);
+        bool const mismatchesRunAim = expectedRunAim &&
+            (*expectedRunAim != standing ||
+             (claimedAim != _claimed.end() && !claimedByRun));
+        if (mismatchesRunAim)
+        {
+            // The old coordinator must not end, reset or forget a newer
+            // errand's intent and drive state. That owner will release it.
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run release for '{}' left newer aim '{}' "
+                     "and its travel owner state in place",
+                     name, standing);
+            return;
+        }
         // WHO ENDED IT, REMEMBERED FOR THE ONE READER THAT NEEDS IT (#632
         // follow-up). A staging run that has to take its leader's errand back
         // reports how often; without this it could not say who took it, and a
@@ -5772,21 +5822,21 @@ public:
         // EACH FENCE IS READ ONCE, AND THE LINE PRINTS WHAT THE GATE TESTED
         // (#561). The line used to read the column a second time and print it
         // whichever fence fired, so a profession errand read as "errand ''".
-        bool const claimed = _claimed.count(name) != 0;
-        std::string const standing = claimed ? std::string() : CurrentTravelNpc(name);
         uint32 const learnSkill = claimed ? 0 : LearnSkillPending(name);
-        std::string const fence = OverseerDecisions::TravelReleaseFence(learnSkill, standing);
+        std::string const fence = changedSinceClaim
+            ? std::string("the column changed after this book's claim")
+            : OverseerDecisions::TravelReleaseFence(learnSkill, standing);
         // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
         // in the column the travel drive was not walking has not walked it at
         // all, and must not stop the travel drive from starting it.
         auto const driving = _state.find(name);
-        bool const wasDriving = driving != _state.end() && !standing.empty() &&
+        bool const wasDriving = claimed && driving != _state.end() && !standing.empty() &&
                                 driving->second.target == standing;
         if (!fence.empty())
         {
             LOG_INFO("module.overseer",
                      "overseer: travel release for '{}' skipped the column "
-                     "write - {} and this book never claimed the aim it would "
+                     "write - {} and this book did not claim the aim it would "
                      "have erased",
                      name, fence);
             if (wasDriving)
@@ -5795,7 +5845,8 @@ public:
         else
         {
             CharacterDatabase.Execute(
-                "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}'", Esc(name));
+                "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' "
+                "AND travel_npc = '{}'", Esc(name), Esc(standing));
         }
         // The run no longer owns what no longer exists. `_refused` is
         // deliberately NOT swept here: a refusal that died with the errand it
@@ -37395,7 +37446,33 @@ private:
                                                        coord.runsWanted, coord.capKnown);
         if (progress.counted)
             CountRunDone(leaderName);
-        _travelAims.Release(leaderName, "the dungeon run coordinator");
+        auto const recordedLeg = coord.legAim.find(leaderName);
+        std::string const recordedRunAim =
+            recordedLeg == coord.legAim.end() ? std::string() : recordedLeg->second;
+        bool const mayClearRecordedRunAim = _travelAims.ReleaseRunAim(
+            leaderName, recordedRunAim, "the dungeon run coordinator");
+        std::string const currentAim = TravelAimBook::CurrentTravelNpc(leaderName);
+        if (mayClearRecordedRunAim &&
+            OverseerDecisions::RunAimMayBeReleased(currentAim, recordedRunAim))
+        {
+            // Release normally protects every foreign `at:` aim. Here the run
+            // has its own exact leg record, so a compare-and-swap can retire
+            // only the positional value this run last claimed. A newer aim or
+            // any other kind of errand is left to its owner.
+            CharacterDatabase.DirectExecute(
+                "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND "
+                "travel_npc = '{}' AND enabled = 1",
+                Esc(leaderName), Esc(recordedRunAim));
+            std::string const afterRelease = TravelAimBook::CurrentTravelNpc(leaderName);
+            if (afterRelease.empty())
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} retired its exact final travel aim for '{}'",
+                         runId, leaderName);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} left '{}'s newer travel aim '{}' in place",
+                         runId, leaderName, afterRelease);
+        }
 
         uint32 const finished = progress.runsDone;
         uint32 const wanted = coord.runsWanted;
