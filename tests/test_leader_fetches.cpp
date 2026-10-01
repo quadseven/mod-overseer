@@ -33,12 +33,14 @@ using OverseerDecisions::FetchFacts;
 using OverseerDecisions::FetchLimits;
 using OverseerDecisions::FetchRunAnswer;
 using OverseerDecisions::FetchRunPhase;
+using OverseerDecisions::FetchSweepStep;
 using OverseerDecisions::FetchStep;
 using OverseerDecisions::FetchStepWord;
 using OverseerDecisions::MemberFollowsForFlight;
 using OverseerDecisions::PickFetchTarget;
 using OverseerDecisions::ReadFamilyRegroup;
 using OverseerDecisions::ReadFetch;
+using OverseerDecisions::ReadFetchSweep;
 using OverseerDecisions::ReadRegroupClaim;
 using OverseerDecisions::RegroupCarriedOnWithout;
 using OverseerDecisions::RegroupClaim;
@@ -223,6 +225,18 @@ void AFetchWithNothingToServeIsAbandoned()
     Step("abandon outranks arriving", ReadFetch(late, LIMITS), FetchStep::Abandon);
 }
 
+// One temporary gap during a client handoff must not erase the fetch and put
+// its target on the fifteen-minute stand-down.
+void ATransientPollGapKeepsTheFetch()
+{
+    Check("45-second client handoff gap keeps the fetch",
+          ReadFetchSweep(45, 60) == FetchSweepStep::Keep, true);
+    Check("the grace boundary still keeps the fetch",
+          ReadFetchSweep(59, 60) == FetchSweepStep::Keep, true);
+    Check("a fetch missing for a minute is released",
+          ReadFetchSweep(60, 60) == FetchSweepStep::End, true);
+}
+
 // (a) GATHERING and before lend the leader; BARRIER goes back to GATHERING
 // first; from ENTER on the run keeps him.
 void ARunLendsTheLeaderWhileItIsAssembling()
@@ -310,6 +324,7 @@ int main()
     TheFetchEndsWhereTheHoldLifts();
     TheFetchHasACeiling();
     AFetchWithNothingToServeIsAbandoned();
+    ATransientPollGapKeepsTheFetch();
     ARunLendsTheLeaderWhileItIsAssembling();
     TheFamilyStopsCarryingOnWithoutTheFetchedMember();
     ADeadFetchedMemberIsStillDead();

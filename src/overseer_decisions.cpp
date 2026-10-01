@@ -6129,6 +6129,11 @@ char const* FetchStepWord(FetchStep step)
     return "unknown";
 }
 
+FetchSweepStep ReadFetchSweep(time_t secondsSinceLastMark, time_t graceSeconds)
+{
+    return secondsSinceLastMark >= graceSeconds ? FetchSweepStep::End : FetchSweepStep::Keep;
+}
+
 FetchRunAnswer RunLetsTheLeaderFetch(FetchRunPhase phase)
 {
     switch (phase)

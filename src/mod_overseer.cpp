@@ -2215,6 +2215,10 @@ constexpr time_t FETCH_CEILING_SECONDS = TRAVEL_BACKSTOP_SECONDS;
 // member's own hold asks the flight again on the same clock.
 constexpr time_t FETCH_STANDDOWN_SECONDS = REGROUP_STANDDOWN_SECONDS;
 
+// A single regroup poll may be absent while a client takes over its bot.
+// Keep that fetch alive briefly so the next poll can re-mark it.
+constexpr time_t FETCH_MARK_GRACE_SECONDS = 60;
+
 // The foot limit the hold lifts on, the line past which a member that is NOT
 // held is still walking back, and the ceiling above. And where a fetch for a
 // member held off a lethal leg arrives (#697): beside it, at the line the
@@ -21601,15 +21605,14 @@ private:
     {
         std::string target;
         time_t since{0};
+        // Last family poll that confirmed this fetch is still wanted.
+        time_t lastMarked{0};
         // The leader's catch-up escort is aimed at the member. False while
         // another owner's walk still has him (BARRIER's escort until the run
         // lets go of it, or a home errand).
         bool aimed{false};
         // The fence that refused the aim, when one did. See ReadFetch.
         std::string refusal;
-        // Marked by DriveFetch and swept by SweepFetches, the shape every other
-        // lease on the party clock has.
-        bool wanted{false};
     };
     std::map<std::string, Fetch> _fetches;              // leader -> the fetch
     std::map<std::string, std::string> _fetchFenceSaid;  // leader -> column said
@@ -21684,23 +21687,26 @@ private:
                  static_cast<uint32>(FETCH_STANDDOWN_SECONDS / 60));
     }
 
-    // Ends a fetch the party poll stopped marking: the family dissolved, the
-    // leader logged out, or leadership moved. On the same first statement as
-    // SweepCatchUps, and after it, so an escort that sweep already ended is
-    // simply not there to end twice.
+    // Ends a fetch only after the party poll has stopped marking it beyond the
+    // client-handoff grace. On the same first statement as SweepCatchUps, and
+    // after it, so an escort that sweep already ended is simply not there to
+    // end twice.
     void SweepFetches()
     {
+        time_t const now = std::time(nullptr);
         std::vector<std::string> stale;
         for (auto& entry : _fetches)
         {
-            if (entry.second.wanted)
-                entry.second.wanted = false;
-            else
+            time_t const age = std::max<time_t>(0, now - entry.second.lastMarked);
+            if (OverseerDecisions::ReadFetchSweep(age, FETCH_MARK_GRACE_SECONDS) ==
+                OverseerDecisions::FetchSweepStep::End)
                 stale.push_back(entry.first);
         }
         for (std::string const& leaderName : stale)
-            EndFetch(leaderName, "nothing marked it this poll, so the family it was for is "
-                                 "gone or has a new leader");
+            EndFetch(leaderName,
+                     "the family has not marked the fetch for " +
+                         std::to_string(static_cast<uint32>(FETCH_MARK_GRACE_SECONDS)) +
+                         " seconds, so it is released");
     }
 
     // AIM THE LEADER AT THE MEMBER, or leave the fetch unaimed and say why.
@@ -21715,7 +21721,6 @@ private:
         if (aimed != _dungeonEscorts.end() && aimed->second.catchUp)
         {
             fetch.aimed = true;
-            aimed->second.wanted = true;
             return;
         }
         auto const refused = _catchUpRefused.find(leaderName);
@@ -21809,7 +21814,7 @@ private:
                 EndFetch(leaderName, "another intent took the leader - see the leader intent line");
                 return;
             }
-            fetch.wanted = true;
+            fetch.lastMarked = std::time(nullptr);
             auto const walk = _dungeonEscorts.find(leaderName);
             if (!fetch.aimed || walk == _dungeonEscorts.end() || !walk->second.catchUp)
             {
@@ -21819,7 +21824,6 @@ private:
                 AimFetch(fetch, leaderName, target);
                 return;
             }
-            walk->second.wanted = true;
             // THE MEMBER USUALLY STANDS STILL, BUT NOT ALWAYS. Its hold asks
             // the flight again every CATCH_UP_FAR_HOLD_SECONDS, and a member
             // walking toward a leader walking toward it moves the aim. Re-aimed
@@ -21906,7 +21910,7 @@ private:
         fetch = Fetch{};
         fetch.target = pick;
         fetch.since = std::time(nullptr);
-        fetch.wanted = true;
+        fetch.lastMarked = fetch.since;
         bool const lethalLeg = HeldOffLethalLeg(pick);
         LOG_WARN("module.overseer",
                  "overseer: '{}' goes back for '{}', which is held {} yards away because "
