@@ -84,7 +84,12 @@ enum class LeaderClientLossAction
     Abandon,
 };
 
-LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, std::time_t lostSince,
+// Keep an occupied run held until both the family leader's client and a
+// command-capable member of each inside party are available. If either stays
+// absent past the bound, evacuate so the campaign can recover instead of
+// leaving the party inside without its dungeon controller.
+LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuerAvailable,
+                                               std::time_t lostSince,
                                                std::time_t now,
                                                std::time_t maxWaitSeconds = DUNGEON_LEADER_CLIENT_LOST_SECONDS);
 

@@ -32,14 +32,20 @@ int main()
           static_cast<int>(DungeonLeaderClientGate(true, 800, 1000)),
           static_cast<int>(LeaderClientGate::Open));
     Check("lost client holds inside bound",
-          static_cast<int>(DungeonLeaderClientLoss(false, 1000, 1299)),
+          static_cast<int>(DungeonLeaderClientLoss(false, false, 1000, 1299)),
           static_cast<int>(LeaderClientLossAction::Hold));
     Check("lost client abandons after bound",
-          static_cast<int>(DungeonLeaderClientLoss(false, 1000, 1301)),
+          static_cast<int>(DungeonLeaderClientLoss(false, false, 1000, 1301)),
           static_cast<int>(LeaderClientLossAction::Abandon));
     Check("connected client continues",
-          static_cast<int>(DungeonLeaderClientLoss(true, 0, 1000)),
+          static_cast<int>(DungeonLeaderClientLoss(true, true, 0, 1000)),
           static_cast<int>(LeaderClientLossAction::Continue));
+    Check("connected client without party issuer holds",
+          static_cast<int>(DungeonLeaderClientLoss(true, false, 1000, 1299)),
+          static_cast<int>(LeaderClientLossAction::Hold));
+    Check("missing party issuer evacuates after bound",
+          static_cast<int>(DungeonLeaderClientLoss(true, false, 1000, 1301)),
+          static_cast<int>(LeaderClientLossAction::Abandon));
 
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;

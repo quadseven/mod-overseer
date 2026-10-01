@@ -41645,11 +41645,23 @@ private:
                                                 ? clientLeader->GetSession()
                                                 : nullptr;
         bool const leaderSocketOpen = leaderSession && !leaderSession->IsSocketClosed();
+        bool hasInsideMember = false;
+        bool allInsideMembersHaveIssuer = true;
+        for (std::string const& member : members)
+        {
+            Player* const candidate = ObjectAccessor::FindPlayerByName(member);
+            if (!candidate || !InDungeonRun(candidate))
+                continue;
+            hasInsideMember = true;
+            if (!AuthorizedDcIssuer(candidate))
+                allInsideMembersHaveIssuer = false;
+        }
+        bool const partyIssuerAvailable = !hasInsideMember || allInsideMembersHaveIssuer;
         if (!leaderSocketOpen)
             coord.leaderClientOpenSince = 0;
         else if (!coord.leaderClientOpenSince)
             coord.leaderClientOpenSince = clientNow;
-        if (!leaderSocketOpen)
+        if (!leaderSocketOpen || !partyIssuerAvailable)
         {
             if (!coord.leaderClientLostSince)
                 coord.leaderClientLostSince = clientNow;
@@ -41687,7 +41699,8 @@ private:
             {
                 OverseerDecisions::LeaderClientLossAction const loss =
                     OverseerDecisions::DungeonLeaderClientLoss(
-                        leaderSocketOpen, coord.leaderClientLostSince, clientNow);
+                        leaderSocketOpen, partyIssuerAvailable,
+                        coord.leaderClientLostSince, clientNow);
                 if (loss == OverseerDecisions::LeaderClientLossAction::Hold)
                 {
                     coord.leaderClientHoldActive = true;
@@ -41696,7 +41709,8 @@ private:
                         coord.loggedLeaderClientHold = true;
                         LOG_WARN("module.overseer",
                                  "overseer: dungeon run for '{}' is held because the leader's "
-                                 "client disconnected; members inside stay put for up to {} seconds",
+                                 "client or an authorized party issuer is unavailable; members "
+                                 "inside stay put for up to {} seconds",
                                  leaderName, static_cast<uint32>(
                                      OverseerDecisions::DUNGEON_LEADER_CLIENT_LOST_SECONDS));
                     }
@@ -41725,7 +41739,8 @@ private:
                         coord.loggedLeaderClientHold = false;
                         LOG_INFO("module.overseer",
                                  "overseer: dungeon run hold for '{}' ended because the "
-                                 "leader's client did not return within {} seconds; evacuating",
+                                 "leader's client or an authorized party issuer did not return "
+                                 "within {} seconds; evacuating",
                                  leaderName, static_cast<uint32>(
                                      OverseerDecisions::DUNGEON_LEADER_CLIENT_LOST_SECONDS));
                     }
@@ -41751,7 +41766,8 @@ private:
                     coord.loggedLeaderClientHold = false;
                     LOG_INFO("module.overseer",
                              "overseer: dungeon run hold for '{}' ended because the leader's "
-                             "client returned; members may move again",
+                             "client and an authorized party issuer are available; members may "
+                             "move again",
                              leaderName);
                     for (std::string const& member : members)
                     {
