@@ -7179,6 +7179,15 @@ FetchStep ReadFetch(FetchFacts const& facts, FetchLimits const& limits);
 // "continue", "arrived", "abandon", "give up".
 char const* FetchStepWord(FetchStep step);
 
+// What the family poll does when it has not marked an active fetch this poll.
+enum class FetchSweepStep : std::uint8_t
+{
+    Keep,  // a transient poll gap has not outlasted the grace period
+    End,   // the fetch has stopped being marked long enough to release it
+};
+
+FetchSweepStep ReadFetchSweep(time_t secondsSinceLastMark, time_t graceSeconds);
+
 // (a) A DUNGEON RUN AND A FETCH. Where the run stands, as the fetch needs it.
 enum class FetchRunPhase : std::uint8_t
 {
