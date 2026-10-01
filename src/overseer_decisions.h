@@ -3999,6 +3999,10 @@ bool TravelFocusOutlivesItsErrand(TravelFocusFacts const& facts);
 // caller cannot pair a plural subject with a singular verb.
 std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing);
 
+// May the dungeon coordinator clear this exact positional aim when its run
+// ends? A newer or unrelated aim must remain untouched.
+bool RunAimMayBeReleased(std::string const& current, std::string const& recordedRunAim);
+
 // ------------- a point aim left over from before a restart (#658) ------------
 //
 // TravelAimBook remembers which aims it wrote in memory only. After a restart
