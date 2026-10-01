@@ -3411,6 +3411,11 @@ enum class DungeonCompletion : uint8_t
 // difficulty this run is not on says nothing about this run.
 DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completedMask);
 
+// Select the encounters this run must credit. Independent-wing maps require a
+// non-empty, verified wing mask; otherwise completion remains unknowable.
+uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask,
+                                uint32_t wingMask);
+
 // Some maps contain several independent dungeon wings behind different
 // entrance triggers. Their encounter list is the union of all wings, so a
 // single-wing run cannot be proved complete from the map-level mask.
