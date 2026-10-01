@@ -1313,12 +1313,6 @@ constexpr float TRAVEL_WALK_SAMPLE_YARDS = TRAVEL_THREAT_RADIUS / 2.f;
 // perfectly good shop fifth in the list.
 constexpr std::size_t TRAVEL_WALK_CANDIDATES = GRAVEYARD_CANDIDATES;
 
-// COUNTERS ARE A LOCAL ERRAND. Beyond this distance the character is no
-// longer walking to a town service; it is crossing a large part of the map
-// without a route the mover can prove. Refuse that aim and let a later town
-// stop try again from a better position.
-constexpr float TRAVEL_COUNTER_MAX_WALK_YARDS = 1500.0f;
-
 // AND THE LONGEST WALK THAT IS READ AT ALL, so one absurd aim cannot turn this
 // into a sweep with a thousand points in it. Past this the tail of the line is
 // simply not judged, which is safe in exactly one direction: this gate may only
@@ -13542,8 +13536,9 @@ private:
             candidate.entry = spawn.entry;
             candidate.distance = bot->GetDistance2d(spawn.x, spawn.y);
             candidate.mayInteract = known->second;
-            if (townCounterRole && candidate.mayInteract &&
-                candidate.distance > TRAVEL_COUNTER_MAX_WALK_YARDS)
+            if (candidate.mayInteract &&
+                !OverseerDecisions::TownCounterWalkAllowed(townCounterRole,
+                                                           candidate.distance))
             {
                 ++distantUsableCounters;
                 if (nearestDistantCounterYards < 0.f ||
@@ -13561,7 +13556,8 @@ private:
                 *outSaid = "the nearest counter this character may use is " +
                            std::to_string(static_cast<uint32>(nearestDistantCounterYards + 0.5f)) +
                            " yards away, beyond the " +
-                           std::to_string(static_cast<uint32>(TRAVEL_COUNTER_MAX_WALK_YARDS)) +
+                           std::to_string(static_cast<uint32>(
+                               OverseerDecisions::TOWN_COUNTER_MAX_WALK_YARDS)) +
                            "-yard limit for a town-service walk";
             return false;
         }
@@ -13698,7 +13694,8 @@ private:
             if (townCounterRole && distantUsableCounters)
                 *outSaid += "; " + std::to_string(distantUsableCounters) +
                             " farther usable counter(s) are beyond the " +
-                            std::to_string(static_cast<uint32>(TRAVEL_COUNTER_MAX_WALK_YARDS)) +
+                            std::to_string(static_cast<uint32>(
+                                OverseerDecisions::TOWN_COUNTER_MAX_WALK_YARDS)) +
                             "-yard limit for a town-service walk";
         }
         if (choice.verdict != OverseerDecisions::TravelTargetVerdict::Chosen)

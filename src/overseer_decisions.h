@@ -8362,6 +8362,8 @@ HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts);
 // One spawn of the wanted role standing on the character's own map. The
 // caller has already asked whether this character may interact with it, the
 // same way the bank and repair candidate lists arrive already asked.
+constexpr float TOWN_COUNTER_MAX_WALK_YARDS = 1500.0f;
+bool TownCounterWalkAllowed(bool isTownCounter, float distanceYards);
 //
 // AND WHETHER IT IS A PLACE THE CHARACTER CAN STAND (#267). `guardCount` is
 // how many creatures hostile to this character AND above its level are
