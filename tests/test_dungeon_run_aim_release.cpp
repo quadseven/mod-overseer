@@ -53,9 +53,13 @@ void RunCompletionUsesAnExactCompareAndSwap()
     Check("run-scoped owner release remains", release != std::string::npos);
     Check("stale run aim is considered after scoped release",
           release != std::string::npos && guardedRelease > release);
+    std::size_t const clear = finalizer.find("CharacterDatabase.DirectExecute(");
+    std::string const clearCall = clear == std::string::npos
+        ? std::string() : finalizer.substr(clear, 400);
     Check("database clear compares the character and exact recorded aim",
-          finalizer.find("WHERE name = '{}' AND \"\n                \"travel_npc = '{}' AND enabled = 1") !=
-              std::string::npos);
+          clearCall.find("WHERE name = '{}' AND") != std::string::npos &&
+              clearCall.find("travel_npc = '{}' AND enabled = 1") !=
+                  std::string::npos);
     Check("the exact fallback clear completes before the next travel poll",
           finalizer.find("CharacterDatabase.DirectExecute(") != std::string::npos);
     Check("the CAS uses the captured run leg",
@@ -93,9 +97,11 @@ void GeneralTravelReleaseCannotEraseAChangedAim()
               body.find("TravelOwner::Exit") != std::string::npos);
     std::size_t const scopedMismatch = body.find("if (mismatchesRunAim)");
     std::size_t const intentEnd = body.find("EndLeaderColumnIntent(name");
+    std::size_t const mismatchReturn = body.find("return;", scopedMismatch);
     Check("a foreign run-end aim returns before ending the newer intent",
-          scopedMismatch != std::string::npos && intentEnd > scopedMismatch &&
-              body.find("return;", scopedMismatch) < intentEnd);
+          scopedMismatch != std::string::npos && intentEnd != std::string::npos &&
+              mismatchReturn != std::string::npos &&
+              mismatchReturn < intentEnd && scopedMismatch < intentEnd);
 }
 
 }  // namespace
