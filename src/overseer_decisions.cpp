@@ -7107,6 +7107,11 @@ RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& fact
                              : RevivedSickGroundStep::HoldOutOfCombat;
 }
 
+bool TownCounterWalkAllowed(bool isTownCounter, float distanceYards)
+{
+    return !isTownCounter || distanceYards <= TOWN_COUNTER_MAX_WALK_YARDS;
+}
+
 TravelTargetChoice ChooseTravelTarget(std::vector<TravelTargetCandidate> const& candidates)
 {
     TravelTargetChoice choice;

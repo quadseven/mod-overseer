@@ -30,6 +30,8 @@ using OverseerDecisions::TravelTargetCandidate;
 using OverseerDecisions::TravelTargetChoice;
 using OverseerDecisions::TravelTargetExplanation;
 using OverseerDecisions::TravelTargetVerdict;
+using OverseerDecisions::TownCounterWalkAllowed;
+using OverseerDecisions::TOWN_COUNTER_MAX_WALK_YARDS;
 
 namespace
 {
@@ -338,6 +340,18 @@ void ATieGoesToTheLowerIndex()
              ChooseTravelTarget(refusedTogether).nearestRefused, 0);
 }
 
+void TownCounterWalksStayLocal()
+{
+    Check("a nearby usable counter remains in reach",
+          TownCounterWalkAllowed(true, 224.3f), true);
+    Check("the town-service limit is inclusive",
+          TownCounterWalkAllowed(true, TOWN_COUNTER_MAX_WALK_YARDS), true);
+    Check("a counter across the map is refused",
+          TownCounterWalkAllowed(true, 4018.0f), false);
+    Check("other travel roles keep their existing range",
+          TownCounterWalkAllowed(false, 4018.0f), true);
+}
+
 }  // namespace
 
 int main()
@@ -354,6 +368,7 @@ int main()
     AnEmptyMapIsNotTheSameAnswerAsAHostileOne();
     AnOrdinaryErrandSaysNothingExtra();
     ATieGoesToTheLowerIndex();
+    TownCounterWalksStayLocal();
 
     if (failures)
     {

@@ -13494,6 +13494,11 @@ private:
         std::map<uint32, bool> mayDealWith;
         std::vector<OverseerDecisions::TravelTargetCandidate> candidates;
         std::vector<TravelSpawn const*> spawns;
+        unsigned distantUsableCounters = 0;
+        float nearestDistantCounterYards = -1.f;
+        bool const townCounterRole =
+            (wantedFlag & (UNIT_NPC_FLAG_VENDOR | UNIT_NPC_FLAG_REPAIR |
+                           UNIT_NPC_FLAG_BANKER | UNIT_NPC_FLAG_AUCTIONEER)) != 0;
         for (TravelSpawn const& spawn : _travelSpawns)
         {
             if (spawn.mapId != mapId)
@@ -13531,8 +13536,30 @@ private:
             candidate.entry = spawn.entry;
             candidate.distance = bot->GetDistance2d(spawn.x, spawn.y);
             candidate.mayInteract = known->second;
+            if (candidate.mayInteract &&
+                !OverseerDecisions::TownCounterWalkAllowed(townCounterRole,
+                                                           candidate.distance))
+            {
+                ++distantUsableCounters;
+                if (nearestDistantCounterYards < 0.f ||
+                    candidate.distance < nearestDistantCounterYards)
+                    nearestDistantCounterYards = candidate.distance;
+                continue;
+            }
             candidates.push_back(candidate);
             spawns.push_back(&spawn);
+        }
+
+        if (townCounterRole && candidates.empty() && distantUsableCounters)
+        {
+            if (outSaid)
+                *outSaid = "the nearest counter this character may use is " +
+                           std::to_string(static_cast<uint32>(nearestDistantCounterYards + 0.5f)) +
+                           " yards away, beyond the " +
+                           std::to_string(static_cast<uint32>(
+                               OverseerDecisions::TOWN_COUNTER_MAX_WALK_YARDS)) +
+                           "-yard limit for a town-service walk";
+            return false;
         }
 
         // WHAT IS STANDING AROUND EACH ONE (#267). Asked only of the spawns
@@ -13662,7 +13689,15 @@ private:
         OverseerDecisions::TravelTargetChoice const choice =
             OverseerDecisions::ChooseTravelTarget(candidates);
         if (outSaid)
+        {
             *outSaid = OverseerDecisions::TravelTargetExplanation(choice, candidates);
+            if (townCounterRole && distantUsableCounters)
+                *outSaid += "; " + std::to_string(distantUsableCounters) +
+                            " farther usable counter(s) are beyond the " +
+                            std::to_string(static_cast<uint32>(
+                                OverseerDecisions::TOWN_COUNTER_MAX_WALK_YARDS)) +
+                            "-yard limit for a town-service walk";
+        }
         if (choice.verdict != OverseerDecisions::TravelTargetVerdict::Chosen)
             return false;
 
