@@ -35,6 +35,7 @@ using OverseerDecisions::ArrivalReachesTrigger;
 using OverseerDecisions::DungeonWrongSide;
 using OverseerDecisions::DungeonRunEntryBlockers;
 using OverseerDecisions::DungeonRunEntryState;
+using OverseerDecisions::TravelAimAtPosition;
 using OverseerDecisions::DungeonRunWrongSide;
 
 namespace
@@ -365,6 +366,73 @@ void TheLandingPointIsAlreadyInsideTheWayOutOnceTheServersCheckIsUsed()
               ArrivalReachesTrigger(ARRIVED_YARDS, radius), true);
 }
 
+void APositionAimFitsTheRosterColumnAtDungeonCoordinates()
+{
+    std::string const aim = TravelAimAtPosition(389, 2.58019f, -0.013587f, -13.3668f);
+    CheckBool("door aim has the travel_npc prefix", aim.rfind("at:389:", 0) == 0, true);
+    CheckBool("door aim preserves useful coordinate precision",
+              aim == "at:389:2.6,-0.0,-13.4", true);
+    CheckBool("door aim fits the roster column", aim.size() <= 32, true);
+
+    std::string const large = TravelAimAtPosition(12345, -17000.6f, -17000.6f, -17000.6f);
+    CheckBool("large door coordinates use whole-yard precision",
+              large == "at:12345:-17001,-17001,-17001", true);
+    CheckBool("large door aim still fits the roster column", large.size() <= 32, true);
+}
+
+void DungeonAndRaidDoorWalksUseTheBoundedFormatter()
+{
+    std::ifstream input("src/mod_overseer.cpp");
+    std::string const source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    std::size_t count = 0;
+    for (std::size_t position = source.find("TravelAimAtPosition(");
+         position != std::string::npos;
+         position = source.find("TravelAimAtPosition(", position + 1))
+        ++count;
+    CheckBool("crossing, straggler, and raid doors share the bounded formatter",
+              count >= 3, true);
+}
+
+void AnUnformattableDoorAimIsRefusedByEveryAdapter()
+{
+    std::ifstream input("src/mod_overseer.cpp");
+    std::string const source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+
+    std::size_t const crossingCall =
+        source.find("TravelAimAtPosition(", source.find("DriveDungeonCrossing("));
+    std::size_t const crossingGuard = source.find("if (doorAim.empty())", crossingCall);
+    std::size_t const crossingRefusal =
+        source.find("return DungeonCrossingResult::GaveUp;", crossingGuard);
+    CheckBool("crossing refuses an unformattable aim",
+              crossingCall != std::string::npos && crossingGuard != std::string::npos &&
+                  crossingRefusal != std::string::npos &&
+                  crossingRefusal - crossingGuard < 500,
+              true);
+
+    std::size_t const stragglerCall =
+        source.find("TravelAimAtPosition(", source.find("WalkStragglersOut("));
+    std::size_t const stragglerGuard = source.find("if (doorAim.empty())", stragglerCall);
+    std::size_t const stragglerRefusal = source.find("return 0;", stragglerGuard);
+    CheckBool("straggler exit refuses an unformattable aim",
+              stragglerCall != std::string::npos &&
+                  stragglerGuard != std::string::npos &&
+                  stragglerRefusal != std::string::npos &&
+                  stragglerRefusal - stragglerGuard < 500,
+              true);
+
+    std::size_t const raidCall = source.find("TravelAimAtPosition(", stragglerCall + 1);
+    std::size_t const raidGuard = source.find("if (aim.empty())", raidCall);
+    std::size_t const raidRefusal = source.find("continue;", raidGuard);
+    std::size_t const raidTimeline = source.find("WriteRaidTimeline(", raidGuard);
+    CheckBool("raid door refuses an unformattable aim",
+              raidCall != std::string::npos && raidGuard != std::string::npos &&
+                  raidRefusal != std::string::npos && raidTimeline != std::string::npos &&
+                  raidTimeline < raidRefusal && raidRefusal - raidGuard < 500,
+              true);
+}
+
 } // namespace
 
 int main()
@@ -381,6 +449,9 @@ int main()
     ATooLooseToleranceArrivesOutsideTheDoor();
     ADoorWithNoRadiusIsRefusedRatherThanGuessed();
     TheLandingPointIsAlreadyInsideTheWayOutOnceTheServersCheckIsUsed();
+    APositionAimFitsTheRosterColumnAtDungeonCoordinates();
+    DungeonAndRaidDoorWalksUseTheBoundedFormatter();
+    AnUnformattableDoorAimIsRefusedByEveryAdapter();
     if (!failures)
         std::printf("a member left inside is walked out, and an aim only opens a door it "
                     "stops inside\n");

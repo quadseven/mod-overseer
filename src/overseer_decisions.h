@@ -2505,6 +2505,12 @@ constexpr float DOOR_ARRIVAL_FLOOR_YARDS = 1.0f;
 DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYards,
                                 AreaTriggerShape const& trigger);
 
+// Format the position form of the roster's travel aim. Keep the result within
+// the column's 32-character limit while retaining tenths of a yard where the
+// map id and coordinates allow it.
+constexpr std::size_t TRAVEL_AIM_MAX_CHARS = 32;
+std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z);
+
 // HOW FAR BACK FROM THIS DOOR THE PARTY GATHERS. The staging standoff is
 // measured from the door's centre, and for a sphere it is `standoffYards`
 // exactly as it always was: every sphere row stages on that number today and
