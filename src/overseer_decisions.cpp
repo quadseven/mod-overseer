@@ -2644,6 +2644,13 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
+uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask, uint32_t wingMask)
+{
+    if (!DungeonMapHasIndependentWings(mapId))
+        return mapMask;
+    return mapMask & wingMask;
+}
+
 bool DungeonMapHasIndependentWings(uint32_t mapId)
 {
     // Scarlet Monastery's four wings share map 189 but have separate entrance

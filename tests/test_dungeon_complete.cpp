@@ -15,6 +15,7 @@
 
 using OverseerDecisions::DungeonCompletion;
 using OverseerDecisions::DungeonRunCompletion;
+using OverseerDecisions::DungeonRunExpectedMask;
 using OverseerDecisions::DungeonMapHasIndependentWings;
 using OverseerDecisions::DungeonRunExitOutcome;
 
@@ -107,6 +108,24 @@ void BitsTheMapDoesNotCreditAreIgnored()
           DungeonCompletion::NotYet);
 }
 
+void IndependentWingsUseOnlyTheirVerifiedEncounters()
+{
+    constexpr uint32_t mapMask = 0b1111111;
+    constexpr uint32_t graveyardMask = 0b0000011;
+    CheckBool("Scarlet Graveyard selects its two encounter bits",
+             DungeonRunExpectedMask(189, mapMask, graveyardMask) == graveyardMask, true);
+    Check("Scarlet Graveyard is complete after its two bosses",
+          DungeonRunCompletion(DungeonRunExpectedMask(189, mapMask, graveyardMask),
+                               graveyardMask), DungeonCompletion::Complete);
+    Check("Scarlet Graveyard remains incomplete after one boss",
+          DungeonRunCompletion(DungeonRunExpectedMask(189, mapMask, graveyardMask),
+                               0b0000001), DungeonCompletion::NotYet);
+    CheckBool("an unconfigured independent wing fails closed",
+             DungeonRunExpectedMask(189, mapMask, 0) == 0, true);
+    CheckBool("connected maps keep their full encounter mask",
+             DungeonRunExpectedMask(389, 0b1111, 0b0001) == 0b1111, true);
+}
+
 void TheOutcomeWordPrefersProofOverInference()
 {
     CheckWord("plain walk out", DungeonRunExitOutcome(false, false, false), "left");
@@ -159,6 +178,7 @@ int main()
     EveryCreditedEncounterMeansComplete();
     OneEncounterShortIsNotFinished();
     BitsTheMapDoesNotCreditAreIgnored();
+    IndependentWingsUseOnlyTheirVerifiedEncounters();
     TheOutcomeWordPrefersProofOverInference();
     TheNewWordStillCountsAsARun();
     if (!failures)

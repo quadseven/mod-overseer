@@ -248,8 +248,10 @@
 #include "DBCStores.h"
 #include "DBCStructure.h"
 #include "AiFactory.h"
+#include "AiObjectContext.h"
 #include "PlayerbotFactory.h"
 #include "Playerbots.h"
+#include "Value.h"
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
@@ -31995,44 +31997,42 @@ private:
         return 0;
     }
 
-    // EVERY BIT THIS MAP CAN CREDIT, WHICH IS WHAT "FINISHED" HAS TO BE
-    // MEASURED AGAINST (#226).
-    //
-    // BUILT FROM THE SAME LIST THE CORE CREDITS OUT OF, so the two numbers
-    // cannot drift: Map::UpdateEncounterState (Map.cpp:2933-2975) walks exactly
-    // this list on every kill and ORs in `1 << dbcEntry->encounterIndex`, then
-    // writes the result to the InstanceSave that CompletedEncounters above reads
-    // back. Asking the same store for the whole set turns that running total
-    // into a completion test without a per-map constant anybody has to maintain,
-    // and without the boss-state framework neither Deadmines nor Wailing Caverns
-    // uses. See OverseerDecisions::DungeonRunCompletion for the argument at
-    // length.
-    //
-    // ZERO IS "THIS MAP CREDITS NOTHING", NOT "NOTHING LEFT TO DO", and the
-    // decision function is built around telling those apart. A map with no rows
-    // in the DBC answers nullptr here, and a run on it keeps exactly the endings
-    // it has today.
-    //
-    // GetDungeonEncounterList  ObjectMgr.h:953; DungeonEncounter::dbcEntry
-    // ObjectMgr.h:710; DungeonEncounterEntry::encounterIndex DBCStructure.h.
-    // Read every time rather than cached: it is a hash lookup in a store loaded
-    // once at startup, and a cached copy is one more thing that can be stale -
-    // the same argument the door's own coordinates are re-read under.
-    static uint32 ExpectedEncounterMask(uint32 mapId)
+    // THE MAP'S DBC MASK IS THE BOUNDARY; FOR SPLIT MAPS THE DUNGEON BRAIN'S
+    // WING-FILTERED ROSTER SUPPLIES THE SUBSET. That roster is already filtered
+    // from the same DungeonEncounter credit entries the core uses, so this does
+    // not maintain a second boss-to-wing table. Intersecting the two masks keeps
+    // an absent or unverified wing roster from claiming bits the instance cannot
+    // credit. A zero expectation remains Unknowable in DungeonRunCompletion.
+    static uint32 DungeonBrainExpectedEncounterMask(Player* member)
     {
-        if (OverseerDecisions::DungeonMapHasIndependentWings(mapId))
+        PlayerbotAI* ai = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        AiObjectContext* context = ai ? ai->GetAiObjectContext() : nullptr;
+        if (!context)
             return 0;
 
+        Value<uint32>* const value =
+            context->GetValue<uint32>("dungeon clear expected encounter mask");
+        return value ? value->Get() : 0;
+    }
+
+    static uint32 ExpectedEncounterMask(uint32 mapId, Player* member)
+    {
         DungeonEncounterList const* encounters =
             sObjectMgr->GetDungeonEncounterList(mapId, DUNGEON_DIFFICULTY_NORMAL);
         if (!encounters)
             return 0;
 
-        uint32 mask = 0;
+        uint32 mapMask = 0;
         for (DungeonEncounter const* encounter : *encounters)
-            if (encounter && encounter->dbcEntry)
-                mask |= 1u << encounter->dbcEntry->encounterIndex;
-        return mask;
+            if (encounter && encounter->dbcEntry &&
+                encounter->dbcEntry->encounterIndex < 32)
+                mapMask |= 1u << encounter->dbcEntry->encounterIndex;
+
+        uint32 const wingMask =
+            OverseerDecisions::DungeonMapHasIndependentWings(mapId)
+                ? DungeonBrainExpectedEncounterMask(member)
+                : 0;
+        return OverseerDecisions::DungeonRunExpectedMask(mapId, mapMask, wingMask);
     }
 
     // ---- the CLEARING watchdog: has the run gone anywhere (#171) ----
@@ -37043,9 +37043,9 @@ private:
             // could only end on the finder flag: 1 of 20 runs cleared, the rest
             // timed out or were lost. The same DungeonEncounter.dbc credit the
             // campaign coordinator finishes on (CompletedEncounters,
-            // ExpectedEncounterMask) answers it. Wing maps expect 0 and stay on
-            // the finder flag.
-            poll.expectedMask = ExpectedEncounterMask(run.mapId);
+            // ExpectedEncounterMask) answers it, filtered to the wing named by
+            // this run's portal keyword.
+            poll.expectedMask = ExpectedEncounterMask(run.mapId, tank);
             poll.creditedMask = poll.expectedMask ? CompletedEncounters(tank) : 0;
             if (!run.bossesTotal && poll.expectedMask)
             {
@@ -44529,7 +44529,8 @@ private:
             // and this is not asked again for the run.
             if (!coord.provedComplete)
             {
-                uint32 const expected = ExpectedEncounterMask(portal->insideMapId);
+                uint32 const expected =
+                    ExpectedEncounterMask(portal->insideMapId, leader);
                 uint32 const credited = CompletedEncounters(leader);
                 OverseerDecisions::DungeonCompletion const done =
                     OverseerDecisions::DungeonRunCompletion(expected, credited);
@@ -44544,12 +44545,13 @@ private:
                     coord.loggedCrossingWaiting = false;
                     LOG_INFO("module.overseer",
                              "overseer: dungeon run {} of campaign {} is FINISHED - every "
-                             "encounter map {} credits has been credited (mask {} of {}). "
+                             "encounters required for portal '{}' on map {} have been "
+                             "credited (mask {} of {}). "
                              "EXIT walks them back out through the door they came in by, "
                              "which is the first ending this coordinator has ever had for "
                              "a run that simply worked",
-                             coord.runNumber, coord.campaignId, portal->insideMapId,
-                             credited, expected);
+                             coord.runNumber, coord.campaignId, portal->keyword,
+                             portal->insideMapId, credited, expected);
                     return;
                 }
 
@@ -44563,17 +44565,13 @@ private:
                 {
                     coord.loggedNoCompletionSignal = true;
                     LOG_WARN("module.overseer",
-                             "overseer: map {} {}, so this "
-                             "coordinator cannot tell when a run on it is finished. The "
+                             "overseer: map {} has no verified encounter mask for portal "
+                             "'{}', so this coordinator cannot tell when the run is "
+                             "finished. The "
                              "run still ends the ways it always could - the clearing "
                              "watchdog, a job change, or the map emptying - and it will "
                              "never be recorded 'complete'",
-                             portal->insideMapId,
-                             OverseerDecisions::DungeonMapHasIndependentWings(
-                                 portal->insideMapId)
-                                 ? "is split into wings its DungeonEncounter rows do not "
-                                   "tell apart (#431)"
-                                 : "has no DungeonEncounter rows");
+                             portal->insideMapId, portal->keyword);
                 }
             }
 
