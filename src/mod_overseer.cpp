@@ -798,6 +798,45 @@ struct NearbyThreat
     std::string name;
 };
 
+static std::unordered_map<ObjectGuid::LowType, int32> const& CreatureSpawnEvents()
+{
+    static std::unordered_map<ObjectGuid::LowType, int32> const bySpawn = [] {
+        std::unordered_map<ObjectGuid::LowType, int32> out;
+        auto const& lists = sGameEventMgr->GameEventCreatureGuids;
+        uint32 const eventCount = static_cast<uint32>(sGameEventMgr->GetEventMap().size());
+        for (uint32 slot = 0; slot < lists.size(); ++slot)
+        {
+            int32 const gameEvent = OverseerDecisions::GameEventOfSlot(slot, eventCount);
+            if (!gameEvent)
+                continue;
+            for (ObjectGuid::LowType const spawnId : lists[slot])
+                out.emplace(spawnId, gameEvent);
+        }
+        return out;
+    }();
+    return bySpawn;
+}
+
+static int32 CreatureSpawnEvent(ObjectGuid::LowType spawnId)
+{
+    auto const& bySpawn = CreatureSpawnEvents();
+    auto const found = bySpawn.find(spawnId);
+    return found == bySpawn.end() ? 0 : found->second;
+}
+
+static bool SpawnEventIsActive(int32 gameEvent)
+{
+    if (!gameEvent)
+        return true;
+    uint16 const id = static_cast<uint16>(gameEvent < 0 ? -gameEvent : gameEvent);
+    return OverseerDecisions::SpawnStandsNow(gameEvent, sGameEventMgr->IsActiveEvent(id));
+}
+
+static bool CreatureSpawnStandsNow(ObjectGuid::LowType spawnId)
+{
+    return SpawnEventIsActive(CreatureSpawnEvent(spawnId));
+}
+
 // WHETHER THIS SPAWN IS SOMETHING A CHARACTER COULD BE MADE TO FIGHT AT ALL
 // (#302, which is a live false refusal in the gate that already shipped and is
 // filed on its own because it stands without #300).
@@ -852,6 +891,9 @@ static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float 
     for (auto const& spawn : sObjectMgr->GetAllCreatureData())
     {
         CreatureData const& data = spawn.second;
+        // Match travel target selection: inactive event spawns are not hazards.
+        if (!CreatureSpawnStandsNow(spawn.first))
+            continue;
         if (data.mapid != mapId)
             continue;
         float const dx = data.posX - x;
@@ -938,6 +980,8 @@ static void HostileSpawnsNearEach(Player* bot, uint32 mapId,
     for (auto const& spawn : sObjectMgr->GetAllCreatureData())
     {
         CreatureData const& data = spawn.second;
+        if (!CreatureSpawnStandsNow(spawn.first))
+            continue;
         if (data.mapid != mapId)
             continue;
         CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
@@ -13059,22 +13103,7 @@ private:
     // OverseerDecisions::GameEventOfSlot states.
     static int32 GameEventOfSpawn(ObjectGuid::LowType spawnId)
     {
-        static std::unordered_map<ObjectGuid::LowType, int32> const bySpawn = [] {
-            std::unordered_map<ObjectGuid::LowType, int32> out;
-            auto const& lists = sGameEventMgr->GameEventCreatureGuids;
-            uint32 const eventCount = static_cast<uint32>(sGameEventMgr->GetEventMap().size());
-            for (uint32 slot = 0; slot < lists.size(); ++slot)
-            {
-                int32 const gameEvent = OverseerDecisions::GameEventOfSlot(slot, eventCount);
-                if (!gameEvent)
-                    continue;
-                for (ObjectGuid::LowType const spawnId : lists[slot])
-                    out.emplace(spawnId, gameEvent);
-            }
-            return out;
-        }();
-        auto const found = bySpawn.find(spawnId);
-        return found == bySpawn.end() ? 0 : found->second;
+        return CreatureSpawnEvent(spawnId);
     }
 
     // IS A SPAWN OF THIS EVENT IN THE WORLD RIGHT NOW (#686)? Asked at every
@@ -13082,10 +13111,7 @@ private:
     // stops while the worldserver runs.
     static bool SpawnInWorldNow(int32 gameEvent)
     {
-        if (!gameEvent)
-            return true;
-        uint16 const id = static_cast<uint16>(gameEvent < 0 ? -gameEvent : gameEvent);
-        return OverseerDecisions::SpawnStandsNow(gameEvent, sGameEventMgr->IsActiveEvent(id));
+        return SpawnEventIsActive(gameEvent);
     }
 
     // WHY AN INDEX AND NOT A QUERY, and why it is built here rather than in
