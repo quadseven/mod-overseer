@@ -3907,8 +3907,8 @@ enum class TravelClaim : uint8_t
 // the staging errand was released on arrival, BARRIER's re-claim of the same
 // point was refused, and the leader was 408 yards away 90 seconds later.
 //
-// Four owners share the travel column, and each claim now says which it is.
-// There is no "unspecified", so a fifth owner cannot arrive fenced by default.
+// Each claim names its owner. There is no "unspecified", so a new owner cannot
+// arrive fenced by default.
 enum class TravelOwner : uint8_t
 {
     HomeErrand,  // a walk to the campaign's inn (#348)
@@ -3918,6 +3918,7 @@ enum class TravelOwner : uint8_t
     WalkBackIn,  // a member walked back into the instance its run is in (#393)
     Respec,      // a walk to a class trainer of its own class for a talent reset (#626)
     TrainingStop,  // the head walking the family to a member's trainer in town (#688)
+    TownTrip,    // a maintenance counter walk that yields to existing errands
     Exit,        // evacuating members after the run is complete
 };
 

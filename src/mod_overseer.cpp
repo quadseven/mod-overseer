@@ -5164,6 +5164,10 @@ void LeaderIntentForTravelOwner(OverseerDecisions::TravelOwner owner,
             kind = OverseerDecisions::LeaderIntentKind::TrainingStop;
             ownerWord = "training stop";
             return;
+        case OverseerDecisions::TravelOwner::TownTrip:
+            kind = OverseerDecisions::LeaderIntentKind::TownErrand;
+            ownerWord = "town trip";
+            return;
     }
     kind = OverseerDecisions::LeaderIntentKind::TownErrand;
     ownerWord = "travel column";
@@ -20328,7 +20332,8 @@ private:
     // Ask for a member to be walked to `aim`, and say so once. Idempotent: a
     // re-ask while the same aim is in flight is what every poll of a crossing
     // does, and TravelAimBook::Claim already refuses to disturb a walk it is
-    // holding the memory for.
+    // holding the memory for. A town trip uses a separate owner below so it
+    // yields to bridge errands rather than claiming live-run priority.
     //
     // `purpose` is stated by every caller rather than defaulted, because the
     // two answers stand a different drive down - see DungeonEscort::purpose.
@@ -20339,6 +20344,13 @@ private:
             purpose == EscortPurpose::LeaveInstance
                 ? OverseerDecisions::TravelOwner::Exit
                 : OverseerDecisions::TravelOwner::Run;
+        EscortTowardWithOwner(name, aim, what, purpose, owner);
+    }
+
+    void EscortTowardWithOwner(std::string const& name, std::string const& aim,
+                               char const* what, EscortPurpose purpose,
+                               OverseerDecisions::TravelOwner owner)
+    {
         if (!_travelAims.Claim(name, aim, owner))
             return;
 
@@ -20384,8 +20396,9 @@ private:
                      "the run's staging point is where the leader is going anyway",
                      what, name, from);
         }
-        // EVERY CALLER IS A RUN WALK (#598). Its exit gets a distinct owner so
-        // it can take over a counter errand; other run walks keep that fence.
+        // A RUN EXIT gets a distinct owner so it can take over a counter errand;
+        // other run walks keep that fence. Town trips use a distinct owner and
+        // cannot pass that same counter-errand fence.
         if (escort.aim == aim)
             return;
 
@@ -40216,7 +40229,8 @@ private:
                     // EscortPurpose::Assemble and not LeaveInstance: nobody is
                     // inside anything, and the purpose is what DriveDungeonClear
                     // reads to decide whether to stand the dungeon brain down.
-                    EscortToward(name, aim, "TOWN", EscortPurpose::Assemble);
+                    EscortTowardWithOwner(name, aim, "TOWN", EscortPurpose::Assemble,
+                                          OverseerDecisions::TravelOwner::TownTrip);
                     trip.walked.insert(name);
                     break;
 
