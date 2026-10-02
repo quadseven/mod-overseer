@@ -45085,7 +45085,7 @@ private:
             Group* group = p->GetGroup();
             if (first)
                 ss << "REPLACE INTO overseer_snapshot (guid, name, level, race, class, "
-                      "map_id, zone_id, area_id, pos_x, pos_y, pos_z, health, max_health, "
+                      "map_id, instance_id, zone_id, area_id, pos_x, pos_y, pos_z, health, max_health, "
                       "in_combat, is_bot, guild_id, group_leader, target_guid) VALUES ";
             else
                 ss << ',';
@@ -45097,6 +45097,7 @@ private:
                << uint32(p->getRace()) << ','
                << uint32(p->getClass()) << ','
                << p->GetMapId() << ','
+               << p->GetInstanceId() << ','
                << p->GetZoneId() << ','
                << p->GetAreaId() << ','
                << p->GetPositionX() << ','
