@@ -58430,7 +58430,9 @@ private:
     // banner on WEAPON_TRAIN_VERB in overseer_decisions.h. The trainer spell is
     // found by what it teaches: the spell itself, or the spell its
     // SPELL_EFFECT_LEARN_SPELL names, carries a SpellLearnSkillNode for the
-    // weapon skill.
+    // weapon skill. Some baseline weapon proficiencies instead expose the
+    // taught skill only through SkillLineAbility.dbc (for example, Woo Ping's
+    // Daggers spell 1180); that mapping is the final fallback.
     static uint32 WeaponSkillTaughtBy(uint32 spellId)
     {
         if (SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(spellId))
@@ -58445,7 +58447,23 @@ private:
             if (SpellLearnSkillNode const* node = sSpellMgr->GetSpellLearnSkill(effect.TriggerSpell))
                 return node->skill;
         }
-        return 0;
+
+        // Weapon masters also teach direct proficiency spells whose learned
+        // skill appears in SkillLineAbility.dbc rather than SpellLearnSkill.
+        // Refuse an ambiguous mapping instead of attributing one spell to the
+        // wrong weapon skill.
+        uint32 weaponSkill = 0;
+        SkillLineAbilityMapBounds const bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+        for (auto it = bounds.first; it != bounds.second; ++it)
+        {
+            SkillLineAbilityEntry const* ability = it->second;
+            if (!ability || !SkillLineIsCategory(ability->SkillLine, SKILL_CATEGORY_WEAPON))
+                continue;
+            if (weaponSkill && weaponSkill != ability->SkillLine)
+                return 0;
+            weaponSkill = ability->SkillLine;
+        }
+        return weaponSkill;
     }
 
     struct TrainerNearbyCheck
