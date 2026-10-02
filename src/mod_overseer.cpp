@@ -7129,6 +7129,9 @@ public:
             // After the trainer, so a reset bought since the last poll has had
             // its points spent before the strategies are asked about (#626).
             KeepTankStrategies();
+            // Buff strategies are never granted by the strategy management -
+            // a priest without "buff" never casts Fortitude. Same clock.
+            KeepBuffStrategies();
             DriveRespec();
             // After the respec, which claims the same column for its own
             // trainer walk and is asked first (#688).
@@ -46191,6 +46194,68 @@ private:
                          "to its combat engine and did not take - it still does not answer "
                          "IsTank",
                          name, static_cast<uint32>(specTab), change);
+            }
+        } while (result->NextRow());
+    }
+
+    // Buff strategies are never granted by the strategy management above -
+    // a priest without "buff" never casts Fortitude, a paladin without
+    // "bwisdom" never blesses. This runs on the same clock as
+    // KeepTankStrategies and repairs them.
+    void KeepBuffStrategies()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            uint8 const cls = bot->getClass();
+            // Priests, mages and druids share the generic "buff" strategy
+            // (Fortitude/Divine Spirit, Arcane Intellect, Mark of the Wild).
+            // Priests also get "rshadow" for Shadow Protection. Paladins use
+            // "bwisdom" (Wisdom and Kings on the party).
+            std::vector<std::string> wanted;
+            if (cls == CLASS_PRIEST)
+            {
+                wanted.push_back("buff");
+                wanted.push_back("rshadow");
+            }
+            else if (cls == CLASS_MAGE || cls == CLASS_DRUID)
+            {
+                wanted.push_back("buff");
+            }
+            else if (cls == CLASS_PALADIN)
+            {
+                wanted.push_back("bwisdom");
+            }
+            else
+            {
+                continue;
+            }
+
+            for (std::string const& strategy : wanted)
+            {
+                if (StrategyPresent(botAI, StrategyItem{strategy, true}))
+                    continue;
+                std::string const change = "+" + strategy;
+                botAI->ChangeStrategy(change.c_str(), BOT_STATE_NON_COMBAT);
+                if (StrategyPresent(botAI, StrategyItem{strategy, true}))
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' lacked the '{}' buff strategy - granted, "
+                             "so it buffs its party",
+                             name, strategy);
+                }
             }
         } while (result->NextRow());
     }
