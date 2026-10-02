@@ -2982,6 +2982,7 @@ bool TravelOwnerPassesAnEmptyLearnColumn(TravelOwner owner)
         case TravelOwner::Respec:
         case TravelOwner::TrainingStop:
             return true;
+        case TravelOwner::TownTrip:
         case TravelOwner::HomeErrand:
             return false;
     }
@@ -3000,6 +3001,7 @@ bool TravelOwnerIsALiveRun(TravelOwner owner)
         case TravelOwner::CatchUp:
         case TravelOwner::Respec:
         case TravelOwner::TrainingStop:
+        case TravelOwner::TownTrip:
             return false;
     }
     return false;

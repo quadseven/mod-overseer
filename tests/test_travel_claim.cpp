@@ -55,6 +55,15 @@ void CheckClaim(char const* what, TravelClaim got, TravelClaim want)
     ++failures;
 }
 
+void CheckBool(char const* what, bool got, bool want)
+{
+    if (got == want)
+        return;
+    std::printf("FAIL %s: got %s, wanted %s\n", what, got ? "true" : "false",
+                want ? "true" : "false");
+    ++failures;
+}
+
 void CheckText(char const* what, std::string const& got, std::string const& want)
 {
     if (got == want)
@@ -140,6 +149,34 @@ void ARunClaimOverAnEmptyColumnIsWritten()
                ReadTravelClaim(RunFacts(0, "")), TravelClaim::Write);
 }
 
+// A counter run is not a dungeon run. It must let a bridge-owned auction,
+// mailbox, or other positional errand finish before taking the travel column.
+void ATownTripYieldsToAnOutstandingErrand()
+{
+    using OverseerDecisions::TravelOwner;
+    using OverseerDecisions::TravelOwnerIsALiveRun;
+    using OverseerDecisions::TravelOwnerPassesAnEmptyLearnColumn;
+
+    TravelClaimFacts town(TravelOwner::TownTrip);
+    town.column = "at:0:-8815.2,652.9,94.9";
+    town.target = "vendor";
+    CheckClaim("a town trip waits for a bridge positional errand",
+               ReadTravelClaim(town), TravelClaim::RefusedForeign);
+
+    town.column.clear();
+    town.learnSkill = 186;
+    CheckClaim("a town trip does not displace a pending profession errand",
+               ReadTravelClaim(town), TravelClaim::RefusedProfession);
+
+    town.learnSkill = 0;
+    CheckClaim("a town trip can claim an otherwise idle travel column",
+               ReadTravelClaim(town), TravelClaim::Write);
+    CheckBool("a town trip is not a live dungeon run",
+              TravelOwnerIsALiveRun(TravelOwner::TownTrip), false);
+    CheckBool("a town trip does not pass an empty profession column",
+              TravelOwnerPassesAnEmptyLearnColumn(TravelOwner::TownTrip), false);
+}
+
 // AN AIM THE BOOK ALREADY WROTE IS REPLACED. A catch-up re-aim and a run's
 // next leg both write over the book's own previous `at:` aim, which the foreign
 // fence would otherwise refuse as if the bridge had written it.
@@ -216,6 +253,7 @@ int main()
     ACatchUpClaimAcrossTheThreeCases();
     AnOrdinaryClaimKeepsTheProfessionFence();
     ARunClaimOverAnEmptyColumnIsWritten();
+    ATownTripYieldsToAnOutstandingErrand();
     TheBooksOwnAimIsReplaced();
     TheReleaseLineNamesTheFence();
 
