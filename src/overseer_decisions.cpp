@@ -32,6 +32,11 @@ LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
     return LeaderClientGate::Open;
 }
 
+bool DungeonLeaderHoldsTheSeat(bool clientSocketOpen, bool headlessSteerable)
+{
+    return clientSocketOpen || headlessSteerable;
+}
+
 LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuerAvailable,
                                                std::time_t lostSince,
                                                std::time_t now, std::time_t maxWaitSeconds)
