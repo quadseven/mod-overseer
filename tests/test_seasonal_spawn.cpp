@@ -96,6 +96,8 @@ void EverySpawnSearchAsks()
           source.find("spawn.gameEvent = GameEventOfSpawn(itr.first);") != std::string::npos);
     Check("both index searches skip a spawn out of the world",
           count("if (!SpawnInWorldNow(spawn.gameEvent))") == 2);
+    Check("the hostile-ground sweep skips event spawns that are not in the world",
+          count("if (!CreatureSpawnStandsNow(spawn.first))") == 2);
     Check("the guild-bot walk skips it too",
           source.find("if (!SpawnInWorldNow(GameEventOfSpawn(itr.first)))") != std::string::npos);
     Check("the event lists are read through the core's slot layout",
