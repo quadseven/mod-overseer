@@ -3424,6 +3424,13 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
 
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.
+// The encounter bits a run cannot be expected to credit, because the boss
+// spawns only through an event or an item mod-dungeon-clear never starts.
+// Taken out of every expectation (DungeonRunExpectedMask), so a party that
+// killed everything else proves the run complete instead of standing in the
+// instance until the clearing watchdog ends it 'stalled'.
+uint32_t EventGatedEncounterMask(uint32_t mapId);
+
 uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask,
                                 uint32_t wingMask);
 

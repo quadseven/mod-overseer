@@ -126,6 +126,27 @@ void IndependentWingsUseOnlyTheirVerifiedEncounters()
              DungeonRunExpectedMask(389, 0b1111, 0b0001) == 0b1111, true);
 }
 
+void AnEventGatedBossIsNotRequired()
+{
+    // wow-dev 2026-10-03: a full Gnomeregan clear credited mask 58 of 62. The
+    // missing bit is Grubbis, who spawns only with the Emi Shortfuse escort.
+    constexpr uint32_t gnomeregan = 0b111110;
+    Check("Gnomeregan is complete without Grubbis",
+          DungeonRunCompletion(DungeonRunExpectedMask(90, gnomeregan, 0), 58),
+          DungeonCompletion::Complete);
+    Check("Gnomeregan still waits on Thermaplugg",
+          DungeonRunCompletion(DungeonRunExpectedMask(90, gnomeregan, 0), 58 & ~(1u << 5)),
+          DungeonCompletion::NotYet);
+    CheckBool("Wailing Caverns does not require Mutanus",
+             DungeonRunExpectedMask(43, 0xFF, 0) == 0x7F, true);
+    CheckBool("Razorfen Downs does not require Tuten'kash",
+             DungeonRunExpectedMask(129, 0b1111, 0) == 0b1110, true);
+    CheckBool("Zul'Farrak does not require Gahz'rilla",
+             DungeonRunExpectedMask(209, 0xFF, 0) == 0xFD, true);
+    CheckBool("a map with no gated boss is unchanged",
+             DungeonRunExpectedMask(389, 0b1111, 0) == 0b1111, true);
+}
+
 void TheOutcomeWordPrefersProofOverInference()
 {
     CheckWord("plain walk out", DungeonRunExitOutcome(false, false, false), "left");
@@ -179,6 +200,7 @@ int main()
     OneEncounterShortIsNotFinished();
     BitsTheMapDoesNotCreditAreIgnored();
     IndependentWingsUseOnlyTheirVerifiedEncounters();
+    AnEventGatedBossIsNotRequired();
     TheOutcomeWordPrefersProofOverInference();
     TheNewWordStillCountsAsARun();
     if (!failures)
