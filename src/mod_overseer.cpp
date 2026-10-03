@@ -5870,10 +5870,17 @@ public:
         // EACH FENCE IS READ ONCE, AND THE LINE PRINTS WHAT THE GATE TESTED
         // (#561). The line used to read the column a second time and print it
         // whichever fence fired, so a profession errand read as "errand ''".
-        uint32 const learnSkill = claimed ? 0 : LearnSkillPending(name);
-        std::string const fence = changedSinceClaim
-            ? std::string("the column changed after this book's claim")
-            : OverseerDecisions::TravelReleaseFence(learnSkill, standing);
+        // THE GATE DECIDES, NOT THE FENCE ALONE (#822). A self-claimed aim
+        // whose column has not moved since is this book's errand ending, and
+        // the foreign-aim fence does not apply to it: asking the fence alone
+        // read a claimed `repair` as a foreign errand, skipped the column
+        // write, and reborn the same stale aim every poll.
+        OverseerDecisions::TravelReleaseGateFacts gateFacts;
+        gateFacts.claimed = claimed;
+        gateFacts.changedSinceClaim = changedSinceClaim;
+        gateFacts.learnSkill = claimed ? 0 : LearnSkillPending(name);
+        gateFacts.standing = standing;
+        std::string const fence = OverseerDecisions::TravelReleaseGate(gateFacts);
         // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
         // in the column the travel drive was not walking has not walked it at
         // all, and must not stop the travel drive from starting it.

@@ -3036,6 +3036,27 @@ std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing)
     return said;
 }
 
+std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
+{
+    // A COLUMN THAT MOVED AFTER THE CLAIM IS NOT THIS BOOK'S TO ERASE. The
+    // writer that moved it owns what stands now; the release leaves it and
+    // the book's own bookkeeping still ends, exactly as before.
+    if (facts.changedSinceClaim)
+        return "the column changed after this book's claim";
+    // A CLAIMED AIM IS THIS BOOK'S ERRAND ENDING (#822). The foreign-aim fence
+    // exists for aims the book never claimed - a repair/vendor/banker/
+    // auctioneer aim the bridge wrote, a positional aim another pass is
+    // walking. When this book wrote the standing aim itself and the column has
+    // not moved since, the errand is over and the column write goes through:
+    // skipping it leaves the stale aim standing with the claim erased, and
+    // the next poll re-reads it as a new errand forever. Measured in Scarlet
+    // Monastery: sent to `repair`, no spawn on the map, release, write
+    // skipped - reborn every poll.
+    if (facts.claimed)
+        return std::string();
+    return TravelReleaseFence(facts.learnSkill, facts.standing);
+}
+
 bool RunAimMayBeReleased(std::string const& current,
                          std::string const& recordedRunAim)
 {

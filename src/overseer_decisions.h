@@ -4013,6 +4013,30 @@ bool TravelFocusOutlivesItsErrand(TravelFocusFacts const& facts);
 // caller cannot pair a plural subject with a singular verb.
 std::string TravelReleaseFence(uint32_t learnSkill, std::string const& standing);
 
+// THE RELEASE GATE'S FULL DECISION (#822). TravelReleaseFence answers whether
+// a fence is up; this answers whether the gate fires, given whose aim is
+// standing. TravelAimBook::ReleaseImpl asks this instead of the fence alone,
+// because the fence alone cannot tell "an aim this book never claimed" from
+// "the errand this book just finished".
+struct TravelReleaseGateFacts
+{
+    // This book wrote the aim now standing in the column (_claimed answers).
+    bool claimed{false};
+    // The column moved after that claim: whatever stands now is not the
+    // book's to erase, claimed or not.
+    bool changedSinceClaim{false};
+    // Pending learn skill, or 0. Read only when the aim is unclaimed; a
+    // claimed aim's errand is ending, profession or not.
+    uint32_t learnSkill{0};
+    // The travel_npc column as the release read it.
+    std::string standing;
+};
+
+// Empty means the column write goes through. Non-empty is the same whole
+// clause TravelReleaseFence returns, or "the column changed after this book's
+// claim" when the column moved.
+std::string TravelReleaseGate(TravelReleaseGateFacts const& facts);
+
 // May the dungeon coordinator clear this exact positional aim when its run
 // ends? A newer or unrelated aim must remain untouched.
 bool RunAimMayBeReleased(std::string const& current, std::string const& recordedRunAim);
