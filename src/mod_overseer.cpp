@@ -7500,20 +7500,6 @@ private:
             player->GetName(), RosterRequiresAClient(), HeadlessRosterCache());
     }
 
-    // Is this character in the world as a headless roster bot, played
-    // unwatched by configuration? Steerable asked with no client: the answer
-    // for the seat a dungeon run's leader holds when nobody is watching
-    // (OverseerDecisions::DungeonLeaderHoldsTheSeat).
-    static bool HeadlessSeat(Player const* player)
-    {
-        if (!player)
-            return false;
-        WorldSession const* session = player->GetSession();
-        return OverseerDecisions::RosterCharacterIsSteerable(
-            false, player->IsInWorld(), session && session->IsBot(),
-            player->GetName(), RosterRequiresAClient(), HeadlessRosterCache());
-    }
-
     // Log a headless bot out through whichever holder owns it. Mirrors
     // mod-playerbots' own eviction on a real login
     // (PlayerbotsSecureLogin.cpp:31-50): a bot added by a master lives in
@@ -25424,14 +25410,7 @@ private:
     // condition, is the caller's to check.
     static bool MayIssueDcCommands(Player* member)
     {
-        // A HEADLESS ROSTER LEADER MAY ISSUE TOO. The leader is kept its own
-        // master (a selfbot) by KeepRosterFollowing over `present`, which is
-        // the Steerable list, headless bots included. Asking for a socket
-        // here as well left every headless family with no issuer and the
-        // dungeon brain OFF (dev realm, 2026-09-29).
-        return OverseerDecisions::DungeonLeaderHoldsTheSeat(ClientAttached(member),
-                                                            HeadlessSeat(member)) &&
-               (IsRealPlayer(member) || IsSelfBot(member));
+        return ClientAttached(member) && (IsRealPlayer(member) || IsSelfBot(member));
     }
 
     // A groupmate the dungeon module will accept a command FROM.
@@ -41929,10 +41908,7 @@ private:
         WorldSession* const leaderSession = clientLeader && clientLeader->IsInWorld()
                                                 ? clientLeader->GetSession()
                                                 : nullptr;
-        // THE SEAT, NOT ONLY THE SOCKET: a listed headless leader has no socket
-        // by design and holds the seat while it is in the world.
-        bool const leaderHoldsSeat = OverseerDecisions::DungeonLeaderHoldsTheSeat(
-            leaderSession && !leaderSession->IsSocketClosed(), HeadlessSeat(clientLeader));
+        bool const leaderSocketOpen = leaderSession && !leaderSession->IsSocketClosed();
         bool hasInsideMember = false;
         bool allInsideMembersHaveIssuer = true;
         for (std::string const& member : members)
@@ -41945,11 +41921,11 @@ private:
                 allInsideMembersHaveIssuer = false;
         }
         bool const partyIssuerAvailable = !hasInsideMember || allInsideMembersHaveIssuer;
-        if (!leaderHoldsSeat)
+        if (!leaderSocketOpen)
             coord.leaderClientOpenSince = 0;
         else if (!coord.leaderClientOpenSince)
             coord.leaderClientOpenSince = clientNow;
-        if (!leaderHoldsSeat || !partyIssuerAvailable)
+        if (!leaderSocketOpen || !partyIssuerAvailable)
         {
             if (!coord.leaderClientLostSince)
                 coord.leaderClientLostSince = clientNow;
@@ -41958,7 +41934,7 @@ private:
             coord.leaderClientLostSince = 0;
         OverseerDecisions::LeaderClientGate const leaderClientGate =
             OverseerDecisions::DungeonLeaderClientGate(
-                leaderHoldsSeat, coord.leaderClientOpenSince, clientNow);
+                leaderSocketOpen, coord.leaderClientOpenSince, clientNow);
 
         // Bag pressure outranks dungeon progress. This check deliberately
         // happens after the roster census and before job/campaign decisions,
@@ -41987,7 +41963,7 @@ private:
             {
                 OverseerDecisions::LeaderClientLossAction const loss =
                     OverseerDecisions::DungeonLeaderClientLoss(
-                        leaderHoldsSeat, partyIssuerAvailable,
+                        leaderSocketOpen, partyIssuerAvailable,
                         coord.leaderClientLostSince, clientNow);
                 if (loss == OverseerDecisions::LeaderClientLossAction::Hold)
                 {
