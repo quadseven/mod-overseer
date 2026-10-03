@@ -77,19 +77,6 @@ LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
                                          std::time_t now,
                                          std::time_t settleSeconds = DUNGEON_LEADER_CLIENT_SETTLE_SECONDS);
 
-// WHO HOLDS A RUN'S LEADING SEAT, WHEN NOBODY IS WATCHING. #735 asks the leader
-// for an open socket because a client that drops around the door leaves the
-// party with nobody to issue the clear. A roster character that
-// Overseer.HeadlessRoster says is played unwatched has no socket by design and
-// no client to drop: while it is in the world as a bot it is steered like any
-// other roster character (RosterCharacterIsSteerable). Measured on the dev
-// realm 2026-09-29: both heads headless, The Stockade entered through the
-// dungeon finder, the brain held OFF for want of an issuer, the run ended
-// `client_lost` after 300 seconds and went again, for as long as nobody
-// watched. `clientSocketOpen` is the socket test the gate always used;
-// `headlessSteerable` is RosterCharacterIsSteerable asked with no client.
-bool DungeonLeaderHoldsTheSeat(bool clientSocketOpen, bool headlessSteerable);
-
 enum class LeaderClientLossAction
 {
     Continue,
