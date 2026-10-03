@@ -2679,11 +2679,35 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
+uint32_t EventGatedEncounterMask(uint32_t mapId)
+{
+    // Bits from DungeonEncounter.dbc for each map, read off the dev realm's
+    // client data on 2026-10-03.
+    switch (mapId)
+    {
+        case 90:   // Grubbis: only with the Blastmaster Emi Shortfuse escort.
+                   // A full Gnomeregan clear on wow-dev 2026-10-03 credited
+                   // mask 58 of 62, every bit but this one.
+            return 1u << 2;
+        case 43:   // Mutanus the Devourer: only after the Disciple of Naralex
+                   // escort ends.
+            return 1u << 7;
+        case 129:  // Tuten'kash: only when the gong is rung.
+            return 1u << 0;
+        case 209:  // Gahz'rilla: only when the Mallet of Zul'Farrak is used
+                   // at the gong.
+            return 1u << 1;
+        default:
+            return 0;
+    }
+}
+
 uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask, uint32_t wingMask)
 {
+    uint32_t const required = mapMask & ~EventGatedEncounterMask(mapId);
     if (!DungeonMapHasIndependentWings(mapId))
-        return mapMask;
-    return mapMask & wingMask;
+        return required;
+    return required & wingMask;
 }
 
 bool DungeonMapHasIndependentWings(uint32_t mapId)
