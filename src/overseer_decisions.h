@@ -18413,6 +18413,16 @@ enum class FinderState : std::uint8_t
     Other,      // boot, raid browser, a finished dungeon
 };
 
+// Does a dungeon finder group still belong to the finder? While it is
+// matching (role check, queue, proposal) or any of its members stands in an
+// instance, yes, and the one-group rule leaves it alone. Otherwise it is a
+// leftover: the run it was made for is over, nobody is inside, and it holds
+// part of a family apart from its head for good, because the only other
+// thing that disbands one (LeaveTheFinderGroup) looks for it through the
+// head's group, and a relog takes the head out of it (wow-dev 2026-10-03:
+// both families split four and one for hours).
+bool FinderGroupStillServes(FinderState state, bool anyMemberInAnInstance);
+
 struct FinderPollFacts
 {
     bool joined{false};
