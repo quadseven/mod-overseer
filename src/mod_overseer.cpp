@@ -41958,7 +41958,7 @@ private:
             coord.leaderClientLostSince = 0;
         OverseerDecisions::LeaderClientGate const leaderClientGate =
             OverseerDecisions::DungeonLeaderClientGate(
-                leaderHoldsSeat, coord.leaderClientOpenSince, clientNow);
+                leaderSocketOpen, coord.leaderClientOpenSince, clientNow);
 
         // Bag pressure outranks dungeon progress. This check deliberately
         // happens after the roster census and before job/campaign decisions,
@@ -41987,7 +41987,7 @@ private:
             {
                 OverseerDecisions::LeaderClientLossAction const loss =
                     OverseerDecisions::DungeonLeaderClientLoss(
-                        leaderHoldsSeat, partyIssuerAvailable,
+                        leaderSocketOpen, partyIssuerAvailable,
                         coord.leaderClientLostSince, clientNow);
                 if (loss == OverseerDecisions::LeaderClientLossAction::Hold)
                 {
