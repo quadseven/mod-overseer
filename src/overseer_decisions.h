@@ -16829,6 +16829,10 @@ float NearWalkCapYards(WalkGoal goal);
 // True only past the goal's near cap.
 bool IsFarWalk(WalkGoal goal, float yards);
 
+// A near walk whose straight first leg gives no step goes by the travel
+// survey instead, where a far walk may go at all.
+bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed);
+
 // May a far walk start on this map? Eastern Kingdoms and Kalimdor only.
 bool FarWalkMapAllowed(uint32_t mapId);
 

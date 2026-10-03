@@ -14611,6 +14611,11 @@ bool IsFarWalk(WalkGoal goal, float yards)
     return yards > NearWalkCapYards(goal);
 }
 
+bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed)
+{
+    return !straightLegGrounded && farWalkMapAllowed;
+}
+
 bool FarWalkMapAllowed(uint32_t mapId)
 {
     return mapId == FAR_WALK_MAP_EASTERN_KINGDOMS || mapId == FAR_WALK_MAP_KALIMDOR;
