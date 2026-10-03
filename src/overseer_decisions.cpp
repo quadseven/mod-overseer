@@ -2075,6 +2075,14 @@ CatchUpAimSource DecideCatchUpAimSource(bool rosterLeaderPresent,
                               : CatchUpAimSource::RosterLeaderPosition;
 }
 
+bool FinderGroupStillServes(FinderState state, bool anyMemberInAnInstance)
+{
+    if (anyMemberInAnInstance)
+        return true;
+    return state == FinderState::RoleCheck || state == FinderState::Queued ||
+           state == FinderState::Proposal;
+}
+
 FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats)
 {
     FamilyGroupPlan plan;

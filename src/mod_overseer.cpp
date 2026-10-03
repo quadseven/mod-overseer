@@ -8153,10 +8153,71 @@ private:
     // (#607), so the split is said when it changes and not every poll.
     std::map<std::string, std::string> _loggedFamilySplit;
 
+    // True when it disbanded one, so the caller waits a poll for the core to
+    // finish taking the group apart.
+    bool DisbandLeftoverFinderGroups(std::vector<Player*> const& present,
+                                     std::string const& family)
+    {
+        for (Player* p : present)
+        {
+            Group* group = p->GetGroup();
+            // isLFGGroup  Group.h:224
+            if (!group || !group->isLFGGroup())
+                continue;
+            // THE HEAD'S OWN FINDER GROUP IS RESETTING'S (LeaveTheFinderGroup),
+            // which disbands it at the right moment of a run. This is only
+            // for the group a relog left him out of.
+            bool headInIt = false;
+            // A member between maps counts as inside: the finder's teleport in
+            // has every member out of the world at once, in state Dungeon.
+            bool inside = false;
+            // GetFirstMember  Group.h:252  GroupReference* GetFirstMember()
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member)
+                    continue;
+                if (member->GetName() == family)
+                    headInIt = true;
+                // IsBeingTeleported  Player.h  bool IsBeingTeleported() const
+                // IsDungeon  Map.h  bool IsDungeon() const
+                if (!member->IsInWorld() || member->IsBeingTeleported() ||
+                    (member->GetMap() && member->GetMap()->IsDungeon()))
+                    inside = true;
+            }
+            if (headInIt || family.empty())
+                continue;
+            OverseerDecisions::FinderState const state =
+                FinderStateOf(sLFGMgr->GetState(group->GetGUID()));
+            if (OverseerDecisions::FinderGroupStillServes(state, inside))
+                continue;
+            LOG_WARN("module.overseer",
+                     "overseer: family of '{}' - '{}' is in a dungeon finder group led by '{}' "
+                     "that nobody is inside and the finder is not matching (state {}). It is "
+                     "disbanded so the family's own party forms again under its head",
+                     family, p->GetName(), group->GetLeaderName(),
+                     static_cast<unsigned>(state));
+            group->Disband();
+            return true;
+        }
+        return false;
+    }
+
     void KeepFamilyGrouped(std::vector<Player*> const& present,
                            std::string const& wantsToLead)
     {
         if (present.size() < 2)
+            return;
+
+        // A LEFTOVER FINDER GROUP IS LET GO FIRST (FinderGroupStillServes).
+        // The plan below leaves a finder group alone as the core's, which is
+        // right while it is matching or inside and wrong for ever after: on
+        // wow-dev 2026-10-03 both families' four followers sat in the finder
+        // groups of finished runs for hours while each head stood in a group
+        // of one, so training, town trips and every run attempt failed.
+        // Disbanded rather than left member by member, as LeaveTheFinderGroup
+        // does, and the merge forms the family's party on the next poll.
+        if (DisbandLeftoverFinderGroups(present, wantsToLead))
             return;
 
         // ONE GROUP PER FAMILY, UNDER THE HEAD (#607). This used to take the
