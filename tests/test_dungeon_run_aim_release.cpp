@@ -110,9 +110,14 @@ void GeneralTravelReleaseCannotEraseAChangedAim()
     std::string const body = source.substr(release, 9000);
     Check("a claim counts only when its recorded aim still matches",
           body.find("claimedAim->second == standing") != std::string::npos);
+    // (#822) The changed-column fence moved into TravelReleaseGate: the
+    // release feeds its claim facts to the gate, and the gate's changed-column
+    // behavior is pinned behaviorally in test_release_gate_claimed.cpp. What
+    // this still pins, structurally, is that the release consults whether the
+    // column moved - and whose claim stands - before its column write.
     Check("a changed live aim fences the stale claim's release",
           body.find("changedSinceClaim") != std::string::npos &&
-              body.find("the column changed after this book's claim") != std::string::npos);
+              body.find("TravelReleaseGate(") != std::string::npos);
     Check("the generic clear compares against the freshly read aim",
           body.find("AND travel_npc = '{}'\", Esc(name), Esc(standing)") !=
               std::string::npos);
