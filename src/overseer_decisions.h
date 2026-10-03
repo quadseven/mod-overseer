@@ -19537,6 +19537,70 @@ struct AuraFact
 //  "count":N,"positive":N}
 std::string AuraProbeJson(std::vector<AuraFact> const& auras);
 
+// ======================================================== the family meter ==
+//
+// Damage done, healing done and damage taken per family member over one
+// fight, for the site's meter (the `meter` probe). A fight is a run of events
+// with no gap longer than METER_IDLE_SECONDS; the first event after a longer
+// gap closes the fight into `previous` and opens a new one. Healing is raw,
+// overheal included: the core's OnHeal hook carries the amount cast.
+constexpr std::time_t METER_IDLE_SECONDS = 8;
+
+enum class MeterKind : std::uint8_t
+{
+    Damage,
+    Healing,
+    Taken,
+};
+
+struct MeterTotals
+{
+    std::uint64_t damage{0};
+    std::uint64_t healing{0};
+    std::uint64_t taken{0};
+};
+
+struct MeterFight
+{
+    std::time_t started{0};
+    std::time_t last{0};
+    std::map<std::string, MeterTotals> by;
+};
+
+struct MeterBook
+{
+    MeterFight current;
+    MeterFight previous;
+};
+
+void MeterRecord(MeterBook& book, std::string const& name, MeterKind kind,
+                 std::uint32_t amount, std::time_t now);
+
+// Whether the current fight is still going: an event within the idle gap.
+bool MeterLive(MeterBook const& book, std::time_t now);
+
+// Whole seconds the shown fight has lasted, at least 1: up to `now` while it
+// is live, up to its last event once it is over.
+std::time_t MeterSeconds(MeterBook const& book, std::time_t now);
+
+// One member's line for the probe. `threat` is negative when the tank's
+// target has no threat entry for this member, or there is no target.
+struct MeterLine
+{
+    std::string name;
+    MeterTotals totals;
+    float threat{-1.0f};
+};
+
+// {"live":B,"seconds":N,"target":S,"top_threat":F,"members":[{"name":S,
+//  "damage":N,"dps":N,"healing":N,"hps":N,"taken":N,"threat":F,
+//  "threat_pct":N}]}
+// threat_pct is this member's threat as a percent of the target's highest,
+// or -1 when either is unknown.
+std::string MeterProbeJson(std::vector<MeterLine> const& lines, bool live,
+                           std::time_t seconds, std::string const& target,
+                           float topThreat);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

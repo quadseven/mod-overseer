@@ -92,7 +92,7 @@ void TheAdapterIsWired()
     }
     Check("DoProbe answers auras",
           Has(source, "else if (what == \"auras\")\n            out = ProbeAuras(bot);"));
-    Check("the unknown-probe message lists it", Has(source, "|bags|auras)"));
+    Check("the unknown-probe message lists it", Has(source, "|bags|auras|meter)"));
     std::size_t const at = source.find("static std::string ProbeAuras(Player* bot)");
     Check("ProbeAuras exists", at != std::string::npos);
     std::size_t const end = source.find("static std::string ProbeBags(Player* bot)", at);

@@ -17677,4 +17677,89 @@ std::string AuraProbeJson(std::vector<AuraFact> const& auras)
     return out;
 }
 
+void MeterRecord(MeterBook& book, std::string const& name, MeterKind kind,
+                 std::uint32_t amount, std::time_t now)
+{
+    if (book.current.last && now - book.current.last > METER_IDLE_SECONDS)
+    {
+        book.previous = book.current;
+        book.current = MeterFight{};
+    }
+    if (!book.current.started)
+        book.current.started = now;
+    book.current.last = now;
+    MeterTotals& totals = book.current.by[name];
+    switch (kind)
+    {
+        case MeterKind::Damage:
+            totals.damage += amount;
+            break;
+        case MeterKind::Healing:
+            totals.healing += amount;
+            break;
+        case MeterKind::Taken:
+            totals.taken += amount;
+            break;
+    }
+}
+
+bool MeterLive(MeterBook const& book, std::time_t now)
+{
+    return book.current.last && now - book.current.last <= METER_IDLE_SECONDS;
+}
+
+std::time_t MeterSeconds(MeterBook const& book, std::time_t now)
+{
+    MeterFight const& fight = book.current;
+    if (!fight.started)
+        return 1;
+    std::time_t const end = MeterLive(book, now) ? now : fight.last;
+    return std::max<std::time_t>(1, end - fight.started);
+}
+
+std::string MeterProbeJson(std::vector<MeterLine> const& lines, bool live,
+                           std::time_t seconds, std::string const& target,
+                           float topThreat)
+{
+    auto quoted = [](std::string const& s) {
+        std::string out = "\"";
+        for (char ch : s)
+        {
+            if (ch == '"' || ch == '\\')
+                out += '\\';
+            out += ch;
+        }
+        return out + "\"";
+    };
+    auto number = [](float f) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(f));
+        return std::string(buf);
+    };
+    std::time_t const span = std::max<std::time_t>(1, seconds);
+    std::string out = std::string("{\"live\":") + (live ? "true" : "false") +
+                      ",\"seconds\":" + std::to_string(span) +
+                      ",\"target\":" + quoted(target) +
+                      ",\"top_threat\":" + number(topThreat) + ",\"members\":[";
+    for (std::size_t i = 0; i < lines.size(); ++i)
+    {
+        MeterLine const& line = lines[i];
+        if (i)
+            out += ",";
+        long long pct = -1;
+        if (line.threat >= 0.0f && topThreat > 0.0f)
+            pct = std::llround(100.0 * line.threat / topThreat);
+        out += "{\"name\":" + quoted(line.name) +
+               ",\"damage\":" + std::to_string(line.totals.damage) +
+               ",\"dps\":" + std::to_string(line.totals.damage / span) +
+               ",\"healing\":" + std::to_string(line.totals.healing) +
+               ",\"hps\":" + std::to_string(line.totals.healing / span) +
+               ",\"taken\":" + std::to_string(line.totals.taken) +
+               ",\"threat\":" + number(line.threat) +
+               ",\"threat_pct\":" + std::to_string(pct) + "}";
+    }
+    out += "]}";
+    return out;
+}
+
 }  // namespace OverseerDecisions
