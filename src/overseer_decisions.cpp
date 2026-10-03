@@ -14404,7 +14404,7 @@ TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command)
     };
     if (words.empty() || words[0] != TRAINER_WALK_VERB || words.size() > 4)
         return malformed();
-    bool sawSkill = false, sawLearn = false, sawMax = false;
+    bool sawSkill = false, sawLearn = false, sawMax = false, sawTalents = false;
     for (std::size_t i = 1; i < words.size(); ++i)
     {
         std::string key, value;
@@ -14428,10 +14428,18 @@ TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command)
             if (!ErrandWalkCap(value, request.maxYards))
                 return malformed();
         }
+        else if (key == "talents" && !sawTalents)
+        {
+            sawTalents = true;
+            if (value.size() != 1 || value[0] < '0' || value[0] > '2')
+                return malformed();
+            request.talentTab = value[0] - '0';
+        }
         else
             return malformed();
     }
-    if (!sawSkill)
+    // EXACTLY ONE OF A TRADE AND A TREE (#692), and a reset buys no recipes.
+    if (sawSkill == sawTalents || (sawTalents && sawLearn))
         return malformed();
     return request;
 }
@@ -14547,9 +14555,48 @@ bool ErrandWalkRefusalRetryable(std::string const& reason)
         || reason == E::VendorLeftWorld || reason == E::VendorLeftMap
         || reason == E::VendorFlight || reason == E::VendorTimedOut
         || reason == E::VendorStalled || reason == E::TaughtNothing
+        || reason == E::TalentsCannotAfford
         || reason == S::SpawnTooFar || reason == S::SpawnGround || reason == S::SpawnCombat
         || reason == S::SpawnDied || reason == S::SpawnLeftWorld || reason == S::SpawnLeftMap
         || reason == S::SpawnFlight || reason == S::SpawnTimedOut || reason == S::SpawnStalled;
+}
+
+char const* TalentWalkRefusal(RespecFacts const& facts)
+{
+    RespecFacts walker = facts;
+    walker.available = true;
+    walker.columnFree = true;
+    walker.runOwnsTravel = false;
+    walker.sinceLastMiss = UINT32_MAX;
+    namespace E = ErrandWalkRefusal;
+    switch (JudgeRespec(walker))
+    {
+        case RespecStep::NoTree: return E::MalformedTrainer;
+        case RespecStep::TooLow: return E::TalentsTooLow;
+        case RespecStep::InTree: return E::TalentsInTree;
+        case RespecStep::CannotAfford: return E::TalentsCannotAfford;
+        case RespecStep::Walk: return "";
+        // The roster's travel column, run ownership, and retry clock are not
+        // asked for a guild raider (facts hardcoded above). If JudgeRespec
+        // ever returns one of these, fail closed rather than silently walking.
+        case RespecStep::NotNow:
+        case RespecStep::RunOwnsTravel:
+        case RespecStep::ColumnBusy:
+        case RespecStep::Resting:
+            return E::MalformedTrainer;
+    }
+    // Unreachable: all RespecStep values are handled above. Fail closed if a
+    // new step is added without updating this switch.
+    return E::MalformedTrainer;
+}
+
+TrainerVisitOutcome JudgeTalentVisit(bool resetTook, uint32_t const (&pointsAfter)[3],
+                                     uint8_t tree)
+{
+    if (resetTook && DominantTree(pointsAfter) == tree && !PointsOutsideTree(pointsAfter, tree))
+        return TrainerVisitOutcome::Learned;
+    return TrainerVisitOutcome::TaughtNothing;
+>>>>>>> c2e77b1 (Respec a guild raider at a class trainer: walk-to-trainer talents:<tab> (#692))
 }
 
 TrainerVisitOutcome JudgeTrainerVisit(TrainerVisitFacts const& facts)
