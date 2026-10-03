@@ -3358,6 +3358,22 @@ struct PendingLine
     bool isBot = false;
 };
 
+// THE FAMILY METER (OverseerDecisions::MeterRecord). Written by
+// OverseerMeterScript's hooks, which run on map update threads, and read by
+// the `meter` probe on the world thread, so every touch holds g_meterMutex.
+// The seats are refreshed on the party poll (RefreshMeterSeats): a character
+// that is not a roster member is never counted.
+struct MeterSeat
+{
+    std::string name;
+    std::string family;
+};
+std::mutex g_meterMutex;
+std::map<ObjectGuid::LowType, MeterSeat> g_meterSeats;
+std::map<std::string, std::vector<std::string>> g_meterFamilies;
+std::map<std::string, std::string> g_meterLeaders;
+std::map<std::string, OverseerDecisions::MeterBook> g_meterBooks;
+
 std::mutex g_chatMutex;
 std::vector<PendingLine> g_chatQueue;
 // A chat storm must cost a bounded amount of memory, never an unbounded one.
@@ -7794,6 +7810,7 @@ private:
         // THE LEADERS THE INTENT BOOK GOVERNS, and Jev's current picks for
         // them, before any rule of this poll asks it anything.
         RefreshLeaderIntentBook(rosters);
+        RefreshMeterSeats(rosters);
 
         for (OverseerDecisions::FamilyRoster const& roster : rosters)
         {
@@ -48281,6 +48298,86 @@ private:
         return o.str();
     }
 
+    // Who the meter counts: every roster member in the world, by guid, with
+    // its family. Asked on the party poll, so a member who logs in is counted
+    // within one poll.
+    static void RefreshMeterSeats(std::vector<OverseerDecisions::FamilyRoster> const& rosters)
+    {
+        std::map<ObjectGuid::LowType, MeterSeat> seats;
+        std::map<std::string, std::vector<std::string>> families;
+        std::map<std::string, std::string> leaders;
+        for (OverseerDecisions::FamilyRoster const& roster : rosters)
+        {
+            leaders[roster.family] = roster.leader;
+            for (OverseerDecisions::FamilyMember const& member : roster.members)
+            {
+                families[roster.family].push_back(member.name);
+                if (Player* p = ObjectAccessor::FindPlayerByName(member.name))
+                    seats[p->GetGUID().GetCounter()] = MeterSeat{member.name, roster.family};
+            }
+        }
+        std::lock_guard<std::mutex> guard(g_meterMutex);
+        g_meterSeats.swap(seats);
+        g_meterFamilies.swap(families);
+        g_meterLeaders.swap(leaders);
+    }
+
+    // The `meter` probe: the asked character's family, one line per member,
+    // over the current fight or the last one. Threat is read on the family
+    // leader's current target, which is the tank's, from that creature's own
+    // threat list.
+    static std::string ProbeMeter(Player* bot)
+    {
+        std::string family;
+        std::vector<std::string> members;
+        std::string leaderName;
+        OverseerDecisions::MeterBook book;
+        {
+            std::lock_guard<std::mutex> guard(g_meterMutex);
+            auto const seat = g_meterSeats.find(bot->GetGUID().GetCounter());
+            if (seat == g_meterSeats.end())
+                return "{\"error\":\"not a roster member\"}";
+            family = seat->second.family;
+            members = g_meterFamilies[family];
+            leaderName = g_meterLeaders[family];
+            book = g_meterBooks[family];
+        }
+        std::time_t const now = GameTime::GetGameTime().count();
+
+        Player* leader = leaderName.empty() ? nullptr : ObjectAccessor::FindPlayerByName(leaderName);
+        // GetVictim  Unit.h  Unit* GetVictim() const
+        Unit* target = leader ? leader->GetVictim() : nullptr;
+        // CanHaveThreatList  Unit.h  bool CanHaveThreatList() const
+        bool const threatened = target && target->CanHaveThreatList();
+        float top = 0.0f;
+        if (threatened)
+            // GetCurrentVictim  ThreatManager.h:111  Unit* GetCurrentVictim()
+            if (Unit* victim = target->GetThreatMgr().GetCurrentVictim())
+                top = target->GetThreatMgr().GetThreat(victim);
+
+        std::vector<OverseerDecisions::MeterLine> lines;
+        for (std::string const& name : members)
+        {
+            OverseerDecisions::MeterLine line;
+            line.name = name;
+            auto const totals = book.current.by.find(name);
+            if (totals != book.current.by.end())
+                line.totals = totals->second;
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (threatened && member)
+            {
+                // GetThreat  ThreatManager.h:124  float GetThreat(Unit const* who, bool includeOffline = false) const
+                float const threat = target->GetThreatMgr().GetThreat(member);
+                line.threat = threat;
+                top = std::max(top, threat);
+            }
+            lines.push_back(line);
+        }
+        return OverseerDecisions::MeterProbeJson(
+            lines, OverseerDecisions::MeterLive(book, now), OverseerDecisions::MeterSeconds(book, now),
+            target ? target->GetName() : std::string(), top);
+    }
+
     static char const* DoProbe(Player* bot, std::string const& what, char const*& status,
                                std::string& out)
     {
@@ -48298,8 +48395,10 @@ private:
             out = ProbeBags(bot);
         else if (what == "auras")
             out = ProbeAuras(bot);
+        else if (what == "meter")
+            out = ProbeMeter(bot);
         else
-            return "unknown probe (state|spells|talents|strategies|gear|bags|auras)";
+            return "unknown probe (state|spells|talents|strategies|gear|bags|auras|meter)";
 
         status = "delivered";
         return "";
@@ -64414,6 +64513,54 @@ public:
     }
 };
 
+// THE FAMILY METER'S EARS. OnDamage and OnHeal fire for every hit and heal in
+// the world, on map update threads, so each one looks a guid up and returns
+// unless a roster member is on either end. A pet's or totem's damage counts
+// for its owner.
+class OverseerMeterScript : public UnitScript
+{
+public:
+    OverseerMeterScript() : UnitScript("OverseerMeterScript", true, {
+        UNITHOOK_ON_DAMAGE,
+        UNITHOOK_ON_HEAL,
+    }) {}
+
+    void OnDamage(Unit* attacker, Unit* victim, uint32& damage) override
+    {
+        if (!damage)
+            return;
+        // GetCharmerOrOwnerPlayerOrPlayerItself  Unit.h  Player* GetCharmerOrOwnerPlayerOrPlayerItself() const
+        Player* source = attacker ? attacker->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+        Player* hurt = victim ? victim->ToPlayer() : nullptr;
+        if (!source && !hurt)
+            return;
+        Note(source, OverseerDecisions::MeterKind::Damage, damage);
+        Note(hurt, OverseerDecisions::MeterKind::Taken, damage);
+    }
+
+    void OnHeal(Unit* healer, Unit* /*reciever*/, uint32& gain) override
+    {
+        if (!gain || !healer)
+            return;
+        Note(healer->GetCharmerOrOwnerPlayerOrPlayerItself(), OverseerDecisions::MeterKind::Healing,
+             gain);
+    }
+
+private:
+    static void Note(Player* player, OverseerDecisions::MeterKind kind, uint32 amount)
+    {
+        if (!player)
+            return;
+        std::time_t const now = GameTime::GetGameTime().count();
+        std::lock_guard<std::mutex> guard(g_meterMutex);
+        auto const seat = g_meterSeats.find(player->GetGUID().GetCounter());
+        if (seat == g_meterSeats.end())
+            return;
+        OverseerDecisions::MeterRecord(g_meterBooks[seat->second.family], seat->second.name, kind,
+                                       amount, now);
+    }
+};
+
 void Addmod_overseerScripts()
 {
     // Install the crash trace before constructing scripts or starting module work.
@@ -64428,4 +64575,5 @@ void Addmod_overseerScripts()
     new OverseerDoorScript();
     new OverseerFinderScript();
     new OverseerKeepScript();
+    new OverseerMeterScript();
 }
