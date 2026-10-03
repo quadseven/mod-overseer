@@ -62603,25 +62603,11 @@ private:
         return true;
     }
 
-    // Hand the walker its next leg, if it needs one. Answers false when the
-    // ground gave no step, which the caller counts.
-    //
-    // A LEG IS ISSUED ONLY WHEN THE WALKER IS NOT ALREADY ON ONE: standing
-    // still, or with something other than a point walk in its active slot.
-    // Re-issuing a MovePoint every poll would restart the spline every two
-    // seconds for no gain.
-    static bool IssueMailWalkLeg(Player* who, MailWalkEvidence& ev, bool force)
+    // Where the next leg of a walk goes, without moving anybody: a straight
+    // leg toward the destination for a near walk, the travel survey's next leg
+    // for a far one. False when the ground there gives no step.
+    static bool MailWalkLegStep(Player* who, MailWalkEvidence& ev, WorldPosition& step)
     {
-        MotionMaster* const motion = who->GetMotionMaster();
-        if (!motion)
-            return false;
-        if (!force && who->isMoving()
-            && motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
-        {
-            LetHeldCharacterWalk(ev.character, MAIL_WALK_SWEEP_QUIET_SECONDS);
-            return true;
-        }
-
         bool final = false;
         OverseerDecisions::MailWalkPoint aim = OverseerDecisions::MailWalkLegAim(
             who->GetPositionX(), who->GetPositionY(), who->GetPositionZ(), ev.boxX, ev.boxY,
@@ -62662,9 +62648,33 @@ private:
 
         // THE GROUND GUARD, AND FOR A FAR WALK THE ROSTER'S RETREAT ALONG THE
         // ROUTE when the point it aimed at is refused (#592).
-        WorldPosition step;
         if (!GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aimZ), step) &&
             !(ev.far && RetreatAlongRoute(who, destination, ev.travel, step)))
+            return false;
+        return true;
+    }
+
+    // Hand the walker its next leg, if it needs one. Answers false when the
+    // ground gave no step, which the caller counts.
+    //
+    // A LEG IS ISSUED ONLY WHEN THE WALKER IS NOT ALREADY ON ONE: standing
+    // still, or with something other than a point walk in its active slot.
+    // Re-issuing a MovePoint every poll would restart the spline every two
+    // seconds for no gain.
+    static bool IssueMailWalkLeg(Player* who, MailWalkEvidence& ev, bool force)
+    {
+        MotionMaster* const motion = who->GetMotionMaster();
+        if (!motion)
+            return false;
+        if (!force && who->isMoving()
+            && motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+        {
+            LetHeldCharacterWalk(ev.character, MAIL_WALK_SWEEP_QUIET_SECONDS);
+            return true;
+        }
+
+        WorldPosition step;
+        if (!MailWalkLegStep(who, ev, step))
             return false;
 
         if (!who->IsStandState())
@@ -63049,10 +63059,10 @@ private:
         // round the corner is a near walk in every respect.
         ev.far = D::IsFarWalk(goal, choice.yards);
         int64_t const nowSeconds = static_cast<int64_t>(std::time(nullptr));
-        if (ev.far)
+        // Arms the walk as a far one: the budget, and the travel survey's
+        // errand. Returns the budget's refusal, or "" once armed.
+        auto armFar = [&]() -> char const*
         {
-            if (!D::FarWalkMapAllowed(ev.mapId))
-                return refuse(D::FarWalkRefusal::NotOnAContinent);
             PruneFarWalkBudget(nowSeconds);
             auto& budget = FarWalkStarts();
             uint32 underWay = 0;
@@ -63071,7 +63081,7 @@ private:
                          "{}s) (#633)",
                          id, ev.character, wall, underWay, D::FAR_WALKS_AT_ONCE,
                          D::FAR_WALK_STARTS_PER_BOT, D::FAR_WALK_BUDGET_WINDOW_SECONDS);
-                return refuse(wall);
+                return wall;
             }
             // The name the roster drive's log lines and the survey planner call
             // the errand by.
@@ -63082,6 +63092,35 @@ private:
             ev.travel.z = ev.boxZ;
             ev.travel.errandSince = std::time(nullptr);
             ev.travel.progress.since = std::time(nullptr);
+            return "";
+        };
+        if (ev.far)
+        {
+            if (!D::FarWalkMapAllowed(ev.mapId))
+                return refuse(D::FarWalkRefusal::NotOnAContinent);
+            if (char const* wall = armFar(); *wall)
+                return refuse(wall);
+        }
+
+        // A NEAR WALK WHOSE STRAIGHT FIRST LEG HAS NO GROUND TAKES THE ROAD.
+        // On wow-dev 2026-10-03 every guild gear walk ended "the ground toward
+        // the vendor does not hold" on its first leg: 502 yards down from the
+        // Darnassus terraces, 413 yards across the Durotar cliffs. The travel
+        // survey knows the way round; the straight line does not.
+        if (!ev.far)
+        {
+            WorldPosition probe;
+            if (D::NearWalkFallsBackToRoute(MailWalkLegStep(who, ev, probe),
+                                            D::FarWalkMapAllowed(ev.mapId)))
+            {
+                if (char const* wall = armFar(); *wall)
+                    return refuse(wall);
+                ev.far = true;
+                LOG_INFO("module.overseer",
+                         "overseer: {} walk {} - the straight line from '{}' to '{}' gives "
+                         "no first step, so it goes by the travel survey instead",
+                         noun, id, ev.character, ev.mailboxName);
+            }
         }
 
         // ---- the way there ---------------------------------------------------
