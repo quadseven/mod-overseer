@@ -27537,10 +27537,29 @@ private:
         // hold hands back exactly what it took when it lifts.
         if (HeldStill(name))
         {
+            // AND THE HOLD IN FORCE IS TOLD WHAT IT NOW OWES. It found `stay`
+            // already on and the mover already off, so it recorded taking
+            // neither; without this the debt was dropped and the character
+            // stood until a restart (see HandRevivalDebtOn).
+            auto const inForce = HoldsInForce().find(name);
+            bool const found = inForce != HoldsInForce().end();
+            std::string const holder = found ? inForce->second.verb : "other";
+            if (found)
+            {
+                HoldRecord& record = inForce->second;
+                OverseerDecisions::HoldDebt const owed = OverseerDecisions::HandRevivalDebtOn(
+                    {record.addedStay, record.removedFollow, record.removedNewRpg}, led,
+                    botAI->GetMaster() != nullptr);
+                record.addedStay = owed.addedStay;
+                record.removedFollow = owed.removedFollow;
+                record.removedNewRpg = owed.removedNewRpg;
+            }
             LOG_INFO("module.overseer",
-                     "overseer: '{}' is out of its post-revival hold but a casting verb is "
-                     "holding it still - the mover stays off and the cast hold hands it back",
-                     name);
+                     "overseer: '{}' is out of its post-revival hold but the {} hold is "
+                     "holding it still - the mover stays off and that hold now hands back "
+                     "`stay` and {}",
+                     name, holder,
+                     led ? "`new rpg`" : botAI->GetMaster() ? "`follow`" : "nothing else");
             return;
         }
 
