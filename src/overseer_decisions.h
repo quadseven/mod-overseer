@@ -16841,6 +16841,15 @@ bool IsFarWalk(WalkGoal goal, float yards);
 // survey instead, where a far walk may go at all.
 bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed);
 
+// May this character cast its standing craft errand now? On job 'craft'
+// always (the drive's own mode). On a family's campaign jobs - 'town run', or
+// a 'dungeon' job - only between runs: outside any dungeon run, alive, out of
+// combat and standing still, which is the family waiting in town for repair,
+// reset or training. The masters of every family trade sat on those jobs for
+// good on wow-dev 2026-10-04 and nine of ten crafts stood at 1 of 75.
+bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inCombat,
+                 bool moving);
+
 // May a far walk start on this map? Eastern Kingdoms and Kalimdor only.
 bool FarWalkMapAllowed(uint32_t mapId);
 
