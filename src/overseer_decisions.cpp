@@ -14611,6 +14611,32 @@ bool IsFarWalk(WalkGoal goal, float yards)
     return yards > NearWalkCapYards(goal);
 }
 
+bool MailWalkPointAlongPath(std::vector<MailWalkPoint> const& points, float maxYards,
+                            MailWalkPoint& out)
+{
+    if (points.size() < 2)
+        return false;
+    float walked = 0.f;
+    for (std::size_t i = 1; i < points.size(); ++i)
+    {
+        MailWalkPoint const& a = points[i - 1];
+        MailWalkPoint const& b = points[i];
+        float const dx = b.x - a.x;
+        float const dy = b.y - a.y;
+        float const dz = b.z - a.z;
+        float const length = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (walked + length >= maxYards && length > 0.f)
+        {
+            float const t = (maxYards - walked) / length;
+            out = MailWalkPoint{a.x + dx * t, a.y + dy * t, a.z + dz * t};
+            return true;
+        }
+        walked += length;
+    }
+    out = points.back();
+    return true;
+}
+
 bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed)
 {
     return !straightLegGrounded && farWalkMapAllowed;

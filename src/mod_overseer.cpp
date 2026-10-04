@@ -62648,10 +62648,36 @@ private:
 
         // THE GROUND GUARD, AND FOR A FAR WALK THE ROSTER'S RETREAT ALONG THE
         // ROUTE when the point it aimed at is refused (#592).
-        if (!GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aimZ), step) &&
-            !(ev.far && RetreatAlongRoute(who, destination, ev.travel, step)))
+        if (GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aimZ), step) ||
+            (ev.far && RetreatAlongRoute(who, destination, ev.travel, step)))
+            return true;
+
+        // AND THEN THE NAVMESH'S OWN WAY. A straight leg's aim is a point on
+        // the line with a surface sampled under it, and on the Darnassus
+        // terraces or the Durotar cliffs that point has no walkable polygon,
+        // so every vendor walk there was refused on its first leg even with
+        // the travel survey (wow-dev 2026-10-03). The core's path toward the
+        // destination is walkable by construction; a leg's length along it is
+        // the aim instead.
+        return NavmeshLegToward(who, ev, step);
+    }
+
+    static bool NavmeshLegToward(Player* who, MailWalkEvidence const& ev, WorldPosition& step)
+    {
+        PathGenerator path(who);   // PathGenerator.h:61
+        if (!path.CalculatePath(ev.boxX, ev.boxY, ev.boxZ))
             return false;
-        return true;
+        if (path.GetPathType() & PATHFIND_NOPATH)
+            return false;
+        std::vector<OverseerDecisions::MailWalkPoint> points;
+        points.reserve(path.GetPath().size());
+        for (G3D::Vector3 const& point : path.GetPath())
+            points.push_back(OverseerDecisions::MailWalkPoint{point.x, point.y, point.z});
+        OverseerDecisions::MailWalkPoint aim;
+        if (!OverseerDecisions::MailWalkPointAlongPath(
+                points, OverseerDecisions::MAIL_WALK_LEG_YARDS, aim))
+            return false;
+        return GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aim.z), step);
     }
 
     // Hand the walker its next leg, if it needs one. Answers false when the
