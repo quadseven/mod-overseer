@@ -64688,6 +64688,67 @@ private:
     }
 };
 
+// Every auction that closes, sold or lapsed, is one row of
+// overseer_auction_history (wow-overseer#536). The core calls these two hooks
+// from AuctionHouseObject::Update on the world thread; the work here is a few
+// field reads, a cache lookup per side, and one CharacterDatabase.Execute,
+// which is queued on the async worker, so nothing waits on the database.
+class OverseerAuctionScript : public AuctionHouseScript
+{
+public:
+    OverseerAuctionScript() : AuctionHouseScript("OverseerAuctionScript", {
+        AUCTIONHOUSEHOOK_ON_AUCTION_SUCCESSFUL,
+        AUCTIONHOUSEHOOK_ON_AUCTION_EXPIRE,
+    }) {}
+
+    void OnAuctionSuccessful(AuctionHouseObject* /*ah*/, AuctionEntry* entry) override
+    {
+        Record(entry, OverseerDecisions::AuctionOutcome::Sold);
+    }
+
+    void OnAuctionExpire(AuctionHouseObject* /*ah*/, AuctionEntry* entry) override
+    {
+        Record(entry, OverseerDecisions::AuctionOutcome::Expired);
+    }
+
+private:
+    static OverseerDecisions::AuctionPartyKind PartyKind(ObjectGuid guid)
+    {
+        if (guid.IsEmpty())
+            return OverseerDecisions::ClassifyAuctionParty(false, false, false, false);
+        std::string name;
+        uint32 guildId = 0;
+        if (CharacterCacheEntry const* cache = sCharacterCache->GetCharacterCacheByGuid(guid))
+        {
+            name = cache->Name;
+            guildId = cache->GuildId;
+        }
+        bool const onRoster = !name.empty() && OnRoster(name);
+        bool const inGuild =
+            StoryWho(false, guildId) == OverseerDecisions::ItemStoryWho::GuildMember;
+        return OverseerDecisions::ClassifyAuctionParty(
+            true, onRoster, inGuild, sRandomPlayerbotMgr.IsRandomBot(guid.GetCounter()));
+    }
+
+    static void Record(AuctionEntry const* entry, OverseerDecisions::AuctionOutcome outcome)
+    {
+        if (!entry)
+            return;
+        OverseerDecisions::AuctionHistoryRow row;
+        row.house = static_cast<unsigned>(entry->GetHouseId());
+        row.itemEntry = entry->item_template;
+        row.itemCount = entry->itemCount;
+        row.bid = entry->bid;
+        row.buyout = entry->buyout;
+        row.outcome = outcome;
+        row.sellerGuid = entry->owner.GetCounter();
+        row.sellerKind = PartyKind(entry->owner);
+        row.buyerGuid = entry->bidder.GetCounter();
+        row.buyerKind = PartyKind(entry->bidder);
+        CharacterDatabase.Execute(OverseerDecisions::AuctionHistoryInsertSql(row).c_str());
+    }
+};
+
 void Addmod_overseerScripts()
 {
     // Install the crash trace before constructing scripts or starting module work.
@@ -64703,4 +64764,5 @@ void Addmod_overseerScripts()
     new OverseerFinderScript();
     new OverseerKeepScript();
     new OverseerMeterScript();
+    new OverseerAuctionScript();
 }

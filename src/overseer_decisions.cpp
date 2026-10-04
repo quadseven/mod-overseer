@@ -17849,4 +17849,61 @@ std::string MeterProbeJson(std::vector<MeterLine> const& lines, bool live,
     return out;
 }
 
+// ---------------------------------------- the auction history (wow-overseer#536) --
+
+char const* AuctionOutcomeWord(AuctionOutcome outcome)
+{
+    return outcome == AuctionOutcome::Sold ? "sold" : "expired";
+}
+
+char const* AuctionPartyWord(AuctionPartyKind kind)
+{
+    switch (kind)
+    {
+        case AuctionPartyKind::RandomBot:
+            return "random_bot";
+        case AuctionPartyKind::GuildMember:
+            return "guild_member";
+        case AuctionPartyKind::Family:
+            return "family";
+        case AuctionPartyKind::Player:
+            return "player";
+        case AuctionPartyKind::Unknown:
+            break;
+    }
+    return "unknown";
+}
+
+AuctionPartyKind ClassifyAuctionParty(bool known, bool onRoster, bool inStoryGuild,
+                                      bool randomBot)
+{
+    if (!known)
+        return AuctionPartyKind::Unknown;
+    if (onRoster)
+        return AuctionPartyKind::Family;
+    if (inStoryGuild)
+        return AuctionPartyKind::GuildMember;
+    if (randomBot)
+        return AuctionPartyKind::RandomBot;
+    return AuctionPartyKind::Player;
+}
+
+unsigned AuctionPricePaid(AuctionOutcome outcome, unsigned bid)
+{
+    return outcome == AuctionOutcome::Sold ? bid : 0;
+}
+
+std::string AuctionHistoryInsertSql(AuctionHistoryRow const& row)
+{
+    return "INSERT INTO overseer_auction_history (house, item_entry, item_count, bid, buyout, "
+           "price_paid, outcome, seller_guid, seller_kind, buyer_guid, buyer_kind) VALUES (" +
+           std::to_string(row.house) + ", " + std::to_string(row.itemEntry) + ", " +
+           std::to_string(row.itemCount) + ", " + std::to_string(row.bid) + ", " +
+           std::to_string(row.buyout) + ", " +
+           std::to_string(AuctionPricePaid(row.outcome, row.bid)) + ", '" +
+           AuctionOutcomeWord(row.outcome) + "', " + std::to_string(row.sellerGuid) + ", '" +
+           AuctionPartyWord(row.sellerKind) + "', " + std::to_string(row.buyerGuid) + ", '" +
+           AuctionPartyWord(row.buyerKind) + "')";
+}
+
 }  // namespace OverseerDecisions
