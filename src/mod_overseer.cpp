@@ -46983,6 +46983,14 @@ private:
             batch.swap(g_deathQueue);
             dropped = g_droppedDeaths;
             g_droppedDeaths = 0;
+            // A guild member whose last row is older than the gap no longer
+            // holds anything back, so its entry is dropped (#533): the map
+            // stays the size of the members dying right now, not of every name
+            // the guilds ever had.
+            std::int64_t const cutoff = static_cast<std::int64_t>(std::time(nullptr)) -
+                                        OverseerDecisions::GUILD_DEATH_MIN_GAP_SECONDS;
+            for (auto it = g_guildDeathAt.begin(); it != g_guildDeathAt.end();)
+                it = it->second <= cutoff ? g_guildDeathAt.erase(it) : std::next(it);
         }
 
         if (dropped)
