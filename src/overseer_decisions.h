@@ -2705,12 +2705,21 @@ enum class DungeonClearStallAction
     Extract,
 };
 
+//
+// A REFUSED SKIP ENDS THE LADDER. A `dc skip` on the last objective the
+// dungeon module can still reach switches the module off ("No bosses left -
+// disabling"), and every later skip is refused with "Dungeon clear is not
+// enabled". Measured on wow-dev (2026-10-04): Grug's Gnomeregan run took an
+// accepted skip at 07:13 ET and two refused ones at 07:22 and 07:27 before it
+// walked out, and Zug's Shadowfang runs did the same. Nothing more can move a
+// run whose brain is off, so `skipRefused` extracts at once.
 DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   bool partyBusy,
                                                   bool movementProgress,
                                                   bool stalled,
                                                   unsigned skips,
-                                                  unsigned maximumSkips);
+                                                  unsigned maximumSkips,
+                                                  bool skipRefused = false);
 
 // ------------------------------ how long busy may mean anything (#382) --
 //

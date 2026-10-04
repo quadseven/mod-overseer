@@ -1943,7 +1943,8 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   bool movementProgress,
                                                   bool stalled,
                                                   unsigned skips,
-                                                  unsigned maximumSkips)
+                                                  unsigned maximumSkips,
+                                                  bool skipRefused)
 {
     // A run is only stalled when every legitimate source of progress is quiet.
     // In particular, being inside a dungeon or merely waiting between pulls is
@@ -1954,8 +1955,8 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
     // A zero bound is useful to callers that want extraction immediately, and
     // makes the policy explicit rather than relying on an underflow or a magic
     // special case at the call site.
-    return skips < maximumSkips ? DungeonClearStallAction::Skip
-                                : DungeonClearStallAction::Extract;
+    return skips < maximumSkips && !skipRefused ? DungeonClearStallAction::Skip
+                                                : DungeonClearStallAction::Extract;
 }
 
 bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,

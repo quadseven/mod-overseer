@@ -57,6 +57,25 @@ void ExhaustedRunIsExtracted()
           DungeonClearStallAction::Extract);
 }
 
+void ARefusedSkipExtractsAtOnce()
+{
+    // wow-dev, 2026-10-04: a skip on the last reachable objective switched the
+    // dungeon module off, and two more skips were refused 10 minutes apart.
+    Check("refused after one skip",
+          DungeonClearStallDecision(false, false, false, true, 1, 3, true),
+          DungeonClearStallAction::Extract);
+    Check("refused first skip",
+          DungeonClearStallDecision(false, false, false, true, 0, 3, true),
+          DungeonClearStallAction::Extract);
+    Check("accepted skip keeps the ladder",
+          DungeonClearStallDecision(false, false, false, true, 1, 3, false),
+          DungeonClearStallAction::Skip);
+    // A refusal never outranks a run that is still progressing.
+    Check("refused but busy",
+          DungeonClearStallDecision(false, true, false, true, 1, 3, true),
+          DungeonClearStallAction::Nothing);
+}
+
 void ABusyHoldThatExpiredNoLongerProtectsTheRun()
 {
     // #382: the adapter used to pass a literal `false` here, because its own
@@ -82,6 +101,7 @@ int main()
     HealthyProgressIsNeverInterrupted();
     StalledRunGetsBoundedSkips();
     ExhaustedRunIsExtracted();
+    ARefusedSkipExtractsAtOnce();
     ABusyHoldThatExpiredNoLongerProtectsTheRun();
     return failures ? 1 : 0;
 }

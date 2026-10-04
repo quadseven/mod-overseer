@@ -31054,6 +31054,9 @@ private:
         // progress signal that does not depend on where anybody is standing.
         uint32 clearEncounters{0};
         unsigned clearSkips{0};
+        // The dungeon module refused a `dc skip`: the run walks out at once and
+        // its row says so (DungeonClearStallDecision, skipRefused).
+        bool clearSkipRefused{false};
         // WHEN THIS RUN LAST ACTUALLY GOT SOMEWHERE (#382): a boss credited or
         // the leader thirty yards from its mark, and nothing else. A busy party
         // holds the watchdog's patience clock, which is correct, and before this
@@ -32612,7 +32615,17 @@ private:
                      skipped ? "accepted"
                              : "REFUSED or unavailable - the dungeon module's log says "
                                "why under 'DC command refused'");
-            return false;
+            // A REFUSED SKIP IS THE LAST RUNG. The dungeon module switches
+            // itself off when a skip leaves it nothing to reach, and refuses
+            // every skip after that; waiting out the rest of the ladder was
+            // ten minutes of standing still before the same walk out.
+            if (skipped ||
+                OverseerDecisions::DungeonClearStallDecision(
+                    false, busyHolds, false, progress.stalled, coord.clearSkips,
+                    DUNGEON_CLEAR_SKIPS, true) !=
+                    OverseerDecisions::DungeonClearStallAction::Extract)
+                return false;
+            coord.clearSkipRefused = true;
         }
 
         // SKIPPING DOES NOT REACH IT. Said once, and then the run ENDS rather
@@ -32628,12 +32641,18 @@ private:
         // could not clear and a party the world stopped hitting. Both end the
         // run; only one of them is worth chasing upstream.
         coord.stalledReason =
-            "the run stopped progressing inside map " + std::to_string(insideMapId) +
-            ": no boss credit and no movement for " +
-            std::to_string((DUNGEON_CLEAR_SKIPS + 1) * DUNGEON_CLEAR_STALL_SECONDS / 60) +
-            " minutes, and " + std::to_string(DUNGEON_CLEAR_SKIPS) +
-            " 'dc skip's did not restart it" +
-            (anyBusy ? " (" + busyName + " was " + busyReason + " throughout)" : "");
+            coord.clearSkipRefused
+                ? "the dungeon module refused 'dc skip' " + std::to_string(coord.clearSkips) +
+                      " inside map " + std::to_string(insideMapId) +
+                      ": it had switched itself off with nothing left it could reach"
+                : "the run stopped progressing inside map " + std::to_string(insideMapId) +
+                      ": no boss credit and no movement for " +
+                      std::to_string((DUNGEON_CLEAR_SKIPS + 1) * DUNGEON_CLEAR_STALL_SECONDS /
+                                     60) +
+                      " minutes, and " + std::to_string(DUNGEON_CLEAR_SKIPS) +
+                      " 'dc skip's did not restart it";
+        coord.stalledReason +=
+            anyBusy ? " (" + busyName + " was " + busyReason + " throughout)" : "";
         LOG_ERROR("module.overseer",
                   "overseer: dungeon run {} of campaign {} cannot be cleared - {} 'dc "
                   "skip's and '{}' has still not moved {}y on map {}, with {}. Walking "
