@@ -4663,10 +4663,14 @@ void RememberAim(std::string const& name, std::string const& job, uint32 questAi
 // be running the victim's death on - map-update, same as every other event
 // hook in this file (see the file header). Memory only, same discipline as
 // RecordEvent: no database work, no resolving anything not already handed in.
+static bool InNaturalGuild(Player* p);
+
 void RememberKiller(Player* killed, std::string const& killerType,
                     std::string const& killerName, uint32 killerEntry)
 {
-    if (!killed || !OnRoster(killed->GetName()))
+    // A guild member's death row (#533) needs its killer too, or every one of
+    // them would read as 'environment'.
+    if (!killed || !(OnRoster(killed->GetName()) || InNaturalGuild(killed)))
         return;
     std::lock_guard<std::mutex> guard(g_killMutex);
     PendingKill& k = g_pendingKill[LowerName(killed->GetName())];
@@ -4743,6 +4747,9 @@ struct PendingDeath
 std::mutex g_deathMutex;
 std::vector<PendingDeath> g_deathQueue;
 uint64 g_droppedDeaths = 0;
+// When each managed-guild member's last death row was queued, by lowercased
+// name, under g_deathMutex. One entry per guild member at most.
+std::map<std::string, std::int64_t> g_guildDeathAt;
 
 // A death is never coalesced, unlike g_eventQueue. Every keyed queue in this
 // file exists because the SAME fact repeating is not new information; a
@@ -4751,6 +4758,21 @@ uint64 g_droppedDeaths = 0;
 // comment - bounded so a runaway hook can never grow this without limit.
 constexpr size_t MAX_DEATH_QUEUE = 200;
 
+// One level change, queued for the world thread to write (#533). Same shape and
+// discipline as PendingDeath: memory only on the hook thread, never coalesced.
+struct PendingLevel
+{
+    std::string characterName;
+    uint32 characterGuid = 0;
+    uint8 oldLevel = 0;
+    uint8 newLevel = 0;
+    uint16 mapId = 0;
+    uint32 zoneId = 0;
+    uint32 guildId = 0;
+};
+std::vector<PendingLevel> g_levelQueue;  // under g_deathMutex, bounded below
+uint64 g_droppedLevels = 0;
+
 // The one place a death's full context is captured. Runs on whatever thread
 // OnPlayerJustDied fires on - a map-update thread, per the file header - so
 // it does NO database work: it reads three in-memory caches and the
@@ -4758,9 +4780,9 @@ constexpr size_t MAX_DEATH_QUEUE = 200;
 // is merely dead), and pushes a struct under a mutex. FlushDeaths, called
 // only from OnUpdate on the world thread, is the only code that touches
 // MySQL for this table.
-// A NATURAL GUILD MEMBER'S DEATH, SAID IN THE LOG (infra#4799). RecordDeath
-// keeps overseer_death to the roster, and several readers count that table
-// by map and zone, so a guild's hundreds of deaths an hour do not go there.
+// A NATURAL GUILD MEMBER'S DEATH, SAID IN THE LOG (infra#4799). overseer_death
+// now covers the guilds too (#533, one row per member per minute at most); the
+// log line still says what the row cannot.
 // The guild dies about 800 times an hour on the dev realm with nothing saying
 // to what; this line says it: the killer, its level and rank, how many were
 // on the member, and the member's own level, health pool and gear.
@@ -4799,15 +4821,65 @@ static void LogGuildDeath(Player* killed, char const* kind, std::string const& k
              killed->GetGroup() ? ", grouped" : "");
 }
 
+// The level-up record (#533): the family and the managed guilds, decided by
+// OverseerDecisions::RecordsLevel. Memory only, like RecordDeath.
+static void RecordLevel(Player* player, uint8 oldLevel)
+{
+    if (!player)
+        return;
+    bool const onRoster = OnRoster(player->GetName());
+    if (!OverseerDecisions::RecordsLevel(onRoster, !onRoster && InNaturalGuild(player)))
+        return;
+    PendingLevel l;
+    l.characterName = player->GetName();
+    l.characterGuid = player->GetGUID().GetCounter();
+    l.oldLevel = oldLevel;
+    l.newLevel = player->GetLevel();
+    l.mapId = static_cast<uint16>(player->GetMapId());
+    l.zoneId = player->GetZoneId();
+    l.guildId = player->GetGuildId();
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    if (g_levelQueue.size() >= MAX_DEATH_QUEUE)
+    {
+        ++g_droppedLevels;
+        return;
+    }
+    g_levelQueue.push_back(std::move(l));
+}
+
 void RecordDeath(Player* player)
 {
     if (!player)
         return;
-    if (!OnRoster(player->GetName()))
-        return;
 
     std::string const lower = LowerName(player->GetName());
     std::time_t const now = std::time(nullptr);
+
+    // THE FAMILY AND THE MANAGED GUILDS (#533). OverseerDecisions::RecordsDeath
+    // decides; this is its inputs. The last row queued for a guild member is
+    // kept here, under the queue's own lock, so the gap it enforces is measured
+    // against what was actually queued.
+    bool const onRoster = OnRoster(player->GetName());
+    bool const inGuild = !onRoster && InNaturalGuild(player);
+    if (!onRoster && !inGuild)
+        return;
+    bool record = true;
+    if (inGuild)
+    {
+        std::lock_guard<std::mutex> guard(g_deathMutex);
+        std::int64_t& last = g_guildDeathAt[lower];
+        record = OverseerDecisions::RecordsDeath(false, true, last,
+                                                 static_cast<std::int64_t>(now));
+        if (record)
+            last = static_cast<std::int64_t>(now);
+    }
+    if (!record)
+    {
+        // The killer left for this death is spent with it.
+        std::lock_guard<std::mutex> guard(g_killMutex);
+        g_pendingKill.erase(lower);
+        return;
+    }
 
     PendingDeath d;
     d.characterName = player->GetName();
@@ -6680,6 +6752,7 @@ public:
             return;
         RecordEvent(player, "level_up", player->GetLevel(), "",
                     "from " + std::to_string(static_cast<uint32>(oldLevel)));
+        RecordLevel(player, oldLevel);
         // GiveLevel has already counted the new points (InitTalentForLevel),
         // and the playerbots level-up action runs later, on the bot's own AI
         // update, where it finds nothing left to spend.
@@ -7311,6 +7384,7 @@ public:
         {
             _deathTimer = 0;
             FlushDeaths();
+            FlushLevels();
         }
         if (_sweepTimer >= CHAT_SWEEP_MS)
         {
@@ -7331,6 +7405,9 @@ public:
             // happening problem to protect - only a first and only occurrence.
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_death WHERE created_at < NOW() - INTERVAL {} DAY",
+                DEATH_RETENTION_DAYS);
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_level WHERE created_at < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
             // The run timeline: swept on created_at like the deaths, because a
             // row is never updated after it is written.
@@ -46857,6 +46934,44 @@ private:
     // CharacterDatabase.Execute logs the failure and returns; it does not
     // throw, and nothing upstream of it - a bot's own death - is put at risk
     // either way, because nothing here runs on that path.
+    // The level rows (#533), written on the same timer and under the same
+    // rule as FlushDeaths: only this world-thread call touches the database, and
+    // a missing table costs rows, not the level change.
+    void FlushLevels()
+    {
+        std::vector<PendingLevel> batch;
+        uint64 dropped = 0;
+        {
+            std::lock_guard<std::mutex> guard(g_deathMutex);
+            if (g_levelQueue.empty() && !g_droppedLevels)
+                return;
+            batch.swap(g_levelQueue);
+            dropped = g_droppedLevels;
+            g_droppedLevels = 0;
+        }
+        if (dropped)
+            LOG_WARN("module.overseer", "overseer: dropped {} level changes (queue full)", dropped);
+        if (batch.empty())
+            return;
+        std::ostringstream ss;
+        ss << "INSERT INTO overseer_level (character_name, character_guid, old_level, "
+              "new_level, map, zone, guild_id) VALUES ";
+        bool first = true;
+        for (PendingLevel const& l : batch)
+        {
+            if (!first)
+                ss << ',';
+            first = false;
+            ss << "('" << Esc(l.characterName) << "'," << l.characterGuid
+               << ',' << static_cast<uint32>(l.oldLevel)
+               << ',' << static_cast<uint32>(l.newLevel)
+               << ',' << static_cast<uint32>(l.mapId)
+               << ',' << l.zoneId
+               << ',' << l.guildId << ')';
+        }
+        CharacterDatabase.Execute(ss.str().c_str());
+    }
+
     void FlushDeaths()
     {
         std::vector<PendingDeath> batch;
@@ -46868,6 +46983,14 @@ private:
             batch.swap(g_deathQueue);
             dropped = g_droppedDeaths;
             g_droppedDeaths = 0;
+            // A guild member whose last row is older than the gap no longer
+            // holds anything back, so its entry is dropped (#533): the map
+            // stays the size of the members dying right now, not of every name
+            // the guilds ever had.
+            std::int64_t const cutoff = static_cast<std::int64_t>(std::time(nullptr)) -
+                                        OverseerDecisions::GUILD_DEATH_MIN_GAP_SECONDS;
+            for (auto it = g_guildDeathAt.begin(); it != g_guildDeathAt.end();)
+                it = it->second <= cutoff ? g_guildDeathAt.erase(it) : std::next(it);
         }
 
         if (dropped)

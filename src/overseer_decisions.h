@@ -19671,6 +19671,23 @@ std::string MeterProbeJson(std::vector<MeterLine> const& lines, bool live,
                            std::time_t seconds, std::string const& target,
                            float topThreat);
 
+// WHO GETS A ROW IN overseer_death AND overseer_level (wow-overseer#533).
+//
+// The family was the only cohort either table ever covered, so leveling
+// throughput could not be measured for the guilds: no deaths per hour, no
+// level-ups. A member of a managed guild (Overseer.Natural.Guilds) is recorded
+// as well. The family keeps every row. A guild member is held to one death row
+// per GUILD_DEATH_MIN_GAP_SECONDS, because the guilds die about 800 times an
+// hour and a death loop on one member would otherwise fill the table with one
+// body. A level change needs no gap: a character has at most 79 of them.
+constexpr std::int64_t GUILD_DEATH_MIN_GAP_SECONDS = 60;
+
+// `lastRecordedAt` is when this member's last death row was queued, 0 for
+// never.
+bool RecordsDeath(bool onRoster, bool inManagedGuild, std::int64_t lastRecordedAt,
+                  std::int64_t now);
+bool RecordsLevel(bool onRoster, bool inManagedGuild);
+
 // ---------------------------------------- the auction history (wow-overseer#536) --
 //
 // An auction that closes is recorded as one row of overseer_auction_history:
