@@ -14616,12 +14616,21 @@ private:
             // (job='quest', mid-dungeon, whatever), and this drive must not
             // touch anyone it was not told to. See LoadJobs above.
             auto const jobIt = jobs.find(name);
-            if (jobIt == jobs.end() || jobIt->second != "craft")
+            if (jobIt == jobs.end())
                 continue;
 
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot || !bot->IsInWorld())
                 continue;   // same "read on its own" discipline as every other drive
+
+            // BETWEEN RUNS TOO (OverseerDecisions::MayCraftNow): a family on a
+            // campaign job crafts while it waits in town, never inside a run,
+            // in a fight or on the move.
+            // isMoving  Unit.h  bool isMoving() const
+            if (!OverseerDecisions::MayCraftNow(jobIt->second, InDungeonRun(bot),
+                                                bot->IsAlive(), bot->IsInCombat(),
+                                                bot->isMoving()))
+                continue;
 
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
             if (!info)

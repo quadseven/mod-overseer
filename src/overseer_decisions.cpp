@@ -14611,6 +14611,16 @@ bool IsFarWalk(WalkGoal goal, float yards)
     return yards > NearWalkCapYards(goal);
 }
 
+bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inCombat,
+                 bool moving)
+{
+    if (job == "craft")
+        return true;
+    bool const campaignJob =
+        job == "town run" || job == "dungeon" || job.rfind("dungeon:", 0) == 0;
+    return campaignJob && !inDungeonRun && alive && !inCombat && !moving;
+}
+
 bool MailWalkPointAlongPath(std::vector<MailWalkPoint> const& points, float maxYards,
                             MailWalkPoint& out)
 {
