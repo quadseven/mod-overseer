@@ -14627,6 +14627,17 @@ bool CraftDismountsFirst(bool mounted, bool inFlight)
     return mounted && !inFlight;
 }
 
+HoldDebt HandRevivalDebtOn(HoldDebt inForce, bool revivalLed, bool hasMaster)
+{
+    HoldDebt out = inForce;
+    out.addedStay = true;
+    if (revivalLed)
+        out.removedNewRpg = true;
+    else if (hasMaster)
+        out.removedFollow = true;
+    return out;
+}
+
 bool MailWalkPointAlongPath(std::vector<MailWalkPoint> const& points, float maxYards,
                             MailWalkPoint& out)
 {

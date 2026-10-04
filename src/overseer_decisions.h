@@ -16868,6 +16868,23 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
 // character off a taxi would cancel an errand nobody asked to cancel.
 bool CraftDismountsFirst(bool mounted, bool inFlight);
 
+// A REVIVAL HOLD THAT ENDS UNDER ANOTHER HOLD HANDS ITS DEBT ON. The revival
+// hold adds `stay` and takes `new rpg` (the leader) or `follow` (a member with
+// a master); when a longer hold is still in force at its end it used to defer
+// and drop that debt, and the other hold, which had found `stay` already on and
+// `new rpg` already off, recorded taking neither and gave neither back. On
+// wow-dev 2026-10-04, 50 of 132 guild members stood in place with `stay` on and
+// `new rpg` off after a spirit-healer revival, earning 7 XP an hour against
+// 617 for the rest, until the next restart. The hold in force now owes what the
+// revival hold took.
+struct HoldDebt
+{
+    bool addedStay{false};
+    bool removedFollow{false};
+    bool removedNewRpg{false};
+};
+HoldDebt HandRevivalDebtOn(HoldDebt inForce, bool revivalLed, bool hasMaster);
+
 // May a far walk start on this map? Eastern Kingdoms and Kalimdor only.
 bool FarWalkMapAllowed(uint32_t mapId);
 
