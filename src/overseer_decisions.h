@@ -17421,6 +17421,13 @@ bool ClassicRankAllowed(uint32_t rankMaxSkill);
 bool ClassicRecipeAllowed(uint32_t reqSkillRank);
 }  // namespace Classic
 
+// May a far walk start here? On the classic continents, as FarWalkMapAllowed
+// says, and also in the Blood Elf and Draenei starting lands on map 530
+// (Classic::IsStartingLand), where 24 guild members at levels 11 to 24 stood
+// on wow-dev on 2026-10-04 and 62 walks a day were refused "a far walk starts
+// only on the Eastern Kingdoms or Kalimdor". Outland proper stays refused.
+bool FarWalkAllowedAt(uint32_t mapId, uint32_t zoneId);
+
 // -- a failed dungeon EXIT hearths out (2026-09-24) ---------------------------
 //
 // WHAT IT ENDS, measured on the dev realm. A leader alone inside Ragefire

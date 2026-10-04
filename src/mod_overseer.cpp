@@ -63131,7 +63131,7 @@ private:
         };
         if (ev.far)
         {
-            if (!D::FarWalkMapAllowed(ev.mapId))
+            if (!D::FarWalkAllowedAt(ev.mapId, who->GetZoneId()))
                 return refuse(D::FarWalkRefusal::NotOnAContinent);
             if (char const* wall = armFar(); *wall)
                 return refuse(wall);
@@ -63146,7 +63146,7 @@ private:
         {
             WorldPosition probe;
             if (D::NearWalkFallsBackToRoute(MailWalkLegStep(who, ev, probe),
-                                            D::FarWalkMapAllowed(ev.mapId)))
+                                            D::FarWalkAllowedAt(ev.mapId, who->GetZoneId())))
             {
                 if (char const* wall = armFar(); *wall)
                     return refuse(wall);
