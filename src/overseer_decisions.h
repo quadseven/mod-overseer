@@ -19671,6 +19671,63 @@ std::string MeterProbeJson(std::vector<MeterLine> const& lines, bool live,
                            std::time_t seconds, std::string const& target,
                            float topThreat);
 
+// ---------------------------------------- the auction history (wow-overseer#536) --
+//
+// An auction that closes is recorded as one row of overseer_auction_history:
+// what sold or lapsed, for how much, and who was on each side, so the market
+// engine can price from observed sales. Pure rules only; the hooks that read
+// the core's AuctionEntry live in mod_overseer.cpp.
+
+enum class AuctionOutcome
+{
+    Sold,
+    Expired,
+};
+
+// The word stored in the `outcome` column.
+char const* AuctionOutcomeWord(AuctionOutcome outcome);
+
+enum class AuctionPartyKind
+{
+    Unknown,
+    RandomBot,
+    GuildMember,
+    Family,
+    Player,
+};
+
+// The word stored in `seller_kind` and `buyer_kind`.
+char const* AuctionPartyWord(AuctionPartyKind kind);
+
+// Who a seller or buyer is. `known` is false for an empty guid (an expired
+// auction has no buyer). The roster (a family) outranks a guild, and a guild
+// outranks a random bot: a family or guild character is a person to the market
+// even when a bot drives it. Anyone else is a player.
+AuctionPartyKind ClassifyAuctionParty(bool known, bool onRoster, bool inStoryGuild,
+                                      bool randomBot);
+
+// What the buyer paid. The core sets `bid` to the buyout price on a buyout, so
+// a sold auction's price is its bid; an expired one was paid by nobody.
+unsigned AuctionPricePaid(AuctionOutcome outcome, unsigned bid);
+
+struct AuctionHistoryRow
+{
+    unsigned house{0};
+    unsigned itemEntry{0};
+    unsigned itemCount{0};
+    unsigned bid{0};
+    unsigned buyout{0};
+    AuctionOutcome outcome{AuctionOutcome::Expired};
+    unsigned sellerGuid{0};
+    AuctionPartyKind sellerKind{AuctionPartyKind::Unknown};
+    unsigned buyerGuid{0};
+    AuctionPartyKind buyerKind{AuctionPartyKind::Unknown};
+};
+
+// The INSERT for one row. Every value is a number or one of the fixed words
+// above, so nothing needs escaping.
+std::string AuctionHistoryInsertSql(AuctionHistoryRow const& row);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
