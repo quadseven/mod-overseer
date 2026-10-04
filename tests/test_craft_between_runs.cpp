@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string>
 
+using OverseerDecisions::CraftDismountsFirst;
 using OverseerDecisions::MayCraftNow;
 
 namespace
@@ -42,6 +43,10 @@ void TheDecision()
     Check("never on the move", !MayCraftNow("town run", false, true, false, true));
     Check("never dead", !MayCraftNow("town run", false, false, false, false));
     Check("questing does not craft", !MayCraftNow("quest", false, true, false, false));
+    // wow-dev 2026-10-04: 184 craft casts refused with SPELL_FAILED_NOT_MOUNTED.
+    Check("a mounted crafter dismounts first", CraftDismountsFirst(true, false));
+    Check("a crafter on foot does nothing", !CraftDismountsFirst(false, false));
+    Check("a taxi is never cancelled", !CraftDismountsFirst(true, true));
     Check("a dungeon-looking prefix is not enough",
           !MayCraftNow("dungeons", false, true, false, false));
 }
