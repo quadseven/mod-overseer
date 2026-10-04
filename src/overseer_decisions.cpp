@@ -14622,6 +14622,11 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
     return campaignJob && !inDungeonRun && alive && !inCombat && !moving;
 }
 
+bool CraftDismountsFirst(bool mounted, bool inFlight)
+{
+    return mounted && !inFlight;
+}
+
 bool MailWalkPointAlongPath(std::vector<MailWalkPoint> const& points, float maxYards,
                             MailWalkPoint& out)
 {

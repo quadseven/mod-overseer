@@ -16859,6 +16859,15 @@ bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed);
 bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inCombat,
                  bool moving);
 
+// A MOUNTED CRAFTER IS TAKEN OFF ITS MOUNT FIRST. Spell::CheckCast refuses a
+// tradeskill cast on a ground mount with SPELL_FAILED_NOT_MOUNTED (64); a
+// client sends CMSG_CANCEL_MOUNT_AURA before the cast, a bot does not. On
+// wow-dev 2026-10-04, within an hour of crafting between runs going live,
+// Grug, Bork, Grog and Ugga had 184 craft casts refused with 64 and none
+// crafted. In flight is left alone: the handler refuses it, and taking a
+// character off a taxi would cancel an errand nobody asked to cancel.
+bool CraftDismountsFirst(bool mounted, bool inFlight);
+
 // May a far walk start on this map? Eastern Kingdoms and Kalimdor only.
 bool FarWalkMapAllowed(uint32_t mapId);
 

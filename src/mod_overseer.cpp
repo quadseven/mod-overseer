@@ -14677,6 +14677,18 @@ private:
             if (shortOfReagents)
                 continue;
 
+            // Off the mount first, through the handler a client drives for the
+            // same reason (see the cast hold, #337): it does both Dismount()
+            // and the aura removal.
+            if (OverseerDecisions::CraftDismountsFirst(bot->IsMounted(), bot->IsInFlight()))
+            {
+                if (WorldSession* session = bot->GetSession())
+                {
+                    WorldPacket cancelMount(CMSG_CANCEL_MOUNT_AURA, 0);
+                    session->HandleCancelMountAuraOpcode(cancelMount);
+                }
+            }
+
             SpellCastResult const result = bot->CastSpell(bot, spellId, false);
             if (result == SPELL_CAST_OK)
             {
@@ -14711,6 +14723,9 @@ private:
                     break;
                 case SPELL_FAILED_ITEM_NOT_FOUND:
                     resultName = "item not found";
+                    break;
+                case SPELL_FAILED_NOT_MOUNTED:
+                    resultName = "mounted";
                     break;
                 default:
                     break;
