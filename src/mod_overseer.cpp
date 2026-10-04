@@ -7177,6 +7177,7 @@ public:
         {
             _craftTimer = 0;
             DriveCraft();
+            DriveHeadTrades();
         }
         // Same ordering convention as DriveCraft just above, and the same
         // reason it is safe: a character is job='quest' XOR job='craft' XOR
@@ -14599,6 +14600,66 @@ private:
     // this function logs the refusal and leaves the errand standing, and
     // nothing is crafted out of thin air - the same "fail closed, not open"
     // shape every other drive in this file holds to.
+    // When each roster selfbot's open trade was first seen, for
+    // AnswerTradeAtHead's waits. World thread only, like every register here.
+    std::map<std::string, time_t> _headTradeSeen;
+
+    // ANSWER A TRADE OPENED TO A SELFBOT ON THE ROSTER (AnswerTradeAtHead).
+    // A trade this module opens itself (DoTrade) accepts both sides in the same
+    // call and never reaches here open.
+    void DriveHeadTrades()
+    {
+        std::map<std::string, std::string> const roster = LoadJobs();
+        time_t const now = std::time(nullptr);
+        for (auto const& entry : roster)
+        {
+            std::string const& name = entry.first;
+            Player* head = ObjectAccessor::FindPlayerByName(name);
+            TradeData* mine = head && head->IsInWorld() ? head->GetTradeData() : nullptr;
+            if (!mine || !IsSelfBot(head))
+            {
+                _headTradeSeen.erase(name);
+                continue;
+            }
+            Player* trader = head->GetTrader();
+            TradeData* theirs = trader ? trader->GetTradeData() : nullptr;
+            if (!trader || !theirs)
+                continue;
+            auto const seen = _headTradeSeen.emplace(name, now).first;
+            uint32 const open = static_cast<uint32>(now - seen->second);
+
+            uint32 theyOffer = 0, weGive = 0;
+            for (uint32 slot = 0; slot < TRADE_SLOT_TRADED_COUNT; ++slot)
+            {
+                theyOffer += theirs->GetItem(TradeSlots(slot)) ? 1u : 0u;
+                weGive += mine->GetItem(TradeSlots(slot)) ? 1u : 0u;
+            }
+            bool const kin = OnRoster(trader->GetName()) ||
+                             (trader->GetGuildId() && trader->GetGuildId() == head->GetGuildId());
+            OverseerDecisions::HeadTradeAnswer const answer = OverseerDecisions::AnswerTradeAtHead(
+                kin, theyOffer, static_cast<uint32>(theirs->GetMoney()), weGive,
+                static_cast<uint32>(mine->GetMoney()), open);
+            if (answer == OverseerDecisions::HeadTradeAnswer::Wait)
+                continue;
+            if (answer == OverseerDecisions::HeadTradeAnswer::Accept)
+            {
+                WorldPacket accept(CMSG_ACCEPT_TRADE, 0);
+                head->GetSession()->HandleAcceptTradeOpcode(accept);
+            }
+            else
+                head->TradeCancel(true);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' answered the trade '{}' opened - {} ({} item(s) and {} "
+                     "copper offered, {} asked of it, open {}s, {})",
+                     name, trader->GetName(),
+                     answer == OverseerDecisions::HeadTradeAnswer::Accept ? "accepted"
+                                                                          : "declined",
+                     theyOffer, static_cast<uint32>(theirs->GetMoney()), weGive, open,
+                     kin ? "family or guild" : "a stranger");
+            _headTradeSeen.erase(name);
+        }
+    }
+
     void DriveCraft()
     {
         std::map<std::string, std::string> const jobs = LoadJobs();
