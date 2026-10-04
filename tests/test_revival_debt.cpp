@@ -62,7 +62,11 @@ void TheAdapterIsWired()
     Check("the module source is readable (run from the repo root)", !source.empty());
     std::size_t const release = source.find("void ReleaseRevivalHold(");
     Check("ReleaseRevivalHold exists", release != std::string::npos);
-    std::size_t const next = source.find("\n    }\n", release);
+    if (release == std::string::npos)
+        return;
+    std::size_t next = source.find("\n    }\n", release);
+    if (next == std::string::npos)
+        next = source.size();
     std::string const body = source.substr(release, next - release);
     Check("the deferral hands the debt on",
           body.find("OverseerDecisions::HandRevivalDebtOn(") != std::string::npos);

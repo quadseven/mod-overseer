@@ -27542,7 +27542,9 @@ private:
             // neither; without this the debt was dropped and the character
             // stood until a restart (see HandRevivalDebtOn).
             auto const inForce = HoldsInForce().find(name);
-            if (inForce != HoldsInForce().end())
+            bool const found = inForce != HoldsInForce().end();
+            std::string const holder = found ? inForce->second.verb : "other";
+            if (found)
             {
                 HoldRecord& record = inForce->second;
                 OverseerDecisions::HoldDebt const owed = OverseerDecisions::HandRevivalDebtOn(
@@ -27556,7 +27558,7 @@ private:
                      "overseer: '{}' is out of its post-revival hold but the {} hold is "
                      "holding it still - the mover stays off and that hold now hands back "
                      "`stay` and {}",
-                     name, inForce != HoldsInForce().end() ? inForce->second.verb : "other",
+                     name, holder,
                      led ? "`new rpg`" : botAI->GetMaster() ? "`follow`" : "nothing else");
             return;
         }
