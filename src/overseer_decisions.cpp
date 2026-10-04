@@ -17849,4 +17849,19 @@ std::string MeterProbeJson(std::vector<MeterLine> const& lines, bool live,
     return out;
 }
 
+bool RecordsDeath(bool onRoster, bool inManagedGuild, std::int64_t lastRecordedAt,
+                  std::int64_t now)
+{
+    if (onRoster)
+        return true;
+    if (!inManagedGuild)
+        return false;
+    return lastRecordedAt == 0 || now - lastRecordedAt >= GUILD_DEATH_MIN_GAP_SECONDS;
+}
+
+bool RecordsLevel(bool onRoster, bool inManagedGuild)
+{
+    return onRoster || inManagedGuild;
+}
+
 }  // namespace OverseerDecisions
