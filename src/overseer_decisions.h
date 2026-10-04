@@ -16425,6 +16425,14 @@ struct MailWalkPoint
     float z{0.f};
 };
 
+// The point `maxYards` along a path's points from its first, or its last point
+// when the path is shorter. False for a path of fewer than two points. Used to
+// take a walk's next leg off the navmesh's own route when the straight leg's
+// aim has no ground under it (quadseven/mod-overseer: guild vendor walks on
+// wow-dev 2026-10-03 refused on the Darnassus terraces and Durotar cliffs).
+bool MailWalkPointAlongPath(std::vector<MailWalkPoint> const& points, float maxYards,
+                            MailWalkPoint& out);
+
 // THE AIM FOR THIS LEG: the box itself when it is within `legYards`, and
 // otherwise the point `legYards` along the straight line toward it (z
 // interpolated; the adapter re-grounds it). `final` says which.
