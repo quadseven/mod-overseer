@@ -15181,6 +15181,11 @@ bool ClassicRecipeAllowed(uint32_t reqSkillRank)
 }
 }  // namespace Classic
 
+bool FarWalkAllowedAt(uint32_t mapId, uint32_t zoneId)
+{
+    return FarWalkMapAllowed(mapId) || Classic::IsStartingLand(mapId, zoneId);
+}
+
 ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxAttempts)
 {
     if (!facts.inWorld || !facts.onInsideMap)
