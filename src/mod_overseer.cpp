@@ -48782,6 +48782,10 @@ private:
                 // is a roster job mode, which never begins with this word.
                 detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Spawn, status,
                                 rowResult, _pendingMailWalks, id);
+            else if (kind == "job" && OverseerDecisions::IsRenameRow(command))
+                // A RENAME (2026-10-05) rides kind='job', routed on its first
+                // word like the walks above, so no ENUM migration is needed.
+                detail = DoRename(player, command, status, rowResult);
             else if (kind == "job")
                 detail = DoJob(player, command, status, rowResult);
             else if (kind == "sell" && OverseerDecisions::IsDestroyRow(command))
@@ -57207,6 +57211,95 @@ private:
         return "";
     }
 
+
+    // ---------------------------------------------------------------- rename --
+    //
+    // THE CORE'S RENAME AND THIS MODULE'S NAME-KEYED ROWS, AS ONE ACT. The
+    // steps are HandleCharacterRenameCommand's (cs_character.cpp): normalize
+    // and check the name, refuse one already taken, drop the declined name,
+    // rename the Player in place and in the name map, and update the cache.
+    // Unlike the command, the name is written to the database here and a bot
+    // is not kicked: a bot has no client to reconnect, so the kick would only
+    // log it out, and the written name is what the next save keeps. A real
+    // client is kicked as the command does, because its client holds the old
+    // name. Then every row in RenameTables() follows it, in one transaction.
+    static char const* DoRename(Player* who, std::string const& command, char const*& status,
+                                std::string& out)
+    {
+        using OverseerDecisions::ParseRenameRequest;
+        using OverseerDecisions::RenameFacts;
+        using OverseerDecisions::RenameRefusal;
+        using OverseerDecisions::RenameRequest;
+
+        std::string const oldName = who->GetName();
+        RenameRequest const request = ParseRenameRequest(command);
+        auto describe = [&](char const* outcome, char const* reason, std::string const& newName)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(reason)
+              << ",\"from\":" << J(oldName) << ",\"to\":" << J(newName) << "}";
+            out = o.str();
+        };
+        if (!request.ok)
+        {
+            describe("refused", request.error.c_str(), "");
+            return "malformed rename request";
+        }
+
+        std::string newName = request.newName;
+        RenameFacts facts;
+        facts.nameValid = normalizePlayerName(newName) &&
+                          ObjectMgr::CheckPlayerName(newName, true) == CHAR_NAME_SUCCESS;
+        facts.sameName = newName == oldName;
+        if (facts.nameValid && !facts.sameName)
+        {
+            CharacterDatabasePreparedStatement* check =
+                CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHECK_NAME);
+            check->SetData(0, newName);
+            facts.nameTaken = bool(CharacterDatabase.Query(check));
+        }
+        Map const* map = who->GetMap();
+        facts.inInstance = map && map->Instanceable();
+        facts.inCombat = who->IsInCombat();
+        facts.inDungeonRun = InDungeonRun(who);
+        if (char const* const refusal = RenameRefusal(facts))
+        {
+            describe("refused", refusal, newName);
+            return refusal;
+        }
+
+        ObjectGuid const guid = who->GetGUID();
+        CharacterDatabasePreparedStatement* declined =
+            CharacterDatabase.GetPreparedStatement(CHAR_DEL_DECLINED_NAME);
+        declined->SetData(0, guid.GetCounter());
+        CharacterDatabase.Execute(declined);
+
+        who->SetName(newName);
+        ObjectAccessor::UpdatePlayerNameMapReference(oldName, who);
+        CharacterDatabasePreparedStatement* rename =
+            CharacterDatabase.GetPreparedStatement(CHAR_UPD_NAME_BY_GUID);
+        rename->SetData(0, newName);
+        rename->SetData(1, guid.GetCounter());
+        CharacterDatabase.Execute(rename);
+        sCharacterCache->UpdateCharacterData(guid, newName);
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        for (OverseerDecisions::RenameTable const& t : OverseerDecisions::RenameTables())
+            trans->Append("UPDATE {} SET {} = '{}' WHERE {} = '{}'", t.table, t.column,
+                          Esc(newName), t.column, Esc(oldName));
+        CharacterDatabase.CommitTransaction(trans);
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is renamed '{}' - the core's rename, and its roster, raid "
+                 "seat, keep list, goals, trades and stream rows moved with it",
+                 oldName, newName);
+        if (WorldSession* session = who->GetSession())
+            if (!session->IsBot())
+                session->KickPlayer("overseer rename");
+        describe("renamed", "", newName);
+        status = "applied";
+        return "";
+    }
 
     // --------------------------------------------------------------- conjure --
     //
