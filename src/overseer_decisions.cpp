@@ -6970,6 +6970,88 @@ CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
     return price;
 }
 
+char const* StrandedWayName(StrandedWay way)
+{
+    switch (way)
+    {
+        case StrandedWay::NotStranded:  return "not stranded";
+        case StrandedWay::StandDown:    return "stand down";
+        case StrandedWay::Wait:         return "wait";
+        case StrandedWay::Hearth:       return "hearth";
+        case StrandedWay::Sail:         return "sail";
+        case StrandedWay::WaitForStone: return "wait for the stone";
+        case StrandedWay::Refuse:       return "refuse";
+    }
+    return "wait";
+}
+
+StrandedWay DecideStrandedWay(StrandedFacts const& f)
+{
+    if (!f.readable)
+        return StrandedWay::Wait;
+    if (f.aboard)
+        return StrandedWay::Sail;
+    if (f.familyOwnsTheWay)
+        return StrandedWay::StandDown;
+    if (f.memberMap == f.leaderMap)
+        return f.crossingUnderWay && f.crossingLanded ? StrandedWay::Sail
+                                                      : StrandedWay::NotStranded;
+    if (!f.alive || f.inCombat || f.hearthInFlight)
+        return StrandedWay::Wait;
+    if (f.boundOnLeaderMap && f.carriesStone && f.stoneReady)
+        return StrandedWay::Hearth;
+    if (f.transportServes)
+        return StrandedWay::Sail;
+    if (f.boundOnLeaderMap && f.carriesStone)
+        return StrandedWay::WaitForStone;
+    return StrandedWay::Refuse;
+}
+
+std::string StrandedWayExplanation(StrandedFacts const& f, StrandedWay way)
+{
+    std::string const here = std::to_string(f.memberMap);
+    std::string const there = std::to_string(f.leaderMap);
+    switch (way)
+    {
+        case StrandedWay::NotStranded:
+            return "it is on its leader's map and no crossing of its own is under way";
+        case StrandedWay::StandDown:
+            return "a dungeon run, the family's own crossing, or a dungeon door on this "
+                   "member's continent that the family is walking to decides where it goes, so "
+                   "it does not cross on its own";
+        case StrandedWay::Wait:
+            if (!f.readable)
+                return "it could not be read this poll";
+            if (!f.alive)
+                return "it is dead, and its ghost run comes first";
+            if (f.inCombat)
+                return "it is fighting, and nothing sets off while it does";
+            return "a hearth is already in flight for it";
+        case StrandedWay::Hearth:
+            return "its hearthstone is bound on map " + there +
+                   ", its leader's, and is ready, so it hearths there";
+        case StrandedWay::Sail:
+            if (f.aboard)
+                return "it is a passenger, so its crossing is supervised to the far landing";
+            if (f.memberMap == f.leaderMap)
+                return "it has landed on map " + there + " and its crossing has the step "
+                       "off the deck left";
+            return "a transport its faction may ride joins map " + here + " and map " + there +
+                   ", so it walks to the berth, boards when the transport docks, rides, and "
+                   "walks off";
+        case StrandedWay::WaitForStone:
+            return "no transport its faction may ride joins map " + here + " and map " + there +
+                   ", and its hearthstone, bound on map " + there + ", is cooling down";
+        case StrandedWay::Refuse:
+            return "no transport its faction may ride, with a surveyed berth level with its "
+                   "deck at both ends, joins map " + here + " and map " + there +
+                   ", and its hearthstone is " +
+                   (f.carriesStone ? std::string("not bound on map ") + there
+                                   : std::string("not carried"));
+    }
+    return "unknown";
+}
+
 namespace
 {
 

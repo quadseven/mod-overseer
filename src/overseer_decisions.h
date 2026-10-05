@@ -6603,12 +6603,13 @@ RevivalMoveVerdict RevivalMayCrossMaps(RevivalMove const& move);
 // follower standing in formation.
 //
 // THE SILENCE IS THE DEFECT, and it is worth being plain about what this
-// decision does and does not do. It reunites nobody. `follow` cannot cross a
-// map (FollowActions.cpp:285), the catch-up walk has nowhere on this map to
-// aim at, and an `at:` aim cannot name a coordinate on another one
+// decision does and does not do. It reunites nobody by itself. `follow` cannot
+// cross a map (FollowActions.cpp:285), the catch-up walk has nowhere on this map
+// to aim at, and an `at:` aim cannot name a coordinate on another one
 // (ResolveTravelTarget refuses a spawn off-map). All of that is correct and
-// none of it changes. What changes is that a party split stops looking exactly
-// like a party that is merely slow. An operator lost real time to that twice
+// none of it changes. What reunites a split member is DecideStrandedWay (#274):
+// its hearthstone, or its own faction's boat. What changes here is that a party
+// split stops looking exactly like a party that is merely slow. An operator lost real time to that twice
 // in one day, because eleven minutes of four characters standing still with no
 // log line is indistinguishable from four characters walking.
 enum class FollowGap
@@ -8112,6 +8113,93 @@ struct CrossingPrice
 
 CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
                              CrossingPriceLimits const& limits);
+
+// ------------------------ a member stranded on another continent (#274) --
+//
+// THE CROSSING ABOVE ONLY EVER MOVED A DUNGEON RUN'S LEADER, so a follower on
+// the other continent from its leader stayed there. Measured on the dev realm
+// 2026-10-05: both families' leaders on map 0 and one follower of each on map
+// 1, and the worldserver said "THE PARTY IS SPLIT ACROSS TWO MAPS AND NOTHING
+// IN THIS MODULE CAN REJOIN IT" for each on every restart.
+//
+// WHAT A PLAYER IN THAT FOLLOWER'S SHOES DOES. Hearths, if the stone is bound
+// on the leader's continent and ready. Otherwise walks to a boat or zeppelin of
+// its own faction, waits for it to dock, steps aboard, rides, and walks off at
+// the far landing; from there it is an ordinary catch-up walk. Nothing is
+// teleported by GM command and nothing is granted.
+//
+// THE STRANDED MEMBER IS THE ONLY CHARACTER ON ITS CONTINENT, so its crossing
+// is ReadCrossing's with one member, and that member is the "leader" of it:
+// the one character aimed, the one stepped aboard and the one walked off. That
+// is the standing rule about aiming one character, applied to the only
+// character there is. Its leader is not moved for it.
+//
+// THE ORDER IS THE RULE, written out:
+//
+//   1. UNREADABLE: wait. A character this poll could not steer has no map.
+//   2. ABOARD: sail. A passenger is supervised to the far landing whatever
+//      else is true, because any other order walks it off a moving deck.
+//   3. A DUNGEON RUN OR THE FAMILY'S OWN CROSSING: stand down. Those decide
+//      where the whole family goes, and the far side may be where it is going.
+//   4. ON THE LEADER'S MAP: nothing, unless its own crossing landed it here
+//      and still has the walk off the deck to supervise. A leader who came to
+//      its continent instead ends the crossing.
+//   5. DEAD, FIGHTING, OR A HEARTH IN FLIGHT: wait. The ghost run, the fight
+//      and the cast each own the character until they end.
+//   6. BOUND ON THE LEADER'S MAP WITH THE STONE READY: hearth. Ahead of the
+//      boat because it is one cast against a walk, a wait and a ride, and
+//      ahead of a crossing already walking to its berth for the same reason.
+//   7. A TRANSPORT OF ITS OWN FACTION JOINS THE TWO MAPS: sail.
+//   8. BOUND ON THE LEADER'S MAP, STONE COOLING DOWN: wait for the stone.
+//   9. OTHERWISE: refuse, and say which half of the way across is missing.
+enum class StrandedWay : std::uint8_t
+{
+    NotStranded,
+    StandDown,
+    Wait,
+    Hearth,
+    Sail,
+    WaitForStone,
+    Refuse,
+};
+
+char const* StrandedWayName(StrandedWay way);
+
+struct StrandedFacts
+{
+    bool readable{false};
+    bool alive{false};
+    bool inCombat{false};
+    std::uint32_t memberMap{0};
+    std::uint32_t leaderMap{0};
+    // Standing on a transport, read from the character.
+    bool aboard{false};
+    // Its own crossing has taken a step and not ended.
+    bool crossingUnderWay{false};
+    // It stands on that crossing's destination map. Only a crossing that has
+    // landed it has anything left to do on its leader's map: one whose leader
+    // came to it instead is over, not sailing it away from him.
+    bool crossingLanded{false};
+    // A dungeon run's escort or the family's continent crossing is under way,
+    // or the family's dungeon door is on this member's continent and the
+    // family walks to it: the family is coming here.
+    bool familyOwnsTheWay{false};
+    // The hearthstone's bind is on the leader's map.
+    bool boundOnLeaderMap{false};
+    bool carriesStone{false};
+    // Carried, off cooldown, and with casts left to try this episode.
+    bool stoneReady{false};
+    bool hearthInFlight{false};
+    // A transport whose crew is not hostile to this character, with a level
+    // surveyed berth at both ends, joins the two maps (PriceCrossings picked
+    // one).
+    bool transportServes{false};
+};
+
+StrandedWay DecideStrandedWay(StrandedFacts const& facts);
+
+// The verdict as one sentence, for the log line that says it.
+std::string StrandedWayExplanation(StrandedFacts const& facts, StrandedWay way);
 
 // ----------------------------- who a character can actually be sent to (#234) --
 //

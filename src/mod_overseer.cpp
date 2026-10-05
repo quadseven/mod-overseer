@@ -1494,6 +1494,12 @@ constexpr uint32 CROSSING_BACKSTOP_SECONDS = 1800;
 // follower who is on its way to arrive, and far short of the two hours a
 // leader stood at the Theramore berth for a follower held 2,448 yards off.
 constexpr uint32 CROSSING_FETCH_WAIT_SECONDS = 5 * 60;
+// HOW LONG A STRANDED MEMBER'S REFUSED BOAT HOME IS LEFT BEFORE IT IS PRICED
+// AGAIN (#274). A refusal is a fact about the route (a guarded berth, a
+// crossing past its backstop), and re-opening it on the next party poll would
+// walk the member back toward the same refusal every thirty seconds. A quarter
+// of an hour is several boat periods and short of the backstop itself.
+constexpr uint32 LONE_CROSSING_STANDDOWN_SECONDS = 15 * 60;
 
 // The same question for an aimed POSITION, and it needs a different answer.
 // Everything above reasons about a creature: the slack exists because the
@@ -7332,6 +7338,12 @@ public:
             // the trip hands the party straight back instead of steering it for
             // one poll alongside the coordinator.
             DriveTownTrip();
+            // A STRANDED MEMBER'S OWN BOAT HOME (#274), on this clock for the
+            // reason the family crossing is on it: a stop is a minute long, and
+            // the party's thirty second poll could miss it. After the
+            // coordinator, so a family crossing begun this tick is seen by the
+            // party poll's stand-down before anything here aims anybody.
+            DriveLoneCrossings();
         }
         // AND THE TRAVEL DRIVE POLLS FASTER WHILE A RUN IS ESCORTING (#122).
         //
@@ -20260,6 +20272,14 @@ private:
         // only while `rejoin`; see DUNGEON_REJOIN_BACKSTOP_SECONDS for why a
         // walk that claims this lease has to bring its own clock.
         time_t rejoinSince{0};
+        // ...AND THE FIFTH OWNER (#274). True: a stranded member's walk to the
+        // berth of its own boat home, marked by DriveLoneCrossings on the
+        // coordinator's five second clock and swept by that drive when it stops
+        // marking. Its own flag rather than `catchUp`, because the catch-up's
+        // foot limit would hold a member still for a berth past 1,500 yards,
+        // and the boat is the one way home that can be that far. Gives way to
+        // a run on the same terms as the other three.
+        bool crossing{false};
         // WHETHER THIS CATCH-UP MAY STILL DECIDE TO FLY (#138). Set by
         // CatchUpToward on the poll that STARTS the walk and spent by
         // ConsiderFlight the first time flying is genuinely on the table,
@@ -20329,6 +20349,13 @@ private:
         return it != _dungeonEscorts.end() && it->second.rejoin;
     }
 
+    // Is this member walking to the berth of its own boat home (#274)?
+    bool IsCrossingAlone(std::string const& name) const
+    {
+        auto const it = _dungeonEscorts.find(name);
+        return it != _dungeonEscorts.end() && it->second.crossing;
+    }
+
     // WHOSE WALK THIS IS, IN THE WORDS AN OPERATOR READS. Four owners share one
     // lease and every line about it used to be a two-way ternary written at the
     // call site, which is how the third owner would have arrived reported as the
@@ -20342,6 +20369,8 @@ private:
             return "home errand";
         if (IsRejoining(name))
             return "walk back in";
+        if (IsCrossingAlone(name))
+            return "boat home";
         return "run";
     }
 
@@ -20688,7 +20717,7 @@ private:
         // knows where the family is going, and the lease it inherits -
         // `granted` - is handed back by the run's own sweep exactly as if the
         // run had granted it.
-        if (escort.catchUp || escort.homeBind || escort.rejoin)
+        if (escort.catchUp || escort.homeBind || escort.rejoin || escort.crossing)
         {
             // ...AND OVER A HOME ERRAND ON THE SAME TERMS (#348). The errand
             // walks a member away from the family to an inn, which is exactly
@@ -20707,8 +20736,10 @@ private:
             // the door the rejoin was walking it to.
             char const* const from = escort.catchUp    ? "catch-up walk"
                                      : escort.homeBind ? "home errand"
+                                     : escort.crossing ? "walk to its boat home"
                                                        : "walk back in";
             escort.catchUp = false;
+            escort.crossing = false;
             escort.homeBind = false;
             escort.homeSince = 0;
             escort.rejoin = false;
@@ -20887,7 +20918,7 @@ private:
         if (!_travelAims.Claim(name, aimText, OverseerDecisions::TravelOwner::CatchUp))
         {
             _catchUpRefused[name] = _travelAims.ClaimRefusal(name);
-            if (escort.aim.empty() && !escort.catchUp && !escort.rejoin &&
+            if (escort.aim.empty() && !escort.catchUp && !escort.rejoin && !escort.crossing &&
                 !escort.granted && !escort.homeBind)
                 _dungeonEscorts.erase(name);
             return false;
@@ -21097,25 +21128,31 @@ private:
     {
         uint32 const here = p->GetMapId();
         uint32 const there = leader->GetMapId();
-        auto const said = _partySplitSaid.find(name);
-        if (said != _partySplitSaid.end() && said->second == there)
-            return;
         _partySplitSaid[name] = there;
+        // WHY NOTHING CROSSES FOR IT, from DecideStrandedWay on this same poll
+        // (#274). The line is re-said when the leader's map or the reason
+        // changes, and not otherwise.
+        auto const why = _strandedWhy.find(name);
+        std::string const reason =
+            why == _strandedWhy.end() ? std::string("its way across was not read") : why->second;
+        std::string const key = std::to_string(there) + '|' + reason;
+        auto const said = _partySplitLineSaid.find(name);
+        if (said != _partySplitLineSaid.end() && said->second == key)
+            return;
+        _partySplitLineSaid[name] = key;
         LOG_ERROR("module.overseer",
                   "overseer: '{}' is on map {} and its leader '{}' is on map {} - THE "
-                  "PARTY IS SPLIT ACROSS TWO MAPS AND NOTHING IN THIS MODULE CAN REJOIN "
-                  "IT. `follow` cannot cross a map, this catch-up walk has nowhere on "
-                  "this map to aim at, and an `at:` aim cannot name a coordinate on "
-                  "another one, so nothing in this module can walk this follower to "
-                  "anybody until somebody moves it. Following, a catch-up walk, an "
-                  "escort and a WALKED dungeon run are blocked for it until then; a run by "
-                  "the dungeon finder is not, because the finder takes a family in from "
-                  "wherever each member stands (Overseer.DungeonFinder.Default). AN ERRAND IT "
-                  "CAN RUN ALONE ON THIS MAP IS NOT: it may still be sent to an "
+                  "PARTY IS SPLIT ACROSS TWO MAPS AND THIS MEMBER IS NOT CROSSING: {}. "
+                  "`follow` cannot cross a map and an `at:` aim cannot name a coordinate "
+                  "on another one, so following, a catch-up walk, an escort and a WALKED "
+                  "dungeon run are blocked for it until it crosses; a run by the dungeon "
+                  "finder is not, because the finder takes a family in from wherever each "
+                  "member stands (Overseer.DungeonFinder.Default). AN ERRAND IT CAN RUN "
+                  "ALONE ON THIS MAP IS NOT BLOCKED EITHER: it may still be sent to an "
                   "innkeeper, a vendor, a repairer or a trainer under its own aim, and "
-                  "binding at an innkeeper here is what stops the next death dragging "
-                  "it back across the ocean (#241, #289)",
-                  name, here, leader->GetName(), there);
+                  "binding at an innkeeper on its leader's continent is what lets its "
+                  "hearthstone bring it back (#241, #274, #289)",
+                  name, here, leader->GetName(), there, reason);
     }
 
     // ONE FOLLOWER, ONE POLL: should it be walking to the leader on its own,
@@ -21203,7 +21240,25 @@ private:
         OverseerDecisions::FollowGap const reading = ReadGap(p, leader, gap);
         bool const split = reading == OverseerDecisions::FollowGap::SplitAcrossMaps;
         if (!split)
+        {
             _partySplitSaid.erase(name);
+            _partySplitLineSaid.erase(name);
+        }
+
+        // A MEMBER ON ANOTHER CONTINENT GOES BACK AS A PLAYER WOULD (#274): its
+        // hearthstone if it is bound on the leader's continent and ready, or
+        // its own faction's boat. Asked before every walk below, because none
+        // of them can cross a map, and asked while its crossing is still
+        // landing it, because a catch-up walk started on a deck walks a
+        // passenger into the harbour. A member that is crossing is still
+        // recorded as split, silently: SayPartySplit's line is for a member
+        // nothing is moving.
+        if (DriveStrandedMember(p, leader, name, split))
+        {
+            if (split)
+                _partySplitSaid[name] = leader->GetMapId();
+            return;
+        }
         // THE ORDINARY END OF A TOO-FAR HOLD: the leader came back within the
         // line. Asked before every return below so a follower back in
         // formation is let go on the first poll that sees it.
@@ -22430,7 +22485,8 @@ private:
             // started (#138). A home errand is marked on its own drive's clock
             // and swept by SweepHomeBindEscorts, for exactly the same reason
             // (#348).
-            if (it->second.catchUp || it->second.homeBind || it->second.rejoin)
+            if (it->second.catchUp || it->second.homeBind || it->second.rejoin ||
+                it->second.crossing)
             {
                 ++it;
                 continue;
@@ -38799,7 +38855,12 @@ private:
     // every creature spawn on the map. Spawn data does not move, so the answer
     // is kept against the point it was asked about. It is the #267 gate every
     // travel destination goes through, and a berth is one.
-    bool BerthIsGuarded(DungeonRunCoordinatorState& coord, Player* leader, uint32 mapId,
+    //
+    // `Memo` IS EITHER A FAMILY'S COORDINATOR OR ONE STRANDED MEMBER'S OWN
+    // CROSSING (#274): both carry the same `crossing*` fields, and one reading
+    // of the world serves both rather than a second copy of it.
+    template <typename Memo>
+    bool BerthIsGuarded(Memo& coord, Player* leader, uint32 mapId,
                         float x, float y, uint32& outLevel)
     {
         outLevel = 0;
@@ -38833,7 +38894,8 @@ private:
     // DRIVEN BY THE ROSTER AND NOT BY WHO HAPPENS TO BE ONLINE. A member this
     // cannot steer produces a reading that says so, and the decision refuses to
     // grade a party it cannot see.
-    CrossingRoute ReadCrossingFromWorld(DungeonRunCoordinatorState& coord,
+    template <typename Memo>
+    CrossingRoute ReadCrossingFromWorld(Memo& coord,
                                         std::vector<std::string> const& members,
                                         std::string const& leaderName, Player* leader,
                                         uint32 originMap, uint32 destinationMap,
@@ -39518,6 +39580,551 @@ private:
                                   route.world.destinationMap, route.landingMooringX,
                                   route.landingMooringY, route.landingMooringZ);
                 }
+                break;
+        }
+    }
+
+    // ---------------- a member stranded on another continent (#274) --
+    //
+    // THE CROSSING ABOVE MOVES A DUNGEON RUN'S LEADER AND NOBODY ELSE, so a
+    // follower revived, hearthed or left on the other continent from its
+    // leader used to stay there for good, and SayPartySplit said so in
+    // capitals on every restart. What a player in its shoes does is hearth, if
+    // the stone is bound on the leader's continent and ready, or else walk to
+    // its own faction's boat or zeppelin, wait for it, ride it and walk off.
+    // OverseerDecisions::DecideStrandedWay picks between those on the party
+    // poll; the boat itself is ReadCrossing with one member, driven below on
+    // the coordinator's five second clock, because a stop is a minute long and
+    // a thirty second poll can miss the whole of it.
+    //
+    // THE MEMBER IS THE ONLY CHARACTER ITS CROSSING EVER MOVES. Its leader is
+    // not walked anywhere for it, nobody is teleported and nothing is boarded
+    // by this module: the step onto a docked deck and off it again are the same
+    // straight-line steps the family crossing takes, and the bot AI's own
+    // transport check does the boarding.
+    //
+    // THE MEMO CARRIES THE SAME `crossing*` FIELDS a coordinator does, so
+    // ReadCrossingFromWorld and BerthIsGuarded read the world for it exactly as
+    // they do for a family. World thread only, lost on a restart: a restart
+    // costs one re-priced route, and a member aboard at that moment is read as
+    // a passenger again by the transport it is standing on.
+    struct LoneCrossing
+    {
+        std::string leaderName;
+        uint32 crossingRouteEntry{0};
+        uint32 crossingOriginMap{0};
+        uint32 crossingDestinationMap{0};
+        bool crossingMooringKnown{false};
+        std::string crossingTransportName;
+        bool crossingSwept{false};
+        uint32 crossingSweptMap{0};
+        float crossingSweptX{0.f};
+        float crossingSweptY{0.f};
+        bool crossingBerthGuarded{false};
+        uint32 crossingBerthGuardLevel{0};
+        // When the crossing first aimed the member at a berth; zero until then.
+        time_t crossingSince{0};
+        uint8 crossingSaid{255};
+        time_t holdSaidAt{0};
+    };
+    std::map<std::string, LoneCrossing> _loneCrossings;
+    // A member whose boat home was refused, and when (LONE_CROSSING_STANDDOWN_SECONDS).
+    std::map<std::string, std::pair<time_t, std::string>> _loneCrossingRefused;
+    // Hearth casts asked of a stranded member this split (EXIT_HEARTH_ATTEMPTS).
+    std::map<std::string, unsigned> _strandedHearthTries;
+    // The last way said for a stranded member, so each is said once per change.
+    std::map<std::string, std::string> _strandedWaySaid;
+    // Why a split member is not crossing, for SayPartySplit's line.
+    std::map<std::string, std::string> _strandedWhy;
+
+    bool CrossingAlone(std::string const& name) const
+    {
+        return _loneCrossings.find(name) != _loneCrossings.end();
+    }
+
+    // Ends a stranded member's own crossing however it ended: the aim it
+    // walked under, the escort that lent it `new rpg`, and the crossing's hold.
+    void EndLoneCrossing(std::string const& name, char const* why)
+    {
+        auto const memo = _loneCrossings.find(name);
+        if (memo == _loneCrossings.end())
+            return;
+        _loneCrossings.erase(memo);
+        Player* const p = ObjectAccessor::FindPlayerByName(name);
+        auto const escort = _dungeonEscorts.find(name);
+        if (escort != _dungeonEscorts.end() && escort->second.crossing)
+        {
+            EndOneEscort(name, escort->second.granted);
+            _dungeonEscorts.erase(escort);
+        }
+        auto const hold = HoldsInForce().find(name);
+        if (hold != HoldsInForce().end() && hold->second.verb == CROSSING_HOLD_VERB)
+            ReleaseHold(name, p, why, CROSSING_HOLD_VERB);
+        LOG_INFO("module.overseer", "overseer: '{}' ends its own crossing - {}", name, why);
+    }
+
+    // ONE STRANDED MEMBER, ONE PARTY POLL. Answers true when this took the
+    // member (a hearth, or a crossing of its own), so DriveCatchUp does nothing
+    // else with it on this poll; false leaves the member to the drive as before,
+    // with `_strandedWhy` saying why nothing crosses for it.
+    bool DriveStrandedMember(Player* p, Player* leader, std::string const& name, bool split)
+    {
+        auto memo = _loneCrossings.find(name);
+        // THE CHEAP QUESTION FIRST: a member beside its leader with no crossing
+        // of its own is every member on every ordinary poll.
+        if (!split && memo == _loneCrossings.end())
+        {
+            _strandedHearthTries.erase(name);
+            _strandedWaySaid.erase(name);
+            _strandedWhy.erase(name);
+            return false;
+        }
+
+        MotionTransport const* riding = nullptr;
+        if (Transport* onBoard = p->GetTransport())
+            riding = onBoard->ToMotionTransport();
+
+        OverseerDecisions::StrandedFacts facts;
+        facts.readable = SteerableAI(p) != nullptr && p->IsInWorld();
+        facts.alive = p->IsAlive();
+        facts.inCombat = p->IsInCombat();
+        facts.memberMap = p->GetMapId();
+        facts.leaderMap = leader->GetMapId();
+        facts.aboard = riding != nullptr;
+        facts.crossingUnderWay = memo != _loneCrossings.end() && memo->second.crossingSince;
+        facts.crossingLanded = memo != _loneCrossings.end() &&
+                               p->GetMapId() == memo->second.crossingDestinationMap;
+
+        // WHO ELSE DECIDES WHERE THIS MEMBER GOES. The family's own crossing,
+        // a run's escort, or a dungeon whose door is on this member's continent
+        // and which the family walks to: the family is coming here, and sailing
+        // away from it is the ping-pong this must not start. A family that
+        // goes in by the finder walks to no door, so it is not one of these.
+        std::string const family = FamilyOfCharacter(name);
+        auto const escort = _dungeonEscorts.find(name);
+        bool const runEscort = escort != _dungeonEscorts.end() && !escort->second.catchUp &&
+                               !escort->second.crossing;
+        bool familyComesHere = false;
+        if (split && !FinderIsDefault())
+            if (QueryResult job = CharacterDatabase.Query(
+                    "SELECT job FROM overseer_roster WHERE name = '{}'", Esc(leader->GetName())))
+            {
+                std::string const leaderJob = job->Fetch()[0].Get<std::string>();
+                if (IsDungeonJob(leaderJob))
+                    if (DungeonPortal const* portal =
+                            FindDungeonPortal(DungeonKeywordForJob(leaderJob)))
+                        familyComesHere = portal->outsideMapId == p->GetMapId();
+            }
+        facts.familyOwnsTheWay =
+            FamilyCrossing(family) || runEscort || InDungeonRun(p) || familyComesHere;
+
+        facts.boundOnLeaderMap = p->m_homebindMapId == leader->GetMapId();
+        uint32 const stone = HearthstoneSpellOf(p);
+        facts.carriesStone = stone != 0;
+        facts.stoneReady = stone && !p->HasSpellCooldown(stone) &&
+                           _strandedHearthTries[name] < OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
+        facts.hearthInFlight = HearthPendingFor(name);
+
+        // PRICED ONLY WHEN IT CAN MATTER, and never while a refusal stands.
+        auto const refused = _loneCrossingRefused.find(name);
+        bool const standingDown =
+            refused != _loneCrossingRefused.end() &&
+            std::time(nullptr) - refused->second.first < time_t(LONE_CROSSING_STANDDOWN_SECONDS);
+        if (refused != _loneCrossingRefused.end() && !standingDown)
+            _loneCrossingRefused.erase(refused);
+        std::string priced;
+        if (split && !facts.aboard && !standingDown && facts.memberMap != facts.leaderMap)
+        {
+            std::vector<CrossingTransportInfo const*> serving;
+            std::vector<std::pair<int, int>> stops;
+            facts.transportServes =
+                PriceCrossingTransports(p, facts.memberMap, facts.leaderMap,
+                                        leader->GetPositionX(), leader->GetPositionY(), 0,
+                                        serving, stops, priced) >= 0;
+        }
+
+        OverseerDecisions::StrandedWay const way = OverseerDecisions::DecideStrandedWay(facts);
+        std::string why = OverseerDecisions::StrandedWayExplanation(facts, way);
+        if (standingDown && way != OverseerDecisions::StrandedWay::Sail)
+            why += "; its last boat home was refused (" + refused->second.second +
+                   ") and is priced again within " +
+                   std::to_string(LONE_CROSSING_STANDDOWN_SECONDS / 60) + " minutes";
+        else if (!priced.empty() && way == OverseerDecisions::StrandedWay::Refuse)
+            why += " (priced: " + priced + ")";
+        _strandedWhy[name] = why;
+
+        // SAID ONCE PER CHANGE OF WAY, for SayPartySplit's reason.
+        std::string const word = OverseerDecisions::StrandedWayName(way);
+        bool const fresh = _strandedWaySaid[name] != word;
+        _strandedWaySaid[name] = word;
+
+        switch (way)
+        {
+            case OverseerDecisions::StrandedWay::NotStranded:
+                EndLoneCrossing(name, "it is on its leader's map");
+                _strandedHearthTries.erase(name);
+                return false;
+
+            case OverseerDecisions::StrandedWay::StandDown:
+                EndLoneCrossing(name, "the family's own way decides where it goes");
+                if (fresh && split)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is on map {} and its leader '{}' on map {} - "
+                             "it does not cross on its own: {}",
+                             name, facts.memberMap, leader->GetName(), facts.leaderMap, why);
+                return false;
+
+            case OverseerDecisions::StrandedWay::Wait:
+                // A crossing already under way keeps the member: its own drive
+                // reads the world every five seconds and waits on the same facts.
+                return CrossingAlone(name);
+
+            case OverseerDecisions::StrandedWay::WaitForStone:
+            case OverseerDecisions::StrandedWay::Refuse:
+                // A crossing on foot that can no longer go on is ended, so it
+                // does not walk the member on toward a berth nothing believes in.
+                // A passenger never reaches here: aboard is always Sail.
+                EndLoneCrossing(name, "no way across is open to it");
+                return false;
+
+            case OverseerDecisions::StrandedWay::Hearth:
+            {
+                EndLoneCrossing(name, "its hearthstone takes it home instead");
+                OverseerDecisions::ExitHearthFacts cast;
+                cast.inWorld = true;
+                cast.onInsideMap = true;
+                cast.alive = facts.alive;
+                cast.carriesStone = facts.carriesStone;
+                cast.onCooldown = stone && p->HasSpellCooldown(stone);
+                cast.inCombat = facts.inCombat;
+                cast.moving = p->isMoving();
+                cast.pending = facts.hearthInFlight;
+                cast.attempts = _strandedHearthTries[name];
+                switch (OverseerDecisions::ExitFailureHearthStep(cast))
+                {
+                    case OverseerDecisions::ExitHearthStep::Cast:
+                    {
+                        char const* status = "error";
+                        std::string evidence;
+                        unsigned const attempt = ++_strandedHearthTries[name];
+                        char const* const refusal =
+                            DoHearth(p, "use", status, evidence, _pendingHearths, 0);
+                        if (!refusal || !*refusal)
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' is on map {} and its leader '{}' on map {} "
+                                     "- {} (attempt {} of {}) (#274)",
+                                     name, facts.memberMap, leader->GetName(), facts.leaderMap,
+                                     why, attempt, OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                        else
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' could not hearth to its leader's map {}: {} "
+                                     "(attempt {} of {})",
+                                     name, facts.leaderMap, refusal, attempt,
+                                     OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                        break;
+                    }
+                    case OverseerDecisions::ExitHearthStep::StopFirst:
+                    {
+                        CastHoldReport report;
+                        HoldStillAndReport(p, name, "hearth", report);
+                        break;
+                    }
+                    case OverseerDecisions::ExitHearthStep::Waiting:
+                    case OverseerDecisions::ExitHearthStep::Impossible:
+                    case OverseerDecisions::ExitHearthStep::NotInside:
+                        break;
+                }
+                return true;
+            }
+
+            case OverseerDecisions::StrandedWay::Sail:
+                break;
+        }
+
+        // A CROSSING ON FOOT AIMED AT A MAP THE LEADER HAS SINCE LEFT starts
+        // again toward where he is now. Never once aboard: the boat decides.
+        if (memo != _loneCrossings.end() && !facts.aboard &&
+            facts.memberMap == memo->second.crossingOriginMap &&
+            memo->second.crossingDestinationMap != facts.leaderMap)
+        {
+            EndLoneCrossing(name, "its leader has moved to another map");
+            memo = _loneCrossings.end();
+        }
+        if (memo == _loneCrossings.end())
+        {
+            LoneCrossing started;
+            started.leaderName = leader->GetName();
+            started.crossingOriginMap = facts.memberMap;
+            started.crossingDestinationMap = facts.leaderMap;
+            _loneCrossings[name] = started;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is on map {} and its leader '{}' on map {} - {}. Priced: "
+                     "{} (#274)",
+                     name, facts.memberMap, leader->GetName(), facts.leaderMap, why,
+                     priced.empty() ? std::string("not asked") : priced);
+        }
+        else
+            memo->second.leaderName = leader->GetName();
+        return true;
+    }
+
+    // EVERY STRANDED MEMBER'S OWN CROSSING, ON THE COORDINATOR'S CLOCK. Ends the
+    // walks it stopped marking last, the same shape every other escort sweep has.
+    void DriveLoneCrossings()
+    {
+        for (auto it = _loneCrossings.begin(); it != _loneCrossings.end();)
+        {
+            std::string const name = it->first;
+            ++it;  // the drive may end this crossing, which erases its entry
+            DriveLoneCrossing(name);
+        }
+        for (auto it = _dungeonEscorts.begin(); it != _dungeonEscorts.end();)
+        {
+            if (!it->second.crossing)
+            {
+                ++it;
+                continue;
+            }
+            if (it->second.wanted)
+            {
+                it->second.wanted = false;
+                ++it;
+                continue;
+            }
+            EndOneEscort(it->first, it->second.granted);
+            it = _dungeonEscorts.erase(it);
+        }
+    }
+
+    void DriveLoneCrossing(std::string const& name)
+    {
+        auto const found = _loneCrossings.find(name);
+        if (found == _loneCrossings.end())
+            return;
+        LoneCrossing& memo = found->second;
+        Player* const p = ObjectAccessor::FindPlayerByName(name);
+        PlayerbotAI* const ai = SteerableAI(p);
+        // NOT READ AT ALL WHILE IT CANNOT BE STEERED. Reading the route with no
+        // traveller would drop the transport it chose, and a member logged out
+        // mid-ride must come back to the boat it is standing on.
+        if (!ai || !p->IsInWorld())
+            return;
+
+        // A PASSENGER KEEPS THE TRANSPORT IT IS STANDING ON, whatever another
+        // would now cost, so `aboard` cannot read false under its own feet.
+        if (Transport* onBoard = p->GetTransport())
+            if (MotionTransport const* mo = onBoard->ToMotionTransport())
+                if (mo->GetEntry())
+                    memo.crossingRouteEntry = mo->GetEntry();
+
+        Player* const leader = ObjectAccessor::FindPlayerByName(memo.leaderName);
+        bool const leaderThere = leader && leader->IsInWorld() &&
+                                 leader->GetMapId() == memo.crossingDestinationMap;
+        CrossingRoute route = ReadCrossingFromWorld(
+            memo, std::vector<std::string>{name}, name, p, memo.crossingOriginMap,
+            memo.crossingDestinationMap, leaderThere ? leader->GetPositionX() : 0.f,
+            leaderThere ? leader->GetPositionY() : 0.f);
+        if (memo.crossingSince &&
+            std::time(nullptr) - memo.crossingSince > time_t(CROSSING_BACKSTOP_SECONDS))
+            route.world.overdue = true;
+        route.world.leaderWaitSeconds =
+            memo.crossingSince ? static_cast<uint32>(std::time(nullptr) - memo.crossingSince) : 0;
+
+        OverseerDecisions::CrossingLimits limits;
+        limits.berthArrivedYards = CROSSING_BERTH_ARRIVED_YARDS;
+        limits.gatherYards = CROSSING_GATHER_YARDS;
+        limits.minBoardDwellMs = CROSSING_MIN_BOARD_DWELL_MS;
+        limits.fetchPastYards = CATCH_UP_FOOT_LIMIT_YARDS;
+        limits.fetchWaitSeconds = CROSSING_FETCH_WAIT_SECONDS;
+        OverseerDecisions::CrossingStep const step =
+            OverseerDecisions::ReadCrossing(route.world, route.members, limits);
+
+        uint8 const said = static_cast<uint8>(step.action);
+        bool const fresh = memo.crossingSaid != said;
+        memo.crossingSaid = said;
+        std::string const why = OverseerDecisions::CrossingExplanation(step, route.world);
+        std::string const boat =
+            route.transportName.empty() ? std::string("a transport") : route.transportName;
+        uint32 const origin = route.world.originMap;
+        uint32 const destination = route.world.destinationMap;
+
+        auto const holdIt = [&]() {
+            HoldCharacterStill(p, ai, name, CROSSING_HOLD_VERB, CROSSING_BACKSTOP_SECONDS, false);
+        };
+        auto const releaseIt = [&](char const* reason) {
+            auto const hold = HoldsInForce().find(name);
+            if (hold != HoldsInForce().end() && hold->second.verb == CROSSING_HOLD_VERB)
+                ReleaseHold(name, p, reason, CROSSING_HOLD_VERB);
+        };
+
+        switch (step.action)
+        {
+            case OverseerDecisions::CrossingAction::Walk:
+            {
+                releaseIt("it is walking to the berth again");
+                std::ostringstream aim;
+                aim << std::fixed << std::setprecision(1);
+                aim << "at:" << origin << ':' << route.berthX << ',' << route.berthY << ','
+                    << route.berthZ;
+                std::string const aimText = aim.str();
+                if (aimText.size() > TRAVEL_AIM_COLUMN_CHARS)
+                {
+                    if (fresh)
+                        LOG_ERROR("module.overseer",
+                                  "overseer: the berth aim for '{}' is {} characters and "
+                                  "overseer_roster.travel_npc holds {}: {}",
+                                  name, uint32(aimText.size()), uint32(TRAVEL_AIM_COLUMN_CHARS),
+                                  aimText);
+                    break;
+                }
+                if (!memo.crossingSince)
+                    memo.crossingSince = std::time(nullptr);
+                if (!_travelAims.Claim(name, aimText, OverseerDecisions::TravelOwner::CatchUp))
+                    break;
+                // ITS OWN LEASE, taken over from a catch-up walk left from
+                // before the split; the escort is what lends it `new rpg`.
+                DungeonEscort& escort = _dungeonEscorts[name];
+                escort.catchUp = false;
+                escort.crossing = true;
+                escort.wanted = true;
+                escort.aim = aimText;
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' walks to the berth for '{}' at ({:.1f}, {:.1f}, "
+                             "{:.1f}) on map {}, to sail to its leader on map {} - {}",
+                             name, boat, route.berthX, route.berthY, route.berthZ, origin,
+                             destination, why);
+                break;
+            }
+
+            case OverseerDecisions::CrossingAction::Hold:
+                holdIt();
+                if (!LevelWithBerth(p, route))
+                    StepTowardBerth(p, origin, route.berthX, route.berthY, route.berthZ);
+                if (fresh || std::time(nullptr) - memo.holdSaidAt >= 60)
+                {
+                    memo.holdSaidAt = std::time(nullptr);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' waits at the berth for '{}' on map {} - docked "
+                             "here {}, stop left {}ms (needs {}) - {}",
+                             name, boat, origin, route.world.dockedAtOrigin ? "yes" : "no",
+                             route.world.dwellLeftMs, CROSSING_MIN_BOARD_DWELL_MS, why);
+                }
+                break;
+
+            case OverseerDecisions::CrossingAction::Board:
+            {
+                if (fresh)
+                    _travelAims.Release(name, "its boat home");
+                holdIt();
+                if (!LevelWithBerth(p, route))
+                {
+                    StepTowardBerth(p, origin, route.berthX, route.berthY, route.berthZ);
+                    break;
+                }
+                CrossingTransportInfo const* info = CatalogueEntry(route.transportEntry);
+                MotionTransport* live = LiveCrossingTransport(p, route.transportEntry);
+                float x = 0.f, y = 0.f, z = 0.f;
+                if (!info || !live || !DeckEdgeToward(p, live, *info, x, y, z))
+                {
+                    if (fresh)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is at the berth for '{}' and it is docked, but "
+                                 "no point on its deck within {:.0f} yards and level with it is "
+                                 "confirmed by the map, so it does not step - {}",
+                                 name, boat, CROSSING_BOARD_REACH_YARDS, why);
+                    break;
+                }
+                // The family crossing's own step: a straight line over a few
+                // yards of planking, and the bot AI's transport check boards it.
+                p->GetMotionMaster()->MovePoint(CROSSING_STEP_POINT_ID, x, y, z,
+                                                FORCED_MOVEMENT_NONE, 0.f, 0.f,
+                                                /*generatePath*/ false,
+                                                /*forceDestination*/ false);
+                LetHeldCharacterWalk(name, CROSSING_STEP_WALK_SECONDS);
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' steps aboard '{}' at ({:.1f}, {:.1f}, {:.1f}) on "
+                             "map {}, {:.1f} yards from where it stands - {}",
+                             name, boat, x, y, z, origin, p->GetExactDist2d(x, y), why);
+                break;
+            }
+
+            case OverseerDecisions::CrossingAction::Ride:
+                holdIt();
+                if (fresh)
+                {
+                    _travelAims.Release(name, "its boat home");
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is aboard '{}' between maps {} and {}, sailing "
+                             "to its leader - {}",
+                             name, boat, origin, destination, why);
+                }
+                break;
+
+            case OverseerDecisions::CrossingAction::Disembark:
+                holdIt();
+                if (!step.leaderAboard && p->GetMapId() == destination)
+                    StepOntoGround(p, LiveCrossingTransport(p, route.transportEntry),
+                                   route.landings);
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is on map {} and still on '{}' - {}", name,
+                             destination, boat, why);
+                break;
+
+            case OverseerDecisions::CrossingAction::WalkOff:
+            case OverseerDecisions::CrossingAction::StepBack:
+            {
+                holdIt();
+                bool const back = step.action == OverseerDecisions::CrossingAction::StepBack;
+                float const yards = StepOntoGround(p, p->GetTransport(),
+                                                   back ? route.originBerths : route.landings);
+                if (fresh)
+                {
+                    if (yards < 0.f)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is aboard '{}' at its dock on map {} and there "
+                                 "is no surveyed ground off its deck within {:.0f} yards, so it "
+                                 "stays aboard - {}",
+                                 name, boat, back ? origin : destination,
+                                 CROSSING_WALK_OFF_REACH_YARDS, why);
+                    else
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' {} '{}' on map {}, {:.1f} yards onto surveyed "
+                                 "ground - {}",
+                                 name, back ? "steps back off" : "walks off", boat,
+                                 back ? origin : destination, yards, why);
+                }
+                break;
+            }
+
+            case OverseerDecisions::CrossingAction::Done:
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is ashore on map {} and off '{}' - its crossing is "
+                         "over and it walks to its leader from here (#274)",
+                         name, destination, boat);
+                EndLoneCrossing(name, "it is ashore on its leader's map");
+                break;
+
+            case OverseerDecisions::CrossingAction::Refuse:
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' cannot sail from map {} to map {} - refused at '{}': "
+                         "{}. Its boat home is priced again in {} minutes",
+                         name, origin, destination, OverseerDecisions::CrossingLegName(step.leg),
+                         why, LONE_CROSSING_STANDDOWN_SECONDS / 60);
+                _loneCrossingRefused[name] = {std::time(nullptr), why};
+                EndLoneCrossing(name, "its crossing is refused");
+                break;
+
+            case OverseerDecisions::CrossingAction::Wait:
+            case OverseerDecisions::CrossingAction::Fetch:
+                // A lone crossing has nobody to fetch: ReadCrossing only answers
+                // Fetch for a follower on the pier, and there is none.
+                if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' does not move on its crossing this poll - {}",
+                             name, why);
                 break;
         }
     }
@@ -65025,6 +65632,9 @@ private:
     // Erased by DriveCatchUp the moment the two are on one map again, so a
     // family that splits, reunites and splits again is announced twice.
     std::map<std::string, uint32> _partySplitSaid;
+    // The leader's map and the reason SayPartySplit last said, so its line is
+    // said once per change rather than once per poll.
+    std::map<std::string, std::string> _partySplitLineSaid;
     // Who was last told it stays put while cut off from a family waiting in
     // town, keyed the same way, so the line is said once per split.
     std::map<std::string, uint32> _cutOffInTownSaid;
