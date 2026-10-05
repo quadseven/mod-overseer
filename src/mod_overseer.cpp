@@ -57231,23 +57231,37 @@ private:
     // ---------------------------------------------------------------- rename --
     //
     // THE CORE'S RENAME AND THIS MODULE'S NAME-KEYED ROWS, AS ONE ACT. The
-    // steps are HandleCharacterRenameCommand's (cs_character.cpp): normalize
-    // and check the name, refuse one already taken, drop the declined name,
-    // rename the Player in place and in the name map, and update the cache.
-    // Unlike the command, the name is written to the database here and a bot
-    // is not kicked: a bot has no client to reconnect, so the kick would only
-    // log it out, and the written name is what the next save keeps. A real
-    // client is kicked as the command does, because its client holds the old
-    // name. Then every row in RenameTables() follows it, in one transaction.
+    // checks are HandleCharacterRenameCommand's (cs_character.cpp): normalize
+    // and check the name, refuse one already taken. Every refusal is decided
+    // while the Player is still valid.
+    //
+    // A BOT IS LOGGED OUT BEFORE IT IS RENAMED (2026-10-05). The first version
+    // renamed an online bot in place, and a live Player's old name stays in
+    // whatever cached it (group member slots, the guild's member entries,
+    // mod-playerbots' maps), which is why the core kicks an online character
+    // and only writes the name of an offline one. So a bot goes out through
+    // EvictHeadlessBot, which saves and frees it, then takes the core's offline
+    // path (declined name dropped, CHAR_UPD_NAME_BY_GUID, the character cache),
+    // then the RenameTables() rows, then is queued back in under the new name.
+    // The logout's own save writes the OLD name; it is queued on the character
+    // database's async queue ahead of the name update, so the new name is the
+    // one that lands. Nothing touches `who` after the evict.
+    //
+    // A real client keeps the core's online path: renamed in place, then
+    // kicked, because its client holds the old name. RenamePlanFor and
+    // RenameSteps (overseer_decisions) choose the plan and its order.
     static char const* DoRename(Player* who, std::string const& command, char const*& status,
                                 std::string& out)
     {
         using OverseerDecisions::ParseRenameRequest;
         using OverseerDecisions::RenameFacts;
+        using OverseerDecisions::RenamePlan;
         using OverseerDecisions::RenameRefusal;
         using OverseerDecisions::RenameRequest;
+        using OverseerDecisions::RenameStep;
 
         std::string const oldName = who->GetName();
+        ObjectGuid const guid = who->GetGUID();
         RenameRequest const request = ParseRenameRequest(command);
         auto describe = [&](char const* outcome, char const* reason, std::string const& newName)
         {
@@ -57278,40 +57292,89 @@ private:
         facts.inInstance = map && map->Instanceable();
         facts.inCombat = who->IsInCombat();
         facts.inDungeonRun = InDungeonRun(who);
-        if (char const* const refusal = RenameRefusal(facts))
+        char const* const refusal = RenameRefusal(facts);
+        WorldSession* const session = who->GetSession();
+        bool const isBot = session && session->IsBot();
+        RenamePlan const plan =
+            OverseerDecisions::RenamePlanFor(refusal != nullptr, isBot, who->IsInWorld());
+        if (plan == RenamePlan::Refuse)
         {
-            describe("refused", refusal, newName);
-            return refusal;
+            char const* const said = refusal ? refusal : "logging in or out right now; retry in a minute";
+            describe("refused", said, newName);
+            return said;
         }
 
-        ObjectGuid const guid = who->GetGUID();
-        CharacterDatabasePreparedStatement* declined =
-            CharacterDatabase.GetPreparedStatement(CHAR_DEL_DECLINED_NAME);
-        declined->SetData(0, guid.GetCounter());
-        CharacterDatabase.Execute(declined);
+        for (RenameStep const step : OverseerDecisions::RenameSteps(plan))
+        {
+            switch (step)
+            {
+                case RenameStep::LogOut:
+                    EvictHeadlessBot(who);   // saves and frees the Player
+                    who = nullptr;
+                    // LogoutPlayerBot returns without logging out a bot that
+                    // no holder owns or that is already logging out. Then the
+                    // Player is still in the world and nothing has changed.
+                    if (ObjectAccessor::FindConnectedPlayer(guid))
+                    {
+                        char const* const said = "it could not be logged out cleanly; retry in a minute";
+                        describe("refused", said, newName);
+                        return said;
+                    }
+                    break;
 
-        who->SetName(newName);
-        ObjectAccessor::UpdatePlayerNameMapReference(oldName, who);
-        CharacterDatabasePreparedStatement* rename =
-            CharacterDatabase.GetPreparedStatement(CHAR_UPD_NAME_BY_GUID);
-        rename->SetData(0, newName);
-        rename->SetData(1, guid.GetCounter());
-        CharacterDatabase.Execute(rename);
-        sCharacterCache->UpdateCharacterData(guid, newName);
+                case RenameStep::RenameLive:
+                    who->SetName(newName);
+                    ObjectAccessor::UpdatePlayerNameMapReference(oldName, who);
+                    break;
 
-        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-        for (OverseerDecisions::RenameTable const& t : OverseerDecisions::RenameTables())
-            trans->Append("UPDATE {} SET {} = '{}' WHERE {} = '{}'", t.table, t.column,
-                          Esc(newName), t.column, Esc(oldName));
-        CharacterDatabase.CommitTransaction(trans);
+                case RenameStep::WriteName:
+                {
+                    CharacterDatabasePreparedStatement* declined =
+                        CharacterDatabase.GetPreparedStatement(CHAR_DEL_DECLINED_NAME);
+                    declined->SetData(0, guid.GetCounter());
+                    CharacterDatabase.Execute(declined);
+                    CharacterDatabasePreparedStatement* rename =
+                        CharacterDatabase.GetPreparedStatement(CHAR_UPD_NAME_BY_GUID);
+                    rename->SetData(0, newName);
+                    rename->SetData(1, guid.GetCounter());
+                    CharacterDatabase.Execute(rename);
+                    sCharacterCache->UpdateCharacterData(guid, newName);
+                    break;
+                }
 
-        LOG_INFO("module.overseer",
-                 "overseer: '{}' is renamed '{}' - the core's rename, and its roster, raid "
-                 "seat, keep list, goals, trades and stream rows moved with it",
-                 oldName, newName);
-        if (WorldSession* session = who->GetSession())
-            if (!session->IsBot())
-                session->KickPlayer("overseer rename");
+                case RenameStep::MoveRows:
+                {
+                    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+                    for (OverseerDecisions::RenameTable const& t : OverseerDecisions::RenameTables())
+                        trans->Append("UPDATE {} SET {} = '{}' WHERE {} = '{}'", t.table, t.column,
+                                      Esc(newName), t.column, Esc(oldName));
+                    CharacterDatabase.CommitTransaction(trans);
+                    break;
+                }
+
+                case RenameStep::Kick:
+                    if (WorldSession* client = who->GetSession())
+                        client->KickPlayer("overseer rename");
+                    break;
+
+                case RenameStep::LogIn:
+                    if (!sRandomPlayerbotMgr.GetPlayerBot(guid))
+                        sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+                    break;
+            }
+        }
+
+        if (plan == RenamePlan::EvictThenRename)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is renamed '{}' - the bot was logged out, renamed offline with "
+                     "its roster, raid seat, keep list, goals, trades and stream rows, and queued "
+                     "back in under the new name",
+                     oldName, newName);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is renamed '{}' - the core's online rename with its roster, raid "
+                     "seat, keep list, goals, trades and stream rows, and the client was kicked",
+                     oldName, newName);
         describe("renamed", "", newName);
         status = "applied";
         return "";

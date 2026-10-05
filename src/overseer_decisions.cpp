@@ -8212,6 +8212,32 @@ char const* RenameRefusal(RenameFacts const& facts)
     return nullptr;
 }
 
+RenamePlan RenamePlanFor(bool refused, bool isBot, bool inWorld)
+{
+    if (refused || !inWorld)
+        return RenamePlan::Refuse;
+    return isBot ? RenamePlan::EvictThenRename : RenamePlan::RenameThenKick;
+}
+
+std::vector<RenameStep> const& RenameSteps(RenamePlan plan)
+{
+    static std::vector<RenameStep> const none;
+    static std::vector<RenameStep> const bot = {
+        RenameStep::LogOut, RenameStep::WriteName, RenameStep::MoveRows, RenameStep::LogIn};
+    static std::vector<RenameStep> const client = {
+        RenameStep::RenameLive, RenameStep::WriteName, RenameStep::MoveRows, RenameStep::Kick};
+    switch (plan)
+    {
+        case RenamePlan::EvictThenRename:
+            return bot;
+        case RenamePlan::RenameThenKick:
+            return client;
+        case RenamePlan::Refuse:
+            break;
+    }
+    return none;
+}
+
 std::vector<RenameTable> const& RenameTables()
 {
     static std::vector<RenameTable> const tables = {
