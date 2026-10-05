@@ -8826,6 +8826,31 @@ struct GroupChatRoute
 
 GroupChatRoute GroupChatRouteFor(std::string const& channel);
 
+// THE FACTION'S PUBLIC CHANNEL (wow-overseer issue 591). A `chat` row on the
+// `lfg` channel is said in the public channel a player would use to find a
+// group: LookingForGroup when the speaker is on it (mod-playerbots joins a
+// random bot to it at login), else the General channel of the zone it stands
+// in, which it joins first as a client does on entering a zone. A speaker on
+// neither is refused by name: the core's Channel::Say tells a non-member "not
+// on channel" and says nothing, which must not read as delivered.
+//
+// WHY NOT ANY GENERAL IT IS ON. Player::IsInChannel compares channel ids, and
+// every zone's General has the same id, so it cannot say which General a bot
+// is on; Channel::IsOn, which can, is private. LookingForGroup is one channel
+// per faction, so its id answers exactly.
+constexpr char PUBLIC_CHAT_CHANNEL[] = "lfg";
+constexpr std::uint32_t CHAT_CHANNEL_GENERAL = 1;
+constexpr std::uint32_t CHAT_CHANNEL_LOOKING_FOR_GROUP = 26;
+
+enum class PublicChannel : std::uint8_t
+{
+    LookingForGroup,
+    ZoneGeneral,
+    None,
+};
+
+PublicChannel PickPublicChannel(bool onLookingForGroup, bool zoneHasGeneral);
+
 // ------------------------------------ an errand that is killing its traveller --
 //
 // THE RULE AGENTS.md ALREADY STATES, AND WHICH NOTHING IMPLEMENTED. "Aim the
@@ -18617,6 +18642,19 @@ constexpr unsigned GUILD_RUN_EMPTY_SECONDS = 90;
 // members a short window to return before the living party is recalled.
 constexpr unsigned GUILD_RUN_ROLE_RECOVERY_SECONDS = 5 * 60;
 
+// A PICK-UP GROUP (wow-overseer issue 591). A guild group short a real tank
+// or healer recruits one from the server the way players do: its asker says
+// "LF healer for Deadmines, 4/5" in LookingForGroup, and a random bot of the
+// same faction that plays the seat answers. The row then names that member
+// as a pug after the five:
+//
+//   finder-run <keyword> <healer> <dps> <dps> <dps> pug <name> [pug <name>]
+//
+// A pug is one of the five, at most GUILD_FINDER_MAX_PUGS of them, and is the
+// only member who need not be in the guild; it must be on the guild's side.
+constexpr char GUILD_FINDER_PUG_WORD[] = "pug";
+constexpr unsigned GUILD_FINDER_MAX_PUGS = 2;
+
 enum class GuildFinderRefusal : std::uint8_t
 {
     None,
@@ -18624,6 +18662,8 @@ enum class GuildFinderRefusal : std::uint8_t
     Malformed,
     BadName,
     SameNameTwice,
+    PugNotInGroup,
+    TooManyPugs,
 };
 
 struct GuildFinderRequest
@@ -18633,7 +18673,36 @@ struct GuildFinderRequest
     std::string healer;
     // Exactly three.
     std::vector<std::string> damage;
+    // Members of the five who joined from outside the guild, as the row
+    // spells them. Empty for a group of guildmates only.
+    std::vector<std::string> pugs;
 };
+
+// Is `name` one of the request's pugs (names compare without case, as the
+// core's own lookups do).
+bool GuildFinderIsPug(GuildFinderRequest const& request, std::string const& name);
+
+// THE GUILD AND THE SIDE. Every member but a pug is in the anchor's guild; a
+// pug is on the anchor's side. The anchor is the first of the five who is not
+// a pug (the tank, unless the tank is the pug).
+enum class GuildFinderKinship : std::uint8_t
+{
+    Kin,
+    AnchorInNoGuild,  // the anchor is in no guild, so no guild group exists
+    NotInGuild,       // a guildmate seat held by somebody outside the guild
+    OtherSide,        // a pug of the other faction
+};
+
+struct GuildFinderKin
+{
+    bool pug{false};
+    std::uint32_t guildId{0};
+    std::uint8_t team{0};
+    std::uint32_t anchorGuildId{0};
+    std::uint8_t anchorTeam{0};
+};
+
+GuildFinderKinship GuildFinderKinOf(GuildFinderKin const& kin);
 
 // Is this `guild` row the finder run rather than a DoGuild verb? On the first
 // word, the way a walk rides `mail` and `cast`, so no ENUM migration is needed.

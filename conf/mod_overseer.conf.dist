@@ -394,7 +394,11 @@
 #                     arms mod-dungeon-clear inside and reads the run back to
 #                     its end (cleared, wiped, abandoned, timed out) into the
 #                     row's `result`. Family members are refused; the families
-#                     have their own campaigns. 0 refuses every such row.
+#                     have their own campaigns. A trailing `pug <name>` (up to
+#                     two) names one of the five who answered the guild's
+#                     LookingForGroup call from outside it: a pug need not be
+#                     in the guild but must be on its side. 0 refuses every
+#                     such row.
 #
 #        Default:     0
 #

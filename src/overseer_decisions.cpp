@@ -7536,6 +7536,13 @@ GroupChatRoute GroupChatRouteFor(std::string const& channel)
     return route;
 }
 
+PublicChannel PickPublicChannel(bool onLookingForGroup, bool zoneHasGeneral)
+{
+    if (onLookingForGroup)
+        return PublicChannel::LookingForGroup;
+    return zoneHasGeneral ? PublicChannel::ZoneGeneral : PublicChannel::None;
+}
+
 // ------------------------------------ an errand that is killing its traveller --
 
 int64_t ErrandDeathWindow(int64_t errandSeconds, ErrandDeathLimits const& limits)
@@ -16415,9 +16422,22 @@ GuildFinderRequest ParseGuildFinderRequest(std::string const& command, std::stri
         out.error = GuildFinderRefusal::NotThisVerb;
         return out;
     }
-    if (words.size() != 2 + (GUILD_FINDER_GROUP_SIZE - 1))
+    std::size_t const five = 2 + (GUILD_FINDER_GROUP_SIZE - 1);
+    // After the five, nothing but `pug <name>` pairs.
+    if (words.size() < five || (words.size() - five) % 2 != 0)
     {
         out.error = GuildFinderRefusal::Malformed;
+        return out;
+    }
+    for (std::size_t i = five; i < words.size(); i += 2)
+        if (words[i] != GUILD_FINDER_PUG_WORD)
+        {
+            out.error = GuildFinderRefusal::Malformed;
+            return out;
+        }
+    if ((words.size() - five) / 2 > GUILD_FINDER_MAX_PUGS)
+    {
+        out.error = GuildFinderRefusal::TooManyPugs;
         return out;
     }
     if (!IsPortalKeyword(words[1]))
@@ -16431,7 +16451,7 @@ GuildFinderRequest ParseGuildFinderRequest(std::string const& command, std::stri
         out.error = GuildFinderRefusal::BadName;
         return out;
     }
-    for (std::size_t i = 2; i < words.size(); ++i)
+    for (std::size_t i = 2; i < five; ++i)
     {
         if (!IsCharacterName(words[i]))
         {
@@ -16447,10 +16467,52 @@ GuildFinderRequest ParseGuildFinderRequest(std::string const& command, std::stri
             }
         seen.push_back(lower);
     }
+    std::vector<std::string> pugsSeen;
+    for (std::size_t i = five + 1; i < words.size(); i += 2)
+    {
+        if (!IsCharacterName(words[i]))
+        {
+            out.error = GuildFinderRefusal::BadName;
+            return out;
+        }
+        std::string const lower = LowerName(words[i]);
+        if (std::find(seen.begin(), seen.end(), lower) == seen.end())
+        {
+            out.error = GuildFinderRefusal::PugNotInGroup;
+            return out;
+        }
+        if (std::find(pugsSeen.begin(), pugsSeen.end(), lower) != pugsSeen.end())
+        {
+            out.error = GuildFinderRefusal::SameNameTwice;
+            return out;
+        }
+        pugsSeen.push_back(lower);
+        out.pugs.push_back(words[i]);
+    }
     out.keyword = words[1];
     out.healer = words[2];
-    out.damage.assign(words.begin() + 3, words.end());
+    out.damage.assign(words.begin() + 3, words.begin() + five);
     return out;
+}
+
+bool GuildFinderIsPug(GuildFinderRequest const& request, std::string const& name)
+{
+    std::string const lower = LowerName(name);
+    for (std::string const& pug : request.pugs)
+        if (LowerName(pug) == lower)
+            return true;
+    return false;
+}
+
+GuildFinderKinship GuildFinderKinOf(GuildFinderKin const& kin)
+{
+    if (kin.anchorGuildId == 0)
+        return GuildFinderKinship::AnchorInNoGuild;
+    if (kin.pug)
+        return kin.team == kin.anchorTeam ? GuildFinderKinship::Kin
+                                          : GuildFinderKinship::OtherSide;
+    return kin.guildId == kin.anchorGuildId ? GuildFinderKinship::Kin
+                                            : GuildFinderKinship::NotInGuild;
 }
 
 char const* GuildFinderRefusalWord(GuildFinderRefusal refusal)
@@ -16460,9 +16522,12 @@ char const* GuildFinderRefusalWord(GuildFinderRefusal refusal)
         case GuildFinderRefusal::None:          return "";
         case GuildFinderRefusal::NotThisVerb:   return "not a finder-run row";
         case GuildFinderRefusal::Malformed:
-            return "a finder-run row is: finder-run <keyword> <healer> <dps> <dps> <dps>";
+            return "a finder-run row is: finder-run <keyword> <healer> <dps> <dps> <dps> "
+                   "[pug <name>]";
         case GuildFinderRefusal::BadName:       return "a name in the row is not a character name";
         case GuildFinderRefusal::SameNameTwice: return "the row names one character twice";
+        case GuildFinderRefusal::PugNotInGroup: return "a pug the row names is not one of the five";
+        case GuildFinderRefusal::TooManyPugs:   return "the row names more pugs than a guild group takes";
     }
     return "unknown";
 }

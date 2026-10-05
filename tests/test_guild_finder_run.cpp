@@ -24,6 +24,10 @@ using OverseerDecisions::FINDER_ROLE_TANK;
 using OverseerDecisions::GUILD_RUN_CEILING_SECONDS;
 using OverseerDecisions::GUILD_RUN_EMPTY_SECONDS;
 using OverseerDecisions::GUILD_RUN_ROLE_RECOVERY_SECONDS;
+using OverseerDecisions::GuildFinderIsPug;
+using OverseerDecisions::GuildFinderKin;
+using OverseerDecisions::GuildFinderKinOf;
+using OverseerDecisions::GuildFinderKinship;
 using OverseerDecisions::GuildFinderRefusal;
 using OverseerDecisions::GuildFinderRefusalWord;
 using OverseerDecisions::GuildFinderRequest;
@@ -287,6 +291,89 @@ void TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming()
 
 }  // namespace
 
+// A PICK-UP GROUP (wow-overseer issue 591): the row names one of the five as
+// a pug, and only that member may come from outside the guild.
+void APugIsOneOfTheFiveNamedAfterThem()
+{
+    GuildFinderRequest const r = ParseGuildFinderRequest(
+        "finder-run deadmines Thrall Mage Rogue Lock pug Thrall", "Warrior");
+    Check("a row with a pug parses", r.error == GuildFinderRefusal::None);
+    Check("the five are as before",
+          r.healer == "Thrall" && r.damage.size() == 3 && r.damage[2] == "Lock");
+    Check("the pug is named", r.pugs.size() == 1 && r.pugs[0] == "Thrall");
+    Check("the pug is found without case", GuildFinderIsPug(r, "thrall"));
+    Check("a guildmate is not a pug", !GuildFinderIsPug(r, "Mage"));
+
+    GuildFinderRequest const tank = ParseGuildFinderRequest(
+        "finder-run deadmines Priest Mage Rogue Lock pug Warrior", "Warrior");
+    Check("the tank may be the pug",
+          tank.error == GuildFinderRefusal::None && GuildFinderIsPug(tank, "Warrior"));
+
+    GuildFinderRequest const both = ParseGuildFinderRequest(
+        "finder-run deadmines Thrall Mage Rogue Lock pug Warrior pug Thrall", "Warrior");
+    Check("a tank and a healer may both be pugs",
+          both.error == GuildFinderRefusal::None && both.pugs.size() == 2);
+
+    GuildFinderRequest const none =
+        ParseGuildFinderRequest("finder-run deadmines A B C D", "T");
+    Check("a row of guildmates names no pug", none.error == GuildFinderRefusal::None &&
+                                                  none.pugs.empty() && !GuildFinderIsPug(none, "A"));
+}
+
+void APugTheRowCannotPlaceIsRefused()
+{
+    Check("a pug who is not one of the five",
+          ParseGuildFinderRequest("finder-run deadmines A B C D pug Stranger", "T").error ==
+              GuildFinderRefusal::PugNotInGroup);
+    Check("the pug word with no name",
+          ParseGuildFinderRequest("finder-run deadmines A B C D pug", "T").error ==
+              GuildFinderRefusal::Malformed);
+    Check("another word in the pug's place",
+          ParseGuildFinderRequest("finder-run deadmines A B C D friend A", "T").error ==
+              GuildFinderRefusal::Malformed);
+    Check("one pug named twice",
+          ParseGuildFinderRequest("finder-run deadmines A B C D pug A pug A", "T").error ==
+              GuildFinderRefusal::SameNameTwice);
+    Check("no more than two pugs",
+          ParseGuildFinderRequest("finder-run deadmines A B C D pug A pug B pug C", "T").error ==
+              GuildFinderRefusal::TooManyPugs);
+    Check("a pug's name is a character name",
+          ParseGuildFinderRequest("finder-run deadmines A B C D pug A1", "T").error ==
+              GuildFinderRefusal::BadName);
+    Check("the refusal says so",
+          std::string(GuildFinderRefusalWord(GuildFinderRefusal::PugNotInGroup)).find("pug") !=
+              std::string::npos);
+}
+
+void OnlyAPugMayComeFromOutsideTheGuildAndNeverFromTheOtherSide()
+{
+    GuildFinderKin mate;
+    mate.guildId = 7;
+    mate.team = 0;
+    mate.anchorGuildId = 7;
+    mate.anchorTeam = 0;
+    Check("a guildmate is kin", GuildFinderKinOf(mate) == GuildFinderKinship::Kin);
+
+    GuildFinderKin stranger = mate;
+    stranger.guildId = 0;
+    Check("a guildless member who is not a pug is refused",
+          GuildFinderKinOf(stranger) == GuildFinderKinship::NotInGuild);
+
+    GuildFinderKin pug = stranger;
+    pug.pug = true;
+    Check("a guildless pug of the same side is kin", GuildFinderKinOf(pug) == GuildFinderKinship::Kin);
+    pug.guildId = 9;
+    Check("a pug from another guild is kin too", GuildFinderKinOf(pug) == GuildFinderKinship::Kin);
+    pug.team = 1;
+    Check("a pug of the other side is refused",
+          GuildFinderKinOf(pug) == GuildFinderKinship::OtherSide);
+
+    GuildFinderKin lone = mate;
+    lone.anchorGuildId = 0;
+    Check("no guild group without a guild",
+          GuildFinderKinOf(lone) == GuildFinderKinship::AnchorInNoGuild);
+}
+
 int main()
 {
     TheRowIsRoutedOnItsFirstWord();
@@ -302,6 +389,9 @@ int main()
     AGroupThatLeftOrOutstayedIsOver();
     ADisabledBrainIsAskedAgainWhileSomebodyLives();
     TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming();
+    APugIsOneOfTheFiveNamedAfterThem();
+    APugTheRowCannotPlaceIsRefused();
+    OnlyAPugMayComeFromOutsideTheGuildAndNeverFromTheOtherSide();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
