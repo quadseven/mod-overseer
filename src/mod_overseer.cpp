@@ -199,6 +199,7 @@
 #include "BattlegroundMgr.h"
 #include "CellImpl.h"
 #include "CharacterCache.h"
+#include "ChannelMgr.h"
 #include "Chat.h"
 // The guild recruit policy (infra#3744). This is the only configuration this
 // module reads, and it reads it here rather than baking the numbers in because
@@ -315,6 +316,7 @@
 #include <bitset>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
@@ -37115,9 +37117,19 @@ private:
                     return refuse("'" + name + "' is already in guild run " +
                                   std::to_string(run.id));
 
-        uint32 const guildId = tank->GetGuildId();
-        if (!guildId)
-            return refuse("the tank is in no guild");
+        // THE ANCHOR: the first of the five who is not a pug (issue 591). Its
+        // guild is the group's guild and its side the pugs' side.
+        Player* anchor = nullptr;
+        for (std::string const& name : names)
+            if (!OverseerDecisions::GuildFinderIsPug(request, name))
+            {
+                anchor = ObjectAccessor::FindPlayerByName(name);
+                if (!anchor || !anchor->IsInWorld())
+                    return refuse("'" + name + "' is not in the world");
+                break;
+            }
+        if (!anchor)
+            return refuse("every member of the row is a pug");
         std::vector<Player*> players;
         for (std::string const& name : names)
         {
@@ -37128,8 +37140,23 @@ private:
                 return refuse("'" + name + "' is a family member, which its own campaign directs");
             if (!GET_PLAYERBOT_AI(p))
                 return refuse("'" + name + "' is not a bot");
-            if (p->GetGuildId() != guildId)
-                return refuse("'" + name + "' is not in the tank's guild");
+            OverseerDecisions::GuildFinderKin kin;
+            kin.pug = OverseerDecisions::GuildFinderIsPug(request, name);
+            kin.guildId = p->GetGuildId();
+            kin.team = static_cast<uint8>(p->GetTeamId());
+            kin.anchorGuildId = anchor->GetGuildId();
+            kin.anchorTeam = static_cast<uint8>(anchor->GetTeamId());
+            switch (OverseerDecisions::GuildFinderKinOf(kin))
+            {
+                case OverseerDecisions::GuildFinderKinship::Kin:
+                    break;
+                case OverseerDecisions::GuildFinderKinship::AnchorInNoGuild:
+                    return refuse("'" + anchor->GetName() + "' is in no guild");
+                case OverseerDecisions::GuildFinderKinship::NotInGuild:
+                    return refuse("'" + name + "' is not in the tank's guild");
+                case OverseerDecisions::GuildFinderKinship::OtherSide:
+                    return refuse("'" + name + "' is a pug of the other faction");
+            }
             if (!p->IsAlive())
                 return refuse("'" + name + "' is dead");
             if (p->IsInCombat())
@@ -37213,11 +37240,15 @@ private:
         run.queuedAt = std::time(nullptr);
         run.heartbeatAt = run.queuedAt;
         TrackGuildRunLoot(run.guids);
+        std::string pugWords;
+        for (std::string const& pug : request.pugs)
+            pugWords += (pugWords.empty() ? "" : ", ") + ("'" + pug + "'");
         LOG_WARN("module.overseer",
                  "overseer: GUILD FINDER RUN {} - '{}' leads '{}', '{}', '{}', '{}' into finder "
-                 "dungeon {} ('{}', map {}); after the role check the group is in state {}",
+                 "dungeon {} ('{}', map {}); after the role check the group is in state {}{}{}",
                  id, tankName, names[1], names[2], names[3], names[4], dungeon->ID,
-                 request.keyword, portal->insideMapId, static_cast<unsigned>(FinderStateOf(state)));
+                 request.keyword, portal->insideMapId, static_cast<unsigned>(FinderStateOf(state)),
+                 pugWords.empty() ? "" : "; pug ", pugWords);
         out = GuildRunJson(run, "queued", nullptr, 0, run.queuedAt);
         _guildRuns.push_back(run);
         status = "verifying";
@@ -48295,6 +48326,65 @@ private:
                     return WatcherOnline(w);
                 });
             }
+        }
+        else if (channel == OverseerDecisions::PUBLIC_CHAT_CHANNEL)
+        {
+            // THE FACTION'S PUBLIC CHANNEL (PickPublicChannel): LookingForGroup,
+            // else the General of the speaker's zone. Channel::Say is the call
+            // mod-playerbots' SayToChannel makes, and the join below is the one
+            // its login makes (PlayerbotMgr, "join standard channels").
+            ChannelMgr* const cMgr = ChannelMgr::forTeam(player->GetTeamId());
+            if (!cMgr)
+                return "no channels for this faction";
+            Channel* lfg = nullptr;
+            for (auto const& entry : cMgr->GetChannels())
+                if (entry.second &&
+                    entry.second->GetChannelId() == OverseerDecisions::CHAT_CHANNEL_LOOKING_FOR_GROUP)
+                {
+                    lfg = entry.second;
+                    break;
+                }
+            AreaTableEntry const* const zone = sAreaTableStore.LookupEntry(player->GetZoneId());
+            ChatChannelsEntry const* const general =
+                sChatChannelsStore.LookupEntry(OverseerDecisions::CHAT_CHANNEL_GENERAL);
+            uint8 const locale = sWorld->GetDefaultDbcLocale();
+            std::string zoneName;
+            if (zone)
+            {
+                zoneName = zone->area_name[locale] ? zone->area_name[locale] : "";
+                if (zoneName.empty() && zone->area_name[LOCALE_enUS])
+                    zoneName = zone->area_name[LOCALE_enUS];
+            }
+            bool const zoneHasGeneral = general && zone && !zoneName.empty() &&
+                                        player->CanJoinConstantChannelInZone(general, zone);
+            switch (OverseerDecisions::PickPublicChannel(lfg && player->IsInChannel(lfg),
+                                                         zoneHasGeneral))
+            {
+                case OverseerDecisions::PublicChannel::LookingForGroup:
+                    lfg->Say(player->GetGUID(), text, LANG_UNIVERSAL);
+                    break;
+                case OverseerDecisions::PublicChannel::ZoneGeneral:
+                {
+                    char const* pattern = general->pattern[locale];
+                    if (!pattern || !*pattern)
+                        pattern = general->pattern[LOCALE_enUS];
+                    if (!pattern || !*pattern)
+                        return "no General channel name in this locale";
+                    char name[100];
+                    std::snprintf(name, sizeof(name), pattern, zoneName.c_str());
+                    Channel* const here = cMgr->GetJoinChannel(name, general->ChannelID);
+                    if (!here)
+                        return "the zone's General channel could not be opened";
+                    // A member already on it is told so and nothing changes.
+                    here->JoinChannel(player, "");
+                    here->Say(player->GetGUID(), text, LANG_UNIVERSAL);
+                    break;
+                }
+                case OverseerDecisions::PublicChannel::None:
+                    return "not on LookingForGroup, and no General channel in this zone";
+            }
+            // Not captured for the watchers: public channels never are (the
+            // note on Channel::IsOn after OnPlayerCanUseChat says why).
         }
         else if (channel == "guild" || channel == "officer")
         {
