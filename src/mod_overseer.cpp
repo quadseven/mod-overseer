@@ -51729,6 +51729,77 @@ private:
             return "";
         }
 
+        // ---- place bag ---------------------------------------------------
+        //
+        // A BOUGHT BANK BAG SLOT HOLDS NOTHING UNTIL A BAG IS PUT IN IT (#625).
+        // The client puts one there only when a player drags it onto the slot:
+        // CMSG_SWAP_ITEM, whose handler (ItemHandler.cpp, HandleSwapItem) checks
+        // both positions with IsValidPos, asks CanUseBank for a bank position,
+        // and calls Player::SwapItem. The banker was activated above, so
+        // CanUseBank holds; the slot is chosen by FirstOpenBankBagPosition and
+        // asked of CanBankItem with that exact slot, the same question
+        // SwapItem asks, so the refusal has a name. Then read back: the bag is
+        // at that position, or this row says it is not.
+        if (request.verb == OverseerDecisions::BankVerb::PlaceBag)
+        {
+            Item* item = FindCarriedItem(who, true, request.itemGuid);
+            if (!item)
+                return refuse("item not carried", "item not carried");
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!proto)
+                return refuse("no item template", "item has no template");
+            ev.haveItem = true;
+            ObjectGuid const itemGuid = item->GetGUID();
+            ev.itemGuid = itemGuid.GetCounter();
+            ev.itemEntry = item->GetEntry();
+            ev.itemName = proto->Name1;
+            ev.itemCount = item->GetCount();
+            ev.from = PlaceOf(item);
+
+            if (!item->IsBag())
+                return refuse("not a bag", "item is not a bag");
+            if (item->GetBagSlot() == INVENTORY_SLOT_BAG_0 && item->GetSlot() < INVENTORY_SLOT_ITEM_START)
+                return refuse("bag is worn", "a worn bag is not placed in the bank");
+            if (!item->ToBag()->IsEmpty())
+                return refuse("bag not empty", "a bag with items in it cannot be moved");
+
+            std::array<bool, OverseerDecisions::BANK_BAG_POSITIONS> occupied{};
+            for (uint32 i = 0; i < OverseerDecisions::BANK_BAG_POSITIONS; ++i)
+                occupied[i] = who->GetItemByPos(INVENTORY_SLOT_BAG_0, uint8(BANK_SLOT_BAG_START + i)) != nullptr;
+            int const open = OverseerDecisions::FirstOpenBankBagPosition(uint32(std::max(0, ev.bankSlots)), occupied);
+            if (open < 0)
+                return refuse(ev.bankSlots > 0 ? "no open bank bag slot" : "no bank bag slot bought",
+                              ev.bankSlots > 0 ? "every bought bank bag slot holds a bag"
+                                               : "no bank bag slot is bought");
+            uint8 const slot = uint8(BANK_SLOT_BAG_START + open);
+
+            ItemPosCountVec dest;
+            InventoryResult const msg = who->CanBankItem(INVENTORY_SLOT_BAG_0, slot, dest, item, false);
+            ev.haveInventoryResult = true;
+            ev.inventoryResult = msg;
+            if (msg != EQUIP_ERR_OK)
+                return refuse("bank cannot take the bag", "the bank bag slot cannot take the bag");
+
+            uint16 const dst = uint16((INVENTORY_SLOT_BAG_0 << 8) | slot);
+            who->SwapItem(item->GetPos(), dst);
+
+            Item* moved = who->GetItemByGuid(itemGuid);
+            ev.moneyAfter = who->GetMoney();
+            if (!moved || moved->GetPos() != dst)
+            {
+                describe("refused", "the bag did not land in the bank bag slot");
+                return "the core did not put the bag in the bank bag slot";
+            }
+            ev.to = PlaceOf(moved);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' placed {} (item {}, {} slots) in bank bag slot {} at {} ({})",
+                     who->GetName(), ev.itemName, ev.itemGuid, proto->ContainerSlots, open + 1,
+                     ev.bankerName, ev.bankerEntry);
+            describe("placed", "");
+            status = "delivered";
+            return "";
+        }
+
         // ---- deposit / withdraw: the item must be on the side it leaves ----
         bool const deposit = request.verb == OverseerDecisions::BankVerb::Deposit;
         Item* item = deposit ? FindCarriedItem(who, true, request.itemGuid)

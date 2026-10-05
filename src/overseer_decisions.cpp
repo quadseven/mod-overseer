@@ -5303,7 +5303,7 @@ BankRequest ParseBankRequest(std::string const& command)
 
     if (words.empty())
     {
-        request.error = "malformed bank: want deposit guid:<n>, withdraw guid:<n>, or buy slot";
+        request.error = "malformed bank: want deposit guid:<n>, withdraw guid:<n>, place-bag guid:<n>, or buy slot";
         return request;
     }
 
@@ -5318,13 +5318,11 @@ BankRequest ParseBankRequest(std::string const& command)
         return request;
     }
 
-    if (words[0] == "deposit" || words[0] == "withdraw")
+    if (words[0] == "deposit" || words[0] == "withdraw" || words[0] == "place-bag")
     {
         if (words.size() != 2)
         {
-            request.error = words[0] == "deposit"
-                                ? "malformed bank: want deposit guid:<item_instance.guid>"
-                                : "malformed bank: want withdraw guid:<item_instance.guid>";
+            request.error = "malformed bank: want " + words[0] + " guid:<item_instance.guid>";
             return request;
         }
         uint32_t const guid = GuidOf(words[1]);
@@ -5333,13 +5331,24 @@ BankRequest ParseBankRequest(std::string const& command)
             request.error = "malformed bank: item must be guid:<item_instance.guid>, not 0";
             return request;
         }
-        request.verb = words[0] == "deposit" ? BankVerb::Deposit : BankVerb::Withdraw;
+        request.verb = words[0] == "deposit"    ? BankVerb::Deposit
+                       : words[0] == "withdraw" ? BankVerb::Withdraw
+                                                : BankVerb::PlaceBag;
         request.itemGuid = guid;
         return request;
     }
 
-    request.error = "malformed bank: unknown verb (want deposit, withdraw, or buy slot)";
+    request.error = "malformed bank: unknown verb (want deposit, withdraw, place-bag, or buy slot)";
     return request;
+}
+
+int FirstOpenBankBagPosition(uint32_t bought, std::array<bool, BANK_BAG_POSITIONS> const& occupied)
+{
+    uint32_t const usable = bought < BANK_BAG_POSITIONS ? bought : BANK_BAG_POSITIONS;
+    for (uint32_t i = 0; i < usable; ++i)
+        if (!occupied[i])
+            return static_cast<int>(i);
+    return -1;
 }
 
 uint32_t NearestBanker(std::vector<BankerCandidate> const& candidates)
