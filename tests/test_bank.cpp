@@ -37,7 +37,9 @@
 #include <string>
 #include <vector>
 
+using OverseerDecisions::BANK_BAG_POSITIONS;
 using OverseerDecisions::BankerCandidate;
+using OverseerDecisions::FirstOpenBankBagPosition;
 using OverseerDecisions::BankRequest;
 using OverseerDecisions::BankVerb;
 using OverseerDecisions::NearestBanker;
@@ -56,6 +58,7 @@ char const* Name(BankVerb verb)
         case BankVerb::Deposit:  return "Deposit";
         case BankVerb::Withdraw: return "Withdraw";
         case BankVerb::BuySlot:  return "BuySlot";
+        case BankVerb::PlaceBag: return "PlaceBag";
     }
     return "?";
 }
@@ -96,6 +99,7 @@ void TheThreeVerbsParse()
     CheckParse("deposit guid:1303004", BankVerb::Deposit, 1303004);
     CheckParse("withdraw guid:7", BankVerb::Withdraw, 7);
     CheckParse("buy slot", BankVerb::BuySlot, 0);
+    CheckParse("place-bag guid:4240", BankVerb::PlaceBag, 4240);
 }
 
 // A row typed by hand carries whatever blanks the hand put there.
@@ -111,10 +115,16 @@ void BlanksDoNotMatter()
 // reads in `detail`, so they are pinned, not just the fact of refusal.
 void TheWrongTextIsRefusedByName()
 {
-    CheckRefused("", "malformed bank: want deposit guid:<n>, withdraw guid:<n>, or buy slot");
-    CheckRefused("   ", "malformed bank: want deposit guid:<n>, withdraw guid:<n>, or buy slot");
-    CheckRefused("sell guid:12", "malformed bank: unknown verb (want deposit, withdraw, or buy slot)");
-    CheckRefused("Deposit guid:12", "malformed bank: unknown verb (want deposit, withdraw, or buy slot)");
+    char const* const empty =
+        "malformed bank: want deposit guid:<n>, withdraw guid:<n>, place-bag guid:<n>, or buy slot";
+    char const* const unknown =
+        "malformed bank: unknown verb (want deposit, withdraw, place-bag, or buy slot)";
+    CheckRefused("", empty);
+    CheckRefused("   ", empty);
+    CheckRefused("sell guid:12", unknown);
+    CheckRefused("Deposit guid:12", unknown);
+    CheckRefused("place-bag", "malformed bank: want place-bag guid:<item_instance.guid>");
+    CheckRefused("place-bag guid:0", "malformed bank: item must be guid:<item_instance.guid>, not 0");
     CheckRefused("deposit", "malformed bank: want deposit guid:<item_instance.guid>");
     CheckRefused("withdraw", "malformed bank: want withdraw guid:<item_instance.guid>");
     CheckRefused("deposit guid:12 guid:13", "malformed bank: want deposit guid:<item_instance.guid>");
@@ -154,8 +164,31 @@ void TheNearestInteractableBankerIsChosen()
 
 }  // namespace
 
+// WHERE A PLACED BAG GOES (#625): the first bought bank bag position with no
+// bag in it, never one that was not bought, and none at all when all are full.
+void CheckOpen(char const* why, uint32_t bought, std::array<bool, BANK_BAG_POSITIONS> occupied, int want)
+{
+    int const got = FirstOpenBankBagPosition(bought, occupied);
+    if (got == want)
+        return;
+    std::printf("FAIL open bank bag position (%s): got %d, wanted %d\n", why, got, want);
+    ++failures;
+}
+
+void APlacedBagGoesToTheFirstOpenBoughtPosition()
+{
+    std::array<bool, BANK_BAG_POSITIONS> const none{};
+    CheckOpen("nothing bought", 0, none, -1);
+    CheckOpen("one bought, empty", 1, none, 0);
+    CheckOpen("the first is full, the second is open", 2, {true, false}, 1);
+    CheckOpen("every bought one is full", 2, {true, true}, -1);
+    CheckOpen("an unbought position is never chosen", 1, {true, false}, -1);
+    CheckOpen("more than seven bought reads as seven", 9, {true, true, true, true, true, true, false}, 6);
+}
+
 int main()
 {
+    APlacedBagGoesToTheFirstOpenBoughtPosition();
     TheThreeVerbsParse();
     BlanksDoNotMatter();
     TheWrongTextIsRefusedByName();

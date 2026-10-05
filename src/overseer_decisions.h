@@ -45,6 +45,7 @@
 #define MOD_OVERSEER_DECISIONS_H
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -5951,6 +5952,8 @@ constexpr char const* BeingLooted   = "item is being looted";
 //     deposit guid:<item_instance.guid>    bags -> bank
 //     withdraw guid:<item_instance.guid>   bank -> bags
 //     buy slot                             the next bank bag slot, if affordable
+//     place-bag guid:<item_instance.guid>  a carried empty bag -> the first
+//                                          bought, empty bank bag slot
 //
 // GUID ONLY, NO `entry:` FORM, unlike give and trade. Those keep `entry` for
 // "the only one they have"; a bank move is exactly where that convenience
@@ -5971,13 +5974,14 @@ enum class BankVerb
     None,      // not a bank request at all; `error` says why
     Deposit,
     Withdraw,
-    BuySlot
+    BuySlot,
+    PlaceBag
 };
 
 struct BankRequest
 {
     BankVerb verb{BankVerb::None};
-    uint32_t itemGuid{0};   // for Deposit and Withdraw; 0 for BuySlot
+    uint32_t itemGuid{0};   // for Deposit, Withdraw and PlaceBag; 0 for BuySlot
     std::string error;      // the refusal literal when verb is None, else empty
 };
 
@@ -5987,6 +5991,16 @@ struct BankRequest
 // every "not found" path in the core returns and a row asking for it would
 // be answered by whichever item that path found first.
 BankRequest ParseBankRequest(std::string const& command);
+
+// WHERE A PLACED BAG GOES (#625). A bought bank bag slot is a place for a bag,
+// and the client puts one there only when a player drags it onto the slot
+// (CMSG_SWAP_ITEM to a BANK_SLOT_BAG_* position); auto-bank fills the 28 item
+// slots and never a bag position (Player::CanBankItem with NULL_SLOT). So
+// `place-bag` names the slot itself: the first of the `bought` positions,
+// counted from the first, that holds no bag. -1 when none is bought or every
+// bought one is full. `occupied` has one entry per bank bag position.
+constexpr uint32_t BANK_BAG_POSITIONS = 7;
+int FirstOpenBankBagPosition(uint32_t bought, std::array<bool, BANK_BAG_POSITIONS> const& occupied);
 
 // WHICH BANKER, when a city square has several in reach.
 //
