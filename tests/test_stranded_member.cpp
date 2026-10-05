@@ -106,6 +106,28 @@ void TheWayAcross()
     CheckWay("with no boat, a stone bound there is waited for",
              DecideStrandedWay(cooling), StrandedWay::WaitForStone);
 
+    // Rule 6b: Uzza, four hours on a ledge in Stonetalon, stone bound in
+    // Ratchet on its own continent, walk to the berth given up on the ground.
+    StrandedFacts ledge = Stranded();
+    ledge.boundOnMemberMap = true;
+    ledge.berthWalkGaveUp = true;
+    CheckWay("a berth walk given up on the ground hearths to the inn on its own map",
+             DecideStrandedWay(ledge), StrandedWay::Hearth);
+    CheckSays("the hearth out of a ledge says why",
+              StrandedWayExplanation(ledge, StrandedWay::Hearth), "gave up on the ground");
+    StrandedFacts ledgeCooling = ledge;
+    ledgeCooling.stoneReady = false;
+    CheckWay("after the hearth, the stone cooling down, it sails from the inn",
+             DecideStrandedWay(ledgeCooling), StrandedWay::Sail);
+    StrandedFacts walkingFine = ledge;
+    walkingFine.berthWalkGaveUp = false;
+    CheckWay("a berth walk that has not given up keeps sailing, stone or not",
+             DecideStrandedWay(walkingFine), StrandedWay::Sail);
+    StrandedFacts boundElsewhere = ledge;
+    boundElsewhere.boundOnMemberMap = false;
+    CheckWay("a stone bound on a third map is no way off the ledge",
+             DecideStrandedWay(boundElsewhere), StrandedWay::Sail);
+
     StrandedFacts none = Stranded();
     none.transportServes = false;
     CheckWay("no boat and no stone bound there is refused", DecideStrandedWay(none),

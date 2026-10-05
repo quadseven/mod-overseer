@@ -8149,6 +8149,12 @@ CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
 //   6. BOUND ON THE LEADER'S MAP WITH THE STONE READY: hearth. Ahead of the
 //      boat because it is one cast against a walk, a wait and a ride, and
 //      ahead of a crossing already walking to its berth for the same reason.
+//   6b. ITS WALK TO THE BERTH GAVE UP ON THE GROUND, AND THE STONE IS BOUND
+//      ON ITS OWN MAP AND READY: hearth to its inn, and sail from there. A
+//      player stuck on a ledge does exactly this. Measured on the dev realm
+//      2026-10-05: Uzza stood four hours at z 198 in Stonetalon, every bearing
+//      toward its berth refused, with its stone ready and bound in Ratchet,
+//      which has a boat of its own.
 //   7. A TRANSPORT OF ITS OWN FACTION JOINS THE TWO MAPS: sail.
 //   8. BOUND ON THE LEADER'S MAP, STONE COOLING DOWN: wait for the stone.
 //   9. OTHERWISE: refuse, and say which half of the way across is missing.
@@ -8186,6 +8192,11 @@ struct StrandedFacts
     bool familyOwnsTheWay{false};
     // The hearthstone's bind is on the leader's map.
     bool boundOnLeaderMap{false};
+    // The hearthstone's bind is on this member's own map (rule 6b).
+    bool boundOnMemberMap{false};
+    // Its walk toward a berth was released as unreachable on the ground
+    // recently (the travel drive's ground give-up, #312).
+    bool berthWalkGaveUp{false};
     bool carriesStone{false};
     // Carried, off cooldown, and with casts left to try this episode.
     bool stoneReady{false};
