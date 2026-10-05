@@ -14611,6 +14611,9 @@ private:
     {
         std::map<std::string, std::string> const roster = LoadJobs();
         time_t const now = std::time(nullptr);
+        // Bounded by the roster: a name that has left it is forgotten here.
+        for (auto it = _headTradeSeen.begin(); it != _headTradeSeen.end();)
+            it = roster.count(it->first) ? std::next(it) : _headTradeSeen.erase(it);
         for (auto const& entry : roster)
         {
             std::string const& name = entry.first;
