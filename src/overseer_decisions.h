@@ -6142,8 +6142,8 @@ int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates);
 TownRetry BuyRefusalRetry(std::string const& detail);
 
 // WHAT A VENDOR LINE WITH AN ExtendedCost ASKS FOR (wow-overseer#589), read
-// from ItemExtendedCost.dbc by the executor. `goldToo` is VendorItem::
-// IsGoldRequired: a line can ask for gold as well as honor.
+// from ItemExtendedCost.dbc by the executor. Gold a line may ask for as well
+// (VendorItem::IsGoldRequired) is priced and checked by the gold path.
 struct ExtendedCostShape
 {
     uint32_t honor{0};        // reqhonorpoints, per purchase

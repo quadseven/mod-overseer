@@ -75,6 +75,12 @@ void TheRowIsRoutedOnItsFirstWord()
     Check("nor the finder run", IsBattlegroundQueueRow("finder-run deadmines A B C D"), false);
     Check("nor an empty row", IsBattlegroundQueueRow(""), false);
     Check("and the finder run does not take it", IsGuildFinderRow("bg-queue av"), false);
+
+    // THE TWO kind='guild' ROUTES ARE DISJOINT, so the dispatcher's order
+    // between them cannot matter: no row is claimed by both.
+    for (char const* row : {"bg-queue av", "bg-queue wsg", "bg-queue ab", "bg-queue",
+                            "finder-run deadmines Ann Bo Cy Di", "finder-run", "invite Auren"})
+        Check(row, IsBattlegroundQueueRow(row) && IsGuildFinderRow(row), false);
 }
 
 void EachBattlegroundIsTheCoresType()
