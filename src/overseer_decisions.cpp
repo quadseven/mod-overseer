@@ -8143,6 +8143,83 @@ BindRequest ParseBindRequest(std::string const& command)
     return request;
 }
 
+static std::vector<std::string> RenameWords(std::string const& text)
+{
+    std::vector<std::string> words;
+    std::string word;
+    for (char ch : text)
+    {
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
+        {
+            if (!word.empty())
+                words.push_back(word);
+            word.clear();
+        }
+        else
+            word += ch;
+    }
+    if (!word.empty())
+        words.push_back(word);
+    return words;
+}
+
+bool IsRenameRow(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return !words.empty() && words[0] == "rename-to";
+}
+
+RenameRequest ParseRenameRequest(std::string const& command)
+{
+    RenameRequest request;
+    std::vector<std::string> const words = RenameWords(command);
+    if (words.empty() || words[0] != "rename-to")
+    {
+        request.error = "malformed rename: want rename-to <NewName>";
+        return request;
+    }
+    if (words.size() != 2)
+    {
+        request.error = "malformed rename: want exactly one new name";
+        return request;
+    }
+    request.ok = true;
+    request.newName = words[1];
+    return request;
+}
+
+char const* RenameRefusal(RenameFacts const& facts)
+{
+    if (facts.sameName)
+        return "the new name is the name it already has";
+    if (!facts.nameValid)
+        return "the core refuses that name";
+    if (facts.nameTaken)
+        return "another character already has that name";
+    if (facts.inDungeonRun)
+        return "it is on a dungeon run, and a rename logs it out";
+    if (facts.inInstance)
+        return "it is inside an instance, and a rename logs it out";
+    if (facts.inCombat)
+        return "it is fighting, and a rename logs it out";
+    return nullptr;
+}
+
+std::vector<RenameTable> const& RenameTables()
+{
+    static std::vector<RenameTable> const tables = {
+        {"overseer_roster", "name"},
+        {"overseer_raid_spec", "name"},
+        {"overseer_raid_seat", "name"},
+        {"overseer_keep", "character_name"},
+        {"overseer_goal", "character_name"},
+        {"overseer_trade", "character_name"},
+        {"overseer_stream", "character"},
+        {"overseer_chat_watch", "name"},
+    };
+    return tables;
+}
+
 char const* BindOutcomeWord(BindOutcome outcome)
 {
     switch (outcome)

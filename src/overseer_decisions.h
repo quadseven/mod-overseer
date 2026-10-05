@@ -9571,6 +9571,56 @@ struct BindRequest
 // handler is always going to refuse.
 BindRequest ParseBindRequest(std::string const& command);
 
+// ---------------------------------------------------------- a rename (2026-10-05) --
+// THE OPERATOR NAMES THE RAIDERS. Both guilds' raid groups take names by group
+// letter (Cave's caveman names, Bonkers' race jokes), and the summoners and
+// maintenance members are renamed too. A rename through the core alone changes
+// `characters.name` and nothing else, and this module keys a character's job,
+// family, professions, raid seat and more by that name, so the renamed
+// character would come back as a stranger to every drive here. The rename is
+// therefore one verb that does both: the core's own rename and the move of
+// every name-keyed row this module owns (RENAME_TABLES).
+//
+// THE ROW. It rides kind='job' and is routed on its first word, `rename-to`,
+// so no ENUM migration is needed: `rename-to <NewName>`. The name is taken as
+// written; case matters to a name, so nothing here lowers it.
+struct RenameRequest
+{
+    bool ok{false};
+    std::string newName;
+    std::string error;  // the refusal literal when not ok
+};
+
+bool IsRenameRow(std::string const& command);
+RenameRequest ParseRenameRequest(std::string const& command);
+
+// WHEN A RENAME IS REFUSED. The core's rename logs an online character out,
+// so a character in an instance, in a fight or inside a dungeon run is never
+// renamed: the logout would strand it or its group. A name the core would
+// refuse, or one already taken, is refused before anything changes.
+struct RenameFacts
+{
+    bool nameValid{false};   // ObjectMgr::CheckPlayerName said success
+    bool nameTaken{false};   // another character already has it
+    bool sameName{false};    // the new name is the old one
+    bool inInstance{false};
+    bool inCombat{false};
+    bool inDungeonRun{false};
+};
+
+// nullptr when the rename may go ahead, else the refusal literal.
+char const* RenameRefusal(RenameFacts const& facts);
+
+// Every table this module or its bridge keys by a character's name, with the
+// column, that a rename moves. History (deaths, events, chat, commands, past
+// runs) keeps the name the character had when it happened.
+struct RenameTable
+{
+    char const* table;
+    char const* column;
+};
+std::vector<RenameTable> const& RenameTables();
+
 // A home, or a place, as it was read off the world at one moment.
 //
 // `known` IS NOT `zero`. A map id of 0 is Eastern Kingdoms and a coordinate of
