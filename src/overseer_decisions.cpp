@@ -8253,6 +8253,126 @@ std::vector<RenameTable> const& RenameTables()
     return tables;
 }
 
+bool IsRetireRow(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return !words.empty() && words[0] == "retire";
+}
+
+RetireRequest ParseRetireRequest(std::string const& command)
+{
+    RetireRequest request;
+    std::vector<std::string> const words = RenameWords(command);
+    if (words.size() != 1 || words[0] != "retire")
+    {
+        request.error = "malformed retire: want the one word retire";
+        return request;
+    }
+    request.ok = true;
+    return request;
+}
+
+RetireRefusal RetireVerdictFor(RetireRequest const& request, RetireFacts const& facts)
+{
+    if (!request.ok)
+        return RetireRefusal::BadRequest;
+    if (!facts.exists)
+        return RetireRefusal::NoSuchCharacter;
+    if (!facts.randomBotAccount)
+        return RetireRefusal::NotRandomBotAccount;
+    if (facts.keptGuild)
+        return RetireRefusal::KeptGuild;
+    if (facts.onRoster)
+        return RetireRefusal::OnRoster;
+    if (facts.deathKnight)
+        return RetireRefusal::DeathKnight;
+    if (facts.level < RETIRE_MIN_LEVEL)
+        return RetireRefusal::BelowLevel;
+    if (facts.betweenWorlds)
+        return RetireRefusal::BetweenWorlds;
+    if (facts.clientAttached)
+        return RetireRefusal::ClientAttached;
+    return RetireRefusal::None;
+}
+
+char const* RetireRefusalSaid(RetireRefusal refusal)
+{
+    switch (refusal)
+    {
+        case RetireRefusal::None:
+            return "";
+        case RetireRefusal::BadRequest:
+            return "malformed retire: want the one word retire";
+        case RetireRefusal::NoSuchCharacter:
+            return "no character has that name";
+        case RetireRefusal::NotRandomBotAccount:
+            return "not on a random-bot account; only factory bots are retired";
+        case RetireRefusal::KeptGuild:
+            return "in a guild that is kept; its members are never retired";
+        case RetireRefusal::OnRoster:
+            return "on the roster; a family member is never retired";
+        case RetireRefusal::DeathKnight:
+            return "a death knight; the factory death knights stay";
+        case RetireRefusal::BelowLevel:
+            return "below level 42; a level the realm reaches naturally is never retired";
+        case RetireRefusal::BetweenWorlds:
+            return "logging in or out right now; retry in a minute";
+        case RetireRefusal::ClientAttached:
+            return "a real game client holds it; only a headless bot is logged out";
+    }
+    return "refused";
+}
+
+bool RetireRefusalPasses(RetireRefusal refusal)
+{
+    return refusal == RetireRefusal::BetweenWorlds || refusal == RetireRefusal::ClientAttached;
+}
+
+RetirePlan RetirePlanFor(RetireRefusal refusal, bool inWorld)
+{
+    if (refusal != RetireRefusal::None)
+        return RetirePlan::Refuse;
+    return inWorld ? RetirePlan::EvictThenSettle : RetirePlan::Settle;
+}
+
+RetireWait RetireWaitFor(bool present, unsigned absentForMs, unsigned waitedMs)
+{
+    if (waitedMs >= RETIRE_CEILING_MS)
+        return RetireWait::GiveUp;
+    if (present)
+        return RetireWait::Evict;
+    if (absentForMs >= RETIRE_SETTLE_MS)
+        return RetireWait::Delete;
+    return RetireWait::Wait;
+}
+
+bool AccountNameHasPrefix(std::string const& account, std::string const& prefix)
+{
+    if (prefix.empty() || account.size() < prefix.size())
+        return false;
+    for (std::size_t i = 0; i < prefix.size(); ++i)
+    {
+        char a = account[i];
+        char b = prefix[i];
+        if (a >= 'A' && a <= 'Z')
+            a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z')
+            b = static_cast<char>(b - 'A' + 'a');
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+
+std::string RetireLogLine(std::string const& name, unsigned level, int classId, std::string const& guild)
+{
+    std::string const cls = ClassWord(classId);
+    return "overseer: retired '" + name + "' (level " + std::to_string(level) + " " +
+           (cls.empty() ? "class " + std::to_string(classId) : cls) + ", " +
+           (guild.empty() ? std::string("no guild") : "guild '" + guild + "'") +
+           ") through Player::DeleteFromDB";
+}
+
 char const* BindOutcomeWord(BindOutcome outcome)
 {
     switch (outcome)

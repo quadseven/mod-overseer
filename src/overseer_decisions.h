@@ -9673,6 +9673,114 @@ struct RenameTable
 };
 std::vector<RenameTable> const& RenameTables();
 
+// ---------------------------------------------------------- a retire (2026-10-05) --
+// THE FACTORY BOTS ARE RETIRED. mod-playerbots' old pre-levelling default made
+// a crop of random-bot characters at the top of the level range that never
+// earned a level. The operator chose to retire them (delete them) rather than
+// strip them, and to keep the factory death knights. The delete is the core's
+// own: Player::DeleteFromDB(low, account, true, true), exactly what
+// `.character erase` calls (cs_character.cpp), which removes the character and
+// every row keyed by it (items, mail, auctions, guild membership, pets, social
+// lists) in one transaction. Nothing here writes a DELETE of its own.
+//
+// THE ROW. It rides kind='job' and is routed on its first word, `retire`, so
+// no ENUM migration is needed. The command is the one word; the character is
+// the row's target_name. It is dispatched BEFORE the online test, like a
+// naturalize row, because its target is normally offline.
+struct RetireRequest
+{
+    bool ok{false};
+    std::string error;  // the refusal literal when not ok
+};
+
+bool IsRetireRow(std::string const& command);
+RetireRequest ParseRetireRequest(std::string const& command);
+
+// The realm's highest NATURAL level when the operator approved this: nobody
+// who earned their levels is past 41, so a character at 42 or above on a
+// random-bot account was made that way by the factory.
+constexpr unsigned RETIRE_MIN_LEVEL = 42;
+
+// WHAT A RETIRE IS ASKED ABOUT. Read from the core's character cache and this
+// module's roster, and asked again at the moment of the delete.
+struct RetireFacts
+{
+    bool exists{false};            // the character cache knows the name
+    bool randomBotAccount{false};  // its account is a random-bot account
+    bool keptGuild{false};         // in a guild that is kept (Cave, Bonkers, ...)
+    bool onRoster{false};          // any overseer_roster row names it
+    bool deathKnight{false};
+    unsigned level{0};
+    bool betweenWorlds{false};     // logging in, logging out or teleporting
+    bool clientAttached{false};    // a real game client holds its session
+};
+
+enum class RetireRefusal
+{
+    None,
+    BadRequest,
+    NoSuchCharacter,
+    NotRandomBotAccount,
+    KeptGuild,
+    OnRoster,
+    DeathKnight,
+    BelowLevel,
+    BetweenWorlds,
+    ClientAttached,
+};
+
+// The first rule the character fails, in the order above, or None. Who the
+// character IS (account, guild, roster, class, level) is asked before WHERE it
+// is (between worlds, a client attached), so a character that must never be
+// retired is refused for that reason and not for one that a retry would clear.
+RetireRefusal RetireVerdictFor(RetireRequest const& request, RetireFacts const& facts);
+char const* RetireRefusalSaid(RetireRefusal refusal);
+
+// Is the refusal one that waiting can clear? Only the two about where the
+// character is: the rest are about who it is and stand forever.
+bool RetireRefusalPasses(RetireRefusal refusal);
+
+// HOW A RETIRE IS CARRIED OUT, ONCE IT IS NOT REFUSED. The core refuses to
+// delete a loaded character (HandleCharDeleteOpcode), so an online headless
+// bot is logged out first, through the holder that owns it, and nothing
+// touches the Player after that. Either way the delete then waits until the
+// character has been absent from the world for RETIRE_SETTLE_MS: long enough
+// for the logout's own save to reach the database ahead of the delete, and
+// for a login the random-bot manager had already started to land, where the
+// next poll sees it and logs it out again.
+enum class RetirePlan
+{
+    Refuse,
+    Settle,           // offline: wait out the settle, then delete
+    EvictThenSettle,  // a headless bot in the world: log out, then the same
+};
+
+RetirePlan RetirePlanFor(RetireRefusal refusal, bool inWorld);
+
+constexpr unsigned RETIRE_SETTLE_MS = 10000;
+constexpr unsigned RETIRE_CEILING_MS = 180000;
+
+enum class RetireWait
+{
+    Wait,    // still settling, or still in the world
+    Evict,   // back in the world as a headless bot: log it out again
+    Delete,  // absent long enough: delete now
+    GiveUp,  // never stayed out within the ceiling: the row ends in error
+};
+
+// `present` is a Player for the guid or a session still holding it;
+// `absentForMs` is how long it has been continuously absent; `waitedMs` is the
+// whole wait since the row was taken.
+RetireWait RetireWaitFor(bool present, unsigned absentForMs, unsigned waitedMs);
+
+// Does an account name begin with the random-bot account prefix? Ignoring
+// case: the core stores account names in upper case (AccountMgr) and
+// mod-playerbots' prefix is configured in lower case ("rndbot").
+bool AccountNameHasPrefix(std::string const& account, std::string const& prefix);
+
+// The one INFO line per retired character, the record of what went.
+std::string RetireLogLine(std::string const& name, unsigned level, int classId, std::string const& guild);
+
 // A home, or a place, as it was read off the world at one moment.
 //
 // `known` IS NOT `zero`. A map id of 0 is Eastern Kingdoms and a coordinate of
