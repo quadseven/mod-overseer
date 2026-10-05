@@ -18812,6 +18812,17 @@ enum class FinderState : std::uint8_t
 // both families split four and one for hours).
 bool FinderGroupStillServes(FinderState state, bool anyMemberInAnInstance);
 
+// AND A FINISHED RUN'S GROUP WITH THE HEAD STILL IN IT. The head's own finder
+// group was left alone as LeaveTheFinderGroup's to disband, but that only
+// happens at the right moment of a run. On wow-dev 2026-10-05 Grug's whole
+// family sat in Gnomeregan's finder group for three and a half hours after
+// the campaign let the dungeon go, scattered across Dun Morogh, Ironforge,
+// the Arathi Highlands and the Barrens, and the one-group rule never formed
+// the family's own party again. A group the finder no longer serves is kept
+// for a head only while the family's run is open.
+bool LeftoverFinderGroupKept(FinderState state, bool anyMemberInAnInstance, bool headInIt,
+                             bool familyRunOpen);
+
 struct FinderPollFacts
 {
     bool joined{false};

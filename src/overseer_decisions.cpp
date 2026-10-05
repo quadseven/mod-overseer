@@ -2099,6 +2099,14 @@ bool FinderGroupStillServes(FinderState state, bool anyMemberInAnInstance)
            state == FinderState::Proposal;
 }
 
+bool LeftoverFinderGroupKept(FinderState state, bool anyMemberInAnInstance, bool headInIt,
+                             bool familyRunOpen)
+{
+    if (FinderGroupStillServes(state, anyMemberInAnInstance))
+        return true;
+    return headInIt && familyRunOpen;
+}
+
 FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats)
 {
     FamilyGroupPlan plan;

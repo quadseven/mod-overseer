@@ -8321,11 +8321,12 @@ private:
                     (member->GetMap() && member->GetMap()->IsDungeon()))
                     inside = true;
             }
-            if (headInIt || family.empty())
+            if (family.empty())
                 continue;
             OverseerDecisions::FinderState const state =
                 FinderStateOf(sLFGMgr->GetState(group->GetGUID()));
-            if (OverseerDecisions::FinderGroupStillServes(state, inside))
+            if (OverseerDecisions::LeftoverFinderGroupKept(state, inside, headInIt,
+                                                          FamilyOnADungeonRun(family)))
                 continue;
             LOG_WARN("module.overseer",
                      "overseer: family of '{}' - '{}' is in a dungeon finder group led by '{}' "
