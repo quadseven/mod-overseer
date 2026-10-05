@@ -28096,6 +28096,8 @@ private:
             {
                 EndGhostRecovery(botAI, name);
                 ReleaseRevivalHold(botAI, name);
+                if (LeaveGuildDeathSpot(bot, name, now))
+                    continue;
                 // Resurrection Sickness is rested out, not fought through: at
                 // a quarter of its stats a member in starting gear dies to the
                 // first creature it meets.
@@ -28119,6 +28121,44 @@ private:
             DriveGhostRecovery(bot, botAI, name, corpse, deathsHere, /*ladder*/ false,
                                hostileGround);
         }
+    }
+
+    // A LIVING MEMBER THAT HAS DIED TWICE WHERE IT STANDS HEARTHS OUT
+    // (wow-overseer#597). The deaths are the ones this drive remembers
+    // (_guildDeathMarks), counted within the repeat radius of where the member
+    // stands now, so it fires on revival at the corpse, at a graveyard beside
+    // the killer, or on walking back into the same spot. True when a hearth was
+    // started this poll.
+    bool LeaveGuildDeathSpot(Player* bot, std::string const& name, int64 now)
+    {
+        auto const it = _guildDeathMarks.find(name);
+        if (it == _guildDeathMarks.end() || it->second.empty())
+            return false;
+        OverseerDecisions::PruneGuildDeathMarks(it->second, now, GHOST_REPEAT_MINUTES);
+        unsigned const deathsHere = OverseerDecisions::CountGuildDeathsNear(
+            it->second, now, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+            GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
+        uint32 const stone = HearthstoneSpellOf(bot);
+        bool const hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
+        if (OverseerDecisions::GuildLeavesDeathSpot(deathsHere, GHOST_RECOVERY_LIMITS.repeatDeaths,
+                                                    hearthReady, bot->IsInCombat()) !=
+            OverseerDecisions::GuildDeathSpotStep::Hearth)
+            return false;
+        char const* status = "error";
+        std::string evidence;
+        std::string const refusal = DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+        // A refusal that repeats every poll (bound at this spot, already
+        // casting) is said once, not once a poll.
+        std::string& said = _guildDeathSpotRefusal[name];
+        if (!refusal.empty() && said == refusal)
+            return false;
+        said = refusal;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where it "
+                 "stands in {}min and hearths out instead of fighting on there{}",
+                 name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
+                 refusal.empty() ? std::string() : " - refused: " + refusal);
+        return refusal.empty();
     }
 
     // ---------------------------------- a natural guild member's own trainer --
@@ -64512,6 +64552,8 @@ private:
     std::map<std::string, GhostRecoveryState> _ghostRecovery;
     // A natural guild member's recent deaths (DriveGuildGhostRecovery), by name.
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
+    // The last hearth refusal LeaveGuildDeathSpot logged for a member, by name.
+    std::map<std::string, std::string> _guildDeathSpotRefusal;
     // DriveGuildTraining: every class trainer spawn by the class it serves, the
     // entry each spot is, the trainer each member was last sent to, and when
     // the drive last ran.

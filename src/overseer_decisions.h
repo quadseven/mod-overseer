@@ -17839,6 +17839,24 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
 GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
                                  unsigned repeatDeaths);
 
+// A GUILD MEMBER THAT HAS DIED TWICE AT ONE SPOT LEAVES IT ONCE ALIVE. Every
+// recovery path brought guild members back to the same mobs: the corpse run,
+// the spirit healer at a graveyard beside the killer, the walk back from the
+// graveyard, the playerbots revive in place. On wow-dev 2026-10-04 after
+// GuildGhostFallback shipped, 311 guild deaths in 49 minutes were repeats and
+// 161 of them a third or later death at one spot (wow-overseer#597). A player
+// who has died twice in one place stops, hearths, and comes back another way.
+// Hearth when `deathsHere` (deaths within the repeat radius of where the member
+// stands, inside the repeat window) reaches `repeatDeaths`, the stone is ready,
+// and the member is out of combat (the core refuses the cast in combat).
+enum class GuildDeathSpotStep
+{
+    Stay,
+    Hearth,
+};
+GuildDeathSpotStep GuildLeavesDeathSpot(unsigned deathsHere, unsigned repeatDeaths,
+                                        bool hearthReady, bool inCombat);
+
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
 char const* GhostRecoveryWord(GhostRecovery choice);
