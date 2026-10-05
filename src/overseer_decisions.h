@@ -9736,10 +9736,6 @@ enum class RetireRefusal
 RetireRefusal RetireVerdictFor(RetireRequest const& request, RetireFacts const& facts);
 char const* RetireRefusalSaid(RetireRefusal refusal);
 
-// Is the refusal one that waiting can clear? Only the two about where the
-// character is: the rest are about who it is and stand forever.
-bool RetireRefusalPasses(RetireRefusal refusal);
-
 // HOW A RETIRE IS CARRIED OUT, ONCE IT IS NOT REFUSED. The core refuses to
 // delete a loaded character (HandleCharDeleteOpcode), so an online headless
 // bot is logged out first, through the holder that owns it, and nothing

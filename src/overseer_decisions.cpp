@@ -8323,11 +8323,6 @@ char const* RetireRefusalSaid(RetireRefusal refusal)
     return "refused";
 }
 
-bool RetireRefusalPasses(RetireRefusal refusal)
-{
-    return refusal == RetireRefusal::BetweenWorlds || refusal == RetireRefusal::ClientAttached;
-}
-
 RetirePlan RetirePlanFor(RetireRefusal refusal, bool inWorld)
 {
     if (refusal != RetireRefusal::None)

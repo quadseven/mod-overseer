@@ -23,7 +23,6 @@ using OverseerDecisions::RetireLogLine;
 using OverseerDecisions::RetirePlan;
 using OverseerDecisions::RetirePlanFor;
 using OverseerDecisions::RetireRefusal;
-using OverseerDecisions::RetireRefusalPasses;
 using OverseerDecisions::RetireRefusalSaid;
 using OverseerDecisions::RetireRequest;
 using OverseerDecisions::RetireVerdictFor;
@@ -124,12 +123,6 @@ void WhereItIs()
     f.betweenWorlds = true;
     Check("who outranks where", RetireVerdictFor(Ok(), f) == RetireRefusal::KeptGuild);
 
-    Check("between worlds passes", RetireRefusalPasses(RetireRefusal::BetweenWorlds));
-    Check("a client passes", RetireRefusalPasses(RetireRefusal::ClientAttached));
-    Check("a kept guild does not", !RetireRefusalPasses(RetireRefusal::KeptGuild));
-    Check("the roster does not", !RetireRefusalPasses(RetireRefusal::OnRoster));
-    Check("a death knight does not", !RetireRefusalPasses(RetireRefusal::DeathKnight));
-    Check("a low level does not", !RetireRefusalPasses(RetireRefusal::BelowLevel));
 }
 
 void EveryRefusalIsSaid()
