@@ -8209,6 +8209,18 @@ struct StrandedFacts
 
 StrandedWay DecideStrandedWay(StrandedFacts const& facts);
 
+// STEPPING OFF A DOCKED DECK MEANS LEAVING THE TRANSPORT (#274). The walk-off
+// counted a passenger within its landed distance of surveyed ground as off and
+// moved it no further. But a passenger is a passenger until the transport lets
+// it go, and standing 2 yards from the dock is not that: on the dev realm on
+// 2026-10-05 Uzza was "walked off" the Thundercaller at the Undercity tower
+// twice, 2.0 yards onto surveyed ground, and was still aboard when the
+// zeppelin left, so it rode back to Kalimdor each time. A player stepping onto
+// the dock is taken off the transport by the core; this does the same for a
+// passenger already beside ground off the deck of a docked transport.
+bool ShouldLeaveDeck(bool stillAboard, bool transportDocked, float yardsToGround,
+                     float landedYards);
+
 // The verdict as one sentence, for the log line that says it.
 std::string StrandedWayExplanation(StrandedFacts const& facts, StrandedWay way);
 

@@ -6993,6 +6993,13 @@ char const* StrandedWayName(StrandedWay way)
     return "wait";
 }
 
+bool ShouldLeaveDeck(bool stillAboard, bool transportDocked, float yardsToGround,
+                     float landedYards)
+{
+    return stillAboard && transportDocked && yardsToGround >= 0.f &&
+           yardsToGround <= landedYards;
+}
+
 StrandedWay DecideStrandedWay(StrandedFacts const& f)
 {
     if (!f.readable)
