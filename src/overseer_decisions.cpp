@@ -365,6 +365,15 @@ bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach)
                           reading.floorBelowValid, footingReach);
 }
 
+bool OffADeckInTheAir(TerrainReading const& reading, float dropYards)
+{
+    if (dropYards <= 0.f || !reading.besideTransport ||
+        !reading.movementMeasured || reading.falling ||
+        reading.hasLocalNavmesh || !reading.floorBelowValid)
+        return false;
+    return reading.z - reading.floorBelowZ >= dropYards;
+}
+
 bool SomeInstrumentFoundGround(TerrainReading const& reading,
                                float footingReach)
 {
@@ -749,6 +758,17 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
     // it is only a remedy for a character the world is not holding up.
     if (reading.movementMeasured)
     {
+        // EXCEPT IN THE AIR BESIDE A TRANSPORT, where not falling is the
+        // second before the fall and not a floor (see OffADeckInTheAir). Put
+        // down where the fall would have put it, once per episode; a set-down
+        // that did not hold gets the note below rather than a second teleport.
+        if (!state.setDown && OffADeckInTheAir(reading, limits.setDownDropYards))
+        {
+            state.setDown = true;
+            state.lastAttempt = now;
+            return TerrainRecoveryVerdict{TerrainRemedy::SetDown,
+                                          reading.floorBelowZ};
+        }
         if (!reading.falling)
         {
             if (state.saidNotFalling)
@@ -2640,6 +2660,9 @@ bool TerrainRemedyEndsTheErrand(TerrainRemedy remedy, bool onTheGround)
         case TerrainRemedy::GiveUp:        return !onTheGround;
         case TerrainRemedy::NotFalling:    return false;
         case TerrainRemedy::ReturnToLastGround: return true;
+        // The aim did not put it in the air; a transport that stopped carrying
+        // it did. Its errand goes on from the ground it is set down on.
+        case TerrainRemedy::SetDown:       return false;
     }
     return true;
 }
