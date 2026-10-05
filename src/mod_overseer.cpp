@@ -38737,7 +38737,23 @@ private:
         if (yards > CROSSING_WALK_OFF_REACH_YARDS)
             return -1.f;
         if (yards <= CROSSING_LANDED_YARDS)
+        {
+            // BESIDE THE GROUND AND STILL A PASSENGER: let the transport go
+            // of him the way the core does a player stepping onto the dock
+            // (OverseerDecisions::ShouldLeaveDeck). Only ever at a dock: the
+            // callers walk off and step back only while it is moored.
+            if (transport && OverseerDecisions::ShouldLeaveDeck(
+                                 who->GetTransport() == transport, true, yards,
+                                 CROSSING_LANDED_YARDS))
+            {
+                transport->RemovePassenger(who);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' steps off '{}' onto the dock, {:.1f} yards from "
+                         "surveyed ground - the transport lets go of it here (#274)",
+                         who->GetName(), transport->GetName(), yards);
+            }
             return yards;
+        }
         who->GetMotionMaster()->MovePoint(CROSSING_STEP_POINT_ID, x, y, z, FORCED_MOVEMENT_NONE,
                                           0.f, 0.f, /*generatePath*/ false,
                                           /*forceDestination*/ false);

@@ -30,6 +30,7 @@ using OverseerDecisions::CrossingMember;
 using OverseerDecisions::CrossingStep;
 using OverseerDecisions::CrossingWorld;
 using OverseerDecisions::DecideStrandedWay;
+using OverseerDecisions::ShouldLeaveDeck;
 using OverseerDecisions::ReadCrossing;
 using OverseerDecisions::StrandedFacts;
 using OverseerDecisions::StrandedWay;
@@ -292,8 +293,34 @@ void TheLoneCrossing()
 
 }  // namespace
 
+void SteppingOffTheDeck()
+{
+    // Uzza at the Undercity tower: still aboard, docked, 2.0 yards from ground.
+    if (!ShouldLeaveDeck(true, true, 2.0f, 2.0f))
+    {
+        std::printf("FAIL a passenger beside the dock leaves the transport\n");
+        ++failures;
+    }
+    if (ShouldLeaveDeck(true, false, 1.0f, 2.0f))
+    {
+        std::printf("FAIL nobody steps off a transport that is not docked\n");
+        ++failures;
+    }
+    if (ShouldLeaveDeck(true, true, 6.0f, 2.0f))
+    {
+        std::printf("FAIL a passenger short of the ground walks on rather than leaving\n");
+        ++failures;
+    }
+    if (ShouldLeaveDeck(false, true, 1.0f, 2.0f))
+    {
+        std::printf("FAIL one already ashore has nothing to leave\n");
+        ++failures;
+    }
+}
+
 int main()
 {
+    SteppingOffTheDeck();
     TheWayAcross();
     WhatComesFirst();
     TheLoneCrossing();
