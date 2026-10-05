@@ -6067,7 +6067,7 @@ TownRetry RepairRefusalRetry(std::string const& detail);
 //
 // WHAT A kind='buy' ROW MAY SAY.
 //
-//     entry:<item_template.entry> [count:<n>] [max:<copper>]
+//     entry:<item_template.entry> [count:<n>] [max:<copper>] [honor:<points>]
 //
 // `entry:` AND NOT `guid:`, which is the opposite of every other item verb
 // here, and the reason is that the item does not exist yet. There is no
@@ -6090,6 +6090,15 @@ TownRetry RepairRefusalRetry(std::string const& detail);
 // slot. A purchase cannot; the gold is simply spent. `max` lets the sender say
 // what it expected to pay and the executor refuse rather than discover.
 // Absent, there is no ceiling.
+//
+// `honor` IS THE SAME CEILING IN HONOR POINTS, AND THE ONLY WAY TO SPEND THEM
+// (wow-overseer#589). A vendor line with an ExtendedCost is priced in honor,
+// arena points or tokens instead of gold, and the PvP quartermasters sell the
+// level 60 battleground and rank gear that way on this server. The core takes
+// the honor itself (Player::BuyItemFromVendorSlot), so the row only has to say
+// what it expected to pay. A line priced in honor is bought only when the row
+// names an honor ceiling: spending honor is never a side effect of a buy that
+// was written for gold.
 struct BuyRequest
 {
     bool valid{false};
@@ -6097,11 +6106,13 @@ struct BuyRequest
     uint32_t count{1};      // purchases, not items; never 0
     bool capped{false};     // whether `max:` was given
     uint32_t maxCopper{0};  // meaningful only when capped
+    bool honorCapped{false};  // whether `honor:` was given
+    uint32_t maxHonor{0};     // meaningful only when honorCapped
     std::string error;      // the refusal literal when invalid, else empty
 };
 
-// The first word must be `entry:`; `count:` and `max:` may follow in either
-// order, each at most once. A count of 0 is refused rather than read as 1,
+// The first word must be `entry:`; `count:`, `max:` and `honor:` may follow in
+// any order, each at most once. A count of 0 is refused rather than read as 1,
 // because the core silently rewrites a count below 1 to 1 and a row asking for
 // nothing should be a malformed row rather than a purchase nobody asked for. A
 // `max:` of 0 is allowed and means "only if it is free", which is a real thing
@@ -6129,6 +6140,27 @@ struct BuyVendorCandidate
 int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates);
 
 TownRetry BuyRefusalRetry(std::string const& detail);
+
+// WHAT A VENDOR LINE WITH AN ExtendedCost ASKS FOR (wow-overseer#589), read
+// from ItemExtendedCost.dbc by the executor. `goldToo` is VendorItem::
+// IsGoldRequired: a line can ask for gold as well as honor.
+struct ExtendedCostShape
+{
+    uint32_t honor{0};        // reqhonorpoints, per purchase
+    uint32_t arena{0};        // reqarenapoints, per purchase
+    bool tokens{false};       // any reqitem
+    uint32_t arenaRating{0};  // reqpersonalarenarating
+};
+
+// Whether a line priced through ExtendedCost may be bought by this row, as
+// the refusal literal or nullptr. Only an honor price is spent: arena points,
+// a rating or a token is refused, because nothing this module plans earns
+// them. An honor price needs an `honor:` ceiling on the row at or above the
+// whole purchase (`count` times the price), and the buyer must hold that much
+// honor. The core makes the same honor test and answers it to a client a bot
+// does not have, so it is made here first and named.
+char const* ExtendedCostRefusal(ExtendedCostShape const& cost, BuyRequest const& request,
+                                uint32_t honorHeld);
 
 // ------------------------------------------------------- a death's cause --
 //
@@ -19810,6 +19842,67 @@ struct AuctionHistoryRow
 // The INSERT for one row. Every value is a number or one of the fixed words
 // above, so nothing needs escaping.
 std::string AuctionHistoryInsertSql(AuctionHistoryRow const& row);
+
+// ------------------------------------------- battleground queue (#589) --
+//
+// A MEMBER QUEUES A BATTLEGROUND THE WAY A PLAYER DOES (wow-overseer#589).
+// The bridge sends a guild member whose next gear upgrade is PvP gear into the
+// battleground that earns it. mod-playerbots queues a random bot only to fill
+// a queue a real player opened (BGJoinAction::shouldJoinBg), so nothing there
+// queues a member on its own wish, and no chat command does.
+//
+// The row rides kind='guild' and is routed on its first word, as the finder
+// run does, so no ENUM migration is needed:
+//
+//     bg-queue <av|wsg|ab>
+//
+// The executor sends CMSG_BATTLEMASTER_JOIN to the core's own handler with the
+// character's own guid (a battleground in 3.3.5 needs no battlemaster in
+// reach; the playerbots join action does the same). A character that leads
+// its group queues the group; the core then checks every member. Once queued,
+// the invitation is answered by the playerbots `bg status` trigger every bot
+// carries, and inside, the battleground strategies play it.
+bool IsBattlegroundQueueRow(std::string const& command);
+
+struct BattlegroundQueueRequest
+{
+    bool valid{false};
+    std::string key;     // av, wsg or ab
+    uint32_t bgTypeId{0};  // BattlegroundTypeId: 1 AV, 2 WSG, 3 AB
+    std::string error;   // the refusal literal when invalid, else empty
+};
+
+// `bg-queue` then exactly one of av, wsg or ab.
+BattlegroundQueueRequest ParseBattlegroundQueueRequest(std::string const& command);
+
+// What the executor reads off the character before it asks the core.
+struct BattlegroundQueueFacts
+{
+    bool inBattleground{false};
+    bool queuedForThis{false};
+    bool freeQueueSlot{true};
+    bool bracketFits{true};    // a PvpDifficulty bracket holds its level
+    bool levelAllowed{true};   // Player::GetBGAccessByLevel
+    bool deserter{false};      // !Player::CanJoinToBattleground
+    bool groupFollower{false}; // in a group it does not lead
+    bool inDungeonFinder{false};
+};
+
+// NOT A FAILURE: the character is already where the row wants it, inside a
+// battleground or in this one's queue. The word goes into the result and the
+// row is delivered, so the sender reads "waiting for the battle", not an
+// error. nullptr when neither holds.
+char const* BattlegroundQueueAlready(BattlegroundQueueFacts const& facts);
+
+// The refusal literal, or nullptr when the core should be asked. The order is
+// the handler's own, so the first reason named is the one the core would hit.
+// A group follower is refused because its leader queues the group, which is
+// how a party goes in together.
+char const* BattlegroundQueueRefusal(BattlegroundQueueFacts const& facts);
+
+// How a refusal is retried: the level and the grammar never change by
+// waiting; a full queue list, a deserter debuff or the dungeon finder do.
+TownRetry BattlegroundQueueRetry(std::string const& detail);
 
 }  // namespace OverseerDecisions
 

@@ -195,6 +195,8 @@
  */
 
 #include "AuctionHouseMgr.h"
+#include "Battleground.h"
+#include "BattlegroundMgr.h"
 #include "CellImpl.h"
 #include "CharacterCache.h"
 #include "Chat.h"
@@ -48014,6 +48016,11 @@ private:
                                        _pendingLearns, id);
             else if (kind == "cast")
                 detail = DoCast(player, command, status, rowResult, _pendingCasts, id);
+            else if (kind == "guild" && OverseerDecisions::IsBattlegroundQueueRow(command))
+                // A MEMBER QUEUES A BATTLEGROUND (wow-overseer#589), on
+                // kind='guild' and routed on the first word like the finder
+                // run below, so no ENUM migration is needed.
+                detail = DoBattlegroundQueue(player, command, status, rowResult);
             else if (kind == "guild" && OverseerDecisions::IsGuildFinderRow(command))
                 // THE GUILD COORDINATOR'S FIVE-MAN, on kind='guild' and routed
                 // on the first word as the walks ride `mail` and `cast`, so no
@@ -51494,6 +51501,8 @@ private:
         using OverseerDecisions::BuyRequest;
         using OverseerDecisions::BuyVendorCandidate;
         using OverseerDecisions::ChooseBuyVendor;
+        using OverseerDecisions::ExtendedCostRefusal;
+        using OverseerDecisions::ExtendedCostShape;
         using OverseerDecisions::ParseBuyRequest;
         using OverseerDecisions::TownRetryWord;
 
@@ -51521,6 +51530,11 @@ private:
             float nearestYards = -1.f;
             bool haveInventoryResult = false;
             InventoryResult inventoryResult = EQUIP_ERR_OK;
+            // Honor (wow-overseer#589): -1 when the line is not priced in it.
+            int64 honorPrice = -1;
+            int64 honorCap = -1;
+            int64 honorBefore = -1;
+            int64 honorAfter = -1;
         } ev;
 
         auto describe = [&](char const* outcome, char const* reason)
@@ -51546,7 +51560,11 @@ private:
               << ",\"money_after\":" << ev.moneyAfter
               << ",\"spent\":" << spent
               << ",\"price_matches_spend\":"
-              << ((ev.price >= 0 && spent >= 0 && ev.price == spent) ? "true" : "false");
+              << ((ev.price >= 0 && spent >= 0 && ev.price == spent) ? "true" : "false")
+              << ",\"honor_price\":" << ev.honorPrice
+              << ",\"honor_cap\":" << ev.honorCap
+              << ",\"honor_before\":" << ev.honorBefore
+              << ",\"honor_after\":" << ev.honorAfter;
             if (ev.haveVendor)
                 o << ",\"vendor\":{\"entry\":" << ev.vendorEntry
                   << ",\"name\":" << J(ev.vendorName)
@@ -51581,6 +51599,8 @@ private:
         ev.purchases = request.count;
         if (request.capped)
             ev.cap = int64(request.maxCopper);
+        if (request.honorCapped)
+            ev.honorCap = int64(request.maxHonor);
         ev.moneyBefore = buyer->GetMoney();
         ev.moneyAfter = ev.moneyBefore;
 
@@ -51735,8 +51755,32 @@ private:
             return refuse("vendor does not stock the item");
         if (!candidates[choice].inStock)
             return refuse("vendor is out of stock");
-        if (line->ExtendedCost && !line->IsGoldRequired(proto))
-            return refuse("item is not bought with gold");
+        // A LINE PRICED THROUGH ExtendedCost (wow-overseer#589). Until now
+        // every such line was refused, because nothing here earned anything
+        // but gold. A guild member that grinds honor for a battleground or
+        // rank piece spends it here: honor only, and only under the row's own
+        // `honor:` ceiling (ExtendedCostRefusal). The core takes the honor
+        // itself in BuyItemFromVendorSlot; this reads it back below.
+        if (line->ExtendedCost)
+        {
+            ItemExtendedCostEntry const* iece = sItemExtendedCostStore.LookupEntry(line->ExtendedCost);
+            if (!iece)
+                return refuse("item is not bought with gold");
+            ExtendedCostShape cost;
+            cost.honor = iece->reqhonorpoints;
+            cost.arena = iece->reqarenapoints;
+            cost.arenaRating = iece->reqpersonalarenarating;
+            for (uint32 i = 0; i < MAX_ITEM_EXTENDED_COST_REQUIREMENTS; ++i)
+                if (iece->reqitem[i])
+                    cost.tokens = true;
+            ev.honorBefore = int64(buyer->GetHonorPoints());
+            ev.honorAfter = ev.honorBefore;
+            if (cost.honor > 0)
+                ev.honorPrice = int64(cost.honor) * int64(request.count);
+            if (char const* const refusal =
+                    ExtendedCostRefusal(cost, request, buyer->GetHonorPoints()))
+                return refuse(refusal);
+        }
 
         // The core's own price, computed the same way and in the same order:
         // the whole stack first, then floor() of the reputation discount.
@@ -51794,6 +51838,8 @@ private:
         // ---- believe nothing; read the bags and the purse back ----------------
         ev.moneyAfter = buyer->GetMoney();
         ev.carriedAfter = int32(buyer->GetItemCount(request.entry, false));
+        if (ev.honorBefore >= 0)
+            ev.honorAfter = int64(buyer->GetHonorPoints());
         if (line->maxcount != 0)
             ev.stockLeft = int32(vendor->GetVendorItemCurrentCount(line));
 
@@ -51815,6 +51861,11 @@ private:
             describe("error", "the item arrived but the price paid does not match");
             return "the item arrived but the price paid does not match";
         }
+        if (ev.honorPrice > 0 && ev.honorAfter != ev.honorBefore - ev.honorPrice)
+        {
+            describe("error", "the item arrived but the honor paid does not match");
+            return "the item arrived but the honor paid does not match";
+        }
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' bought {} x {} (entry {}) from {} ({}) for {} copper",
@@ -51822,6 +51873,147 @@ private:
                  ev.vendorEntry, price);
 
         describe("bought", "");
+        status = "delivered";
+        return "";
+    }
+
+
+    // ---------------------------------------------------- battleground queue --
+    //
+    // A GUILD MEMBER QUEUES A BATTLEGROUND FOR ITS NEXT UPGRADE
+    // (wow-overseer#589). The bridge decides who wants PvP gear and which
+    // battleground earns it; this puts the character in that queue the way a
+    // player's client does, through the core's own handler.
+    //
+    // WHY THE HANDLER AND NOT BattlegroundQueue::AddGroup. The handler is
+    // where every gate lives - the bracket, the queue slots, the deserter
+    // debuff, the dungeon finder, the group's own checks when the character
+    // leads one - and where the status packet is sent that starts the
+    // invitation. A second copy of it here would drift. So the packet is
+    // built as a client builds it (guid, BattlegroundTypeId, instance 0 for
+    // "first available", join-as-group) and handed to
+    // WorldSession::HandleBattlemasterJoinOpcode. In 3.3.5 a battleground
+    // needs no battlemaster in reach; the character's own guid stands in, as
+    // it does in the playerbots join action.
+    //
+    // WHY THE PRE-CHECKS. Every refusal in that handler is a packet to a
+    // client a bot does not have, so the row would read `delivered` with
+    // nothing queued. The gates are read first and named
+    // (OverseerDecisions::BattlegroundQueueRefusal), and the queue is READ
+    // BACK afterwards: InBattlegroundQueueForBattlegroundQueueType is the only
+    // proof the core accepted it.
+    //
+    // WHAT HAPPENS NEXT IS NOT HERE. The invitation is answered by the
+    // playerbots `bg status` trigger, which every bot carries, and inside the
+    // battleground the playerbots battleground strategies play it.
+    //
+    // Column re-use, no new columns:
+    //   target_name  the character (a group leader queues its group)
+    //   command      `bg-queue <av|wsg|ab>`
+    //   detail       short refusal literal, or empty on success
+    //   result       JSON: outcome, reason, retry, the facts read, the request
+    static char const* DoBattlegroundQueue(Player* who, std::string const& command,
+                                           char const*& status, std::string& out)
+    {
+        using OverseerDecisions::BattlegroundQueueAlready;
+        using OverseerDecisions::BattlegroundQueueFacts;
+        using OverseerDecisions::BattlegroundQueueRefusal;
+        using OverseerDecisions::BattlegroundQueueRequest;
+        using OverseerDecisions::BattlegroundQueueRetry;
+        using OverseerDecisions::ParseBattlegroundQueueRequest;
+        using OverseerDecisions::TownRetryWord;
+
+        BattlegroundQueueRequest const request = ParseBattlegroundQueueRequest(command);
+        BattlegroundQueueFacts facts;
+        bool asGroup = false;
+        int32 bracket = -1;
+
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome)
+              << ",\"reason\":" << J(reason)
+              << ",\"retry\":" << J(*reason ? TownRetryWord(BattlegroundQueueRetry(reason)) : "")
+              << ",\"character\":" << J(who->GetName())
+              << ",\"level\":" << uint32(who->GetLevel())
+              << ",\"battleground\":" << J(request.key)
+              << ",\"bg_type\":" << request.bgTypeId
+              << ",\"bracket\":" << bracket
+              << ",\"as_group\":" << (asGroup ? "true" : "false")
+              << ",\"in_battleground\":" << (facts.inBattleground ? "true" : "false")
+              << ",\"queued_for_this\":" << (facts.queuedForThis ? "true" : "false")
+              << ",\"deserter\":" << (facts.deserter ? "true" : "false")
+              << ",\"honor\":" << who->GetHonorPoints()
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (!request.valid)
+        {
+            describe("refused", request.error.c_str());
+            return "malformed bg-queue request";
+        }
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("character has no session");
+
+        BattlegroundTypeId const bgTypeId = BattlegroundTypeId(request.bgTypeId);
+        Battleground* const bg = sBattlegroundMgr->GetBattlegroundTemplate(bgTypeId);
+        if (!bg)
+            return refuse("no such battleground");
+        BattlegroundQueueTypeId const queueTypeId = BattlegroundMgr::BGQueueTypeId(bgTypeId, 0);
+        if (queueTypeId == BATTLEGROUND_QUEUE_NONE)
+            return refuse("no such battleground");
+
+        PvPDifficultyEntry const* const bracketEntry =
+            GetBattlegroundBracketByLevel(bg->GetMapId(), who->GetLevel());
+        if (bracketEntry)
+            bracket = int32(bracketEntry->GetBracketId());
+
+        Group* const group = who->GetGroup();
+        asGroup = group && group->IsLeader(who->GetGUID());
+
+        facts.inBattleground = who->InBattleground();
+        facts.queuedForThis = who->InBattlegroundQueueForBattlegroundQueueType(queueTypeId);
+        facts.freeQueueSlot = who->HasFreeBattlegroundQueueId();
+        facts.bracketFits = bracketEntry != nullptr;
+        facts.levelAllowed = who->GetBGAccessByLevel(bgTypeId);
+        facts.deserter = !who->CanJoinToBattleground(bg);
+        facts.groupFollower = group && !asGroup;
+        facts.inDungeonFinder = sLFGMgr->GetState(who->GetGUID()) > lfg::LFG_STATE_NONE;
+
+        if (char const* const already = BattlegroundQueueAlready(facts))
+        {
+            describe("already", already);
+            status = "delivered";
+            return "";
+        }
+        if (char const* const refusal = BattlegroundQueueRefusal(facts))
+            return refuse(refusal);
+
+        {
+            WorldPacket packet(CMSG_BATTLEMASTER_JOIN, 8 + 4 + 4 + 1);
+            packet << who->GetGUID();
+            packet << uint32(bgTypeId);
+            packet << uint32(0);
+            packet << uint8(asGroup ? 1 : 0);
+            session->HandleBattlemasterJoinOpcode(packet);
+        }
+
+        if (!who->InBattlegroundQueueForBattlegroundQueueType(queueTypeId))
+            return refuse("the core did not queue the character");
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' (level {}) queued for battleground {} (bracket {}){}",
+                 who->GetName(), who->GetLevel(), request.key, bracket,
+                 asGroup ? " with its group" : "");
+        facts.queuedForThis = true;
+        describe("queued", "");
         status = "delivered";
         return "";
     }

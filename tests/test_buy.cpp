@@ -39,6 +39,8 @@ using OverseerDecisions::BuyRefusalRetry;
 using OverseerDecisions::BuyRequest;
 using OverseerDecisions::BuyVendorCandidate;
 using OverseerDecisions::ChooseBuyVendor;
+using OverseerDecisions::ExtendedCostRefusal;
+using OverseerDecisions::ExtendedCostShape;
 using OverseerDecisions::ParseBuyRequest;
 using OverseerDecisions::TownRetry;
 using OverseerDecisions::TownRetryWord;
@@ -71,6 +73,12 @@ void CheckWord(char const* what, std::string const& got, char const* want)
         return;
     std::printf("FAIL %s: got '%s', wanted '%s'\n", what, got.c_str(), want);
     ++failures;
+}
+
+// A refusal literal that may be nullptr (no refusal).
+void CheckRefusal(char const* what, char const* got, char const* want)
+{
+    CheckWord(what, got ? got : "(no refusal)", want);
 }
 
 BuyVendorCandidate Vendor(float distance, float discount, bool stocks, bool inStock)
@@ -162,14 +170,75 @@ void EverythingElseIsMalformed()
 void AMalformedRequestSaysWhichWordWasWrong()
 {
     CheckWord("an empty command names the whole grammar", ParseBuyRequest("").error,
-              "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]");
+              "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>][ honor:<points>]");
     CheckWord("a zero entry names the entry", ParseBuyRequest("entry:0").error,
               "malformed buy: first word must be entry:<item_template.entry>, not 0");
     CheckWord("a zero count names the count", ParseBuyRequest("entry:1 count:0").error,
               "malformed buy: count must be 1 or more");
-    CheckWord("an unknown key names the two that are known",
+    CheckWord("an unknown key names the three that are known",
               ParseBuyRequest("entry:1 slot:2").error,
-              "malformed buy: unknown word (want count:<n> or max:<copper>)");
+              "malformed buy: unknown word (want count:<n>, max:<copper> or honor:<points>)");
+}
+
+// ---- honor (wow-overseer#589) ----------------------------------------------
+
+void AnHonorCeilingIsReadBesideTheOthers()
+{
+    BuyRequest const request = ParseBuyRequest("entry:19325 count:1 honor:5000");
+    Check("entry, count and honor is valid", request.valid, true);
+    Check("and the honor ceiling is set", request.honorCapped, true);
+    CheckNumber("and is the number given", request.maxHonor, 5000);
+    Check("and sets no copper ceiling", request.capped, false);
+
+    BuyRequest const absent = ParseBuyRequest("entry:19325");
+    Check("no honor word sets no honor ceiling", absent.honorCapped, false);
+    Check("an honor given twice is malformed",
+          ParseBuyRequest("entry:1 honor:2 honor:3").valid, false);
+    CheckWord("and says so", ParseBuyRequest("entry:1 honor:2 honor:3").error,
+              "malformed buy: honor given twice");
+}
+
+ExtendedCostShape Honor(uint32_t points)
+{
+    ExtendedCostShape cost;
+    cost.honor = points;
+    return cost;
+}
+
+void HonorIsSpentOnlyUnderTheRowsOwnCeiling()
+{
+    BuyRequest const capped = ParseBuyRequest("entry:19325 honor:5000");
+    Check("an honor price within the ceiling and held is bought",
+          ExtendedCostRefusal(Honor(5000), capped, 6000) == nullptr, true);
+    CheckRefusal("a row written for gold never spends honor",
+              ExtendedCostRefusal(Honor(5000), ParseBuyRequest("entry:19325 max:100"), 9000),
+              "item is bought with honor and the row set no honor cap");
+    CheckRefusal("a price over the ceiling is refused before the core sees it",
+              ExtendedCostRefusal(Honor(9000), capped, 20000),
+              "honor price exceeds the cap the row set");
+    CheckRefusal("and the ceiling is on the whole purchase",
+              ExtendedCostRefusal(Honor(3000), ParseBuyRequest("entry:1 count:2 honor:5000"), 9000),
+              "honor price exceeds the cap the row set");
+    CheckRefusal("too little honor held is named, not left to the core's silent refusal",
+              ExtendedCostRefusal(Honor(5000), capped, 4999), "not enough honor");
+}
+
+void OnlyHonorIsEverSpent()
+{
+    BuyRequest const capped = ParseBuyRequest("entry:1 honor:99999");
+    ExtendedCostShape arena = Honor(100);
+    arena.arena = 50;
+    CheckRefusal("arena points", ExtendedCostRefusal(arena, capped, 99999),
+              "item costs more than honor");
+    ExtendedCostShape tokens = Honor(0);
+    tokens.tokens = true;
+    CheckRefusal("a token", ExtendedCostRefusal(tokens, capped, 99999), "item costs more than honor");
+    ExtendedCostShape rating = Honor(100);
+    rating.arenaRating = 1500;
+    CheckRefusal("a rating", ExtendedCostRefusal(rating, capped, 99999),
+              "item costs more than honor");
+    Check("a cost line that asks for nothing is no refusal",
+          ExtendedCostRefusal(Honor(0), ParseBuyRequest("entry:1"), 0) == nullptr, true);
 }
 
 // ---- which vendor ----------------------------------------------------------
@@ -239,14 +308,16 @@ void AVendorThatDoesNotStockItIsStillNamed()
 void TheItemAndTheCommandAreNeverWorthRetrying()
 {
     for (char const* detail :
-         {"malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]",
+         {"malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>][ honor:<points>]",
           "malformed buy: first word must be entry:<item_template.entry>, not 0",
           "malformed buy: count must be 1 or more", "malformed buy: count given twice",
-          "malformed buy: max given twice",
-          "malformed buy: unknown word (want count:<n> or max:<copper>)",
+          "malformed buy: max given twice", "malformed buy: honor given twice",
+          "malformed buy: unknown word (want count:<n>, max:<copper> or honor:<points>)",
           "malformed buy request", "no such item",
           "item is not for this class", "item is for the other faction",
-          "item is not bought with gold", "price exceeds the cap the row set",
+          "item is not bought with gold", "item costs more than honor",
+          "item is bought with honor and the row set no honor cap",
+          "honor price exceeds the cap the row set", "price exceeds the cap the row set",
           "count exceeds what the packet carries", "count would overflow the purse"})
         Check(detail, BuyRefusalRetry(detail) == TownRetry::Never, true);
 }
@@ -264,7 +335,8 @@ void StockAndMoneyAndBagsAreWorthRetryingLater()
     // the sale queued behind this row, and the bags empty the same way. All
     // three are the same vendor, later.
     for (char const* detail : {"vendor is out of stock", "cannot afford the purchase",
-                               "bags cannot take the item", "buyer is dead"})
+                               "bags cannot take the item", "buyer is dead",
+                               "not enough honor"})
         Check(detail, BuyRefusalRetry(detail) == TownRetry::Later, true);
 }
 
@@ -295,6 +367,10 @@ int main()
     SurplusBlanksAreNotWords();
     EverythingElseIsMalformed();
     AMalformedRequestSaysWhichWordWasWrong();
+
+    AnHonorCeilingIsReadBesideTheOthers();
+    HonorIsSpentOnlyUnderTheRowsOwnCeiling();
+    OnlyHonorIsEverSpent();
 
     NoVendorIsNoChoice();
     HavingTheThingBeatsMerelySellingIt();
