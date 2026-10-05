@@ -194,6 +194,7 @@
  * race.
  */
 
+#include "AccountMgr.h"
 #include "AuctionHouseMgr.h"
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
@@ -48565,6 +48566,10 @@ private:
         // fresh login before they act, and for a reset's walk home after.
         ResolveNaturalizeChecks(sincePollMs);
 
+        // ...and the retire rows, which wait for the character to stay out of
+        // the world before the core deletes it.
+        ResolveRetireChecks(sincePollMs);
+
         // ...and the mailbox walks, which are driven as well as judged: each
         // poll reads where the walker is and hands it its next leg (#569).
         ResolveMailWalks(sincePollMs);
@@ -48774,6 +48779,12 @@ private:
                 // target may be offline, and when it is online it is logged
                 // out before anything is done to it (see DoNaturalize).
                 detail = DoNaturalize(targetName, command, id, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsRetireRow(command))
+                // A RETIRE (2026-10-05) rides kind='job', routed on its first
+                // word like a rename, so no ENUM migration is needed; and it is
+                // BEFORE the online test like a naturalize row, because its
+                // target is normally offline (see DoRetire).
+                detail = DoRetire(targetName, command, id, status, rowResult);
             else if (!player)
                 detail = "target not online";
             else if (kind == "chat")
@@ -54406,6 +54417,234 @@ private:
         }
 
         _pendingNaturalizes.swap(still);
+    }
+
+    // -------------------------------------------------------------- retire --
+    //
+    // kind='job', command `retire` (2026-10-05): delete one factory-made random
+    // bot through the core's own Player::DeleteFromDB, with deleteFinally set,
+    // which is exactly what `.character erase` calls. Who may be retired and
+    // how the wait runs are OverseerDecisions' (the retire block, pinned by
+    // tests/test_retire.cpp); this section reads the facts and acts.
+    //
+    // THE CORE WILL NOT DELETE A LOADED CHARACTER (HandleCharDeleteOpcode), so
+    // a headless bot in the world is logged out first through the holder that
+    // owns it, and the random-bot manager is told not to bring it back: its
+    // `add` value is cleared and its `logout` value set, through
+    // RandomPlayerbotMgr::SetValue so the manager's cache agrees with its
+    // table. The delete then waits out RETIRE_SETTLE_MS of continuous absence,
+    // so the logout's save is queued well ahead of the delete and a login the
+    // manager had already started has landed (and is logged out again).
+
+    struct RetireCheck
+    {
+        uint32 id{0};
+        ObjectGuid guid;
+        std::string name;
+        uint32 waitedMs{0};
+        uint32 absentMs{0};
+    };
+
+    std::vector<RetireCheck> _pendingRetires;
+
+    static std::vector<std::string> RetireKeepGuilds()
+    {
+        return OverseerDecisions::ParseNameList(
+            sConfigMgr->GetOption<std::string>("Overseer.Retire.KeepGuilds", "Cave,Bonkers"));
+    }
+
+    static bool RetireAccountIsRandomBot(uint32 accountId)
+    {
+        std::string account;
+        if (!accountId || !AccountMgr::GetName(accountId, account))
+            return false;
+        return OverseerDecisions::AccountNameHasPrefix(account, sPlayerbotAIConfig.randomBotAccountPrefix);
+    }
+
+    static OverseerDecisions::RetireFacts ReadRetireFacts(ObjectGuid guid, std::string const& name, Player* live)
+    {
+        OverseerDecisions::RetireFacts facts;
+        CharacterCacheEntry const* cache = guid ? sCharacterCache->GetCharacterCacheByGuid(guid) : nullptr;
+        facts.exists = cache != nullptr;
+        if (!cache)
+            return facts;
+
+        facts.randomBotAccount = RetireAccountIsRandomBot(cache->AccountId);
+        std::string const guild = GuildNameOf(guid, live);
+        facts.keptGuild = !guild.empty() && (OverseerDecisions::NameListHas(RetireKeepGuilds(), guild) ||
+                                             OverseerDecisions::NameListHas(NaturalGuilds(), guild));
+        facts.onRoster = CountQuery("SELECT COUNT(*) FROM overseer_roster WHERE name = '{}'", Esc(name)) > 0;
+        facts.deathKnight = cache->Class == CLASS_DEATH_KNIGHT;
+        facts.level = live ? live->GetLevel() : cache->Level;
+        facts.betweenWorlds = live ? (!live->IsInWorld() || live->IsBeingTeleported())
+                                   : sWorldSessionMgr->FindOfflineSessionForCharacterGUID(guid.GetCounter()) != nullptr;
+        facts.clientAttached = live && ClientAttached(live);
+        return facts;
+    }
+
+    // Keep the random-bot manager from logging the character (back) in while
+    // the retire waits: `add` off makes its next pass drop it, `logout` on
+    // keeps its login pass from picking it again.
+    static void HoldOutOfRotation(ObjectGuid guid)
+    {
+        uint32 const low = guid.GetCounter();
+        sRandomPlayerbotMgr.SetValue(low, "add", 0);
+        sRandomPlayerbotMgr.SetValue(low, "logout", 1);
+    }
+
+    static std::string RetireRefused(std::string const& name, char const* reason)
+    {
+        return "{\"outcome\":\"refused\",\"reason\":" + J(reason) + ",\"character\":" + J(name) + "}";
+    }
+
+    char const* DoRetire(std::string const& targetName, std::string const& command, uint32 id,
+                         char const*& status, std::string& out)
+    {
+        using OverseerDecisions::RetirePlan;
+        using OverseerDecisions::RetireRefusal;
+        OverseerDecisions::RetireRequest const request = OverseerDecisions::ParseRetireRequest(command);
+
+        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(targetName);
+        Player* live = guid ? ObjectAccessor::FindConnectedPlayer(guid) : nullptr;
+        OverseerDecisions::RetireFacts const facts = ReadRetireFacts(guid, targetName, live);
+        RetireRefusal const refusal = OverseerDecisions::RetireVerdictFor(request, facts);
+        if (refusal != RetireRefusal::None)
+        {
+            char const* said = OverseerDecisions::RetireRefusalSaid(refusal);
+            out = RetireRefused(targetName, said);
+            return said;
+        }
+
+        for (RetireCheck const& pending : _pendingRetires)
+            if (pending.guid == guid)
+            {
+                out = RetireRefused(targetName, "another retire row for this character is still in flight");
+                return "another retire row for this character is still in flight";
+            }
+
+        RetirePlan const plan = OverseerDecisions::RetirePlanFor(refusal, live != nullptr);
+        if (plan == RetirePlan::EvictThenSettle)
+        {
+            WorldSession* session = live->GetSession();
+            if (!session || !session->IsBot())
+            {
+                out = RetireRefused(targetName, "in the world with a session this module cannot log out cleanly");
+                return "in the world with a session this module cannot log out cleanly";
+            }
+        }
+
+        HoldOutOfRotation(guid);
+        if (plan == RetirePlan::EvictThenSettle)
+        {
+            LOG_INFO("module.overseer", "overseer: retire {} for '{}' - logging the headless bot out first", id,
+                     targetName);
+            EvictHeadlessBot(live);  // frees the Player
+            live = nullptr;
+        }
+
+        RetireCheck check;
+        check.id = id;
+        check.guid = guid;
+        check.name = targetName;
+        _pendingRetires.push_back(check);
+
+        out = "{\"outcome\":\"settling\",\"character\":" + J(targetName) +
+              ",\"note\":\"deleted through Player::DeleteFromDB once it has stayed out of the world\"}";
+        status = "verifying";
+        return "";
+    }
+
+    void FinishRetire(RetireCheck const& check, char const* status, std::string const& detail,
+                      std::string const& result)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            status, Esc(detail), EscLong(result), check.id, g_runToken);
+    }
+
+    void ResolveRetireChecks(uint32 elapsedMs)
+    {
+        using OverseerDecisions::RetireRefusal;
+        using OverseerDecisions::RetireWait;
+        std::vector<RetireCheck> still;
+        still.reserve(_pendingRetires.size());
+
+        for (RetireCheck& check : _pendingRetires)
+        {
+            check.waitedMs += elapsedMs;
+            Player* live = ObjectAccessor::FindConnectedPlayer(check.guid);
+            bool const present =
+                live || sWorldSessionMgr->FindOfflineSessionForCharacterGUID(check.guid.GetCounter()) != nullptr;
+            check.absentMs = present ? 0 : check.absentMs + elapsedMs;
+
+            RetireWait const wait = OverseerDecisions::RetireWaitFor(present, check.absentMs, check.waitedMs);
+            if (wait == RetireWait::Wait)
+            {
+                still.push_back(check);
+                continue;
+            }
+            if (wait == RetireWait::GiveUp)
+            {
+                FinishRetire(check, "error", "did not stay out of the world within three minutes",
+                             RetireRefused(check.name, "did not stay out of the world within three minutes"));
+                continue;
+            }
+            if (wait == RetireWait::Evict)
+            {
+                // Back in the world: a login the manager had started landed.
+                // A headless bot settled in the world goes out again; anything
+                // else (between worlds, a client) is waited on to the ceiling.
+                if (live && live->IsInWorld() && !live->IsBeingTeleported() && !ClientAttached(live) &&
+                    live->GetSession() && live->GetSession()->IsBot())
+                {
+                    LOG_INFO("module.overseer", "overseer: retire {} for '{}' - it came back in; logging it out again",
+                             check.id, check.name);
+                    HoldOutOfRotation(check.guid);
+                    EvictHeadlessBot(live);
+                }
+                still.push_back(check);
+                continue;
+            }
+
+            // DELETE. Every rule asked again of the character as the cache
+            // holds it now: its guild, its roster row or its account may have
+            // changed while it settled.
+            OverseerDecisions::RetireFacts const facts = ReadRetireFacts(check.guid, check.name, nullptr);
+            RetireRefusal const refusal =
+                OverseerDecisions::RetireVerdictFor(OverseerDecisions::ParseRetireRequest("retire"), facts);
+            if (refusal != RetireRefusal::None)
+            {
+                char const* said = OverseerDecisions::RetireRefusalSaid(refusal);
+                FinishRetire(check, "error", said, RetireRefused(check.name, said));
+                continue;
+            }
+
+            CharacterCacheEntry const* cache = sCharacterCache->GetCharacterCacheByGuid(check.guid);
+            uint32 const accountId = cache->AccountId;
+            int const classId = cache->Class;
+            unsigned const level = cache->Level;
+            std::string const guild = GuildNameOf(check.guid, nullptr);
+
+            Player::DeleteFromDB(check.guid.GetCounter(), accountId, true, true);
+
+            if (sCharacterCache->GetCharacterCacheByGuid(check.guid))
+            {
+                // DeleteFromDB returns early, keeping the cache entry, only for
+                // a delete method it does not support. Said, not assumed gone.
+                FinishRetire(check, "error", "the core's delete left the character in place",
+                             RetireRefused(check.name, "the core's delete left the character in place"));
+                continue;
+            }
+
+            LOG_INFO("module.overseer", "{}", OverseerDecisions::RetireLogLine(check.name, level, classId, guild));
+            std::ostringstream o;
+            o << "{\"outcome\":\"retired\",\"character\":" << J(check.name) << ",\"level\":" << level
+              << ",\"class\":" << J(OverseerDecisions::ClassWord(classId)) << ",\"guild\":" << J(guild) << '}';
+            FinishRetire(check, "applied", "", o.str());
+        }
+
+        _pendingRetires.swap(still);
     }
 
     // ---- facts about spells and skills, from the core's own tables ----
