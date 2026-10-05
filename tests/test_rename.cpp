@@ -10,11 +10,16 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using OverseerDecisions::IsRenameRow;
 using OverseerDecisions::ParseRenameRequest;
 using OverseerDecisions::RenameFacts;
+using OverseerDecisions::RenamePlan;
+using OverseerDecisions::RenamePlanFor;
 using OverseerDecisions::RenameRefusal;
+using OverseerDecisions::RenameStep;
+using OverseerDecisions::RenameSteps;
 using OverseerDecisions::RenameTables;
 
 namespace
@@ -71,6 +76,55 @@ void WhenItIsRefused()
     Check("not to the same name", RenameRefusal(f) != nullptr);
 }
 
+// Where a step sits in a plan, or -1 when the plan never takes it.
+int At(RenamePlan plan, RenameStep step)
+{
+    std::vector<RenameStep> const& steps = RenameSteps(plan);
+    for (std::size_t i = 0; i < steps.size(); ++i)
+        if (steps[i] == step)
+            return int(i);
+    return -1;
+}
+
+void HowItIsCarriedOut()
+{
+    // The plan, from the facts.
+    Check("an online bot is logged out and renamed offline",
+          RenamePlanFor(false, true, true) == RenamePlan::EvictThenRename);
+    Check("a real client takes the core's online path",
+          RenamePlanFor(false, false, true) == RenamePlan::RenameThenKick);
+    Check("a refusal stands for a bot", RenamePlanFor(true, true, true) == RenamePlan::Refuse);
+    Check("a refusal stands for a client", RenamePlanFor(true, false, true) == RenamePlan::Refuse);
+    Check("a bot logging in or out is not touched",
+          RenamePlanFor(false, true, false) == RenamePlan::Refuse);
+    Check("a refused rename does nothing at all", RenameSteps(RenamePlan::Refuse).empty());
+
+    // THE BOT: out of the world before its name changes (2026-10-05, ten
+    // online guild bots renamed in place). A live Player is never renamed.
+    RenamePlan const bot = RenamePlan::EvictThenRename;
+    Check("a bot is logged out first", At(bot, RenameStep::LogOut) == 0);
+    Check("a bot is never renamed while live", At(bot, RenameStep::RenameLive) == -1);
+    Check("its name is written after the logout",
+          At(bot, RenameStep::WriteName) > At(bot, RenameStep::LogOut));
+    Check("its rows move after the name",
+          At(bot, RenameStep::MoveRows) > At(bot, RenameStep::WriteName));
+    Check("it is queued back in last",
+          At(bot, RenameStep::LogIn) == int(RenameSteps(bot).size()) - 1);
+    Check("a bot has no client to kick", At(bot, RenameStep::Kick) == -1);
+
+    // THE CLIENT: the in-place name comes before the kick, because the logout
+    // save the kick causes writes whatever name the Player carries.
+    RenamePlan const client = RenamePlan::RenameThenKick;
+    Check("a client is renamed before it is kicked",
+          At(client, RenameStep::RenameLive) >= 0 &&
+              At(client, RenameStep::RenameLive) < At(client, RenameStep::Kick));
+    Check("a client's rows move before the kick",
+          At(client, RenameStep::MoveRows) >= 0 &&
+              At(client, RenameStep::MoveRows) < At(client, RenameStep::Kick));
+    Check("a client is not logged out as a bot", At(client, RenameStep::LogOut) == -1 &&
+                                                     At(client, RenameStep::LogIn) == -1);
+}
+
 bool Moves(char const* table)
 {
     for (auto const& t : RenameTables())
@@ -98,6 +152,7 @@ int main()
 {
     TheRow();
     WhenItIsRefused();
+    HowItIsCarriedOut();
     WhatMovesWithIt();
     if (failures)
         return 1;

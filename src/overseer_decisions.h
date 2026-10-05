@@ -9623,6 +9623,46 @@ struct RenameFacts
 // nullptr when the rename may go ahead, else the refusal literal.
 char const* RenameRefusal(RenameFacts const& facts);
 
+// HOW A RENAME IS CARRIED OUT, ONCE IT IS NOT REFUSED (2026-10-05). The first
+// version renamed an online bot in place (SetName and the name map, no
+// logout). A live Player's old name is still held by whatever cached it while
+// it was in the world: a group's member slot, the guild's member entry,
+// mod-playerbots' own maps. That is why the core's `.character rename` kicks
+// an online character and only writes the name of an offline one
+// (cs_character.cpp, HandleCharacterRenameCommand). So a bot is logged out
+// first and renamed offline, then logged back in under the new name; nothing
+// touches the Player after the logout, which frees it.
+//
+// A real client keeps the core's online path: the name is changed in place
+// and the client is kicked. The kick is deferred to the session's next
+// update, and the logout save it causes writes the name the Player carries,
+// so the in-place name has to be set BEFORE the kick or that save would put
+// the old name back.
+enum class RenamePlan
+{
+    Refuse,           // a refusal stands, or the character is between worlds
+    EvictThenRename,  // a bot: log out, rename offline, log back in
+    RenameThenKick,   // a real client: the core's online path
+};
+
+enum class RenameStep
+{
+    LogOut,      // EvictHeadlessBot; the Player is freed
+    RenameLive,  // SetName and the name map, on a Player still in the world
+    WriteName,   // declined name dropped, CHAR_UPD_NAME_BY_GUID, the cache
+    MoveRows,    // every RenameTables() row, in one transaction
+    Kick,        // the client is disconnected
+    LogIn,       // queued back in through the random-bot holder
+};
+
+// `refused` is RenameRefusal() != nullptr. `inWorld` is false for a character
+// that is logging in or out right now, which is refused, as no step here is
+// safe on it.
+RenamePlan RenamePlanFor(bool refused, bool isBot, bool inWorld);
+
+// The steps of a plan, in the order they are carried out. Empty for Refuse.
+std::vector<RenameStep> const& RenameSteps(RenamePlan plan);
+
 // Every table this module or its bridge keys by a character's name, with the
 // column, that a rename moves. History (deaths, events, chat, commands, past
 // runs) keeps the name the character had when it happened.
