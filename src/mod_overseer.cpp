@@ -57679,8 +57679,9 @@ private:
                 {
                     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
                     for (OverseerDecisions::RenameTable const& t : OverseerDecisions::RenameTables())
-                        trans->Append("UPDATE {} SET {} = '{}' WHERE {} = '{}'", t.table, t.column,
-                                      Esc(newName), t.column, Esc(oldName));
+                        trans->Append(OverseerDecisions::RenameRowStatement(t, Esc(newName),
+                                                                            Esc(oldName))
+                                          .c_str());
                     CharacterDatabase.CommitTransaction(trans);
                     break;
                 }

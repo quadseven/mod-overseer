@@ -8263,6 +8263,14 @@ std::vector<RenameTable> const& RenameTables()
     return tables;
 }
 
+std::string RenameRowStatement(RenameTable const& table, std::string const& newName,
+                               std::string const& oldName)
+{
+    std::string const column = std::string("`") + table.column + "`";
+    return std::string("UPDATE `") + table.table + "` SET " + column + " = '" + newName +
+           "' WHERE " + column + " = '" + oldName + "'";
+}
+
 bool IsRetireRow(std::string const& command)
 {
     std::vector<std::string> const words = RenameWords(command);
