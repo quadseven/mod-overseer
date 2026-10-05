@@ -16611,6 +16611,17 @@ GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
                                                              : GuildRunRearmStep::Wait;
 }
 
+GuildRunStrayStep GuildRunStrayNext(GuildRunStrayFacts const& facts)
+{
+    // Asked first: a live run's group is never the leftover, whatever else is
+    // true of it, and its tank can have no other group to clean up.
+    if (facts.tankInGroup && facts.liveRunGroup)
+        return GuildRunStrayStep::Drop;
+    if (!facts.tankInGroup || !facts.finderGroup)
+        return facts.expired ? GuildRunStrayStep::Drop : GuildRunStrayStep::Wait;
+    return facts.takenOut ? GuildRunStrayStep::Disband : GuildRunStrayStep::TakeOut;
+}
+
 GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
 {
     if (poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||

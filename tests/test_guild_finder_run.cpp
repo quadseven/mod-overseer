@@ -36,6 +36,9 @@ using OverseerDecisions::GuildRunNext;
 using OverseerDecisions::GuildRunRearmFacts;
 using OverseerDecisions::GuildRunRearmNext;
 using OverseerDecisions::GuildRunRearmStep;
+using OverseerDecisions::GuildRunStrayFacts;
+using OverseerDecisions::GuildRunStrayNext;
+using OverseerDecisions::GuildRunStrayStep;
 using OverseerDecisions::GuildRunPoll;
 using OverseerDecisions::GuildRunVerdict;
 using OverseerDecisions::GuildRunVerdictWord;
@@ -289,6 +292,46 @@ void TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming()
     Check("nobody alive: nothing to re-arm", GuildRunRearmNext(f) == GuildRunRearmStep::Skip);
 }
 
+// The live trace (2026-10-04): a restart left 'Velalenn' a stray, and eleven
+// minutes later Velalenn was seated in a NEW run under another tank. Once that
+// group was in the dungeon it was a finder group, and the stray took the new
+// run's members out and disbanded the group: "abandoned: the group is gone".
+void ARestartsStrayNeverTakesANewRunsGroup()
+{
+    GuildRunStrayFacts f;
+    f.tankInGroup = true;
+    f.finderGroup = true;
+    f.liveRunGroup = true;
+    Check("the stray's tank in a live run's finder group: the stray is dropped",
+          GuildRunStrayNext(f) == GuildRunStrayStep::Drop);
+    f.takenOut = true;
+    Check("even after an earlier take-out, a live run's group is never disbanded",
+          GuildRunStrayNext(f) == GuildRunStrayStep::Drop);
+    f.finderGroup = false;
+    f.takenOut = false;
+    Check("a live run still queueing (no finder flag yet) is not the stray's either",
+          GuildRunStrayNext(f) == GuildRunStrayStep::Drop);
+}
+
+void ARestartsOwnLeftoverIsStillTakenOutThenDisbanded()
+{
+    GuildRunStrayFacts f;
+    Check("the tank not back yet: wait", GuildRunStrayNext(f) == GuildRunStrayStep::Wait);
+    f.expired = true;
+    Check("the quarter hour over with no group: forget it",
+          GuildRunStrayNext(f) == GuildRunStrayStep::Drop);
+
+    f.expired = false;
+    f.tankInGroup = true;
+    Check("a plain party is not the finder group: wait",
+          GuildRunStrayNext(f) == GuildRunStrayStep::Wait);
+    f.finderGroup = true;
+    Check("the leftover finder group: take the living out first",
+          GuildRunStrayNext(f) == GuildRunStrayStep::TakeOut);
+    f.takenOut = true;
+    Check("then disband it", GuildRunStrayNext(f) == GuildRunStrayStep::Disband);
+}
+
 }  // namespace
 
 // A PICK-UP GROUP (wow-overseer issue 591): the row names one of the five as
@@ -389,6 +432,8 @@ int main()
     AGroupThatLeftOrOutstayedIsOver();
     ADisabledBrainIsAskedAgainWhileSomebodyLives();
     TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming();
+    ARestartsStrayNeverTakesANewRunsGroup();
+    ARestartsOwnLeftoverIsStillTakenOutThenDisbanded();
     APugIsOneOfTheFiveNamedAfterThem();
     APugTheRowCannotPlaceIsRefused();
     OnlyAPugMayComeFromOutsideTheGuildAndNeverFromTheOtherSide();

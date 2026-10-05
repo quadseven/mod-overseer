@@ -18888,6 +18888,42 @@ enum class GuildRunRearmStep : std::uint8_t
 
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts);
 
+// A RESTART'S LEFTOVER GROUP, NEVER THE NEXT RUN'S. A worldserver that dies
+// mid-run leaves a stray: the tank of a run it did not finish, whose finder
+// group is taken out and disbanded when the tank is back in one, for a
+// quarter of an hour. The tank was recognised and nothing else, so when the
+// tank (or a member of the lost run that was its tank) was seated in a NEW
+// guild run inside that quarter hour, the new run's finder group was the one
+// taken out and disbanded, a few seconds after it went in: "abandoned: the
+// group is gone" (guild runs 195 and 202 on 2026-10-04, each 10 to 15 minutes
+// after a restart). A group a guild run of this process formed is never the
+// stray's: a character is in one group at a time, and a new run is refused
+// for a member who is still in a group, so a tank found in a live run's group
+// has no leftover group to clean up and the stray is dropped.
+struct GuildRunStrayFacts
+{
+    // The stray's tank is in the world and in a group.
+    bool tankInGroup{false};
+    // That group is a finder group (the core's LFG flag).
+    bool finderGroup{false};
+    // That group is the group of a guild run this process is driving.
+    bool liveRunGroup{false};
+    // The members were already sent out on an earlier poll.
+    bool takenOut{false};
+    // The stray's quarter hour is over.
+    bool expired{false};
+};
+
+enum class GuildRunStrayStep : std::uint8_t
+{
+    Wait,     // the tank is not back in a finder group yet
+    Drop,     // nothing is left to clean up: forget the stray
+    TakeOut,  // send the living out of the dungeon
+    Disband,  // disband the leftover group
+};
+
+GuildRunStrayStep GuildRunStrayNext(GuildRunStrayFacts const& facts);
+
 // ------------------------- what a level-up hands the roster (the operator) --
 //
 // TrainRoster runs on every level change of a roster character. With factory

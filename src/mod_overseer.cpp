@@ -37754,7 +37754,10 @@ private:
     // flag and this module's memory gone. Rows this process did not claim are
     // ended by ExpireAbandonedClaims; their groups are read once here and, for
     // a quarter of an hour, the living are taken out and the group disbanded as
-    // soon as the tank is back in the world.
+    // soon as the tank is back in the world. A group a live guild run of this
+    // process formed is never the leftover (OverseerDecisions::GuildRunStrayNext):
+    // the tank seated in a new run inside the quarter hour used to have the new
+    // run's group disbanded under it.
     void DriveGuildRunStrays(std::time_t now)
     {
         if (!_guildRunStraysRead)
@@ -37793,13 +37796,35 @@ private:
         {
             Player* const tank = ObjectAccessor::FindPlayerByName(stray.tank);
             Group* const group = tank ? tank->GetGroup() : nullptr;
-            if (!group || !group->isLFGGroup())
+            OverseerDecisions::GuildRunStrayFacts facts;
+            facts.tankInGroup = group != nullptr;
+            facts.finderGroup = group && group->isLFGGroup();
+            if (group)
             {
-                if (now < stray.until)
-                    still.push_back(stray);
+                uint64 const groupGuid = group->GetGUID().GetRawValue();
+                for (GuildRun const& run : _guildRuns)
+                    if (run.groupGuid == groupGuid)
+                        facts.liveRunGroup = true;
+            }
+            facts.takenOut = stray.teleported;
+            facts.expired = now >= stray.until;
+            OverseerDecisions::GuildRunStrayStep const step =
+                OverseerDecisions::GuildRunStrayNext(facts);
+            if (step == OverseerDecisions::GuildRunStrayStep::Wait)
+            {
+                still.push_back(stray);
                 continue;
             }
-            if (!stray.teleported)
+            if (step == OverseerDecisions::GuildRunStrayStep::Drop)
+            {
+                if (facts.liveRunGroup)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' led a guild finder run before the restart and is "
+                             "now in a new one; that group is the new run's and is left alone",
+                             stray.tank);
+                continue;
+            }
+            if (step == OverseerDecisions::GuildRunStrayStep::TakeOut)
             {
                 stray.teleported = true;
                 for (std::string const& name : stray.names)
