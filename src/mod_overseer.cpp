@@ -25080,6 +25080,9 @@ private:
                              "bearing for {} polls running without getting any nearer - releasing the errand as unreachable",
                              name, target, refusal.consecutive);
                     _travelAims.Release(name, "the travel drive (every bearing refused, ground give-up)");
+                    // A stranded member whose walk to its berth gives up here
+                    // may hearth out of it instead (DecideStrandedWay, rule 6b).
+                    _strandedGroundGiveUp[name] = std::time(nullptr);
                 }
                 continue;
             }
@@ -39632,6 +39635,8 @@ private:
     std::map<std::string, std::pair<time_t, std::string>> _loneCrossingRefused;
     // Hearth casts asked of a stranded member this split (EXIT_HEARTH_ATTEMPTS).
     std::map<std::string, unsigned> _strandedHearthTries;
+    // When a member's travel walk last gave up on the ground (rule 6b).
+    std::map<std::string, time_t> _strandedGroundGiveUp;
     // The last way said for a stranded member, so each is said once per change.
     std::map<std::string, std::string> _strandedWaySaid;
     // Why a split member is not crossing, for SayPartySplit's line.
@@ -39677,6 +39682,7 @@ private:
             _strandedHearthTries.erase(name);
             _strandedWaySaid.erase(name);
             _strandedWhy.erase(name);
+            _strandedGroundGiveUp.erase(name);
             return false;
         }
 
@@ -39719,6 +39725,11 @@ private:
             FamilyCrossing(family) || runEscort || InDungeonRun(p) || familyComesHere;
 
         facts.boundOnLeaderMap = p->m_homebindMapId == leader->GetMapId();
+        facts.boundOnMemberMap = p->m_homebindMapId == p->GetMapId();
+        auto const gaveUp = _strandedGroundGiveUp.find(name);
+        facts.berthWalkGaveUp = gaveUp != _strandedGroundGiveUp.end() &&
+                                std::time(nullptr) - gaveUp->second <
+                                    time_t(LONE_CROSSING_STANDDOWN_SECONDS * 2);
         uint32 const stone = HearthstoneSpellOf(p);
         facts.carriesStone = stone != 0;
         facts.stoneReady = stone && !p->HasSpellCooldown(stone) &&

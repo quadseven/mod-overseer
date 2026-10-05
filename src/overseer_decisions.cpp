@@ -7000,6 +7000,8 @@ StrandedWay DecideStrandedWay(StrandedFacts const& f)
         return StrandedWay::Wait;
     if (f.boundOnLeaderMap && f.carriesStone && f.stoneReady)
         return StrandedWay::Hearth;
+    if (f.berthWalkGaveUp && f.boundOnMemberMap && f.carriesStone && f.stoneReady)
+        return StrandedWay::Hearth;
     if (f.transportServes)
         return StrandedWay::Sail;
     if (f.boundOnLeaderMap && f.carriesStone)
@@ -7028,6 +7030,10 @@ std::string StrandedWayExplanation(StrandedFacts const& f, StrandedWay way)
                 return "it is fighting, and nothing sets off while it does";
             return "a hearth is already in flight for it";
         case StrandedWay::Hearth:
+            if (!f.boundOnLeaderMap)
+                return "its walk to the berth gave up on the ground, and its hearthstone is "
+                       "bound on map " + here + ", its own, and is ready, so it hearths to its "
+                       "inn and sails from there";
             return "its hearthstone is bound on map " + there +
                    ", its leader's, and is ready, so it hearths there";
         case StrandedWay::Sail:
