@@ -14627,6 +14627,14 @@ bool CraftDismountsFirst(bool mounted, bool inFlight)
     return mounted && !inFlight;
 }
 
+GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
+                                 unsigned repeatDeaths)
+{
+    if (healerGraveKnown && deathsHere >= repeatDeaths)
+        return GhostRecovery::SpiritHealer;
+    return GhostRecovery::CorpseRun;
+}
+
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
                                   uint32_t weGive, uint32_t ourCopper, uint32_t openSeconds)
 {
