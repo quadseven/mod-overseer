@@ -14627,6 +14627,21 @@ bool CraftDismountsFirst(bool mounted, bool inFlight)
     return mounted && !inFlight;
 }
 
+HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
+                                  uint32_t weGive, uint32_t ourCopper, uint32_t openSeconds)
+{
+    // A head never gives through someone else's window.
+    if (weGive > 0 || ourCopper > 0)
+        return HeadTradeAnswer::Decline;
+    if (!traderIsKin)
+        return openSeconds >= HEAD_TRADE_STRANGER_SECONDS ? HeadTradeAnswer::Decline
+                                                          : HeadTradeAnswer::Wait;
+    if (theyOffer > 0 || theirCopper > 0)
+        return HeadTradeAnswer::Accept;
+    return openSeconds >= HEAD_TRADE_EMPTY_SECONDS ? HeadTradeAnswer::Decline
+                                                   : HeadTradeAnswer::Wait;
+}
+
 HoldDebt HandRevivalDebtOn(HoldDebt inForce, bool revivalLed, bool hasMaster)
 {
     HoldDebt out = inForce;

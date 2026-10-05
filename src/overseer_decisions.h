@@ -16868,6 +16868,24 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
 // character off a taxi would cancel an errand nobody asked to cancel.
 bool CraftDismountsFirst(bool mounted, bool inFlight);
 
+// A TRADE OPENED TO A SELFBOT HEAD IS ANSWERED LIKE A PERSON WOULD. mod-playerbots'
+// TradeStatusAction returns at once for a selfbot (a human is assumed at the
+// client), and a family head is a selfbot with a client and no human. On
+// wow-dev 2026-10-04 the operator watched Zug stand with a family member's
+// trade window open, a belt offered, and nothing answering it. A person
+// accepts a gift from family or guild that asks nothing back, waits a moment
+// for one still being filled, and declines everything else.
+enum class HeadTradeAnswer
+{
+    Wait,
+    Accept,
+    Decline,
+};
+constexpr uint32_t HEAD_TRADE_STRANGER_SECONDS = 3;
+constexpr uint32_t HEAD_TRADE_EMPTY_SECONDS = 60;
+HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
+                                  uint32_t weGive, uint32_t ourCopper, uint32_t openSeconds);
+
 // A REVIVAL HOLD THAT ENDS UNDER ANOTHER HOLD HANDS ITS DEBT ON. The revival
 // hold adds `stay` and takes `new rpg` (the leader) or `follow` (a member with
 // a master); when a longer hold is still in force at its end it used to defer
