@@ -16882,6 +16882,7 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
 // character off a taxi would cancel an errand nobody asked to cancel.
 bool CraftDismountsFirst(bool mounted, bool inFlight);
 
+
 // A TRADE OPENED TO A SELFBOT HEAD IS ANSWERED LIKE A PERSON WOULD. mod-playerbots'
 // TradeStatusAction returns at once for a selfbot (a human is assumed at the
 // client), and a family head is a selfbot with a client and no human. On
@@ -17825,6 +17826,18 @@ struct GhostRecoveryVerdict
 // takes it.
 GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
                                          GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
+
+// A GUILD MEMBER THAT MAY NOT USE THE LADDER STILL LEAVES A DEATH LOOP. When the
+// ghost decision answers Ladder (the spirit healer's graveyard failed its safety
+// test) for a caller that does not run the stuck-revival ladder, the old
+// fallback was the corpse run: back to the killer. On wow-dev 2026-10-04 half of
+// 912 guild deaths an hour were repeat deaths at the same corpse
+// (wow-overseer#586). A player who has died twice in one place takes the spirit
+// healer, even at a graveyard that is not perfectly safe, rather than walk back
+// into the same mobs. Below `repeatDeaths` (or with no graveyard known) the
+// corpse run stands.
+GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
+                                 unsigned repeatDeaths);
 
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.

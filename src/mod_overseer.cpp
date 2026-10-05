@@ -28857,7 +28857,15 @@ private:
                      st.healerRefused.empty() ? "" : " refused: ", st.healerRefused);
         }
 
-        switch (verdict.choice)
+        // A CALLER WITHOUT THE LADDER (the natural guilds) does not fall back
+        // to a corpse run after repeat deaths: it takes the spirit healer
+        // (OverseerDecisions::GuildGhostFallback, wow-overseer#586).
+        OverseerDecisions::GhostRecovery choice = verdict.choice;
+        if (choice == OverseerDecisions::GhostRecovery::Ladder && !ladder)
+            choice = OverseerDecisions::GuildGhostFallback(
+                st.deathsHere, st.healerGrave != nullptr, GHOST_RECOVERY_LIMITS.repeatDeaths);
+
+        switch (choice)
         {
             case OverseerDecisions::GhostRecovery::CorpseRun:
                 ReturnCorpseRun(botAI, st);
@@ -28866,11 +28874,6 @@ private:
                 LeaseCorpseRun(bot, botAI, st, false);
                 return true;
             case OverseerDecisions::GhostRecovery::Ladder:
-                if (!ladder)
-                {
-                    ReturnCorpseRun(botAI, st);
-                    return false;
-                }
                 LeaseCorpseRun(bot, botAI, st, false);
                 return false;
             case OverseerDecisions::GhostRecovery::SpiritHealer:
