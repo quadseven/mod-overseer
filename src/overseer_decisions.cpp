@@ -14748,6 +14748,14 @@ GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
     return GhostRecovery::CorpseRun;
 }
 
+GuildDeathSpotStep GuildLeavesDeathSpot(unsigned deathsHere, unsigned repeatDeaths,
+                                        bool hearthReady, bool inCombat)
+{
+    if (repeatDeaths && deathsHere >= repeatDeaths && hearthReady && !inCombat)
+        return GuildDeathSpotStep::Hearth;
+    return GuildDeathSpotStep::Stay;
+}
+
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
                                   uint32_t weGive, uint32_t ourCopper, uint32_t openSeconds)
 {
