@@ -7645,9 +7645,37 @@ private:
             return false;
         bool const attached = ClientAttached(player);
         WorldSession const* session = player->GetSession();
-        return OverseerDecisions::RosterCharacterIsSteerable(
-            attached, player->IsInWorld(), session && session->IsBot(),
-            player->GetName(), RosterRequiresAClient(), HeadlessRosterCache());
+        bool const isBot = session && session->IsBot();
+        if (OverseerDecisions::RosterCharacterIsSteerable(
+                attached, player->IsInWorld(), isBot,
+                player->GetName(), RosterRequiresAClient(), HeadlessRosterCache()))
+            return true;
+        // A FAMILY STAND-IN IS STEERED WHILE IT STANDS IN (2026-10-05). It is
+        // not on the roster, so the gate above refuses it under
+        // Overseer.RequireClient, and the run's census, crossing and finder
+        // would then count a seat nobody may move. See RefreshStandins.
+        return OverseerDecisions::StandinGuestIsSteerable(
+            IsStandinGuest(player->GetName()), attached, player->IsInWorld(), isBot);
+    }
+
+    // THE GUESTS STANDING IN FOR A FAMILY MEMBER RIGHT NOW, as RefreshStandins
+    // last froze them. Read by Steerable, which the teleport hook can reach
+    // from a map thread (DoorShutFor), so it sits behind a lock; written on
+    // the world thread only, once per dungeon poll.
+    static std::mutex& StandinGuestLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+    static std::set<std::string>& StandinGuestNames()
+    {
+        static std::set<std::string> names;
+        return names;
+    }
+    static bool IsStandinGuest(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(StandinGuestLock());
+        return StandinGuestNames().count(name) != 0;
     }
 
     // Log a headless bot out through whichever holder owns it. Mirrors
@@ -7948,9 +7976,16 @@ private:
 
         for (OverseerDecisions::FamilyRoster const& roster : rosters)
         {
+            // A MEMBER SITTING OUT FOR A STAND-IN (2026-10-05) is not grouped,
+            // followed or pulled back: it leaves the family group and is left
+            // to its own job. The guest takes its seat by its own path below.
+            OverseerDecisions::FamilyStandin const* const standin =
+                FrozenStandinFor(roster.leader);
             std::vector<Player*> present;
             for (OverseerDecisions::FamilyMember const& member : roster.members)
             {
+                if (standin && member.name == standin->outName)
+                    continue;
                 // Present means playing: on camera (#131), or headless because
                 // Overseer.HeadlessRoster says this one is played unwatched. A
                 // roster character in the world with NEITHER is on its way out
@@ -7961,7 +7996,15 @@ private:
                 if (Steerable(p))
                     present.push_back(p);
             }
-            KeepFamilyGrouped(present, roster.leader);
+            Player* guest = nullptr;
+            if (standin)
+            {
+                SendSittingOutMemberOff(*standin);
+                Player* const g = ObjectAccessor::FindPlayerByName(standin->inName);
+                if (Steerable(g))
+                    guest = g;
+            }
+            KeepFamilyGrouped(present, roster.leader, guest);
         }
 
         // After every rule of this poll has asked: what the book holds each
@@ -8343,7 +8386,7 @@ private:
     }
 
     void KeepFamilyGrouped(std::vector<Player*> const& present,
-                           std::string const& wantsToLead)
+                           std::string const& wantsToLead, Player* guest = nullptr)
     {
         if (present.size() < 2)
             return;
@@ -8562,9 +8605,18 @@ private:
 
         group->BroadcastGroupUpdate();
 
+        // A STAND-IN GUEST IS SEATED AFTER THE FAMILY, never planned with it:
+        // PlanFamilyGroup may found the party in a member's group when the head
+        // has none, and a guest's group is a guild party of strangers the
+        // family must never be merged into. Seated every party poll, so it is
+        // back in the head's group after each finder-group disband.
+        std::vector<Player*> following = present;
+        if (guest && SeatStandinGuest(group, guest, wantsToLead))
+            following.push_back(guest);
+
         // Runs LAST on purpose: it hands out the leader that the block above
         // has just finished correcting.
-        KeepRosterFollowing(group, present, wantsToLead);
+        KeepRosterFollowing(group, following, wantsToLead);
     }
 
     // ---------------------- one hold, for every verb that has to cast (#335) --
@@ -28263,7 +28315,10 @@ private:
             // bot: a bot session with an AI and no client.
             WorldSession const* session = bot->GetSession();
             PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
-            if (!OverseerDecisions::GuildGhostDriven(OnRoster(name), session && session->IsBot(),
+            // A family stand-in is the family's while it stands in (2026-10-05),
+            // and the family's run, not the guild's drives, directs it.
+            bool const familyDirects = OnRoster(name) || IsStandinGuest(name);
+            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && session->IsBot(),
                                                     ClientAttached(bot) && !(session && session->IsBot()),
                                                     botAI != nullptr))
                 continue;
@@ -28496,7 +28551,10 @@ private:
             std::string const name = bot->GetName();
             WorldSession const* session = bot->GetSession();
             PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
-            if (!OverseerDecisions::GuildGhostDriven(OnRoster(name), session && session->IsBot(),
+            // A family stand-in is the family's while it stands in (2026-10-05),
+            // and the family's run, not the guild's drives, directs it.
+            bool const familyDirects = OnRoster(name) || IsStandinGuest(name);
+            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && session->IsBot(),
                                                     ClientAttached(bot) && !(session && session->IsBot()),
                                                     botAI != nullptr))
                 continue;
@@ -30710,9 +30768,9 @@ private:
         {
             if (FamilyOnADungeonRun(roster->family))
                 continue;
-            std::vector<std::string> members;
-            for (OverseerDecisions::FamilyMember const& member : roster->members)
-                members.push_back(member.name);
+            // Without a member sitting out for a stand-in (2026-10-05): it is
+            // left to its own job, not walked to the family's inn.
+            std::vector<std::string> const members = FamilyMembersAtHome(*roster);
             DriveHomeBindFor(members, roster->leader, jobs);
         }
     }
@@ -35467,6 +35525,8 @@ private:
             OverseerDecisions::FinderMember m;
             m.name = name;
             m.leader = name == leaderName;
+            // A stand-in answers with its seat, not its class (2026-10-05).
+            m.roleMask = StandinRoleMaskFor(leaderName, name);
             Player* const p = ObjectAccessor::FindPlayerByName(name);
             if (p && p->IsInWorld())
             {
@@ -36955,8 +37015,13 @@ private:
                     Player* const p = ObjectAccessor::FindPlayerByName(name);
                     if (!p || !p->GetSession())
                         continue;
+                    // A STAND-IN ANSWERS WITH ITS SEAT (2026-10-05), through the
+                    // same rule the readiness check above counted it by.
+                    OverseerDecisions::FinderMember answer;
+                    answer.classId = p->getClass();
+                    answer.roleMask = StandinRoleMaskFor(leaderName, name);
                     WorldPacket roles(CMSG_LFG_SET_ROLES, 1);
-                    roles << uint8(OverseerDecisions::FinderRoleMask(p->getClass(), false));
+                    roles << uint8(OverseerDecisions::FinderMemberRoleMask(answer));
                     roles.rpos(0);
                     p->GetSession()->HandleLfgSetRolesOpcode(roles);
                 }
@@ -37376,6 +37441,9 @@ private:
                 return refuse("'" + name + "' is not in the world");
             if (OnRoster(name))
                 return refuse("'" + name + "' is a family member, which its own campaign directs");
+            if (IsStandinGuest(name))
+                return refuse("'" + name + "' stands in for a family member, and that family's "
+                              "campaign directs it");
             if (!GET_PLAYERBOT_AI(p))
                 return refuse("'" + name + "' is not a bot");
             OverseerDecisions::GuildFinderKin kin;
@@ -41132,9 +41200,13 @@ private:
 
         for (OverseerDecisions::FamilyRoster const* roster : driven)
         {
-            std::vector<std::string> members;
-            for (OverseerDecisions::FamilyMember const& member : roster->members)
-                members.push_back(member.name);
+            // THE RUN'S PARTY (2026-10-05): a member sitting out for a stand-in
+            // is left to its own job, not walked to the family's vendor, and
+            // the guest IS walked there. The coordinator holds a run for the
+            // bag room of every member of its party (ReadRunBags), and the
+            // trip is what clears it, so the two must read the same party or
+            // a guest with full bags holds the run for a trip never taken.
+            std::vector<std::string> const members = FamilyRunParty(*roster);
             DriveTownTripFor(_townTrips[roster->family], roster->family, members,
                              roster->leader);
         }
@@ -42820,6 +42892,477 @@ private:
         ReturnRaidStayLeases(ghostsWalked);
     }
 
+    // -------------------------------------------- family stand-ins (2026-10-05) --
+    //
+    // THE OPERATOR'S REQUEST: when a family member is busy tailoring, put a
+    // different damage dealer, tank or healer in. The bridge writes one
+    // overseer_family_standin row per family naming who sits out, which guild
+    // member stands in, and in which seat; this module reads it once per
+    // dungeon poll and never writes it.
+    //
+    // WHAT A STAND-IN CHANGES. The run's party (OverseerDecisions::RunParty) is
+    // what DriveDungeonRunFor and DriveTownTripFor are handed as `members`, so
+    // finder readiness, the census, the crossing, the reset, the outcome, the
+    // stamps and the bag-room trip all see the guest. The member sitting out is left out of the family's grouping,
+    // following, town trip and home bind, leaves the family group, and is left
+    // to its own job. The guest is seated in the head's group after the family
+    // is (SeatStandinGuest), and answers the finder's role check with its seat.
+    //
+    // WHEN. Only while the family's coordinator is IDLE or RESETTING, and the
+    // party then frozen holds for the whole run even if the row is deleted
+    // (OverseerDecisions::NextFrozenStandin). In memory, like the coordinator:
+    // a bounce re-reads the row and freezes it again at the first window.
+
+    // head -> the stand-in frozen for that family. Absent means none.
+    std::map<std::string, OverseerDecisions::FamilyStandin> _frozenStandins;
+    // guest -> head, for a guest released from a family and not yet out of its
+    // group (SweepLeavingGuests).
+    std::map<std::string, std::string> _standinLeaving;
+    // What was last said, so each line is said once per change.
+    std::string _standinRefusedSaid;
+    std::map<std::string, std::string> _standinSaid;
+    // guest -> whether it carried `new rpg` when it first stood in.
+    std::map<std::string, bool> _standinGuestHadRpg;
+    int8 _familyStandinTable{-1};
+
+    bool FamilyStandinTablePresent()
+    {
+        if (_familyStandinTable < 0)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_family_standin", "'family','out_name','in_name','seat','reason'", 5);
+            _familyStandinTable = present ? 1 : 0;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_family_standin is missing "
+                         "(2026_10_05_00_overseer_family_standin.sql has not been applied) - "
+                         "no family member sits out for a stand-in, and every family runs "
+                         "with its own roster");
+        }
+        return _familyStandinTable == 1;
+    }
+
+    // Every row, in id order. A seat the module does not know is refused here
+    // and said once, rather than read as damage.
+    std::vector<OverseerDecisions::FamilyStandin> LoadStandinRows()
+    {
+        std::vector<OverseerDecisions::FamilyStandin> rows;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT `family`, out_name, in_name, seat, reason FROM overseer_family_standin "
+            "ORDER BY id");
+        if (!result)
+            return rows;
+        do
+        {
+            Field* f = result->Fetch();
+            OverseerDecisions::FamilyStandin row;
+            row.family = f[0].Get<std::string>();
+            row.outName = f[1].Get<std::string>();
+            row.inName = f[2].Get<std::string>();
+            std::string const seat = f[3].Get<std::string>();
+            row.reason = f[4].Get<std::string>();
+            if (!OverseerDecisions::ParseStandinSeat(seat, row.seat))
+            {
+                std::string& said = _standinSaid["seat:" + row.family];
+                if (said != seat)
+                {
+                    said = seat;
+                    LOG_WARN("module.overseer",
+                             "overseer: family of '{}' - the stand-in row names seat '{}', "
+                             "which is not tank, healer or dps, so it is not applied",
+                             row.family, seat);
+                }
+                continue;
+            }
+            rows.push_back(row);
+        } while (result->NextRow());
+        return rows;
+    }
+
+    OverseerDecisions::FamilyStandin const* FrozenStandinFor(std::string const& head) const
+    {
+        if (head.empty())
+            return nullptr;
+        auto const it = _frozenStandins.find(head);
+        return it == _frozenStandins.end() || !it->second.Active() ? nullptr : &it->second;
+    }
+
+    // The family as the home bind drives it: the roster without the member
+    // sitting out. The guest is not added: a stand-in is a guest for a few
+    // runs, and its hearth stays where its own guild life put it.
+    std::vector<std::string> FamilyMembersAtHome(OverseerDecisions::FamilyRoster const& roster) const
+    {
+        OverseerDecisions::FamilyStandin const* const standin = FrozenStandinFor(roster.leader);
+        std::vector<std::string> members;
+        for (OverseerDecisions::FamilyMember const& member : roster.members)
+            if (!standin || member.name != standin->outName)
+                members.push_back(member.name);
+        return members;
+    }
+
+    // The family as its dungeon run drives it: the roster with the guest in
+    // the out member's place (OverseerDecisions::RunParty).
+    std::vector<std::string> FamilyRunParty(OverseerDecisions::FamilyRoster const& roster) const
+    {
+        std::vector<std::string> members;
+        for (OverseerDecisions::FamilyMember const& member : roster.members)
+            members.push_back(member.name);
+        return OverseerDecisions::RunParty(members, roster.leader,
+                                           FrozenStandinFor(roster.leader));
+    }
+
+    // The finder role bits `name` answers with when it stands in for the
+    // family `head` leads, or zero for every role its class could fill.
+    uint8 StandinRoleMaskFor(std::string const& head, std::string const& name) const
+    {
+        OverseerDecisions::FamilyStandin const* const standin = FrozenStandinFor(head);
+        if (!standin || standin->inName != name)
+            return 0;
+        return OverseerDecisions::StandinSeatRoleMask(standin->seat);
+    }
+
+    static OverseerDecisions::StandinWindow StandinWindowOf(DungeonRunPhase phase)
+    {
+        switch (phase)
+        {
+            case DungeonRunPhase::Idle:      return OverseerDecisions::StandinWindow::Idle;
+            case DungeonRunPhase::Resetting: return OverseerDecisions::StandinWindow::Resetting;
+            default:                         return OverseerDecisions::StandinWindow::Running;
+        }
+    }
+
+    // THE MEMBER SITTING OUT LEAVES THE FAMILY GROUP, the way a player types
+    // /leave, and stops following the head. A battleground, battlefield or
+    // finder group is the core's and is left alone, as KeepFamilyGrouped
+    // leaves it. Asked every party poll while the stand-in holds, so a member
+    // who is put back in by anything else is sent off again.
+    void SendSittingOutMemberOff(OverseerDecisions::FamilyStandin const& standin)
+    {
+        Player* const out = ObjectAccessor::FindPlayerByName(standin.outName);
+        Player* const head = ObjectAccessor::FindPlayerByName(standin.family);
+        if (!out || !out->IsInWorld())
+            return;
+        if (PlayerbotAI* const outAI = GET_PLAYERBOT_AI(out))
+            if (head && outAI->GetMaster() == head)
+            {
+                outAI->SetMaster(nullptr);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' sits out of the family of '{}' and no longer "
+                         "follows him", standin.outName, standin.family);
+            }
+        Group* const group = out->GetGroup();
+        if (!group || !head || head->GetGroup() != group || group->isBGGroup() ||
+            group->isBFGroup() || group->isLFGGroup())
+            return;
+        out->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+        if (out->GetGroup())
+            return;   // the core refused; asked again next poll
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' left the family group of '{}' to sit out ({}); '{}' stands "
+                 "in as {}",
+                 standin.outName, standin.family,
+                 standin.reason.empty() ? std::string("no reason given") : standin.reason,
+                 standin.inName, OverseerDecisions::StandinSeatWord(standin.seat));
+    }
+
+    // SEAT THE GUEST IN THE HEAD'S GROUP, modelled on PrepareRitualSummoner:
+    // a guest already in it is left there, a guest in another group leaves it
+    // first (AddMember on a grouped player leaves two groups both holding
+    // him), a group the core owns is never touched, and a full party is not
+    // forced: the member sitting out is sent off first, which is what makes
+    // the room. True when the guest is in the head's group afterwards.
+    bool SeatStandinGuest(Group* group, Player* guest, std::string const& head)
+    {
+        if (!group || !guest || head.empty())
+            return false;
+        Player* const headPlayer = ObjectAccessor::FindPlayerByName(head);
+        if (!headPlayer || headPlayer->GetGroup() != group)
+            return false;
+        std::string const name = guest->GetName();
+        // WHETHER IT WANDERED ON ITS OWN BEFORE IT STOOD IN, read before the
+        // family's following takes `new rpg` off it as off any follower, so
+        // the release can hand it back (SweepLeavingGuests).
+        if (!_standinGuestHadRpg.count(name))
+            if (PlayerbotAI* const guestAI = GET_PLAYERBOT_AI(guest))
+                _standinGuestHadRpg[name] = guestAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+        if (guest->GetGroup() == group)
+            return true;
+        auto say = [this, &name](std::string const& why) {
+            std::string& said = _standinSaid["seat-guest:" + name];
+            if (said == why)
+                return;
+            said = why;
+            LOG_WARN("module.overseer", "overseer: stand-in '{}' is not seated yet - {}",
+                     name, why);
+        };
+        if (group->isRaidGroup() || group->isBGGroup() || group->isBFGroup() ||
+            group->isLFGGroup())
+        {
+            say("the head's group is a raid or a group the core owns");
+            return false;
+        }
+        if (Group* const other = guest->GetGroup())
+        {
+            if (other->isBGGroup() || other->isBFGroup() || other->isLFGGroup())
+            {
+                say("it is in a battleground, battlefield or dungeon-finder group");
+                return false;
+            }
+            std::string const otherLeader = other->GetLeaderName();
+            guest->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+            if (guest->GetGroup())
+            {
+                say("it did not leave the group led by '" + otherLeader + "'");
+                return false;
+            }
+        }
+        if (group->IsFull())
+        {
+            say("the head's party is full");
+            return false;
+        }
+        if (!group->AddMember(guest))
+        {
+            say("the core refused to add it to the head's party");
+            return false;
+        }
+        _standinSaid.erase("seat-guest:" + name);
+        group->SendUpdate();
+        LOG_INFO("module.overseer",
+                 "overseer: stand-in '{}' joined the family party of '{}'", name, head);
+        return true;
+    }
+
+    // A RELEASED GUEST LEAVES THE FAMILY GROUP, modelled on
+    // RestoreRitualSummoner: only the head's own group is left, and only while
+    // the guest is still in it. A group the core owns is waited out rather
+    // than left, so the entry stays until the guest can leave or has gone.
+    // The member who sat out is grouped again by KeepFamilyGrouped.
+    void SweepLeavingGuests()
+    {
+        for (auto it = _standinLeaving.begin(); it != _standinLeaving.end();)
+        {
+            std::string const guestName = it->first;
+            std::string const head = it->second;
+            if (IsStandinGuest(guestName))
+            {
+                it = _standinLeaving.erase(it);   // standing in again
+                continue;
+            }
+            Player* const guest = ObjectAccessor::FindPlayerByName(guestName);
+            Player* const headPlayer = ObjectAccessor::FindPlayerByName(head);
+            Group* const group = headPlayer ? headPlayer->GetGroup() : nullptr;
+            if (!guest)
+            {
+                ++it;   // out of the world; its seat is let go when it is back
+                continue;
+            }
+            PlayerbotAI* const guestAI = GET_PLAYERBOT_AI(guest);
+            if (guestAI && headPlayer && guestAI->GetMaster() == headPlayer)
+                guestAI->SetMaster(nullptr);
+            // The wander the family's following took off it, handed back.
+            auto const hadRpg = _standinGuestHadRpg.find(guestName);
+            if (hadRpg != _standinGuestHadRpg.end())
+            {
+                if (hadRpg->second && guestAI &&
+                    !guestAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    guestAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+                _standinGuestHadRpg.erase(hadRpg);
+            }
+            if (!group || guest->GetGroup() != group)
+            {
+                it = _standinLeaving.erase(it);
+                continue;
+            }
+            if (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup())
+            {
+                ++it;
+                continue;
+            }
+            guest->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+            if (guest->GetGroup() == group)
+            {
+                ++it;   // the core refused; asked again next poll
+                continue;
+            }
+            group->SendUpdate();
+            LOG_INFO("module.overseer",
+                     "overseer: stand-in '{}' left the family party of '{}' - the stand-in "
+                     "is over", guestName, head);
+            it = _standinLeaving.erase(it);
+        }
+    }
+
+    void ReleaseStandinGuest(OverseerDecisions::FamilyStandin const& standin)
+    {
+        _standinLeaving[standin.inName] = standin.family;
+    }
+
+    // ONCE PER DUNGEON POLL: read the table, freeze or release each driven
+    // family's stand-in by its coordinator's phase, and republish the guests.
+    void RefreshStandins(std::vector<OverseerDecisions::FamilyRoster> const& rosters,
+                         std::vector<OverseerDecisions::FamilyRoster const*> const& driven)
+    {
+        std::vector<OverseerDecisions::FamilyStandin> rows;
+        if (FamilyStandinTablePresent())
+            rows = LoadStandinRows();
+        OverseerDecisions::StandinBook const book = OverseerDecisions::ChooseStandins(rows, rosters);
+
+        std::string refused;
+        for (OverseerDecisions::StandinRefused const& r : book.refused)
+            refused += r.row.family + "|" + r.row.outName + "|" + r.row.inName + "|" +
+                       OverseerDecisions::StandinRefusalWord(r.why) + ";";
+        if (refused != _standinRefusedSaid)
+        {
+            _standinRefusedSaid = refused;
+            for (OverseerDecisions::StandinRefused const& r : book.refused)
+                LOG_WARN("module.overseer",
+                         "overseer: stand-in row for family of '{}' ('{}' out, '{}' in) is "
+                         "not applied - {}",
+                         r.row.family, r.row.outName, r.row.inName,
+                         OverseerDecisions::StandinRefusalWord(r.why));
+        }
+
+        std::set<std::string> heads;
+        for (OverseerDecisions::FamilyRoster const* roster : driven)
+        {
+            if (roster->leader.empty())
+                continue;
+            std::string const& head = roster->leader;
+            heads.insert(head);
+            auto const coord = _dungeonRunCoordinators.find(roster->family);
+            OverseerDecisions::StandinWindow const window =
+                coord == _dungeonRunCoordinators.end()
+                    ? OverseerDecisions::StandinWindow::Idle
+                    : StandinWindowOf(coord->second.phase);
+            OverseerDecisions::FamilyStandin const none;
+            auto const wantedIt = book.byHead.find(head);
+            OverseerDecisions::FamilyStandin const& wanted =
+                wantedIt == book.byHead.end() ? none : wantedIt->second;
+            Player* const guest =
+                wanted.Active() ? ObjectAccessor::FindPlayerByName(wanted.inName) : nullptr;
+            OverseerDecisions::FamilyStandin const frozen =
+                _frozenStandins.count(head) ? _frozenStandins[head] : none;
+            OverseerDecisions::StandinStep const step = OverseerDecisions::NextFrozenStandin(
+                window, frozen, wanted, guest && guest->IsInWorld());
+
+            std::string const rowSig =
+                wanted.Active() ? wanted.outName + ">" + wanted.inName : std::string("none");
+            switch (step.move)
+            {
+                case OverseerDecisions::StandinMove::Apply:
+                case OverseerDecisions::StandinMove::Swap:
+                {
+                    if (step.move == OverseerDecisions::StandinMove::Swap)
+                    {
+                        LOG_INFO("module.overseer",
+                                 "overseer: family of '{}' - the stand-in changes between "
+                                 "runs: '{}' stands down for '{}', who is grouped with the "
+                                 "family again",
+                                 head, frozen.inName, frozen.outName);
+                        ReleaseStandinGuest(frozen);
+                    }
+                    std::vector<std::string> names;
+                    for (OverseerDecisions::FamilyMember const& member : roster->members)
+                        names.push_back(member.name);
+                    LOG_INFO("module.overseer",
+                             "overseer: family of '{}' - '{}' sits out ({}) and guild member "
+                             "'{}' stands in as {}. The run's party is {}, frozen for each "
+                             "run until the row is gone and the coordinator is between runs",
+                             head, step.frozen.outName,
+                             step.frozen.reason.empty() ? std::string("no reason given")
+                                                        : step.frozen.reason,
+                             step.frozen.inName,
+                             OverseerDecisions::StandinSeatWord(step.frozen.seat),
+                             JoinNames(OverseerDecisions::RunParty(names, head, &step.frozen)));
+                    _standinLeaving.erase(step.frozen.inName);
+                    _standinSaid.erase("hold:" + head);
+                    _standinSaid.erase("wait:" + head);
+                    break;
+                }
+                case OverseerDecisions::StandinMove::Release:
+                    LOG_INFO("module.overseer",
+                             "overseer: family of '{}' - the stand-in is over: '{}' stands "
+                             "down and leaves the family group, and '{}' (who sat out for: {}) "
+                             "is grouped with the family again",
+                             head, frozen.inName, frozen.outName,
+                             frozen.reason.empty() ? std::string("no reason given")
+                                                   : frozen.reason);
+                    ReleaseStandinGuest(frozen);
+                    _standinSaid.erase("hold:" + head);
+                    _standinSaid.erase("wait:" + head);
+                    break;
+                case OverseerDecisions::StandinMove::WaitForGuest:
+                {
+                    std::string& said = _standinSaid["wait:" + head];
+                    if (said != rowSig)
+                    {
+                        said = rowSig;
+                        LOG_WARN("module.overseer",
+                                 "overseer: family of '{}' - stand-in '{}' for '{}' is not in "
+                                 "the world, so the family keeps its party until it is",
+                                 head, wanted.inName, wanted.outName);
+                    }
+                    break;
+                }
+                case OverseerDecisions::StandinMove::Keep:
+                {
+                    // A ROW THAT DIFFERS FROM THE FROZEN PARTY MID-RUN is said
+                    // once: the run ends with the party it began with.
+                    bool const differs = frozen.Active() ? !wanted.SameSwap(frozen)
+                                                         : wanted.Active();
+                    std::string& said = _standinSaid["hold:" + head];
+                    if (!differs)
+                        said.clear();
+                    else if (said != rowSig)
+                    {
+                        said = rowSig;
+                        LOG_INFO("module.overseer",
+                                 "overseer: family of '{}' - the stand-in row now reads {}, "
+                                 "but a run is under way; the party frozen when it opened "
+                                 "({}) holds until it ends",
+                                 head, rowSig,
+                                 frozen.Active() ? frozen.outName + " out, " + frozen.inName +
+                                                       " in"
+                                                 : std::string("the whole family"));
+                    }
+                    break;
+                }
+            }
+            if (step.frozen.Active())
+                _frozenStandins[head] = step.frozen;
+            else
+                _frozenStandins.erase(head);
+            if (step.move == OverseerDecisions::StandinMove::Apply ||
+                step.move == OverseerDecisions::StandinMove::Swap)
+                SendSittingOutMemberOff(step.frozen);
+        }
+
+        // A FAMILY NO LONGER DRIVEN lets its guest go, as its coordinator is.
+        for (auto it = _frozenStandins.begin(); it != _frozenStandins.end();)
+        {
+            if (heads.count(it->first))
+            {
+                ++it;
+                continue;
+            }
+            LOG_INFO("module.overseer",
+                     "overseer: family of '{}' is no longer on the roster with a leader, so "
+                     "stand-in '{}' stands down and '{}' no longer sits out",
+                     it->first, it->second.inName, it->second.outName);
+            ReleaseStandinGuest(it->second);
+            it = _frozenStandins.erase(it);
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(StandinGuestLock());
+            StandinGuestNames().clear();
+            for (auto const& entry : _frozenStandins)
+                StandinGuestNames().insert(entry.second.inName);
+        }
+        SweepLeavingGuests();
+    }
+
     void DriveDungeonRun()
     {
         // WHAT RELEASES A STAGING HOLD, AND IT IS THE PHASE RATHER THAN A LIST
@@ -42938,16 +43481,21 @@ private:
             it = _dungeonRunCoordinators.erase(it);
         }
 
+        // THE STAND-INS, read once per poll and frozen by each coordinator's
+        // phase BEFORE any family is driven, so the party a run opens with
+        // this poll is the party it keeps.
+        RefreshStandins(rosters, driven);
+
         for (OverseerDecisions::FamilyRoster const* roster : driven)
         {
-            std::vector<std::string> members;
-            for (OverseerDecisions::FamilyMember const& member : roster->members)
-                members.push_back(member.name);
+            // THE RUN'S PARTY, not the roster: a member sitting out is not
+            // counted, staged, crossed or judged, and its guest is.
+            std::vector<std::string> const members = FamilyRunParty(*roster);
             DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
             bool familyMemberInsideInstance = false;
-            for (OverseerDecisions::FamilyMember const& member : roster->members)
+            for (std::string const& memberName : members)
             {
-                Player* bot = ObjectAccessor::FindPlayerByName(member.name);
+                Player* bot = ObjectAccessor::FindPlayerByName(memberName);
                 if (bot && bot->GetMap() && bot->GetMap()->Instanceable())
                 {
                     familyMemberInsideInstance = true;

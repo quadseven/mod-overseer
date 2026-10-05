@@ -16648,6 +16648,11 @@ std::uint8_t FinderRoleMask(unsigned classId, bool leader)
     return mask;
 }
 
+std::uint8_t FinderMemberRoleMask(FinderMember const& member)
+{
+    return member.roleMask ? member.roleMask : FinderRoleMask(member.classId, member.leader);
+}
+
 char const* FinderLockWord(std::uint32_t lock)
 {
     switch (lock)
@@ -16753,7 +16758,7 @@ FinderReadiness ReadFinderReadiness(FinderFacts const& facts, bool now)
         return no(why);
     std::vector<std::uint8_t> masks;
     for (FinderMember const& m : facts.family)
-        masks.push_back(FinderRoleMask(m.classId, m.leader));
+        masks.push_back(FinderMemberRoleMask(m));
     if (!FinderRolesFit(masks))
         return no("the family's classes cannot make the one tank, one healer and three damage "
                   "the dungeon finder insists on");
@@ -18591,6 +18596,194 @@ TownRetry BattlegroundQueueRetry(std::string const& detail)
         if (detail == literal)
             return TownRetry::Never;
     return TownRetry::Later;
+}
+
+// ---------------------------------------------------------------- stand-ins --
+
+bool ParseStandinSeat(std::string const& word, StandinSeat& seat)
+{
+    if (word == "tank")
+        seat = StandinSeat::Tank;
+    else if (word == "healer")
+        seat = StandinSeat::Healer;
+    else if (word == "dps")
+        seat = StandinSeat::Damage;
+    else
+        return false;
+    return true;
+}
+
+char const* StandinSeatWord(StandinSeat seat)
+{
+    switch (seat)
+    {
+        case StandinSeat::Tank:   return "tank";
+        case StandinSeat::Healer: return "healer";
+        case StandinSeat::Damage: return "dps";
+    }
+    return "dps";
+}
+
+std::uint8_t StandinSeatRoleMask(StandinSeat seat)
+{
+    switch (seat)
+    {
+        case StandinSeat::Tank:   return FINDER_ROLE_TANK;
+        case StandinSeat::Healer: return FINDER_ROLE_HEALER;
+        case StandinSeat::Damage: return FINDER_ROLE_DAMAGE;
+    }
+    return FINDER_ROLE_DAMAGE;
+}
+
+bool FamilyStandin::SameSwap(FamilyStandin const& other) const
+{
+    return family == other.family && outName == other.outName && inName == other.inName &&
+           seat == other.seat;
+}
+
+char const* StandinRefusalWord(StandinRefusal refusal)
+{
+    switch (refusal)
+    {
+        case StandinRefusal::None:            return "legal";
+        case StandinRefusal::Incomplete:      return "a name is empty";
+        case StandinRefusal::NoSuchFamily:    return "no family on the roster has that head";
+        case StandinRefusal::SwapsTheHead:    return "the head never sits out";
+        case StandinRefusal::OutNotInFamily:  return "the member sitting out is not in that family";
+        case StandinRefusal::GuestOnRoster:   return "the guest is a roster character, whose own "
+                                                     "family directs it";
+        case StandinRefusal::GuestIsOut:      return "the guest and the member sitting out are "
+                                                     "the same character";
+        case StandinRefusal::SecondForFamily: return "the family already has a stand-in";
+        case StandinRefusal::GuestTaken:      return "the guest already stands in for another "
+                                                     "family";
+    }
+    return "unknown";
+}
+
+StandinRefusal CheckStandin(std::vector<std::string> const& members, std::string const& leader,
+                            FamilyStandin const& standin,
+                            std::vector<std::string> const& wholeRoster)
+{
+    auto has = [](std::vector<std::string> const& names, std::string const& name) {
+        return std::find(names.begin(), names.end(), name) != names.end();
+    };
+    if (standin.family.empty() || standin.outName.empty() || standin.inName.empty())
+        return StandinRefusal::Incomplete;
+    if (leader.empty() || standin.family != leader)
+        return StandinRefusal::NoSuchFamily;
+    if (standin.outName == leader)
+        return StandinRefusal::SwapsTheHead;
+    if (standin.inName == standin.outName)
+        return StandinRefusal::GuestIsOut;
+    if (!has(members, standin.outName))
+        return StandinRefusal::OutNotInFamily;
+    if (has(members, standin.inName) || has(wholeRoster, standin.inName))
+        return StandinRefusal::GuestOnRoster;
+    return StandinRefusal::None;
+}
+
+std::vector<std::string> RunParty(std::vector<std::string> const& members,
+                                  std::string const& leader, FamilyStandin const* standin)
+{
+    if (!standin || !standin->Active() ||
+        CheckStandin(members, leader, *standin, members) != StandinRefusal::None)
+        return members;
+    std::vector<std::string> party;
+    party.reserve(members.size());
+    for (std::string const& name : members)
+        party.push_back(name == standin->outName ? standin->inName : name);
+    return party;
+}
+
+StandinBook ChooseStandins(std::vector<FamilyStandin> const& rows,
+                           std::vector<FamilyRoster> const& rosters)
+{
+    StandinBook book;
+    std::vector<std::string> wholeRoster;
+    for (FamilyRoster const& roster : rosters)
+        for (FamilyMember const& member : roster.members)
+            wholeRoster.push_back(member.name);
+    std::vector<std::string> guests;
+    for (FamilyStandin const& row : rows)
+    {
+        FamilyRoster const* family = nullptr;
+        for (FamilyRoster const& roster : rosters)
+            if (!roster.leader.empty() && roster.leader == row.family)
+                family = &roster;
+        StandinRefusal why = StandinRefusal::NoSuchFamily;
+        if (row.family.empty() || row.outName.empty() || row.inName.empty())
+            why = StandinRefusal::Incomplete;
+        else if (family)
+        {
+            std::vector<std::string> members;
+            for (FamilyMember const& member : family->members)
+                members.push_back(member.name);
+            why = CheckStandin(members, family->leader, row, wholeRoster);
+        }
+        if (why == StandinRefusal::None && book.byHead.count(row.family))
+            why = StandinRefusal::SecondForFamily;
+        if (why == StandinRefusal::None &&
+            std::find(guests.begin(), guests.end(), row.inName) != guests.end())
+            why = StandinRefusal::GuestTaken;
+        if (why != StandinRefusal::None)
+        {
+            book.refused.push_back(StandinRefused{row, why});
+            continue;
+        }
+        book.byHead[row.family] = row;
+        guests.push_back(row.inName);
+    }
+    return book;
+}
+
+char const* StandinMoveWord(StandinMove move)
+{
+    switch (move)
+    {
+        case StandinMove::Keep:         return "keep";
+        case StandinMove::Apply:        return "apply";
+        case StandinMove::Swap:         return "swap";
+        case StandinMove::Release:      return "release";
+        case StandinMove::WaitForGuest: return "wait-for-guest";
+    }
+    return "keep";
+}
+
+StandinStep NextFrozenStandin(StandinWindow window, FamilyStandin const& frozen,
+                              FamilyStandin const& row, bool guestInWorld)
+{
+    StandinStep step;
+    step.frozen = frozen;
+    if (window == StandinWindow::Running)
+        return step;
+    if (!row.Active())
+    {
+        if (frozen.Active())
+        {
+            step.move = StandinMove::Release;
+            step.frozen = FamilyStandin();
+        }
+        return step;
+    }
+    if (frozen.Active() && frozen.SameSwap(row))
+        return step;
+    if (!guestInWorld)
+    {
+        step.move = StandinMove::WaitForGuest;
+        return step;
+    }
+    step.move = frozen.Active() ? StandinMove::Swap : StandinMove::Apply;
+    step.frozen = row;
+    return step;
+}
+
+bool StandinGuestIsSteerable(bool registeredGuest, bool clientAttached, bool inWorld,
+                             bool isBotSession)
+{
+    if (!registeredGuest)
+        return false;
+    return clientAttached || (inWorld && isBotSession);
 }
 
 }  // namespace OverseerDecisions
