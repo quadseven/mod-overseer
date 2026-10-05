@@ -5525,7 +5525,8 @@ BuyRequest ParseBuyRequest(std::string const& command)
 
     if (words.empty())
     {
-        request.error = "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]";
+        request.error =
+            "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>][ honor:<points>]";
         return request;
     }
 
@@ -5538,8 +5539,10 @@ BuyRequest ParseBuyRequest(std::string const& command)
 
     bool haveCount = false;
     bool haveMax = false;
+    bool haveHonor = false;
     uint32_t count = 1;
     uint32_t maxCopper = 0;
+    uint32_t maxHonor = 0;
 
     for (size_t i = 1; i < words.size(); ++i)
     {
@@ -5567,7 +5570,18 @@ BuyRequest ParseBuyRequest(std::string const& command)
             maxCopper = value;
             continue;
         }
-        request.error = "malformed buy: unknown word (want count:<n> or max:<copper>)";
+        if (TownKeyed(words[i], "honor", value))
+        {
+            if (haveHonor)
+            {
+                request.error = "malformed buy: honor given twice";
+                return request;
+            }
+            haveHonor = true;
+            maxHonor = value;
+            continue;
+        }
+        request.error = "malformed buy: unknown word (want count:<n>, max:<copper> or honor:<points>)";
         return request;
     }
 
@@ -5576,6 +5590,8 @@ BuyRequest ParseBuyRequest(std::string const& command)
     request.count = count;
     request.capped = haveMax;
     request.maxCopper = maxCopper;
+    request.honorCapped = haveHonor;
+    request.maxHonor = maxHonor;
     return request;
 }
 
@@ -5622,17 +5638,21 @@ int ChooseBuyVendor(std::vector<BuyVendorCandidate> const& candidates)
 TownRetry BuyRefusalRetry(std::string const& detail)
 {
     static char const* const NEVER[] = {
-        "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>]",
+        "malformed buy: want entry:<item_template.entry>[ count:<n>][ max:<copper>][ honor:<points>]",
         "malformed buy: first word must be entry:<item_template.entry>, not 0",
         "malformed buy: count must be 1 or more",
         "malformed buy: count given twice",
         "malformed buy: max given twice",
-        "malformed buy: unknown word (want count:<n> or max:<copper>)",
+        "malformed buy: honor given twice",
+        "malformed buy: unknown word (want count:<n>, max:<copper> or honor:<points>)",
         "malformed buy request",
         "no such item",
         "item is not for this class",
         "item is for the other faction",
         "item is not bought with gold",
+        "item costs more than honor",
+        "item is bought with honor and the row set no honor cap",
+        "honor price exceeds the cap the row set",
         "price exceeds the cap the row set",
         "count exceeds what the packet carries",
         "count would overflow the purse",
@@ -5649,6 +5669,23 @@ TownRetry BuyRefusalRetry(std::string const& detail)
         if (detail == literal)
             return TownRetry::Elsewhere;
     return TownRetry::Later;
+}
+
+char const* ExtendedCostRefusal(ExtendedCostShape const& cost, BuyRequest const& request,
+                                uint32_t honorHeld)
+{
+    if (cost.arena > 0 || cost.tokens || cost.arenaRating > 0)
+        return "item costs more than honor";
+    if (cost.honor == 0)
+        return nullptr;
+    if (!request.honorCapped)
+        return "item is bought with honor and the row set no honor cap";
+    uint64_t const whole = uint64_t(cost.honor) * uint64_t(request.count);
+    if (whole > uint64_t(request.maxHonor))
+        return "honor price exceeds the cap the row set";
+    if (whole > uint64_t(honorHeld))
+        return "not enough honor";
+    return nullptr;
 }
 
 char const* DeathDriverName(DeathDriver driver)
@@ -17988,6 +18025,91 @@ std::string AuctionHistoryInsertSql(AuctionHistoryRow const& row)
            AuctionOutcomeWord(row.outcome) + "', " + std::to_string(row.sellerGuid) + ", '" +
            AuctionPartyWord(row.sellerKind) + "', " + std::to_string(row.buyerGuid) + ", '" +
            AuctionPartyWord(row.buyerKind) + "')";
+}
+
+namespace
+{
+constexpr char const* BG_QUEUE_VERB = "bg-queue";
+}  // namespace
+
+bool IsBattlegroundQueueRow(std::string const& command)
+{
+    std::vector<std::string> const words = TownWords(command);
+    return !words.empty() && words[0] == BG_QUEUE_VERB;
+}
+
+BattlegroundQueueRequest ParseBattlegroundQueueRequest(std::string const& command)
+{
+    BattlegroundQueueRequest out;
+    std::vector<std::string> const words = TownWords(command);
+    if (words.empty() || words[0] != BG_QUEUE_VERB)
+    {
+        out.error = "malformed bg-queue: want bg-queue <av|wsg|ab>";
+        return out;
+    }
+    if (words.size() != 2)
+    {
+        out.error = "malformed bg-queue: want exactly one battleground (av, wsg or ab)";
+        return out;
+    }
+    static struct
+    {
+        char const* key;
+        uint32_t type;
+    } const KNOWN[] = {{"av", 1}, {"wsg", 2}, {"ab", 3}};
+    for (auto const& known : KNOWN)
+    {
+        if (words[1] == known.key)
+        {
+            out.valid = true;
+            out.key = known.key;
+            out.bgTypeId = known.type;
+            return out;
+        }
+    }
+    out.error = "malformed bg-queue: unknown battleground (want av, wsg or ab)";
+    return out;
+}
+
+char const* BattlegroundQueueAlready(BattlegroundQueueFacts const& facts)
+{
+    if (facts.inBattleground)
+        return "already in a battleground";
+    if (facts.queuedForThis)
+        return "already in this battleground's queue";
+    return nullptr;
+}
+
+char const* BattlegroundQueueRefusal(BattlegroundQueueFacts const& facts)
+{
+    if (!facts.bracketFits)
+        return "no bracket of that battleground holds this level";
+    if (!facts.freeQueueSlot)
+        return "no free battleground queue slot";
+    if (facts.groupFollower)
+        return "a group member is queued by its leader";
+    if (facts.inDungeonFinder)
+        return "in the dungeon finder";
+    if (facts.deserter)
+        return "deserter";
+    if (!facts.levelAllowed)
+        return "level is not allowed into that battleground";
+    return nullptr;
+}
+
+TownRetry BattlegroundQueueRetry(std::string const& detail)
+{
+    static char const* const NEVER[] = {
+        "malformed bg-queue request",
+        "no such battleground",
+        "no bracket of that battleground holds this level",
+        "level is not allowed into that battleground",
+        "a group member is queued by its leader",
+    };
+    for (char const* literal : NEVER)
+        if (detail == literal)
+            return TownRetry::Never;
+    return TownRetry::Later;
 }
 
 }  // namespace OverseerDecisions
