@@ -16,6 +16,7 @@
 #include <cstdio>
 
 using OverseerDecisions::FinderGroupStillServes;
+using OverseerDecisions::LeftoverFinderGroupKept;
 using OverseerDecisions::FinderState;
 
 namespace
@@ -53,10 +54,26 @@ void TheFinderKeepsWhatItIsUsing()
 
 }  // namespace
 
+void AFinishedRunsGroupWithTheHeadIsLetGo()
+{
+    // Grug's family, Gnomeregan's finder group, the campaign done, nobody in.
+    Check("the head's finished-run group goes once the family's run is over",
+          !LeftoverFinderGroupKept(FinderState::Other, false, true, false));
+    Check("the head's group stays while the family's run is open",
+          LeftoverFinderGroupKept(FinderState::Other, false, true, true));
+    Check("a member inside keeps the head's group whatever the run says",
+          LeftoverFinderGroupKept(FinderState::Dungeon, true, true, false));
+    Check("a queue keeps the head's group",
+          LeftoverFinderGroupKept(FinderState::Queued, false, true, false));
+    Check("without the head, a leftover goes as before",
+          !LeftoverFinderGroupKept(FinderState::None, false, false, true));
+}
+
 int main()
 {
     ALeftoverIsLetGo();
     TheFinderKeepsWhatItIsUsing();
+    AFinishedRunsGroupWithTheHeadIsLetGo();
     if (failures)
         return 1;
     std::printf("ok test_finder_group_leftover\n");

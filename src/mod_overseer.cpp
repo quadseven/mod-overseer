@@ -8321,18 +8321,20 @@ private:
                     (member->GetMap() && member->GetMap()->IsDungeon()))
                     inside = true;
             }
-            if (headInIt || family.empty())
+            if (family.empty())
                 continue;
             OverseerDecisions::FinderState const state =
                 FinderStateOf(sLFGMgr->GetState(group->GetGUID()));
-            if (OverseerDecisions::FinderGroupStillServes(state, inside))
+            if (OverseerDecisions::LeftoverFinderGroupKept(state, inside, headInIt,
+                                                          FamilyOnADungeonRun(family)))
                 continue;
             LOG_WARN("module.overseer",
                      "overseer: family of '{}' - '{}' is in a dungeon finder group led by '{}' "
-                     "that nobody is inside and the finder is not matching (state {}). It is "
+                     "that nobody is inside and the finder is not matching (state {}){}. It is "
                      "disbanded so the family's own party forms again under its head",
                      family, p->GetName(), group->GetLeaderName(),
-                     static_cast<unsigned>(state));
+                     static_cast<unsigned>(state),
+                     headInIt ? ", and the family's run is over with its head still in it" : "");
             group->Disband();
             return true;
         }
