@@ -7323,7 +7323,8 @@ RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& fact
     // AN INN OR A CITY IS NEVER LETHAL GROUND. Measured: Zug, resting in the
     // Valley of Strength, read a level 80 spawn within 30 yards and hearthed
     // thirty feet to Orgrimmar's inn.
-    bool const lethal = facts.groundTopLevel >= facts.memberLevel + facts.levelGap;
+    bool const lethal = facts.groundTopLevel >= facts.memberLevel + facts.levelGap
+                        || (facts.repeatDeaths && facts.deathsHere >= facts.repeatDeaths);
     // A guild member rests its sickness out on any ground that is not lethal,
     // an inn or a city included. Lethal ground falls through to the family's
     // rule below: hearth when the stone is ready, else hold out of combat.

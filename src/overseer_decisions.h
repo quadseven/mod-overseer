@@ -18222,6 +18222,14 @@ struct RevivedSickGroundFacts
     // A natural guild member rests out its sickness wherever it stands: at
     // item level 2 to 5 it cannot afford to fight at a quarter of its stats.
     bool restWhileSick{false};
+    // ITS OWN DEATHS HERE MAKE THE GROUND LETHAL TOO. On wow-dev 2026-10-05
+    // Zrog (27) died 21 times in 10 minutes at the Hillsbrad Fields spirit
+    // healer to Hillsbrad Footmen (26): never three levels above it, so the
+    // ground read safe and it stayed to die again. `deathsHere` counts its
+    // deaths within the ghost repeat radius and window; at `repeatDeaths`
+    // (the ghost recovery's own death loop count) the ground is lethal.
+    unsigned deathsHere{0};
+    unsigned repeatDeaths{0};
 };
 RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& facts);
 
