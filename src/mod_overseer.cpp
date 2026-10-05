@@ -627,6 +627,24 @@ constexpr time_t TERRAIN_LAST_GROUND_MAX_AGE_SECONDS = 900;
 // prove the first did not stick.
 constexpr unsigned TERRAIN_PLANE_MAX_RETURNS = 2;
 
+// HOW FAR DOWN THE FLOOR MUST BE BEFORE A CHARACTER IN THE AIR BESIDE A BOAT
+// OR A ZEPPELIN IS SET DOWN ONTO IT (OverseerDecisions::OffADeckInTheAir).
+// DERIVED, NOT PICKED: the core's own fall arithmetic (Player::HandleFall,
+// mirrored as FALL_DAMAGE_SLOPE and FALL_DAMAGE_INTERCEPT) reaches the whole
+// of max health at 69.0 yards, so this is the drop that kills from full
+// health - OverseerDecisions::LethalFallYards on a stock realm, written as
+// the same expression so it can be a constant. The three zeppelin drops it
+// was written for were 97 yards. A tower beside a docked transport is not:
+// the Undercity tower reads 54 yards over the terrain, and a character
+// stepping between a tower and a deck must never be pulled to the ground.
+constexpr float TERRAIN_SET_DOWN_DROP_YARDS =
+    (1.f - OverseerDecisions::FALL_DAMAGE_INTERCEPT) /
+    OverseerDecisions::FALL_DAMAGE_SLOPE;
+
+// The core's own reach for a transport (Map::GetTransportForPos skips any
+// further than this, Map.cpp:1166), and so the reach of "beside" one.
+constexpr float TERRAIN_TRANSPORT_REACH_YARDS = 75.0f;
+
 // The whole policy in one constant, as OverseerDecisions::TerrainRecoveryStep
 // takes it. Everything it contains is declared just above; this only puts them
 // in the order that function reads them.
@@ -640,7 +658,8 @@ constexpr OverseerDecisions::TerrainRecoveryLimits TERRAIN_RECOVERY_LIMITS{
     TERRAIN_RECOVERY_FALLING_WINDOW_SECONDS,
     TERRAIN_PLANE_REACH_YARDS,
     TERRAIN_LAST_GROUND_MAX_AGE_SECONDS,
-    TERRAIN_PLANE_MAX_RETURNS};
+    TERRAIN_PLANE_MAX_RETURNS,
+    TERRAIN_SET_DOWN_DROP_YARDS};
 
 // HOW LONG DEAD BEFORE THIS DRIVE STOPS WAITING FOR THE NORMAL PATH.
 // Corpse-run for a corpse a few yards away is seconds; mod-playerbots' own
@@ -26448,6 +26467,24 @@ private:
                 SurfaceAt(bot, reading.x, reading.y,
                           reading.z + TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
                           reading.floorBelowZ);
+            // AND WHETHER A BOAT OR A ZEPPELIN IS RIGHT HERE (see
+            // OverseerDecisions::OffADeckInTheAir). Asked only where it can
+            // change the answer: a gap that could matter, no polygon, and a
+            // floor found under the feet. The map's own list of the transports
+            // on it, at the core's own reach; this drive never measures a
+            // passenger, so whatever is found here is not carrying this
+            // character.
+            std::string besideName;
+            if (gapCouldMatter && !reading.hasLocalNavmesh && reading.floorBelowValid)
+                if (Map* const transportMap = bot->GetMap())
+                    for (Transport* t : transportMap->GetAllTransports())
+                        if (t && t->IsInWorld() &&
+                            bot->GetExactDist(t) < TERRAIN_TRANSPORT_REACH_YARDS)
+                        {
+                            reading.besideTransport = true;
+                            besideName = t->GetName();
+                            break;
+                        }
             // ONE FOLD, READ IN TWO PLACES. The step below asks the same
             // question to choose the remedy and this line asks it to choose
             // which give-up sentence to log; before #296 each computed it
@@ -26659,6 +26696,32 @@ private:
                           verdict.groundZ,
                           static_cast<uint32>(std::time(nullptr) - memory.plane.ground.when),
                           job, questAim, travelTarget);
+                continue;
+            }
+
+            // DOWN ONTO THE FLOOR, BESIDE A TRANSPORT THAT STOPPED CARRYING IT.
+            // Same map, same x and y, onto the floor the probe just measured
+            // under the feet - which is where the fall was about to put it,
+            // without the fall. Its errand and its party are kept: the aim
+            // did not put it in the air.
+            if (verdict.remedy == OverseerDecisions::TerrainRemedy::SetDown)
+            {
+                float const downZ = verdict.liftZ + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS;
+                bot->TeleportTo(bot->GetMapId(), fromX, fromY, downZ,
+                                bot->GetOrientation());
+                OverseerDecisions::FallBaselineHandedOver(
+                    _fallBaseline[LowerName(name)], downZ, std::time(nullptr));
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' WAS IN THE AIR beside '{}' at map {} position "
+                          "({:.1f}, {:.1f}, {:.1f}): not on it, no local navmesh, not "
+                          "falling yet, and the floor {:.1f} yards down at z {:.1f}, "
+                          "which kills from full health. SET DOWN onto that floor at the "
+                          "same x/y instead of letting it fall there. It keeps quest aim "
+                          "job='{}' quest={} travel='{}' and its party. Somebody still "
+                          "needs to look at why the transport stopped carrying it",
+                          name, besideName, static_cast<uint32>(fromMap), fromX, fromY,
+                          fromZ, fromZ - verdict.liftZ, verdict.liftZ, job, questAim,
+                          travelTarget);
                 continue;
             }
 

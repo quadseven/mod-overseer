@@ -482,6 +482,13 @@ enum class TerrainRemedy
     // for still holds - no remedy here can change a continent, and this one
     // moves x and y only to a place the character itself already stood.
     ReturnToLastGround,
+
+    // DOWN ONTO THE FLOOR UNDER ITS OWN FEET, because it is in the air beside a
+    // boat or a zeppelin that is no longer carrying it (see OffADeckInTheAir).
+    // `liftZ` carries the floor. Same map, same x, same y, so the closure the
+    // block above argues for still holds: this is where the fall would have
+    // put the character, without the fall.
+    SetDown,
 };
 
 // ONE POLL'S WORTH OF WORLD, as the adapter measured it. Grouped rather than
@@ -562,6 +569,13 @@ struct TerrainReading
     // is a placeholder BY DESIGN and its floors are models, so a character
     // standing on one is not under anything.
     bool onOpenMap{false};
+    // A BOAT OR A ZEPPELIN IS WITHIN REACH, and this character is not its
+    // passenger (the drive stands down on a passenger before it measures
+    // anything). The reach is the core's own: Map::GetTransportForPos only
+    // looks at transports within 75 yards. FALSE BY DEFAULT, which keeps every
+    // reading taken before this existed exactly as it was. See
+    // OffADeckInTheAir.
+    bool besideTransport{false};
 };
 
 // One terrain height, or the core's answer that there is none.
@@ -688,6 +702,11 @@ struct TerrainRecoveryLimits
     // fix it and one to prove the first did not stick, then the module says so
     // instead of teleporting a character every second.
     unsigned maxPlaneReturns{0};
+    // HOW FAR BELOW ITS FEET THE FLOOR HAS TO BE before a character left in
+    // the air beside a transport is set down onto it (OffADeckInTheAir). The
+    // fall the core would charge for: see TERRAIN_SET_DOWN_DROP_YARDS in the
+    // adapter for where the number comes from. ZERO DISABLES THE SET-DOWN.
+    float setDownDropYards{0.f};
 };
 
 // IS THIS CHARACTER STANDING ON THE FEATURELESS PLANE UNDER THE WORLD?
@@ -775,6 +794,10 @@ struct TerrainRecoveryState
     // The "not falling, so it is standing on something" note, said once per
     // episode for the same reason `saidOnGround` is.
     bool saidNotFalling{false};
+    // ONE SET-DOWN PER EPISODE. One that worked leaves the character on the
+    // floor, where the next poll reads nothing wrong; one that did not is
+    // reported with the not-falling note rather than repeated every second.
+    bool setDown{false};
     // WHERE THIS EPISODE STARTED. Anchored on the first poll that holds, and
     // the episode is abandoned when the character turns up on another map or
     // more than `episodeRadius` away.
@@ -882,6 +905,31 @@ bool FloorUnderfoot(float currentZ, float floorBelowZ, bool floorBelowValid,
 // there is a third input, which is exactly how a guard ends up enforced on one
 // path and not the other.
 bool ReadingStandsOnTheGround(TerrainReading const& reading, float footingReach);
+
+// IS THIS CHARACTER IN THE AIR BESIDE A TRANSPORT THAT IS NOT CARRYING IT?
+//
+// Every input has to say so, and each one rules out a different innocent
+// reading: not on a transport (the drive never measures a passenger), a boat
+// or a zeppelin within the core's 75-yard reach (`besideTransport`), no
+// navmesh polygon Detour could find, not falling by the character's own
+// movement flags, and the nearest floor the probes see under its feet at
+// least `dropYards` below it. A character on a pier, a tower or a deck the
+// probes see has a floor within a stride; one walking a cliff path has a
+// polygon; one with no transport near is the layered ground #725 is about.
+//
+// MEASURED, THREE TIMES IN ONE PLACE. The Horde leader was dropped out of
+// the Orgrimmar to Undercity zeppelin on its first leg over Tirisfal Glades,
+// map 0, on 2026-10-03 at 19:55 and 22:32 and on 2026-10-05 at 00:51. Each
+// time the terrain drive read him at z 135 (map 0 (1993.9, 737.2),
+// (2000.7, 760.7), (1994.0, 737.5)), under the zeppelin's own hull, with no
+// local navmesh, the floor 97 yards down at z 38, and NOT FALLING, and logged
+// "NOTHING IS BEING MOVED". Four to five seconds later he was dead of the
+// fall at z 38. The not-falling note is right that nothing is wrong with the
+// probes there; it is wrong that the character is standing on anything.
+//
+// `dropYards` NOT POSITIVE DISABLES THIS, and so does a reading that did not
+// measure the transport or the floor: every default declines.
+bool OffADeckInTheAir(TerrainReading const& reading, float dropYards);
 
 // THE PLACE A "NOTHING IS BEING MOVED" TERRAIN NOTE IS ABOUT (mod-overseer#775).
 // Those notes are about the ground, not the character: a roof over the Orgrimmar
