@@ -4706,12 +4706,19 @@ void RememberKiller(Player* killed, std::string const& killerType,
     k.killerEntry = killerEntry;
     if (killerType == "creature" && killerEntry)
     {
+        int64_t const now = static_cast<int64_t>(std::time(nullptr));
+        // A mark is read only inside the repeat window (KillerAtCorpse), so an
+        // older one is dropped here, and the map holds only recent kills.
+        for (auto it = g_creatureKill.begin(); it != g_creatureKill.end();)
+            it = now - it->second.at > int64_t(GHOST_REPEAT_MINUTES) * 60
+                ? g_creatureKill.erase(it)
+                : std::next(it);
         OverseerDecisions::CreatureKillMark& mark = g_creatureKill[LowerName(killed->GetName())];
         mark.entry = killerEntry;
         mark.mapId = killed->GetMapId();
         mark.x = killed->GetPositionX();
         mark.y = killed->GetPositionY();
-        mark.at = static_cast<int64_t>(std::time(nullptr));
+        mark.at = now;
     }
 }
 
@@ -29043,6 +29050,10 @@ private:
             Aura const* sickness = bot->GetAura(15007);
             int64 const sickEnds =
                 OverseerDecisions::SicknessEndsAt(now, sickness ? sickness->GetDuration() : 0);
+            // Ended sicknesses are dropped here too, so the map holds only
+            // members that are sick now.
+            for (auto it = _sicknessEndsAt.begin(); it != _sicknessEndsAt.end();)
+                it = it->second <= now ? _sicknessEndsAt.erase(it) : std::next(it);
             if (sickEnds)
                 _sicknessEndsAt[name] = sickEnds;
             else
