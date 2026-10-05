@@ -27870,6 +27870,9 @@ private:
         bool hasDecision{false};
         OverseerDecisions::RevivedSickGroundStep lastDecision{
             OverseerDecisions::RevivedSickGroundStep::Stay};
+        // Its own deaths around where it revived, read once per revival.
+        bool deathsRead{false};
+        unsigned deathsHere{0};
         std::vector<std::string> removedCombat;
         bool addedFlee{false};
     };
@@ -27904,6 +27907,21 @@ private:
         uint32 const stone = HearthstoneSpellOf(bot);
         facts.hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
         facts.restWhileSick = restWhileSick;
+        if (!state.deathsRead)
+        {
+            // The ghost recovery's own count, around where it stands now: a
+            // spirit healer revives it beside the deaths that sent it there.
+            if (QueryResult row = CharacterDatabase.Query(
+                    "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+                    "AND created_at >= NOW() - INTERVAL {} MINUTE AND map = {} "
+                    "AND POW(pos_x - {}, 2) + POW(pos_y - {}, 2) <= {}",
+                    Esc(name), GHOST_REPEAT_MINUTES, bot->GetMapId(), bot->GetPositionX(),
+                    bot->GetPositionY(), GHOST_REPEAT_RADIUS * GHOST_REPEAT_RADIUS))
+                state.deathsHere = static_cast<unsigned>(row->Fetch()[0].Get<uint64>());
+            state.deathsRead = true;
+        }
+        facts.deathsHere = state.deathsHere;
+        facts.repeatDeaths = GHOST_RECOVERY_LIMITS.repeatDeaths;
         auto const step = OverseerDecisions::DecideRevivedSickGround(facts);
 
         if (state.hasDecision && state.lastDecision != step)
@@ -27912,8 +27930,8 @@ private:
         {
             LOG_WARN("module.overseer",
                      "overseer: '{}' revived with Resurrection Sickness on ground reaching "
-                     "level {} (member level {}, lethal gap {}) - decision: {} (#746)",
-                     name, facts.groundTopLevel, facts.memberLevel, facts.levelGap,
+                     "level {} (member level {}, lethal gap {}, {} death(s) here) - decision: {} (#746)",
+                     name, facts.groundTopLevel, facts.memberLevel, facts.levelGap, facts.deathsHere,
                      step == OverseerDecisions::RevivedSickGroundStep::Hearth ? "hearth" :
                      step == OverseerDecisions::RevivedSickGroundStep::HoldOutOfCombat
                          ? "hold out of combat" : "stay");
