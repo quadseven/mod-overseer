@@ -17,6 +17,8 @@ using OverseerDecisions::ParseRenameRequest;
 using OverseerDecisions::RenameFacts;
 using OverseerDecisions::RenamePlan;
 using OverseerDecisions::RenamePlanFor;
+using OverseerDecisions::RenameRowStatement;
+using OverseerDecisions::RenameTables;
 using OverseerDecisions::RenameRefusal;
 using OverseerDecisions::RenameStep;
 using OverseerDecisions::RenameSteps;
@@ -148,8 +150,34 @@ void WhatMovesWithIt()
 
 }  // namespace
 
+// wow-dev 2026-10-05: `character` is a MySQL 8 reserved word, and the unquoted
+// row move aborted the worldserver on every start. Every identifier is quoted.
+void TheRowMoveQuotesEveryIdentifier()
+{
+    bool sawCharacter = false;
+    for (auto const& t : RenameTables())
+    {
+        std::string const sql = RenameRowStatement(t, "Fumma", "Aurerim");
+        std::string const col = std::string("`") + t.column + "`";
+        std::string const want = std::string("UPDATE `") + t.table + "` SET " + col +
+                                 " = 'Fumma' WHERE " + col + " = 'Aurerim'";
+        if (sql != want)
+        {
+            std::printf("FAIL row move for %s: got '%s'\n", t.table, sql.c_str());
+            ++failures;
+        }
+        sawCharacter |= std::string(t.column) == "character";
+    }
+    if (!sawCharacter)
+    {
+        std::printf("FAIL the reserved-word column is no longer in the list; keep a case for it\n");
+        ++failures;
+    }
+}
+
 int main()
 {
+    TheRowMoveQuotesEveryIdentifier();
     TheRow();
     WhenItIsRefused();
     HowItIsCarriedOut();

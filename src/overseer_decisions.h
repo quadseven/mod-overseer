@@ -9673,6 +9673,15 @@ struct RenameTable
 };
 std::vector<RenameTable> const& RenameTables();
 
+// THE ROW MOVE'S STATEMENT, EVERY IDENTIFIER QUOTED (wow-dev 2026-10-05).
+// overseer_stream's column is named `character`, a reserved word in MySQL 8;
+// unquoted, `UPDATE overseer_stream SET character = ...` failed to parse, and
+// the core treats a parse error in an async transaction as fatal: it aborted
+// the worldserver on every start while a rename row was claimed. `newName`
+// and `oldName` arrive already escaped by the caller.
+std::string RenameRowStatement(RenameTable const& table, std::string const& newName,
+                               std::string const& oldName);
+
 // ---------------------------------------------------------- a retire (2026-10-05) --
 // THE FACTORY BOTS ARE RETIRED. mod-playerbots' old pre-levelling default made
 // a crop of random-bot characters at the top of the level range that never
