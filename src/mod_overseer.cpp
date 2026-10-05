@@ -27917,8 +27917,13 @@ private:
                     "AND POW(pos_x - {}, 2) + POW(pos_y - {}, 2) <= {}",
                     Esc(name), GHOST_REPEAT_MINUTES, bot->GetMapId(), bot->GetPositionX(),
                     bot->GetPositionY(), GHOST_REPEAT_RADIUS * GHOST_REPEAT_RADIUS))
+            {
+                // Read once it answers. A COUNT always returns its one row, so
+                // no row is a failed read, and the next poll asks again rather
+                // than trusting a zero for the whole revival.
                 state.deathsHere = static_cast<unsigned>(row->Fetch()[0].Get<uint64>());
-            state.deathsRead = true;
+                state.deathsRead = true;
+            }
         }
         facts.deathsHere = state.deathsHere;
         facts.repeatDeaths = GHOST_RECOVERY_LIMITS.repeatDeaths;
