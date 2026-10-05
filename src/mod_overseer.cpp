@@ -4571,6 +4571,10 @@ struct PendingKill
 };
 std::mutex g_killMutex;
 std::map<std::string, PendingKill> g_pendingKill;  // key: lowercased victim name
+// The creature that last killed each character, where and when, for the ghost
+// recovery's threat count (wow-overseer#599). Kept past RecordDeath, which
+// consumes g_pendingKill. Same mutex. Key: lowercased victim name.
+std::map<std::string, OverseerDecisions::CreatureKillMark> g_creatureKill;
 
 // Called from WriteSnapshot, world thread only - see that function.
 void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
@@ -4700,6 +4704,15 @@ void RememberKiller(Player* killed, std::string const& killerType,
     k.killerType = killerType;
     k.killerName = killerName;
     k.killerEntry = killerEntry;
+    if (killerType == "creature" && killerEntry)
+    {
+        OverseerDecisions::CreatureKillMark& mark = g_creatureKill[LowerName(killed->GetName())];
+        mark.entry = killerEntry;
+        mark.mapId = killed->GetMapId();
+        mark.x = killed->GetPositionX();
+        mark.y = killed->GetPositionY();
+        mark.at = static_cast<int64_t>(std::time(nullptr));
+    }
 }
 
 // One recorded death, queued for the world thread to write. NOT a repeat of
@@ -28031,6 +28044,7 @@ private:
         float corpseY{0.f};
         unsigned deathsHere{0};
         NearbyThreat spawnThreat;  // hostile spawns above its level near the corpse
+        uint32 killerEntry{0};     // the creature kind that killed it here, or 0
         GraveyardStruct const* healerGrave{nullptr};
         std::string healerRefused;  // why the healer's graveyard is unsafe, or empty
         bool choseHealer{false};
@@ -28044,7 +28058,8 @@ private:
 
     // Living creatures near the corpse that could fight a character of this
     // level again: alive, hostile to it, attackable, not a critter, and at or
-    // above `minLevel`.
+    // above `minLevel` or of the `killerEntry` kind that killed it here
+    // (OverseerDecisions::CorpseThreat, wow-overseer#599).
     struct GhostThreatCheck
     {
         Player const* ghost;
@@ -28052,12 +28067,14 @@ private:
         float y;
         float range;
         uint32 minLevel;
+        uint32 killerEntry;
         bool operator()(Creature* creature) const
         {
             static constexpr uint32 CANNOT_FIGHT =
                 UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_SELECTABLE;
             return creature->IsAlive() && !creature->IsCritter() &&
-                   creature->GetLevel() >= minLevel &&
+                   OverseerDecisions::CorpseThreat(creature->GetLevel(), minLevel,
+                                                   creature->GetEntry(), killerEntry) &&
                    creature->GetExactDist2d(x, y) <= range &&
                    !creature->HasUnitFlag(UnitFlags(CANNOT_FIGHT)) &&
                    creature->IsHostileTo(ghost);
@@ -28852,15 +28869,25 @@ private:
 
             st.spawnThreat = HostileSpawnsNear(bot, st.mapId, st.corpseX, st.corpseY,
                                                GHOST_CORPSE_THREAT_RADIUS, bot->GetLevel());
+            {
+                std::lock_guard<std::mutex> guard(g_killMutex);
+                auto const kill = g_creatureKill.find(LowerName(name));
+                if (kill != g_creatureKill.end())
+                    st.killerEntry = OverseerDecisions::KillerAtCorpse(
+                        kill->second, st.mapId, st.corpseX, st.corpseY, GHOST_REPEAT_RADIUS,
+                        static_cast<int64_t>(time(nullptr)), int64_t(GHOST_REPEAT_MINUTES) * 60);
+            }
             st.healerGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
             if (st.healerGrave)
                 st.healerRefused = GraveyardRefusal(bot, *st.healerGrave);
         }
 
-        // Live: what is standing near the corpse NOW at or above its level.
+        // Live: what is standing near the corpse NOW at or above its level, or
+        // of the kind that killed it here.
         uint32 const level = bot->GetLevel();
         std::list<Creature*> threats;
-        GhostThreatCheck check{bot, st.corpseX, st.corpseY, GHOST_CORPSE_THREAT_RADIUS, level};
+        GhostThreatCheck check{bot, st.corpseX, st.corpseY, GHOST_CORPSE_THREAT_RADIUS, level,
+                               st.killerEntry};
         Acore::CreatureListSearcher<GhostThreatCheck> searcher(bot, threats, check);
         Cell::VisitObjects(st.corpseX, st.corpseY, bot->GetMap(), searcher,
                            GHOST_CORPSE_THREAT_RADIUS);
@@ -28893,11 +28920,14 @@ private:
             facts.healerGraveyardSafe = true;
             facts.choseHealer = true;
         }
-        auto const healerUse = _lastSpiritHealerUse.find(name);
-        facts.healerUsedRecently =
-            healerUse != _lastSpiritHealerUse.end() &&
-            now >= healerUse->second &&
-            now - healerUse->second <= SPIRIT_HEALER_SICKNESS_SECONDS;
+        // Sick while the debuff lasts, not a fixed window after the healer
+        // (wow-overseer#598): the aura itself, or the end read from it at the
+        // revival.
+        auto const sickUntil = _sicknessEndsAt.find(name);
+        facts.sick = OverseerDecisions::SicknessLasts(
+            bot->HasAura(15007), sickUntil == _sicknessEndsAt.end() ? 0 : sickUntil->second, now);
+        if (!facts.sick && sickUntil != _sicknessEndsAt.end())
+            _sicknessEndsAt.erase(sickUntil);
         facts.corpseRunPossible = true;
         OverseerDecisions::GhostRecoveryVerdict const verdict =
             OverseerDecisions::DecideGhostRecovery(facts, GHOST_RECOVERY_LIMITS);
@@ -28912,14 +28942,15 @@ private:
                      "overseer: ghost recovery for '{}' (level {}) is '{}' - {}. Corpse at map {} "
                      "({:.0f}, {:.0f}), {:.0f} yards away; {} death(s) within {:.0f} yards in "
                      "{}min; strongest hostile within {:.0f} yards of the corpse level {}{}{}; "
-                     "{} live hostile(s) there at or above its level; spirit healer graveyard "
-                     "'{}'{}{}",
+                     "{} live hostile(s) there at or above its level or of its killer's kind "
+                     "(entry {}); {}; spirit healer graveyard '{}'{}{}",
                      name, level, OverseerDecisions::GhostRecoveryWord(verdict.choice),
                      OverseerDecisions::GhostRecoveryReasonText(verdict.reason), st.mapId,
                      st.corpseX, st.corpseY, bot->GetExactDist2d(st.corpseX, st.corpseY),
                      st.deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
                      GHOST_CORPSE_THREAT_RADIUS, strongest, strongestName.empty() ? "" : " '",
                      strongestName.empty() ? "" : strongestName + "'", threats.size(),
+                     st.killerEntry, facts.sick ? "sick" : "not sick",
                      st.healerGrave ? st.healerGrave->name : std::string("none"),
                      st.healerRefused.empty() ? "" : " refused: ", st.healerRefused);
         }
@@ -29007,7 +29038,15 @@ private:
                      "instead of reclaiming its corpse at ({:.0f}, {:.0f}) - resurrection "
                      "sickness and durability loss included, as for any player who does",
                      name, healerName, st.healerGrave->name, st.corpseX, st.corpseY);
-            _lastSpiritHealerUse[name] = now;
+            // When this sickness ends, read from the aura the core just
+            // applied: one minute a level above 10 below level 20, ten from 20.
+            Aura const* sickness = bot->GetAura(15007);
+            int64 const sickEnds =
+                OverseerDecisions::SicknessEndsAt(now, sickness ? sickness->GetDuration() : 0);
+            if (sickEnds)
+                _sicknessEndsAt[name] = sickEnds;
+            else
+                _sicknessEndsAt.erase(name);
             ReturnCorpseRun(botAI, st);
             _ghostRecovery.erase(name);
             HoldAfterRevival(bot, botAI, name, bot->GetMapId(), bot->GetPositionX(),
@@ -64846,7 +64885,9 @@ private:
     std::map<std::string, std::pair<int64, bool>> _revivalHoldUntil;
 
     std::map<std::string, RevivedSicknessState> _revivedSickness;
-    std::map<std::string, int64> _lastSpiritHealerUse;
+    // When each character's Resurrection Sickness from the spirit healer ends
+    // (OverseerDecisions::SicknessEndsAt), by name.
+    std::map<std::string, int64> _sicknessEndsAt;
 
     // WHAT EACH GHOST WAS DECIDED TO DO ABOUT ITS CORPSE (#664), keyed by
     // name and tied to one death by its ghost time. World thread only, from

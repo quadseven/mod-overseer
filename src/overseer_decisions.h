@@ -17857,8 +17857,11 @@ enum class GhostRecoveryReason : uint8_t
     AlreadyChose,     // the spirit healer was chosen on an earlier poll
     RepeatDeaths,     // died here already inside the repeat window
     Outlevelled,      // a hostile well above its level stands near the corpse
-    HostilesNearby,   // a hostile at or above its level stands near the corpse now
+    HostilesNearby,   // a hostile at or above its level, or of its killer's kind,
+                      // stands near the corpse now
     WaitedOut,        // it waited and the corpse never cleared
+    StillSick,        // it still carries Resurrection Sickness; the corpse run
+                      // does not stack another
 };
 
 struct GhostRecoveryFacts
@@ -17870,8 +17873,9 @@ struct GhostRecoveryFacts
     // The highest level of any hostile near the corpse, spawn table or live
     // grid, whichever is higher. 0 when there is none.
     uint32_t strongestNearCorpse{0};
-    // Living hostiles near the corpse right now at or above the character's
-    // own level: the ones that can walk away, and the ones worth waiting for.
+    // Living hostiles near the corpse right now that CorpseThreat counts: at or
+    // above the character's own level, or of the kind that killed it there.
+    // The ones that can walk away, and the ones worth waiting for.
     unsigned liveThreatsNearCorpse{0};
     // Seconds since the release (the corpse's ghost time).
     long ghostSeconds{0};
@@ -17880,8 +17884,9 @@ struct GhostRecoveryFacts
     bool healerGraveyardSafe{false};
     // An earlier poll of this same death already chose the spirit healer.
     bool choseHealer{false};
-    // A spirit-healer resurrection happened within the sickness window.
-    bool healerUsedRecently{false};
+    // It carries Resurrection Sickness now (SicknessLasts), so the spirit
+    // healer would stack another.
+    bool sick{false};
     bool corpseRunPossible{false};
 };
 
@@ -17914,11 +17919,20 @@ struct GhostRecoveryVerdict
     GhostRecoveryReason reason{GhostRecoveryReason::Clear};
 };
 
-// FIVE RULES, IN THIS ORDER:
+// SIX RULES, IN THIS ORDER:
 //
 //   1. The spirit healer was already chosen for this death: keep it. A ghost
 //      halfway to the healer is not turned round because a patrol wandered off.
 //   2. It has died `repeatDeaths` times here inside the window: spirit healer.
+//   2a. It still carries Resurrection Sickness and the corpse run is possible:
+//      corpse run, so the sickness does not stack (mod-overseer#747). This
+//      sits BELOW rule 2: a second death at one spot is the death loop, and
+//      walking back into it costs more than a second dose of sickness. It
+//      also ends when the debuff ends, not a fixed 600 seconds after the
+//      healer. On wow-dev 2026-10-04, with it above rule 2 and on a fixed
+//      window, 101 of 311 repeat deaths in 49 minutes were corpse runs it
+//      forced, 77 of them after the sickness had worn off
+//      (wow-overseer#598).
 //   3. A hostile at least `levelGap` levels above it is near the corpse:
 //      spirit healer.
 //   4. A hostile at or above its level is near the corpse now: wait, and after
@@ -17931,6 +17945,47 @@ struct GhostRecoveryVerdict
 // takes it.
 GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
                                          GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
+
+// WHEN RESURRECTION SICKNESS ENDS. `remainingMs` is what the core's aura (spell
+// 15007) has left at `now`, read the moment the spirit healer revives the
+// character; 0 or less when it carries none (below the sickness level). The
+// duration is the core's own: one minute a level above 10 below level 20,
+// ten minutes from 20. Returns the second it ends, or 0 for no sickness.
+int64_t SicknessEndsAt(int64_t now, int32_t remainingMs);
+
+// It is sick while the aura is on it, or before the end SicknessEndsAt read
+// from that aura at the revival (`endsAt` 0 for none). The second test keeps
+// the answer right for a ghost whatever the core does with the aura at death.
+bool SicknessLasts(bool auraOn, int64_t endsAt, int64_t now);
+
+// THE KILLER IS A THREAT WHATEVER ITS LEVEL. The live threat count near a
+// corpse counted only creatures at or above the character's own level, so a
+// pack below it that had just killed it read as nothing near the corpse, and
+// the ghost reclaimed beside it. On wow-dev 2026-10-04, 83 of 311 repeat
+// deaths in 49 minutes were corpse runs judged clear this way, and 79 of the
+// 83 killers were below the member's level (wow-overseer#599). A creature
+// counts when it is at or above `memberLevel`, or when its entry is
+// `killerEntry`, the kind that killed the character at this corpse (0: none
+// known).
+bool CorpseThreat(uint32_t creatureLevel, uint32_t memberLevel, uint32_t creatureEntry,
+                  uint32_t killerEntry);
+
+// The creature that killed a character last, where and when.
+struct CreatureKillMark
+{
+    uint32_t entry{0};
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+    int64_t at{0};
+};
+
+// The entry of the creature that killed the character at THIS corpse: the
+// last kill mark, when it is on the corpse's map, within `radius` of it, and no
+// older than `maxAgeSeconds` at `now`. 0 otherwise, so a killer from another
+// place or an old death is never read as this one's.
+uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corpseX,
+                        float corpseY, float radius, int64_t now, int64_t maxAgeSeconds);
 
 // A GUILD MEMBER THAT MAY NOT USE THE LADDER STILL LEAVES A DEATH LOOP. When the
 // ghost decision answers Ladder (the spirit healer's graveyard failed its safety

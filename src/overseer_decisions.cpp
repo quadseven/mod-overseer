@@ -15529,13 +15529,16 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
     if (facts.choseHealer)
         return healer(GhostRecoveryReason::AlreadyChose);
 
-    // 1a. Do not stack Resurrection Sickness when the corpse remains reachable.
-    if (facts.healerUsedRecently && facts.corpseRunPossible)
-        return verdict;
-
     // 2. It has already died here inside the window.
     if (limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths)
         return healer(GhostRecoveryReason::RepeatDeaths);
+
+    // 2a. Do not stack Resurrection Sickness when the corpse remains reachable.
+    if (facts.sick && facts.corpseRunPossible)
+    {
+        verdict.reason = GhostRecoveryReason::StillSick;
+        return verdict;
+    }
 
     // 3. Something near the corpse is well above it.
     if (facts.strongestNearCorpse &&
@@ -15556,6 +15559,34 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
 
     // 5. Clear: the corpse run is what anybody would do.
     return verdict;
+}
+
+int64_t SicknessEndsAt(int64_t now, int32_t remainingMs)
+{
+    if (remainingMs <= 0)
+        return 0;
+    return now + (static_cast<int64_t>(remainingMs) + 999) / 1000;
+}
+
+bool SicknessLasts(bool auraOn, int64_t endsAt, int64_t now)
+{
+    return auraOn || (endsAt && now < endsAt);
+}
+
+bool CorpseThreat(uint32_t creatureLevel, uint32_t memberLevel, uint32_t creatureEntry,
+                  uint32_t killerEntry)
+{
+    return creatureLevel >= memberLevel || (killerEntry && creatureEntry == killerEntry);
+}
+
+uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corpseX,
+                        float corpseY, float radius, int64_t now, int64_t maxAgeSeconds)
+{
+    if (!mark.entry || mark.mapId != mapId || now < mark.at || now - mark.at > maxAgeSeconds)
+        return 0;
+    float const dx = mark.x - corpseX;
+    float const dy = mark.y - corpseY;
+    return dx * dx + dy * dy <= radius * radius ? mark.entry : 0;
 }
 
 char const* GhostRecoveryWord(GhostRecovery choice)
@@ -15709,9 +15740,13 @@ char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
         case GhostRecoveryReason::Outlevelled:
             return "a hostile well above its level stands near the corpse";
         case GhostRecoveryReason::HostilesNearby:
-            return "a hostile at or above its level stands near the corpse right now";
+            return "a hostile at or above its level, or of the kind that killed it, stands "
+                   "near the corpse right now";
         case GhostRecoveryReason::WaitedOut:
             return "it waited and the corpse never cleared";
+        case GhostRecoveryReason::StillSick:
+            return "it still carries Resurrection Sickness and the spirit healer would stack "
+                   "another";
     }
     return "unknown";
 }

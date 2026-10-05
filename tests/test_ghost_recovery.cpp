@@ -32,6 +32,8 @@ using OverseerDecisions::GhostRecoveryLimits;
 using OverseerDecisions::GhostRecoveryReason;
 using OverseerDecisions::GhostRecoveryVerdict;
 using OverseerDecisions::GhostRecoveryWord;
+using OverseerDecisions::SicknessEndsAt;
+using OverseerDecisions::SicknessLasts;
 
 namespace
 {
@@ -70,15 +72,6 @@ int main()
     // The ordinary death: nothing near the corpse. Corpse run, as before.
     Check("a first death with nothing near the corpse runs back",
           DecideGhostRecovery(Quiet()), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
-
-    {
-        GhostRecoveryFacts f = Quiet();
-        f.deathsHere = 2;
-        f.healerUsedRecently = true;
-        f.corpseRunPossible = true;
-        Check("recent spirit-healer use prefers a possible corpse run",
-              DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
-    }
 
     // Zork at 09:06:33: the second death inside the window, in one place.
     {
@@ -193,26 +186,100 @@ int main()
         ++failures;
     }
 
-    // Test: A sick member on lethal ground with a ready stone hearths, and without one is held out of combat.
-    // With the cooldown fix, a second death within 10 minutes of spirit-healer use should prefer corpse run.
+    // RESURRECTION SICKNESS DOES NOT OUTRANK THE DEATH LOOP (wow-overseer#598).
+    // Caelianon, level 13 in Duskwood on 2026-10-04: the spirit healer at
+    // Ravenhill at 23:07:25, dead again at 23:08:04, and the next decision a
+    // corpse run with four deaths within 60 yards and a level 24 Skeletal
+    // Horror beside the corpse. A second death at one spot takes the spirit
+    // healer, sick or not.
     {
         GhostRecoveryFacts f = Quiet();
+        f.level = 13;
         f.deathsHere = 2;
-        f.healerUsedRecently = true;   // spirit healer was used within 10 min
-        f.corpseRunPossible = true;    // corpse run is an option
-        Check("sick member with ready stone hearths prefers corpse run over spirit healer when recently used",
-              DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
+        f.sick = true;
+        f.corpseRunPossible = true;
+        Check("a sick member's second death here takes the spirit healer",
+              DecideGhostRecovery(f), GhostRecovery::SpiritHealer,
+              GhostRecoveryReason::RepeatDeaths);
+        f.deathsHere = 4;
+        f.strongestNearCorpse = 24;
+        Check("Caelianon's fourth death beside a level 24 takes the spirit healer",
+              DecideGhostRecovery(f), GhostRecovery::SpiritHealer,
+              GhostRecoveryReason::RepeatDeaths);
+        f.healerGraveyardSafe = false;
+        Check("and an unsafe graveyard still keeps it off the corpse",
+              DecideGhostRecovery(f), GhostRecovery::Ladder, GhostRecoveryReason::RepeatDeaths);
     }
 
-    // Test: A second death within 10 minutes of a spirit-healer revival does not choose the spirit healer again
-    // when a corpse run is possible. This verifies the 10-minute cooldown prevents stacking Resurrection Sickness.
+    // A first death while sick is still a corpse run, so the sickness does not
+    // stack (mod-overseer#747), and the log says why.
     {
         GhostRecoveryFacts f = Quiet();
-        f.deathsHere = 3;
-        f.healerUsedRecently = true;   // first death used spirit healer within 10 min window
-        f.corpseRunPossible = true;    // corpse run is possible
-        Check("second death within 10 min of spirit-healer revival prefers corpse run, avoids sickness stacking",
-              DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
+        f.sick = true;
+        f.corpseRunPossible = true;
+        Check("a sick member's first death here runs back to the corpse",
+              DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::StillSick);
+        f.strongestNearCorpse = 30;
+        Check("even beside a hostile well above it", DecideGhostRecovery(f),
+              GhostRecovery::CorpseRun, GhostRecoveryReason::StillSick);
+        f.corpseRunPossible = false;
+        Check("unless the corpse run is not possible", DecideGhostRecovery(f),
+              GhostRecovery::SpiritHealer, GhostRecoveryReason::Outlevelled);
+    }
+
+    // THE HOLD ENDS WITH THE DEBUFF. The core gives a level 13 member three
+    // minutes of sickness (one a level above 10), not ten: Caelianon took the
+    // healer at 23:07:25 and the sickness ended at 23:10:53. Once it has worn
+    // off, the member is not sick, and the ordinary rules decide.
+    {
+        long const healer = 1000;
+        long const ends = SicknessEndsAt(healer, 180000);
+        if (ends != healer + 180)
+        {
+            std::printf("FAIL three minutes of sickness ends at +180s, got %+lds\n",
+                        ends - healer);
+            ++failures;
+        }
+        if (SicknessEndsAt(healer, 179001) != healer + 180)
+        {
+            std::printf("FAIL a part second of sickness left counts as a whole one\n");
+            ++failures;
+        }
+        if (SicknessEndsAt(healer, 0) != 0 || SicknessEndsAt(healer, -5) != 0)
+        {
+            std::printf("FAIL no aura at the revival is no sickness\n");
+            ++failures;
+        }
+        if (!SicknessLasts(false, ends, healer + 179))
+        {
+            std::printf("FAIL a member is sick until its sickness ends\n");
+            ++failures;
+        }
+        if (SicknessLasts(false, ends, healer + 180) || SicknessLasts(false, ends, healer + 599))
+        {
+            std::printf("FAIL a member whose sickness ended is held as sick\n");
+            ++failures;
+        }
+        if (!SicknessLasts(true, 0, healer + 599))
+        {
+            std::printf("FAIL the aura on the member is sickness\n");
+            ++failures;
+        }
+        if (SicknessLasts(false, 0, healer))
+        {
+            std::printf("FAIL no aura and no recorded end is not sickness\n");
+            ++failures;
+        }
+
+        // At 23:11, past the end, beside the level 24: the spirit healer.
+        GhostRecoveryFacts f = Quiet();
+        f.level = 13;
+        f.strongestNearCorpse = 24;
+        f.corpseRunPossible = true;
+        f.sick = SicknessLasts(false, ends, healer + 215);
+        Check("past the sickness's end, outlevelled takes the spirit healer",
+              DecideGhostRecovery(f), GhostRecovery::SpiritHealer,
+              GhostRecoveryReason::Outlevelled);
     }
 
     if (failures)
