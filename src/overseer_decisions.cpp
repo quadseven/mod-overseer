@@ -16270,6 +16270,16 @@ bool TrainingStopLegRetries(uint32_t offered, uint32_t learned, uint32_t triesSo
     return offered > 0 && learned == 0 && triesSoFar < TRAINING_STOP_LEARN_TRIES;
 }
 
+std::string TrainingStopLegAim(uint32_t trainerEntry)
+{
+    return "trainer:" + std::to_string(trainerEntry);
+}
+
+bool TrainingStopLegStillWalking(std::string const& column, uint32_t trainerEntry)
+{
+    return column == TrainingStopLegAim(trainerEntry);
+}
+
 bool TrainingStopArrivalMissed(bool hasAwayMembers, uint32_t reachPolls)
 {
     return hasAwayMembers && reachPolls >= TRAINING_STOP_REACH_POLLS;

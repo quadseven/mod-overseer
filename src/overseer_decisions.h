@@ -18682,6 +18682,16 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
 // A member who learned something, or was offered nothing, is not retried.
 bool TrainingStopLegRetries(uint32_t offered, uint32_t learned, uint32_t triesSoFar);
 
+// The aim a training stop leg writes into the head's travel column for its
+// trainer: "trainer:<entry>". The walking test below reads the column against
+// this same text, so the writer and the reader cannot drift apart.
+std::string TrainingStopLegAim(uint32_t trainerEntry);
+
+// Is the leg still walking: the head's travel column still holds the leg's aim.
+// A column that holds anything else (empty, or another errand) means the leg
+// was ended by something other than its arrival.
+bool TrainingStopLegStillWalking(std::string const& column, uint32_t trainerEntry);
+
 // Whether one or more eligible members missed the trainer before the reach
 // wait expired, leaving their visit unfinished.
 bool TrainingStopArrivalMissed(bool hasAwayMembers, uint32_t reachPolls);

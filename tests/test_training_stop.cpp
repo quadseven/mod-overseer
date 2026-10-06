@@ -413,8 +413,11 @@ void TheAdapterIsWired()
     Check("its claim names its owner",
           source.find("OverseerDecisions::TravelOwner::TrainingStop))") != std::string::npos);
     Check("training aims are namespaced away from numeric vendor errands",
-          source.find("\"trainer:\" + std::to_string(entry)") != std::string::npos &&
-              source.find("target == \"trainer:\" + std::to_string(stopLeg->second.entry)") !=
+          source.find("Claim(headName, OverseerDecisions::TrainingStopLegAim(entry),") !=
+                  std::string::npos &&
+              source.find("target == OverseerDecisions::TrainingStopLegAim(stopLeg->second.entry)") !=
+                  std::string::npos &&
+              source.find("TrainingStopLegStillWalking(column, walking->second.entry)") !=
                   std::string::npos);
     std::size_t const stopArrival = source.find("if (TeachAtTrainingStop(stopLeg->second))");
     std::size_t const respecArrival = source.find("if (RespecOnArrival(name, bot, entry, respec->second))");
