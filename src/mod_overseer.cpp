@@ -32295,6 +32295,19 @@ private:
     {
         std::string const key = LowerName(name);
         std::time_t const now = std::time(nullptr);
+        // A hearth older than the forget window no longer refuses anything,
+        // so it is dropped, and the refusal said for it with it. Both maps
+        // hold only characters inside their window.
+        for (auto it = _planeHearths.begin(); it != _planeHearths.end();)
+        {
+            if (now - it->second >= TERRAIN_RECOVERY_FORGET_SECONDS)
+            {
+                _planeHearthRefusal.erase(it->first);
+                it = _planeHearths.erase(it);
+            }
+            else
+                ++it;
+        }
         auto const last = _planeHearths.find(key);
         uint32 const stone = HearthstoneSpellOf(bot);
 
@@ -32320,6 +32333,8 @@ private:
             DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
         if (refused && *refused)
         {
+            // One entry per character, replaced rather than appended, and
+            // cleared by the cast that ends the refusals.
             std::string& said = _planeHearthRefusal[key];
             if (said != refused)
             {
