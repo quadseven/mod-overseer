@@ -18876,6 +18876,206 @@ std::string StandinGuestWord(FamilyStandin const& standin)
     return standin.HasGuest() ? standin.inName : std::string("nobody");
 }
 
+// ------------------------------------- a party for a quest that needs help --
+
+namespace
+{
+bool PartyVerbIs(std::string const& command, char const* verb)
+{
+    std::vector<std::string> const words = GuildFinderWords(command);
+    return !words.empty() && words[0] == verb;
+}
+}  // namespace
+
+bool IsPartyUpRow(std::string const& command)
+{
+    return PartyVerbIs(command, PARTY_UP_VERB);
+}
+
+bool IsPartyWalkRow(std::string const& command)
+{
+    return PartyVerbIs(command, PARTY_WALK_VERB);
+}
+
+bool IsPartyDisbandRow(std::string const& command)
+{
+    return PartyVerbIs(command, PARTY_DISBAND_VERB);
+}
+
+PartyUpRequest ParsePartyUpRequest(std::string const& command, std::string const& leader)
+{
+    PartyUpRequest out;
+    std::vector<std::string> const words = GuildFinderWords(command);
+    if (words.empty() || words[0] != PARTY_UP_VERB)
+    {
+        out.error = PartyRowError::NotThisVerb;
+        return out;
+    }
+    if (words.size() < 2)
+    {
+        out.error = PartyRowError::Malformed;
+        return out;
+    }
+    if (words.size() - 1 > PARTY_MAX_HELPERS)
+    {
+        out.error = PartyRowError::TooManyHelpers;
+        return out;
+    }
+    if (!IsCharacterName(leader))
+    {
+        out.error = PartyRowError::BadName;
+        return out;
+    }
+    std::vector<std::string> seen{LowerName(leader)};
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        if (!IsCharacterName(words[i]))
+        {
+            out.error = PartyRowError::BadName;
+            return out;
+        }
+        std::string const lower = LowerName(words[i]);
+        for (std::string const& known : seen)
+            if (known == lower)
+            {
+                out.error = PartyRowError::SameNameTwice;
+                return out;
+            }
+        seen.push_back(lower);
+        out.helpers.push_back(words[i]);
+    }
+    return out;
+}
+
+char const* PartyRowErrorWord(PartyRowError error)
+{
+    switch (error)
+    {
+        case PartyRowError::None:           return "";
+        case PartyRowError::NotThisVerb:    return "not a party row";
+        case PartyRowError::Malformed:      return "a party-up row is: party-up <helper> [<helper> ...]";
+        case PartyRowError::BadName:        return "a name in the row is not a character name";
+        case PartyRowError::SameNameTwice:  return "the row names one character twice";
+        case PartyRowError::TooManyHelpers: return "the row names more than four helpers";
+    }
+    return "unknown";
+}
+
+char const* PartyLeaderGate(PartyLeaderFacts const& f)
+{
+    namespace R = PartyRefusal;
+    if (!f.hasBotAI)
+        return R::LeaderNotABot;
+    if (!f.inWorld)
+        return R::LeaderNotInWorld;
+    if (!f.alive)
+        return R::LeaderDead;
+    if (f.inCombat)
+        return R::LeaderInCombat;
+    if (f.inInstance)
+        return R::LeaderInInstance;
+    if (f.leadsQuestParty)
+        return R::LeaderHasAParty;
+    if (f.inGroup)
+        return R::LeaderInAGroup;
+    if (f.leadsCampaign)
+        return R::LeaderLeadsCampaign;
+    if (f.onRoster)
+        return R::LeaderOnRoster;
+    return "";
+}
+
+char const* PartyHelperGate(PartyHelperFacts const& f)
+{
+    namespace R = PartyRefusal;
+    if (!f.inWorld)
+        return R::NotInWorld;
+    if (!f.hasBotAI)
+        return R::NotABot;
+    if (!f.alive)
+        return R::Dead;
+    if (f.inCombat)
+        return R::InCombat;
+    if (f.inInstance)
+        return R::InInstance;
+    if (f.group == PartyGroupState::OtherParty)
+        return R::InAnotherParty;
+    if (!f.sameMapAsLeader)
+        return R::OtherMap;
+    if (f.yardsFromLeader < 0.f || f.yardsFromLeader > PARTY_RANGE_YARDS)
+        return R::TooFar;
+    if (f.familyCampaign)
+        return R::FamilyCampaign;
+    return "";
+}
+
+PartyWalkRequest ParsePartyWalkRequest(std::string const& command)
+{
+    PartyWalkRequest out;
+    std::vector<std::string> const words = GuildFinderWords(command);
+    if (words.size() < 2 || words.size() > 3 || words[0] != PARTY_WALK_VERB)
+    {
+        out.error = PartyRefusal::MalformedWalk;
+        return out;
+    }
+    std::string rewritten = SPAWN_WALK_VERB;
+    for (std::size_t i = 1; i < words.size(); ++i)
+        rewritten += " " + words[i];
+    SpawnWalkRequest const spawn = ParseSpawnWalkRequest(rewritten);
+    if (*spawn.error)
+    {
+        out.error = PartyRefusal::MalformedWalk;
+        return out;
+    }
+    if (spawn.gameObject)
+    {
+        out.error = PartyRefusal::NotAnObjective;
+        return out;
+    }
+    out.spawnWalkCommand = rewritten;
+    return out;
+}
+
+char const* PartyWalkGate(PartyWalkFacts const& f)
+{
+    namespace R = PartyRefusal;
+    if (!f.leadsQuestParty)
+        return R::NoParty;
+    if (f.anyoneDead)
+        return R::Dead;
+    if (f.anyoneOtherMap)
+        return R::OtherMap;
+    if (f.farthestYards < 0.f || f.farthestYards > PARTY_RANGE_YARDS)
+        return R::TooFar;
+    return "";
+}
+
+PartyEnds PartyNext(PartyPollFacts const& f)
+{
+    if (f.anyoneDead)
+        return PartyEnds::MemberDied;
+    if (f.anyoneGone)
+        return PartyEnds::MemberGone;
+    if (f.anyoneInInstance)
+        return PartyEnds::InstanceEntered;
+    if (f.secondsUp >= f.ceilingSeconds)
+        return PartyEnds::TimedOut;
+    return PartyEnds::Standing;
+}
+
+char const* PartyEndsWord(PartyEnds ends)
+{
+    switch (ends)
+    {
+        case PartyEnds::Standing:        return "standing";
+        case PartyEnds::MemberDied:      return "a member died";
+        case PartyEnds::MemberGone:      return "a member left the party or the world";
+        case PartyEnds::InstanceEntered: return "a member entered an instance";
+        case PartyEnds::TimedOut:        return "timed out";
+    }
+    return "unknown";
+}
+
 // ------------------------------- quest objectives that need a USE (kind='quest') --
 
 namespace
