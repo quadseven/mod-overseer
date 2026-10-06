@@ -18983,7 +18983,18 @@ struct FinderMember
     // The core's lock on the dungeon for this member (LfgLockStatusType), or
     // zero when it may queue.
     std::uint32_t lock{0};
+    // The role bits this member answers the role check with, or zero for every
+    // role its class could fill (FinderRoleMask). A family stand-in answers
+    // with its seat alone (StandinSeatRoleMask), because it was brought in to
+    // fill that seat and the finder must not hand it another.
+    std::uint8_t roleMask{0};
 };
+
+// The role bits one member answers the finder's role check with: its own
+// `roleMask` when it carries one, else every role its class could fill. Read
+// by the readiness check and by the Join that answers the role check, so the
+// two cannot disagree about a stand-in.
+std::uint8_t FinderMemberRoleMask(FinderMember const& member);
 
 struct FinderFacts
 {
@@ -20476,6 +20487,146 @@ char const* BattlegroundQueueRefusal(BattlegroundQueueFacts const& facts);
 // How a refusal is retried: the level and the grammar never change by
 // waiting; a full queue list, a deserter debuff or the dungeon finder do.
 TownRetry BattlegroundQueueRetry(std::string const& detail);
+
+// ---------------------------------------------------------------- stand-ins --
+//
+// A FAMILY MEMBER SITS OUT AND A GUILD MEMBER STANDS IN (operator request,
+// 2026-10-05). The operator asked that a family member busy tailoring be
+// replaced by a different damage dealer, tank or healer, so the family's
+// dungeon campaign keeps running with a guest in the seat the crafter left.
+//
+// THE BRIDGE DECIDES, THE MODULE ONLY READS. The bridge writes at most one row
+// per family into overseer_family_standin
+// (2026_10_05_00_overseer_family_standin.sql) and deletes it when the crafter
+// is done; `family` there is the head's name. Everything below is what the
+// module does with a row it reads.
+
+enum class StandinSeat : std::uint8_t
+{
+    Tank,
+    Healer,
+    Damage,
+};
+
+// The table's ENUM word: 'tank', 'healer' or 'dps'. False on anything else.
+bool ParseStandinSeat(std::string const& word, StandinSeat& seat);
+char const* StandinSeatWord(StandinSeat seat);
+
+// The finder role bits a guest answers the role check with: its seat alone,
+// never the leader bit, because the head leads and the guest is not the head.
+std::uint8_t StandinSeatRoleMask(StandinSeat seat);
+
+struct FamilyStandin
+{
+    std::string family;    // the head's name
+    std::string outName;   // the member who sits out
+    std::string inName;    // the guest who takes the seat
+    StandinSeat seat{StandinSeat::Damage};
+    std::string reason;
+
+    // An empty guest is "no stand-in", which is how the frozen slot of a
+    // family with none reads.
+    bool Active() const { return !inName.empty(); }
+    // The same swap: who sits out, who stands in, and in which seat. The
+    // reason is words for the log and does not make a different party.
+    bool SameSwap(FamilyStandin const& other) const;
+};
+
+enum class StandinRefusal : std::uint8_t
+{
+    None,
+    Incomplete,        // a name is empty
+    NoSuchFamily,      // `family` names no head on the roster
+    SwapsTheHead,      // the head never sits out
+    OutNotInFamily,    // `out_name` is not one of this family's members
+    GuestOnRoster,     // `in_name` is a roster character, of any family
+    GuestIsOut,        // the same character on both sides
+    SecondForFamily,   // the family already has its stand-in
+    GuestTaken,        // the guest already stands in for another family
+};
+
+char const* StandinRefusalWord(StandinRefusal refusal);
+
+// Is this row a legal stand-in for this family? `members` is the family's
+// enabled roster, `leader` its head, and `wholeRoster` every enabled roster
+// character of every family: a member of another family is not a guest,
+// because its own campaign directs it.
+StandinRefusal CheckStandin(std::vector<std::string> const& members, std::string const& leader,
+                            FamilyStandin const& standin,
+                            std::vector<std::string> const& wholeRoster);
+
+// THE RUN'S PARTY: the roster minus the member who sits out plus the guest, in
+// roster order with the guest in the place the out member held. With no
+// stand-in, or one CheckStandin refuses against this roster, it is the roster
+// unchanged: a bad row never shrinks a family.
+std::vector<std::string> RunParty(std::vector<std::string> const& members,
+                                  std::string const& leader, FamilyStandin const* standin);
+
+struct StandinRefused
+{
+    FamilyStandin row;
+    StandinRefusal why{StandinRefusal::None};
+};
+
+struct StandinBook
+{
+    std::map<std::string, FamilyStandin> byHead;   // the legal stand-in per head
+    std::vector<StandinRefused> refused;
+};
+
+// Every row the table holds, in id order, against every family on the roster.
+// ONE STAND-IN PER FAMILY AND ONE FAMILY PER GUEST: the table's unique key
+// already holds the first, and the first row in id order wins either way, so a
+// guest asked for twice stands in for the family that asked first.
+StandinBook ChooseStandins(std::vector<FamilyStandin> const& rows,
+                           std::vector<FamilyRoster> const& rosters);
+
+// Where the family's dungeon coordinator stands, as the stand-in rule reads it.
+enum class StandinWindow : std::uint8_t
+{
+    Idle,        // nothing runs
+    Resetting,   // a run is opening (or the next of a campaign): nobody is inside
+    Running,     // every other phase: the party is the one the run began with
+};
+
+enum class StandinMove : std::uint8_t
+{
+    Keep,           // the frozen party stands
+    Apply,          // none frozen, the row is applied
+    Swap,           // a different row replaces the frozen one
+    Release,        // the row is gone, the frozen one is let go
+    WaitForGuest,   // the row's guest is not in the world; nothing changes yet
+};
+
+char const* StandinMoveWord(StandinMove move);
+
+struct StandinStep
+{
+    StandinMove move{StandinMove::Keep};
+    FamilyStandin frozen;   // what the family runs with after this step
+};
+
+// APPLIED ONLY BETWEEN RUNS, AND FROZEN FOR THE WHOLE RUN. A run's party is
+// read by its census, its crossing, its reset, its outcome and its stamps, and
+// a party that changed under a run would have it count a member it never took
+// in, or abandon one it did. So the table is obeyed only while the coordinator
+// is IDLE or RESETTING, where nobody is inside, and at every other phase the
+// party frozen when the run opened stands even if the row is deleted or
+// changed: the run ends with the party it began with.
+//
+// A row whose guest is not in the world is not applied, so a family is never
+// broken up for a guest who is not there to take the seat. An inactive `row`
+// means the table holds no legal row for this family.
+StandinStep NextFrozenStandin(StandinWindow window, FamilyStandin const& frozen,
+                              FamilyStandin const& row, bool guestInWorld);
+
+// May a drive steer this stand-in guest? It is not on the roster, so the
+// roster gate (RosterCharacterIsSteerable) refuses it under
+// Overseer.RequireClient. A registered guest is steerable while it is in the
+// world with a client or as a bot; an unregistered character never is by this
+// rule.
+bool StandinGuestIsSteerable(bool registeredGuest, bool clientAttached, bool inWorld,
+                             bool isBotSession);
 
 }  // namespace OverseerDecisions
 
