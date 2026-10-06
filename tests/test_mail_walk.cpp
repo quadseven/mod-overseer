@@ -183,6 +183,33 @@ void TheGateNamesTheFirstWall()
     f.heldByAnother = true;
     CheckText("another verb's hold is not taken over", MailWalkGate(f), R::HeldByAnother);
 
+    // A roster member sitting out for a stand-in walks like a guildmate.
+    f = Ready();
+    f.onRoster = true;
+    f.sittingOut = true;
+    CheckText("a member sitting out is walked", MailWalkGate(f), "");
+
+    // Every other wall still holds for the member sitting out.
+    f = Ready();
+    f.onRoster = true;
+    f.sittingOut = true;
+    f.inInstance = true;
+    CheckText("sitting out, in an instance", MailWalkGate(f), R::InInstance);
+    f.inInstance = false;
+    f.inCombat = true;
+    CheckText("sitting out, in combat", MailWalkGate(f), R::InCombat);
+    f.inCombat = false;
+    f.inFlight = true;
+    CheckText("sitting out, on a taxi", MailWalkGate(f), R::InFlight);
+    f.inFlight = false;
+    f.groupedFollower = true;
+    CheckText("sitting out, grouped as a follower", MailWalkGate(f), R::Follower);
+
+    // Sitting out without being on the roster changes nothing.
+    f = Ready();
+    f.sittingOut = true;
+    CheckText("non-roster is unchanged", MailWalkGate(f), "");
+
     // Combat outranks the roster: the row says the wall that moves first.
     f = Ready();
     f.inCombat = true;

@@ -16880,6 +16880,10 @@ struct MailWalkGateFacts
     bool inCombat{false};
     bool inInstance{false};
     bool onRoster{false};
+    // A roster member sitting out its family's campaign for a stand-in. It has
+    // left the family group and travel_npc has no mailbox target, so it walks
+    // like a guildmate; every other wall still applies.
+    bool sittingOut{false};
     bool groupedFollower{false};
     bool alreadyWalking{false};
     bool heldByAnother{false};

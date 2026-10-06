@@ -14538,7 +14538,7 @@ char const* MailWalkGate(MailWalkGateFacts const& facts)
         return R::InCombat;
     if (facts.inInstance)
         return R::InInstance;
-    if (facts.onRoster)
+    if (facts.onRoster && !facts.sittingOut)
         return R::OnRoster;
     if (facts.groupedFollower)
         return R::Follower;

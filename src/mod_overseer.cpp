@@ -7672,6 +7672,17 @@ private:
         static std::set<std::string> names;
         return names;
     }
+    // THE MEMBERS SITTING OUT, frozen at the same poll and behind the same lock.
+    static std::set<std::string>& StandinOutNames()
+    {
+        static std::set<std::string> names;
+        return names;
+    }
+    static bool IsStandinSittingOut(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(StandinGuestLock());
+        return StandinOutNames().count(name) != 0;
+    }
     static bool IsStandinGuest(std::string const& name)
     {
         std::lock_guard<std::mutex> guard(StandinGuestLock());
@@ -43600,9 +43611,14 @@ private:
         {
             std::lock_guard<std::mutex> guard(StandinGuestLock());
             StandinGuestNames().clear();
+            StandinOutNames().clear();
             for (auto const& entry : _frozenStandins)
+            {
                 if (entry.second.HasGuest())
                     StandinGuestNames().insert(entry.second.inName);
+                if (entry.second.Active())
+                    StandinOutNames().insert(entry.second.outName);
+            }
         }
         SweepLeavingGuests();
     }
@@ -65611,6 +65627,7 @@ private:
         gate.inCombat = who->IsInCombat();
         gate.inInstance = map && map->Instanceable();
         gate.onRoster = OnRoster(ev.character);
+        gate.sittingOut = IsStandinSittingOut(ev.character);
         Group* group = who->GetGroup();
         gate.groupedFollower = group && group->GetLeaderGUID() != who->GetGUID();
         for (MailWalkCheck const& check : walking)
