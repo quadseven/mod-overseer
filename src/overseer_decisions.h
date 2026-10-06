@@ -20500,6 +20500,14 @@ TownRetry BattlegroundQueueRetry(std::string const& detail);
 // (2026_10_05_00_overseer_family_standin.sql) and deletes it when the crafter
 // is done; `family` there is the head's name. Everything below is what the
 // module does with a row it reads.
+//
+// A ROW WITH NO GUEST (operator decision, 2026-10-05): `in_name` empty means
+// the member sits out and nobody takes its seat, because no guild member could
+// be found who fits the door. The family then runs short-handed: its run party
+// is the roster without the member (four of five), the dungeon finder refuses
+// a party under FINDER_GROUP_SIZE (ReadFinderReadiness), and the run goes in
+// by the walk-in path, whose staging, census, barrier, crossing and reset all
+// read the run's party rather than a count of five.
 
 enum class StandinSeat : std::uint8_t
 {
@@ -20520,13 +20528,16 @@ struct FamilyStandin
 {
     std::string family;    // the head's name
     std::string outName;   // the member who sits out
-    std::string inName;    // the guest who takes the seat
+    std::string inName;    // the guest who takes the seat, or empty for none
     StandinSeat seat{StandinSeat::Damage};
     std::string reason;
 
-    // An empty guest is "no stand-in", which is how the frozen slot of a
-    // family with none reads.
-    bool Active() const { return !inName.empty(); }
+    // A member sits out. An empty out member is "no stand-in", which is how
+    // the frozen slot of a family with none reads.
+    bool Active() const { return !outName.empty(); }
+    // Somebody takes the seat. False for a row that sits the member out with
+    // no guest, where the family runs short-handed.
+    bool HasGuest() const { return !inName.empty(); }
     // The same swap: who sits out, who stands in, and in which seat. The
     // reason is words for the log and does not make a different party.
     bool SameSwap(FamilyStandin const& other) const;
@@ -20535,7 +20546,7 @@ struct FamilyStandin
 enum class StandinRefusal : std::uint8_t
 {
     None,
-    Incomplete,        // a name is empty
+    Incomplete,        // the family or the member sitting out is empty
     NoSuchFamily,      // `family` names no head on the roster
     SwapsTheHead,      // the head never sits out
     OutNotInFamily,    // `out_name` is not one of this family's members
@@ -20556,7 +20567,8 @@ StandinRefusal CheckStandin(std::vector<std::string> const& members, std::string
                             std::vector<std::string> const& wholeRoster);
 
 // THE RUN'S PARTY: the roster minus the member who sits out plus the guest, in
-// roster order with the guest in the place the out member held. With no
+// roster order with the guest in the place the out member held. A row with no
+// guest is the roster minus the member sitting out, one short. With no
 // stand-in, or one CheckStandin refuses against this roster, it is the roster
 // unchanged: a bad row never shrinks a family.
 std::vector<std::string> RunParty(std::vector<std::string> const& members,
@@ -20577,7 +20589,8 @@ struct StandinBook
 // Every row the table holds, in id order, against every family on the roster.
 // ONE STAND-IN PER FAMILY AND ONE FAMILY PER GUEST: the table's unique key
 // already holds the first, and the first row in id order wins either way, so a
-// guest asked for twice stands in for the family that asked first.
+// guest asked for twice stands in for the family that asked first. Rows with
+// no guest never collide with each other on the guest.
 StandinBook ChooseStandins(std::vector<FamilyStandin> const& rows,
                            std::vector<FamilyRoster> const& rosters);
 
@@ -20615,8 +20628,9 @@ struct StandinStep
 // changed: the run ends with the party it began with.
 //
 // A row whose guest is not in the world is not applied, so a family is never
-// broken up for a guest who is not there to take the seat. An inactive `row`
-// means the table holds no legal row for this family.
+// broken up for a guest who is not there to take the seat. A row with no guest
+// waits for nobody (`guestInWorld` is not read). An inactive `row` means the
+// table holds no legal row for this family.
 StandinStep NextFrozenStandin(StandinWindow window, FamilyStandin const& frozen,
                               FamilyStandin const& row, bool guestInWorld);
 
@@ -20627,6 +20641,9 @@ StandinStep NextFrozenStandin(StandinWindow window, FamilyStandin const& frozen,
 // rule.
 bool StandinGuestIsSteerable(bool registeredGuest, bool clientAttached, bool inWorld,
                              bool isBotSession);
+
+// The guest's name for a log line, or "nobody" for a row with no guest.
+std::string StandinGuestWord(FamilyStandin const& standin);
 
 }  // namespace OverseerDecisions
 

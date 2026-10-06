@@ -123,8 +123,10 @@ void OtherBadRowsAreRefused()
     Check("a row for another head is refused",
           CheckStandin(kFamily, "Grug", Row("Og", "Thak", StandinSeat::Damage, "Zug"), kFamily) ==
               StandinRefusal::NoSuchFamily);
-    Check("an empty guest is refused",
-          CheckStandin(kFamily, "Grug", Row("Og", ""), kFamily) == StandinRefusal::Incomplete);
+    Check("an empty member sitting out is refused",
+          CheckStandin(kFamily, "Grug", Row("", "Thak"), kFamily) == StandinRefusal::Incomplete);
+    Check("an empty guest is a sit-out with no guest (test_family_four_handed)",
+          CheckStandin(kFamily, "Grug", Row("Og", ""), kFamily) == StandinRefusal::None);
     Check("a legal row passes",
           CheckStandin(kFamily, "Grug", Row("Og", "Thak"), kFamily) == StandinRefusal::None);
 }
