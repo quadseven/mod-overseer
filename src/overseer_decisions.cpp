@@ -15177,6 +15177,13 @@ bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed)
     return !straightLegGrounded && farWalkMapAllowed;
 }
 
+char const* SpawnWalkFirstStepRefusal(bool creatureSpawn, bool firstLegHasStep)
+{
+    if (!creatureSpawn || firstLegHasStep)
+        return "";
+    return SpawnWalkRefusal::SpawnFirstStepDrop;
+}
+
 bool FarWalkMapAllowed(uint32_t mapId)
 {
     return mapId == FAR_WALK_MAP_EASTERN_KINGDOMS || mapId == FAR_WALK_MAP_KALIMDOR;

@@ -66238,17 +66238,6 @@ private:
         ev.bestYards = choice.yards;
         ev.nowYards = choice.yards;
 
-        // Creature-targeted send and walk rows use the same cliff/drop guard
-        // as every other module-issued walk. A destination whose first safe
-        // step cannot be found is refused before the hold or movement point is
-        // installed, so a creature spawn cannot pull a character over a rim.
-        if (goal == D::WalkGoal::Spawn && !ev.spawnIsObject)
-        {
-            WorldPosition step;
-            if (!GroundedStep(who, WorldPosition(ev.mapId, ev.boxX, ev.boxY, ev.boxZ), step))
-                return refuse("the first step toward the creature goes over a drop");
-        }
-
         // ---- near or far (#633) ----------------------------------------------
         //
         // FAR ONLY WHEN THE DESTINATION IS, and only where a far walk may go:
@@ -66320,6 +66309,27 @@ private:
                          "no first step, so it goes by the travel survey instead",
                          noun, id, ev.character, ev.mailboxName);
             }
+        }
+
+        // THE DROP GUARD READS THE FIRST LEG, NOT THE WHOLE WAY. A creature
+        // spawn must not pull a character over a rim, so a walk whose first
+        // step has no ground is refused before the hold or the movement point
+        // is installed (#648). That step is the leg the walk will actually
+        // take: at most MAIL_WALK_LEG_YARDS of the straight line, or the travel
+        // survey's next leg once the walk is far. The guard used to hand the
+        // spawn itself to GroundedStep, a probe of the whole distance, which
+        // was refused for every spawn past about 700 yards from a character on
+        // a plateau or in a capital: 43 of 163 class quest walks on the dev realm on
+        // 2026-10-06 ended "goes over a drop" with no step taken, none of them
+        // under 695 yards, and the survey that knows the way down was never
+        // asked.
+        if (goal == D::WalkGoal::Spawn)
+        {
+            WorldPosition firstLeg;
+            if (char const* wall = D::SpawnWalkFirstStepRefusal(
+                    !ev.spawnIsObject, MailWalkLegStep(who, ev, firstLeg));
+                *wall)
+                return refuse(wall);
         }
 
         // ---- the way there ---------------------------------------------------
