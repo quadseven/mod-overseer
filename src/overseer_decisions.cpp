@@ -833,6 +833,31 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
     }
 }
 
+PlaneHearthVerdict DecidePlaneHearth(PlaneHearthFacts const& facts)
+{
+    if (!facts.onPlane)
+        return {PlaneHearthAction::NotOnPlane, "it is not on the hidden plane"};
+    if (facts.alreadyHearthedThisWindow)
+        return {PlaneHearthAction::GiveUp,
+                "it has already used its hearthstone off the plane in this forget "
+                "window"};
+    if (!facts.hasStone)
+        return {PlaneHearthAction::GiveUp, "it carries no hearthstone"};
+    if (facts.bindMap != facts.currentMap)
+        return {PlaneHearthAction::GiveUp,
+                "its hearthstone is bound on map " + std::to_string(facts.bindMap) +
+                    ", not map " + std::to_string(facts.currentMap) +
+                    ", and nothing here changes a map (#188)"};
+    if (!facts.stoneReady)
+        return {PlaneHearthAction::GiveUp, "its hearthstone is on cooldown"};
+    return {PlaneHearthAction::Hearth,
+            facts.groundOnRecord
+                ? "returning it to its last ground did not hold, and its hearthstone "
+                  "is ready and bound on this map"
+                : "it has no ground on record to return to, and its hearthstone is "
+                  "ready and bound on this map"};
+}
+
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap)
 {

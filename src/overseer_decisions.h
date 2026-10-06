@@ -1068,6 +1068,62 @@ TerrainRecoveryVerdict TerrainRecoveryStep(TerrainRecoveryState& state,
                                            TerrainRecoveryLimits const& limits,
                                            time_t now);
 
+// OFF THE HIDDEN PLANE BY HEARTHSTONE, WHEN THE LADDER HAS NOTHING LEFT.
+//
+// MEASURED (2026-10-05, after a worldserver restart). Four of one family's
+// five logged in at their saved position on the placeholder plane under
+// Stormwind, map 0 around (-8044, 170, 59.5). The plane rung needs the last
+// ground the character stood on, and a restart forgets it, so every poll ended
+// in the plane give-up and none of the four could ever be moved: "NOT MOVING
+// IT AGAIN until the forget window has passed", and then the same again.
+//
+// A PLAYER STUCK THERE USES THE HEARTHSTONE, and so does the bot. It is the
+// item's own spell cast through the item-use path the hearth verb already
+// drives, not a teleport this module writes, and it is offered only where it
+// keeps the guarantee #188 is built on: the homebind must be on the map the
+// character stands on. A hearth across a continent is the bind-point
+// escalation that split the family on 2026-09-05, and it stays refused.
+//
+// ASKED ONLY AT THE GIVE-UP, so a character with ground to go back to still
+// goes back to it first. `groundOnRecord` changes the reason and not the
+// action: the give-up is reached either because returns did not hold or
+// because there was nothing to return to, and the hearth answers both.
+//
+// ONCE PER CHARACTER PER FORGET WINDOW (`alreadyHearthedThisWindow`, which the
+// adapter also sets while a hearth is still being cast). A stone that went out
+// and still left the character on the plane means its inn is not the answer,
+// and the loud give-up says so rather than spending the cooldown again.
+//
+// Each refusal names its reason, so the give-up line says which it was.
+enum class PlaneHearthAction : std::uint8_t
+{
+    // Not on the plane: this rule has nothing to say.
+    NotOnPlane,
+    // Cast the hearthstone.
+    Hearth,
+    // Stay on the plane and say so loudly, with `reason`.
+    GiveUp,
+};
+
+struct PlaneHearthFacts
+{
+    bool onPlane{false};
+    bool groundOnRecord{false};
+    bool hasStone{false};
+    bool stoneReady{false};
+    uint32_t bindMap{0};
+    uint32_t currentMap{0};
+    bool alreadyHearthedThisWindow{false};
+};
+
+struct PlaneHearthVerdict
+{
+    PlaneHearthAction action{PlaneHearthAction::NotOnPlane};
+    std::string reason;
+};
+
+PlaneHearthVerdict DecidePlaneHearth(PlaneHearthFacts const& facts);
+
 // IS THIS CHARACTER BELOW THE WORLD, ON EVIDENCE AND NOT ON A MISSING
 // READING (#725)? A surface overhead by the gap, no instrument standing it on
 // the ground, and (where the movement state was measured) falling. What the
