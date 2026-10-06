@@ -241,9 +241,16 @@ void EachTransportInTheCatalogueIsARouteForItsOwnFactionOnly()
               !RouteKnown(b, !b.hordeCrew));
     }
     // The neutral Ratchet to Booty Bay boat: a goblin crew has no quarrel with either side.
-    D::CrossingOffer neutral = OfferFor(table[0], true);
+    // Built from its own values (both berths surveyed, goblin crew), not from a zeppelin's.
+    D::CrossingOffer neutral;
     neutral.entry = 20808;
     neutral.crew = D::ReadCrewWelcome(8, 0);
+    neutral.berthKnown = true;
+    neutral.landingKnown = true;
+    neutral.toBerthYards = 100.f;
+    neutral.landingToGoalYards = 0.f;
+    neutral.rideSeconds = 60.f;
+    neutral.periodSeconds = 240.f;
     D::CrossingPriceLimits limits;
     limits.yardsPerSecond = 7.f;
     Check("Maiden's Fancy (neutral crew) is a route for either side",
