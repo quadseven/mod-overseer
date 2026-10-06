@@ -15016,6 +15016,7 @@ bool ErrandWalkRefusalRetryable(std::string const& reason)
         || reason == E::VendorStalled || reason == E::TaughtNothing
         || reason == E::TalentsCannotAfford
         || reason == S::SpawnTooFar || reason == S::SpawnGround || reason == S::SpawnCombat
+        || reason == S::SpawnFirstStepDrop
         || reason == S::SpawnDied || reason == S::SpawnLeftWorld || reason == S::SpawnLeftMap
         || reason == S::SpawnFlight || reason == S::SpawnTimedOut || reason == S::SpawnStalled;
 }
@@ -15182,6 +15183,37 @@ char const* SpawnWalkFirstStepRefusal(bool creatureSpawn, bool firstLegHasStep)
     if (!creatureSpawn || firstLegHasStep)
         return "";
     return SpawnWalkRefusal::SpawnFirstStepDrop;
+}
+
+FirstLegPick PickFirstLegWaypoint(std::vector<MailWalkPoint> const& points, float startZ,
+                                  float maxYards, float lethalYards)
+{
+    FirstLegPick pick;
+    if (points.size() < 2)
+        return pick;
+    pick.firstDropYards = startZ - points[1].z;
+    float walked = 0.f;
+    for (std::size_t i = 1; i < points.size(); ++i)
+    {
+        float const dx = points[i].x - points[i - 1].x;
+        float const dy = points[i].y - points[i - 1].y;
+        float const dz = points[i].z - points[i - 1].z;
+        walked += std::sqrt(dx * dx + dy * dy + dz * dz);
+        float const drop = startZ - points[i].z;
+        // The first waypoint is judged on the drop alone: however far off it
+        // is, it is the one the character would walk to.
+        if (drop > lethalYards || (i > 1 && walked > maxYards))
+            break;
+        pick.found = true;
+        pick.point = points[i];
+        pick.dropYards = drop;
+    }
+    return pick;
+}
+
+char const* SpawnWalkFirstLegRefusal(bool creatureSpawn, bool probeFoundStep, bool pathLegFound)
+{
+    return SpawnWalkFirstStepRefusal(creatureSpawn, probeFoundStep || pathLegFound);
 }
 
 bool FarWalkMapAllowed(uint32_t mapId)

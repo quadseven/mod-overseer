@@ -17338,7 +17338,8 @@ char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state);
 // MailWalkRefusalRetryable's answers. Too far is retryable here: a random bot
 // wanders, and the next pass may find it in town. No such destination on the
 // map, a malformed row and a trainer with nothing left to teach are not. A
-// spawn walk's walls follow the same rule: too far, the ground and every
+// spawn walk's walls follow the same rule: too far, the ground, a first leg
+// over a drop (the character moves, and the leg changes with it) and every
 // ending are retryable; a malformed row, a spawn the world does not hold, one
 // on another map and one out of season are not.
 bool ErrandWalkRefusalRetryable(std::string const& reason);
@@ -17522,6 +17523,41 @@ bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed);
 // never on the whole distance: a spawn far off is reached by the road, and
 // whether the road starts well is the first leg's question.
 char const* SpawnWalkFirstStepRefusal(bool creatureSpawn, bool firstLegHasStep);
+
+// THE FIRST LEG OF A WALK, READ OFF THE PATHFINDER'S OWN WAYPOINTS (2026-10-06).
+// The straight-line probe and the interpolated point 250 yards along the path
+// both refused walks the pathfinder routes correctly: a character on a plateau
+// or at a capital's edge stood 74 yards (a warrior in the Barrens) and 374
+// yards (one near Ironforge) above the spawn he was sent to, and every probe
+// that took the spawn's height into the question read a drop. The first leg is
+// the run of waypoints from the character's feet: each is a place on the
+// navmesh, so each is walkable from the one before it, and the only question
+// left is whether the character would end the leg further below where it
+// started than a fall survives. `lethalYards` is LethalFallYards() on a stock
+// realm (69 yards).
+//
+// Walks the waypoints in order, keeping the furthest one that is within
+// `maxYards` along the path and whose drop below `startZ` is within
+// `lethalYards`; stops at the first one beyond either bound. `found` is false
+// for a path of fewer than two points and when the very first waypoint is a
+// lethal drop below the start: a real cliff edge, the one case the guard is
+// for. `firstDropYards` is the first waypoint's drop (negative when it is
+// above the start), so a refusal can say what it saw.
+struct FirstLegPick
+{
+    bool found{false};
+    MailWalkPoint point;
+    float dropYards{0.f};        // of the picked waypoint, below startZ
+    float firstDropYards{0.f};   // of the first waypoint after the start
+};
+FirstLegPick PickFirstLegWaypoint(std::vector<MailWalkPoint> const& points, float startZ,
+                                  float maxYards, float lethalYards);
+
+// The refusal for a creature spawn walk, "" when it may start. A walk starts
+// when its first leg has a step (what the grounded probe found), or when the
+// pathfinder's first leg does (`pathLegFound`, from PickFirstLegWaypoint).
+// Only when neither does is the walk refused as a drop.
+char const* SpawnWalkFirstLegRefusal(bool creatureSpawn, bool probeFoundStep, bool pathLegFound);
 
 // May this character cast its standing craft errand now? On job 'craft'
 // always (the drive's own mode). On a family's campaign jobs - 'town run', or
