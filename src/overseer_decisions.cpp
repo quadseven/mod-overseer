@@ -15185,28 +15185,40 @@ char const* SpawnWalkFirstStepRefusal(bool creatureSpawn, bool firstLegHasStep)
     return SpawnWalkRefusal::SpawnFirstStepDrop;
 }
 
-FirstLegPick PickFirstLegWaypoint(std::vector<MailWalkPoint> const& points, float startZ,
-                                  float maxYards, float lethalYards)
+FirstLegPick PickFirstLegWaypoint(std::vector<MailWalkPoint> const& points, float maxYards,
+                                  float strideYards, float maxStrideDrop)
 {
     FirstLegPick pick;
     if (points.size() < 2)
         return pick;
-    pick.firstDropYards = startZ - points[1].z;
     float walked = 0.f;
     for (std::size_t i = 1; i < points.size(); ++i)
     {
-        float const dx = points[i].x - points[i - 1].x;
-        float const dy = points[i].y - points[i - 1].y;
-        float const dz = points[i].z - points[i - 1].z;
-        walked += std::sqrt(dx * dx + dy * dy + dz * dz);
-        float const drop = startZ - points[i].z;
-        // The first waypoint is judged on the drop alone: however far off it
-        // is, it is the one the character would walk to.
-        if (drop > lethalYards || (i > 1 && walked > maxYards))
+        MailWalkPoint const& a = points[i - 1];
+        MailWalkPoint const& b = points[i];
+        float const dx = b.x - a.x;
+        float const dy = b.y - a.y;
+        float const length = std::sqrt(dx * dx + dy * dy);
+        float const drop = a.z - b.z;
+        float const stride = (length > strideYards && strideYards > 0.f)
+            ? drop * strideYards / length
+            : drop;
+        if (i == 1)
+            pick.firstStrideDrop = stride;
+        if (stride > maxStrideDrop)
             break;
+        if (walked + length > maxYards && length > 0.f)
+        {
+            float const t = (maxYards - walked) / length;
+            pick.found = true;
+            pick.point = MailWalkPoint{a.x + dx * t, a.y + dy * t, a.z + (b.z - a.z) * t};
+            pick.netDropYards = points[0].z - pick.point.z;
+            return pick;
+        }
+        walked += length;
         pick.found = true;
-        pick.point = points[i];
-        pick.dropYards = drop;
+        pick.point = b;
+        pick.netDropYards = points[0].z - b.z;
     }
     return pick;
 }

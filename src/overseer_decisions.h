@@ -17524,34 +17524,31 @@ bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed);
 // whether the road starts well is the first leg's question.
 char const* SpawnWalkFirstStepRefusal(bool creatureSpawn, bool firstLegHasStep);
 
-// THE FIRST LEG OF A WALK, READ OFF THE PATHFINDER'S OWN WAYPOINTS (2026-10-06).
-// The straight-line probe and the interpolated point 250 yards along the path
-// both refused walks the pathfinder routes correctly: a character on a plateau
-// or at a capital's edge stood 74 yards (a warrior in the Barrens) and 374
-// yards (one near Ironforge) above the spawn he was sent to, and every probe
-// that took the spawn's height into the question read a drop. The first leg is
-// the run of waypoints from the character's feet: each is a place on the
-// navmesh, so each is walkable from the one before it, and the only question
-// left is whether the character would end the leg further below where it
-// started than a fall survives. `lethalYards` is LethalFallYards() on a stock
-// realm (69 yards).
+// THE FIRST LEG OF A WALK, READ OFF THE PATHFINDER'S OWN WAYPOINTS, AND A DROP
+// JUDGED LOCALLY (2026-10-06). The first version of this compared the height of
+// a waypoint with the start's over the whole leg and refused a 592 yard ramp
+// that falls 74 yards (about seven degrees) because 74 is more than a fall
+// survives. A drop is a vertical step: a long leg is as steep as its steepest
+// stride and no steeper. Each segment between consecutive waypoints is scaled
+// to a `strideYards` stride (a segment shorter than the stride counts whole)
+// and refused only when that stride falls more than `maxStrideDrop`.
 //
-// Walks the waypoints in order, keeping the furthest one that is within
-// `maxYards` along the path and whose drop below `startZ` is within
-// `lethalYards`; stops at the first one beyond either bound. `found` is false
-// for a path of fewer than two points and when the very first waypoint is a
-// lethal drop below the start: a real cliff edge, the one case the guard is
-// for. `firstDropYards` is the first waypoint's drop (negative when it is
-// above the start), so a refusal can say what it saw.
+// Walks the segments in order and takes the furthest point within `maxYards`
+// along the path: a waypoint, or the point on the segment that crosses the
+// reach. Stops at the first segment with a steep stride. `found` is false for a
+// path of fewer than two points and when the very first segment is a cliff.
+// `firstStrideDrop` is that first segment's stride drop (negative when it
+// climbs), `netDropYards` the picked point's height below the first
+// waypoint's start, so a refusal can say what it saw.
 struct FirstLegPick
 {
     bool found{false};
     MailWalkPoint point;
-    float dropYards{0.f};        // of the picked waypoint, below startZ
-    float firstDropYards{0.f};   // of the first waypoint after the start
+    float netDropYards{0.f};
+    float firstStrideDrop{0.f};
 };
-FirstLegPick PickFirstLegWaypoint(std::vector<MailWalkPoint> const& points, float startZ,
-                                  float maxYards, float lethalYards);
+FirstLegPick PickFirstLegWaypoint(std::vector<MailWalkPoint> const& points, float maxYards,
+                                  float strideYards, float maxStrideDrop);
 
 // The refusal for a creature spawn walk, "" when it may start. A walk starts
 // when its first leg has a step (what the grounded probe found), or when the

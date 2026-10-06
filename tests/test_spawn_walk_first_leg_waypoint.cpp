@@ -1,6 +1,6 @@
 /*
  * A creature spawn walk's drop guard reads the pathfinder's first waypoint
- * (2026-10-06, after the first-leg fix of #868 still refused the guild's class
+ * (2026-10-06; #872 judged the net drop of the leg and still refused the class
  * quest walks).
  *
  * Live rows on the dev realm, every pass: a warrior in the Barrens at z 101.338
@@ -39,77 +39,78 @@ void Check(char const* what, bool ok)
     ++failures;
 }
 
-float const LETHAL = D::LethalFallYards();
+constexpr float STRIDE = 5.f;
+constexpr float SAFE = 10.f;   // TRAVEL_GROUND_DROP_YARDS
 
-// Bigzug, map 1: start (-278.664, -3957.11, 101.338), Uzzek at z 27.3383.
+D::FirstLegPick Pick(std::vector<MailWalkPoint> const& path)
+{
+    return D::PickFirstLegWaypoint(path, 250.f, STRIDE, SAFE);
+}
+
+// Bigzug, map 1, live on 2026-10-06 22:36: bot z 101.338, the path's first
+// waypoint is the destination at z 27.2, 592 yards off. The net drop is 74
+// yards (more than a fall survives) over a seven degree ramp.
 void TheBarrensWarrior()
 {
-    float const startZ = 101.338f;
-    float const spawnZ = 27.3383f;
-    Check("the whole way down is a lethal drop (what a straight probe read)",
-          startZ - spawnZ > LETHAL);
     std::vector<MailWalkPoint> const path = {
-        {-278.664f, -3957.11f, startZ},
-        {-250.f, -3940.f, 99.f},
-        {-120.f, -3860.f, 90.f},
-        {185.746f, -3597.21f, spawnZ},
+        {-278.664f, -3957.11f, 101.338f},
+        {185.746f, -3597.21f, 27.2f},
     };
-    D::FirstLegPick const pick = D::PickFirstLegWaypoint(path, startZ, 250.f, LETHAL);
-    Check("the first leg is found", pick.found);
-    Check("its drop is the first waypoint's, small", pick.firstDropYards < 5.f);
-    Check("the leg ends at the furthest waypoint inside the reach", pick.point.z == 90.f);
+    float const net = 101.338f - 27.2f;
+    Check("the net drop of the leg is over the lethal fall (what failed live)",
+          net > D::LethalFallYards());
+    D::FirstLegPick const pick = Pick(path);
+    Check("the ramp passes the guard", pick.found);
+    Check("its steepest stride drops under a yard", pick.firstStrideDrop < 1.f);
+    Check("the step is the reach along the leg, not the far end",
+          pick.point.x < path[1].x && pick.point.z < 101.338f && pick.point.z > 27.2f);
     Check("the guard lets the walk start",
           *D::SpawnWalkFirstLegRefusal(true, false, pick.found) == '\0');
 }
 
-// Gronk and Hurk, map 0: start z 483.183, Ilsa Corbin at z 109.521.
+// Gronk (z 483.183) and Hurk (z 423.1), map 0, live: the path's first waypoint
+// is the destination at z 109.4, thousands of yards off.
 void TheDwarfWarriors()
 {
-    float const startZ = 483.183f;
-    Check("the spawn is far below the start", startZ - 109.521f > LETHAL);
-    std::vector<MailWalkPoint> const path = {
-        {-6049.f, -206.714f, startZ},
-        {-6030.f, -190.f, 480.f},
-        {-5900.f, -100.f, 470.f},
-        {-8688.56f, 325.764f, 109.521f},
-    };
-    D::FirstLegPick const pick = D::PickFirstLegWaypoint(path, startZ, 250.f, LETHAL);
-    Check("found", pick.found);
-    Check("stops before the far waypoint", pick.point.z == 470.f);
+    for (float startZ : {483.183f, 423.1f})
+    {
+        std::vector<MailWalkPoint> const path = {
+            {-6049.f, -206.714f, startZ},
+            {-8688.56f, 325.764f, 109.4f},
+        };
+        D::FirstLegPick const pick = Pick(path);
+        Check("a long ramp far below the start passes", pick.found);
+    }
 }
 
 void ALongFlatLegPasses()
 {
-    std::vector<MailWalkPoint> const path = {{0.f, 0.f, 50.f}, {400.f, 0.f, 50.f}};
-    D::FirstLegPick const pick = D::PickFirstLegWaypoint(path, 50.f, 250.f, LETHAL);
-    Check("a first waypoint beyond the reach is still the leg", pick.found);
-    Check("and it is that waypoint", pick.point.x == 400.f);
+    D::FirstLegPick const pick = Pick({{0.f, 0.f, 50.f}, {400.f, 0.f, 50.f}});
+    Check("found", pick.found);
+    Check("the step is the reach along it", pick.point.x == 250.f);
 }
 
-void ARealCliffIsStillRefused()
+void ATrueCliffInTheFirstTenYardsIsRefused()
 {
-    std::vector<MailWalkPoint> const path = {{0.f, 0.f, 100.f}, {5.f, 0.f, 20.f},
-                                             {40.f, 0.f, 20.f}};
-    D::FirstLegPick const pick = D::PickFirstLegWaypoint(path, 100.f, 250.f, LETHAL);
-    Check("a first waypoint 80 yards down gives no leg", !pick.found);
-    Check("and the drop is reported", pick.firstDropYards > LETHAL);
+    D::FirstLegPick const pick = Pick({{0.f, 0.f, 100.f}, {10.f, 0.f, 20.f}, {400.f, 0.f, 20.f}});
+    Check("80 yards down in 10 yards gives no leg", !pick.found);
+    Check("the stride drop is reported", pick.firstStrideDrop > SAFE);
     Check("so the guard refuses with the bridge's words",
           std::strcmp(D::SpawnWalkFirstLegRefusal(true, false, pick.found),
                       D::SpawnWalkRefusal::SpawnFirstStepDrop) == 0);
 }
 
-void ADescentStopsBeforeTheLethalWaypoint()
+void ASteepStrideAfterAGoodOneEndsTheLegBeforeIt()
 {
-    std::vector<MailWalkPoint> const path = {{0.f, 0.f, 100.f}, {10.f, 0.f, 90.f},
-                                             {20.f, 0.f, 80.f}, {30.f, 0.f, 20.f}};
-    D::FirstLegPick const pick = D::PickFirstLegWaypoint(path, 100.f, 250.f, LETHAL);
-    Check("the leg ends at the last waypoint that survives", pick.found && pick.point.z == 80.f);
+    D::FirstLegPick const pick =
+        Pick({{0.f, 0.f, 100.f}, {50.f, 0.f, 95.f}, {55.f, 0.f, 20.f}});
+    Check("the leg is the good part", pick.found && pick.point.z == 95.f);
 }
 
 void TooShortAPathGivesNothing()
 {
-    Check("no waypoints", !D::PickFirstLegWaypoint({}, 0.f, 250.f, LETHAL).found);
-    Check("one waypoint", !D::PickFirstLegWaypoint({{0.f, 0.f, 0.f}}, 0.f, 250.f, LETHAL).found);
+    Check("no waypoints", !Pick({}).found);
+    Check("one waypoint", !Pick({{0.f, 0.f, 0.f}}).found);
 }
 
 void ADropRefusalIsRetryable()
@@ -144,8 +145,8 @@ int main()
     TheBarrensWarrior();
     TheDwarfWarriors();
     ALongFlatLegPasses();
-    ARealCliffIsStillRefused();
-    ADescentStopsBeforeTheLethalWaypoint();
+    ATrueCliffInTheFirstTenYardsIsRefused();
+    ASteepStrideAfterAGoodOneEndsTheLegBeforeIt();
     TooShortAPathGivesNothing();
     ADropRefusalIsRetryable();
     AGameobjectIsNeverRefused();
