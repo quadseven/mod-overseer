@@ -19083,6 +19083,110 @@ char const* PartyEndsWord(PartyEnds ends)
     return "unknown";
 }
 
+// ----------------------------------------------------------------- cross-to-map --
+
+bool IsCrossRow(std::string const& command)
+{
+    std::vector<std::string> const words = GuildFinderWords(command);
+    return !words.empty() && words[0] == CROSS_VERB;
+}
+
+CrossRequest ParseCrossRequest(std::string const& command)
+{
+    CrossRequest out;
+    std::vector<std::string> const words = GuildFinderWords(command);
+    char const prefix[] = "map:";
+    if (words.size() != 2 || words[0] != CROSS_VERB || words[1].compare(0, 4, prefix) != 0)
+    {
+        out.error = CrossRefusal::Malformed;
+        return out;
+    }
+    std::string const digits = words[1].substr(4);
+    if (digits.empty() || digits.size() > 5 ||
+        digits.find_first_not_of("0123456789") != std::string::npos)
+    {
+        out.error = CrossRefusal::Malformed;
+        return out;
+    }
+    // At most five digits, so this cannot overflow, and it cannot throw.
+    for (char c : digits)
+        out.map = out.map * 10 + static_cast<std::uint32_t>(c - '0');
+    return out;
+}
+
+char const* CrossGate(CrossFacts const& f)
+{
+    namespace R = CrossRefusal;
+    if (!f.enabled)
+        return R::Disabled;
+    if (!f.isBot)
+        return R::NotABot;
+    if (!f.inWorld)
+        return R::NotInWorld;
+    if (!f.alive)
+        return R::Dead;
+    if (f.inCombat)
+        return R::InCombat;
+    if (f.inInstance)
+        return R::InInstance;
+    if (f.inFlight)
+        return R::InFlight;
+    if (f.onTargetMap)
+        return R::AlreadyThere;
+    if (f.alreadyCrossing)
+        return R::AlreadyCrossing;
+    if (f.busy)
+        return R::Busy;
+    if (!f.routeKnown)
+        return R::NoRoute;
+    if (f.campaignArmed)
+        return R::Campaign;
+    if (f.crossingsUnderWay >= f.atOnce)
+        return R::AtCap;
+    return "";
+}
+
+bool CrossRefusalRetryable(std::string const& reason)
+{
+    namespace R = CrossRefusal;
+    return reason == R::NotInWorld || reason == R::Busy || reason == R::Dead || reason == R::InCombat ||
+           reason == R::InFlight || reason == R::Campaign || reason == R::AtCap ||
+           reason == R::GroundGaveUp || reason == R::TimedOut || reason == R::Died ||
+           reason == R::Gone;
+}
+
+char const* CrossEndWord(CrossEnd end)
+{
+    switch (end)
+    {
+        case CrossEnd::Arrived:  return "arrived";
+        case CrossEnd::Refused:  return "refused";
+        case CrossEnd::TimedOut: return "timeout";
+    }
+    return "refused";
+}
+
+std::string CrossResultJson(CrossEnd end, std::string const& reason, bool retry,
+                            std::uint32_t map, unsigned steps)
+{
+    std::string escaped;
+    for (char c : reason)
+    {
+        if (c == '"' || c == '\\')
+        {
+            escaped += '\\';
+            escaped += c;
+        }
+        else if (static_cast<unsigned char>(c) < 0x20)
+            escaped += ' ';
+        else
+            escaped += c;
+    }
+    return std::string("{\"outcome\":\"") + CrossEndWord(end) + "\",\"reason\":\"" + escaped +
+           "\",\"retry\":" + (retry ? "true" : "false") + ",\"map\":" + std::to_string(map) +
+           ",\"steps\":" + std::to_string(steps) + "}";
+}
+
 // ------------------------------- quest objectives that need a USE (kind='quest') --
 
 namespace
