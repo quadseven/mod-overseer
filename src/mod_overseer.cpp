@@ -1743,6 +1743,10 @@ constexpr float TRAVEL_GROUND_SAMPLE_YARDS = 4.0f;
 // about what a slope looks like.
 constexpr float TRAVEL_GROUND_DROP_YARDS = 10.0f;
 
+// The stride a first leg's slope is judged over: a drop is a vertical step, so
+// a long ramp is as steep as its steepest few yards (2026-10-06).
+constexpr float TRAVEL_FIRST_LEG_STRIDE_YARDS = 5.0f;
+
 // HOW FAR THE SURFACE MAY RISE BETWEEN TWO FOUR-YARD SAMPLES. A larger rise
 // is a rock face or wall, not a walkable slope. The old check only rejected
 // drops, so an unreachable quest point on a mountainside was approached by
@@ -66231,12 +66235,14 @@ private:
         WorldPosition waypoint;
         float botZ{0.f};
         float waypointZ{0.f};   // the picked waypoint, or the first one when none was
-        float firstDropYards{0.f};
+        float firstStrideDrop{0.f};
     };
 
     static NavFirstLeg NavmeshFirstLeg(Player* who, MailWalkEvidence const& ev)
     {
         NavFirstLeg leg;
+        // The path's own first point is where the bot stands; its height is
+        // the one the first segment is measured from.
         leg.botZ = who->GetPositionZ();
         PathGenerator path(who);   // PathGenerator.h:61
         if (!path.CalculatePath(ev.boxX, ev.boxY, ev.boxZ))
@@ -66249,9 +66255,9 @@ private:
             points.push_back(OverseerDecisions::MailWalkPoint{point.x, point.y, point.z});
         leg.pathFound = points.size() >= 2;
         OverseerDecisions::FirstLegPick const pick = OverseerDecisions::PickFirstLegWaypoint(
-            points, leg.botZ, OverseerDecisions::MAIL_WALK_LEG_YARDS,
-            OverseerDecisions::LethalFallYards());
-        leg.firstDropYards = pick.firstDropYards;
+            points, OverseerDecisions::MAIL_WALK_LEG_YARDS, TRAVEL_FIRST_LEG_STRIDE_YARDS,
+            TRAVEL_GROUND_DROP_YARDS);
+        leg.firstStrideDrop = pick.firstStrideDrop;
         leg.legFound = pick.found;
         if (pick.found)
         {
@@ -66848,10 +66854,10 @@ private:
             {
                 LOG_INFO("module.overseer",
                          "overseer: spawn walk {} for '{}' refused first leg: bot z {:.1f}, "
-                         "first waypoint z {:.1f} (drop {:.1f}, lethal {:.1f}), spawn z {:.1f}, "
+                         "first waypoint z {:.1f} (stride drop {:.1f}, safe {:.1f}), spawn z {:.1f}, "
                          "path {}",
-                         id, ev.character, nav.botZ, nav.waypointZ, nav.firstDropYards,
-                         D::LethalFallYards(), ev.boxZ, nav.pathFound ? "found" : "none");
+                         id, ev.character, nav.botZ, nav.waypointZ, nav.firstStrideDrop,
+                         TRAVEL_GROUND_DROP_YARDS, ev.boxZ, nav.pathFound ? "found" : "none");
                 return refuse(wall);
             }
         }
