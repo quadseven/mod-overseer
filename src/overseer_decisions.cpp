@@ -19373,4 +19373,139 @@ char const* QuestUseOutcomeWord(QuestUseOutcome outcome)
     return "unreadable";
 }
 
+// ------------------------------------ a hunt at a spawn (class quest kills) --
+
+bool IsHuntRow(std::string const& command)
+{
+    std::vector<std::string> const words = MailWalkWords(command);
+    return !words.empty() && words[0] == HUNT_SPAWN_VERB;
+}
+
+namespace
+{
+// A non-zero decimal that fits in 32 bits and is at most `ceiling`.
+bool HuntNumber(std::string const& text, uint32_t ceiling, uint32_t& out)
+{
+    uint32_t value = 0;
+    if (!ErrandWalkId(text, value) || value > ceiling)
+        return false;
+    out = value;
+    return true;
+}
+}  // namespace
+
+HuntRequest ParseHuntRequest(std::string const& command)
+{
+    HuntRequest request;
+    HuntRequest bad;
+    bad.error = HuntRefusal::MalformedHunt;
+    std::vector<std::string> const words = MailWalkWords(command);
+    if (words.empty() || words[0] != HUNT_SPAWN_VERB || words.size() > 4)
+        return bad;
+    bool sawEntry = false, sawCount = false, sawMax = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        std::string key, value;
+        if (!ErrandWalkPair(words[i], key, value))
+            return bad;
+        if (key == "creature" && !sawEntry)
+        {
+            sawEntry = true;
+            if (!ErrandWalkId(value, request.entry))
+                return bad;
+        }
+        else if (key == "count" && !sawCount)
+        {
+            sawCount = true;
+            if (!HuntNumber(value, HUNT_MAX_COUNT, request.count))
+                return bad;
+        }
+        else if (key == "max" && !sawMax)
+        {
+            sawMax = true;
+            if (!HuntNumber(value, HUNT_MAX_SECONDS, request.maxSeconds))
+                return bad;
+        }
+        else
+            return bad;
+    }
+    if (!sawEntry)
+        return bad;
+    return request;
+}
+
+char const* HuntGate(HuntFacts const& f)
+{
+    namespace R = HuntRefusal;
+    if (!f.hasBotAI)
+        return R::NotABot;
+    if (!f.inWorld)
+        return R::NotInWorld;
+    if (!f.alive)
+        return R::Dead;
+    if (f.inInstance)
+        return R::InInstance;
+    if (f.inFlight)
+        return R::InFlight;
+    if (f.alreadyHunting)
+        return R::AlreadyHunting;
+    if (f.atCapacity)
+        return R::AtCapacity;
+    if (!f.targetFound)
+        return R::NoTarget;
+    if (f.levelsAbove >= static_cast<int>(HUNT_LEVEL_GAP))
+        return R::TooHighLevel;
+    if (f.healthPct < HUNT_HEALTH_FLOOR_PCT)
+        return R::LowHealth;
+    if (f.attackers > HUNT_MAX_ATTACKERS)
+        return R::TooManyAdds;
+    return "";
+}
+
+TownRetry HuntRefusalRetry(std::string const& reason)
+{
+    namespace R = HuntRefusal;
+    if (reason == R::MalformedHunt || reason == R::Disabled || reason == R::NotABot)
+        return TownRetry::Never;
+    if (reason == R::InInstance)
+        return TownRetry::Elsewhere;
+    return TownRetry::Later;
+}
+
+HuntStep HuntNext(HuntPollFacts const& f)
+{
+    if (f.count && f.kills >= f.count)
+        return HuntStep::Done;
+    if (f.secondsUp >= f.maxSeconds)
+        return HuntStep::TimedOut;
+    HuntFacts const& g = f.gate;
+    if (!g.hasBotAI || !g.inWorld || !g.alive || g.inInstance || g.inFlight)
+        return HuntStep::Refused;
+    if (f.inCombat || f.lootPending)
+        return HuntStep::Fight;
+    if (g.healthPct < HUNT_HEALTH_FLOOR_PCT)
+        return HuntStep::Rest;
+    char const* const wall = HuntGate(g);
+    if (!*wall)
+        return HuntStep::Pull;
+    // No target in reach, a target too far above the bot, or adds on it: none of
+    // them ends the hunt. The mobs respawn and the bot's own AI deals with adds.
+    return HuntStep::Wait;
+}
+
+char const* HuntStepWord(HuntStep step)
+{
+    switch (step)
+    {
+        case HuntStep::Done:     return "done";
+        case HuntStep::TimedOut: return "timeout";
+        case HuntStep::Refused:  return "refused";
+        case HuntStep::Fight:    return "fighting";
+        case HuntStep::Rest:     return "resting";
+        case HuntStep::Wait:     return "waiting";
+        case HuntStep::Pull:     return "pulling";
+    }
+    return "unknown";
+}
+
 }  // namespace OverseerDecisions
