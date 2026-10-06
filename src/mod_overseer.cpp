@@ -37414,6 +37414,366 @@ private:
         return true;
     }
 
+    // ================================ a party for a quest that needs help ==
+    //
+    // OverseerDecisions::ParsePartyUpRequest and its neighbours. The control
+    // plane's class-quest ask picks the answerers and hands the pick here as
+    // `party-up` (seat the named helpers in the asker's party), `party-walk`
+    // (walk the leader to a creature spawn, the party following) and
+    // `party-disband` (the objective is done).
+    //
+    // THE PARTY IS FORMED BY THE SAME CALLS AS A GUILD FINDER RUN'S: a Group
+    // created under the leader, then Group::AddMember for each helper, the two
+    // calls an accepted invite ends in (HandleGroupAcceptOpcode). The stand-in
+    // code seats its guest with the same AddMember. No invite packet is sent:
+    // a bot answering an invite is decided by its own accept action, and a
+    // helper who declined would leave the row applied with no party.
+    //
+    // THE FOLLOW IS THE FAMILY'S: the leader is its own master (a random bot's
+    // master is only ever a person, so nobody else would follow it), each
+    // helper's master is the leader, `follow` is on and `new rpg` is off, the
+    // three things KeepRosterFollowing sets on a family follower. Whatever was
+    // changed is recorded and handed back when the party ends. The helpers
+    // fight what the leader fights through the bots' own assist.
+    //
+    // THE WALK IS `walk-to-spawn` for the leader, unchanged (DoWalk, the same
+    // gates, hold and legs). Only the arrival differs: a leader of a quest
+    // party is held where it stands instead of being let go, until the party
+    // ends, because a walk that lets the leader go sends it grinding away from
+    // the creature the party came for.
+    struct QuestParty
+    {
+        uint32 id{0};
+        std::string leader;
+        std::vector<std::string> helpers;
+        uint64 groupGuid{0};
+        std::time_t formedAt{0};
+        // What forming the party changed, handed back when it ends.
+        bool leaderHadNoMaster{false};
+        bool leaderTookNewRpgOff{false};
+        std::map<std::string, bool> helperHadFollow;
+        std::map<std::string, bool> helperHadNewRpg;
+        bool walked{false};
+    };
+    std::vector<QuestParty> _questParties;
+
+    // Overseer.PartyWalk.Enable: may a `party-up` row form a quest party.
+    static bool QuestPartyEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.PartyWalk.Enable", false);
+    }
+
+    // Overseer.PartyWalk.MaxParties: quest parties standing at once.
+    static uint32 QuestPartyMax()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.PartyWalk.MaxParties", 4);
+    }
+
+    QuestParty* QuestPartyOf(std::string const& leaderName)
+    {
+        for (QuestParty& party : _questParties)
+            if (party.leader == leaderName)
+                return &party;
+        return nullptr;
+    }
+
+    // Is this character a family member whose family has a campaign armed (a
+    // dungeon job, or the town hold a campaign's family waits on) or running
+    // (a coordinator not at IDLE), or a stand-in guest working for one? Such a
+    // character is never seated and never leads.
+    bool InAFamilyCampaign(std::string const& name)
+    {
+        if (IsStandinGuest(name))
+            return true;
+        std::string const family = FamilyOfCharacter(name);
+        if (family.empty())
+            return false;
+        if (FamilyOnADungeonRun(family))
+            return true;
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
+        std::map<std::string, std::string> const jobs = LoadJobs();
+        for (auto const& member : families)
+        {
+            if (member.second != family)
+                continue;
+            auto const job = jobs.find(member.first);
+            if (job != jobs.end() &&
+                (IsDungeonJob(job->second) || OverseerDecisions::HoldsInTown(job->second)))
+                return true;
+        }
+        return false;
+    }
+
+    char const* DoPartyUp(Player* leader, std::string const& command, char const*& status,
+                          std::string& out, uint32 id)
+    {
+        namespace D = OverseerDecisions;
+        std::string const leaderName = leader->GetName();
+        auto refuse = [&](std::string const& why) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"phase\":\"refused\",\"outcome\":\"refused\",\"why\":" << J(why)
+              << ",\"request\":" << J(command) << '}';
+            out = o.str();
+            status = "error";
+            LOG_WARN("module.overseer", "overseer: party-up {} for '{}' refused - {}", id,
+                     leaderName, why);
+            return "refused: see result";
+        };
+
+        if (!QuestPartyEnabled())
+            return refuse("Overseer.PartyWalk.Enable is off");
+        D::PartyUpRequest const request = D::ParsePartyUpRequest(command, leaderName);
+        if (request.error != D::PartyRowError::None)
+            return refuse(D::PartyRowErrorWord(request.error));
+        if (_questParties.size() >= QuestPartyMax())
+            return refuse("the realm already has " + std::to_string(_questParties.size()) +
+                          " quest parties (Overseer.PartyWalk.MaxParties)");
+
+        D::PartyLeaderFacts lf;
+        lf.hasBotAI = GET_PLAYERBOT_AI(leader) != nullptr;
+        lf.inWorld = leader->IsInWorld() && leader->GetSession() && leader->GetMap();
+        lf.alive = leader->IsAlive();
+        lf.inCombat = leader->IsInCombat();
+        lf.inInstance = leader->GetMap() && leader->GetMap()->Instanceable();
+        lf.inGroup = leader->GetGroup() != nullptr;
+        lf.leadsQuestParty = QuestPartyOf(leaderName) != nullptr;
+        lf.leadsCampaign = InAFamilyCampaign(leaderName);
+        lf.onRoster = OnRoster(leaderName) && !IsStandinSittingOut(leaderName);
+        if (char const* wall = D::PartyLeaderGate(lf); *wall)
+            return refuse(wall);
+
+        std::vector<Player*> helpers;
+        for (std::string const& name : request.helpers)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            D::PartyHelperFacts hf;
+            hf.inWorld = p && p->IsInWorld() && p->GetSession() && p->GetMap();
+            if (hf.inWorld)
+            {
+                hf.hasBotAI = GET_PLAYERBOT_AI(p) != nullptr;
+                hf.alive = p->IsAlive();
+                hf.inCombat = p->IsInCombat();
+                hf.inInstance = p->GetMap()->Instanceable();
+                hf.group = p->GetGroup() ? D::PartyGroupState::OtherParty : D::PartyGroupState::None;
+                hf.sameMapAsLeader = p->GetMap() == leader->GetMap();
+                hf.yardsFromLeader = hf.sameMapAsLeader ? p->GetDistance(leader) : -1.f;
+                hf.familyCampaign = InAFamilyCampaign(p->GetName());
+            }
+            if (char const* wall = D::PartyHelperGate(hf); *wall)
+                return refuse("'" + name + "': " + wall);
+            for (QuestParty const& party : _questParties)
+                if (std::find(party.helpers.begin(), party.helpers.end(), p->GetName()) !=
+                    party.helpers.end())
+                    return refuse("'" + name + "': " + D::PartyRefusal::InAnotherParty);
+            helpers.push_back(p);
+        }
+
+        Group* group = new Group();
+        if (!group->Create(leader))
+        {
+            delete group;
+            return refuse("the core would not form a party under the leader");
+        }
+        sGroupMgr->AddGroup(group);
+        for (Player* p : helpers)
+            if (!group->AddMember(p))
+            {
+                group->Disband();
+                return refuse("'" + p->GetName() + "' could not join the party");
+            }
+
+        QuestParty party;
+        party.id = id;
+        party.leader = leaderName;
+        party.groupGuid = group->GetGUID().GetRawValue();
+        party.formedAt = std::time(nullptr);
+        if (PlayerbotAI* leaderAI = GET_PLAYERBOT_AI(leader))
+        {
+            party.leaderHadNoMaster = leaderAI->GetMaster() == nullptr;
+            leaderAI->SetMaster(leader);
+            if (leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) && !HeldStill(leaderName))
+            {
+                leaderAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                party.leaderTookNewRpgOff = true;
+            }
+        }
+        for (Player* p : helpers)
+        {
+            std::string const name = p->GetName();
+            party.helpers.push_back(name);
+            PlayerbotAI* const ai = GET_PLAYERBOT_AI(p);
+            ai->SetMaster(leader);
+            party.helperHadFollow[name] = ai->HasStrategy("follow", BOT_STATE_NON_COMBAT);
+            party.helperHadNewRpg[name] = ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+            if (!party.helperHadFollow[name])
+                ai->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+            if (party.helperHadNewRpg[name])
+                ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+        }
+
+        std::ostringstream o;
+        o << "{\"phase\":\"formed\",\"outcome\":\"formed\",\"leader\":" << J(leaderName)
+          << ",\"helpers\":[";
+        for (std::size_t i = 0; i < party.helpers.size(); ++i)
+            o << (i ? "," : "") << J(party.helpers[i]);
+        o << "],\"ceiling_seconds\":" << D::PARTY_CEILING_SECONDS
+          << ",\"range_yards\":" << static_cast<unsigned>(D::PARTY_RANGE_YARDS) << '}';
+        out = o.str();
+        LOG_WARN("module.overseer",
+                 "overseer: QUEST PARTY {} - '{}' leads {} helper(s) and follows nobody; the party "
+                 "ends on `party-disband`, a death, a member gone, an instance, or after {}s",
+                 id, leaderName, party.helpers.size(), D::PARTY_CEILING_SECONDS);
+        _questParties.push_back(std::move(party));
+        status = "applied";
+        return "";
+    }
+
+    char const* DoPartyDisband(Player* leader, char const*& status, std::string& out)
+    {
+        std::string const leaderName = leader->GetName();
+        QuestParty* const party = QuestPartyOf(leaderName);
+        if (!party)
+        {
+            out = "{\"phase\":\"none\",\"outcome\":\"no party\"}";
+            status = "unchanged";
+            return OverseerDecisions::PartyRefusal::NoParty;
+        }
+        EndQuestParty(*party, "the control plane said the objective is done");
+        _questParties.erase(_questParties.begin() + (party - _questParties.data()));
+        out = "{\"phase\":\"ended\",\"outcome\":\"disbanded\"}";
+        status = "applied";
+        return "";
+    }
+
+    char const* DoPartyWalk(Player* leader, std::string const& command, char const*& status,
+                            std::string& out, uint32 id)
+    {
+        namespace D = OverseerDecisions;
+        std::string const leaderName = leader->GetName();
+        auto refuse = [&](char const* why) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"phase\":\"refused\",\"outcome\":\"refused\",\"why\":" << J(why)
+              << ",\"request\":" << J(command) << '}';
+            out = o.str();
+            status = "error";
+            LOG_WARN("module.overseer", "overseer: party-walk {} for '{}' refused - {}", id,
+                     leaderName, why);
+            return why;
+        };
+
+        D::PartyWalkRequest const request = D::ParsePartyWalkRequest(command);
+        if (*request.error)
+            return refuse(request.error);
+        QuestParty* const party = QuestPartyOf(leaderName);
+        D::PartyWalkFacts facts;
+        facts.leadsQuestParty = party != nullptr;
+        if (party)
+            for (std::string const& name : party->helpers)
+            {
+                Player* const p = ObjectAccessor::FindPlayerByName(name);
+                if (!p || !p->IsInWorld() || !p->GetMap())
+                {
+                    facts.farthestYards = -1.f;
+                    continue;
+                }
+                if (!p->IsAlive())
+                    facts.anyoneDead = true;
+                if (p->GetMap() != leader->GetMap())
+                    facts.anyoneOtherMap = true;
+                else if (facts.farthestYards >= 0.f)
+                    facts.farthestYards = std::max(facts.farthestYards, p->GetDistance(leader));
+            }
+        if (char const* wall = D::PartyWalkGate(facts); *wall)
+            return refuse(wall);
+
+        char const* const detail = DoWalk(leader, request.spawnWalkCommand,
+                                          D::WalkGoal::Spawn, status, out, _pendingMailWalks, id);
+        if (std::string(status) == "verifying")
+            party->walked = true;
+        return detail;
+    }
+
+    // THE PARTY ENDS. The helpers stop following and the party is disbanded; the
+    // leader gets back what forming took and is let go from its hold.
+    void EndQuestParty(QuestParty& party, std::string const& why)
+    {
+        Group* const group = RunGroup(party.groupGuid);
+        Player* const leader = ObjectAccessor::FindPlayerByName(party.leader);
+        for (std::string const& name : party.helpers)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const ai = p && p->IsInWorld() ? GET_PLAYERBOT_AI(p) : nullptr;
+            if (!ai)
+                continue;
+            if (!leader || ai->GetMaster() == leader)
+                ai->SetMaster(nullptr);
+            if (!party.helperHadFollow[name])
+                ai->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
+            if (party.helperHadNewRpg[name])
+                ai->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        }
+        if (group && !group->isBGGroup() && !group->isBFGroup() && !group->isLFGGroup())
+            group->Disband();
+        if (leader && leader->IsInWorld())
+        {
+            if (PlayerbotAI* const ai = GET_PLAYERBOT_AI(leader))
+            {
+                if (party.leaderHadNoMaster && ai->GetMaster() == leader)
+                    ai->SetMaster(nullptr);
+                if (party.leaderTookNewRpgOff && !HeldStill(party.leader))
+                    ai->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+            }
+            ReleaseHold(party.leader, leader, "the quest party is over", MAIL_WALK_HOLD_VERB);
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: QUEST PARTY {} of '{}' is over - {}; {}s up, {} helper(s) let go",
+                 party.id, party.leader, why, std::time(nullptr) - party.formedAt,
+                 party.helpers.size());
+    }
+
+    // ONE POLL OF EVERY QUEST PARTY, from DeliverPendingCommands.
+    void DriveQuestParties()
+    {
+        if (_questParties.empty())
+            return;
+        namespace D = OverseerDecisions;
+        std::time_t const now = std::time(nullptr);
+        std::vector<QuestParty> still;
+        for (QuestParty& party : _questParties)
+        {
+            Player* const leader = ObjectAccessor::FindPlayerByName(party.leader);
+            Group* const group = RunGroup(party.groupGuid);
+            D::PartyPollFacts facts;
+            facts.secondsUp = static_cast<unsigned>(now - party.formedAt);
+            std::vector<Player*> everyone;
+            everyone.push_back(leader);
+            for (std::string const& name : party.helpers)
+                everyone.push_back(ObjectAccessor::FindPlayerByName(name));
+            for (Player* p : everyone)
+            {
+                if (!p || !p->IsInWorld() || !p->GetMap() || !group || p->GetGroup() != group)
+                {
+                    facts.anyoneGone = true;
+                    continue;
+                }
+                if (!p->IsAlive())
+                    facts.anyoneDead = true;
+                if (p->GetMap()->Instanceable())
+                    facts.anyoneInInstance = true;
+            }
+            D::PartyEnds const ends = D::PartyNext(facts);
+            if (ends == D::PartyEnds::Standing)
+            {
+                still.push_back(std::move(party));
+                continue;
+            }
+            EndQuestParty(party, D::PartyEndsWord(ends));
+        }
+        _questParties.swap(still);
+    }
+
     // ================================== a guild group by the dungeon finder ==
     //
     // THE GUILD'S OWN FIVE-MAN (OverseerDecisions::ParseGuildFinderRequest).
@@ -49412,6 +49772,10 @@ private:
         // the queue to the end of the run and hold their row until then.
         DriveGuildFinderRuns();
 
+        // ...and the quest parties, which stand until the control plane ends
+        // them, a member is lost, or their clock runs out.
+        DriveQuestParties();
+
         // Then end any cast hold that outlived the row that placed it (#335).
         // AFTER the five above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
@@ -49635,6 +49999,10 @@ private:
                 detail = DoShare(player, targetArg, command, status, rowResult);
             else if (kind == "quest")
                 detail = DoQuest(player, command, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsPartyWalkRow(command))
+                // A QUEST PARTY'S WALK (see DoPartyWalk), on kind='job' beside
+                // `walk-to-spawn` and routed on its first word the same way.
+                detail = DoPartyWalk(player, command, status, rowResult, id);
             else if (kind == "job" && OverseerDecisions::IsSpawnWalkRow(command))
                 // THE GUILD JOBS' WALK TO A SPAWN, on kind='job' because the
                 // place it goes is where the bot's job is (a field to gather,
@@ -49715,6 +50083,13 @@ private:
                 // kind='guild' and routed on the first word like the finder
                 // run below, so no ENUM migration is needed.
                 detail = DoBattlegroundQueue(player, command, status, rowResult);
+            else if (kind == "guild" && OverseerDecisions::IsPartyUpRow(command))
+                // A QUEST PARTY (see DoPartyUp), on kind='guild' beside the
+                // finder run and routed on the first word, so no ENUM
+                // migration is needed.
+                detail = DoPartyUp(player, command, status, rowResult, id);
+            else if (kind == "guild" && OverseerDecisions::IsPartyDisbandRow(command))
+                detail = DoPartyDisband(player, status, rowResult);
             else if (kind == "guild" && OverseerDecisions::IsGuildFinderRow(command))
                 // THE GUILD COORDINATOR'S FIVE-MAN, on kind='guild' and routed
                 // on the first word as the walks ride `mail` and `cast`, so no
@@ -65403,6 +65778,21 @@ private:
         AnchorHoldWhereItStands(hold->second, who);
     }
 
+    // The same hold, kept standing at a quest party's objective for the seconds
+    // the party has left rather than for the mailbox linger.
+    static void HoldAtTheObjective(Player* who, std::string const& name, uint32 seconds)
+    {
+        auto& holds = HoldsInForce();
+        auto const hold = holds.find(name);
+        if (hold == holds.end())
+            return;
+        who->StopMoving();
+        PinWhereItStands(who);
+        hold->second.walkingUntil = 0;
+        hold->second.until = time(nullptr) + seconds;
+        AnchorHoldWhereItStands(hold->second, who);
+    }
+
     // A GUILD RAIDER'S TALENT RESET, AT THE CLASS TRAINER THE WALK REACHED
     // (#692). The reset is bought through the same door as RespecOnArrival
     // (AskForTalentWipe), and the points are spent with mod-playerbots' premade
@@ -66368,14 +66758,26 @@ private:
                 // the work, and a hold would keep it from them.
                 bot->StopMoving();
                 status = "applied";
-                ReleaseHold(check.targetName, bot, "the walk to its work is over",
-                            MAIL_WALK_HOLD_VERB);
+                // A QUEST PARTY'S LEADER IS HELD AT THE OBJECTIVE instead, until
+                // the party ends; the ceiling is the party's own clock.
+                QuestParty const* const party = QuestPartyOf(check.targetName);
+                if (party)
+                {
+                    int64 const left = int64(D::PARTY_CEILING_SECONDS) -
+                                       int64(std::time(nullptr) - party->formedAt);
+                    HoldAtTheObjective(bot, check.targetName,
+                                       left > 0 ? static_cast<uint32>(left) : 0u);
+                }
+                else
+                    ReleaseHold(check.targetName, bot, "the walk to its work is over",
+                                MAIL_WALK_HOLD_VERB);
                 LOG_INFO("module.overseer",
                          "overseer: spawn walk {} - '{}' reached '{}' ({} spawn {}, {:.1f} "
-                         "yards) after {}ms and {} leg(s); let go to play there",
+                         "yards) after {}ms and {} leg(s); {} there",
                          check.id, check.targetName, ev.mailboxName,
                          ev.spawnIsObject ? "gameobject" : "creature", ev.spawnId,
-                         ev.reachedYards, ev.waitedMs, ev.legs);
+                         ev.reachedYards, ev.waitedMs, ev.legs,
+                         party ? "held for its party" : "let go to play");
             }
             else if (state == D::MailWalkState::Arrived)
             {

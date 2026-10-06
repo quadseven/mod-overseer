@@ -414,6 +414,27 @@
 #
 #Overseer.GuildFinder.MaxGroups = 2
 
+#    Overseer.PartyWalk.Enable
+#        Description: May a `party-up` row seat named bots in the asker's party for
+#                     a quest that needs help. The party follows its leader, a
+#                     `party-walk creature:<spawn id>` row walks the leader (and so
+#                     the party) to a creature spawn, and a `party-disband` row, a
+#                     member's death, a member leaving the party or the world, an
+#                     instance, or 30 minutes end it. Family members whose
+#                     family has a campaign armed or running are refused. 0
+#                     refuses every such row.
+#
+#        Default:     0
+#
+#Overseer.PartyWalk.Enable = 0
+
+#    Overseer.PartyWalk.MaxParties
+#        Description: Quest parties standing at once.
+#
+#        Default:     4
+#
+#Overseer.PartyWalk.MaxParties = 4
+
 ########################################
 #
 #    ONE MOVEMENT OWNER PER FAMILY LEADER

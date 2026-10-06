@@ -20757,6 +20757,206 @@ bool StandinGuestIsSteerable(bool registeredGuest, bool clientAttached, bool inW
 // The guest's name for a log line, or "nobody" for a row with no guest.
 std::string StandinGuestWord(FamilyStandin const& standin);
 
+// ------------------------------------- a party for a quest that needs help --
+//
+// A CLASS QUEST THAT NEEDS HELP IS ASKED FOR AND ANSWERED, AND THEN THE ANSWERERS
+// MUST BE ONE PARTY AT THE OBJECTIVE. The control plane posts the ask, picks the
+// answerers (same guild, same map, near in level, nearest first, at most four)
+// and sends three rows. The module seats the named helpers in the asker's party
+// and walks that party to a creature spawn; it never decides who answers.
+//
+//   kind='guild'  party-up <helper> [<helper> ...]      target: the asker (leader)
+//   kind='job'    party-walk creature:<spawn id> [max:<yards>]   target: the leader
+//   kind='guild'  party-disband                         target: the leader
+//
+// `party-up` and `party-disband` ride kind='guild' beside `finder-run`, and
+// `party-walk` rides kind='job' beside `walk-to-spawn`, each routed on its first
+// word, so no ENUM migration is needed. The `source` column is free text; the
+// control plane writes 'classask'.
+//
+// THE PARTY IS FORMED THE WAY A GUILD FINDER RUN FORMS ITS PARTY, not by a
+// second mechanism: Group::Create under the leader, then Group::AddMember for
+// each helper, the two calls an accepted invite ends in. The leader is made its
+// own master, as the finder run makes its tank (a random bot's group master is
+// only ever a person), so the helpers take it as master on their next tick and
+// follow it, and the party fights what the leader fights through the bots' own
+// assist. Nothing is teleported and nothing is granted.
+//
+// THE WALK IS `walk-to-spawn` FOR THE LEADER. The helpers follow and are never
+// walked; the leader holds where it arrives until the party ends.
+//
+// THE PARTY ENDS (PartyEnds) when the control plane writes `party-disband`
+// (the quest objective is done), when PARTY_CEILING_SECONDS have passed since it
+// formed, when any member is dead, gone from the world or out of the party, or
+// when a member is inside an instance. A fight does not end it: fighting the
+// objective is what it is for. Ending makes every helper leave the party, clears
+// the leader's master if the party set it, and lifts the leader's hold.
+constexpr char PARTY_UP_VERB[] = "party-up";
+constexpr char PARTY_WALK_VERB[] = "party-walk";
+constexpr char PARTY_DISBAND_VERB[] = "party-disband";
+
+// Helpers named in one row: a party of five holds the leader and four.
+constexpr unsigned PARTY_MAX_HELPERS = 4;
+// How near the leader a helper must stand for the party to form or to walk.
+constexpr float PARTY_RANGE_YARDS = 100.0f;
+// How long a party stands before the module ends it, from the moment it formed.
+constexpr unsigned PARTY_CEILING_SECONDS = 30 * 60;
+
+bool IsPartyUpRow(std::string const& command);
+bool IsPartyWalkRow(std::string const& command);
+bool IsPartyDisbandRow(std::string const& command);
+
+enum class PartyRowError : std::uint8_t
+{
+    None,
+    NotThisVerb,
+    Malformed,
+    BadName,
+    SameNameTwice,
+    TooManyHelpers,
+};
+
+struct PartyUpRequest
+{
+    PartyRowError error{PartyRowError::None};
+    std::vector<std::string> helpers;
+};
+
+// `party-up` then one to PARTY_MAX_HELPERS character names (letters only), none
+// the leader's and none twice (names compare without case).
+PartyUpRequest ParsePartyUpRequest(std::string const& command, std::string const& leader);
+
+char const* PartyRowErrorWord(PartyRowError error);
+
+namespace PartyRefusal
+{
+// The leader.
+constexpr char const* LeaderNotInWorld   = "the leader is not in the world";
+constexpr char const* LeaderNotABot      = "the leader is not a bot";
+constexpr char const* LeaderDead         = "the leader is dead";
+constexpr char const* LeaderInCombat     = "the leader is in combat";
+constexpr char const* LeaderInInstance   = "the leader is inside an instance or a battleground";
+constexpr char const* LeaderInAGroup     = "the leader is already in a party";
+constexpr char const* LeaderHasAParty    = "the leader already leads a quest party";
+constexpr char const* LeaderLeadsCampaign = "the leader leads a family campaign";
+constexpr char const* LeaderOnRoster     = "the leader is a family member, which its own party directs";
+// A helper.
+constexpr char const* NotInWorld         = "a helper is not in the world";
+constexpr char const* NotABot            = "a helper is not a bot";
+constexpr char const* Dead               = "a helper is dead";
+constexpr char const* InCombat           = "a helper is in combat";
+constexpr char const* InInstance         = "a helper is inside an instance or a battleground";
+constexpr char const* InAnotherParty     = "a helper is already in a party that is not this one";
+constexpr char const* OtherMap           = "a helper is on another map than the leader";
+constexpr char const* TooFar             = "a helper is more than 100 yards from the leader";
+constexpr char const* FamilyCampaign     = "a helper belongs to a family whose campaign is armed or running";
+// The walk.
+constexpr char const* NoParty            = "the character leads no quest party";
+constexpr char const* NotAnObjective     = "party-walk takes a creature spawn, not a gameobject";
+constexpr char const* MalformedWalk      = "a party-walk row is: party-walk creature:<spawn id> [max:<yards>]";
+}  // namespace PartyRefusal
+
+// A helper's group standing against the party being formed.
+enum class PartyGroupState : std::uint8_t
+{
+    None,        // in no party
+    ThisParty,   // already in the leader's party (a row asked twice)
+    OtherParty,  // in a party of anybody else's, a family's included
+};
+
+struct PartyLeaderFacts
+{
+    bool hasBotAI{true};
+    bool inWorld{true};
+    bool alive{true};
+    bool inCombat{false};
+    bool inInstance{false};
+    // In any party at all (a quest party leader stands in none until it forms).
+    bool inGroup{false};
+    // Leads a party this verb already formed.
+    bool leadsQuestParty{false};
+    // On the roster, and its family's campaign is armed or running.
+    bool leadsCampaign{false};
+    // On the roster with no campaign: its own family's party still directs it
+    // and the walk refuses it, so a party under it could never walk. A roster
+    // member sitting out for a stand-in is not this; it walks like a guildmate.
+    bool onRoster{false};
+};
+
+// "" when the leader may form a party; otherwise the PartyRefusal literal for
+// the first wall, in the order the fields above are declared.
+char const* PartyLeaderGate(PartyLeaderFacts const& facts);
+
+struct PartyHelperFacts
+{
+    bool inWorld{true};
+    bool hasBotAI{true};
+    bool alive{true};
+    bool inCombat{false};
+    bool inInstance{false};
+    PartyGroupState group{PartyGroupState::None};
+    bool sameMapAsLeader{true};
+    // Distance to the leader; below zero is an unread one and never counts as near.
+    float yardsFromLeader{0.f};
+    // A roster member whose family's campaign is armed or running.
+    bool familyCampaign{false};
+};
+
+// "" when the helper may be seated; otherwise the PartyRefusal literal for the
+// first wall, in the order the fields above are declared, the party first, the
+// campaign last of all so a family member is always named for its campaign.
+char const* PartyHelperGate(PartyHelperFacts const& facts);
+
+// The leader's walk row as the `walk-to-spawn` row it is carried out as, or ""
+// with `error` set. Only a creature spawn: a party goes to a mob.
+struct PartyWalkRequest
+{
+    char const* error{""};
+    std::string spawnWalkCommand;
+};
+PartyWalkRequest ParsePartyWalkRequest(std::string const& command);
+
+struct PartyWalkFacts
+{
+    // The character leads a party this verb formed.
+    bool leadsQuestParty{false};
+    bool anyoneDead{false};
+    bool anyoneOtherMap{false};
+    // The farthest helper from the leader; below zero is unread and counts as far.
+    float farthestYards{0.f};
+};
+
+// "" when the party may be walked; otherwise a PartyRefusal literal.
+char const* PartyWalkGate(PartyWalkFacts const& facts);
+
+// One poll of a standing party.
+struct PartyPollFacts
+{
+    unsigned secondsUp{0};
+    unsigned ceilingSeconds{PARTY_CEILING_SECONDS};
+    bool anyoneDead{false};
+    // Out of the world, or no longer in the party.
+    bool anyoneGone{false};
+    bool anyoneInInstance{false};
+};
+
+enum class PartyEnds : std::uint8_t
+{
+    Standing,
+    MemberDied,
+    MemberGone,
+    InstanceEntered,
+    TimedOut,
+};
+
+// Death first (it is what a bridge most needs to hear), then a member gone, then
+// an instance, then the clock.
+PartyEnds PartyNext(PartyPollFacts const& facts);
+
+// "standing", "a member died", "a member left the party or the world", "a member
+// entered an instance", "timed out".
+char const* PartyEndsWord(PartyEnds ends);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
