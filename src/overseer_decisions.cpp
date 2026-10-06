@@ -15210,15 +15210,15 @@ void PruneFarWalkStarts(std::vector<int64_t>& starts, int64_t now)
 }
 
 char const* FarWalkBudgetGate(std::vector<int64_t> const& startsForBot, int64_t now,
-                              uint32_t underWay)
+                              uint32_t underWay, uint32_t atOnce, uint32_t startsPerBot)
 {
-    if (underWay >= FAR_WALKS_AT_ONCE)
+    if (underWay >= atOnce)
         return FarWalkRefusal::RealmFull;
     uint32_t inWindow = 0;
     for (int64_t at : startsForBot)
         if (now - at < static_cast<int64_t>(FAR_WALK_BUDGET_WINDOW_SECONDS))
             ++inWindow;
-    if (inWindow >= FAR_WALK_STARTS_PER_BOT)
+    if (inWindow >= startsPerBot)
         return FarWalkRefusal::BotBudgetSpent;
     return "";
 }

@@ -65365,6 +65365,22 @@ private:
         return starts;
     }
 
+    // Overseer.FarWalk.AtOnce and Overseer.FarWalk.StartsPerBot: the two far
+    // walk ceilings (#633), read once at load like the settings above.
+    static uint32 FarWalkAtOnce()
+    {
+        static uint32 const v = sConfigMgr->GetOption<uint32>(
+            "Overseer.FarWalk.AtOnce", OverseerDecisions::FAR_WALKS_AT_ONCE);
+        return v;
+    }
+
+    static uint32 FarWalkStartsPerBot()
+    {
+        static uint32 const v = sConfigMgr->GetOption<uint32>(
+            "Overseer.FarWalk.StartsPerBot", OverseerDecisions::FAR_WALK_STARTS_PER_BOT);
+        return v;
+    }
+
     static void PruneFarWalkBudget(int64_t nowSeconds)
     {
         auto& budget = FarWalkStarts();
@@ -66254,15 +66270,16 @@ private:
             auto const mine = budget.find(ev.character);
             std::vector<int64_t> const none;
             if (char const* wall = D::FarWalkBudgetGate(
-                    mine == budget.end() ? none : mine->second, nowSeconds, underWay);
+                    mine == budget.end() ? none : mine->second, nowSeconds, underWay,
+                    FarWalkAtOnce(), FarWalkStartsPerBot());
                 *wall)
             {
                 LOG_INFO("module.overseer",
                          "overseer: guild far walk {} for '{}' refused by the budget: {} "
                          "({} far walk(s) under way on the realm, {} allowed; {} per bot per "
                          "{}s) (#633)",
-                         id, ev.character, wall, underWay, D::FAR_WALKS_AT_ONCE,
-                         D::FAR_WALK_STARTS_PER_BOT, D::FAR_WALK_BUDGET_WINDOW_SECONDS);
+                         id, ev.character, wall, underWay, FarWalkAtOnce(),
+                         FarWalkStartsPerBot(), D::FAR_WALK_BUDGET_WINDOW_SECONDS);
                 return wall;
             }
             // The name the roster drive's log lines and the survey planner call

@@ -176,6 +176,24 @@ void TheBudget()
     CheckText("the realm ceiling is named before the bot's", FarWalkBudgetGate(two, 10000, 9),
               F::RealmFull);
 
+    // The ceilings are the realm's own (Overseer.FarWalk.*), not the defaults.
+    CheckText("a raised ceiling lets the fifth through",
+              FarWalkBudgetGate(none, 10000, FAR_WALKS_AT_ONCE, 12, 2), "");
+    CheckText("...the twelfth is the last", FarWalkBudgetGate(none, 10000, 11, 12, 2), "");
+    CheckText("...and the thirteenth is refused", FarWalkBudgetGate(none, 10000, 12, 12, 2),
+              F::RealmFull);
+    CheckText("a lowered ceiling refuses sooner", FarWalkBudgetGate(none, 10000, 1, 1, 2),
+              F::RealmFull);
+    CheckText("a raised per-bot budget lets the third through",
+              FarWalkBudgetGate(two, 10000, 0, 4, 3), "");
+    std::vector<int64_t> three = {7000, 8000, 9000};
+    CheckText("...and refuses the fourth", FarWalkBudgetGate(three, 10000, 0, 4, 3),
+              F::BotBudgetSpent);
+    CheckText("a bot budget of 0 refuses every start", FarWalkBudgetGate(none, 10000, 0, 4, 0),
+              F::BotBudgetSpent);
+    CheckText("a realm ceiling of 0 refuses every start", FarWalkBudgetGate(none, 10000, 0, 0, 2),
+              F::RealmFull);
+
     std::vector<int64_t> starts = {1000, 5000, 9000};
     PruneFarWalkStarts(starts, 1000 + FAR_WALK_BUDGET_WINDOW_SECONDS);
     CheckNumber("the prune keeps one hour", starts.size(), 2);
