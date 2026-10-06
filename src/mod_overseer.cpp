@@ -67676,6 +67676,14 @@ private:
 
     std::vector<HuntState> _hunts;
 
+    // Overseer.Hunt.AtOnce: hunts running on the realm at once. Each costs a
+    // row look every HUNT_ROW_LOOK_SECONDS and a heartbeat every
+    // HUNT_HEARTBEAT_SECONDS, so the count is capped.
+    static uint32 HuntAtOnce()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.Hunt.AtOnce", 4);
+    }
+
     static bool HuntEnabled()
     {
         return sConfigMgr->GetOption<bool>("Overseer.Hunt.Enable", false);
@@ -67762,6 +67770,7 @@ private:
         for (HuntState const& running : _hunts)
             if (running.character == hunt.character)
                 facts.alreadyHunting = true;
+        facts.atCapacity = _hunts.size() >= HuntAtOnce();
         if (char const* wall = D::HuntGate(facts); *wall)
             return refuse(wall);
 

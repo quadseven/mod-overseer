@@ -108,6 +108,9 @@ void EachGateWallRefusesByName()
     f.alreadyHunting = true;
     Check("already hunting", Is(D::HuntGate(f), R::AlreadyHunting));
     f = D::HuntFacts{};
+    f.atCapacity = true;
+    Check("realm at capacity", Is(D::HuntGate(f), R::AtCapacity));
+    f = D::HuntFacts{};
     f.targetFound = false;
     Check("no target", Is(D::HuntGate(f), R::NoTarget));
     f = D::HuntFacts{};
@@ -141,6 +144,7 @@ void RefusalsSayWhetherToAskAgain()
     Check("instance elsewhere", D::HuntRefusalRetry(R::InInstance) == D::TownRetry::Elsewhere);
     Check("already hunting later",
           D::HuntRefusalRetry(R::AlreadyHunting) == D::TownRetry::Later);
+    Check("capacity later", D::HuntRefusalRetry(R::AtCapacity) == D::TownRetry::Later);
     Check("low health later", D::HuntRefusalRetry(R::LowHealth) == D::TownRetry::Later);
     Check("no target later", D::HuntRefusalRetry(R::NoTarget) == D::TownRetry::Later);
     Check("adds later", D::HuntRefusalRetry(R::TooManyAdds) == D::TownRetry::Later);
@@ -219,6 +223,8 @@ void TheAdapterAndTheConfAreWired()
           adapter.find("kind == \"job\" && OverseerDecisions::IsHuntRow(command)") !=
               std::string::npos);
     Check("adapter reads the switch", adapter.find("Overseer.Hunt.Enable") != std::string::npos);
+    Check("adapter reads the ceiling", adapter.find("Overseer.Hunt.AtOnce") != std::string::npos);
+    Check("conf documents the ceiling", conf.find("Overseer.Hunt.AtOnce") != std::string::npos);
     Check("adapter judges with the pure decision",
           adapter.find("D::HuntNext(") != std::string::npos &&
               adapter.find("D::HuntGate(") != std::string::npos);

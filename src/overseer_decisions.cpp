@@ -19347,6 +19347,8 @@ char const* HuntGate(HuntFacts const& f)
         return R::InFlight;
     if (f.alreadyHunting)
         return R::AlreadyHunting;
+    if (f.atCapacity)
+        return R::AtCapacity;
     if (!f.targetFound)
         return R::NoTarget;
     if (f.levelsAbove >= static_cast<int>(HUNT_LEVEL_GAP))

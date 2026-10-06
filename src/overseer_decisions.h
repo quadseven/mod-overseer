@@ -6181,7 +6181,6 @@ constexpr char const* InInstance = "character is inside an instance or battlegro
 constexpr char const* Moving = "character is moving";
 constexpr char const* AlreadyRunning = "a quest use is already under way for this character";
 constexpr char const* HeldByAnother = "character is held by another verb";
-constexpr char const* AtCapacity   = "the realm already has the most hunts it allows";
 constexpr char const* NoTarget = "no such target within reach on this map";
 constexpr char const* TargetDead = "the creature is dead";
 constexpr char const* TooFar = "the target is too far to use the item or object";
@@ -21195,6 +21194,7 @@ constexpr char const* Dead          = "the character is dead";
 constexpr char const* InInstance    = "the character is in an instance";
 constexpr char const* InFlight      = "the character is in flight";
 constexpr char const* AlreadyHunting = "the character already has a hunt running";
+constexpr char const* AtCapacity    = "the realm already has the most hunts it allows";
 constexpr char const* NoTarget      = "no living creature of the entry within reach";
 constexpr char const* TooHighLevel  = "the creature is too many levels above the character";
 constexpr char const* LowHealth     = "the character is below the health floor";
@@ -21222,8 +21222,9 @@ struct HuntFacts
 };
 
 // "" when a pull may start, else a HuntRefusal literal. First wall wins, in
-// this order: not a bot, not in world, dead, instance, flight, no target, level
-// gap, health floor, adds.
+// this order: not a bot, not in world, dead, instance, flight, a hunt already
+// running, the realm at its hunt ceiling, no target, level gap, health floor,
+// adds.
 char const* HuntGate(HuntFacts const& facts);
 
 // Worth asking again: Later for the ones a minute fixes, Elsewhere for an
