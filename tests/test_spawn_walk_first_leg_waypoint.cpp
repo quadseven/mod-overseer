@@ -39,7 +39,7 @@ void Check(char const* what, bool ok)
     ++failures;
 }
 
-constexpr float LETHAL = (1.f - D::FALL_DAMAGE_INTERCEPT) / D::FALL_DAMAGE_SLOPE;
+float const LETHAL = D::LethalFallYards();
 
 // Bigzug, map 1: start (-278.664, -3957.11, 101.338), Uzzek at z 27.3383.
 void TheBarrensWarrior()
