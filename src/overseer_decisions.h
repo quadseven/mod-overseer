@@ -17590,8 +17590,12 @@ bool FarWalkRefusalRetryable(std::string const& reason);
 // walk, `now` the time now, `underWay` the far walks the realm has running.
 // "" when a far walk may start; otherwise the FarWalkRefusal literal. The realm
 // ceiling is named first: it is the wall that moves soonest.
+// `atOnce` and `startsPerBot` are the two ceilings (the constants above are their
+// defaults; the module reads the realm's own from Overseer.FarWalk.AtOnce and
+// Overseer.FarWalk.StartsPerBot). A ceiling of 0 refuses every far walk.
 char const* FarWalkBudgetGate(std::vector<int64_t> const& startsForBot, int64_t now,
-                              uint32_t underWay);
+                              uint32_t underWay, uint32_t atOnce = FAR_WALKS_AT_ONCE,
+                              uint32_t startsPerBot = FAR_WALK_STARTS_PER_BOT);
 
 // Drop the starts that have left the window, so the memory stays one hour deep.
 void PruneFarWalkStarts(std::vector<int64_t>& starts, int64_t now);

@@ -414,6 +414,27 @@
 #
 #Overseer.GuildFinder.MaxGroups = 2
 
+#    Overseer.FarWalk.AtOnce
+#        Description: Far walks (a walk past the errand distance, up to a whole
+#                     continent) under way on the realm at once. A walk past
+#                     this is refused as retryable, and the site tries again
+#                     later. Each walk costs the world thread one route survey
+#                     when it starts and one waypoint step per bot per poll
+#                     after, so raise it only as far as the realm's tick time
+#                     allows. 0 refuses every far walk.
+#
+#        Default:     4
+#
+#Overseer.FarWalk.AtOnce = 4
+
+#    Overseer.FarWalk.StartsPerBot
+#        Description: Far walks one bot may start in any hour. 0 refuses every
+#                     far walk.
+#
+#        Default:     2
+#
+#Overseer.FarWalk.StartsPerBot = 2
+
 #    Overseer.PartyWalk.Enable
 #        Description: May a `party-up` row seat named bots in the asker's party for
 #                     a quest that needs help. The party follows its leader, a
