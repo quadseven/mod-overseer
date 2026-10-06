@@ -60,6 +60,12 @@ void TheGrammarTakesAnEntryACountAndAClock()
     r = D::ParseHuntRequest("hunt-spawn max:90 count:5 creature:3256");
     Check("all three parse in any order",
           !*r.error && r.entry == 3256 && r.count == 5 && r.maxSeconds == 90);
+    r = D::ParseHuntRequest("hunt-spawn creature:6113 item:6799 max:480");
+    Check("item parses", !*r.error && r.item == 6799 && r.entry == 6113 && r.maxSeconds == 480);
+    Check("item zero refused", *D::ParseHuntRequest("hunt-spawn creature:1 item:0").error);
+    Check("item twice refused", *D::ParseHuntRequest("hunt-spawn creature:1 item:2 item:3").error);
+    Check("all four keys parse",
+          !*D::ParseHuntRequest("hunt-spawn creature:1 item:2 count:3 max:4").error);
     Check("no entry refused", *D::ParseHuntRequest("hunt-spawn count:5").error);
     Check("bare verb refused", *D::ParseHuntRequest("hunt-spawn").error);
     Check("zero entry refused", *D::ParseHuntRequest("hunt-spawn creature:0").error);
@@ -193,8 +199,55 @@ void ThePollDecidesTheNextMove()
     p.inCombat = true;
     Check("combat is left to the bot", D::HuntNext(p) == D::HuntStep::Fight);
     p = D::HuntPollFacts{};
-    p.lootPending = true;
-    Check("loot pending is left to the bot", D::HuntNext(p) == D::HuntStep::Fight);
+    p.corpseLootable = true;
+    Check("a lootable corpse is looted", D::HuntNext(p) == D::HuntStep::Loot);
+    p.inCombat = true;
+    Check("combat outranks the corpse", D::HuntNext(p) == D::HuntStep::Fight);
+    p = D::HuntPollFacts{};
+    p.lootWindowOpen = true;
+    Check("an open loot window is left alone", D::HuntNext(p) == D::HuntStep::Fight);
+    p.corpseLootable = true;
+    Check("a corpse to loot outranks an open window", D::HuntNext(p) == D::HuntStep::Loot);
+
+    // The quest-item hunt: the item held ends it, kills do not.
+    p = D::HuntPollFacts{};
+    p.itemWanted = 6799;
+    p.itemHeld = 1;
+    Check("the wanted item held is done", D::HuntNext(p) == D::HuntStep::Done);
+    p.itemHeld = 0;
+    p.kills = 3;
+    Check("kills without the item are not done", D::HuntNext(p) == D::HuntStep::Pull);
+    p.count = 5;
+    p.itemHeld = 4;
+    Check("count is how many of the item", D::HuntNext(p) == D::HuntStep::Pull);
+    p.itemHeld = 5;
+    Check("count of the item held is done", D::HuntNext(p) == D::HuntStep::Done);
+
+    // No respawn before the clock: end, do not idle (the Vejrek run sat 450 s).
+    p = D::HuntPollFacts{};
+    p.kills = 1;
+    p.secondsUp = 32;
+    p.maxSeconds = 480;
+    p.gate.targetFound = false;
+    p.secondsToRespawn = 600;
+    Check("a spawn back after the clock is nodrop", D::HuntNext(p) == D::HuntStep::NoDrop);
+    p.secondsToRespawn = 448;
+    Check("a spawn back exactly at the clock is nodrop", D::HuntNext(p) == D::HuntStep::NoDrop);
+    p.secondsToRespawn = 447;
+    Check("a spawn back before the clock waits", D::HuntNext(p) == D::HuntStep::Wait);
+    p.secondsToRespawn = 0;
+    Check("a respawn already due waits", D::HuntNext(p) == D::HuntStep::Wait);
+    p.secondsToRespawn = -1;
+    Check("an unread respawn waits", D::HuntNext(p) == D::HuntStep::Wait);
+    p.secondsToRespawn = 600;
+    p.kills = 0;
+    Check("no kill yet never ends as nodrop", D::HuntNext(p) == D::HuntStep::Wait);
+    p.kills = 1;
+    p.gate.targetFound = true;
+    Check("a living target means pull, not nodrop", D::HuntNext(p) == D::HuntStep::Pull);
+    p.gate.targetFound = false;
+    p.corpseLootable = true;
+    Check("the corpse is looted before nodrop", D::HuntNext(p) == D::HuntStep::Loot);
 
     p = D::HuntPollFacts{};
     p.gate.healthPct = 10;
@@ -211,7 +264,9 @@ void ThePollDecidesTheNextMove()
 
     Check("step words", Is(D::HuntStepWord(D::HuntStep::Done), "done") &&
                             Is(D::HuntStepWord(D::HuntStep::TimedOut), "timeout") &&
-                            Is(D::HuntStepWord(D::HuntStep::Refused), "refused"));
+                            Is(D::HuntStepWord(D::HuntStep::Refused), "refused") &&
+                            Is(D::HuntStepWord(D::HuntStep::Loot), "looting") &&
+                            Is(D::HuntStepWord(D::HuntStep::NoDrop), "nodrop"));
 }
 
 void TheAdapterAndTheConfAreWired()
@@ -228,6 +283,10 @@ void TheAdapterAndTheConfAreWired()
     Check("adapter judges with the pure decision",
           adapter.find("D::HuntNext(") != std::string::npos &&
               adapter.find("D::HuntGate(") != std::string::npos);
+    Check("adapter loots through the client's own packets",
+          adapter.find("HandleLootOpcode(") != std::string::npos &&
+              adapter.find("HandleAutostoreLootItemOpcode(") != std::string::npos &&
+              adapter.find("HandleLootReleaseOpcode(") != std::string::npos);
     Check("conf documents the switch, default 0",
           conf.find("Overseer.Hunt.Enable") != std::string::npos);
 }

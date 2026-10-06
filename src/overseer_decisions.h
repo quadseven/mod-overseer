@@ -21138,19 +21138,24 @@ char const* PartyEndsWord(PartyEnds ends);
 //
 // SHAPE, on kind='job' beside `walk-to-spawn`, routed on the first word:
 //
-//   kind='job'  hunt-spawn creature:<entry> [count:<n>] [max:<seconds>]
+//   kind='job'  hunt-spawn creature:<entry> [item:<entry>] [count:<n>] [max:<seconds>]
 //
-// `creature:` is a creature TEMPLATE entry (not a spawn id). `count:` is the
-// kills after which the row is done (default: no count, hunt until the clock or
-// the bridge ends the row). `max:` is the clock in seconds (default
-// HUNT_DEFAULT_SECONDS, at most HUNT_MAX_SECONDS). Each key at most once.
+// `creature:` is a creature TEMPLATE entry (not a spawn id). `item:` is the
+// drop the hunt is for (a quest item, say). `count:` is the kills after which
+// the row is done, or with `item:` the number of that item the bot must hold
+// (default 1); without either the hunt runs until the clock or the bridge ends
+// the row. `max:` is the clock in seconds (default HUNT_DEFAULT_SECONDS, at
+// most HUNT_MAX_SECONDS). Each key at most once.
 //
 // WHAT A HUNT DOES. While the bot stands within HUNT_SEEK_YARDS of a living
 // creature of the entry and is not fighting, it selects the nearest one, faces
 // it and starts the auto attack through the client's own attack packet, running
 // at it when it is out of reach. Nothing else is scripted: the bot's combat
-// strategy fights, its loot strategy and its loot action take the corpse, and
-// the hunt only keeps the next target coming as mobs respawn.
+// strategy fights. The corpse is looted by the hunt itself through the client's
+// own loot packets (open, take every item, quest item and the money, close),
+// because the bot's loot strategy was measured not to take a quest item from a
+// corpse it had just killed. The hunt then keeps the next target coming as mobs
+// respawn, or ends when none can before the clock does.
 //
 // REFUSED AT THE START, and again before every new pull, by HuntGate.
 
@@ -21175,6 +21180,7 @@ struct HuntRequest
 {
     uint32_t entry{0};
     uint32_t count{0};  // 0: no kill count, hunt until the clock or the bridge
+    uint32_t item{0};   // 0: no item; else the drop the hunt is for
     uint32_t maxSeconds{HUNT_DEFAULT_SECONDS};
     char const* error{""};
 };
@@ -21199,6 +21205,8 @@ constexpr char const* NoTarget      = "no living creature of the entry within re
 constexpr char const* TooHighLevel  = "the creature is too many levels above the character";
 constexpr char const* LowHealth     = "the character is below the health floor";
 constexpr char const* TooManyAdds   = "too many hostiles are already on the character";
+// The ending of a hunt nothing more can come of before its clock.
+constexpr char const* NoDrop        = "nothing respawns before the clock runs out";
 }  // namespace HuntRefusal
 
 struct HuntFacts
@@ -21240,6 +21248,8 @@ enum class HuntStep : std::uint8_t
     Rest,      // below the health floor: no new pull, the bot rests
     Wait,      // nothing alive of the entry in reach, or too many adds: look again
     Pull,      // select, face and attack the nearest one
+    Loot,      // a corpse of the entry holds loot: take it through the loot packets
+    NoDrop,    // nothing can respawn before the clock runs out: end, retry later
 };
 
 struct HuntPollFacts
@@ -21249,15 +21259,25 @@ struct HuntPollFacts
     uint32_t secondsUp{0};
     uint32_t maxSeconds{HUNT_DEFAULT_SECONDS};
     bool inCombat{false};
-    bool lootPending{false};  // a corpse of the entry within reach still holds loot
+    // A corpse of the entry within reach holds loot this hunt has not tried.
+    bool corpseLootable{false};
+    bool lootWindowOpen{false};  // the bot has a loot window open
+    uint32_t itemWanted{0};      // the row's item entry; 0 for none
+    uint32_t itemHeld{0};        // how many of it the bot carries
+    // Seconds until the creature's spawn respawns, from the last corpse seen;
+    // -1 when no corpse was seen to read it from.
+    int32_t secondsToRespawn{-1};
     HuntFacts gate;
 };
 
-// One poll's decision. Order: kill count, clock, a wall that ends the hunt,
-// fighting or looting, health floor, then the rest of the gate.
+// One poll's decision. Order: the goal (kills, or the item held), clock, a wall
+// that ends the hunt, fighting, a corpse to loot, an open loot window, no respawn
+// before the clock (NoDrop, after at least one kill), health floor, then the
+// rest of the gate.
 HuntStep HuntNext(HuntPollFacts const& facts);
 
-// "done", "timeout", "refused", "fighting", "resting", "waiting", "pulling".
+// "done", "timeout", "refused", "fighting", "resting", "waiting", "pulling",
+// "looting", "nodrop".
 char const* HuntStepWord(HuntStep step);
 
 }  // namespace OverseerDecisions
