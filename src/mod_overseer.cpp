@@ -26657,8 +26657,19 @@ private:
             OverseerDecisions::TerrainRecoveryVerdict const verdict =
                 OverseerDecisions::TerrainRecoveryStep(
                     memory, reading, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
+            bool const groundOnRecord = memory.plane.ground.valid &&
+                                        memory.plane.ground.mapId == bot->GetMapId();
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::Nothing)
+            {
+                // STILL ON THE PLANE AFTER THE GIVE-UP WAS SAID. The ladder is
+                // silent here until the forget window, but a hearthstone the
+                // give-up poll could not cast (the character was moving, or
+                // casting something else) is asked for again, so a refusal
+                // that clears by itself does not cost ten minutes on the plane.
+                if (onThePlane && memory.plane.saidGiveUp)
+                    HearthOffThePlane(bot, name, groundOnRecord);
                 continue;
+            }
 
             // NOT FALLING, SO STANDING ON SOMETHING (#725). Said once per
             // episode, with every reading that went into it, and nothing is
@@ -27013,17 +27024,34 @@ private:
                     _travelAims.Refuse(name, travelTarget,
                                        "it walked the character onto the plane under "
                                        "the world");
+                // ITS OWN HEARTHSTONE FIRST, ON ITS OWN MAP ONLY. After a
+                // restart there is no ground on record and this line used to
+                // be the whole answer, for ever (2026-10-05). The stone is
+                // the item's spell through the core's item-use path, never a
+                // teleport written here, and DecidePlaneHearth refuses a bind
+                // on another map, so #188's guarantee stands. The cast and a
+                // refused cast are said by HearthOffThePlane.
+                OverseerDecisions::PlaneHearthVerdict const hearth =
+                    HearthOffThePlane(bot, name, groundOnRecord);
+                // A hearth already being cast is the answer in progress, and
+                // the give-up line would only contradict it for ten seconds.
+                if (hearth.action == OverseerDecisions::PlaneHearthAction::Hearth ||
+                    HearthPendingFor(bot->GetName()))
+                    continue;
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' IS STILL UNDER THE WORLD at map {} position "
                           "({:.1f}, {:.1f}, {:.1f}) on the hidden plane (terrain z "
                           "{:.3f}, featureless for {:.0f} yards round it) and this module "
                           "has returned it {} time(s) already, or has no ground on record "
-                          "and no surface to climb to. NOT MOVING IT AGAIN until the "
+                          "({}) and no surface to climb to. It does not hearth off: {}. "
+                          "NOT MOVING IT AGAIN until the "
                           "forget window has passed; somebody needs to look at what puts "
                           "this character on the plane. Aim job='{}' quest={} travel='{}'",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
                           reading.terrainZ, TERRAIN_PLANE_RING_YARDS,
-                          memory.plane.returns, job, questAim, travelTarget);
+                          memory.plane.returns,
+                          groundOnRecord ? "ground on record" : "none on record",
+                          hearth.reason, job, questAim, travelTarget);
                 continue;
             }
 
@@ -32249,6 +32277,76 @@ private:
             if (check.targetName == name)
                 return true;
         return false;
+    }
+
+    // OFF THE HIDDEN PLANE BY ITS OWN HEARTHSTONE, at the plane give-up (see
+    // OverseerDecisions::DecidePlaneHearth for why and when). Gathers the
+    // facts, asks the decision, and casts through DoHearth, the same item-use
+    // path every other hearth in this file takes. Says the cast once, and a
+    // refused cast once per distinct reason; a refused cast is asked again on
+    // the next poll because most refusals (moving, casting) clear by
+    // themselves and DoHearth's own hold is what clears the commonest one.
+    std::map<std::string, std::time_t> _planeHearths;
+    std::map<std::string, std::string> _planeHearthRefusal;
+
+    OverseerDecisions::PlaneHearthVerdict HearthOffThePlane(Player* bot,
+                                                            std::string const& name,
+                                                            bool groundOnRecord)
+    {
+        std::string const key = LowerName(name);
+        std::time_t const now = std::time(nullptr);
+        auto const last = _planeHearths.find(key);
+        uint32 const stone = HearthstoneSpellOf(bot);
+
+        OverseerDecisions::PlaneHearthFacts facts;
+        facts.onPlane = true;
+        facts.groundOnRecord = groundOnRecord;
+        facts.hasStone = stone != 0;
+        facts.stoneReady = stone && !bot->HasSpellCooldown(stone);
+        facts.bindMap = bot->m_homebindMapId;
+        facts.currentMap = bot->GetMapId();
+        facts.alreadyHearthedThisWindow =
+            HearthPendingFor(bot->GetName()) ||
+            (last != _planeHearths.end() &&
+             now - last->second < TERRAIN_RECOVERY_FORGET_SECONDS);
+        OverseerDecisions::PlaneHearthVerdict const verdict =
+            OverseerDecisions::DecidePlaneHearth(facts);
+        if (verdict.action != OverseerDecisions::PlaneHearthAction::Hearth)
+            return verdict;
+
+        char const* status = "error";
+        std::string evidence;
+        char const* const refused =
+            DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+        if (refused && *refused)
+        {
+            std::string& said = _planeHearthRefusal[key];
+            if (said != refused)
+            {
+                said = refused;
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' is on the hidden plane at map {} ({:.1f}, "
+                          "{:.1f}, {:.1f}) and {}, but the cast was refused: {}. It is "
+                          "asked again on the next poll",
+                          name, static_cast<uint32>(bot->GetMapId()),
+                          bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                          verdict.reason, refused);
+            }
+            return verdict;
+        }
+        _planeHearths[key] = now;
+        _planeHearthRefusal.erase(key);
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' WAS ON THE HIDDEN PLANE at map {} ({:.1f}, {:.1f}, "
+                 "{:.1f}) and {}: it USES ITS HEARTHSTONE, as a player would, to its "
+                 "bind on the same map at ({:.1f}, {:.1f}, {:.1f}). No teleport is "
+                 "written and no map is changed (#188); its family's follow walks it "
+                 "back from the inn. Once per {}s for this character",
+                 name, static_cast<uint32>(bot->GetMapId()), bot->GetPositionX(),
+                 bot->GetPositionY(), bot->GetPositionZ(), verdict.reason,
+                 bot->m_homebindX, bot->m_homebindY, bot->m_homebindZ,
+                 static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS));
+        return verdict;
     }
 
     void WriteExitHearthEvent(std::string const& family, std::string const& leaderName,
