@@ -17537,6 +17537,7 @@ char const* SpawnWalkFirstStepRefusal(bool creatureSpawn, bool firstLegHasStep);
 // along the path: a waypoint, or the point on the segment that crosses the
 // reach. Stops at the first segment with a steep stride. `found` is false for a
 // path of fewer than two points and when the very first segment is a cliff.
+// In both cases `point` is left unset and must not be read.
 // `firstStrideDrop` is that first segment's stride drop (negative when it
 // climbs), `netDropYards` the picked point's height below the first
 // waypoint's start, so a refusal can say what it saw.
